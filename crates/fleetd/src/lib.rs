@@ -4,12 +4,14 @@
 //! each to a SQLite queue before it answers.
 
 mod app;
+pub mod backoff;
 mod config;
 mod dump;
 mod error;
 pub mod events;
 mod hook;
 pub mod http1;
+pub mod poller;
 mod runtime;
 mod store;
 mod system;
