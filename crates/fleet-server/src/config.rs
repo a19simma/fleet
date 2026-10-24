@@ -3,7 +3,7 @@
 use std::fmt;
 use std::net::SocketAddr;
 
-const DEFAULT_LISTEN: &str = "0.0.0.0:7070";
+const DEFAULT_LISTEN: &str = "127.0.0.1:7070";
 const DEFAULT_HEALTH_LISTEN: &str = "0.0.0.0:7072";
 
 /// Why the configuration is unusable.
@@ -108,6 +108,11 @@ pub struct Config {
     pub token: Token,
 }
 
+/// Whether `addr` binds only the loopback interface, so nothing off the host can reach it.
+pub fn is_loopback(addr: &SocketAddr) -> bool {
+    addr.ip().is_loopback()
+}
+
 fn address(
     lookup: &impl Fn(&str) -> Option<String>,
     var: &'static str,
@@ -176,9 +181,26 @@ mod tests {
             ("FLEET_TOKEN", TOKEN),
         ]))
         .unwrap();
-        assert_eq!(config.listen.to_string(), "0.0.0.0:7070");
+        assert_eq!(config.listen.to_string(), "127.0.0.1:7070");
         assert_eq!(config.health_listen.to_string(), "0.0.0.0:7072");
         assert_eq!(config.token.expose(), TOKEN);
+    }
+
+    #[test]
+    fn loopback_predicate_separates_local_from_exposed_binds() {
+        let loopback = ["127.0.0.1:7070", "127.9.9.9:1", "[::1]:7070"];
+        let exposed = [
+            "0.0.0.0:7070",
+            "[::]:7070",
+            "10.0.0.5:7070",
+            "192.168.1.2:80",
+        ];
+        for raw in loopback {
+            assert!(is_loopback(&raw.parse().unwrap()), "{raw}");
+        }
+        for raw in exposed {
+            assert!(!is_loopback(&raw.parse().unwrap()), "{raw}");
+        }
     }
 
     #[test]

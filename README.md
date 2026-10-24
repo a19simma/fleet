@@ -6,7 +6,7 @@ Fleet shows what every agent box is doing and whether anything died. It has thre
 - `fleet-server`: the hosted service that stores box state.
 - `fleet`: the command line client.
 
-Status: pre-alpha. `fleetd` accepts Claude Code hooks on loopback and local events on a unix socket, normalizes and redacts them, and queues them in SQLite. It does not forward them yet. `fleet list` is a stub. `fleet-server` serves `FleetIngest` (`PushEvents`, `Heartbeat`) and `FleetQuery.ListFleet` over gRPC on Postgres, with a bearer token, and `GET /healthz`. `FLEET_DATABASE_URL` and `FLEET_TOKEN` are required. `FLEET_LISTEN` defaults to `0.0.0.0:7070` and `FLEET_HEALTH_LISTEN` to `0.0.0.0:7072`.
+Status: pre-alpha. `fleetd` accepts Claude Code hooks on loopback and local events on a unix socket, normalizes and redacts them, and queues them in SQLite. It does not forward them yet. `fleet list` is a stub. `fleet-server` serves `FleetIngest` (`PushEvents`, `Heartbeat`) and `FleetQuery.ListFleet` over gRPC on Postgres, with a bearer token, and `GET /healthz`. `FLEET_DATABASE_URL` and `FLEET_TOKEN` are required. `FLEET_LISTEN` defaults to `127.0.0.1:7070` and `FLEET_HEALTH_LISTEN` to `0.0.0.0:7072`.
 
 ## Install
 
@@ -68,7 +68,7 @@ curl -X POST http://127.0.0.1:7071/hook/Stop -d '{"session_id":"s-1","last_assis
 target/release/fleetd dump
 ```
 
-`fleet-server` serves plaintext h2c gRPC and does no TLS itself. Run it behind a TLS-terminating Gateway or ingress. It logs a warning at start when `FLEET_LISTEN` is a wildcard address. `FLEET_TOKEN` must be at least 32 characters with no surrounding whitespace. One shared token covers every box and every call, so a leaked token reads and writes the whole fleet. That is a known limit; per-box tokens are planned.
+`fleet-server` serves plaintext h2c gRPC and does no TLS itself. Run it behind a TLS-terminating Gateway or ingress. It binds loopback by default and logs a warning at start when `FLEET_LISTEN` is any non-loopback address. The container image sets `FLEET_LISTEN=0.0.0.0:7070` so it stays reachable. `FLEET_TOKEN` must be at least 32 characters with no surrounding whitespace. One shared token covers every box and every call, so a leaked token reads and writes the whole fleet. That is a known limit; per-box tokens are planned.
 
 fleetd binds 127.0.0.1 only and listens on the unix socket for `POST /event`. Settings, the systemd unit and the Claude Code hook config are in `deploy/README.md`.
 

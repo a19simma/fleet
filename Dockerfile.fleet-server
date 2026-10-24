@@ -27,6 +27,7 @@ LABEL org.opencontainers.image.source="https://github.com/a19simma/fleet" \
       org.opencontainers.image.version="${VERSION}" \
       org.opencontainers.image.revision="${REVISION}"
 COPY --from=builder /out/fleet-server /fleet-server
+ENV FLEET_LISTEN=0.0.0.0:7070
 EXPOSE 7070 7072
 USER nonroot
 ENTRYPOINT ["/fleet-server"]

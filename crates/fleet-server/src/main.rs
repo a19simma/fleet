@@ -8,7 +8,7 @@ use std::time::Duration;
 use axum::Router;
 use axum::routing::get;
 use fleet_server::auth::BearerAuth;
-use fleet_server::config::Config;
+use fleet_server::config::{Config, is_loopback};
 use fleet_server::service::router;
 use fleet_server::store::Store;
 use sqlx::postgres::{PgConnectOptions, PgPoolOptions};
@@ -63,10 +63,10 @@ async fn run() -> Result<(), BoxError> {
     let store = Store::new(pool);
     store.migrate().await?;
 
-    if config.listen.ip().is_unspecified() {
+    if !is_loopback(&config.listen) {
         tracing::warn!(
             listen = %config.listen,
-            "FLEET_LISTEN is a wildcard address and the gRPC listener is plaintext h2c; keep it behind a TLS-terminating gateway"
+            "FLEET_LISTEN is not a loopback address and the gRPC listener is plaintext h2c; keep it behind a TLS-terminating gateway"
         );
     }
     let grpc = TcpIncoming::from(TcpListener::bind(config.listen).await?);
