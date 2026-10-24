@@ -234,9 +234,13 @@ fn count(value: i64, field: &'static str) -> Result<u64, StoreError> {
     u64::try_from(value).map_err(|_| StoreError::OutOfRange(field))
 }
 
-fn parse_count(value: Option<String>, field: &'static str) -> Result<u64, StoreError> {
-    value.map_or(Ok(0), |text| {
-        text.parse().map_err(|_| StoreError::OutOfRange(field))
+fn parse_count(value: Option<String>, bad: &mut u32) -> u64 {
+    let Some(text) = value else {
+        return 0;
+    };
+    text.parse().unwrap_or_else(|_| {
+        *bad = bad.saturating_add(1);
+        0
     })
 }
 
@@ -361,6 +365,20 @@ impl Store {
         Ok(())
     }
 
+    /// Starts a `REPEATABLE READ`, read only transaction, so every query in it sees one
+    /// snapshot.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StoreError::Database`] when the transaction cannot start.
+    pub async fn begin_read(&self) -> Result<Transaction<'static, Postgres>, StoreError> {
+        let mut tx = self.pool.begin().await?;
+        sqlx::query("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ, READ ONLY")
+            .execute(&mut *tx)
+            .await?;
+        Ok(tx)
+    }
+
     /// Lists boxes with their sessions, optionally one box.
     ///
     /// Box status and every age come from the database clock at read time: `UNKNOWN`
@@ -371,20 +389,22 @@ impl Store {
     ///
     /// Returns [`StoreError::Database`] when a query fails.
     pub async fn list_fleet(&self, only: Option<&str>) -> Result<(u64, Vec<BoxView>), StoreError> {
+        let mut tx = self.begin_read().await?;
         let as_of_ms = count(
             sqlx::query_scalar::<_, i64>(NOW_MS)
-                .fetch_one(&self.pool)
+                .fetch_one(&mut *tx)
                 .await?,
             "as_of_ms",
         )?;
         let box_rows = sqlx::query(LIST_BOXES)
             .bind(only)
-            .fetch_all(&self.pool)
+            .fetch_all(&mut *tx)
             .await?;
         let session_rows = sqlx::query(LIST_SESSIONS)
             .bind(only)
-            .fetch_all(&self.pool)
+            .fetch_all(&mut *tx)
             .await?;
+        tx.commit().await?;
 
         let mut sessions: BTreeMap<String, Vec<SessionView>> = BTreeMap::new();
         for row in &session_rows {
@@ -393,6 +413,7 @@ impl Store {
                 .or_default()
                 .push(session_view(row)?);
         }
+        let mut bad_counts = 0;
         let mut boxes = Vec::with_capacity(box_rows.len());
         for row in &box_rows {
             let name: String = row.try_get("box")?;
@@ -400,8 +421,11 @@ impl Store {
             let sessions = sessions.remove(&name).unwrap_or_default();
             boxes.push(BoxView {
                 sessions,
-                ..box_view(row, name, &status)?
+                ..box_view(row, name, &status, &mut bad_counts)?
             });
+        }
+        if bad_counts > 0 {
+            tracing::warn!(bad_counts, "stored queue values are not counts; read as 0");
         }
         Ok((as_of_ms, boxes))
     }
@@ -514,10 +538,9 @@ fn session_view(row: &PgRow) -> Result<SessionView, StoreError> {
     })
 }
 
-fn box_view(row: &PgRow, name: String, status: &str) -> Result<BoxView, StoreError> {
+fn box_view(row: &PgRow, name: String, status: &str, bad: &mut u32) -> Result<BoxView, StoreError> {
     let heartbeat_age: Option<i64> = row.try_get("heartbeat_age_s")?;
     Ok(BoxView {
-        r#box: name,
         hostname: row.try_get("hostname")?,
         status: box_status(status).into(),
         heartbeat_age_s: heartbeat_age
@@ -525,8 +548,25 @@ fn box_view(row: &PgRow, name: String, status: &str) -> Result<BoxView, StoreErr
             .transpose()?,
         boot_id: row.try_get("boot_id")?,
         fleetd_version: row.try_get("fleetd_version")?,
-        queue_pending: parse_count(row.try_get("queue_pending")?, "queue_pending")?,
-        queue_oldest_age_s: parse_count(row.try_get("queue_oldest_age_s")?, "queue_oldest_age_s")?,
+        queue_pending: parse_count(row.try_get("queue_pending")?, bad),
+        queue_oldest_age_s: parse_count(row.try_get("queue_oldest_age_s")?, bad),
         sessions: Vec::new(),
+        r#box: name,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_count_tallies_bad_values_without_logging() {
+        let mut bad = 0;
+        assert_eq!(parse_count(None, &mut bad), 0);
+        assert_eq!(parse_count(Some("12".into()), &mut bad), 12);
+        assert_eq!(bad, 0);
+        assert_eq!(parse_count(Some("junk".into()), &mut bad), 0);
+        assert_eq!(parse_count(Some("-1".into()), &mut bad), 0);
+        assert_eq!(bad, 2);
+    }
 }

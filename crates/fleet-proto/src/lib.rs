@@ -5,7 +5,7 @@
 
 mod convert;
 
-pub use convert::{ConvertError, queued_event};
+pub use convert::{ConvertError, Validated, queued_event};
 
 /// Generated `fleet.v1` messages and services.
 #[expect(

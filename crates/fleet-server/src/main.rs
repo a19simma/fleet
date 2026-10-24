@@ -8,7 +8,7 @@ use std::time::Duration;
 use axum::Router;
 use axum::routing::get;
 use fleet_server::auth::BearerAuth;
-use fleet_server::config::{Config, is_loopback};
+use fleet_server::config::{Config, exposed_binds, is_loopback};
 use fleet_server::service::router;
 use fleet_server::store::Store;
 use sqlx::postgres::{PgConnectOptions, PgPoolOptions};
@@ -67,6 +67,15 @@ async fn run() -> Result<(), BoxError> {
         tracing::warn!(
             listen = %config.listen,
             "FLEET_LISTEN is not a loopback address and the gRPC listener is plaintext h2c; keep it behind a TLS-terminating gateway"
+        );
+    }
+    if let Some((var, addr)) = exposed_binds(&config.listen, &config.health_listen)
+        .into_iter()
+        .find(|(var, _)| *var == "FLEET_HEALTH_LISTEN")
+    {
+        tracing::warn!(
+            listen = %addr,
+            "{var} is not a loopback address; the health listener is reachable off the host"
         );
     }
     let grpc = TcpIncoming::from(TcpListener::bind(config.listen).await?);

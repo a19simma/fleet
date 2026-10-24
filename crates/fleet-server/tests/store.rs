@@ -570,6 +570,37 @@ async fn box_status_follows_heartbeat_age(pool: PgPool) {
 }
 
 #[sqlx::test]
+async fn bad_queue_value_does_not_fail_list_fleet(pool: PgPool) {
+    let store = Store::new(pool.clone());
+    store.ingest(&[(1, prompt("a", "go"))]).await.unwrap();
+    let name = BoxName::new(&box_name()).unwrap();
+    store.heartbeat(&name, &heartbeat()).await.unwrap();
+    sqlx::query("UPDATE boxes SET state = jsonb_set(state, '{queue_pending}', '\"junk\"')")
+        .execute(&pool)
+        .await
+        .unwrap();
+    let view = fleet(&store).await.unwrap();
+    assert_eq!(view.queue_pending, 0);
+    assert_eq!(view.queue_oldest_age_s, 7);
+}
+
+#[sqlx::test]
+async fn list_fleet_reads_in_one_repeatable_read_transaction(pool: PgPool) {
+    let store = Store::new(pool);
+    let mut tx = store.begin_read().await.unwrap();
+    let level: String = sqlx::query_scalar("SHOW transaction_isolation")
+        .fetch_one(&mut *tx)
+        .await
+        .unwrap();
+    let read_only: String = sqlx::query_scalar("SHOW transaction_read_only")
+        .fetch_one(&mut *tx)
+        .await
+        .unwrap();
+    assert_eq!(level, "repeatable read");
+    assert_eq!(read_only, "on");
+}
+
+#[sqlx::test]
 async fn list_fleet_filters_by_box(pool: PgPool) {
     let store = Store::new(pool);
     store.ingest(&[(1, prompt("a", "go"))]).await.unwrap();

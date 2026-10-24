@@ -1,6 +1,6 @@
 use std::fmt;
 
-use fleet_core::{Envelope, EventId, Source};
+use fleet_core::{BoxName, Envelope, EventId, Source};
 use serde_json::Value;
 
 use crate::v1;
@@ -9,6 +9,9 @@ use crate::v1;
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum ConvertError {
+    /// The `box` field is not a valid box name. The raw value is not kept, so an error
+    /// message never echoes client input.
+    InvalidBox,
     /// The `id` field is not a valid event id.
     InvalidId(String),
     /// The `source` field names no known source.
@@ -20,6 +23,7 @@ pub enum ConvertError {
 impl fmt::Display for ConvertError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::InvalidBox => f.write_str("invalid box name"),
             Self::InvalidId(raw) => write!(f, "invalid event id: {raw:?}"),
             Self::InvalidSource(raw) => write!(f, "unknown source: {raw:?}"),
             Self::InvalidPayload(why) => write!(f, "payload is not valid JSON: {why}"),
@@ -50,10 +54,30 @@ impl From<&Envelope> for v1::Envelope {
     }
 }
 
+/// A converted envelope together with its validated box name.
+///
+/// Downstream code reads `box_name` and never re-validates the raw string in `envelope`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Validated {
+    /// The validated box name, equal to `envelope.box_name`.
+    pub box_name: BoxName,
+    /// The converted envelope.
+    pub envelope: Envelope,
+}
+
 impl TryFrom<v1::Envelope> for Envelope {
     type Error = ConvertError;
 
     fn try_from(wire: v1::Envelope) -> Result<Self, Self::Error> {
+        Validated::try_from(wire).map(|validated| validated.envelope)
+    }
+}
+
+impl TryFrom<v1::Envelope> for Validated {
+    type Error = ConvertError;
+
+    fn try_from(wire: v1::Envelope) -> Result<Self, Self::Error> {
+        let box_name = BoxName::new(&wire.r#box).map_err(|_| ConvertError::InvalidBox)?;
         let id = wire
             .id
             .parse::<EventId>()
@@ -64,7 +88,7 @@ impl TryFrom<v1::Envelope> for Envelope {
             .map_err(|_| ConvertError::InvalidSource(wire.source.clone()))?;
         let payload = serde_json::from_str::<Value>(&wire.payload_json)
             .map_err(|err| ConvertError::InvalidPayload(err.to_string()))?;
-        Ok(Self {
+        let envelope = Envelope {
             id,
             schema_version: wire.schema_version,
             box_name: wire.r#box,
@@ -79,7 +103,8 @@ impl TryFrom<v1::Envelope> for Envelope {
             workdir: wire.workdir,
             occurred_at: wire.occurred_at_ms,
             payload,
-        })
+        };
+        Ok(Self { box_name, envelope })
     }
 }
 
@@ -169,6 +194,10 @@ mod tests {
         let good = v1::Envelope::from(&sample());
 
         let mut wire = good.clone();
+        wire.r#box = "other".into();
+        assert_eq!(Envelope::try_from(wire), Err(ConvertError::InvalidBox));
+
+        let mut wire = good.clone();
         wire.id = "nope".into();
         assert_eq!(
             Envelope::try_from(wire),
@@ -188,6 +217,25 @@ mod tests {
             Envelope::try_from(wire),
             Err(ConvertError::InvalidPayload(_))
         ));
+    }
+
+    #[test]
+    fn invalid_box_message_does_not_echo_the_input() {
+        let mut wire = v1::Envelope::from(&sample());
+        wire.r#box = "secret-raw-input".into();
+        let message = match Envelope::try_from(wire) {
+            Err(err) => err.to_string(),
+            Ok(_) => String::new(),
+        };
+        assert!(message.contains("invalid box name"), "{message}");
+        assert!(!message.contains("secret-raw-input"), "{message}");
+    }
+
+    #[test]
+    fn validated_envelope_carries_the_box_name() {
+        let wire = v1::Envelope::from(&sample());
+        let checked = Validated::try_from(wire).map_err(|e| e.to_string());
+        assert_eq!(checked.map(|v| v.box_name.to_string()), Ok(box_name()));
     }
 
     #[test]
