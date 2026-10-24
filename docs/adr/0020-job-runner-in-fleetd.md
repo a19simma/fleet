@@ -1,6 +1,6 @@
 # Job runner in fleetd
 
-Status: Accepted. The workspace, agent runner, push and pull request step, poller and gRPC reporter are built as library code, daemon wiring pending. No daemon runtime path calls them yet. Cancel and lease-lost handling are pending. Supersedes the pueue and `fleet-job` parts of ADR-0016 and the "No git" rule of ADR-0011.
+Status: Accepted. The workspace, agent runner, push and pull request step, poller and gRPC reporter are built as library code, daemon wiring pending. No daemon runtime path calls them yet. Cancel and lease-lost handling are built in the runner, with the same daemon wiring pending. Supersedes the pueue and `fleet-job` parts of ADR-0016 and the "No git" rule of ADR-0011.
 
 ADR-0016 sketched Jobs as pueue tasks started by `fleet-job`. pueue has no Kubernetes story, adds a callback and poll layer, and `fleet-job` does not exist. The goal is a Job that runs on a Box, shows up in the server and ends on a pushed branch with a pull request.
 
@@ -14,8 +14,8 @@ fleetd runs each Job itself, as a child process in a git worktree. There is no p
 - **Stream.** fleetd reads stdout lines, redacts each with the existing redactor and flushes every 2 s or 64 KiB through `ReportJob` (ADR-0021). `progress` is the last assistant text. The stream-json stdout is the transcript, so fleetd does not parse Claude's session `.jsonl`.
 - **Finish.** On exit 0 with commits ahead of the base, fleetd runs `git push origin swarm/<id>` from a throwaway bare repo, not the agent's worktree, then `gh pr create --repo <repo> --head <branch> --base <base> --title <tip commit subject, capped> --body "Fleet job <id>"` unless the job sets `open_pr` off, with a 300 s finish timeout, and sends one terminal `SUCCEEDED` report carrying the branch and `pr_url`. Exit 0 with no commits is one terminal `SUCCEEDED` report with no branch and no `pr_url`. A nonzero exit, a push failure or a `gh` failure is `FAILED` with phase `agent`; the `error` string distinguishes "git push failed" from "pull request could not be opened".
 - **Timeout.** The default hard timeout is 30 min. fleetd then kills the process group and reports `FAILED`.
-- **Cancel.** Not built yet. The `ReportJob` reply carries `cancel_requested`. fleetd sends SIGTERM to the process group, waits 10 s, then sends SIGKILL and reports `CANCELLED`.
-- **Server unreachable mid run.** The child keeps running and chunks buffer in memory, bounded at about 8 MiB. If the lease lapses first, the server marks the Job `LOST`. Not built yet: the next `ReportJob` returns `FAILED_PRECONDITION`, and fleetd kills the child and discards the rest. The branch may already be pushed, so a human checks.
+- **Cancel.** The `ReportJob` reply carries `cancel_requested`. fleetd sends SIGTERM to the process group, waits 10 s, then sends SIGKILL and reports `CANCELLED`.
+- **Server unreachable mid run.** The child keeps running and chunks buffer in memory, bounded at about 8 MiB. If the lease lapses first, the server marks the Job `LOST`. The next `ReportJob` returns `FAILED_PRECONDITION`, and fleetd kills the child and discards the rest. The branch may already be pushed, so a human checks.
 - **fleetd or Box death.** The lease lapses and the Job goes `LOST`. A human resubmits.
 - **Push namespace.** fleetd pushes only `swarm/<job_id>`, only after the agent exits. The agent never pushes. This is the only git write fleetd performs.
 - **Where it runs.** fleetd runs on Boxes. Kubernetes runs the server only.

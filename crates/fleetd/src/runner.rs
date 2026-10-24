@@ -4,7 +4,9 @@
 //! stdout line is redacted, then sent as a transcript chunk. A report goes out when 64 KiB
 //! of chunks are pending, every flush interval while chunks wait, and at least every
 //! report interval even when the agent is silent, so the server lease cannot lapse on a
-//! quiet agent. The reply of a report is not inspected here.
+//! quiet agent. A reply with `cancel_requested` sends `SIGTERM` to the group, and after the
+//! cancel grace `SIGKILL`, then reports `CANCELLED`. A `FAILED_PRECONDITION` reply means the
+//! lease is gone: the group is killed, pending chunks are dropped and nothing more is sent.
 //!
 //! After a successful run, [`AgentRunner::finish`] fetches `swarm/<job_id>` from the worktree
 //! into a throwaway bare repo, counts the commits, pushes the branch and opens the pull
@@ -27,7 +29,7 @@ use serde_json::Value;
 use tokio::io::{AsyncBufRead, AsyncBufReadExt, BufReader};
 use tokio::process::{Child, ChildStdout, Command};
 use tokio::time::{Instant, MissedTickBehavior, Sleep};
-use tonic::Status;
+use tonic::{Code, Status};
 
 use crate::group::GroupGuard;
 use crate::now_ms;
@@ -70,6 +72,9 @@ pub const DEFAULT_REPORT_INTERVAL: Duration = Duration::from_secs(30);
 
 /// Default longest wait for the terminal report after a run ends.
 pub const DEFAULT_TERMINAL_REPORT_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Default time a cancelled agent gets after `SIGTERM` before `SIGKILL`.
+pub const DEFAULT_CANCEL_GRACE: Duration = Duration::from_secs(10);
 
 /// Pending chunk bytes that trigger an immediate report.
 pub const FLUSH_BYTES: usize = 64 * 1024;
@@ -132,6 +137,8 @@ pub struct RunConfig {
     pub flush_interval: Duration,
     /// Longest gap between reports.
     pub report_interval: Duration,
+    /// Time between `SIGTERM` and `SIGKILL` when the server asks to cancel.
+    pub cancel_grace: Duration,
     /// Longest wait for the terminal report. Past it the report is dropped, so a hung
     /// server cannot hold the runner after the process group is dead.
     pub terminal_report_timeout: Duration,
@@ -151,6 +158,7 @@ impl RunConfig {
             timeout: DEFAULT_TIMEOUT,
             flush_interval: DEFAULT_FLUSH_INTERVAL,
             report_interval: DEFAULT_REPORT_INTERVAL,
+            cancel_grace: DEFAULT_CANCEL_GRACE,
             terminal_report_timeout: DEFAULT_TERMINAL_REPORT_TIMEOUT,
             base_env: std::env::vars_os().collect(),
         }
@@ -163,6 +171,11 @@ impl RunConfig {
 pub enum AgentOutcome {
     /// The agent exited with status 0. The caller then runs [`AgentRunner::finish`].
     Succeeded,
+    /// The server asked to cancel. The group was terminated and a `CANCELLED` report attempted.
+    Cancelled,
+    /// The server rejected a report as stale, so the lease is gone. The group was killed and
+    /// nothing more was sent.
+    Lost,
     /// The run failed and a terminal `FAILED` report was attempted.
     Failed {
         /// The exit status, absent when the agent was killed or never started.
@@ -214,7 +227,9 @@ impl<R: Reporter> AgentRunner<R> {
     /// It gets `--dangerously-skip-permissions` only when the config marks the box
     /// disposable. Exit 0 is [`AgentOutcome::Succeeded`]. A nonzero exit, a signal, a
     /// start failure or the timeout sends a terminal `FAILED` report and returns
-    /// [`AgentOutcome::Failed`]. The whole process group is killed on every exit path, so
+    /// [`AgentOutcome::Failed`]. A report reply with `cancel_requested` gives
+    /// [`AgentOutcome::Cancelled`] after `SIGTERM`, the cancel grace and `SIGKILL`. A
+    /// `FAILED_PRECONDITION` reply gives [`AgentOutcome::Lost`]. The whole process group is killed on every exit path, so
     /// no background descendant outlives the run. Every report is raced against the
     /// deadline and shutdown, and the terminal report waits at most
     /// [`RunConfig::terminal_report_timeout`], so a hung server never delays the kill.
@@ -246,6 +261,10 @@ impl<R: Reporter> AgentRunner<R> {
         let end = self
             .drive(&mut child, stdout, &mut guard, &mut stream, &mut ctl)
             .await;
+        if matches!(end, Err(End::Cancel)) {
+            guard.terminate();
+            let _ = tokio::time::timeout(self.config.cancel_grace, child.wait()).await;
+        }
         guard.kill();
         let _ = child.wait().await;
         match end {
@@ -255,6 +274,19 @@ impl<R: Reporter> AgentRunner<R> {
                 None => Ok(stream.fail(None, ERR_SIGNAL).await),
             },
             Err(End::Timeout) => Ok(stream.fail(None, ERR_TIMEOUT).await),
+            Err(End::Cancel) => {
+                stream
+                    .terminal(Terminal {
+                        state: JobState::Cancelled,
+                        exit_code: None,
+                        error: None,
+                        branch: None,
+                        pr_url: None,
+                    })
+                    .await;
+                Ok(AgentOutcome::Cancelled)
+            }
+            Err(End::Lost) => Ok(AgentOutcome::Lost),
             Err(End::Shutdown) => {
                 stream.fail(None, ERR_SHUTDOWN).await;
                 Err(RunError)
@@ -671,6 +703,8 @@ enum End {
     Timeout,
     Shutdown,
     Wait,
+    Cancel,
+    Lost,
 }
 
 impl From<Stop> for End {
@@ -711,6 +745,8 @@ struct Stream<'a, R> {
     progress: String,
     last_report: Instant,
     terminal_timeout: Duration,
+    cancel: bool,
+    lost: bool,
 }
 
 impl<'a, R: Reporter> Stream<'a, R> {
@@ -724,10 +760,15 @@ impl<'a, R: Reporter> Stream<'a, R> {
             progress: String::new(),
             last_report: Instant::now(),
             terminal_timeout,
+            cancel: false,
+            lost: false,
         }
     }
 
     fn push(&mut self, redactor: &Redactor, line: &str) {
+        if self.lost {
+            return;
+        }
         let clean = redactor.redact_str(line);
         if let Some(text) = assistant_text(&clean) {
             self.progress = text.chars().take(MAX_PROGRESS_CHARS).collect();
@@ -751,15 +792,22 @@ impl<'a, R: Reporter> Stream<'a, R> {
         }
     }
 
-    async fn beat(&mut self, report_interval: Duration, ctl: &mut Ctl) -> Result<(), Stop> {
+    async fn beat(&mut self, report_interval: Duration, ctl: &mut Ctl) -> Result<(), End> {
         if !self.pending.is_empty() || self.last_report.elapsed() >= report_interval {
             self.flush(ctl).await?;
         }
         Ok(())
     }
 
-    async fn flush(&mut self, ctl: &mut Ctl) -> Result<(), Stop> {
-        ctl.race(self.send_pending()).await
+    async fn flush(&mut self, ctl: &mut Ctl) -> Result<(), End> {
+        ctl.race(self.send_pending()).await?;
+        if self.lost {
+            Err(End::Lost)
+        } else if self.cancel {
+            Err(End::Cancel)
+        } else {
+            Ok(())
+        }
     }
 
     async fn send_pending(&mut self) {
@@ -768,7 +816,8 @@ impl<'a, R: Reporter> Stream<'a, R> {
             let chunks: Vec<_> = self.pending.iter().take(count).cloned().collect();
             let request = self.request(chunks);
             match self.reporter.report(request).await {
-                Ok(_) => {
+                Ok(reply) => {
+                    self.cancel |= reply.cancel_requested;
                     for dropped in self.pending.drain(..count) {
                         self.pending_bytes -= dropped.text.len();
                     }
@@ -776,6 +825,13 @@ impl<'a, R: Reporter> Stream<'a, R> {
                     if self.pending.is_empty() {
                         return;
                     }
+                }
+                Err(status) if status.code() == Code::FailedPrecondition => {
+                    tracing::warn!("job lease lost");
+                    self.lost = true;
+                    self.pending.clear();
+                    self.pending_bytes = 0;
+                    return;
                 }
                 Err(status) => {
                     tracing::warn!(code = ?status.code(), "job report failed");
@@ -834,14 +890,23 @@ impl<'a, R: Reporter> Stream<'a, R> {
 
     async fn send_terminal(&mut self, end: Terminal) {
         self.send_pending().await;
+        if self.lost {
+            return;
+        }
         let mut request = self.request(Vec::new());
         request.terminal_state = Some(end.state.into());
         request.error = end.error.map(str::to_owned);
         request.exit_code = end.exit_code;
         request.branch = end.branch;
         request.pr_url = end.pr_url;
-        if let Err(status) = self.reporter.report(request).await {
-            tracing::warn!(code = ?status.code(), "job terminal report failed");
+        match self.reporter.report(request).await {
+            Err(status) if status.code() == Code::FailedPrecondition => {
+                tracing::info!("job already ended");
+            }
+            Err(status) => {
+                tracing::warn!(code = ?status.code(), "job terminal report failed");
+            }
+            Ok(_) => {}
         }
     }
 }

@@ -22,6 +22,12 @@ impl GroupGuard {
         )
     }
 
+    pub(crate) fn terminate(&self) {
+        if let Some(pid) = self.0 {
+            let _ = kill_process_group(pid, Signal::TERM);
+        }
+    }
+
     pub(crate) fn kill(&mut self) {
         if let Some(pid) = self.0.take() {
             let _ = kill_process_group(pid, Signal::KILL);

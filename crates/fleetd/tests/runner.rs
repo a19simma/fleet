@@ -5,8 +5,9 @@ use std::future::{Future, ready};
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::Arc;
 use std::sync::OnceLock;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::Duration;
 
 use fleet_core::Redactor;
@@ -47,6 +48,8 @@ quiet) read x < "$path"; exit 0 ;;
 hold) sleep 300 > "$path" & wait ;;
 bg) sleep 300 > "$path" & read x < "$path.ready"; exit 0 ;;
 badutf8) printf 'a\377b\nnext\n'; exit 0 ;;
+stubborn) trap '' TERM; sleep 300 > "$path" & wait ;;
+term) trap 'echo t > "$path.marker"; exit 0' TERM; sleep 300 > "$path" & wait ;;
 closed) exec 1>&-; : > "$path.closed"; read x < "$path"; exit 0 ;;
 huge) head -c 3000000 /dev/zero | tr '\0' a; echo; echo next; exit 0 ;;
 reap) echo $$ > "$path"; read x < "$path.go"; exit 0 ;;
@@ -67,9 +70,17 @@ impl Reporter for Hung {
     }
 }
 
+#[derive(Default)]
+struct Switch {
+    cancel: AtomicBool,
+    lost: AtomicBool,
+    stale_terminal: AtomicBool,
+}
+
 struct Fake {
     tx: mpsc::UnboundedSender<ReportJobRequest>,
     fail_first: AtomicUsize,
+    switch: Arc<Switch>,
 }
 
 impl Reporter for Fake {
@@ -84,8 +95,17 @@ impl Reporter for Fake {
         if failing {
             return ready(Err(Status::unavailable("down")));
         }
+        let terminal = request.terminal_state.is_some();
         let _ = self.tx.send(request);
-        ready(Ok(ReportJobReply::default()))
+        let lost = self.switch.lost.load(Ordering::SeqCst)
+            || (terminal && self.switch.stale_terminal.load(Ordering::SeqCst));
+        if lost {
+            return ready(Err(Status::failed_precondition("stale")));
+        }
+        ready(Ok(ReportJobReply {
+            cancel_requested: self.switch.cancel.load(Ordering::SeqCst),
+            ..ReportJobReply::default()
+        }))
     }
 }
 
@@ -138,14 +158,28 @@ fn runner(
     config: RunConfig,
     fail_first: usize,
 ) -> (AgentRunner<Fake>, mpsc::UnboundedReceiver<ReportJobRequest>) {
+    let (agent, rx, _) = switched(config, fail_first);
+    (agent, rx)
+}
+
+type Switched = (
+    AgentRunner<Fake>,
+    mpsc::UnboundedReceiver<ReportJobRequest>,
+    Arc<Switch>,
+);
+
+fn switched(config: RunConfig, fail_first: usize) -> Switched {
     let (tx, rx) = mpsc::unbounded_channel();
+    let switch = Arc::new(Switch::default());
     let fake = Fake {
         tx,
         fail_first: AtomicUsize::new(fail_first),
+        switch: Arc::clone(&switch),
     };
     (
         AgentRunner::new(config, fake, Redactor::new(["hunter2-hunter2"])),
         rx,
+        switch,
     )
 }
 
@@ -577,5 +611,111 @@ async fn a_hung_reporter_does_not_delay_shutdown() -> TestResult {
     driven?;
     assert!(matches!(outcome?, Err(RunError)));
     tokio::time::timeout(Duration::from_secs(20), reader.eof).await???;
+    Ok(())
+}
+
+type SendError = Box<dyn std::error::Error + Send + Sync>;
+
+fn fast_beat() -> RunConfig {
+    let mut cfg = config(false);
+    cfg.report_interval = Duration::from_millis(50);
+    cfg.cancel_grace = Duration::from_millis(300);
+    cfg
+}
+
+async fn cancel_run(
+    mode: &str,
+    dir: &Path,
+) -> Result<(AgentOutcome, Vec<ReportJobRequest>, Reader), SendError> {
+    let hold = fifo(dir, mode).map_err(|e| e.to_string())?;
+    let mut reader = hold_reader(&hold);
+    let (agent, mut rx, switch) = switched(fast_beat(), 0);
+    let (_trigger, shutdown) = Shutdown::channel();
+    let prompt = format!("{mode}:{}", hold.display());
+    let job = job(&prompt);
+    let (outcome, driven) = tokio::join!(
+        tokio::time::timeout(Duration::from_secs(20), agent.run(&job, dir, shutdown)),
+        async {
+            tokio::time::timeout(Duration::from_secs(20), &mut reader.opened).await??;
+            switch.cancel.store(true, Ordering::SeqCst);
+            Ok::<(), SendError>(())
+        }
+    );
+    driven?;
+    Ok((outcome??, drain(&mut rx), reader))
+}
+
+#[tokio::test]
+async fn cancel_kills_group() -> TestResult {
+    let dir = TempDir::new()?;
+    let (outcome, requests, reader) = cancel_run("stubborn", dir.path())
+        .await
+        .map_err(|e| e.to_string())?;
+    assert_eq!(outcome, AgentOutcome::Cancelled);
+    let last = requests.last().ok_or("no report")?;
+    assert_eq!(last.terminal_state, Some(JobState::Cancelled.into()));
+    tokio::time::timeout(Duration::from_secs(20), reader.eof).await???;
+    Ok(())
+}
+
+#[tokio::test]
+async fn cancel_sends_term_before_kill() -> TestResult {
+    let dir = TempDir::new()?;
+    let (outcome, _, reader) = cancel_run("term", dir.path())
+        .await
+        .map_err(|e| e.to_string())?;
+    assert_eq!(outcome, AgentOutcome::Cancelled);
+    tokio::time::timeout(Duration::from_secs(20), reader.eof).await???;
+    assert!(dir.path().join("term.marker").exists());
+    Ok(())
+}
+
+#[tokio::test]
+async fn precondition_failed_kills() -> TestResult {
+    let dir = TempDir::new()?;
+    let hold = fifo(dir.path(), "hold")?;
+    let mut reader = hold_reader(&hold);
+    let (agent, mut rx, switch) = switched(fast_beat(), 0);
+    let (_trigger, shutdown) = Shutdown::channel();
+    let prompt = format!("hold:{}", hold.display());
+    let job = job(&prompt);
+    let (outcome, driven) = tokio::join!(
+        tokio::time::timeout(
+            Duration::from_secs(20),
+            agent.run(&job, dir.path(), shutdown)
+        ),
+        async {
+            tokio::time::timeout(Duration::from_secs(20), &mut reader.opened).await??;
+            switch.lost.store(true, Ordering::SeqCst);
+            Ok::<(), Box<dyn std::error::Error>>(())
+        }
+    );
+    driven?;
+    assert_eq!(outcome??, AgentOutcome::Lost);
+    let requests = drain(&mut rx);
+    assert!(requests.iter().all(|r| r.terminal_state.is_none()));
+    tokio::time::timeout(Duration::from_secs(20), reader.eof).await???;
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_stale_terminal_report_leaves_the_outcome_unchanged() -> TestResult {
+    let dir = TempDir::new()?;
+    let (agent, mut rx, switch) = switched(config(false), 0);
+    switch.stale_terminal.store(true, Ordering::SeqCst);
+    let (_trigger, shutdown) = Shutdown::channel();
+    let outcome = agent.run(&job("exit3:"), dir.path(), shutdown).await?;
+    assert!(matches!(
+        outcome,
+        AgentOutcome::Failed {
+            exit_code: Some(3),
+            ..
+        }
+    ));
+    let sent = drain(&mut rx);
+    assert_eq!(
+        sent.iter().filter(|r| r.terminal_state.is_some()).count(),
+        1
+    );
     Ok(())
 }
