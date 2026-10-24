@@ -204,16 +204,48 @@ impl Store {
         Ok(deleted)
     }
 
+    #[cfg(test)]
+    pub(crate) fn is_closed(&self) -> bool {
+        self.pool.is_closed()
+    }
+
     /// Checkpoints the WAL and closes the pool.
+    ///
+    /// The pool is closed even when the checkpoint fails.
     ///
     /// # Errors
     ///
     /// Fails when the checkpoint fails.
     pub async fn close(self) -> Result<(), Error> {
-        sqlx::query("PRAGMA wal_checkpoint(TRUNCATE)")
-            .execute(&self.pool)
-            .await?;
-        self.pool.close().await;
+        let checkpoint = async {
+            sqlx::query("PRAGMA wal_checkpoint(TRUNCATE)")
+                .execute(&self.pool)
+                .await
+                .map(drop)
+        };
+        close_after(&self.pool, checkpoint).await
+    }
+}
+
+async fn close_after(
+    pool: &SqlitePool,
+    checkpoint: impl Future<Output = Result<(), sqlx::Error>>,
+) -> Result<(), Error> {
+    let checkpointed = checkpoint.await;
+    pool.close().await;
+    Ok(checkpointed?)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn a_failed_checkpoint_still_closes_the_pool() -> Result<(), sqlx::Error> {
+        let pool = SqlitePool::connect("sqlite::memory:").await?;
+        let result = close_after(&pool, async { Err(sqlx::Error::PoolTimedOut) }).await;
+        assert!(matches!(result, Err(Error::Db(_))), "{result:?}");
+        assert!(pool.is_closed());
         Ok(())
     }
 }

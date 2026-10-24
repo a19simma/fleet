@@ -4,13 +4,14 @@ use std::os::unix::fs::{FileTypeExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use fleet_core::{HookAllowlist, Redactor};
+use fleet_core::{HookAllowlist, Identity, Redactor};
 use sd_notify::NotifyState;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream, UnixListener, UnixStream};
 use tokio::signal::unix::{Signal, SignalKind, signal};
 use tokio::sync::watch;
 use tokio::task::{JoinError, JoinSet};
+use tokio::time::{Interval, MissedTickBehavior};
 
 use crate::Error;
 use crate::app::{AppState, hook_router, socket_router};
@@ -22,7 +23,7 @@ use crate::system::read_identity;
 const DEFAULT_WATCHDOG_PERIOD: Duration = Duration::from_secs(20);
 const MIN_WATCHDOG_PERIOD: Duration = Duration::from_millis(1);
 const SHUTDOWN_GRACE: Duration = Duration::from_secs(10);
-const HEALTH_TIMEOUT: Duration = Duration::from_secs(3);
+const MAX_HEALTH_TIMEOUT: Duration = Duration::from_secs(3);
 const HEALTH_RESPONSE_LIMIT: u64 = 4096;
 
 /// Process signal streams for the daemon.
@@ -188,14 +189,14 @@ async fn healthz_ok(mut stream: impl AsyncRead + AsyncWrite + Unpin) -> std::io:
 }
 
 impl Listener {
-    async fn healthy(&self) -> bool {
+    async fn healthy(&self, timeout: Duration) -> bool {
         let check = async {
             match self {
                 Self::Tcp(addr) => healthz_ok(TcpStream::connect(addr).await?).await,
                 Self::Unix(path) => healthz_ok(UnixStream::connect(path).await?).await,
             }
         };
-        match tokio::time::timeout(HEALTH_TIMEOUT, check).await {
+        match tokio::time::timeout(timeout, check).await {
             Ok(Ok(true)) => true,
             Ok(Ok(false)) => {
                 tracing::warn!(listener = ?self, "healthz did not answer 200 ok");
@@ -213,11 +214,11 @@ impl Listener {
     }
 }
 
-async fn all_healthy(listeners: &[Listener]) -> bool {
+async fn all_healthy(listeners: &[Listener], timeout: Duration) -> bool {
     let mut checks = JoinSet::new();
     for listener in listeners {
         let listener = listener.clone();
-        checks.spawn(async move { listener.healthy().await });
+        checks.spawn(async move { listener.healthy(timeout).await });
     }
     let mut healthy = true;
     while let Some(done) = checks.join_next().await {
@@ -226,11 +227,18 @@ async fn all_healthy(listeners: &[Listener]) -> bool {
     healthy
 }
 
-async fn watchdog(listeners: Vec<Listener>, period: Duration, ping: impl Fn()) {
+fn watchdog_interval(period: Duration) -> Interval {
     let mut tick = tokio::time::interval(period);
+    tick.set_missed_tick_behavior(MissedTickBehavior::Delay);
+    tick
+}
+
+async fn watchdog(listeners: Vec<Listener>, period: Duration, ping: impl Fn()) {
+    let timeout = probe_timeout(period);
+    let mut tick = watchdog_interval(period);
     loop {
         tick.tick().await;
-        if all_healthy(&listeners).await {
+        if all_healthy(&listeners, timeout).await {
             ping();
         } else {
             tracing::error!("a listener failed its healthz check, withholding watchdog ping");
@@ -239,9 +247,19 @@ async fn watchdog(listeners: Vec<Listener>, period: Duration, ping: impl Fn()) {
 }
 
 fn watchdog_period() -> Duration {
-    sd_notify::watchdog_enabled()
+    period_for(sd_notify::watchdog_enabled())
+}
+
+fn period_for(limit: Option<Duration>) -> Duration {
+    limit
         .map_or(DEFAULT_WATCHDOG_PERIOD, |limit| limit / 2)
         .max(MIN_WATCHDOG_PERIOD)
+}
+
+/// The health probe budget for a watchdog `period`: at most 3 seconds and always half
+/// the period or less, so a probe ends before the next tick is due.
+fn probe_timeout(period: Duration) -> Duration {
+    MAX_HEALTH_TIMEOUT.min(period / 2)
 }
 
 /// Runs the daemon until `shutdown` resolves or a listener ends.
@@ -249,9 +267,9 @@ fn watchdog_period() -> Duration {
 /// Opens the queue, binds the loopback listener and the unix socket, sends `READY=1`,
 /// then pings the systemd watchdog every half `WatchdogSec`. Each tick makes one
 /// `GET /healthz` round trip to each listener and sends `WATCHDOG=1` only when every
-/// listener answers 200 within 3 seconds. On shutdown it stops the listeners, aborting
-/// any that outlast a 10 second grace period, checkpoints the WAL and removes the socket
-/// file.
+/// listener answers 200 within half the watchdog period, capped at 3 seconds. On
+/// shutdown it stops the listeners, aborting any that outlast a 10 second grace period,
+/// checkpoints the WAL and removes the socket file.
 ///
 /// # Errors
 ///
@@ -269,6 +287,34 @@ pub async fn run(config: Config, shutdown: impl Future<Output = ()>) -> Result<(
         },
     )
     .await?;
+    run_with_store(config, store, identity, redactor, shutdown).await
+}
+
+async fn bind_all(config: &Config) -> Result<(TcpListener, SocketAddr, UnixListener), Error> {
+    let tcp = TcpListener::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, config.http_port)))
+        .await
+        .map_err(Error::Runtime)?;
+    let tcp_addr = tcp.local_addr().map_err(Error::Runtime)?;
+    let socket = bind_socket(&config.socket_path)?;
+    Ok((tcp, tcp_addr, socket))
+}
+
+async fn run_with_store(
+    config: Config,
+    store: Store,
+    identity: Identity,
+    redactor: Redactor,
+    shutdown: impl Future<Output = ()>,
+) -> Result<(), Error> {
+    let (tcp, tcp_addr, socket) = match bind_all(&config).await {
+        Ok(bound) => bound,
+        Err(err) => {
+            if let Err(close_err) = store.clone().close().await {
+                tracing::warn!(%close_err, "closing the queue after a failed bind failed");
+            }
+            return Err(err);
+        }
+    };
     let state = AppState::new(
         store.clone(),
         identity,
@@ -277,11 +323,6 @@ pub async fn run(config: Config, shutdown: impl Future<Output = ()>) -> Result<(
         config.dedupe_window,
     );
 
-    let tcp = TcpListener::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, config.http_port)))
-        .await
-        .map_err(Error::Runtime)?;
-    let tcp_addr = tcp.local_addr().map_err(Error::Runtime)?;
-    let socket = bind_socket(&config.socket_path)?;
     tracing::info!(addr = %tcp_addr, socket = %config.socket_path.display(), "listening");
 
     let (stop_tx, stop_rx) = watch::channel(false);
@@ -384,7 +425,7 @@ mod tests {
             let _ = axum::serve(unix, app()).await;
         });
         let listeners = vec![Listener::Tcp(addr), Listener::Unix(path)];
-        assert!(all_healthy(&listeners).await);
+        assert!(all_healthy(&listeners, Duration::from_secs(1)).await);
         assert!(pings_within(listeners, Duration::from_millis(300)).await >= 1);
     }
 
@@ -393,7 +434,7 @@ mod tests {
         let (addr, _tcp) = serve_tcp().await;
         let dead = closed_addr().await;
         let listeners = vec![Listener::Tcp(addr), Listener::Tcp(dead)];
-        assert!(!all_healthy(&listeners).await);
+        assert!(!all_healthy(&listeners, Duration::from_secs(1)).await);
         assert_eq!(pings_within(listeners, Duration::from_millis(300)).await, 0);
     }
 
@@ -404,7 +445,131 @@ mod tests {
         let _task = tokio::spawn(async move {
             let _ = axum::serve(listener, Router::new()).await;
         });
-        assert!(!all_healthy(&[Listener::Tcp(addr)]).await);
+        assert!(!all_healthy(&[Listener::Tcp(addr)], Duration::from_secs(1)).await);
+    }
+
+    #[test]
+    fn probe_timeout_stays_below_every_period() {
+        let limits = [
+            None,
+            Some(Duration::from_millis(2)),
+            Some(Duration::from_secs(1)),
+            Some(Duration::from_secs(30)),
+            Some(Duration::from_secs(600)),
+        ];
+        for limit in limits {
+            let period = period_for(limit);
+            assert!(probe_timeout(period) < period, "{limit:?}");
+            assert!(probe_timeout(period) <= MAX_HEALTH_TIMEOUT);
+        }
+    }
+
+    #[tokio::test]
+    async fn the_watchdog_interval_delays_missed_ticks() {
+        let tick = watchdog_interval(Duration::from_millis(20));
+        assert_eq!(tick.missed_tick_behavior(), MissedTickBehavior::Delay);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_stalled_tick_is_not_followed_by_catch_up_ticks() {
+        let period = Duration::from_millis(60);
+        let mut tick = watchdog_interval(period);
+        tick.tick().await;
+        tokio::time::sleep(Duration::from_secs(5)).await;
+        tick.tick().await;
+        let started = tokio::time::Instant::now();
+        tick.tick().await;
+        assert_eq!(started.elapsed(), period);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_listener_that_never_answers_is_probed_once_per_period()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await?;
+        let addr = listener.local_addr()?;
+        let accepted = Arc::new(AtomicUsize::new(0));
+        let seen = Arc::clone(&accepted);
+        let _slow = tokio::spawn(async move {
+            while let Ok((stream, _)) = listener.accept().await {
+                seen.fetch_add(1, Ordering::SeqCst);
+                tokio::spawn(async move {
+                    let _held = stream;
+                    std::future::pending::<()>().await;
+                });
+            }
+        });
+        let pings = pings_within(vec![Listener::Tcp(addr)], Duration::from_secs(10)).await;
+        assert_eq!(pings, 0);
+        let probes = accepted.load(Ordering::SeqCst);
+        assert!((50..=501).contains(&probes), "{probes}");
+        Ok(())
+    }
+
+    fn test_config(dir: &TempDir, port: u16) -> Result<Config, Error> {
+        let file = format!(
+            "http_port = {port}\nsocket_path = \"{}\"\n",
+            dir.path().join("fleetd.sock").display()
+        );
+        Config::resolve(Some(&file), &|_| None)
+    }
+
+    async fn open_store(dir: &TempDir) -> Result<Store, Error> {
+        Store::open(
+            &dir.path().join("q.db"),
+            Limits {
+                max_bytes: u64::MAX,
+                max_age: Duration::from_secs(60),
+            },
+        )
+        .await
+    }
+
+    fn test_identity() -> Identity {
+        Identity {
+            box_name: "alpha".into(),
+            hostname: "host".into(),
+            machine_id: "machine".into(),
+            boot_id: "boot".into(),
+        }
+    }
+
+    #[tokio::test]
+    async fn a_taken_port_fails_startup_and_closes_the_store()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let dir = TempDir::new()?;
+        let taken = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await?;
+        let port = taken.local_addr()?.port();
+        let store = open_store(&dir).await?;
+        let result = run_with_store(
+            test_config(&dir, port)?,
+            store.clone(),
+            test_identity(),
+            Redactor::default(),
+            std::future::pending(),
+        )
+        .await;
+        assert!(matches!(result, Err(Error::Runtime(_))), "{result:?}");
+        assert!(store.is_closed());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_socket_bind_failure_closes_the_store() -> Result<(), Box<dyn std::error::Error>> {
+        let dir = TempDir::new()?;
+        let store = open_store(&dir).await?;
+        let mut config = test_config(&dir, 0)?;
+        config.socket_path = dir.path().join("missing").join("fleetd.sock");
+        let result = run_with_store(
+            config,
+            store.clone(),
+            test_identity(),
+            Redactor::default(),
+            std::future::pending(),
+        )
+        .await;
+        assert!(result.is_err());
+        assert!(store.is_closed());
+        Ok(())
     }
 
     #[tokio::test]
