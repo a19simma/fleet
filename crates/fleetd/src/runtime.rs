@@ -444,6 +444,7 @@ mod tests {
             beat.bump();
             std::future::pending::<()>().await;
         });
+        tokio::task::yield_now().await;
         let mut sup = Supervisor::new();
         sup.register("stalled", &progress, Some(task.abort_handle()));
         step(Duration::from_secs(1)).await;
