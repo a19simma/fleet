@@ -62,10 +62,17 @@ ON CONFLICT (box) DO UPDATE SET \
 
 const UPSERT_HEARTBEAT: &str = "\
 INSERT INTO boxes AS b (box, hostname, machine_id, boot_id, fleetd_version, \
-    last_heartbeat_at, state) \
-VALUES ($1, $2, $3, $4, $5, now(), $6::text::jsonb) \
-ON CONFLICT (box) DO UPDATE SET hostname = EXCLUDED.hostname, \
-    machine_id = EXCLUDED.machine_id, boot_id = EXCLUDED.boot_id, \
+    last_heartbeat_at, state, identity_at_ms) \
+VALUES ($1, $2, $3, $4, $5, now(), $6::text::jsonb, \
+    (extract(epoch FROM clock_timestamp()) * 1000)::bigint) \
+ON CONFLICT (box) DO UPDATE SET \
+    hostname = CASE WHEN EXCLUDED.identity_at_ms >= b.identity_at_ms \
+        THEN EXCLUDED.hostname ELSE b.hostname END, \
+    machine_id = CASE WHEN EXCLUDED.identity_at_ms >= b.identity_at_ms \
+        THEN EXCLUDED.machine_id ELSE b.machine_id END, \
+    boot_id = CASE WHEN EXCLUDED.identity_at_ms >= b.identity_at_ms \
+        THEN EXCLUDED.boot_id ELSE b.boot_id END, \
+    identity_at_ms = GREATEST(b.identity_at_ms, EXCLUDED.identity_at_ms), \
     fleetd_version = COALESCE(NULLIF(EXCLUDED.fleetd_version, ''), b.fleetd_version), \
     last_heartbeat_at = now(), \
     state = EXCLUDED.state";

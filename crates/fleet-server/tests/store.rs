@@ -398,6 +398,28 @@ async fn empty_heartbeat_version_keeps_stored_value(pool: PgPool) {
     assert_eq!(fleet(&store).await.unwrap().fleetd_version, "0.2.1");
 }
 
+#[sqlx::test]
+async fn pre_reboot_event_after_new_boot_heartbeat_keeps_boot_id(pool: PgPool) {
+    let store = Store::new(pool);
+    let name = BoxName::new(&box_name()).unwrap();
+    let before_ms = u64::try_from(
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis(),
+    )
+    .unwrap();
+    tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    let fresh = HeartbeatRequest {
+        boot_id: "boot-new".into(),
+        ..heartbeat()
+    };
+    store.heartbeat(&name, &fresh).await.unwrap();
+    let late = at(on_boot(prompt("a", "go"), "boot-old"), before_ms);
+    store.ingest(&[(1, late)]).await.unwrap();
+    assert_eq!(fleet(&store).await.unwrap().boot_id, "boot-new");
+}
+
 fn heartbeat() -> HeartbeatRequest {
     HeartbeatRequest {
         r#box: box_name(),

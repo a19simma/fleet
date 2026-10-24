@@ -26,7 +26,7 @@ Supersedes the stream and ack parts of ADR-0012 (one stream, cumulative high-wat
 - Accepted 2026-10-24.
 - A request carries at most 500 events, or the call fails with `InvalidArgument`. The server decodes messages up to 1 MiB, applies a 30 second request timeout, 8 concurrent requests and 32 streams per connection, and pings every 30 seconds. Postgres statements time out after 10 seconds. The forwarder limits of 100 events, 256 KiB or 500 ms stay a fleetd choice.
 - The server accepts `schema_version` 1 only. ADR-0012 asks for the current and previous version, and no earlier version has shipped. The window opens when version 2 is defined.
-- A `Notification` for a session with no row stores the event and creates no row, since it sets `last_notification` only (ADR-0019). Box identity (`hostname`, `machine_id`, `boot_id`) follows the newest new event by capture time, so a late batch from an older boot does not overwrite it.
+- A `Notification` for a session with no row stores the event and creates no row, since it sets `last_notification` only (ADR-0019). Box identity (`hostname`, `machine_id`, `boot_id`) follows the newest new event by capture time, so a late batch from an older boot does not overwrite it. A heartbeat stamps the same identity with the server clock under the same guard, so an event captured before the heartbeat cannot rewind it.
 
 ## Consequences
 
