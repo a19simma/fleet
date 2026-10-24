@@ -296,6 +296,26 @@ async fn older_boot_does_not_overwrite_newer_identity(pool: PgPool) {
 }
 
 #[sqlx::test]
+async fn far_future_timestamp_cannot_freeze_identity(pool: PgPool) {
+    let store = Store::new(pool);
+    let future = at(
+        on_boot(prompt("a", "go"), "boot-future"),
+        fleet_server::store::MAX_TS_MS,
+    );
+    store.ingest(&[(1, future)]).await.unwrap();
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis();
+    let later = at(
+        on_boot(prompt("b", "go"), "boot-new"),
+        u64::try_from(now_ms).unwrap() + 1_000,
+    );
+    store.ingest(&[(2, later)]).await.unwrap();
+    assert_eq!(fleet(&store).await.unwrap().boot_id, "boot-new");
+}
+
+#[sqlx::test]
 async fn batch_identity_comes_from_newest_new_event(pool: PgPool) {
     let store = Store::new(pool);
     let newer = at(on_boot(prompt("a", "go"), "boot-new"), 1_790_000_005_000);

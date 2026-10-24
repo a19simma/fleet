@@ -48,7 +48,8 @@ ON CONFLICT (box, session_id) DO UPDATE SET \
 
 const TOUCH_BOX: &str = "\
 INSERT INTO boxes AS b (box, hostname, machine_id, boot_id, last_event_at, identity_at_ms) \
-VALUES ($1, $2, $3, $4, now(), $5) \
+VALUES ($1, $2, $3, $4, now(), \
+    LEAST($5::bigint, (extract(epoch FROM clock_timestamp()) * 1000)::bigint)) \
 ON CONFLICT (box) DO UPDATE SET \
     hostname = CASE WHEN EXCLUDED.identity_at_ms >= b.identity_at_ms \
         THEN EXCLUDED.hostname ELSE b.hostname END, \
