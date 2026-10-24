@@ -11,7 +11,7 @@ Network stance: the Fleet server is a hosted service reached over a VPN or any r
 This plan builds on an existing setup. The facts it relies on:
 
 - A Box is a single-user Linux VM named `box-<n>`, cloned from a Template image. The Template bakes in the software (Claude Code, workmux, pueue, mise) at pinned versions and three credentials: a Claude subscription token, a git credential and a VPN auth key. The Box count is one number in the infrastructure config. Changing it means editing it and applying. Scale-down is manual and happens only after a Box drains: nothing running and nothing unpushed. Box destruction loses anything not yet pushed.
-- Interactive agents run as workmux windows in tmux. Background Jobs run as pueue tasks. A Job is a headless `claude -p` run.
+- Interactive agents run as workmux windows in tmux. Background Jobs run as fleetd child processes. A Job is a headless `claude -p` run in a git worktree.
 - A Box pushes only its own branch, named `swarm/<id>`, and only when `SWARM_BOX=1`. Results leave a Box only through git remotes.
 - Workers load the full global Claude config, so hooks in the baked `settings.json` fire on the Box.
 - Today a laptop `fleet` picker lists Boxes from the VPN peer list and polls tmux and pueue on each Box over ssh. Line formats are `box-N`, `box-N/<session>` and `box-N#<task id>`. Connect is `ssh -t box-N tmux new -A`. Preview is an ssh pane capture. A fixed Claude Code and workmux version is pinned in the Template.
@@ -39,13 +39,13 @@ In v1:
 - Server: `FleetIngest` (`PushEvents`, `Heartbeat`) and `FleetQuery.ListFleet` on Postgres, shared bearer token (ADR-0014).
 - CLI: `fleet list` and `fleet watch`. `fleet watch` polls `ListFleet` from the client and prints changes (decision 10).
 
-Out of v1: `FleetJobs`, `ClaimJob`, `RenewLease`, `ReportJob`, claim and lease, drain and `SetDrain`, the KEDA seam, `fleet-job`, `GetPreview`, `ListEvents`, the `Watch` rpc, and transcript summaries beyond the last assistant text. v1 has no Job cost, since cost arrives only through `fleet-job` (decision 12, deferred).
+Out of v1: drain and `SetDrain`, the KEDA seam, `fleet-job`, `GetPreview`, `ListEvents`, the `Watch` rpc, and transcript summaries beyond the last assistant text. v1 has no Job cost, since cost arrives only through `fleet-job` (decision 12, deferred).
 
 Defaults accepted with the cut:
 
 - Reconcile polls stat-only (size and mtime) every 30 to 60 s and parses a transcript only when it changed.
 - Subagent hand-back prompts are marked `synthetic`.
-- The pueue group `fleet` runs with parallel 1.
+- fleetd runs one Job at a time.
 - The hook gap is accepted, because the recovery poll covers it (ADR-0012).
 - ADRs 0011 to 0017 are Accepted.
 
@@ -64,7 +64,7 @@ Goals:
 Non-goals:
 
 - Remote Control. Out of scope.
-- Moving where Jobs run. Jobs stay pueue tasks, interactive agents stay workmux in tmux.
+- Moving where Jobs run. Jobs run as fleetd child processes, interactive agents stay workmux in tmux.
 - fleetd pushing to git or holding git credentials. Results leave the Box only through git remotes (see Background).
 - Storing transcripts on the server. They stay on the Box under `transcript_path`. fleetd reads them for derived preview text and a timeline only.
 - Autoscaling Boxes. Scale stays the Box count plus apply. The queue seam only exposes depth.
@@ -245,8 +245,6 @@ SQLite in WAL mode at `/var/lib/fleetd/queue.db` (systemd `StateDirectory=fleetd
 
 ### pueue integration
 
-- Primary: `fleet-job` reports `job.result` to the unix socket as the last step. It has the `claude -p --output-format json` object, so cost and result come from it. `fleet-job` redirects stdin of `claude -p` from `/dev/null`, because `claude -p` swallowed a `bash -s` heredoc on stdin in T10. It passes `--verbose` whenever it uses `stream-json`, which exits 1 without it (T1).
-- Dedicated group: fleet work runs in its own pueue group (proposed name `fleet`) with its own parallel setting. The default group runs one job at a time, and in Phase 0 it queued unrelated work behind a running job (T5, T7). The claim's free-slot count (ADR-0016) is the free parallelism of that group.
 - Backstop: the pueue `callback` in `pueue.yml`, verified on v4.0.4 (T6). It fires for success, failure, `pueue kill` (`Killed`, exit code `None`), an external kill (`Failed`, exit 137) and grouped tasks, 0.2 to 0.3 s after the task ends. It fires only for finished tasks: there is no queued or started callback. Variables: `id`, `group`, `result`, `exit_code`, `start`, `end`, `path`, `command`, `output`.
 - Callback injection: pueued pastes `{{ command }}` and `{{ output }}` raw into the shell string, and a task command with double quotes injected shell text in T6. The callback string therefore passes only `{{ id }}` and `{{ group }}`, for example `fleetd pueue-callback "{{ id }}" "{{ group }}"`. The subcommand is fast and fire-and-forget: it writes to the unix socket and exits. fleetd fetches command, output and times with `pueue status --json`. The callback lives in the shared `pueue.yml`, which needs a pueued restart, so the Template provisions it.
 - Reconcile: poll `pueue status --json` every 5 s. It is the only source for `task_queued` and `task_started`, and the recovery path for callbacks fired while fleetd was down. Read the whole output: closing the pipe early made pueue panic with rc 134 (T9).
@@ -375,11 +373,11 @@ service FleetJobs {
   rpc SetDrain(SetDrainRequest) returns (BoxView);
 }
 
-message ClaimRequest { string boot_id; uint32 free_slots; }
-message ClaimReply { Job job; Duration lease; }
+message ClaimRequest { string box; }
+message ClaimReply { Job job; uint32 lease_s; uint32 next_in_s; }
 message Job { string job_id; string prompt; string repo; string base_ref; string result_branch;
   JobState state; string box; uint32 attempt; Timestamp lease_expires_at; JobResult result; }
-enum JobState { QUEUED = 0; CLAIMED = 1; RUNNING = 2; SUCCEEDED = 3; FAILED = 4; CANCELLED = 5; LOST = 6; }
+enum JobState { QUEUED = 0; RUNNING = 2; SUCCEEDED = 3; FAILED = 4; CANCELLED = 5; LOST = 6; }
 ```
 ```
 
@@ -402,12 +400,11 @@ Downsides: one leaked token exposes the fleet, and every Box holds it. Rotation 
 | `boxes` | `box` pk, `hostname`, `machine_id`, `boot_id`, `fleetd_version`, `first_seen_at`, `last_event_at`, `last_heartbeat_at`, `state jsonb` | Built. `state` holds the queue figures of the latest heartbeat. Status is computed on read, not stored (ADR-0019). `draining` comes with drain |
 | `events` | `(box, id)` pk, `boot_id`, `seq`, `schema_version`, `source`, `kind`, `captured_at_ms`, `occurred_at_ms`, `received_at`, `session_id`, `prompt_id`, `workdir`, `payload jsonb` | Built. Not partitioned (ADR-0019). `job_id` is not a column yet |
 | `sessions` | `(box, session_id)` pk, `kind`, `state`, `state_at`, `workdir`, `last_prompt`, `last_message`, `last_notification`, `last_event_at`, `last_event_kind` | Built. Projection from new events, in the ingest transaction |
-| `jobs` | `job_id` pk, `idempotency_key` unique, `prompt`, `repo`, `base_ref`, `result_branch`, `state`, `box`, `attempt`, `max_attempts`, `priority`, `lease_expires_at`, `created_at`, `claimed_at`, `finished_at`, `cost_usd`, `result jsonb` | Queue and history in one table |
-| `job_attempts` | `(job_id, attempt)` pk, `box`, `boot_id`, `pueue_task_id`, `started_at`, `ended_at`, `outcome` | One row per claim |
+| `jobs` | `job_id` pk, `idempotency_key` unique, `prompt`, `repo`, `base_ref`, `result_branch`, `state`, `box`, `attempt`, `lease_expires_at`, `created_at`, `claimed_at`, `finished_at`, `cost_usd`, `result jsonb` | Queue and history in one table |
 
-Indexes: built are `events(box, boot_id, seq)`, `events(box, received_at desc)` and partial `events(session_id) where session_id is not null`. Later: `events(job_id)` and partial `jobs(priority desc, created_at) where state='queued'`.
+Indexes: built are `events(box, boot_id, seq)`, `events(box, received_at desc)` and partial `events(session_id) where session_id is not null`. Later: `events(job_id)` and partial `jobs(created_at) where state='queued'`.
 
-Retention (proposed, ADR-0019): `events` 30 days, tool-event types 7 days, removed by `DELETE`, since the table is not partitioned. No job runs the delete yet. `jobs` and `job_attempts` 1 year. `boxes` and `sessions` kept, `sessions` older than 90 days pruned (not built). Prompts and last messages are stored, so the database is sensitive data (see security).
+Retention (proposed, ADR-0019): `events` 30 days, tool-event types 7 days, removed by `DELETE`, since the table is not partitioned. No job runs the delete yet. `jobs` 1 year. `boxes` and `sessions` kept, `sessions` older than 90 days pruned (not built). Prompts and last messages are stored, so the database is sensitive data (see security).
 
 Projections update in the same transaction as the event insert. The change feed for `Watch` uses `LISTEN/NOTIFY` so more than one server replica works.
 
@@ -429,20 +426,18 @@ The laptop can sleep. On wake the CLI reads current state, and `ListEvents --sin
 ### Lifecycle
 
 ```
-submitted -> QUEUED -> CLAIMED -> RUNNING -> SUCCEEDED
-                          |           |----> FAILED
-                          |           |----> LOST (lease expired while running)
-              (lease expired before start) -> QUEUED, attempt+1
- QUEUED/CLAIMED/RUNNING -> CANCELLED
+submitted -> QUEUED -> RUNNING -> SUCCEEDED
+                          |----> FAILED
+                          |----> LOST (lease expired while running)
+ QUEUED/RUNNING -> CANCELLED
 ```
 
 ### Claim and lease
 
 - `SubmitJob` writes a `QUEUED` row. The caller supplies an `idempotency_key` so a retry does not double-submit.
-- An idle fleetd (the dedicated `fleet` pueue group has a free parallel slot, not draining) calls `ClaimJob`. The server picks the head with `SELECT ... FOR UPDATE SKIP LOCKED`, sets `CLAIMED`, `box`, `lease_expires_at = now + 120 s`, `attempt + 1`, and returns the Job.
-- fleetd hands the Job to `fleet-job`, which creates the worktree under `~/jobs`, exports `FLEET_JOB_ID` and `SWARM_BOX=1`, and adds the pueue task. Result branch is `swarm/<job_id>` (see Background).
-- The lease renews through the heartbeat, which lists `running_job_ids`. State moves to `RUNNING` when `pueue.task_started` arrives. pueue has no started callback, so that event comes from `fleet-job` or the 5 s poll.
-- Lease expiry while `CLAIMED` returns the Job to `QUEUED`. Lease expiry while `RUNNING` marks it `LOST` and does not retry by default, because a Job may have pushed commits. A per-job `retry_on_lost` flag opts in.
+- An idle fleetd (no Job running) calls `ClaimJob`. The server picks the head by `created_at` with `SELECT ... FOR UPDATE SKIP LOCKED`, sets `RUNNING`, `box`, `lease_expires_at = now + 120 s`, `attempt + 1`, and returns the Job.
+- fleetd creates the worktree, exports `FLEET_JOB_ID` and `SWARM_BOX=1`, and runs `claude -p` as its own child process. Result branch is `swarm/<job_id>` (see Background).
+- The lease renews on each `ReportJob` from the holding Box. A server reaper runs every 15 s and marks a `RUNNING` Job with an expired lease `LOST`. A `LOST` Job is never retried, because a Job may have pushed commits.
 - fleetd pulls. The server never pushes to a Box, so a Box needs no inbound port and a sleeping or rebooting Box simply claims later.
 
 ### Scaler read
@@ -476,7 +471,7 @@ Parked sketch, no further design: KEDA is driven through the server. fleetd on t
 | Hook JSON shape differs from assumption | Normalized fields empty | Raw JSON kept verbatim under `raw`. Normalizer is tolerant. T2 recorded the shape on 2.1.289. Re-check on a pin bump |
 | workmux state schema changes | Watcher misparses | Pinned workmux version. Parse errors emit `fleetd.watcher_error` and the reconcile poll still runs |
 | Agent crash with no hook | No `Stop`. The state file stays `working` and emits no event | `workmux wait` started on the `working` transition (exit 3), the DELETE watch, and the fleetd liveness check. Deduped per pane id |
-| Claude killed mid Job | No `job.result` | The pueue callback (id and group only) or the poll emits `pueue.task_finished`. Job goes `FAILED` with no cost |
+| Claude killed mid Job | No `job.result` | fleetd sees the child exit and reports a terminal state. Job goes `FAILED` with no cost |
 | Box reboots mid Job | Task and agent gone | New `boot_id`. Lease expires, Job goes `LOST` |
 | Two fleetd claim the same Job | Double run | `SKIP LOCKED` claim is atomic. A lease belongs to one box |
 | Misconfigured or duplicate box name, such as `box-<n>-<n>` | Wrong identity | Names not matching `box-<n>` are rejected at ingest. The drain check stays |
@@ -489,8 +484,6 @@ Parked sketch, no further design: KEDA is driven through the server. fleetd on t
 | pueue callback injection | `{{ command }}` and `{{ output }}` are pasted raw into the shell string, so quotes in a task command inject shell text (T6) | The callback passes only `{{ id }}` and `{{ group }}`. fleetd reads the rest from `pueue status --json` |
 | Hook listener stalled (accepts, never answers) | A hook could hold a turn | Explicit hook `timeout`. Untested, Phase 1 pre-check |
 | Same hook event from two settings sources | Duplicate `hook.*` events | Loopback hook only in managed settings. fleetd drops exact body repeats within 10 s |
-| Fleet work queues behind other pueue work | The default group runs one job at a time | Dedicated pueue group with its own parallel setting |
-| `claude -p` started from a script on stdin | It swallows the script from stdin | `fleet-job` redirects stdin from `/dev/null` |
 | Hook event lost while fleetd is down | A session exists with no `session_start`, `stop` or `session_end` | Registry discovery emits `session.discovered`, `session.stalled` or `session.ended_unseen` with `source=reconcile`. Payloads are not recovered, only state and the last assistant text |
 | fleetd wedged but alive | No events, no restart | `WATCHDOG=1` only when listener, forwarder and reconcile each progressed. systemd restarts after `WatchdogSec` |
 | Box stops sending heartbeats | Stale data on the laptop | The server derives `stale` at 90 s and `lost` at 10 min at read time (ADR-0019) |

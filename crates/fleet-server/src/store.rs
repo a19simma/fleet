@@ -166,6 +166,10 @@ WHERE job_id = $1 AND attempt = $2 AND box = $3 AND state = 'RUNNING' \
 RETURNING cancel_requested, transcript_bytes, \
 (EXTRACT(EPOCH FROM lease_expires_at) * 1000)::bigint AS lease_ms";
 
+const REAP_EXPIRED: &str = "\
+UPDATE jobs SET state = 'LOST', finished_at = now(), error = 'lease expired' \
+WHERE state = 'RUNNING' AND lease_expires_at < now()";
+
 const TRANSCRIPT_TRUNCATED: &str = "\
 SELECT EXISTS (SELECT 1 FROM job_transcript WHERE job_id = $1 AND truncated)";
 
@@ -652,10 +656,10 @@ impl Store {
     ///
     /// Returns [`StoreError::InvalidBox`] when the box fails [`validate_box`],
     /// [`StoreError::InvalidJob`] when the terminal state, `pr_url`, `error` or `branch`
-    /// is invalid, [`StoreError::InvalidChunk`] when a chunk `seq` exceeds the database range or its
-    /// text holds a NUL character, [`StoreError::StaleReport`] when no running row matches
-    /// the job, attempt and box, and [`StoreError::Database`] when a statement fails. A
-    /// failed call stores nothing.
+    /// is invalid, [`StoreError::InvalidChunk`] when a chunk `seq` exceeds the database range
+    /// or its text holds a NUL character, [`StoreError::StaleReport`] when no running row
+    /// matches the job, attempt and box (a reaped `LOST` row no longer matches), and
+    /// [`StoreError::Database`] when a statement fails. A failed call stores nothing.
     pub async fn report_job(
         &self,
         request: &ReportJobRequest,
@@ -738,6 +742,21 @@ impl Store {
             acked_through_seq: u64::try_from(acked).map_err(|_| StoreError::OutOfRange("seq"))?,
             transcript_truncated: truncated,
         })
+    }
+
+    /// Marks every `RUNNING` job whose lease has expired as `LOST` and returns how many.
+    ///
+    /// One statement tests `state = 'RUNNING'` and `lease_expires_at < now()` and sets
+    /// `state`, `finished_at` and the fixed `error` text `lease expired`, so a report that
+    /// renews the lease first wins and a report that arrives after the reap is stale. A
+    /// `LOST` job is never retried: the box may have pushed commits before it vanished.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StoreError::Database`] when the statement fails.
+    pub async fn reap_expired(&self) -> Result<u64, StoreError> {
+        let done = sqlx::query(REAP_EXPIRED).execute(&self.pool).await?;
+        Ok(done.rows_affected())
     }
 
     /// Starts a `REPEATABLE READ`, read only transaction, so every query in it sees one

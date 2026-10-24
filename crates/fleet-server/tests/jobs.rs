@@ -12,8 +12,10 @@ use fleet_server::jobs::{
     MAX_BASE_REF_BYTES, MAX_ERROR_CHARS, MAX_KEY_BYTES, MAX_PHASE_CHARS, MAX_PR_URL_BYTES,
     MAX_PROGRESS_CHARS, MAX_PROMPT_BYTES, MAX_REPO_BYTES, MAX_TRANSCRIPT_BYTES,
 };
+use fleet_server::reaper::{MAX_BACKOFF, backoff_after, error_kind, run_reaper};
 use fleet_server::store::{Store, StoreError};
 use sqlx::PgPool;
+use tokio::sync::{Notify, watch};
 use tokio::time::timeout;
 
 const WAIT: Duration = Duration::from_secs(30);
@@ -817,4 +819,108 @@ async fn progress_report_ignores_result_fields(pool: PgPool) {
             .await
             .unwrap();
     assert_eq!((state.as_str(), pr, code), ("RUNNING", None, None));
+}
+
+async fn lost_row(pool: &PgPool) -> (String, Option<String>, bool) {
+    sqlx::query_as("SELECT state, error, finished_at IS NOT NULL FROM jobs")
+        .fetch_one(pool)
+        .await
+        .unwrap()
+}
+
+#[sqlx::test]
+async fn expired_lease_becomes_lost(pool: PgPool) {
+    let store = store(pool.clone()).await.with_lease(Duration::from_secs(3));
+    let job = claimed(&store, &claimer(1)).await;
+    let reaped = Notify::new();
+    let (stop_tx, stop_rx) = watch::channel(false);
+    let run = run_reaper(
+        store.clone(),
+        Duration::from_millis(100),
+        stop_rx,
+        Some(&reaped),
+    );
+    let check = async {
+        assert!(
+            timeout(Duration::from_millis(300), reaped.notified())
+                .await
+                .is_err()
+        );
+        assert_eq!(lost_row(&pool).await.0, "RUNNING");
+        timeout(Duration::from_secs(10), reaped.notified())
+            .await
+            .unwrap();
+        stop_tx.send(true).unwrap();
+    };
+    tokio::join!(run, check);
+    assert_eq!(
+        lost_row(&pool).await,
+        ("LOST".to_owned(), Some("lease expired".to_owned()), true)
+    );
+    let late = store
+        .report_plain(
+            &job.job_id,
+            job.attempt,
+            &claimer(1),
+            "running",
+            "late",
+            &[],
+        )
+        .await;
+    assert!(matches!(late, Err(StoreError::StaleReport)));
+    assert!(store.claim_job(&claimer(2)).await.unwrap().is_none());
+}
+
+#[sqlx::test]
+async fn reap_spares_live_and_finished_jobs(pool: PgPool) {
+    let store = store(pool.clone()).await;
+    let job = claimed(&store, &claimer(1)).await;
+    assert_eq!(store.reap_expired().await.unwrap(), 0);
+    store
+        .report_job(&terminal(&job, JobState::Succeeded))
+        .await
+        .unwrap();
+    set_lease_in_past(&pool).await;
+    assert_eq!(store.reap_expired().await.unwrap(), 0);
+    assert_eq!(lost_row(&pool).await.0, "SUCCEEDED");
+    sqlx::query("UPDATE jobs SET state = 'RUNNING', finished_at = NULL")
+        .execute(&pool)
+        .await
+        .unwrap();
+    assert_eq!(store.reap_expired().await.unwrap(), 1);
+    assert_eq!(store.reap_expired().await.unwrap(), 0);
+}
+
+#[test]
+fn backoff_doubles_and_caps() {
+    let period = Duration::from_millis(10);
+    let first = backoff_after(None, period);
+    assert_eq!(first, period);
+    let second = backoff_after(Some(first), period);
+    assert_eq!(second, Duration::from_millis(20));
+    assert_eq!(backoff_after(Some(MAX_BACKOFF), period), MAX_BACKOFF);
+    let mut wait = None;
+    for _ in 0..40 {
+        wait = Some(backoff_after(wait, period));
+    }
+    assert_eq!(wait, Some(MAX_BACKOFF));
+    let slow = MAX_BACKOFF + Duration::from_secs(1);
+    assert_eq!(backoff_after(None, slow), slow);
+}
+
+#[sqlx::test]
+async fn a_failing_pass_logs_a_kind_and_the_loop_stops_on_request(pool: PgPool) {
+    let store = store(pool.clone()).await;
+    pool.close().await;
+    let err = store.reap_expired().await.unwrap_err();
+    assert_eq!(error_kind(&err), "pool_closed");
+    let (stop_tx, stop_rx) = watch::channel(false);
+    let run = run_reaper(store, Duration::from_millis(10), stop_rx, None);
+    let check = async {
+        tokio::task::yield_now().await;
+        stop_tx.send(true).unwrap();
+    };
+    timeout(Duration::from_secs(5), async { tokio::join!(run, check) })
+        .await
+        .unwrap();
 }

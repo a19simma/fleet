@@ -10,30 +10,20 @@ The KEDA work is parked. This ADR is a sketch of the seam and adds no design pas
 
 The queue lives in the Fleet server's Postgres. KEDA is driven through the server, and fleetd on the Box pulls and claims Jobs and starts them. Boxes pull work with a lease.
 
-- **States.** `QUEUED`, `CLAIMED`, `RUNNING`, `SUCCEEDED`, `FAILED`, `CANCELLED`, `LOST`.
+- **States.** `QUEUED`, `RUNNING`, `SUCCEEDED`, `FAILED`, `CANCELLED`, `LOST`. There is no `CLAIMED` state: a claim goes straight to `RUNNING`.
 - **Submit.** `FleetJobs.SubmitJob` writes a `QUEUED` row. The caller sets an idempotency key so a retry does not duplicate.
-- **Claim.** An idle fleetd (a free parallel slot in the dedicated `fleet` pueue group, not draining) calls `ClaimJob`. The server takes the head of `priority desc, created_at` with `FOR UPDATE SKIP LOCKED`, sets `CLAIMED`, the Box, an attempt number and a 120 s lease.
-- **Run.** fleetd gives the Job to `fleet-job`, which makes the worktree under `~/jobs`, exports `FLEET_JOB_ID` and `SWARM_BOX=1`, and adds the pueue task. The result branch is `swarm/<job_id>`, the only branch namespace a Box may push.
-- **Lease.** The heartbeat renews the lease for every id in `running_job_ids`.
-- **Expiry.** A `CLAIMED` Job returns to `QUEUED`. A `RUNNING` Job becomes `LOST` and is not retried unless the Job sets `retry_on_lost`, since it may have pushed commits.
+- **Claim.** An idle fleetd calls `ClaimJob`. The server takes the head of the queue, ordered by `created_at`, with `FOR UPDATE SKIP LOCKED` and in the same statement sets `RUNNING`, the Box, the next attempt number and a 120 s lease. There is no priority.
+- **Run.** The server side ends at the claim. Inferred, not part of the design: fleetd starts the run on the Box, exports `FLEET_JOB_ID` and `SWARM_BOX=1`, and works in a worktree. `claude -p` runs with stdin from `/dev/null`, because an open stdin pipe blocks it. The result branch is `swarm/<job_id>`, the only branch namespace a Box may push.
+- **Lease.** Each `ReportJob` from the holding Box renews the lease by 120 s.
+- **Expiry.** A reaper in the server runs every 15 s. It moves each `RUNNING` Job with an expired lease to `LOST`. A `LOST` Job is never retried, since it may have pushed commits. A report that arrives after the reap gets `FAILED_PRECONDITION`.
 - **Pull only.** The server never connects to a Box. A Box needs no inbound port, and a sleeping or rebooting Box claims later.
 - **Scaler read.** Queue depth is `count(*) where state = 'QUEUED'`, readable by a KEDA PostgreSQL scaler and by `FleetJobs.QueueDepth` for an external scaler.
 - **Scaling unchanged.** KEDA scales Kubernetes workloads and cannot create virtual machines. Box count stays a config number plus apply, and scale-down stays manual. What acts on queue depth is parked (plan, decision 5).
 
-## Phase 0 results
-
-T5, T6, T9 and T10 touch this seam. They contradict one implicit assumption and fix several details.
-
-- **Free slot.** The sketch assumed a free pueue slot. The default group runs one job at a time and queued unrelated work behind a running job (T5, T7). Fleet Jobs run in their own pueue group with its own parallel setting, and `free_slots` is that group's free parallelism.
-- **`RUNNING` transition.** pueue has no started callback, only a finished one (T6). `pueue.task_started` comes from `fleet-job` or the 5 s `pueue status --json` poll.
-- **Finish and kill.** The callback fires for success, failure, `pueue kill` (`Killed`, exit code `None`) and an external kill (`Failed`, exit 137), 0.2 to 0.3 s after the end. Any of these maps to `FAILED`, not `LOST`, because the Box is alive and reported it. `LOST` stays for a lease that expires with no report.
-- **Callback input.** The callback passes only the task id and group. `{{ command }}` and `{{ output }}` inject shell text (T6).
-- **`fleet-job`.** It redirects stdin of `claude -p` from `/dev/null` (T10), passes `--verbose` with `stream-json` (T1), and reads `pueue status --json` to the end (T9).
-- **Cost.** `job.result` takes cost from the `result` object. The transcript cannot supply it (T10).
-
 ## Decisions (2026-10-24)
 
-- Accepted 2026-10-24 as a parked sketch. Nothing in it is built in v1.
+- Accepted 2026-10-24 as a sketch. The v1 job design builds the claim and lease above.
+- Cut: pueue, `fleet-job`, the `CLAIMED` state, `job_attempts`, priority, `max_attempts`, `retry_on_lost` and `fleet retry`.
 - Job cost is deferred. v1 has no `fleet-job`, so no cost reaches the server. The jobs run on a subscription, not the API.
 
 ## Consequences
