@@ -1,6 +1,6 @@
 # Plan: fleetd and the fleet server
 
-Status: draft. Phase 1 is in: the listeners, the SQLite queue and the hook normalizer. The pueue callback, forwarder, reconciler, watchers and heartbeat are not built. The server is built (step 3): the `fleet.v1` proto, `FleetIngest`, `FleetQuery.ListFleet`, `FleetWorker`, the Postgres store with the session projection, bearer auth, migrations at start and `GET /healthz`. Decisions answered on 2026-10-24 are marked Decided below. Phase 0 finished on 2026-10-24: all ten tests ran on one Box (Claude Code 2.1.289, workmux 0.1.276, pueue 4.0.4). The results are folded in below. The records are `docs/phase0/T1.md` to `T10.md` in this repo, indexed by `docs/phase0/README.md`.
+Status: draft. Phase 1 is in: the listeners, the SQLite queue and the hook normalizer. The pueue callback, forwarder, reconciler, watchers and heartbeat are not built. The server is built (step 3): the `fleet.v1` proto, `FleetIngest`, `FleetQuery.ListFleet`, `FleetWorker`, `FleetJobs`, the Postgres store with the session projection, path-scoped bearer auth (`FLEET_TOKEN` box, `FLEET_CLIENT_TOKEN` client), migrations at start and `GET /healthz`. Decisions answered on 2026-10-24 are marked Decided below. Phase 0 finished on 2026-10-24: all ten tests ran on one Box (Claude Code 2.1.289, workmux 0.1.276, pueue 4.0.4). The results are folded in below. The records are `docs/phase0/T1.md` to `T10.md` in this repo, indexed by `docs/phase0/README.md`.
 
 v1 cut and recovery design added 2026-10-24 (see v1 cut). ADRs 0011 to 0017 flipped to Accepted on 2026-10-24. ADR-0018 (ingest protocol) and ADR-0019 (events storage) were added and Accepted the same day. They supersede the stream and ack parts of ADR-0012, the monthly-partition line of ADR-0013 and the forwarder section below.
 
@@ -36,7 +36,7 @@ Decided 2026-10-24. The phases below stay as the full map. v1 is the smallest sl
 In v1:
 
 - fleetd: loopback http hook listener, SQLite queue, forwarder, session registry and reconciler (see Recovery and reconcile), workmux watcher using `workmux wait` exit codes, pueue poll plus the finish callback (id and group only), heartbeat. The unix socket stays, because the `fleetd pueue-callback` subcommand writes to it.
-- Server: `FleetIngest` (`PushEvents`, `Heartbeat`), `FleetQuery.ListFleet` and `FleetWorker` (`ClaimJob`, `ReportJob`) and `FleetJobs` (`SubmitJob`, `GetJob`, `ListJobs`, `CancelJob`, `ReadTranscript`) on Postgres, shared bearer token (ADR-0014).
+- Server: `FleetIngest` (`PushEvents`, `Heartbeat`), `FleetQuery.ListFleet` and `FleetWorker` (`ClaimJob`, `ReportJob`) and `FleetJobs` (`SubmitJob`, `GetJob`, `ListJobs`, `CancelJob`, `ReadTranscript`) on Postgres, two scoped bearer tokens (see Authorization).
 - CLI: `fleet list` and `fleet watch`. `fleet watch` polls `ListFleet` from the client and prints changes (decision 10).
 
 Out of v1: drain and `SetDrain`, the KEDA seam, `fleet-job`, `GetPreview`, `ListEvents`, the `Watch` rpc, and transcript summaries beyond the last assistant text. v1 has no Job cost, since cost arrives only through `fleet-job` (decision 12, deferred).
@@ -75,7 +75,7 @@ Non-goals:
 ```
  laptop                          VPN (any routable path)                hosted service
 +--------------+                                              +-------------------------+
-| fleet CLI    |--gRPC FleetQuery/FleetJobs (bearer token)---->|  fleet server (Rust)    |
+| fleet CLI    |--gRPC FleetQuery/FleetJobs (client token)---->|  fleet server (Rust)    |
 | sesh picker  |                                              |  tonic + sqlx           |
 +--------------+                                              |   ingest | query | jobs |
        |  ssh -t box-N tmux/pueue (attach only)               +------------+------------+
@@ -303,7 +303,7 @@ Rules:
 
 ### Config
 
-`/etc/fleetd/config.toml`, baked. Fields: `server_url` (default from `FLEET_SERVER_URL`, any routable address or name, so an address change needs no rebuild and no VPN feature is assumed), `http_port`, `socket_path`, `queue_max_bytes`, `queue_max_age`, `hook_events` allowlist (provisional default in decision 6), `heartbeat_interval`, `transcript_read_delay` (default 2 s), `pueue_group` (default `fleet`), `reconcile_interval` (default 45 s), `stall_after` (default 10 min), `end_grace` (default two passes), `redact_files` (default `/etc/swarm/secrets.env`). Environment from `/etc/swarm/box.env`, including `FLEET_SERVER_URL` and `FLEET_BOX_NAME`. The bearer token is `FLEET_TOKEN` in `/etc/swarm/secrets.env`. No secret in this file.
+`/etc/fleetd/config.toml`, baked. Fields: `server_url` (default from `FLEET_SERVER_URL`, any routable address or name, so an address change needs no rebuild and no VPN feature is assumed), `http_port`, `socket_path`, `queue_max_bytes`, `queue_max_age`, `hook_events` allowlist (provisional default in decision 6), `heartbeat_interval`, `transcript_read_delay` (default 2 s), `pueue_group` (default `fleet`), `reconcile_interval` (default 45 s), `stall_after` (default 10 min), `end_grace` (default two passes), `redact_files` (default `/etc/swarm/secrets.env`). Environment from `/etc/swarm/box.env`, including `FLEET_SERVER_URL` and `FLEET_BOX_NAME`. The box token is `FLEET_TOKEN` in `/etc/swarm/secrets.env`. The client token is `FLEET_CLIENT_TOKEN`, held by the laptop CLI and the server, never on a Box. No secret in this file.
 
 ### systemd unit
 
@@ -381,17 +381,17 @@ enum JobState { QUEUED = 0; RUNNING = 2; SUCCEEDED = 3; FAILED = 4; CANCELLED = 
 ```
 ```
 
-The service split lets auth differ per service: every service takes the same shared bearer token for the proof of concept (decided 2026-10-24). The built server wraps `FleetIngest`, `FleetQuery`, `FleetWorker` and `FleetJobs` in one `BearerAuth` interceptor. The split stays in the proto so a separate read credential can be added later without an API change.
+The service split lets auth differ per service: the proof of concept started with one shared bearer token (decided 2026-10-24) and now has two, scoped by gRPC path. The built server wraps `FleetIngest`, `FleetQuery`, `FleetWorker` and `FleetJobs` in one `BearerAuth` interceptor. `FLEET_TOKEN` (box) covers `FleetIngest` and `FleetWorker`. `FLEET_CLIENT_TOKEN` (client) covers `FleetQuery` and `FleetJobs`. A token outside its scope, or on an unknown path, gets `PERMISSION_DENIED`. Without `FLEET_CLIENT_TOKEN` (unset or empty) `FleetQuery` and `FleetJobs` are closed.
 
 ### Auth between box and server
 
-Decided (2026-10-24, ADR-0014): a shared bearer token for the proof of concept. fleetd sends gRPC metadata `authorization: Bearer <token>`. The token is `FLEET_TOKEN` in `/etc/swarm/secrets.env`, mode 0640 `root:agent` (the existing secrets pattern), sourced from `~/.config/fleet/token` on the laptop and baked like the other secrets. fleetd's redaction covers it. The server compares in constant time and answers `UNAUTHENTICATED` on a mismatch. It rejects a `box` that does not match `box-<n>`.
+Decided (2026-10-24, ADR-0014, amended 2026-10-24): two shared bearer tokens for the proof of concept. fleetd sends gRPC metadata `authorization: Bearer <box token>`. The box token is `FLEET_TOKEN` in `/etc/swarm/secrets.env`, mode 0640 `root:agent` (the existing secrets pattern), baked like the other secrets. fleetd's redaction covers it. The laptop CLI sends the client token `FLEET_CLIENT_TOKEN`, sourced from `~/.config/fleet/token`, never baked into a Box. The server compares in constant time and answers `UNAUTHENTICATED` on a mismatch and `PERMISSION_DENIED` outside a token's scope. It rejects a `box` that does not match `box-<n>`. See Authorization.
 
 Verified in Phase 0 (T7), with a throwaway python grpcio 1.84.1 server on loopback, plain, no TLS: no token and a wrong token both give `UNAUTHENTICATED`, and the right token gives OK, from a python client and from grpcurl 1.9.4. The metadata key must be lowercase `authorization`. The secrets file at 0640 `root:agent` is readable by `agent` and denied to `nobody`. The interceptor must wrap every service, because it also blocks gRPC reflection: `grpcurl` without `-proto` fails at reflection without a token. Behind the interceptor reflection leaks nothing, so it may stay on. fleet-server does not serve reflection yet; use `-proto` with grpcurl. Not run: a tonic client, TLS, and a real VPN path (Phase 1 pre-check).
 
-Identity comes from the Box (configured name, hostname, machine-id, boot id), never from the VPN. A valid token proves swarm membership, not which Box, so box names are claims.
+Identity comes from the Box (configured name, hostname, machine-id, boot id), never from the VPN. A valid box token proves swarm membership, not which Box, so box names are claims.
 
-Downsides: one leaked token exposes the fleet, and every Box holds it. Rotation means a Template rebuild or a secrets push. Upgrade path: per-Box tokens minted at first boot, then mTLS or JWT.
+Downsides: a leaked box token can ingest and claim as any Box but cannot read the fleet or submit Jobs, and every Box holds it. A leaked client token can read the fleet and submit or cancel Jobs but cannot ingest or claim, and only the laptop and the server hold it. Rotation of the box token means a Template rebuild or a secrets push. Upgrade path: per-Box tokens minted at first boot, then mTLS or JWT.
 
 ## Server schema outline (Postgres)
 
@@ -419,7 +419,7 @@ Projections update in the same transaction as the event insert. The change feed 
 | `fleet watch` | none | v1: the client polls `ListFleet` and prints transitions: a session going idle, a Box going stale. Later: the `Watch` stream of `FleetUpdate`, which also covers a Job finishing with cost |
 | `fleet drain box-N` | manual | `SetDrain`, then show readiness: pueue idle, queue empty, no unpushed commits, fleetd queue pending zero |
 
-The laptop can sleep. On wake the CLI reads current state, and `ListEvents --since` replays what it missed. If the server is unreachable the CLI falls back to the ssh poll for `list` for one release, then drops it. Decided (decision 7): `fleet` is a Rust binary sharing the proto crate with the server. It reads the server address from config (`FLEET_SERVER_URL`) and makes no VPN call, identity lookup or MagicDNS assumption. The ssh fallback and attach are the only paths that need the VPN, as ssh access. The nushell script stays as that fallback. To debug the server with `grpcurl`, pass `-H "authorization: Bearer $FLEET_TOKEN"`: reflection sits behind the same auth interceptor, so even listing services needs the token.
+The laptop can sleep. On wake the CLI reads current state, and `ListEvents --since` replays what it missed. If the server is unreachable the CLI falls back to the ssh poll for `list` for one release, then drops it. Decided (decision 7): `fleet` is a Rust binary sharing the proto crate with the server. It reads the server address from config (`FLEET_SERVER_URL`) and makes no VPN call, identity lookup or MagicDNS assumption. The ssh fallback and attach are the only paths that need the VPN, as ssh access. The nushell script stays as that fallback. To debug the server with `grpcurl`, pass `-H "authorization: Bearer $FLEET_CLIENT_TOKEN"` for `FleetQuery` and `FleetJobs` (the box token for `FleetIngest` and `FleetWorker`): reflection sits behind the same auth interceptor, so even listing services needs the token.
 
 ## Job queue seam
 
@@ -451,8 +451,8 @@ Parked sketch, no further design: KEDA is driven through the server. fleetd on t
 - **Loopback listener.** Any local process can post events. Boxes are single-user, so this is accepted. The unix socket is 0600.
 - **No secrets in events.** fleetd redacts exact values of the secrets loaded from `redact_files` from every string field before queueing. Tool events, which can carry commands with secrets, are off by default. Raw transcripts and raw pueue logs never leave the Box. Derived transcript text (preview and timeline) leaves truncated and redacted. Redaction (T7) matches exact values in nested JSON, sorted longest first, and skips very short values. It does not catch base64, URL-encoded or split forms.
 - **Sensitive content.** Prompts, `last_assistant_message` and transcript-derived preview text reach the server. The server has no public ingress and is reachable only over the VPN. The database is treated like the Box credentials in sensitivity.
-- **Transport.** Plain gRPC over any routable path. TLS is optional and set by the deployment. The VPN, whichever it is, protects the link, and the plan assumes nothing about which. Without TLS the bearer token crosses the VPN in clear text.
-- **Authorization.** One shared bearer token covers ingest, job claim, query and job control (decided 2026-10-24, ADR-0014). Any holder can read every Box's data and submit or cancel Jobs. A claim returns only the claiming Box's Job, and ingest and claim reject a `box` that does not match `box-<n>`. A read-only credential is a later upgrade.
+- **Transport.** Plain gRPC over any routable path. TLS is optional and set by the deployment. The VPN, whichever it is, protects the link, and the plan assumes nothing about which. Without TLS the bearer tokens cross the VPN in clear text.
+- **Authorization.** Two scoped bearer tokens (ADR-0014, amended). The box token `FLEET_TOKEN` covers `FleetIngest` and `FleetWorker`. The client token `FLEET_CLIENT_TOKEN` covers `FleetQuery` and `FleetJobs`. Any other path is `PERMISSION_DENIED`. A box token holder can ingest and claim for any Box. A client token holder can read every Box's data and submit or cancel Jobs. A claim returns only the claiming Box's Job, and ingest and claim reject a `box` that does not match `box-<n>`.
 - **Git.** fleetd never pushes and holds no git credential. It runs read-only git commands to count unpushed commits. That rule is unchanged.
 - **Blast radius.** fleetd runs as `agent`, the same as workers. It adds no privilege and exposes no new inbound port beyond loopback.
 - **Secrets never printed.** fleetd logs event ids and types, never payloads, at default level.
@@ -549,8 +549,8 @@ Numbering is stable. Decided on 2026-10-24 unless marked otherwise.
    - Left to deployment, not decided here: the host platform of the server (Kubernetes, a VM or a VPS).
 
 2. **How does a Box authenticate to the server?** Decided 2026-10-24.
-   - Answer: a shared bearer token, for the proof of concept. gRPC metadata `authorization: Bearer <token>`. `FLEET_TOKEN` in `/etc/swarm/secrets.env`, mode 0640 `root:agent` (the existing secrets pattern), baked into the Template. ADR-0014.
-   - Downside: one leaked token exposes the fleet. Rotation is a Template rebuild or a secrets push.
+   - Answer (amended 2026-10-24, ADR-0014): two shared bearer tokens, for the proof of concept. gRPC metadata `authorization: Bearer <token>`. The box token `FLEET_TOKEN` (`FleetIngest`, `FleetWorker`) is in `/etc/swarm/secrets.env`, mode 0640 `root:agent` (the existing secrets pattern), baked into the Template. The client token `FLEET_CLIENT_TOKEN` (`FleetQuery`, `FleetJobs`) stays on the laptop and the server. See plan.md Authorization. The original answer was a single shared token for write and read.
+   - Downside: a leaked box token can ingest and claim but not read the fleet or submit Jobs. A leaked client token can read and submit but not ingest or claim. Box token rotation is a Template rebuild or a secrets push.
    - Upgrade path: per-Box tokens minted at first boot, then mTLS or JWT.
    - Test: T7 passed with python grpcio and grpcurl. A tonic client is a Phase 1 pre-check.
 

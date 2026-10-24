@@ -58,7 +58,7 @@ impl fmt::Debug for Secret {
     }
 }
 
-/// The shared bearer token boxes and the CLI present. Its `Debug` output hides the value.
+/// A shared bearer token, the box token or the client token. Its `Debug` output hides the value.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Token(Secret);
 
@@ -71,18 +71,27 @@ impl Token {
     /// for one shorter than [`MIN_TOKEN_LEN`] characters or with leading or trailing
     /// whitespace.
     pub fn new(raw: String) -> Result<Self, ConfigError> {
+        Self::named("FLEET_TOKEN", raw)
+    }
+
+    /// Wraps a token read from `var`, which names the variable in any error.
+    ///
+    /// # Errors
+    ///
+    /// Same as [`Token::new`].
+    pub fn named(var: &'static str, raw: String) -> Result<Self, ConfigError> {
         if raw.is_empty() {
-            return Err(ConfigError::Missing("FLEET_TOKEN"));
+            return Err(ConfigError::Missing(var));
         }
         if raw.trim() != raw {
             return Err(ConfigError::Invalid {
-                var: "FLEET_TOKEN",
+                var,
                 reason: "must not have leading or trailing whitespace".to_owned(),
             });
         }
         if raw.chars().count() < MIN_TOKEN_LEN {
             return Err(ConfigError::Invalid {
-                var: "FLEET_TOKEN",
+                var,
                 reason: format!("must be at least {MIN_TOKEN_LEN} characters"),
             });
         }
@@ -104,8 +113,11 @@ pub struct Config {
     pub health_listen: SocketAddr,
     /// Postgres connection URL.
     pub database_url: Secret,
-    /// Bearer token the gRPC services require.
+    /// Box bearer token: `FleetIngest` and `FleetWorker`.
     pub token: Token,
+    /// Client bearer token: `FleetQuery` and `FleetJobs`. `None` when
+    /// `FLEET_CLIENT_TOKEN` is unset or empty; that closes `FleetQuery` and `FleetJobs`.
+    pub client_token: Option<Token>,
 }
 
 /// Lists the listeners bound to a non-loopback address, as `(variable, address)`.
@@ -142,7 +154,8 @@ impl Config {
     /// # Errors
     ///
     /// Returns [`ConfigError`] when `FLEET_DATABASE_URL` or `FLEET_TOKEN` is missing or
-    /// empty, or an address does not parse.
+    /// empty, `FLEET_CLIENT_TOKEN` is set but invalid or equal to `FLEET_TOKEN`, or an
+    /// address does not parse.
     pub fn from_env() -> Result<Self, ConfigError> {
         Self::from_lookup(|var| std::env::var(var).ok())
     }
@@ -157,11 +170,22 @@ impl Config {
             .filter(|v| !v.is_empty())
             .ok_or(ConfigError::Missing("FLEET_DATABASE_URL"))?;
         let token = Token::new(lookup("FLEET_TOKEN").unwrap_or_default())?;
+        let client_token = lookup("FLEET_CLIENT_TOKEN")
+            .filter(|v| !v.is_empty())
+            .map(|raw| Token::named("FLEET_CLIENT_TOKEN", raw))
+            .transpose()?;
+        if client_token.as_ref() == Some(&token) {
+            return Err(ConfigError::Invalid {
+                var: "FLEET_CLIENT_TOKEN",
+                reason: "must differ from FLEET_TOKEN".to_owned(),
+            });
+        }
         Ok(Self {
             listen: address(&lookup, "FLEET_LISTEN", DEFAULT_LISTEN)?,
             health_listen: address(&lookup, "FLEET_HEALTH_LISTEN", DEFAULT_HEALTH_LISTEN)?,
             database_url: Secret::new(database_url),
             token,
+            client_token,
         })
     }
 }
@@ -250,6 +274,37 @@ mod tests {
             Config::from_lookup(lookup(&[url, ("FLEET_TOKEN", "")])).unwrap_err(),
             ConfigError::Missing("FLEET_TOKEN")
         );
+    }
+
+    #[test]
+    fn client_token_is_optional_validated_and_distinct() {
+        let base = [
+            ("FLEET_DATABASE_URL", "postgres://h/db"),
+            ("FLEET_TOKEN", TOKEN),
+        ];
+        let with = |value: &'static str| {
+            let mut vars = base.to_vec();
+            vars.push(("FLEET_CLIENT_TOKEN", value));
+            Config::from_lookup(lookup(&vars))
+        };
+        assert!(
+            Config::from_lookup(lookup(&base))
+                .unwrap()
+                .client_token
+                .is_none()
+        );
+        assert!(with("").unwrap().client_token.is_none());
+        let other = "fedcba9876543210fedcba9876543210";
+        assert_eq!(with(other).unwrap().client_token.unwrap().expose(), other);
+        for bad in ["short", " fedcba9876543210fedcba9876543210", TOKEN] {
+            assert!(matches!(
+                with(bad).unwrap_err(),
+                ConfigError::Invalid {
+                    var: "FLEET_CLIENT_TOKEN",
+                    ..
+                }
+            ));
+        }
     }
 
     #[test]

@@ -8,9 +8,12 @@ mod tests {
     use std::time::Duration;
 
     use fleet_proto::v1::fleet_ingest_client::FleetIngestClient;
+    use fleet_proto::v1::fleet_jobs_client::FleetJobsClient;
     use fleet_proto::v1::fleet_query_client::FleetQueryClient;
+    use fleet_proto::v1::fleet_worker_client::FleetWorkerClient;
     use fleet_proto::v1::{
-        Envelope, HeartbeatRequest, ListFleetRequest, PushEventsRequest, QueuedEvent,
+        ClaimJobRequest, Envelope, HeartbeatRequest, ListFleetRequest, ListJobsRequest,
+        PushEventsRequest, QueuedEvent,
     };
     use fleet_server::auth::BearerAuth;
     use fleet_server::config::Token;
@@ -26,18 +29,24 @@ mod tests {
     use tonic::{Code, Request, Status};
 
     const TOKEN: &str = "test-token-0123456789abcdef0123456789";
+    const CLIENT: &str = "client-token-0123456789abcdef012345";
 
     fn box_name(n: u32) -> String {
         format!("box-{n}")
     }
 
     fn spawn() -> SocketAddr {
+        spawn_with(None)
+    }
+
+    fn spawn_with(client: Option<&str>) -> SocketAddr {
         let pool = PgPoolOptions::new()
             .acquire_timeout(Duration::from_millis(300))
             .connect_lazy("postgres://postgres@127.0.0.1:1/none")
             .unwrap();
         let store = Store::new(pool);
-        let auth = BearerAuth::new(&Token::new(TOKEN.to_owned()).unwrap());
+        let client = client.map(|raw| Token::new(raw.to_owned()).unwrap());
+        let auth = BearerAuth::new(&Token::new(TOKEN.to_owned()).unwrap(), client.as_ref());
         let incoming = TcpIncoming::bind("127.0.0.1:0".parse().unwrap()).unwrap();
         let addr = incoming.local_addr().unwrap();
         tokio::spawn(router(&store, &auth).serve_with_incoming(incoming));
@@ -153,9 +162,71 @@ mod tests {
         }
     }
 
+    async fn code_of(addr: SocketAddr, service: &str, token: Option<&str>) -> Code {
+        let header = Header(token.map(|t| format!("Bearer {t}").into_bytes()));
+        let chan = channel(addr);
+        let result = match service {
+            "ingest" => FleetIngestClient::with_interceptor(chan, header)
+                .push_events(push(Vec::new()))
+                .await
+                .map(|_| ()),
+            "query" => FleetQueryClient::with_interceptor(chan, move |r| header.apply(r))
+                .list_fleet(ListFleetRequest::default())
+                .await
+                .map(|_| ()),
+            "worker" => FleetWorkerClient::with_interceptor(chan, move |r| header.apply(r))
+                .claim_job(ClaimJobRequest { r#box: box_name(1) })
+                .await
+                .map(|_| ()),
+            _ => FleetJobsClient::with_interceptor(chan, move |r| header.apply(r))
+                .list_jobs(ListJobsRequest::default())
+                .await
+                .map(|_| ()),
+        };
+        result.err().map_or(Code::Ok, |status| status.code())
+    }
+
+    #[tokio::test]
+    async fn scope_matrix() {
+        let addr = spawn_with(Some(CLIENT));
+        let scoped = |code: Code| !matches!(code, Code::PermissionDenied | Code::Unauthenticated);
+        for (service, box_ok, client_ok) in [
+            ("ingest", true, false),
+            ("query", false, true),
+            ("worker", true, false),
+            ("jobs", false, true),
+        ] {
+            for (name, token, ok) in [("box", TOKEN, box_ok), ("client", CLIENT, client_ok)] {
+                let code = code_of(addr, service, Some(token)).await;
+                if ok {
+                    assert!(scoped(code), "{name} on {service}: {code:?}");
+                } else {
+                    assert_eq!(code, Code::PermissionDenied, "{name} on {service}");
+                }
+            }
+            for token in [None, Some("wrong-token-0123456789abcdef01234567")] {
+                let code = code_of(addr, service, token).await;
+                assert_eq!(code, Code::Unauthenticated, "{token:?} on {service}");
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn jobs_is_closed_without_a_client_token() {
+        let addr = spawn_with(None);
+        assert_eq!(
+            code_of(addr, "jobs", Some(CLIENT)).await,
+            Code::Unauthenticated
+        );
+        assert_eq!(
+            code_of(addr, "jobs", Some(TOKEN)).await,
+            Code::PermissionDenied
+        );
+    }
+
     #[tokio::test]
     async fn right_token_passes_the_interceptor() {
-        let addr = spawn();
+        let addr = spawn_with(Some(CLIENT));
         let mut client = ingest(addr, Header::right());
         let reply = client
             .push_events(push(Vec::new()))
@@ -165,7 +236,7 @@ mod tests {
         assert_eq!(reply.acked_through_seq, 0);
 
         let mut query = FleetQueryClient::with_interceptor(channel(addr), |request| {
-            Header::right().apply(request)
+            Header(Some(format!("Bearer {CLIENT}").into_bytes())).apply(request)
         });
         let err = query
             .list_fleet(ListFleetRequest::default())
@@ -215,7 +286,11 @@ mod tests {
             assert_eq!(err.code(), Code::Unauthenticated, "{shown}");
         }
         let err = call_unknown_path(addr, Header::right()).await.unwrap_err();
-        assert_eq!(err.code(), Code::Unimplemented);
+        assert_eq!(err.code(), Code::PermissionDenied);
+        let addr = spawn_with(Some(CLIENT));
+        let client = Header(Some(format!("Bearer {CLIENT}").into_bytes()));
+        let err = call_unknown_path(addr, client).await.unwrap_err();
+        assert_eq!(err.code(), Code::PermissionDenied);
     }
 
     #[tokio::test]

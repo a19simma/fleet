@@ -102,7 +102,7 @@ async fn run() -> Result<(), BoxError> {
         stop_rx.clone(),
         None,
     ));
-    let auth = BearerAuth::new(&config.token);
+    let auth = BearerAuth::new(&config.token, config.client_token.as_ref());
     let grpc_server = async {
         router(&store, &auth)
             .serve_with_incoming_shutdown(grpc, stopped(stop_rx.clone()))

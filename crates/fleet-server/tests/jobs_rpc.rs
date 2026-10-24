@@ -48,7 +48,10 @@ async fn store(pool: PgPool) -> Store {
 }
 
 fn spawn(store: &Store) -> Jobs {
-    let auth = BearerAuth::new(&Token::new(TOKEN.to_owned()).unwrap());
+    let auth = BearerAuth::new(
+        &Token::new("box-token-0123456789abcdef0123456789".to_owned()).unwrap(),
+        Some(&Token::new(TOKEN.to_owned()).unwrap()),
+    );
     let incoming = TcpIncoming::bind("127.0.0.1:0".parse().unwrap()).unwrap();
     let addr: SocketAddr = incoming.local_addr().unwrap();
     tokio::spawn(router(store, &auth).serve_with_incoming(incoming));
