@@ -435,6 +435,11 @@ impl Store {
         }
     }
 
+    /// The lease a claim grants and a report renews.
+    pub fn lease(&self) -> Duration {
+        self.lease
+    }
+
     /// Sets the lease a claim grants, [`DEFAULT_LEASE`] otherwise.
     #[must_use]
     pub fn with_lease(mut self, lease: Duration) -> Self {

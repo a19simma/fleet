@@ -1,6 +1,6 @@
 # Plan: fleetd and the fleet server
 
-Status: draft. Phase 1 is in: the listeners, the SQLite queue and the hook normalizer. The pueue callback, forwarder, reconciler, watchers and heartbeat are not built. The server is built (step 3): the `fleet.v1` proto, `FleetIngest`, `FleetQuery.ListFleet`, the Postgres store with the session projection, bearer auth, migrations at start and `GET /healthz`. Decisions answered on 2026-10-24 are marked Decided below. Phase 0 finished on 2026-10-24: all ten tests ran on one Box (Claude Code 2.1.289, workmux 0.1.276, pueue 4.0.4). The results are folded in below. The records are `docs/phase0/T1.md` to `T10.md` in this repo, indexed by `docs/phase0/README.md`.
+Status: draft. Phase 1 is in: the listeners, the SQLite queue and the hook normalizer. The pueue callback, forwarder, reconciler, watchers and heartbeat are not built. The server is built (step 3): the `fleet.v1` proto, `FleetIngest`, `FleetQuery.ListFleet`, `FleetWorker`, the Postgres store with the session projection, bearer auth, migrations at start and `GET /healthz`. Decisions answered on 2026-10-24 are marked Decided below. Phase 0 finished on 2026-10-24: all ten tests ran on one Box (Claude Code 2.1.289, workmux 0.1.276, pueue 4.0.4). The results are folded in below. The records are `docs/phase0/T1.md` to `T10.md` in this repo, indexed by `docs/phase0/README.md`.
 
 v1 cut and recovery design added 2026-10-24 (see v1 cut). ADRs 0011 to 0017 flipped to Accepted on 2026-10-24. ADR-0018 (ingest protocol) and ADR-0019 (events storage) were added and Accepted the same day. They supersede the stream and ack parts of ADR-0012, the monthly-partition line of ADR-0013 and the forwarder section below.
 
@@ -36,7 +36,7 @@ Decided 2026-10-24. The phases below stay as the full map. v1 is the smallest sl
 In v1:
 
 - fleetd: loopback http hook listener, SQLite queue, forwarder, session registry and reconciler (see Recovery and reconcile), workmux watcher using `workmux wait` exit codes, pueue poll plus the finish callback (id and group only), heartbeat. The unix socket stays, because the `fleetd pueue-callback` subcommand writes to it.
-- Server: `FleetIngest` (`PushEvents`, `Heartbeat`) and `FleetQuery.ListFleet` on Postgres, shared bearer token (ADR-0014).
+- Server: `FleetIngest` (`PushEvents`, `Heartbeat`), `FleetQuery.ListFleet` and `FleetWorker` (`ClaimJob`, `ReportJob`) on Postgres, shared bearer token (ADR-0014).
 - CLI: `fleet list` and `fleet watch`. `fleet watch` polls `ListFleet` from the client and prints changes (decision 10).
 
 Out of v1: drain and `SetDrain`, the KEDA seam, `fleet-job`, `GetPreview`, `ListEvents`, the `Watch` rpc, and transcript summaries beyond the last assistant text. v1 has no Job cost, since cost arrives only through `fleet-job` (decision 12, deferred).

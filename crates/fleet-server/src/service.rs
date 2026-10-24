@@ -1,13 +1,15 @@
-//! The `FleetIngest` and `FleetQuery` gRPC handlers.
+//! The `FleetIngest`, `FleetQuery` and `FleetWorker` gRPC handlers.
 
 use std::time::Duration;
 
 use fleet_core::Envelope;
 use fleet_proto::v1::fleet_ingest_server::{FleetIngest, FleetIngestServer};
 use fleet_proto::v1::fleet_query_server::{FleetQuery, FleetQueryServer};
+use fleet_proto::v1::fleet_worker_server::{FleetWorker, FleetWorkerServer};
 use fleet_proto::v1::{
-    HeartbeatReply, HeartbeatRequest, ListFleetReply, ListFleetRequest, PushEventsReply,
-    PushEventsRequest, QueuedEvent, Rejection,
+    ClaimJobReply, ClaimJobRequest, HeartbeatReply, HeartbeatRequest, ListFleetReply,
+    ListFleetRequest, PushEventsReply, PushEventsRequest, QueuedEvent, Rejection, ReportJobReply,
+    ReportJobRequest,
 };
 use fleet_proto::{ConvertError, validate_box};
 use tonic::transport::server::Router;
@@ -25,6 +27,9 @@ pub const MAX_EVENTS_PER_PUSH: usize = 500;
 
 /// Largest `payload_json` one event may carry, in bytes.
 pub const MAX_PAYLOAD_BYTES: usize = 256 * 1024;
+
+/// Seconds a box should wait before it claims again.
+pub const CLAIM_INTERVAL_S: u32 = 5;
 
 /// Largest request message the server decodes, in bytes.
 pub const MAX_MESSAGE_BYTES: usize = 1024 * 1024;
@@ -64,7 +69,7 @@ fn no_nul(field: &str, value: &str) -> Result<(), Status> {
     Ok(())
 }
 
-/// Handler for `FleetIngest` and `FleetQuery`.
+/// Handler for `FleetIngest`, `FleetQuery` and `FleetWorker`.
 #[derive(Debug, Clone)]
 pub struct FleetService {
     store: Store,
@@ -184,6 +189,61 @@ impl FleetQuery for FleetService {
     }
 }
 
+fn worker_error(err: &StoreError) -> Status {
+    match err {
+        StoreError::StaleReport => {
+            Status::failed_precondition("report does not match the running job")
+        }
+        StoreError::InvalidBox => Status::invalid_argument("invalid box name"),
+        StoreError::InvalidChunk => Status::invalid_argument("invalid transcript chunk"),
+        StoreError::InvalidJob(_) => Status::invalid_argument("invalid job report"),
+        StoreError::NotFound => Status::not_found("job not found"),
+        other => storage_unavailable(other),
+    }
+}
+
+#[tonic::async_trait]
+impl FleetWorker for FleetService {
+    async fn claim_job(
+        &self,
+        request: Request<ClaimJobRequest>,
+    ) -> Result<Response<ClaimJobReply>, Status> {
+        let name = validate_box(&request.into_inner().r#box)
+            .map_err(|err| Status::invalid_argument(err.to_string()))?;
+        let job = self
+            .store
+            .claim_job(name.as_str())
+            .await
+            .map_err(|err| worker_error(&err))?;
+        let lease_s = if job.is_some() {
+            u32::try_from(self.store.lease().as_secs()).unwrap_or(u32::MAX)
+        } else {
+            0
+        };
+        Ok(Response::new(ClaimJobReply {
+            job,
+            lease_s,
+            next_in_s: CLAIM_INTERVAL_S,
+        }))
+    }
+
+    async fn report_job(
+        &self,
+        request: Request<ReportJobRequest>,
+    ) -> Result<Response<ReportJobReply>, Status> {
+        let mut request = request.into_inner();
+        let name = validate_box(&request.r#box)
+            .map_err(|err| Status::invalid_argument(err.to_string()))?;
+        request.r#box = name.to_string();
+        let reply = self
+            .store
+            .report_job(&request)
+            .await
+            .map_err(|err| worker_error(&err))?;
+        Ok(Response::new(reply))
+    }
+}
+
 /// Builds the gRPC router with `auth` applied once as a layer over every service.
 ///
 /// The server applies a 30 second request timeout, 8 concurrent requests and 32
@@ -193,7 +253,8 @@ pub fn router(store: &Store, auth: &BearerAuth) -> Router<Stack<BearerAuth, Iden
     let service = FleetService::new(store.clone());
     let ingest =
         FleetIngestServer::new(service.clone()).max_decoding_message_size(MAX_MESSAGE_BYTES);
-    let query = FleetQueryServer::new(service).max_decoding_message_size(MAX_MESSAGE_BYTES);
+    let query = FleetQueryServer::new(service.clone()).max_decoding_message_size(MAX_MESSAGE_BYTES);
+    let worker = FleetWorkerServer::new(service).max_decoding_message_size(MAX_MESSAGE_BYTES);
     tonic::transport::Server::builder()
         .timeout(REQUEST_TIMEOUT)
         .concurrency_limit_per_connection(CONCURRENCY_PER_CONNECTION)
@@ -202,4 +263,36 @@ pub fn router(store: &Store, auth: &BearerAuth) -> Router<Stack<BearerAuth, Iden
         .layer(auth.clone())
         .add_service(ingest)
         .add_service(query)
+        .add_service(worker)
+}
+
+#[cfg(test)]
+mod tests {
+    use tonic::Code;
+
+    use super::*;
+    use crate::jobs::JobInvalid;
+
+    #[test]
+    fn worker_errors_map_to_fixed_statuses() {
+        let cases = [
+            (StoreError::StaleReport, Code::FailedPrecondition),
+            (StoreError::InvalidBox, Code::InvalidArgument),
+            (StoreError::InvalidChunk, Code::InvalidArgument),
+            (
+                StoreError::InvalidJob(JobInvalid::PrUrl),
+                Code::InvalidArgument,
+            ),
+            (StoreError::NotFound, Code::NotFound),
+            (
+                StoreError::Database(sqlx::Error::PoolTimedOut),
+                Code::Unavailable,
+            ),
+        ];
+        for (err, code) in cases {
+            let status = worker_error(&err);
+            assert_eq!(status.code(), code, "{err}");
+            assert!(!status.message().contains("pool"), "{err}");
+        }
+    }
 }
