@@ -161,6 +161,9 @@ pub struct IngestOutcome {
     pub duplicate: u32,
     /// Events the store refused, as `(seq, reason)`.
     pub rejected: Vec<(u64, String)>,
+    /// Lowest `seq` rejected for an unsupported `schema_version`. The caller must not ack
+    /// this `seq` or any later one, so the sender keeps and retries them.
+    pub retry_from_seq: Option<u64>,
 }
 
 struct Prepared {
@@ -268,7 +271,8 @@ impl Store {
     /// repeated event changes nothing. Events that cannot be stored (a NUL character, a
     /// timestamp beyond the year 9999, a number beyond the column range, a
     /// `schema_version` other than [`SCHEMA_VERSION`]) come back in
-    /// [`IngestOutcome::rejected`]. Only the current schema version is accepted, since
+    /// [`IngestOutcome::rejected`]. The lowest `seq` rejected for its schema version is
+    /// also reported in [`IngestOutcome::retry_from_seq`]. Only the current schema version is accepted, since
     /// no earlier one has shipped.
     ///
     /// # Errors
@@ -280,7 +284,13 @@ impl Store {
         for (seq, env) in events {
             match prepare(*seq, env) {
                 Ok(row) => rows.push(row),
-                Err(reason) => outcome.rejected.push((*seq, reason)),
+                Err(reason) => {
+                    if env.schema_version != SCHEMA_VERSION {
+                        outcome.retry_from_seq =
+                            Some(outcome.retry_from_seq.map_or(*seq, |low| low.min(*seq)));
+                    }
+                    outcome.rejected.push((*seq, reason));
+                }
             }
         }
         rows.sort_by_key(|row| row.seq);

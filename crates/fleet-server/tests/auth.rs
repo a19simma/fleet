@@ -226,6 +226,33 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn unsupported_schema_version_is_not_acked() {
+        let addr = spawn();
+        let mut client = ingest(addr, Header::right());
+        let mut first = wire_event(5, &box_name(1), "{}");
+        let mut second = wire_event(6, &box_name(1), "{}");
+        for event in [&mut first, &mut second] {
+            if let Some(envelope) = event.envelope.as_mut() {
+                envelope.schema_version = 2;
+            }
+        }
+        let reply = client
+            .push_events(push(vec![first, second]))
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(reply.acked_through_seq, 4);
+        assert_eq!(reply.stored, 0);
+        let seqs: Vec<u64> = reply.rejected.iter().map(|r| r.seq).collect();
+        assert_eq!(seqs, vec![5, 6]);
+        assert!(
+            reply.rejected[0]
+                .reason
+                .starts_with("unsupported schema_version")
+        );
+    }
+
+    #[tokio::test]
     async fn nul_in_heartbeat_identity_is_invalid_argument() {
         let addr = spawn();
         let mut client = ingest(addr, Header::right());

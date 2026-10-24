@@ -94,7 +94,7 @@ impl FleetIngest for FleetService {
             )));
         }
         batch_box(&events)?;
-        let acked_through_seq = events.iter().map(|event| event.seq).max().unwrap_or(0);
+        let max_seq = events.iter().map(|event| event.seq).max().unwrap_or(0);
 
         let mut valid: Vec<(u64, Envelope)> = Vec::with_capacity(events.len());
         let mut rejected = Vec::new();
@@ -135,6 +135,9 @@ impl FleetIngest for FleetService {
                 .map(|(seq, reason)| Rejection { seq, reason }),
         );
         rejected.sort_by_key(|rejection| rejection.seq);
+        let acked_through_seq = outcome
+            .retry_from_seq
+            .map_or(max_seq, |seq| seq.saturating_sub(1));
         Ok(Response::new(PushEventsReply {
             acked_through_seq,
             stored: outcome.stored,

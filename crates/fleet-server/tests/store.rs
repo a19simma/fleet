@@ -251,6 +251,7 @@ async fn unsupported_schema_version_is_rejected(pool: PgPool) {
     let out = store.ingest(&[(1, old)]).await.unwrap();
     assert_eq!(out.stored, 0);
     assert_eq!(out.rejected.len(), 1);
+    assert_eq!(out.retry_from_seq, Some(1));
 }
 
 #[sqlx::test]
