@@ -40,6 +40,7 @@ for a in "$@"; do
 done
 root="$GIT_DIR/.."
 env > "$root/git-$sub.env"
+printf '%s\n' "$@" > "$root/git-$sub.args"
 if [ "$sub" = rev-list ] && [ -e "$root/emptycount" ]; then exit 0; fi
 exec git "$@"
 "#;
@@ -130,10 +131,18 @@ async fn rig(mode: &str) -> Result<Rig, Box<dyn std::error::Error>> {
 }
 
 fn agent(rig: &Rig) -> (AgentRunner<Fake>, mpsc::UnboundedReceiver<ReportJobRequest>) {
+    agent_with(rig, PathBuf::from(env!("CARGO_BIN_EXE_fleetd")))
+}
+
+fn agent_with(
+    rig: &Rig,
+    askpass_bin: PathBuf,
+) -> (AgentRunner<Fake>, mpsc::UnboundedReceiver<ReportJobRequest>) {
     let (tx, rx) = mpsc::unbounded_channel();
     let mut config = RunConfig::new("claude", false);
     gh().clone_into(&mut config.gh_bin);
     git_wrapper().clone_into(&mut config.git_bin);
+    config.askpass_bin = askpass_bin;
     let mut env: Vec<(OsString, OsString)> = vec![
         ("HOME".into(), rig.dir.path().into()),
         ("GH_TOKEN".into(), "not-a-real-gh-value".into()),
@@ -260,8 +269,15 @@ async fn only_the_push_gets_the_askpass_and_no_helper_runs_with_tokens_in_the_ag
         .finish(&job(&rig, true), &rig.worktree, shutdown)
         .await?;
     let push = recorded(&rig, "push")?;
-    assert!(push.contains("GIT_ASKPASS=/not/a/real/askpass"));
-    assert!(!push.contains("GH_TOKEN"));
+    assert!(push.contains(&format!(
+        "GIT_ASKPASS='{}' askpass\n",
+        env!("CARGO_BIN_EXE_fleetd")
+    )));
+    assert!(!push.contains("/not/a/real/askpass"));
+    assert!(push.contains("GH_TOKEN=not-a-real-gh-value\n"));
+    let args = std::fs::read_to_string(rig.dir.path().join("work").join("git-push.args"))?;
+    assert!(!args.contains("not-a-real-gh-value"));
+    assert!(args.contains("push"));
     assert!(!push.contains("GITHUB_TOKEN"));
     assert!(!push.contains("GH_ENTERPRISE_TOKEN"));
     assert!(push.contains("GIT_CONFIG_GLOBAL=/dev/null"));
@@ -475,6 +491,7 @@ async fn credentialed_children_get_only_their_credential_and_scratch_dirs() -> T
     ];
     let mut push = set(&common);
     push.insert("GIT_ASKPASS".into());
+    push.insert("GH_TOKEN".into());
     assert_eq!(keys(&recorded(&rig, "push")?), push);
     for sub in ["init", "fetch", "rev-list", "log"] {
         assert_eq!(keys(&recorded(&rig, sub)?), set(&common), "{sub}");
@@ -558,5 +575,36 @@ async fn a_title_over_the_limit_is_cut_at_a_char_boundary() -> TestResult {
     let args = std::fs::read_to_string(rig.dir.path().join("gh.args"))?;
     let title = args.lines().nth(9).ok_or("no title")?;
     assert_eq!(title, "é".repeat(256));
+    Ok(())
+}
+
+#[tokio::test]
+async fn an_askpass_path_with_quotes_and_substitutions_runs_as_one_file() -> TestResult {
+    let rig = rig("ok").await?;
+    commit(&rig)?;
+    let odd = rig.dir.path().join("it's $(touch pwned) x");
+    std::fs::create_dir(&odd)?;
+    let bin = odd.join("askpass");
+    std::fs::write(&bin, "#!/bin/sh\necho ran\n")?;
+    std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755))?;
+    let (agent, _rx) = agent_with(&rig, bin);
+    let (_trigger, shutdown) = Shutdown::channel();
+    agent
+        .finish(&job(&rig, true), &rig.worktree, shutdown)
+        .await?;
+    let push = recorded(&rig, "push")?;
+    let line = push
+        .lines()
+        .find_map(|line| line.strip_prefix("GIT_ASKPASS="))
+        .ok_or("no askpass")?;
+    let probe = TempDir::new()?;
+    let out = Command::new("sh")
+        .arg("-c")
+        .arg(format!("{line} prompt"))
+        .current_dir(probe.path())
+        .output()?;
+    assert!(out.status.success());
+    assert_eq!(String::from_utf8(out.stdout)?, "ran\n");
+    assert!(!probe.path().join("pwned").exists());
     Ok(())
 }

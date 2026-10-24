@@ -31,6 +31,12 @@ git add hello.txt
 git -c user.name=t -c user.email=t@example.invalid commit -q -m "add hello.txt"
 "#;
 
+const BLOCKING_AGENT: &str = r#"#!/bin/sh
+mkdir ../.finish-job1
+echo '{"type":"assistant","message":{"content":[{"type":"text","text":"working"}]}}'
+exec tail -f /dev/null
+"#;
+
 const GH: &str = "#!/bin/sh\necho created\necho https://example.invalid/pr/9\n";
 
 struct Stub(Arc<Worker>);
@@ -105,9 +111,16 @@ fn git(dir: &Path, args: &[&str]) -> Result<String, Box<dyn std::error::Error>> 
     Ok(String::from_utf8(out.stdout)?)
 }
 
-#[tokio::test]
-async fn the_daemon_runs_a_claimed_job_to_a_pushed_branch_and_a_pull_request() -> TestResult {
-    let dir = TempDir::new()?;
+struct Launched {
+    inbox: mpsc::UnboundedReceiver<(String, ReportJobRequest)>,
+    stop: oneshot::Sender<()>,
+    daemon: tokio::task::JoinHandle<Result<(), fleetd::Error>>,
+    server: tokio::task::JoinHandle<Result<(), tonic::transport::Error>>,
+    origin: std::path::PathBuf,
+    box_name: String,
+}
+
+async fn launch(dir: &TempDir, agent: &str) -> Result<Launched, Box<dyn std::error::Error>> {
     let origin = dir.path().join("origin.git");
     let seed = dir.path().join("seed");
     std::fs::create_dir(&origin)?;
@@ -123,10 +136,10 @@ async fn the_daemon_runs_a_claimed_job_to_a_pushed_branch_and_a_pull_request() -
     )?;
     let bin = dir.path().join("bin");
     std::fs::create_dir(&bin)?;
-    let claude = script(&bin, "claude", AGENT)?;
+    let claude = script(&bin, "claude", agent)?;
     let gh = script(&bin, "gh", GH)?;
 
-    let (reports, mut inbox) = mpsc::unbounded_channel();
+    let (reports, inbox) = mpsc::unbounded_channel();
     let worker = Arc::new(Worker {
         job: Mutex::new(Some(Job {
             job_id: "job1".into(),
@@ -150,12 +163,12 @@ async fn the_daemon_runs_a_claimed_job_to_a_pushed_branch_and_a_pull_request() -
     let box_name = format!("box-{}", 7);
     let file = format!(
         "http_port = 0\nsocket_path = {:?}\ndb_path = {:?}\njobs_dir = {:?}\nbox_name = {box_name:?}\nclaude_bin = {:?}\ngh_bin = {:?}\nsecrets_file = {:?}\n",
-        dir.path().join("fleetd.sock"),
-        dir.path().join("queue.db"),
-        dir.path().join("jobs"),
-        claude,
-        gh,
-        dir.path().join("secrets.env"),
+        dir.path().join("fleetd.sock").to_string_lossy(),
+        dir.path().join("queue.db").to_string_lossy(),
+        dir.path().join("jobs").to_string_lossy(),
+        claude.to_string_lossy(),
+        gh.to_string_lossy(),
+        dir.path().join("secrets.env").to_string_lossy(),
     );
     std::fs::write(dir.path().join("secrets.env"), "")?;
     let config = Config::resolve(Some(&file), &|_| None)?;
@@ -171,6 +184,27 @@ async fn the_daemon_runs_a_claimed_job_to_a_pushed_branch_and_a_pull_request() -
         })
         .await
     });
+    Ok(Launched {
+        inbox,
+        stop,
+        daemon,
+        server,
+        origin,
+        box_name,
+    })
+}
+
+#[tokio::test]
+async fn the_daemon_runs_a_claimed_job_to_a_pushed_branch_and_a_pull_request() -> TestResult {
+    let dir = TempDir::new()?;
+    let Launched {
+        mut inbox,
+        stop,
+        daemon,
+        server,
+        origin,
+        box_name,
+    } = launch(&dir, AGENT).await?;
 
     let terminal = tokio::time::timeout(Duration::from_secs(60), async {
         while let Some((auth, report)) = inbox.recv().await {
@@ -183,7 +217,6 @@ async fn the_daemon_runs_a_claimed_job_to_a_pushed_branch_and_a_pull_request() -
     })
     .await?
     .ok_or("no terminal report")?;
-
     assert_eq!(terminal.job_id, "job1");
     assert_eq!(terminal.r#box, box_name);
     assert_eq!(terminal.attempt, 1);
@@ -198,5 +231,34 @@ async fn the_daemon_runs_a_claimed_job_to_a_pushed_branch_and_a_pull_request() -
     let _ = stop.send(());
     tokio::time::timeout(Duration::from_secs(30), daemon).await???;
     server.abort();
+    assert!(!dir.path().join("jobs").join("job1").exists());
+    assert!(!dir.path().join("jobs").join(".finish-job1").exists());
+    assert!(dir.path().join("jobs").join(".cache").is_dir());
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_job_cut_short_by_shutdown_still_loses_its_worktree_and_scratch() -> TestResult {
+    let dir = TempDir::new()?;
+    let Launched {
+        mut inbox,
+        stop,
+        daemon,
+        server,
+        ..
+    } = launch(&dir, BLOCKING_AGENT).await?;
+
+    tokio::time::timeout(Duration::from_secs(60), inbox.recv())
+        .await?
+        .ok_or("no report")?;
+    let jobs = dir.path().join("jobs");
+    assert!(jobs.join("job1").is_dir());
+    assert!(jobs.join(".finish-job1").is_dir());
+
+    let _ = stop.send(());
+    tokio::time::timeout(Duration::from_secs(30), daemon).await???;
+    server.abort();
+    assert!(!jobs.join("job1").exists());
+    assert!(!jobs.join(".finish-job1").exists());
     Ok(())
 }

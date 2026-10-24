@@ -5,7 +5,7 @@
     reason = "unreachable_pub forbids plain pub in a private module"
 )]
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use fleet_core::Redactor;
 use fleet_proto::v1::Job;
@@ -31,6 +31,18 @@ pub(crate) struct DaemonRunner {
     agent: AgentRunner<GrpcReporter>,
 }
 
+impl DaemonRunner {
+    async fn execute(&self, job: &Job, path: &Path, shutdown: Shutdown) -> Result<(), RunError> {
+        let outcome = self.agent.run(job, path, shutdown.clone()).await?;
+        if matches!(outcome, AgentOutcome::Succeeded) {
+            self.agent.finish(job, path, shutdown).await?;
+        } else {
+            tracing::info!(outcome = ?outcome, "job ended without a publish step");
+        }
+        Ok(())
+    }
+}
+
 impl JobRunner for DaemonRunner {
     async fn run(&self, job: Job, shutdown: Shutdown) -> Result<(), RunError> {
         let mut prepare_stop = shutdown.clone();
@@ -46,16 +58,11 @@ impl JobRunner for DaemonRunner {
             self.agent.fail_job(&job, ERR_WORKSPACE).await;
             return Ok(());
         };
-        let outcome = self
-            .agent
-            .run(&job, &checkout.path, shutdown.clone())
-            .await?;
-        if matches!(outcome, AgentOutcome::Succeeded) {
-            self.agent.finish(&job, &checkout.path, shutdown).await?;
-        } else {
-            tracing::info!(outcome = ?outcome, "job ended without a publish step");
+        let result = self.execute(&job, &checkout.path, shutdown).await;
+        if self.workspace.remove(&job.job_id, &job.repo).await.is_err() {
+            tracing::warn!(job_id = %job.job_id, "job workspace could not be removed");
         }
-        Ok(())
+        result
     }
 }
 

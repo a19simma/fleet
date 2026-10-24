@@ -121,7 +121,7 @@ impl Workspace {
         tokio::fs::create_dir_all(&cache)
             .await
             .map_err(WorkspaceError::Io)?;
-        let mirror = cache.join(format!("{:016x}.git", fnv1a(repo.as_bytes())));
+        let mirror = self.mirror_path(repo);
         self.sync_mirror(&mirror, repo).await?;
 
         let path = self.root.join(job_id);
@@ -145,6 +145,46 @@ impl Workspace {
 }
 
 impl Workspace {
+    /// Removes the job's worktree and its `.finish-<job_id>` scratch dir, then prunes the
+    /// mirror's worktree records. The bare mirror stays. Every step runs even when an
+    /// earlier one fails.
+    ///
+    /// # Errors
+    ///
+    /// Returns the first failure, with fixed text that carries no path or id.
+    pub async fn remove(&self, job_id: &str, repo: &str) -> Result<(), WorkspaceError> {
+        validate_job_id(job_id)?;
+        validate_repo(repo)?;
+        let mut first = None;
+        for path in [
+            self.root.join(job_id),
+            self.root.join(format!(".finish-{job_id}")),
+        ] {
+            match tokio::fs::remove_dir_all(&path).await {
+                Ok(()) => {}
+                Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+                Err(err) => {
+                    first.get_or_insert(WorkspaceError::Io(err));
+                }
+            }
+        }
+        let mirror = self.mirror_path(repo);
+        if mirror.join("HEAD").exists()
+            && let Err(err) = self
+                .git(&mirror, &["worktree", "prune"], "worktree prune")
+                .await
+        {
+            first.get_or_insert(err);
+        }
+        first.map_or(Ok(()), Err)
+    }
+
+    fn mirror_path(&self, repo: &str) -> PathBuf {
+        self.root
+            .join(CACHE_DIR)
+            .join(format!("{:016x}.git", fnv1a(repo.as_bytes())))
+    }
+
     async fn sync_mirror(&self, mirror: &Path, repo: &str) -> Result<(), WorkspaceError> {
         if !mirror.join("HEAD").exists() {
             let dir = mirror.to_str().ok_or(WorkspaceError::InvalidRepo)?;

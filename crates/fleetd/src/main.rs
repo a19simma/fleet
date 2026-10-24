@@ -1,10 +1,11 @@
-//! fleetd binary: `serve` (default), `dump`, `hook` and `pueue-callback`.
+//! fleetd binary: `serve` (default), `dump`, `hook`, `askpass` and `pueue-callback`.
 
+use std::io::Write;
 use std::path::PathBuf;
 use std::process::ExitCode;
 
 use clap::{Parser, Subcommand};
-use fleetd::{Config, Error, Signals, dump, run, run_hook};
+use fleetd::{Config, Error, Signals, askpass, dump, run, run_hook};
 use tracing_subscriber::EnvFilter;
 
 #[derive(Parser)]
@@ -31,6 +32,12 @@ enum Command {
     Hook {
         /// Hook event name, for example `SessionStart`.
         event: String,
+    },
+    /// Answer a git credential prompt for `GIT_ASKPASS`: the token from `GH_TOKEN` for a
+    /// password prompt, a fixed username for a username prompt, else nothing and exit 1.
+    Askpass {
+        /// The prompt git passes as its only argument.
+        prompt: String,
     },
     /// Report a finished pueue task. Not implemented yet.
     PueueCallback {
@@ -61,6 +68,16 @@ async fn execute(cli: Cli) -> Result<ExitCode, Error> {
                 eprintln!("fleetd hook: {err}");
             }
             std::process::exit(0)
+        }
+        Command::Askpass { prompt } => {
+            let token = std::env::var("GH_TOKEN").ok();
+            let printed = askpass::answer(&prompt, token.as_deref())
+                .is_some_and(|text| writeln!(std::io::stdout(), "{text}").is_ok());
+            Ok(if printed {
+                ExitCode::SUCCESS
+            } else {
+                ExitCode::FAILURE
+            })
         }
         Command::PueueCallback { id, group } => {
             eprintln!("fleetd: pueue-callback is not implemented (task {id}, group {group})");

@@ -78,6 +78,29 @@ async fn worktree_on_branch() -> TestResult {
 }
 
 #[tokio::test]
+async fn remove_deletes_the_worktree_and_scratch_and_keeps_the_mirror() -> TestResult {
+    let dir = TempDir::new()?;
+    let repo = fixture(dir.path())?;
+    let root = dir.path().join("jobs");
+    let ws = Workspace::new(&root);
+    let checkout = ws.prepare("job1", &repo, "main").await?;
+    std::fs::create_dir(root.join(".finish-job1"))?;
+    ws.remove("job1", &repo).await?;
+    assert!(!checkout.path.exists());
+    assert!(!root.join(".finish-job1").exists());
+    assert_eq!(std::fs::read_dir(root.join(".cache"))?.count(), 1);
+    let mirror = std::fs::read_dir(root.join(".cache"))?
+        .next()
+        .ok_or("no mirror")??
+        .path();
+    let listed = git(&mirror, &["worktree", "list", "--porcelain"])?;
+    assert!(!listed.contains("job1"), "{listed}");
+    ws.remove("job1", &repo).await?;
+    ws.prepare("job1b", &repo, "main").await?;
+    Ok(())
+}
+
+#[tokio::test]
 async fn rejects_unsafe_inputs_before_running_git() -> TestResult {
     let dir = TempDir::new()?;
     let root = dir.path().join("jobs");

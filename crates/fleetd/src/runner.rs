@@ -12,8 +12,8 @@
 //! into a throwaway bare repo, counts the commits, pushes the branch and opens the pull
 //! request with `gh` from that repo, then sends the terminal report. Every helper runs in
 //! its own process group with an allowlisted environment and a scratch `HOME` and config
-//! dirs, so no agent-writable config is read. The push carries only `GIT_ASKPASS` and `gh`
-//! only its own token. Push is limited to `file` and `https` remotes.
+//! dirs, so no agent-writable config is read. The push carries only `GIT_ASKPASS`, which names
+//! `fleetd askpass`, and `GH_TOKEN` for that helper to print, and `gh` only its own token. Push is limited to `file` and `https` remotes.
 
 use std::collections::VecDeque;
 use std::ffi::OsString;
@@ -51,7 +51,7 @@ pub const STRIPPED_ENV: [&str; 9] = [
 ];
 
 const CLEAN_ENV: [&str; 1] = ["PATH"];
-const PUSH_ENV: [&str; 2] = ["PATH", "GIT_ASKPASS"];
+const PUSH_ENV: [&str; 2] = ["PATH", "GH_TOKEN"];
 const GH_ENV: [&str; 4] = ["PATH", "GH_TOKEN", "GH_HOST", "GH_ENTERPRISE_TOKEN"];
 const MAX_TITLE_CHARS: usize = 256;
 
@@ -125,6 +125,9 @@ pub struct RunConfig {
     pub claude_bin: PathBuf,
     /// GitHub CLI binary that opens the pull request, `gh` by default.
     pub gh_bin: PathBuf,
+    /// The fleetd executable the push runs as `<path> askpass`, the current executable by
+    /// default.
+    pub askpass_bin: PathBuf,
     /// Git binary used to fetch, count, log and push commits, `git` by default.
     pub git_bin: PathBuf,
     /// Longest time for the finish step and for each helper command in it.
@@ -153,6 +156,7 @@ impl RunConfig {
             claude_bin: claude_bin.into(),
             gh_bin: PathBuf::from("gh"),
             git_bin: PathBuf::from("git"),
+            askpass_bin: std::env::current_exe().unwrap_or_else(|_| PathBuf::from("fleetd")),
             finish_timeout: DEFAULT_FINISH_TIMEOUT,
             disposable,
             timeout: DEFAULT_TIMEOUT,
@@ -310,7 +314,7 @@ impl<R: Reporter> AgentRunner<R> {
     /// environment. The push (`--no-verify`, no hooks path, no stored credential helper, no
     /// global or system git config) and `gh` run from that repo with an allowlisted
     /// environment, a scratch `HOME` and scratch config dirs. The push holds only
-    /// `GIT_ASKPASS` and `gh` only its own token, so config the agent planted cannot
+    /// `GIT_ASKPASS` (`fleetd askpass`) and the `GH_TOKEN` it prints, and `gh` only its own token, so config the agent planted cannot
     /// capture a token. The push allows `file` and `https` remotes only. A failure sends a
     /// `FAILED` report with a fixed error and the redacted, bounded tail of the helper's
     /// stderr as one transcript chunk. The raw output goes nowhere else.
@@ -577,7 +581,9 @@ impl<R: Reporter> AgentRunner<R> {
         );
         match scope {
             Scope::Clean => command.env("GIT_ALLOW_PROTOCOL", "file"),
-            Scope::Push => command.env("GIT_ALLOW_PROTOCOL", "file:https"),
+            Scope::Push => command
+                .env("GIT_ALLOW_PROTOCOL", "file:https")
+                .env("GIT_ASKPASS", askpass_command(&self.config.askpass_bin)),
             Scope::Gh => command
                 .env("GH_CONFIG_DIR", dir.join(GH_CONFIG_DIR))
                 .env("GH_NO_UPDATE_NOTIFIER", "1")
@@ -949,6 +955,10 @@ impl IntoFailure for CaptureError {
             Self::Timeout => Failure::bare(ERR_FINISH_TIMEOUT),
         }
     }
+}
+
+fn askpass_command(bin: &Path) -> String {
+    format!("'{}' askpass", bin.to_string_lossy().replace('\'', "'\\''"))
 }
 
 const HOME_DIR: &str = "home";
