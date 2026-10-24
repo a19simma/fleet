@@ -17,6 +17,7 @@ pub mod poller;
 mod runtime;
 mod store;
 mod system;
+pub mod workspace;
 
 pub use app::{AppState, hook_router, socket_router};
 pub use config::{Config, DEFAULT_CONFIG_PATH, DEFAULT_SECRETS_PATH, SecretsFile};
