@@ -337,3 +337,99 @@ async fn invalid_box_rejected_without_echo(pool: PgPool) {
         .unwrap();
     assert_eq!(state, "QUEUED");
 }
+
+async fn claimed(store: &Store, box_name: &str) -> fleet_proto::v1::Job {
+    store.submit_job(&request("rk")).await.unwrap();
+    store.claim_job(box_name).await.unwrap().unwrap()
+}
+
+async fn set_lease_in_past(pool: &PgPool) {
+    sqlx::query("UPDATE jobs SET lease_expires_at = now() - interval '1 hour'")
+        .execute(pool)
+        .await
+        .unwrap();
+}
+
+#[sqlx::test]
+async fn report_renews_lease(pool: PgPool) {
+    let store = store(pool.clone())
+        .await
+        .with_lease(Duration::from_secs(45));
+    let job = claimed(&store, &claimer(1)).await;
+    set_lease_in_past(&pool).await;
+    let reply = timeout(
+        WAIT,
+        store.report_job(&job.job_id, job.attempt, &claimer(1), "running", "step 2"),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert!(!reply.cancel_requested);
+    let now: i64 = sqlx::query_scalar("SELECT (EXTRACT(EPOCH FROM now()) * 1000)::bigint")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    let delta = i64::try_from(reply.lease_expires_at_ms).unwrap() - now;
+    assert!((40_000..=45_000).contains(&delta), "delta {delta}");
+    let (phase, progress, lease): (String, String, i64) = sqlx::query_as(
+        "SELECT phase, progress, (EXTRACT(EPOCH FROM lease_expires_at) * 1000)::bigint FROM jobs",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(phase, "running");
+    assert_eq!(progress, "step 2");
+    assert_eq!(lease, i64::try_from(reply.lease_expires_at_ms).unwrap());
+    sqlx::query("UPDATE jobs SET cancel_requested = true")
+        .execute(&pool)
+        .await
+        .unwrap();
+    let again = store
+        .report_job(&job.job_id, job.attempt, &claimer(1), "running", "step 3")
+        .await
+        .unwrap();
+    assert!(again.cancel_requested);
+}
+
+#[sqlx::test]
+async fn stale_attempt_rejected(pool: PgPool) {
+    let store = store(pool.clone()).await;
+    let job = claimed(&store, &claimer(1)).await;
+    let secret = "s3cret-job";
+    let cases = [
+        (job.job_id.clone(), job.attempt + 1, claimer(1)),
+        (job.job_id.clone(), job.attempt - 1, claimer(1)),
+        (job.job_id.clone(), job.attempt, claimer(2)),
+        (secret.to_owned(), job.attempt, claimer(1)),
+    ];
+    for (id, attempt, box_name) in cases {
+        let err = store
+            .report_job(&id, attempt, &box_name, "hijack", "hijack")
+            .await
+            .unwrap_err();
+        assert!(matches!(err, StoreError::StaleReport));
+        assert!(!format!("{err} {err:?}").contains(secret));
+    }
+    let err = store
+        .report_job(&job.job_id, job.attempt, secret, "x", "x")
+        .await
+        .unwrap_err();
+    assert!(matches!(err, StoreError::InvalidBox));
+    for state in ["QUEUED", "SUCCEEDED", "LOST", "CANCELLED", "FAILED"] {
+        sqlx::query("UPDATE jobs SET state = $1")
+            .bind(state)
+            .execute(&pool)
+            .await
+            .unwrap();
+        let err = store
+            .report_job(&job.job_id, job.attempt, &claimer(1), "late", "late")
+            .await
+            .unwrap_err();
+        assert!(matches!(err, StoreError::StaleReport), "{state}");
+    }
+    let (phase, progress): (String, String) = sqlx::query_as("SELECT phase, progress FROM jobs")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!((phase.as_str(), progress.as_str()), ("", ""));
+}

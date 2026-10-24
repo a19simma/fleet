@@ -6,7 +6,7 @@ use std::time::Duration;
 
 use fleet_core::{BoxName, Envelope, EventId, SCHEMA_VERSION};
 use fleet_proto::v1::{
-    BoxStatus, BoxView, HeartbeatRequest, Job, JobState, SessionState, SessionView,
+    BoxStatus, BoxView, HeartbeatRequest, Job, JobState, ReportJobReply, SessionState, SessionView,
     SubmitJobRequest,
 };
 use fleet_proto::validate_box;
@@ -137,6 +137,12 @@ progress, phase, branch, pr_url, error, exit_code, cancel_requested, \
 (EXTRACT(EPOCH FROM claimed_at) * 1000)::bigint AS claimed_ms, \
 (EXTRACT(EPOCH FROM finished_at) * 1000)::bigint AS finished_ms";
 
+const REPORT_JOB: &str = "\
+UPDATE jobs SET phase = $4, progress = $5, \
+lease_expires_at = now() + make_interval(secs => $6) \
+WHERE job_id = $1 AND attempt = $2 AND box = $3 AND state = 'RUNNING' \
+RETURNING cancel_requested, (EXTRACT(EPOCH FROM lease_expires_at) * 1000)::bigint AS lease_ms";
+
 /// Lease granted to a claimed job when the store is not configured otherwise.
 pub const DEFAULT_LEASE: Duration = Duration::from_secs(120);
 
@@ -162,6 +168,10 @@ pub enum StoreError {
     /// An idempotency key was reused with different submit parameters. The handler maps
     /// this to gRPC `ALREADY_EXISTS`.
     KeyConflict,
+    /// A report named a job that is missing, not running, held by another box or at
+    /// another attempt. The handler maps this to gRPC `FAILED_PRECONDITION`. No input is
+    /// kept.
+    StaleReport,
 }
 
 impl fmt::Display for StoreError {
@@ -173,6 +183,7 @@ impl fmt::Display for StoreError {
             Self::InvalidJob(reason) => reason.fmt(f),
             Self::InvalidBox => f.write_str("invalid box name"),
             Self::KeyConflict => f.write_str("idempotency key already used with other parameters"),
+            Self::StaleReport => f.write_str("job is not running here at this attempt"),
         }
     }
 }
@@ -183,7 +194,7 @@ impl std::error::Error for StoreError {
             Self::Database(err) => Some(err),
             Self::Migrate(err) => Some(err),
             Self::InvalidJob(err) => Some(err),
-            Self::OutOfRange(_) | Self::InvalidBox | Self::KeyConflict => None,
+            Self::OutOfRange(_) | Self::InvalidBox | Self::KeyConflict | Self::StaleReport => None,
         }
     }
 }
@@ -545,6 +556,46 @@ impl Store {
             .fetch_optional(&self.pool)
             .await?;
         row.as_ref().map(job_from_row).transpose()
+    }
+
+    /// Records a progress report from the box that holds `job_id` and renews its lease.
+    ///
+    /// One statement matches the job id, the attempt and the box on a `RUNNING` row, then
+    /// stores `phase` and `progress` and moves the lease expiry to one store lease from
+    /// now. The reply carries the new expiry and the cancel flag. Transcript fields stay at
+    /// their defaults until chunk storage lands.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StoreError::InvalidBox`] when `box_name` fails [`validate_box`],
+    /// [`StoreError::StaleReport`] when no running row matches the job, attempt and box,
+    /// and [`StoreError::Database`] when the statement fails.
+    pub async fn report_job(
+        &self,
+        job_id: &str,
+        attempt: u32,
+        box_name: &str,
+        phase: &str,
+        progress: &str,
+    ) -> Result<ReportJobReply, StoreError> {
+        let name = validate_box(box_name).map_err(|_| StoreError::InvalidBox)?;
+        let attempt = i32::try_from(attempt).map_err(|_| StoreError::StaleReport)?;
+        let row = sqlx::query(REPORT_JOB)
+            .bind(job_id)
+            .bind(attempt)
+            .bind(name.as_str())
+            .bind(phase)
+            .bind(progress)
+            .bind(self.lease.as_secs_f64())
+            .fetch_optional(&self.pool)
+            .await?
+            .ok_or(StoreError::StaleReport)?;
+        let lease_ms: Option<i64> = row.try_get("lease_ms")?;
+        Ok(ReportJobReply {
+            lease_expires_at_ms: ms(lease_ms, "lease")?.unwrap_or_default(),
+            cancel_requested: row.try_get("cancel_requested")?,
+            ..ReportJobReply::default()
+        })
     }
 
     /// Starts a `REPEATABLE READ`, read only transaction, so every query in it sees one
