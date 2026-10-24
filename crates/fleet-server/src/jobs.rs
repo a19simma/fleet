@@ -13,6 +13,13 @@ pub const MAX_REPO_BYTES: usize = 2048;
 /// Longest accepted base ref, in bytes.
 pub const MAX_BASE_REF_BYTES: usize = 255;
 
+/// Transcript bytes stored per job. Chunks past this are dropped after one marker row.
+pub const MAX_TRANSCRIPT_BYTES: usize = 4 * 1024 * 1024;
+/// Longest stored progress text, in characters. Longer text is cut.
+pub const MAX_PROGRESS_CHARS: usize = 200;
+/// Longest stored phase, in characters. Longer text is cut.
+pub const MAX_PHASE_CHARS: usize = 32;
+
 /// Why a submit request was refused. The variants carry no client input.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]

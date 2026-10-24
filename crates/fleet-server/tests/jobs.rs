@@ -5,8 +5,11 @@
 
 use std::time::Duration;
 
-use fleet_proto::v1::{JobState, SubmitJobRequest};
-use fleet_server::jobs::{MAX_BASE_REF_BYTES, MAX_KEY_BYTES, MAX_PROMPT_BYTES, MAX_REPO_BYTES};
+use fleet_proto::v1::{JobState, SubmitJobRequest, TranscriptChunk};
+use fleet_server::jobs::{
+    MAX_BASE_REF_BYTES, MAX_KEY_BYTES, MAX_PHASE_CHARS, MAX_PROGRESS_CHARS, MAX_PROMPT_BYTES,
+    MAX_REPO_BYTES, MAX_TRANSCRIPT_BYTES,
+};
 use fleet_server::store::{Store, StoreError};
 use sqlx::PgPool;
 use tokio::time::timeout;
@@ -359,7 +362,14 @@ async fn report_renews_lease(pool: PgPool) {
     set_lease_in_past(&pool).await;
     let reply = timeout(
         WAIT,
-        store.report_job(&job.job_id, job.attempt, &claimer(1), "running", "step 2"),
+        store.report_job(
+            &job.job_id,
+            job.attempt,
+            &claimer(1),
+            "running",
+            "step 2",
+            &[],
+        ),
     )
     .await
     .unwrap()
@@ -385,7 +395,14 @@ async fn report_renews_lease(pool: PgPool) {
         .await
         .unwrap();
     let again = store
-        .report_job(&job.job_id, job.attempt, &claimer(1), "running", "step 3")
+        .report_job(
+            &job.job_id,
+            job.attempt,
+            &claimer(1),
+            "running",
+            "step 3",
+            &[],
+        )
         .await
         .unwrap();
     assert!(again.cancel_requested);
@@ -404,14 +421,14 @@ async fn stale_attempt_rejected(pool: PgPool) {
     ];
     for (id, attempt, box_name) in cases {
         let err = store
-            .report_job(&id, attempt, &box_name, "hijack", "hijack")
+            .report_job(&id, attempt, &box_name, "hijack", "hijack", &[])
             .await
             .unwrap_err();
         assert!(matches!(err, StoreError::StaleReport));
         assert!(!format!("{err} {err:?}").contains(secret));
     }
     let err = store
-        .report_job(&job.job_id, job.attempt, secret, "x", "x")
+        .report_job(&job.job_id, job.attempt, secret, "x", "x", &[])
         .await
         .unwrap_err();
     assert!(matches!(err, StoreError::InvalidBox));
@@ -422,7 +439,7 @@ async fn stale_attempt_rejected(pool: PgPool) {
             .await
             .unwrap();
         let err = store
-            .report_job(&job.job_id, job.attempt, &claimer(1), "late", "late")
+            .report_job(&job.job_id, job.attempt, &claimer(1), "late", "late", &[])
             .await
             .unwrap_err();
         assert!(matches!(err, StoreError::StaleReport), "{state}");
@@ -432,4 +449,135 @@ async fn stale_attempt_rejected(pool: PgPool) {
         .await
         .unwrap();
     assert_eq!((phase.as_str(), progress.as_str()), ("", ""));
+}
+
+fn chunk(seq: u64, text: &str) -> TranscriptChunk {
+    TranscriptChunk {
+        seq,
+        ts_ms: 1,
+        text: text.to_owned(),
+        truncated: false,
+    }
+}
+
+#[sqlx::test]
+async fn transcript_dedupes_and_caps(pool: PgPool) {
+    let store = store(pool.clone()).await;
+    let job = claimed(&store, &claimer(1)).await;
+    let id = job.job_id.as_str();
+    let rows = || async {
+        sqlx::query_as::<_, (i64, String, bool)>(
+            "SELECT seq, chunk, truncated FROM job_transcript ORDER BY seq",
+        )
+        .fetch_all(&pool)
+        .await
+        .unwrap()
+    };
+    let first = store
+        .report_job(
+            id,
+            job.attempt,
+            &claimer(1),
+            "r",
+            "p",
+            &[chunk(1, "a"), chunk(2, "b")],
+        )
+        .await
+        .unwrap();
+    assert_eq!(first.acked_through_seq, 2);
+    assert!(!first.transcript_truncated);
+    let again = store
+        .report_job(
+            id,
+            job.attempt,
+            &claimer(1),
+            "r",
+            "p",
+            &[chunk(2, "changed")],
+        )
+        .await
+        .unwrap();
+    assert_eq!(again.acked_through_seq, 2);
+    assert_eq!(rows().await.len(), 2);
+    assert_eq!(rows().await[1].1, "b");
+
+    let stale = store
+        .report_job(id, job.attempt, &claimer(2), "r", "p", &[chunk(3, "x")])
+        .await;
+    assert!(matches!(stale, Err(StoreError::StaleReport)));
+    let nul = store
+        .report_job(id, job.attempt, &claimer(1), "r", "p", &[chunk(3, "a\0b")])
+        .await;
+    assert!(matches!(nul, Err(StoreError::InvalidChunk)));
+    assert_eq!(rows().await.len(), 2);
+
+    let fill = "z".repeat(MAX_TRANSCRIPT_BYTES - 2);
+    let full = store
+        .report_job(id, job.attempt, &claimer(1), "r", "p", &[chunk(3, &fill)])
+        .await
+        .unwrap();
+    assert!(!full.transcript_truncated);
+    let over = store
+        .report_job(
+            id,
+            job.attempt,
+            &claimer(1),
+            "r",
+            "p",
+            &[chunk(4, "x"), chunk(5, "y")],
+        )
+        .await
+        .unwrap();
+    assert!(over.transcript_truncated);
+    assert_eq!(over.acked_through_seq, 5);
+    let replay = store
+        .report_job(
+            id,
+            job.attempt,
+            &claimer(1),
+            "r",
+            "p",
+            &[chunk(4, "x"), chunk(6, "w")],
+        )
+        .await
+        .unwrap();
+    assert!(replay.transcript_truncated);
+    assert_eq!(replay.acked_through_seq, 6);
+    let stored = rows().await;
+    assert_eq!(stored.len(), 4);
+    assert_eq!(stored.iter().filter(|row| row.2).count(), 1);
+    assert_eq!(
+        (stored[3].0, stored[3].1.as_str(), stored[3].2),
+        (4, "", true)
+    );
+    let bytes: i64 = sqlx::query_scalar("SELECT transcript_bytes FROM jobs")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(bytes, i64::try_from(MAX_TRANSCRIPT_BYTES).unwrap());
+}
+
+#[sqlx::test]
+async fn report_cuts_progress_and_phase(pool: PgPool) {
+    let store = store(pool.clone()).await;
+    let job = claimed(&store, &claimer(1)).await;
+    let progress = "\u{e9}".repeat(MAX_PROGRESS_CHARS + 50);
+    let phase = "P".repeat(MAX_PHASE_CHARS + 50);
+    store
+        .report_job(
+            &job.job_id,
+            job.attempt,
+            &claimer(1),
+            &phase,
+            &progress,
+            &[],
+        )
+        .await
+        .unwrap();
+    let (phase, progress): (String, String) = sqlx::query_as("SELECT phase, progress FROM jobs")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(phase.chars().count(), MAX_PHASE_CHARS);
+    assert_eq!(progress.chars().count(), MAX_PROGRESS_CHARS);
 }

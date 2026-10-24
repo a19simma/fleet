@@ -7,14 +7,16 @@ use std::time::Duration;
 use fleet_core::{BoxName, Envelope, EventId, SCHEMA_VERSION};
 use fleet_proto::v1::{
     BoxStatus, BoxView, HeartbeatRequest, Job, JobState, ReportJobReply, SessionState, SessionView,
-    SubmitJobRequest,
+    SubmitJobRequest, TranscriptChunk,
 };
 use fleet_proto::validate_box;
 use serde_json::{Value, json};
 use sqlx::postgres::PgRow;
 use sqlx::{PgPool, Postgres, Row, Transaction};
 
-use crate::jobs::{JobInvalid, validate_submit};
+use crate::jobs::{
+    JobInvalid, MAX_PHASE_CHARS, MAX_PROGRESS_CHARS, MAX_TRANSCRIPT_BYTES, validate_submit,
+};
 use crate::projection::{Projection, State, project};
 
 const INSERT_EVENTS: &str = "\
@@ -141,7 +143,22 @@ const REPORT_JOB: &str = "\
 UPDATE jobs SET phase = $4, progress = $5, \
 lease_expires_at = now() + make_interval(secs => $6) \
 WHERE job_id = $1 AND attempt = $2 AND box = $3 AND state = 'RUNNING' \
-RETURNING cancel_requested, (EXTRACT(EPOCH FROM lease_expires_at) * 1000)::bigint AS lease_ms";
+RETURNING cancel_requested, transcript_bytes, \
+(EXTRACT(EPOCH FROM lease_expires_at) * 1000)::bigint AS lease_ms";
+
+const TRANSCRIPT_TRUNCATED: &str = "\
+SELECT EXISTS (SELECT 1 FROM job_transcript WHERE job_id = $1 AND truncated)";
+
+const TRANSCRIPT_HAS_SEQ: &str = "\
+SELECT EXISTS (SELECT 1 FROM job_transcript WHERE job_id = $1 AND seq = $2)";
+
+const TRANSCRIPT_MAX_SEQ: &str = "\
+SELECT COALESCE(max(seq), 0) FROM job_transcript WHERE job_id = $1";
+
+const INSERT_CHUNK: &str = "\
+INSERT INTO job_transcript (job_id, seq, ts_ms, chunk, truncated) VALUES ($1, $2, $3, $4, $5)";
+
+const SET_TRANSCRIPT_BYTES: &str = "UPDATE jobs SET transcript_bytes = $2 WHERE job_id = $1";
 
 /// Lease granted to a claimed job when the store is not configured otherwise.
 pub const DEFAULT_LEASE: Duration = Duration::from_secs(120);
@@ -172,6 +189,9 @@ pub enum StoreError {
     /// another attempt. The handler maps this to gRPC `FAILED_PRECONDITION`. No input is
     /// kept.
     StaleReport,
+    /// A transcript chunk has a sequence number or text the store cannot keep. No input is
+    /// kept.
+    InvalidChunk,
 }
 
 impl fmt::Display for StoreError {
@@ -184,6 +204,7 @@ impl fmt::Display for StoreError {
             Self::InvalidBox => f.write_str("invalid box name"),
             Self::KeyConflict => f.write_str("idempotency key already used with other parameters"),
             Self::StaleReport => f.write_str("job is not running here at this attempt"),
+            Self::InvalidChunk => f.write_str("invalid transcript chunk"),
         }
     }
 }
@@ -194,7 +215,11 @@ impl std::error::Error for StoreError {
             Self::Database(err) => Some(err),
             Self::Migrate(err) => Some(err),
             Self::InvalidJob(err) => Some(err),
-            Self::OutOfRange(_) | Self::InvalidBox | Self::KeyConflict | Self::StaleReport => None,
+            Self::OutOfRange(_)
+            | Self::InvalidBox
+            | Self::KeyConflict
+            | Self::StaleReport
+            | Self::InvalidChunk => None,
         }
     }
 }
@@ -562,14 +587,22 @@ impl Store {
     ///
     /// One statement matches the job id, the attempt and the box on a `RUNNING` row, then
     /// stores `phase` and `progress` and moves the lease expiry to one store lease from
-    /// now. The reply carries the new expiry and the cancel flag. Transcript fields stay at
-    /// their defaults until chunk storage lands.
+    /// now. Only that holder can append `chunks`, in the same transaction. `phase` is cut
+    /// to [`MAX_PHASE_CHARS`] characters and `progress` to [`MAX_PROGRESS_CHARS`].
+    ///
+    /// A chunk whose `seq` is already stored is skipped and counts as acked. Once stored
+    /// bytes would pass [`MAX_TRANSCRIPT_BYTES`], one marker row with `truncated` set takes
+    /// the first dropped `seq`, and that chunk and every later one is dropped and acked.
+    /// The reply carries the new expiry, the cancel flag, `transcript_truncated` and
+    /// `acked_through_seq`, the highest `seq` stored or seen for the job.
     ///
     /// # Errors
     ///
     /// Returns [`StoreError::InvalidBox`] when `box_name` fails [`validate_box`],
-    /// [`StoreError::StaleReport`] when no running row matches the job, attempt and box,
-    /// and [`StoreError::Database`] when the statement fails.
+    /// [`StoreError::InvalidChunk`] when a chunk `seq` exceeds the database range or its
+    /// text holds a NUL character, [`StoreError::StaleReport`] when no running row matches
+    /// the job, attempt and box, and [`StoreError::Database`] when a statement fails. A
+    /// failed call stores nothing.
     pub async fn report_job(
         &self,
         job_id: &str,
@@ -577,24 +610,78 @@ impl Store {
         box_name: &str,
         phase: &str,
         progress: &str,
+        chunks: &[TranscriptChunk],
     ) -> Result<ReportJobReply, StoreError> {
         let name = validate_box(box_name).map_err(|_| StoreError::InvalidBox)?;
         let attempt = i32::try_from(attempt).map_err(|_| StoreError::StaleReport)?;
+        let mut rows = Vec::with_capacity(chunks.len());
+        for chunk in chunks {
+            let seq = i64::try_from(chunk.seq).map_err(|_| StoreError::InvalidChunk)?;
+            if chunk.text.contains('\0') {
+                return Err(StoreError::InvalidChunk);
+            }
+            rows.push((seq, chunk.ts_ms.min(MAX_TS_MS), chunk));
+        }
+        let phase: String = phase.chars().take(MAX_PHASE_CHARS).collect();
+        let progress: String = progress.chars().take(MAX_PROGRESS_CHARS).collect();
+        let mut tx = self.pool.begin().await?;
         let row = sqlx::query(REPORT_JOB)
             .bind(job_id)
             .bind(attempt)
             .bind(name.as_str())
-            .bind(phase)
-            .bind(progress)
+            .bind(&phase)
+            .bind(&progress)
             .bind(self.lease.as_secs_f64())
-            .fetch_optional(&self.pool)
+            .fetch_optional(&mut *tx)
             .await?
             .ok_or(StoreError::StaleReport)?;
         let lease_ms: Option<i64> = row.try_get("lease_ms")?;
+        let cancel_requested: bool = row.try_get("cancel_requested")?;
+        let stored: i64 = row.try_get("transcript_bytes")?;
+        let mut bytes =
+            usize::try_from(stored).map_err(|_| StoreError::OutOfRange("transcript"))?;
+        let mut truncated: bool = sqlx::query_scalar(TRANSCRIPT_TRUNCATED)
+            .bind(job_id)
+            .fetch_one(&mut *tx)
+            .await?;
+        let mut acked: i64 = sqlx::query_scalar(TRANSCRIPT_MAX_SEQ)
+            .bind(job_id)
+            .fetch_one(&mut *tx)
+            .await?;
+        for (seq, ts_ms, chunk) in rows {
+            acked = acked.max(seq);
+            let known: bool = sqlx::query_scalar(TRANSCRIPT_HAS_SEQ)
+                .bind(job_id)
+                .bind(seq)
+                .fetch_one(&mut *tx)
+                .await?;
+            if known || truncated {
+                continue;
+            }
+            let over = bytes.saturating_add(chunk.text.len()) > MAX_TRANSCRIPT_BYTES;
+            let text = if over { "" } else { chunk.text.as_str() };
+            sqlx::query(INSERT_CHUNK)
+                .bind(job_id)
+                .bind(seq)
+                .bind(i64::try_from(ts_ms).map_err(|_| StoreError::InvalidChunk)?)
+                .bind(text)
+                .bind(over)
+                .execute(&mut *tx)
+                .await?;
+            truncated = over;
+            bytes += text.len();
+        }
+        sqlx::query(SET_TRANSCRIPT_BYTES)
+            .bind(job_id)
+            .bind(i64::try_from(bytes).map_err(|_| StoreError::OutOfRange("transcript"))?)
+            .execute(&mut *tx)
+            .await?;
+        tx.commit().await?;
         Ok(ReportJobReply {
             lease_expires_at_ms: ms(lease_ms, "lease")?.unwrap_or_default(),
-            cancel_requested: row.try_get("cancel_requested")?,
-            ..ReportJobReply::default()
+            cancel_requested,
+            acked_through_seq: u64::try_from(acked).map_err(|_| StoreError::OutOfRange("seq"))?,
+            transcript_truncated: truncated,
         })
     }
 
