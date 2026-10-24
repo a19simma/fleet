@@ -12,5 +12,11 @@ publish = false
 [package.metadata.dist]
 dist = false
 
+[dependencies]
+fleet-core.workspace = true
+fleet-proto.workspace = true
+serde_json.workspace = true
+sqlx = { version = "0.9.0", default-features = false, features = ["runtime-tokio", "tls-rustls-ring-webpki", "postgres", "migrate", "macros"] }
+
 [lints]
 workspace = true

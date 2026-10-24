@@ -40,6 +40,17 @@ cargo build --release --workspace
 
 Binaries land in `target/release/`.
 
+## Test
+
+The `fleet-server` store tests need a Postgres superuser URL in `DATABASE_URL`. `#[sqlx::test]` creates one database per test from it, and a test fails when the variable is missing. `compose.test.yaml` starts a matching `postgres:17`:
+
+```sh
+docker compose -f compose.test.yaml up -d --wait
+export DATABASE_URL=postgres://postgres:postgres@localhost:5432/postgres
+cargo test --workspace
+docker compose -f compose.test.yaml down
+```
+
 ## Run
 
 ```sh
