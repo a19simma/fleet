@@ -104,15 +104,6 @@ pub fn bind_socket(path: &Path) -> Result<UnixListener, Error> {
     Ok(listener)
 }
 
-fn secret_entries(text: &str) -> usize {
-    text.lines()
-        .map(str::trim)
-        .filter(|line| !line.starts_with('#'))
-        .filter_map(|line| line.split_once('='))
-        .filter(|(_, value)| !value.trim().is_empty())
-        .count()
-}
-
 fn load_redactor(config: &Config) -> Result<Redactor, Error> {
     match std::fs::read_to_string(&config.secrets_file.path) {
         Ok(text) => {
@@ -120,9 +111,8 @@ fn load_redactor(config: &Config) -> Result<Redactor, Error> {
             for key in redactor.skipped_keys() {
                 tracing::warn!(key, "secret too short or trivial, not redacted");
             }
-            let entries = secret_entries(&text);
             tracing::info!(
-                secrets = entries.saturating_sub(redactor.skipped_keys().len()),
+                secrets = redactor.len(),
                 skipped = ?redactor.skipped_keys(),
                 "redaction loaded"
             );

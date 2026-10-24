@@ -88,6 +88,16 @@ impl Redactor {
         &self.skipped
     }
 
+    /// Number of distinct secrets loaded.
+    pub fn len(&self) -> usize {
+        self.secrets.len()
+    }
+
+    /// Whether no secrets are loaded.
+    pub fn is_empty(&self) -> bool {
+        self.secrets.is_empty()
+    }
+
     /// Returns the string with every secret replaced.
     pub fn redact_str<'a>(&self, input: &'a str) -> Cow<'a, str> {
         let mut ranges: Vec<(usize, usize)> = Vec::new();
@@ -236,6 +246,19 @@ mod tests {
     use serde_json::json;
 
     use super::*;
+
+    #[test]
+    fn len_counts_distinct_usable_secrets() {
+        let r = Redactor::new([
+            "token-abcdefgh",
+            "token-abcdefgh",
+            "short",
+            "other-secret-1",
+        ]);
+        assert_eq!(r.len(), 2);
+        assert!(!r.is_empty());
+        assert!(Redactor::default().is_empty());
+    }
 
     #[test]
     fn longest_value_goes_first() {
