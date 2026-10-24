@@ -4,6 +4,7 @@
 //! each to a SQLite queue before it answers.
 
 mod app;
+pub mod backoff;
 mod config;
 mod dump;
 mod error;
@@ -12,6 +13,7 @@ pub mod forwarder;
 pub mod heartbeat;
 mod hook;
 pub mod http1;
+pub mod poller;
 mod runtime;
 mod store;
 mod system;
