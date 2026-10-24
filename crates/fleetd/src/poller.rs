@@ -14,7 +14,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use fleet_proto::v1::fleet_worker_client::FleetWorkerClient;
-use fleet_proto::v1::{ClaimJobRequest, Job};
+use fleet_proto::v1::{ClaimJobRequest, Job, ReportJobReply, ReportJobRequest};
 use tokio::sync::watch;
 use tonic::codegen::http::Uri;
 use tonic::metadata::MetadataValue;
@@ -24,6 +24,7 @@ use tonic::{Code, Request, Status};
 
 use crate::Error;
 use crate::backoff::{Backoff, Random, SystemRandom};
+use crate::runner::Reporter;
 
 /// Environment variable that enables the poller and names the server.
 pub const SERVER_URL_ENV: &str = "FLEET_SERVER_URL";
@@ -157,6 +158,51 @@ type Attach = Box<dyn FnMut(Request<()>) -> Result<Request<()>, Status> + Send>;
 
 type Client = FleetWorkerClient<InterceptedService<Channel, Attach>>;
 
+fn attach_client(channel: Channel, header: MetadataValue<tonic::metadata::Ascii>) -> Client {
+    let attach: Attach = Box::new(move |mut request| {
+        request
+            .metadata_mut()
+            .insert("authorization", header.clone());
+        Ok(request)
+    });
+    FleetWorkerClient::with_interceptor(channel, attach)
+}
+
+/// Sends job reports to the Fleet server over `ReportJob` with the bearer token attached.
+pub struct GrpcReporter {
+    client: tokio::sync::Mutex<Client>,
+}
+
+impl fmt::Debug for GrpcReporter {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("GrpcReporter").finish_non_exhaustive()
+    }
+}
+
+impl GrpcReporter {
+    /// A reporter over `channel`. The caller sets the request timeout on the channel.
+    ///
+    /// # Errors
+    ///
+    /// Fails when the token is not a valid header value. The error never contains it.
+    pub fn new(channel: Channel, token: &Token) -> Result<Self, Error> {
+        let client = attach_client(channel, bearer_header(token)?);
+        Ok(Self {
+            client: tokio::sync::Mutex::new(client),
+        })
+    }
+}
+
+impl Reporter for GrpcReporter {
+    async fn report(&self, request: ReportJobRequest) -> Result<ReportJobReply, Status> {
+        let mut client = self.client.lock().await;
+        client
+            .report_job(request)
+            .await
+            .map(tonic::Response::into_inner)
+    }
+}
+
 /// The random sources a [`Poller`] draws from, named so they cannot be swapped.
 #[derive(Debug)]
 pub struct PollRandom<G = SystemRandom> {
@@ -260,13 +306,7 @@ impl<R: JobRunner, G: Random> Poller<R, G> {
         random: PollRandom<G>,
     ) -> Result<Self, Error> {
         let header = bearer_header(token)?;
-        let attach: Attach = Box::new(move |mut request| {
-            request
-                .metadata_mut()
-                .insert("authorization", header.clone());
-            Ok(request)
-        });
-        let client = FleetWorkerClient::with_interceptor(channel, attach);
+        let client = attach_client(channel, header);
         Ok(Self {
             client,
             box_name,

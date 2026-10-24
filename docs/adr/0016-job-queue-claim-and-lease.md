@@ -1,6 +1,6 @@
 # Job queue, claim and lease
 
-Status: Accepted. The pueue runner, `CLAIMED` state, heartbeat lease and `retry_on_lost` are superseded by ADR-0020 and ADR-0021 (planned).
+Status: Accepted. The pueue runner, `CLAIMED` state, heartbeat lease and `retry_on_lost` are superseded by ADR-0020 (built as library code, daemon wiring pending) and ADR-0021 (planned).
 
 A KEDA work queue will later feed Jobs, each a prompt. The first design choices fix how a Box gets work and how a lost Box is told from a slow one.
 
@@ -46,7 +46,7 @@ T5, T6, T9 and T10 touch this seam. They contradict one implicit assumption and 
 
 ## Amendments
 
-Accepted 2026-10-24: ADR-0020 and ADR-0021 build this seam and supersede the parts below. Planned, not built.
+Accepted 2026-10-24: ADR-0020 and ADR-0021 build this seam and supersede the parts below. The runner (ADR-0020) is built as library code, daemon wiring pending. The lease and protocol parts (ADR-0021) are planned, not built.
 
 - **Runner.** There is no `fleet-job`, no pueue group and no `free_slots`. fleetd runs the Job as a child process in a git worktree (ADR-0020). The pueue paragraphs of Phase 0 results no longer apply to Jobs.
 - **States.** `CLAIMED` is dropped. `ClaimJob` moves a Job from `QUEUED` straight to `RUNNING` and sets the Box, the attempt and the lease. The `CLAIMED` expiry rule (return to `QUEUED`) goes with it.

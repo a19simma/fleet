@@ -5,6 +5,13 @@
 //! of chunks are pending, every flush interval while chunks wait, and at least every
 //! report interval even when the agent is silent, so the server lease cannot lapse on a
 //! quiet agent. The reply of a report is not inspected here.
+//!
+//! After a successful run, [`AgentRunner::finish`] fetches `swarm/<job_id>` from the worktree
+//! into a throwaway bare repo, counts the commits, pushes the branch and opens the pull
+//! request with `gh` from that repo, then sends the terminal report. Every helper runs in
+//! its own process group with an allowlisted environment and a scratch `HOME` and config
+//! dirs, so no agent-writable config is read. The push carries only `GIT_ASKPASS` and `gh`
+//! only its own token. Push is limited to `file` and `https` remotes.
 
 use std::collections::VecDeque;
 use std::ffi::OsString;
@@ -25,6 +32,8 @@ use tonic::Status;
 use crate::group::GroupGuard;
 use crate::now_ms;
 use crate::poller::{RunError, Shutdown};
+use crate::proc::{CaptureError, Captured, capture};
+use crate::workspace::{validate_job_id, validate_ref, validate_repo};
 
 /// Variables that never reach the agent.
 pub const STRIPPED_ENV: [&str; 9] = [
@@ -38,6 +47,17 @@ pub const STRIPPED_ENV: [&str; 9] = [
     "FLEET_TOKEN",
     "FLEET_CLIENT_TOKEN",
 ];
+
+const CLEAN_ENV: [&str; 1] = ["PATH"];
+const PUSH_ENV: [&str; 2] = ["PATH", "GIT_ASKPASS"];
+const GH_ENV: [&str; 4] = ["PATH", "GH_TOKEN", "GH_HOST", "GH_ENTERPRISE_TOKEN"];
+const MAX_TITLE_CHARS: usize = 256;
+
+/// Default longest time for the whole finish step, and for each helper in it.
+pub const DEFAULT_FINISH_TIMEOUT: Duration = Duration::from_secs(300);
+
+const TAIL_BYTES: usize = 2048;
+const MAX_PR_URL_BYTES: usize = 2048;
 
 /// Default hard limit on one agent run.
 pub const DEFAULT_TIMEOUT: Duration = Duration::from_secs(30 * 60);
@@ -73,6 +93,11 @@ const ERR_SIGNAL: &str = "agent was killed by a signal";
 const ERR_TIMEOUT: &str = "agent timed out";
 const ERR_SHUTDOWN: &str = "agent stopped by daemon shutdown";
 const ERR_WAIT: &str = "agent could not be awaited";
+const ERR_COMMITS: &str = "job commits could not be inspected";
+const ERR_PUSH: &str = "git push failed";
+const ERR_PR: &str = "pull request could not be opened";
+const ERR_PR_URL: &str = "pull request url was not returned";
+const ERR_FINISH_TIMEOUT: &str = "finish step timed out";
 
 /// Sends one `ReportJob` call. The seam lets tests run without a server.
 pub trait Reporter: Send + Sync {
@@ -93,6 +118,12 @@ pub trait Reporter: Send + Sync {
 pub struct RunConfig {
     /// Agent binary, `claude` by default.
     pub claude_bin: PathBuf,
+    /// GitHub CLI binary that opens the pull request, `gh` by default.
+    pub gh_bin: PathBuf,
+    /// Git binary used to fetch, count, log and push commits, `git` by default.
+    pub git_bin: PathBuf,
+    /// Longest time for the finish step and for each helper command in it.
+    pub finish_timeout: Duration,
     /// True when the box is disposable. Only then the agent runs with permission checks off.
     pub disposable: bool,
     /// Hard limit on the run. The process group is killed when it passes.
@@ -113,6 +144,9 @@ impl RunConfig {
     pub fn new(claude_bin: impl Into<PathBuf>, disposable: bool) -> Self {
         Self {
             claude_bin: claude_bin.into(),
+            gh_bin: PathBuf::from("gh"),
+            git_bin: PathBuf::from("git"),
+            finish_timeout: DEFAULT_FINISH_TIMEOUT,
             disposable,
             timeout: DEFAULT_TIMEOUT,
             flush_interval: DEFAULT_FLUSH_INTERVAL,
@@ -127,12 +161,30 @@ impl RunConfig {
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum AgentOutcome {
-    /// The agent exited with status 0. The caller finishes the job.
+    /// The agent exited with status 0. The caller then runs [`AgentRunner::finish`].
     Succeeded,
     /// The run failed and a terminal `FAILED` report was attempted.
     Failed {
         /// The exit status, absent when the agent was killed or never started.
         exit_code: Option<i32>,
+        /// A fixed description of the failure.
+        error: &'static str,
+    },
+}
+
+/// How the finish step ended.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum FinishOutcome {
+    /// A terminal `SUCCEEDED` report was attempted.
+    Succeeded {
+        /// The pushed branch, absent when the agent made no commits.
+        branch: Option<String>,
+        /// The pull request url, absent when there is no branch or the job opts out of a PR.
+        pr_url: Option<String>,
+    },
+    /// The push or the pull request failed and a terminal `FAILED` report was attempted.
+    Failed {
         /// A fixed description of the failure.
         error: &'static str,
     },
@@ -212,6 +264,290 @@ impl<R: Reporter> AgentRunner<R> {
                 Err(RunError)
             }
         }
+    }
+
+    /// Publishes the agent's work and sends the terminal report.
+    ///
+    /// Commits on `swarm/<job_id>` beyond `origin/<base_ref>` are pushed to the job's repo
+    /// url. None gives a `SUCCEEDED` report with no branch and no pull request. Otherwise,
+    /// unless the job has `open_pr` off, `gh pr create` runs and the last stdout line that
+    /// is an `https` url becomes `pr_url`.
+    ///
+    /// No credentialed command runs in the agent's repo. A throwaway bare repo under the
+    /// jobs directory fetches the branch from the worktree with no tokens in the
+    /// environment. The push (`--no-verify`, no hooks path, no stored credential helper, no
+    /// global or system git config) and `gh` run from that repo with an allowlisted
+    /// environment, a scratch `HOME` and scratch config dirs. The push holds only
+    /// `GIT_ASKPASS` and `gh` only its own token, so config the agent planted cannot
+    /// capture a token. The push allows `file` and `https` remotes only. A failure sends a
+    /// `FAILED` report with a fixed error and the redacted, bounded tail of the helper's
+    /// stderr as one transcript chunk. The raw output goes nowhere else.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RunError`] when `shutdown` fires. A best-effort `FAILED` report is sent
+    /// first and the helper's process group is killed.
+    pub async fn finish(
+        &self,
+        job: &Job,
+        cwd: &Path,
+        shutdown: Shutdown,
+    ) -> Result<FinishOutcome, RunError> {
+        let mut stream = Stream::new(&self.reporter, job, self.config.terminal_report_timeout);
+        let mut ctl = Ctl {
+            deadline: Box::pin(tokio::time::sleep(self.config.finish_timeout)),
+            shutdown,
+        };
+        match ctl.race(self.publish(job, cwd)).await {
+            Ok(Ok(published)) => {
+                stream
+                    .terminal(Terminal {
+                        state: JobState::Succeeded,
+                        exit_code: Some(0),
+                        error: None,
+                        branch: published.branch.clone(),
+                        pr_url: published.pr_url.clone(),
+                    })
+                    .await;
+                Ok(FinishOutcome::Succeeded {
+                    branch: published.branch,
+                    pr_url: published.pr_url,
+                })
+            }
+            Ok(Err(failure)) => {
+                for line in failure.tail.lines() {
+                    stream.push(&self.redactor, line);
+                }
+                stream.fail(None, failure.error).await;
+                Ok(FinishOutcome::Failed {
+                    error: failure.error,
+                })
+            }
+            Err(Stop::Timeout) => {
+                stream.fail(None, ERR_FINISH_TIMEOUT).await;
+                Ok(FinishOutcome::Failed {
+                    error: ERR_FINISH_TIMEOUT,
+                })
+            }
+            Err(Stop::Shutdown) => {
+                stream.fail(None, ERR_SHUTDOWN).await;
+                Err(RunError)
+            }
+        }
+    }
+
+    async fn publish(&self, job: &Job, cwd: &Path) -> Result<Published, Failure> {
+        validate_job_id(&job.job_id).map_err(|_| Failure::bare(ERR_COMMITS))?;
+        validate_repo(&job.repo).map_err(|_| Failure::bare(ERR_PUSH))?;
+        validate_ref(&job.base_ref).map_err(|_| Failure::bare(ERR_COMMITS))?;
+        let branch = format!("swarm/{}", job.job_id);
+        let scratch = Scratch::create(cwd, &job.job_id).map_err(|()| Failure::bare(ERR_COMMITS))?;
+        let dir = scratch.path();
+        if !self.ahead(job, &branch, cwd, dir).await? {
+            return Ok(Published {
+                branch: None,
+                pr_url: None,
+            });
+        }
+        let refspec = format!("refs/heads/{branch}:refs/heads/{branch}");
+        let pushed = self
+            .helper(
+                &self.config.git_bin,
+                dir,
+                &[
+                    "-c",
+                    "core.hooksPath=/dev/null",
+                    "-c",
+                    "core.fsmonitor=",
+                    "-c",
+                    "credential.helper=",
+                    "push",
+                    "--quiet",
+                    "--no-verify",
+                    "--",
+                    &job.repo,
+                    &refspec,
+                ],
+                Scope::Push,
+            )
+            .await
+            .map_err(|e| e.failure(ERR_PUSH))?;
+        if !pushed.success {
+            return Err(Failure::tail(ERR_PUSH, &pushed.stderr));
+        }
+        if !job.open_pr {
+            return Ok(Published {
+                branch: Some(branch),
+                pr_url: None,
+            });
+        }
+        let pr_url = self.open_pr(job, &branch, dir).await?;
+        Ok(Published {
+            branch: Some(branch),
+            pr_url: Some(pr_url),
+        })
+    }
+
+    async fn ahead(
+        &self,
+        job: &Job,
+        branch: &str,
+        cwd: &Path,
+        dir: &Path,
+    ) -> Result<bool, Failure> {
+        self.helper(
+            &self.config.git_bin,
+            dir,
+            &["init", "--bare", "--quiet"],
+            Scope::Clean,
+        )
+        .await
+        .map_err(|e| e.failure(ERR_COMMITS))?;
+        let worktree = cwd.to_str().ok_or_else(|| Failure::bare(ERR_COMMITS))?;
+        let head = format!("+refs/heads/{branch}:refs/heads/{branch}");
+        let base = format!(
+            "+refs/remotes/origin/{base}:refs/remotes/origin/{base}",
+            base = job.base_ref
+        );
+        let fetched = self
+            .helper(
+                &self.config.git_bin,
+                dir,
+                &[
+                    "-c",
+                    "core.hooksPath=/dev/null",
+                    "-c",
+                    "core.fsmonitor=",
+                    "-c",
+                    "core.sshCommand=",
+                    "-c",
+                    "credential.helper=",
+                    "fetch",
+                    "--quiet",
+                    "--no-tags",
+                    "--no-recurse-submodules",
+                    "--",
+                    worktree,
+                    &head,
+                    &base,
+                ],
+                Scope::Clean,
+            )
+            .await
+            .map_err(|e| e.failure(ERR_COMMITS))?;
+        if !fetched.success {
+            return Err(Failure::bare(ERR_COMMITS));
+        }
+        let range = format!("refs/remotes/origin/{}..refs/heads/{branch}", job.base_ref);
+        let counted = self
+            .helper(
+                &self.config.git_bin,
+                dir,
+                &["rev-list", "--count", &range],
+                Scope::Clean,
+            )
+            .await
+            .map_err(|e| e.failure(ERR_COMMITS))?;
+        let count = counted.stdout.trim();
+        if !counted.success || count.is_empty() || !count.bytes().all(|b| b.is_ascii_digit()) {
+            return Err(Failure::bare(ERR_COMMITS));
+        }
+        Ok(!count.bytes().all(|b| b == b'0'))
+    }
+
+    async fn open_pr(&self, job: &Job, branch: &str, dir: &Path) -> Result<String, Failure> {
+        let subject = self
+            .helper(
+                &self.config.git_bin,
+                dir,
+                &["log", "-1", "--format=%s", &format!("refs/heads/{branch}")],
+                Scope::Clean,
+            )
+            .await
+            .map_err(|e| e.failure(ERR_PR))?;
+        let title: String = match subject.stdout.trim() {
+            "" => branch,
+            line => line,
+        }
+        .chars()
+        .take(MAX_TITLE_CHARS)
+        .collect();
+        let created = self
+            .helper(
+                &self.config.gh_bin,
+                dir,
+                &[
+                    "pr",
+                    "create",
+                    "--repo",
+                    &job.repo,
+                    "--head",
+                    branch,
+                    "--base",
+                    &job.base_ref,
+                    "--title",
+                    &title,
+                    "--body",
+                    &format!("Fleet job {}", job.job_id),
+                ],
+                Scope::Gh,
+            )
+            .await
+            .map_err(|e| e.failure(ERR_PR))?;
+        if !created.success {
+            return Err(Failure::tail(ERR_PR, &created.stderr));
+        }
+        pr_url(&created.stdout).ok_or_else(|| Failure::bare(ERR_PR_URL))
+    }
+
+    async fn helper(
+        &self,
+        bin: &Path,
+        dir: &Path,
+        args: &[&str],
+        scope: Scope,
+    ) -> Result<Captured, CaptureError> {
+        let home = dir.join(HOME_DIR);
+        let mut command = Command::new(bin);
+        command
+            .current_dir(dir)
+            .args(args)
+            .env_clear()
+            .env("HOME", &home)
+            .env("XDG_CONFIG_HOME", home.join(".config"))
+            .env("XDG_CACHE_HOME", home.join(".cache"))
+            .env("XDG_DATA_HOME", home.join(".local"))
+            .env("XDG_STATE_HOME", home.join(".state"))
+            .env("GIT_DIR", dir)
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env("GIT_TERMINAL_PROMPT", "0")
+            .env("GH_PROMPT_DISABLED", "1");
+        let allowed: &[&str] = match scope {
+            Scope::Clean => &CLEAN_ENV,
+            Scope::Push => &PUSH_ENV,
+            Scope::Gh => &GH_ENV,
+        };
+        let kept = |name: &OsString| allowed.iter().any(|keep| name == keep);
+        command.envs(
+            self.config
+                .base_env
+                .iter()
+                .filter(|(name, _)| kept(name))
+                .map(|(name, value)| (name, value)),
+        );
+        match scope {
+            Scope::Clean => command.env("GIT_ALLOW_PROTOCOL", "file"),
+            Scope::Push => command.env("GIT_ALLOW_PROTOCOL", "file:https"),
+            Scope::Gh => command
+                .env("GH_CONFIG_DIR", dir.join(GH_CONFIG_DIR))
+                .env("GH_NO_UPDATE_NOTIFIER", "1")
+                .env("GH_BROWSER", "true")
+                .env("GH_EDITOR", "true")
+                .env("GH_PAGER", "cat")
+                .env("PAGER", "cat"),
+        };
+        capture(command, self.config.finish_timeout).await
     }
 
     async fn drive(
@@ -475,26 +811,137 @@ impl<'a, R: Reporter> Stream<'a, R> {
     }
 
     async fn fail(&mut self, exit_code: Option<i32>, error: &'static str) -> AgentOutcome {
-        let bound = self.terminal_timeout;
-        if tokio::time::timeout(bound, self.send_terminal(exit_code, error))
-            .await
-            .is_err()
-        {
-            tracing::warn!("job failure report timed out");
-        }
+        self.terminal(Terminal {
+            state: JobState::Failed,
+            exit_code,
+            error: Some(error),
+            branch: None,
+            pr_url: None,
+        })
+        .await;
         AgentOutcome::Failed { exit_code, error }
     }
 
-    async fn send_terminal(&mut self, exit_code: Option<i32>, error: &'static str) {
-        self.send_pending().await;
-        let mut request = self.request(Vec::new());
-        request.terminal_state = Some(JobState::Failed.into());
-        request.error = Some(error.to_owned());
-        request.exit_code = exit_code;
-        if let Err(status) = self.reporter.report(request).await {
-            tracing::warn!(code = ?status.code(), "job failure report failed");
+    async fn terminal(&mut self, end: Terminal) {
+        let bound = self.terminal_timeout;
+        if tokio::time::timeout(bound, self.send_terminal(end))
+            .await
+            .is_err()
+        {
+            tracing::warn!("job terminal report timed out");
         }
     }
+
+    async fn send_terminal(&mut self, end: Terminal) {
+        self.send_pending().await;
+        let mut request = self.request(Vec::new());
+        request.terminal_state = Some(end.state.into());
+        request.error = end.error.map(str::to_owned);
+        request.exit_code = end.exit_code;
+        request.branch = end.branch;
+        request.pr_url = end.pr_url;
+        if let Err(status) = self.reporter.report(request).await {
+            tracing::warn!(code = ?status.code(), "job terminal report failed");
+        }
+    }
+}
+
+struct Terminal {
+    state: JobState,
+    exit_code: Option<i32>,
+    error: Option<&'static str>,
+    branch: Option<String>,
+    pr_url: Option<String>,
+}
+
+struct Published {
+    branch: Option<String>,
+    pr_url: Option<String>,
+}
+
+#[derive(Clone, Copy)]
+enum Scope {
+    Clean,
+    Push,
+    Gh,
+}
+
+trait IntoFailure {
+    fn failure(self, start: &'static str) -> Failure;
+}
+
+impl IntoFailure for CaptureError {
+    fn failure(self, start: &'static str) -> Failure {
+        match self {
+            Self::Start => Failure::bare(start),
+            Self::Timeout => Failure::bare(ERR_FINISH_TIMEOUT),
+        }
+    }
+}
+
+const HOME_DIR: &str = "home";
+const GH_CONFIG_DIR: &str = "gh";
+
+struct Scratch(PathBuf);
+
+impl Scratch {
+    fn create(cwd: &Path, job_id: &str) -> Result<Self, ()> {
+        let parent = cwd.parent().ok_or(())?;
+        let path = parent.join(format!(".finish-{job_id}"));
+        let _ = std::fs::remove_dir_all(&path);
+        std::fs::create_dir(&path).map_err(|_| ())?;
+        for sub in [HOME_DIR, GH_CONFIG_DIR] {
+            std::fs::create_dir(path.join(sub)).map_err(|_| ())?;
+        }
+        Ok(Self(path))
+    }
+
+    fn path(&self) -> &Path {
+        &self.0
+    }
+}
+
+impl Drop for Scratch {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
+struct Failure {
+    error: &'static str,
+    tail: String,
+}
+
+impl Failure {
+    fn bare(error: &'static str) -> Self {
+        Self {
+            error,
+            tail: String::new(),
+        }
+    }
+
+    fn tail(error: &'static str, stderr: &str) -> Self {
+        let mut start = stderr.len().saturating_sub(TAIL_BYTES);
+        while !stderr.is_char_boundary(start) {
+            start += 1;
+        }
+        Self {
+            error,
+            tail: stderr[start..].to_owned(),
+        }
+    }
+}
+
+fn pr_url(stdout: &str) -> Option<String> {
+    let line = stdout
+        .lines()
+        .rev()
+        .map(str::trim)
+        .find(|l| !l.is_empty())?;
+    let plain = line.len() <= MAX_PR_URL_BYTES
+        && line.starts_with("https://")
+        && !line.chars().any(|c| c.is_control() || c.is_whitespace());
+    plain.then(|| line.to_owned())
 }
 
 fn assistant_text(line: &str) -> Option<String> {

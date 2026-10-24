@@ -31,11 +31,11 @@ Recorded 2026-10-24 when the plan moved into the public repo.
 
 ## Amendments (job system)
 
-ADRs 0020 to 0024 reopen the v1 cut for Jobs. They are planned, not built. The v1 cut below is unchanged and describes v1.
+ADRs 0020 to 0024 reopen the v1 cut for Jobs. The workspace, runner, push and pull request step, poller and gRPC reporter of ADR-0020 and ADR-0024 are built as library code, daemon wiring pending; the rest is planned, not built. The v1 cut below is unchanged and describes v1.
 
 - **Out of v1 list.** `FleetJobs`, `ClaimJob`, claim and lease are designed in ADR-0021. `RenewLease` is replaced by `ReportJob`. Drain, the KEDA seam, `GetPreview` and `ListEvents` stay out.
 - **pueue and `fleet-job`.** Jobs no longer run as pueue tasks. fleetd runs them as child processes in git worktrees (ADR-0020). The non-goal "Jobs stay pueue tasks" is superseded for Jobs.
-- **Git.** The non-goal "fleetd pushing to git or holding git credentials" is superseded. fleetd pushes only `swarm/<job_id>` after the agent exits and holds a fine-grained token (ADR-0020, ADR-0024).
+- **Git.** The non-goal "fleetd pushing to git or holding git credentials" is superseded. Once the runner is wired into the daemon, fleetd pushes only `swarm/<job_id>` after the agent exits and holds a fine-grained token (ADR-0020, ADR-0024).
 - **Transcripts.** The non-goal "Storing transcripts on the server" is superseded for Job output, which the server stores at up to 4 MiB per Job (ADR-0022).
 - **Auth.** The single shared token becomes two scopes, box and client (ADR-0023).
 - **States.** The lifecycle drops `CLAIMED`. The lease is 120 s, renewed by `ReportJob`, with a 15 s reaper (ADR-0021). `retry_on_lost`, priority, `max_attempts` and `job_attempts` are cut.
@@ -78,7 +78,7 @@ Non-goals:
 
 - Remote Control. Out of scope.
 - Moving where Jobs run. Jobs stay pueue tasks, interactive agents stay workmux in tmux.
-- fleetd pushing to git or holding git credentials. Results leave the Box only through git remotes (see Background).
+- fleetd pushing to git or holding git credentials (superseded in part, see ADR-0020 and ADR-0024). Results leave the Box only through git remotes (see Background).
 - Storing transcripts on the server. They stay on the Box under `transcript_path`. fleetd reads them for derived preview text and a timeline only.
 - Autoscaling Boxes. Scale stays the Box count plus apply. The queue seam only exposes depth.
 - A web UI. The laptop `fleet` CLI is the only client for now.
@@ -318,7 +318,7 @@ Rules:
 
 ### Config
 
-`/etc/fleetd/config.toml`, baked. Fields: `server_url` (default from `FLEET_SERVER_URL`, any routable address or name, so an address change needs no rebuild and no VPN feature is assumed), `http_port`, `socket_path`, `queue_max_bytes`, `queue_max_age`, `hook_events` allowlist (provisional default in decision 6), `heartbeat_interval`, `transcript_read_delay` (default 2 s), `pueue_group` (default `fleet`), `reconcile_interval` (default 45 s), `stall_after` (default 10 min), `end_grace` (default two passes), `redact_files` (default `/etc/swarm/secrets.env`). Environment from `/etc/swarm/box.env`, including `FLEET_SERVER_URL` and `FLEET_BOX_NAME`. The bearer token is `FLEET_TOKEN` in `/etc/swarm/secrets.env`. No secret in this file.
+`/etc/fleetd/config.toml`, baked. Fields: `server_url` (default from `FLEET_SERVER_URL`, any routable address or name, so an address change needs no rebuild and no VPN feature is assumed), `http_port`, `socket_path`, `queue_max_bytes`, `queue_max_age`, `hook_events` allowlist (provisional default in decision 6), `heartbeat_interval`, `transcript_read_delay` (default 2 s), `pueue_group` (default `fleet`), `reconcile_interval` (default 45 s), `stall_after` (default 10 min), `end_grace` (default two passes), `redact_files` (default `/etc/swarm/secrets.env`), `gh_bin`, `claude_bin`, `disposable`. Environment from `/etc/swarm/box.env`, including `FLEET_SERVER_URL` and `FLEET_BOX_NAME`. The bearer token is `FLEET_TOKEN` in `/etc/swarm/secrets.env`. No secret in this file.
 
 ### systemd unit
 
@@ -471,7 +471,7 @@ Parked sketch, no further design: KEDA is driven through the server. fleetd on t
 - **Sensitive content.** Prompts, `last_assistant_message` and transcript-derived preview text reach the server. The server has no public ingress and is reachable only over the VPN. The database is treated like the Box credentials in sensitivity.
 - **Transport.** Plain gRPC over any routable path. TLS is optional and set by the deployment. The VPN, whichever it is, protects the link, and the plan assumes nothing about which. Without TLS the bearer token crosses the VPN in clear text.
 - **Authorization.** One shared bearer token covers ingest, job claim, query and job control (decided 2026-10-24, ADR-0014). Any holder can read every Box's data and submit or cancel Jobs. A claim returns only the claiming Box's Job, and ingest and claim reject a `box` that does not match `box-<n>`. A read-only credential is a later upgrade.
-- **Git.** fleetd never pushes and holds no git credential. It runs read-only git commands to count unpushed commits. That rule is unchanged.
+- **Git.** fleetd never pushes and holds no git credential in v1. It runs read-only git commands to count unpushed commits. ADR-0020 and ADR-0024 supersede this in part (built as library code, daemon wiring pending).
 - **Blast radius.** fleetd runs as `agent`, the same as workers. It adds no privilege and exposes no new inbound port beyond loopback.
 - **Secrets never printed.** fleetd logs event ids and types, never payloads, at default level.
 
@@ -609,7 +609,7 @@ Numbering continues the list above. All Decided 2026-10-24.
 
 ## ADRs
 
-All Accepted on 2026-10-24, 0011 to 0024. ADRs 0020 to 0024 are planned, not built. Index and status in `docs/adr/README.md`.
+All Accepted on 2026-10-24, 0011 to 0024. ADRs 0021 to 0023 are planned, not built. ADRs 0020 and 0024 are built as library code, daemon wiring pending. Index and status in `docs/adr/README.md`.
 
 | ADR | Title | Relation |
 |---|---|---|
@@ -622,11 +622,11 @@ All Accepted on 2026-10-24, 0011 to 0024. ADRs 0020 to 0024 are planned, not bui
 | 0017 | Public repo and mise distribution | New. The pinned fleetd comes from a public release through mise. Licence Apache-2.0 |
 | 0018 | Ingest protocol | New. Unary `PushEvents`, per-batch ack. Supersedes the stream and ack parts of 0012 and the forwarder section of this plan |
 | 0019 | Events storage | New. Unpartitioned `events`, delete-based retention, box status computed on read. Supersedes the monthly-partition line of 0013 |
-| 0020 | Job runner in fleetd | New, planned. fleetd child process in a git worktree, no pueue or `fleet-job`. Supersedes the "No git" rule of 0011 in part |
+| 0020 | Job runner in fleetd | New, built as library code, daemon wiring pending. fleetd child process in a git worktree, no pueue or `fleet-job`. Supersedes the "No git" rule of 0011 in part |
 | 0021 | Job protocol | New, planned. `FleetJobs`, `FleetWorker`, `ReportJob`, 120 s lease, 15 s reaper. Supersedes the claim sketch of 0016 |
 | 0022 | Job transcripts on the server | New, planned. Stream-json chunks in Postgres, 4 MiB cap. Amends 0013 |
 | 0023 | Two bearer token scopes | New, planned. Box and client tokens. Amends 0014 |
-| 0024 | Job git credentials and permission policy | New, planned. Fine-grained PAT stripped from the agent environment, disposable Box flag. Amends 0011 |
+| 0024 | Job git credentials and permission policy | New, built as library code, daemon wiring pending. Fine-grained PAT stripped from the agent environment, disposable Box flag. Amends 0011 |
 
 Relation to the existing setup: the ssh polling in the picker conflicts with ADR-0015, hence the partial replacement. The existing design deferred `fleet-job` to its first phase. This plan builds it in Phase 3 of the fleetd rollout, which still fits. A pending check on the `workmux status --json` schema is absorbed by T5. Workers use the full global config, so hooks in the baked `settings.json` fire on the Box. Workmux hooks failing harmlessly on a Box is a pre-existing item and is orthogonal.
 

@@ -15,9 +15,10 @@ use fleet_proto::v1::fleet_worker_server::{FleetWorker, FleetWorkerServer};
 use fleet_proto::v1::{ClaimJobReply, ClaimJobRequest, Job, ReportJobReply, ReportJobRequest};
 use fleetd::backoff::Random;
 use fleetd::poller::{
-    Claimed, JobRunner, MAX_IDLE_WAIT, PollRandom, Poller, REQUEST_TIMEOUT, RunError,
+    Claimed, GrpcReporter, JobRunner, MAX_IDLE_WAIT, PollRandom, Poller, REQUEST_TIMEOUT, RunError,
     SHUTDOWN_GRACE, Shutdown, Token,
 };
+use fleetd::runner::Reporter;
 use hyper_util::rt::TokioIo;
 use tokio::io::DuplexStream;
 use tokio::net::TcpListener;
@@ -56,6 +57,7 @@ struct Shared {
     script: Mutex<VecDeque<Step>>,
     times: Mutex<Vec<Instant>>,
     auth: Mutex<Vec<String>>,
+    report_auth: Mutex<Vec<String>>,
     arrived: Notify,
 }
 
@@ -113,9 +115,23 @@ impl FleetWorker for Stub {
 
     async fn report_job(
         &self,
-        _request: Request<ReportJobRequest>,
+        request: Request<ReportJobRequest>,
     ) -> Result<Response<ReportJobReply>, Status> {
-        Err(Status::unimplemented("not used"))
+        let header = request
+            .metadata()
+            .get("authorization")
+            .and_then(|value| value.to_str().ok())
+            .unwrap_or_default()
+            .to_owned();
+        self.0
+            .report_auth
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .push(header);
+        Ok(Response::new(ReportJobReply {
+            acked_through_seq: request.into_inner().job_id.len() as u64,
+            ..ReportJobReply::default()
+        }))
     }
 }
 
@@ -642,4 +658,25 @@ async fn a_non_http_scheme_is_rejected_without_echoing_the_url() {
             "url {url}"
         );
     }
+}
+
+#[tokio::test]
+async fn grpc_reporter_sends_report_job_with_the_bearer_token() -> Test {
+    let rig = rig(Vec::new());
+    let reporter = GrpcReporter::new(rig.channel.clone(), &Token::new(SECRET))?;
+    let reply = reporter
+        .report(ReportJobRequest {
+            job_id: "job-abc".into(),
+            ..ReportJobRequest::default()
+        })
+        .await?;
+    assert_eq!(reply.acked_through_seq, 7);
+    let seen = rig
+        .shared
+        .report_auth
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .clone();
+    assert_eq!(seen, [format!("Bearer {SECRET}")]);
+    Ok(())
 }

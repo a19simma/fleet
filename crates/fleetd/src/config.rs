@@ -14,6 +14,7 @@ const DEFAULT_QUEUE_MAX_BYTES: u64 = 256 * 1024 * 1024;
 const DEFAULT_QUEUE_MAX_AGE_SECS: u64 = 14 * 24 * 60 * 60;
 const DEFAULT_DEDUPE_SECS: u64 = 10;
 const DEFAULT_CLAUDE_BIN: &str = "claude";
+const DEFAULT_GH_BIN: &str = "gh";
 const DEFAULT_HOOK_EVENTS: [&str; 5] = [
     "SessionStart",
     "UserPromptSubmit",
@@ -35,6 +36,7 @@ struct FileConfig {
     box_name: Option<String>,
     dedupe_window_secs: Option<u64>,
     claude_bin: Option<PathBuf>,
+    gh_bin: Option<PathBuf>,
     disposable: Option<bool>,
 }
 
@@ -70,6 +72,8 @@ pub struct Config {
     pub dedupe_window: Duration,
     /// Agent binary that runs jobs.
     pub claude_bin: PathBuf,
+    /// GitHub CLI binary that opens pull requests, `gh` by default.
+    pub gh_bin: PathBuf,
     /// True when the box is disposable, which lets jobs run with permission checks off.
     pub disposable: bool,
 }
@@ -181,6 +185,7 @@ impl Config {
             claude_bin: file
                 .claude_bin
                 .unwrap_or_else(|| PathBuf::from(DEFAULT_CLAUDE_BIN)),
+            gh_bin: file.gh_bin.unwrap_or_else(|| PathBuf::from(DEFAULT_GH_BIN)),
             disposable: file.disposable.unwrap_or(false),
         })
     }
@@ -230,10 +235,12 @@ mod tests {
     fn job_settings_default_to_a_cautious_agent() {
         let cfg = Config::resolve(None, &env_of(&[])).unwrap();
         assert_eq!(cfg.claude_bin, PathBuf::from("claude"));
+        assert_eq!(cfg.gh_bin, PathBuf::from("gh"));
         assert!(!cfg.disposable);
-        let file = "claude_bin = \"/opt/claude\"\ndisposable = true\n";
+        let file = "claude_bin = \"/opt/claude\"\ngh_bin = \"/opt/gh\"\ndisposable = true\n";
         let cfg = Config::resolve(Some(file), &env_of(&[])).unwrap();
         assert_eq!(cfg.claude_bin, PathBuf::from("/opt/claude"));
+        assert_eq!(cfg.gh_bin, PathBuf::from("/opt/gh"));
         assert!(cfg.disposable);
     }
 

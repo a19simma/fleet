@@ -214,7 +214,7 @@ fn fnv1a(bytes: &[u8]) -> u64 {
     })
 }
 
-fn validate_job_id(id: &str) -> Result<(), WorkspaceError> {
+pub(crate) fn validate_job_id(id: &str) -> Result<(), WorkspaceError> {
     let ok = !id.is_empty()
         && id.len() <= MAX_JOB_ID_LEN
         && id.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_');
@@ -225,7 +225,7 @@ fn validate_job_id(id: &str) -> Result<(), WorkspaceError> {
     }
 }
 
-fn validate_repo(repo: &str) -> Result<(), WorkspaceError> {
+pub(crate) fn validate_repo(repo: &str) -> Result<(), WorkspaceError> {
     let plain = !repo.is_empty()
         && !repo.starts_with('-')
         && !repo.contains("::")
@@ -241,7 +241,7 @@ fn validate_repo(repo: &str) -> Result<(), WorkspaceError> {
     Ok(())
 }
 
-fn validate_ref(name: &str) -> Result<(), WorkspaceError> {
+pub(crate) fn validate_ref(name: &str) -> Result<(), WorkspaceError> {
     let ok = !name.is_empty()
         && !name.starts_with('-')
         && !name.starts_with('/')

@@ -1,8 +1,11 @@
 //! fleetd: the per-box Fleet daemon.
 //!
 //! Hooks and local tools post events. fleetd normalizes and redacts them, then commits
-//! each to a SQLite queue before it answers. The job side claims jobs ([`poller`]), prepares
-//! git worktrees ([`workspace`]) and runs the agent as a child process ([`runner`]).
+//! each to a SQLite queue before it answers.
+//!
+//! The job side exists as library modules only: [`poller`] claims jobs, [`workspace`] prepares
+//! git worktrees, and [`runner`] runs the agent as a child process, then pushes the branch and
+//! opens the pull request. No daemon runtime path calls them yet; daemon wiring is pending.
 
 mod app;
 pub mod backoff;
@@ -16,6 +19,7 @@ pub mod heartbeat;
 mod hook;
 pub mod http1;
 pub mod poller;
+mod proc;
 pub mod runner;
 mod runtime;
 mod store;
