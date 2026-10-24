@@ -19,7 +19,7 @@ These sent earlier work back for a retry. Check each before you commit.
 7. **Duplicate validation.** Validate each input once, at the boundary, and carry the validated type. A second check in a service handler gets flagged.
 8. **Drift in comments and docs.** When behaviour changes, rewrite the rustdoc that described the old behaviour, ADR status lines, and `docs/adr/README.md` rows in the same commit.
 9. **Test binaries that spawn and bind.** On macOS a test binary that both spawns child processes and creates or drops unix sockets can leak fds to the child. Put spawn tests in their own file under `tests/`.
-10. **Lints.** CI clippy is newer than most local toolchains: no `unwrap` or `expect` in tests without `#[expect(lint, reason = "...")]`, keep the first doc paragraph short, and avoid `pub` items in private modules (`unreachable_pub` and `redundant_pub_crate` conflict: use `#[expect]`).
+10. **Lints.** CI clippy is newer than most local toolchains: no `unwrap` or `expect` in tests without `#[expect(lint, reason = "...")]`, keep the first doc paragraph short, and avoid `pub` items in private modules (`unreachable_pub` and `redundant_pub_crate` conflict: use `#[expect]`). A fake in a private trait's test impl that never awaits trips `unused_async_trait_impl`: return `std::future::ready(..)` from a plain `fn`.
 11. **Retry loops that reset on the wrong signal.** Reset a backoff only after the work succeeds, never when it is handed out: resetting on a claimed job let a crash-looping runner claim every 0.5 s. Cap any server-supplied wait (`next_in_s`) so a bad value cannot stall the loop. Test both with a failing runner and a huge value, and mutate the reset to see them fail.
 
 ## Style

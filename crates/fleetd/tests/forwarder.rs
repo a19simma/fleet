@@ -10,6 +10,7 @@ use std::time::Duration;
 use fleet_core::{Envelope, Identity, Source};
 use fleet_proto::v1::fleet_ingest_server::{FleetIngest, FleetIngestServer};
 use fleet_proto::v1::{HeartbeatReply, HeartbeatRequest, PushEventsReply, PushEventsRequest};
+use fleetd::backoff::{Random, SystemRandom};
 use fleetd::forwarder::{self, Batching, Ingest, MAX_MESSAGE_BYTES};
 use fleetd::{Error, Limits, Store, fresh_id, now_ms};
 use prost::Message;
@@ -17,7 +18,7 @@ use serde_json::json;
 use sqlx::ConnectOptions;
 use sqlx::sqlite::SqliteConnectOptions;
 use tempfile::TempDir;
-use tokio::sync::{Notify, oneshot};
+use tokio::sync::{Notify, oneshot, watch};
 use tonic::transport::server::TcpIncoming;
 use tonic::transport::{Endpoint, Server};
 use tonic::{Code, Request, Response, Status};
@@ -34,6 +35,7 @@ enum Mode {
     AckAboveSent(u64),
     AckFirst(usize),
     Fail,
+    Invalid,
     Hang,
 }
 
@@ -99,6 +101,7 @@ impl FleetIngest for Stub {
             Mode::AckAboveSent(extra) => through + extra,
             Mode::AckFirst(count) => seqs.get(count - 1).copied().unwrap(),
             Mode::Fail => return Err(Status::internal("SECRET-SERVER-DETAIL")),
+            Mode::Invalid => return Err(Status::invalid_argument("SECRET-SERVER-DETAIL")),
             Mode::Hang => {
                 self.entered.notify_one();
                 std::future::pending::<()>().await;
@@ -118,6 +121,14 @@ impl FleetIngest for Stub {
         _request: Request<HeartbeatRequest>,
     ) -> Result<Response<HeartbeatReply>, Status> {
         Err(Status::unimplemented("not needed"))
+    }
+}
+
+struct Fixed(f64);
+
+impl Random for Fixed {
+    fn next_unit(&mut self) -> f64 {
+        self.0
     }
 }
 
@@ -356,16 +367,24 @@ async fn run_flushes_a_partial_batch_after_the_wait() {
         ..Batching::default()
     };
     let (stop, stopped) = oneshot::channel::<()>();
+    let (drained, mut first) = watch::channel(0);
     let task = tokio::spawn({
         let (store, mut client) = (store.clone(), client.clone());
         async move {
-            forwarder::run(&store, &mut client, &batching, async {
-                stopped.await.ok();
-            })
+            forwarder::run_observed(
+                &store,
+                &mut client,
+                &batching,
+                SystemRandom::new(),
+                &drained,
+                async {
+                    stopped.await.ok();
+                },
+            )
             .await;
         }
     });
-    tokio::task::yield_now().await;
+    within(first.changed()).await.unwrap();
 
     for _ in 0..3 {
         store.enqueue(&envelope(10), now_ms()).await.unwrap();
@@ -408,4 +427,121 @@ async fn shutdown_does_not_wait_for_a_hung_call() {
 
     within(task).await.unwrap();
     assert_eq!(store.count().await.unwrap(), 2);
+}
+
+async fn raw_row(dir: &TempDir, name: &str) {
+    let mut raw = SqliteConnectOptions::new()
+        .filename(dir.path().join("queue.db"))
+        .connect()
+        .await
+        .unwrap();
+    sqlx::query(
+        "INSERT INTO events (id, ts, kind, priority, payload) VALUES (?, ?, 'x', 0, '{\"a\":1}')",
+    )
+    .bind(name)
+    .bind(i64::try_from(now_ms()).unwrap())
+    .execute(&mut raw)
+    .await
+    .unwrap();
+}
+
+#[tokio::test]
+async fn invalid_argument_keeps_queue() {
+    let dir = TempDir::new().unwrap();
+    let store = store_with(&dir, 3, 10).await;
+    let stub = Stub::new(Mode::Invalid);
+    let client = serve(&stub);
+
+    let mut direct = client.clone();
+    let err = within(forwarder::send_batch(
+        &store,
+        &mut direct,
+        &Batching::default(),
+    ))
+    .await
+    .unwrap_err();
+    let shown = err.to_string();
+    assert!(!shown.contains("SECRET-SERVER-DETAIL"), "{shown}");
+    assert!(
+        matches!(&err, Error::Rpc(status) if status.code() == Code::InvalidArgument),
+        "{shown}"
+    );
+    assert_eq!(store.count().await.unwrap(), 3);
+
+    let batching = Batching {
+        max_wait: Duration::from_secs(60),
+        ..Batching::default()
+    };
+    let (stop, stopped) = oneshot::channel::<()>();
+    let task = tokio::spawn({
+        let (store, mut client) = (store.clone(), client.clone());
+        async move {
+            forwarder::run_with(&store, &mut client, &batching, Fixed(0.01), async {
+                stopped.await.ok();
+            })
+            .await;
+        }
+    });
+    within(async {
+        while stub.log().len() < 5 {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await;
+    stop.send(()).unwrap();
+    within(task).await.unwrap();
+
+    assert_eq!(store.count().await.unwrap(), 3);
+    let calls = stub.log();
+    assert!(calls.iter().all(|call| call.seqs == calls[0].seqs));
+}
+
+#[tokio::test]
+async fn a_lone_oversized_event_stays_queued() {
+    let dir = TempDir::new().unwrap();
+    let store = store_with(&dir, 1, MAX_MESSAGE_BYTES + 1024).await;
+    let stub = Stub::new(Mode::Ack);
+    let mut client = serve(&stub);
+
+    let err = within(forwarder::send_batch(
+        &store,
+        &mut client,
+        &Batching::default(),
+    ))
+    .await
+    .unwrap_err();
+
+    assert!(matches!(&err, Error::Rpc(_)), "{err}");
+    assert_eq!(store.count().await.unwrap(), 1);
+    assert!(stub.sizes().is_empty());
+}
+
+#[tokio::test]
+async fn undecodable_rows_mixed_with_good_rows_are_skipped_then_dropped() {
+    let dir = TempDir::new().unwrap();
+    let store = store_with(&dir, 0, 0).await;
+    raw_row(&dir, "raw-a").await;
+    store.enqueue(&envelope(10), now_ms()).await.unwrap();
+    raw_row(&dir, "raw-b").await;
+    store.enqueue(&envelope(10), now_ms()).await.unwrap();
+    raw_row(&dir, "raw-c").await;
+    let stub = Stub::new(Mode::Ack);
+    let mut client = serve(&stub);
+    let batching = Batching::default();
+
+    let first = within(forwarder::send_batch(&store, &mut client, &batching))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!((first.events, first.deleted), (2, 4));
+    assert_eq!(store.count().await.unwrap(), 1);
+
+    let second = within(forwarder::send_batch(&store, &mut client, &batching))
+        .await
+        .unwrap()
+        .unwrap();
+
+    assert_eq!((second.events, second.deleted), (0, 1));
+    assert_eq!(store.count().await.unwrap(), 0);
+    assert_eq!(stub.sizes(), vec![2]);
 }

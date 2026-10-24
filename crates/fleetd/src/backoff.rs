@@ -1,4 +1,4 @@
-//! Full-jitter exponential backoff used by the job poller.
+//! Full-jitter exponential backoff used by the job poller and the event forwarder.
 //!
 //! The delay ceiling starts at one second and doubles on every failure until it reaches
 //! five minutes. Each delay is drawn uniformly from zero up to the current ceiling. A
@@ -143,7 +143,7 @@ mod tests {
 
     #[test]
     fn standard_is_one_second_to_five_minutes() {
-        let mut backoff = Backoff::standard(Fixed(1.0));
+        let mut backoff = Backoff::standard(Fixed(0.999));
         assert_eq!(backoff.ceiling(), Duration::from_secs(1));
         for _ in 0..40 {
             backoff.next_delay();

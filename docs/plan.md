@@ -240,7 +240,7 @@ SQLite in WAL mode at `/var/lib/fleetd/queue.db` (systemd `StateDirectory=fleetd
 
 - Unary `PushEvents` calls (ADR-0018). Batches of up to 100 events or 256 KiB or 500 ms, one box per batch. fleetd reads the batch with a read-only head peek and keeps no per-row delivery state in the queue.
 - A reply acks the batch through `acked_through_seq`. fleetd deletes every queued event with `seq` up to that value in one range delete, including any listed in `rejected`, which would never succeed.
-- Retry with exponential backoff, 1 s doubling to a 5 min cap, full jitter. Reset on first ack. The backoff is the forwarder's own in-memory state, not a column in the queue. `InvalidArgument` is not retried.
+- Retry with exponential backoff, 1 s doubling to a 5 min cap, full jitter. Reset on first ack. The backoff is the forwarder's own in-memory state, not a column in the queue. `InvalidArgument` never deletes rows: the batch stays queued and is retried on the same schedule.
 - No `Hello` and no server high-water mark. After a gap fleetd resends from its queue and the server dedupes on `(box, id)`.
 
 ### workmux watcher
