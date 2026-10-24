@@ -1,6 +1,7 @@
 //! The `fleet` command line client: job submission and inspection over gRPC.
 
 pub mod config;
+pub mod logs;
 
 use std::fmt;
 use std::io::{Read, Write};
@@ -67,6 +68,14 @@ pub enum Command {
         /// Job id.
         id: String,
     },
+    /// Print a job transcript.
+    Logs {
+        /// Job id.
+        id: String,
+        /// Keep polling until the job ends; exit nonzero unless it succeeded.
+        #[arg(short, long)]
+        follow: bool,
+    },
     /// Request cancellation of a job.
     Cancel {
         /// Job id.
@@ -87,6 +96,8 @@ pub enum CliError {
     Rpc(Status),
     /// Reading input or writing output failed.
     Io(std::io::Error),
+    /// A followed job ended in a state other than `SUCCEEDED`.
+    JobEnded(&'static str),
 }
 
 impl CliError {
@@ -94,7 +105,7 @@ impl CliError {
     pub fn exit_code(&self) -> u8 {
         match self {
             Self::Config(_) | Self::Usage(_) => 2,
-            Self::Connect(_) | Self::Rpc(_) | Self::Io(_) => 1,
+            Self::Connect(_) | Self::Rpc(_) | Self::Io(_) | Self::JobEnded(_) => 1,
         }
     }
 }
@@ -115,6 +126,7 @@ impl fmt::Display for CliError {
             Self::Connect(m) => write!(f, "cannot connect: {m}"),
             Self::Rpc(s) => write!(f, "server error {:?}: {}", s.code(), sanitize(s.message())),
             Self::Io(e) => write!(f, "{e}"),
+            Self::JobEnded(state) => write!(f, "job ended {state}"),
         }
     }
 }
@@ -303,6 +315,10 @@ pub async fn run(
                 .await?
                 .into_inner();
             write_status(out, &job)?;
+        }
+        Command::Logs { id, follow } => {
+            let mut client = session(server, insecure, lookup).await?;
+            logs::logs(&mut client, id, follow, out).await?;
         }
         Command::Cancel { id } => {
             let mut client = session(server, insecure, lookup).await?;

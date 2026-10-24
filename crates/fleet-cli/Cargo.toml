@@ -29,6 +29,7 @@ tonic = { workspace = true, features = ["tls-ring", "tls-webpki-roots"] }
 [dev-dependencies]
 rcgen = { version = "0.14.10", default-features = false, features = ["pem", "ring"] }
 tempfile.workspace = true
+tokio = { workspace = true, features = ["test-util"] }
 tokio-stream.workspace = true
 
 [lints]
