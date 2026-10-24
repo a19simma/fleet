@@ -1,0 +1,36 @@
+[Unit]
+Description=Fleet per-box daemon
+Wants=network-online.target user@1000.service
+After=network-online.target user@1000.service
+
+[Service]
+Type=notify
+User=agent
+Group=agent
+EnvironmentFile=-/etc/swarm/box.env
+Environment=XDG_RUNTIME_DIR=/run/user/1000
+ExecStart=/usr/local/bin/fleetd serve
+Restart=always
+RestartSec=2
+WatchdogSec=60
+TimeoutStopSec=15
+StateDirectory=fleetd
+RuntimeDirectory=fleetd
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=-/home/agent/.local/state/workmux
+UMask=0077
+StateDirectoryMode=0700
+RuntimeDirectoryMode=0700
+PrivateTmp=yes
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+CapabilityBoundingSet=
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+LockPersonality=yes
+RestrictSUIDSGID=yes
+
+[Install]
+WantedBy=multi-user.target

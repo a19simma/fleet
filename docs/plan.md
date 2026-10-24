@@ -1,6 +1,6 @@
 # Plan: fleetd and the fleet server
 
-Status: draft, plan only. Nothing here is built. ADRs 0011 to 0017 are Accepted (2026-10-24). Decisions answered on 2026-10-24 are marked Decided below. Phase 0 finished on 2026-10-24: all ten tests ran on one Box (Claude Code 2.1.289, workmux 0.1.276, pueue 4.0.4). The results are folded in below. The records are `docs/phase0/T1.md` to `T10.md` in this repo, indexed by `docs/phase0/README.md`.
+Status: draft. Phase 1 is in: the listeners, the SQLite queue and the hook normalizer. The pueue callback, forwarder, reconciler, watchers and heartbeat are not built. ADRs 0011 to 0017 are Accepted (2026-10-24). Decisions answered on 2026-10-24 are marked Decided below. Phase 0 finished on 2026-10-24: all ten tests ran on one Box (Claude Code 2.1.289, workmux 0.1.276, pueue 4.0.4). The results are folded in below. The records are `docs/phase0/T1.md` to `T10.md` in this repo, indexed by `docs/phase0/README.md`.
 
 v1 cut and recovery design added 2026-10-24 (see v1 cut). ADRs 0011 to 0017 flipped to Accepted on 2026-10-24.
 
@@ -168,12 +168,14 @@ Heartbeat and the box snapshot are state, not events. They go through the unary 
 
 ## fleetd internals
 
-Language: Rust, one static musl binary, tokio, tonic, axum or hyper for the HTTP listener, rusqlite, `notify` for inotify. Matches the deployment stack and bakes as a single file (ADR-0011).
+Language: Rust, one static musl binary, tokio, tonic, axum for the HTTP listener, sqlx with its SQLite driver, `notify` for inotify. Matches the deployment stack and bakes as a single file (ADR-0011).
 
 ### Listeners
 
-- **HTTP, loopback.** `127.0.0.1:<port>`, fixed port in config (proposed 47077). Claude Code reaches it with one `type: "http"` hook per recorded event, to `http://127.0.0.1:<port>/hook/<EventName>`. The POST body is the same JSON a command hook gets on stdin, and the event name is only in the path: there is no event header (T3). A `200` returns an empty JSON object so the hook is a no-op for Claude Code. `GET /healthz`. fleetd commits the event to the disk queue before it answers. A Unix socket cannot serve hooks: `unix:` and `http+unix:` URLs fail with `Unsupported protocol` on 2.1.289 (T3).
-- **Unix socket.** `/run/fleetd/fleetd.sock`, mode 0660, owner `agent`. Fixed path from systemd `RuntimeDirectory=fleetd`. It does not use `XDG_RUNTIME_DIR`, which is unset in ssh logins. Same HTTP routes plus `POST /job/<event>` for `fleet-job`, and `GET /state` for local tools.
+- **HTTP, loopback.** `127.0.0.1:<port>`, fixed port in config (default 7071). Claude Code reaches it with one `type: "http"` hook per recorded event, to `http://127.0.0.1:<port>/hook/<EventName>`. The POST body is the same JSON a command hook gets on stdin, and the event name is only in the path: there is no event header (T3). A `200` returns an empty JSON object so the hook is a no-op for Claude Code. `GET /healthz`. fleetd commits the event to the disk queue before it answers. A Unix socket cannot serve hooks: `unix:` and `http+unix:` URLs fail with `Unsupported protocol` on 2.1.289 (T3).
+- **Unix socket.** `/run/fleetd/fleetd.sock`, mode 0600, owner `agent`. fleetd and `fleet-job` run as the same user. Fixed path from systemd `RuntimeDirectory=fleetd`. It does not use `XDG_RUNTIME_DIR`, which is unset in ssh logins. Today it serves `POST /event` and the hook routes. `POST /job/<event>` for `fleet-job` and `GET /state` for local tools are not built.
+- **Responses.** `200` with `{}` for an accepted or filtered hook, `400` with `{"error": ...}` for a body that is not a JSON object or an unusable path, `500` with `{"error": ...}` when the queue write fails.
+- **Wire names.** The envelope serializes `id` and `kind`, not `event_id` and `type`. `occurred_at`, `captured_at`, `job_id` and `workdir` arrive with the proto in the server step.
 - **Hook headers.** Intended: the http hook sets `X-Fleet-Job: $FLEET_JOB_ID` with `allowedEnvVars: ["FLEET_JOB_ID"]`, so a hook from a Job carries its job id. Not tested in Phase 0 (the T3 capture used no custom header), so it is a Phase 1 pre-check. `fleet-job` exports `FLEET_JOB_ID`. Interactive sessions have no job id.
 - **Failure behaviour.** Verified (T8): with nothing listening, a hook costs about 2 ms and the run exits 0 with the normal result. Mean wall time over three runs was 1.58 s with a closed-port hook and 1.61 s without, inside the 0.2 s noise. Claude Code logs the failure at ERROR in the debug log and nowhere else. Every hook sets an explicit `timeout`. A listener that accepts a connection and never answers was not tested, so the effect of the timeout is a Phase 1 pre-check. `onFailure` is dropped from the hook config: 2.1.289 accepts it without a warning and it changes nothing, including on a refused connection (T3, T8). The docs tie it to 2.1.295, which the pin does not reach.
 - **Where hooks are configured.** Decided and verified (T4): the loopback http hooks live in the Template at `/etc/claude-code/managed-settings.json`, or in a drop-in `/etc/claude-code/managed-settings.d/10-fleetd.json` that keeps fleetd's file apart from other managed policy. Both load on 2.1.289 (the drop-in was tested alone, not together with the main file). Hooks merge across managed, user and `--settings` sources: a managed hook does not replace a user hook, both fire, and a Job's `--settings` cannot suppress the managed hook. The loopback hook therefore appears only in managed settings, never in the laptop's user `settings.json` or in a Job's `--settings`, or fleetd sees each event twice. A managed file that fails to parse stops Claude Code from starting (docs), so the Template build validates the JSON. Do not set `allowManagedHooksOnly`: the docs say it restricts which hooks run, which could silence the user hooks workers load (see Background), and it was not tested. Not yet run: the `http` hook type inside a managed file (T4 used command hooks) and interactive sessions. Both are Phase 1 pre-checks.
@@ -186,7 +188,7 @@ Shape of one entry in the managed file, one per recorded event. The `timeout` va
     "Stop": [
       {
         "hooks": [
-          { "type": "http", "url": "http://127.0.0.1:47077/hook/Stop", "timeout": 5 }
+          { "type": "http", "url": "http://127.0.0.1:7071/hook/Stop", "timeout": 5 }
         ]
       }
     ]
@@ -212,9 +214,9 @@ On `Stop`, fleetd emits `hook.stop` at once, with `last_assistant_message` as th
 
 ### Disk queue
 
-SQLite in WAL mode at `/var/lib/fleetd/queue.db` (systemd `StateDirectory=fleetd`). One table `events(seq integer primary key, event_id, priority, body blob, sent_at)`. `synchronous=NORMAL` and a checkpoint on shutdown. The commit is the durability point.
+SQLite in WAL mode at `/var/lib/fleetd/queue.db` (systemd `StateDirectory=fleetd`). One table `events(seq integer primary key autoincrement, id text unique, ts, kind, priority, payload, state, attempts, next_try_at)`, where `payload` is the envelope JSON and a repeat of `id` is ignored. `synchronous=NORMAL` and a checkpoint on shutdown. The commit is the durability point.
 
-- **Cap.** 256 MiB or 14 days, whichever first. Overflow policy above.
+- **Cap.** 256 MiB of payload bytes or 14 days, whichever first. When over the byte cap, fleetd deletes the lowest priority, oldest rows first (tool, then status, then normal, then terminal), and records the count in one `fleetd.queue_overflow` event that later drops add to.
 - **Survives.** fleetd restart, server outage, Box reboot. It does not survive Box destruction. fleetd reports pending count and oldest age in the heartbeat so the drain check can include "queue empty".
 - **Alternatives.** Append-only segment files are simpler but need hand-rolled crash recovery and cursor tracking. An embedded KV (redb, sled) has no ad hoc inspection. See ADR-0012.
 
@@ -306,7 +308,7 @@ Rules:
 
 System unit `fleetd.service`, `User=agent`, `Group=agent`, `RuntimeDirectory=fleetd`, `StateDirectory=fleetd`, `EnvironmentFile=/etc/swarm/box.env`, `Environment=XDG_RUNTIME_DIR=/run/user/<uid>`, `Restart=always`, `RestartSec=2`, `WatchdogSec=60`, `After=network-online.target user@<uid>.service`, `Wants=user@<uid>.service`. The ordering matters because the pueue socket sits in `/run/user/<uid>`, a tmpfs that exists only while `user@<uid>.service` runs (linger is on). `XDG_RUNTIME_DIR` is not needed when the socket path is absolute (T9). It is kept because it costs nothing and covers a config that drops `unix_socket_path`.
 
-Hardening: `NoNewPrivileges`, `ProtectSystem=strict`, `ProtectHome=read-only`, and `ReadWritePaths` for the state dir and `~agent/.local/state/workmux`. `ProtectSystem=strict` alone leaves `/home` writable on a Box (T9), so `ProtectHome=read-only` is what makes `~/jobs` read-only. The workmux path must be writable because `workmux status` and `workmux wait` delete stale state files (T5). T9 confirmed a unit as `User=agent` with these settings lists and writes `~/.local/state/workmux` and reads the real pueue daemon. Any worktree path fleetd must write needs its own `ReadWritePaths` entry or a separate process. The unit is a system unit so it needs no login session, and it still depends on `user@<uid>.service` for the pueue socket. pueue's linger user unit stays as is.
+The directives live in `deploy/fleetd.service`. Hardening: `NoNewPrivileges`, `ProtectSystem=strict`, `ProtectHome=read-only`, and `ReadWritePaths` for the state dir and `~agent/.local/state/workmux`. `ProtectSystem=strict` alone leaves `/home` writable on a Box (T9), so `ProtectHome=read-only` is what makes `~/jobs` read-only. The workmux path must be writable because `workmux status` and `workmux wait` delete stale state files (T5). T9 confirmed a unit as `User=agent` with these settings lists and writes `~/.local/state/workmux` and reads the real pueue daemon. Any worktree path fleetd must write needs its own `ReadWritePaths` entry or a separate process. The unit is a system unit so it needs no login session, and it still depends on `user@<uid>.service` for the pueue socket. pueue's linger user unit stays as is.
 
 ### Upgrade path
 
@@ -427,7 +429,7 @@ Parked sketch, no further design: KEDA is driven through the server. fleetd on t
 
 ## Security model
 
-- **Loopback listener.** Any local process can post events. Boxes are single-user, so this is accepted. The unix socket is 0660.
+- **Loopback listener.** Any local process can post events. Boxes are single-user, so this is accepted. The unix socket is 0600.
 - **No secrets in events.** fleetd redacts exact values of the secrets loaded from `redact_files` from every string field before queueing. Tool events, which can carry commands with secrets, are off by default. Raw transcripts and raw pueue logs never leave the Box. Derived transcript text (preview and timeline) leaves truncated and redacted. Redaction (T7) matches exact values in nested JSON, sorted longest first, and skips very short values. It does not catch base64, URL-encoded or split forms.
 - **Sensitive content.** Prompts, `last_assistant_message` and transcript-derived preview text reach the server. The server has no public ingress and is reachable only over the VPN. The database is treated like the Box credentials in sensitivity.
 - **Transport.** Plain gRPC over any routable path. TLS is optional and set by the deployment. The VPN, whichever it is, protects the link, and the plan assumes nothing about which. Without TLS the bearer token crosses the VPN in clear text.
@@ -595,3 +597,19 @@ Terms used in this plan:
 - **Box snapshot**: the latest heartbeat state of a Box, kept on the Fleet server (ADR-0012).
 - **Lease**: the time-limited claim a Box holds on a queued Job (ADR-0016).
 - Job states are defined in ADR-0016 and stay parked with the queue seam.
+
+## Review follow-ups (deferred)
+
+- Rename `Queue` to `Store`, with free-function `events` and `registry` modules over `&mut SqliteConnection` and `sqlx::migrate!`, before the registry lands.
+- Replace the task set with a Supervisor that tracks per-task progress heartbeats for the watchdog.
+- Flatten `Identity` into `Envelope`.
+- Choose a collision-resistant hash (blake3 or sha2) before derived ids persist.
+- Split `Error` into `ParseIdError` and `NotAnObject`.
+- Add an `EVENT_FIELDS` table to the normalizer.
+- Build the image through a dist `github-custom-jobs` workflow_call, or ship a dist-built fleet-server archive.
+- SHA-pin actions and base images, split the push job so `packages:write` applies to tags only, and attest provenance.
+- Add `scripts/private-scan`.
+- Add an auth header to the hook endpoint.
+- Dedupe raw against normalized payload size.
+- Fail closed on redaction when the secrets file is missing.
+- Redact encoded variants of secrets.

@@ -12,5 +12,9 @@ publish = false
 [package.metadata.dist]
 dist = false
 
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+
 [lints]
 workspace = true

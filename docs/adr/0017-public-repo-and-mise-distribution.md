@@ -12,7 +12,13 @@ The fleet repo is public. Tagged releases carry prebuilt binaries. The Template 
 - **Config.** fleetd and the CLI read the server address and the token from env and files: `FLEET_SERVER_URL`, `FLEET_BOX_NAME`, `FLEET_TOKEN`, `/etc/fleetd/config.toml`. No default points at a real host. The wiring (`/etc/swarm/box.env`, the secrets file, the managed-settings file, the unit file) lives in the deployment repo, outside this one. The fleet repo may ship example unit and settings files that use only generic paths.
 - **Enforcement.** CI runs a secret scanner and a pattern check for RFC 1918 ranges, the carrier-grade NAT range used by VPN overlays, and VPN domain suffixes. The check holds patterns, never real names, since a deny list of private hostnames would leak them.
 - **Release assets.** cargo-dist builds the `fleetd` and `fleet-cli` packages for the same three targets: `x86_64-unknown-linux-musl`, `aarch64-unknown-linux-musl` and `aarch64-apple-darwin`. Archives are named after the package, not the binary: `fleetd-<target>.tar.gz` holds `fleetd`, and `fleet-cli-<target>.tar.gz` holds `fleet`. Each has a `.sha256` file, and the release adds an aggregate `sha256.sum`. One target matrix for both packages avoids per-package target config. `fleet-server` and the library crates set `dist = false`. `fleet-server` ships as an OCI image built from the same tag.
-- **mise on the boxes.** One `github:` entry cannot pick two tools from one release, so a Box installs two entries with `tool_alias` and an `asset_pattern` each: `fleetd-*` and `fleet-cli-*`. The syntax is unverified until the first release exists.
+- **mise on the boxes.** One `github:` entry cannot pick two tools from one release, and the `[tool_alias]` bracket form collapses two entries into one tool, so a Box declares a `[tool_alias]` section with `fleetd` and `fleet` both pointing at the repo, plus a `[tools.<name>]` entry each with an exact `asset_pattern` that names the target.
+- **Verified.** On a Linux Box with mise 2026.8.12 and v0.1.0:
+  - The `[tool_alias]` form works: both binaries install and print 0.1.0.
+  - The bracketed form collapses both tools into one.
+  - A wildcard `asset_pattern` ignores the platform and picked the macOS archive.
+  - mise checked the sha256 from the GitHub API digest. The release has no attestations, so mise found none.
+  - The `arch()` template pattern for aarch64 is untested.
 - **Install.** The Template build runs `mise use` with the `github:` backend for fleetd at an exact version, and the laptop does the same for `fleet`. The version pin lives in the deployment repo. An upgrade is still a Template rebuild.
 - **Licence.** Apache-2.0, chosen 2026-10-24. The repo carries a `LICENSE` file with the Apache-2.0 text before the first public push.
 

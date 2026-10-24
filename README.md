@@ -6,29 +6,29 @@ Fleet shows what every agent box is doing and whether anything died. It has thre
 - `fleet-server`: the hosted service that stores box state.
 - `fleet`: the command line client.
 
-Status: pre-alpha. `fleetd` serves `GET /healthz` and nothing else. `fleet list` is a stub. `fleet-server` prints its version.
+Status: pre-alpha. `fleetd` accepts Claude Code hooks on loopback and local events on a unix socket, normalizes and redacts them, and queues them in SQLite. It does not forward them yet. `fleet list` is a stub. `fleet-server` prints its version.
 
 ## Install
 
-Releases are not published yet. Once the first tag exists, install with mise:
-
-```sh
-mise use -g "github:a19simma/fleet"
-```
-
-The release holds two tools in separate archives (`fleetd-<target>.tar.gz` and `fleet-cli-<target>.tar.gz`), so a single `github:` entry cannot pick both. Pin each one with an `asset_pattern`:
+Releases are on GitHub. The release holds two tools in separate archives (`fleetd-<target>.tar.gz` and `fleet-cli-<target>.tar.gz`), so a single `github:` entry cannot pick both. Declare each one in `mise.toml` with an `asset_pattern`:
 
 ```toml
-[tools."github:a19simma/fleet[tool_alias=fleetd]"]
-version = "0.1.0"
-asset_pattern = "fleetd-*"
+[tool_alias]
+fleetd = "github:a19simma/fleet"
+fleet = "github:a19simma/fleet"
 
-[tools."github:a19simma/fleet[tool_alias=fleet]"]
+[tools.fleetd]
 version = "0.1.0"
-asset_pattern = "fleet-cli-*"
+asset_pattern = "fleetd-x86_64-unknown-linux-musl.tar.gz"
+
+[tools.fleet]
+version = "0.1.0"
+asset_pattern = "fleet-cli-x86_64-unknown-linux-musl.tar.gz"
 ```
 
-Until then, build from source.
+The `fleet-cli` archive installs the `fleet` binary. Use the `aarch64-unknown-linux-musl` names on ARM. A wildcard pattern such as `fleetd-*` ignores the platform, so name the target.
+
+To build from source instead, see below.
 
 ## Build from source
 
@@ -43,11 +43,13 @@ Binaries land in `target/release/`.
 ## Run
 
 ```sh
-FLEETD_PORT=7071 target/release/fleetd
+FLEETD_PORT=7071 FLEETD_DB=./fleetd.db FLEETD_SOCKET=./fleetd.sock target/release/fleetd
 curl http://127.0.0.1:7071/healthz
+curl -X POST http://127.0.0.1:7071/hook/Stop -d '{"session_id":"s-1","last_assistant_message":"ok"}'
+target/release/fleetd dump
 ```
 
-`FLEETD_PORT` defaults to 7071. fleetd binds 127.0.0.1 only.
+fleetd binds 127.0.0.1 only and listens on the unix socket for `POST /event`. Settings, the systemd unit and the Claude Code hook config are in `deploy/README.md`.
 
 ## Licence
 

@@ -1,100 +1,75 @@
-//! fleetd: the per-box Fleet daemon. Serves a loopback health endpoint.
+//! fleetd binary: `serve` (default), `dump` and `pueue-callback`.
 
-use std::fmt;
-use std::net::{Ipv4Addr, SocketAddr};
+use std::path::PathBuf;
 use std::process::ExitCode;
 
-use axum::Router;
-use axum::routing::get;
-use clap::Parser;
-use tokio::net::TcpListener;
-
-const DEFAULT_PORT: u16 = 7071;
-const PORT_VAR: &str = "FLEETD_PORT";
+use clap::{Parser, Subcommand};
+use fleetd::{Config, Error, Signals, dump, run};
+use tracing_subscriber::EnvFilter;
 
 #[derive(Parser)]
 #[command(version, about = "Per-box Fleet daemon")]
-struct Cli;
-
-#[derive(Debug)]
-enum Error {
-    Port(String),
-    Io(std::io::Error),
+struct Cli {
+    /// Config file. Defaults to /etc/fleetd/config.toml when that file exists.
+    #[arg(long, global = true, value_name = "PATH")]
+    config: Option<PathBuf>,
+    #[command(subcommand)]
+    command: Option<Command>,
 }
 
-impl fmt::Display for Error {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::Port(raw) => write!(f, "invalid {PORT_VAR} value: {raw:?}"),
-            Self::Io(err) => write!(f, "io error: {err}"),
+#[derive(Subcommand)]
+enum Command {
+    /// Run the daemon. This is the default.
+    Serve,
+    /// Print queued events as JSON lines.
+    Dump {
+        /// Print at most this many events.
+        #[arg(long)]
+        limit: Option<u32>,
+    },
+    /// Report a finished pueue task. Not implemented yet.
+    PueueCallback {
+        /// pueue task id.
+        id: String,
+        /// pueue group.
+        group: String,
+    },
+}
+
+async fn execute(cli: Cli) -> Result<ExitCode, Error> {
+    match cli.command.unwrap_or(Command::Serve) {
+        Command::Serve => {
+            let signals = Signals::register()?;
+            let config = Config::load(cli.config.as_deref())?;
+            run(config, signals.terminated())
+                .await
+                .map(|()| ExitCode::SUCCESS)
+        }
+        Command::Dump { limit } => {
+            let config = Config::load(cli.config.as_deref())?;
+            dump(&config.db_path, limit, &mut std::io::stdout()).await?;
+            Ok(ExitCode::SUCCESS)
+        }
+        Command::PueueCallback { id, group } => {
+            eprintln!("fleetd: pueue-callback is not implemented (task {id}, group {group})");
+            Ok(ExitCode::from(2))
         }
     }
-}
-
-impl std::error::Error for Error {}
-
-impl From<std::io::Error> for Error {
-    fn from(err: std::io::Error) -> Self {
-        Self::Io(err)
-    }
-}
-
-fn parse_port(raw: Option<&str>) -> Result<u16, Error> {
-    raw.map_or(Ok(DEFAULT_PORT), |value| {
-        value.parse().map_err(|_| Error::Port(value.to_owned()))
-    })
-}
-
-async fn healthz() -> &'static str {
-    "ok"
-}
-
-fn router() -> Router {
-    Router::new().route("/healthz", get(healthz))
-}
-
-async fn serve() -> Result<(), Error> {
-    let port = parse_port(std::env::var(PORT_VAR).ok().as_deref())?;
-    let listener = TcpListener::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, port))).await?;
-    axum::serve(listener, router()).await?;
-    Ok(())
 }
 
 #[tokio::main]
 async fn main() -> ExitCode {
-    Cli::parse();
-    match serve().await {
-        Ok(()) => ExitCode::SUCCESS,
+    tracing_subscriber::fmt()
+        .with_env_filter(
+            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
+        )
+        .with_writer(std::io::stderr)
+        .init();
+    match execute(Cli::parse()).await {
+        Ok(code) => code,
         Err(err) => {
             eprintln!("fleetd: {err}");
             ExitCode::FAILURE
         }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use axum::body::{Body, to_bytes};
-    use axum::http::{Request, StatusCode};
-    use tower::ServiceExt;
-
-    use super::*;
-
-    #[tokio::test]
-    async fn healthz_returns_ok() {
-        let response = router()
-            .oneshot(Request::get("/healthz").body(Body::empty()).unwrap())
-            .await
-            .unwrap();
-        assert_eq!(response.status(), StatusCode::OK);
-        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
-        assert_eq!(&body[..], b"ok");
-    }
-
-    #[test]
-    fn port_defaults_and_parses() {
-        assert_eq!(parse_port(None).unwrap(), 7071);
-        assert_eq!(parse_port(Some("8080")).unwrap(), 8080);
-        assert!(parse_port(Some("nope")).is_err());
     }
 }

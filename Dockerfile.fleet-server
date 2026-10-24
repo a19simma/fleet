@@ -1,0 +1,31 @@
+FROM --platform=$BUILDPLATFORM rust:1.88-bookworm AS builder
+ARG TARGETARCH
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends python3-pip \
+    && pip install --break-system-packages cargo-zigbuild==0.24.0 \
+    && rm -rf /var/lib/apt/lists/*
+RUN rustup target add x86_64-unknown-linux-musl aarch64-unknown-linux-musl
+WORKDIR /src
+COPY Cargo.toml Cargo.lock ./
+COPY crates ./crates
+RUN --mount=type=cache,target=/usr/local/cargo/registry \
+    --mount=type=cache,target=/src/target \
+    case "$TARGETARCH" in \
+      amd64) triple=x86_64-unknown-linux-musl ;; \
+      arm64) triple=aarch64-unknown-linux-musl ;; \
+      *) echo "unsupported arch $TARGETARCH" >&2; exit 1 ;; \
+    esac \
+    && cargo zigbuild --release --locked -p fleet-server --target "$triple" \
+    && install -D "target/$triple/release/fleet-server" /out/fleet-server
+
+FROM gcr.io/distroless/static-debian12:nonroot
+ARG VERSION=dev
+ARG REVISION=unknown
+LABEL org.opencontainers.image.source="https://github.com/a19simma/fleet" \
+      org.opencontainers.image.licenses="Apache-2.0" \
+      org.opencontainers.image.title="fleet-server" \
+      org.opencontainers.image.version="${VERSION}" \
+      org.opencontainers.image.revision="${REVISION}"
+COPY --from=builder /out/fleet-server /fleet-server
+USER nonroot
+ENTRYPOINT ["/fleet-server"]
