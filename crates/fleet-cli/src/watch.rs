@@ -33,6 +33,9 @@ fn write_change(out: &mut impl Write, job: &Job) -> std::io::Result<()> {
 
 /// Polls job `id` until it ends, printing each state, phase or progress change.
 ///
+/// A state that is unspecified or unknown to this client is not terminal, so the poll goes
+/// on until a terminal state. A transient RPC error ends the watch with that error.
+///
 /// # Errors
 /// Returns [`CliError::JobEnded`] unless the job succeeded, and [`CliError`] on connection
 /// failure, a server error status or an output failure.

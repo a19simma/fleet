@@ -12,8 +12,9 @@
 //! into a throwaway bare repo, counts the commits, pushes the branch and opens the pull
 //! request with `gh` from that repo, then sends the terminal report. Every helper runs in
 //! its own process group with an allowlisted environment and a scratch `HOME` and config
-//! dirs, so no agent-writable config is read. The push carries only `GIT_ASKPASS`, which names
-//! `fleetd askpass`, and `GH_TOKEN` for that helper to print, and `gh` only its own token. Push is limited to `file` and `https` remotes.
+//! dirs, so no agent-writable config is read. The push carries only `GIT_ASKPASS`, which
+//! names `fleetd askpass`, and the `GH_TOKEN` that helper prints, and `gh` only its own
+//! token. Push is limited to `file` and `https` remotes.
 
 use std::collections::VecDeque;
 use std::ffi::OsString;
@@ -37,7 +38,10 @@ use crate::poller::{RunError, Shutdown};
 use crate::proc::{CaptureError, Captured, capture};
 use crate::workspace::{validate_job_id, validate_ref, validate_repo};
 
-/// Variables that never reach the agent.
+/// Variables removed from the agent's own environment block.
+///
+/// The agent runs as fleetd's uid and can still read the fleetd environment through
+/// `/proc` (ADR-0024 Known limit). The push child keeps `GH_TOKEN` and `GIT_ASKPASS`.
 pub const STRIPPED_ENV: [&str; 9] = [
     "GH_TOKEN",
     "GITHUB_TOKEN",
@@ -233,9 +237,9 @@ impl<R: Reporter> AgentRunner<R> {
     /// start failure or the timeout sends a terminal `FAILED` report and returns
     /// [`AgentOutcome::Failed`]. A report reply with `cancel_requested` gives
     /// [`AgentOutcome::Cancelled`] after `SIGTERM`, the cancel grace and `SIGKILL`. A
-    /// `FAILED_PRECONDITION` reply gives [`AgentOutcome::Lost`]. The whole process group is killed on every exit path, so
-    /// no background descendant outlives the run. Every report is raced against the
-    /// deadline and shutdown, and the terminal report waits at most
+    /// `FAILED_PRECONDITION` reply gives [`AgentOutcome::Lost`]. The whole process group is
+    /// killed on every exit path, so no background descendant outlives the run. Every report
+    /// is raced against the deadline and shutdown, and the terminal report waits at most
     /// [`RunConfig::terminal_report_timeout`], so a hung server never delays the kill.
     ///
     /// # Errors
@@ -314,10 +318,11 @@ impl<R: Reporter> AgentRunner<R> {
     /// environment. The push (`--no-verify`, no hooks path, no stored credential helper, no
     /// global or system git config) and `gh` run from that repo with an allowlisted
     /// environment, a scratch `HOME` and scratch config dirs. The push holds only
-    /// `GIT_ASKPASS` (`fleetd askpass`) and the `GH_TOKEN` it prints, and `gh` only its own token, so config the agent planted cannot
-    /// capture a token. The push allows `file` and `https` remotes only. A failure sends a
-    /// `FAILED` report with a fixed error and the redacted, bounded tail of the helper's
-    /// stderr as one transcript chunk. The raw output goes nowhere else.
+    /// `GIT_ASKPASS` (`fleetd askpass`) and the `GH_TOKEN` it prints, and `gh` only its own
+    /// token, so config the agent planted cannot capture a token. The push allows `file` and
+    /// `https` remotes only. A failure sends a `FAILED` report with a fixed error and the
+    /// redacted, bounded tail of the helper's stderr as one transcript chunk. The raw output
+    /// goes nowhere else.
     ///
     /// # Errors
     ///

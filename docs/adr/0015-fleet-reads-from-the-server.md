@@ -32,7 +32,7 @@ The existing picker has `fleet` ssh into each Box and poll tmux and pueue, so th
 
 ## Amendments
 
-- **Job commands (ADR-0021), planned.** The CLI adds `fleet submit`, `jobs`, `status`, `logs [-f]` and `cancel`, through `FleetJobs` with the client token (ADR-0023). `list` and `watch` are unchanged.
+- **Job commands (ADR-0021), built.** The CLI adds `fleet submit`, `jobs`, `status`, `logs [-f]` and `cancel`, through `FleetJobs` with the client token (ADR-0023). `list` and `watch` are unchanged.
 
 ## Considered and rejected
 

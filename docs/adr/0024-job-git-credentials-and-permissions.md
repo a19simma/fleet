@@ -7,7 +7,7 @@ Pushing a branch and opening a pull request need write access to the repo, and A
 ## Decision
 
 - **Credential.** A fine-grained personal access token with contents and pull-requests write, scoped to named repos. It lives in `/etc/swarm/secrets.env` beside the other secrets, as `GH_TOKEN`. The first test scopes it to one throwaway repo.
-- **Who sees it.** fleetd's own `git` and `gh` child processes get it through `GIT_ASKPASS` and `GH_TOKEN`. `GIT_ASKPASS` names `fleetd askpass`, which prints `GH_TOKEN` from its environment for a password prompt and `x-access-token` for a username prompt, so an https push needs no operator-supplied helper. The agent child environment strips `GH_TOKEN` and `FLEET_TOKEN`, but that only cleans the child's own env block (see Known limit). The redactor also masks the value in events and transcripts.
+- **Who sees it.** Only fleetd's `git push` and `gh` children get the token. The `git push` child gets `GIT_ASKPASS`, set to `fleetd askpass`, and `GH_TOKEN`, so `GH_TOKEN` reaches both the push process and the askpass helper it runs. The helper prints `GH_TOKEN` from its environment for a password prompt and `x-access-token` for a username prompt, so an https push needs no operator-supplied helper. The `gh` child gets `GH_TOKEN`, plus `GH_HOST` and `GH_ENTERPRISE_TOKEN` when set. The fetch from the agent's worktree and every other helper get no token. The agent child environment strips `GH_TOKEN` and `FLEET_TOKEN`, but that only cleans the child's own env block (see Known limit). The redactor also masks the value in events and transcripts. Any claim here that the token stays secret holds against a process under a uid other than fleetd's. It does not hold against the agent, which runs as fleetd's uid.
 - **Pull request.** `gh pr create --repo <repo> --head <branch> --base <base> --title <tip commit subject, capped> --body "Fleet job <id>"`, run by fleetd after the push (ADR-0020). The agent never pushes.
 - **Branch.** The result branch is `swarm/<job_id>`, the only branch namespace a Box may push (ADR-0016).
 - **Permissions.** fleetd config marks a Box disposable or not. Only a disposable Box runs Jobs with `--dangerously-skip-permissions`. Other Boxes get a configurable permission mode and tool allowlist. Not built: only `disposable` exists.
@@ -15,14 +15,14 @@ Pushing a branch and opening a pull request need write access to the repo, and A
 
 ## Consequences
 
-- Once the runner is wired into the daemon, fleetd holds the job PAT. It is a new credential, separate from the baked git credential, and sits beside the four credentials already on a Box: the Claude subscription token, the baked git credential, the VPN auth key and the Box bearer token. A leaked PAT can write to its scoped repos only.
+- fleetd holds the job PAT. It is a new credential, separate from the baked git credential, and sits beside the four credentials already on a Box: the Claude subscription token, the baked git credential, the VPN auth key and the Box bearer token. A leaked PAT can write to its scoped repos only.
 - With skip-permissions the agent has a full shell, so the Box is the sandbox. Its blast radius is the Box plus its Claude token plus the git PAT, which the agent can read (see Known limit).
 - A leaked client token (ADR-0023) can make a Box clone any repo the PAT reads and push to any it writes, until the allowlist exists.
-- Inferred, not part of the design: a Job prompt can still make the agent print files it can read, so redaction of exact values is the only masking.
+- A Job prompt can make the agent print files it can read. The redactor masks exact values only.
 
-Known limit:
+## Known limit
 
-- The agent runs as the same uid as fleetd and can read the fleetd process environment through `/proc/<pid>/environ` and any file fleetd reads, so `GH_TOKEN` and `FLEET_TOKEN` are exposed to the agent on this box. Use a fine-grained PAT scoped to throwaway repos on disposable Boxes only. Per-job isolation (a separate uid or a credential broker) is not built.
+- The agent runs as the same uid as fleetd and can read the fleetd process environment through `/proc/<pid>/environ` and any file fleetd reads, so `GH_TOKEN` and `FLEET_TOKEN` are exposed to the agent on this box. The same uid also reads `/etc/swarm/secrets.env`. Use a fine-grained PAT scoped to throwaway repos on disposable Boxes only. Per-job isolation (a separate uid or a credential broker) is not built.
 
 ## Considered and rejected
 

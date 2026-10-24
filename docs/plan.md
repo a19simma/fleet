@@ -31,11 +31,11 @@ Recorded 2026-10-24 when the plan moved into the public repo.
 
 ## Amendments (job system)
 
-ADRs 0020 to 0024 reopen the v1 cut for Jobs. The workspace, runner, push and pull request step, poller and gRPC reporter of ADR-0020 and ADR-0024 are built as library code, daemon wiring pending; the rest is planned, not built. The v1 cut below is unchanged and describes v1.
+ADRs 0020 to 0024 reopen the v1 cut for Jobs. The workspace, runner, push and pull request step, poller and gRPC reporter of ADR-0020 and ADR-0024 are built and run by the daemon while `FLEET_SERVER_URL` and `FLEET_TOKEN` are set. ADRs 0021 to 0023 are built in the server. The v1 cut below is unchanged and describes v1.
 
 - **Out of v1 list.** `FleetJobs`, `ClaimJob`, claim and lease are designed in ADR-0021. `RenewLease` is replaced by `ReportJob`. Drain, the KEDA seam, `GetPreview` and `ListEvents` stay out.
 - **pueue and `fleet-job`.** Jobs no longer run as pueue tasks. fleetd runs them as child processes in git worktrees (ADR-0020). The non-goal "Jobs stay pueue tasks" is superseded for Jobs.
-- **Git.** The non-goal "fleetd pushing to git or holding git credentials" is superseded. Once the runner is wired into the daemon, fleetd pushes only `swarm/<job_id>` after the agent exits and holds a fine-grained token (ADR-0020, ADR-0024).
+- **Git.** The non-goal "fleetd pushing to git or holding git credentials" is superseded. fleetd pushes only `swarm/<job_id>` after the agent exits and holds a fine-grained token (ADR-0020, ADR-0024).
 - **Transcripts.** The non-goal "Storing transcripts on the server" is superseded for Job output, which the server stores at up to 4 MiB per Job (ADR-0022).
 - **Auth.** The single shared token becomes two scopes, box and client (ADR-0023).
 - **States.** The lifecycle drops `CLAIMED`. The lease is 120 s, renewed by `ReportJob`, with a 15 s reaper (ADR-0021). `retry_on_lost`, priority, `max_attempts` and `job_attempts` are cut.
@@ -70,7 +70,7 @@ Goals:
 
 - One place that knows what every Box is doing: sessions, Jobs, results, cost, health.
 - No event lost across laptop sleep, server restarts or network blips between a Box and the server.
-- Catch what hooks miss: crashed agents, killed pueue tasks, Boxes that go quiet.
+- Catch what hooks miss: crashed agents, killed agent processes, Boxes that go quiet.
 - Replace ssh polling in `fleet list` and `fleet preview` with reads from the server (see Background).
 - A seam for the later KEDA work queue: a Job lifecycle, claim and lease, and a readable queue depth.
 
@@ -316,7 +316,7 @@ Rules:
 
 ### Config
 
-`/etc/fleetd/config.toml`, baked. Fields: `server_url` (default from `FLEET_SERVER_URL`, any routable address or name, so an address change needs no rebuild and no VPN feature is assumed), `http_port`, `socket_path`, `queue_max_bytes`, `queue_max_age`, `hook_events` allowlist (provisional default in decision 6), `heartbeat_interval`, `transcript_read_delay` (default 2 s), `pueue_group` (default `fleet`), `reconcile_interval` (default 45 s), `stall_after` (default 10 min), `end_grace` (default two passes), `redact_files` (default `/etc/swarm/secrets.env`), `gh_bin`, `claude_bin`, `disposable`. Environment from `/etc/swarm/box.env`, including `FLEET_SERVER_URL` and `FLEET_BOX_NAME`. The box token is `FLEET_TOKEN` in `/etc/swarm/secrets.env`. The client token is `FLEET_CLIENT_TOKEN`, held by the laptop CLI and the server, never on a Box. No secret in this file.
+`/etc/fleetd/config.toml`, baked. Fields: `server_url` (default from `FLEET_SERVER_URL`, any routable address or name, so an address change needs no rebuild and no VPN feature is assumed), `http_port`, `socket_path`, `queue_max_bytes`, `queue_max_age`, `hook_events` allowlist (provisional default in decision 6), `heartbeat_interval`, `transcript_read_delay` (default 2 s), `pueue_group` (default `fleet`), `reconcile_interval` (default 45 s), `stall_after` (default 10 min), `end_grace` (default two passes), `redact_files` (default `/etc/swarm/secrets.env`), `jobs_dir` (default `$STATE_DIRECTORY/jobs`, set by `FLEETD_JOBS_DIR`; job worktrees stay until an operator removes them after a failed prepare or a killed fleetd), `gh_bin`, `claude_bin`, `disposable`. Environment from `/etc/swarm/box.env`, including `FLEET_SERVER_URL` and `FLEET_BOX_NAME`. The box token is `FLEET_TOKEN` in `/etc/swarm/secrets.env`. The client token is `FLEET_CLIENT_TOKEN`, held by the laptop CLI and the server, never on a Box. No secret in this file.
 
 ### systemd unit
 
@@ -466,7 +466,7 @@ Parked sketch, no further design: KEDA is driven through the server. fleetd on t
 - **Sensitive content.** Prompts, `last_assistant_message` and transcript-derived preview text reach the server. The server has no public ingress and is reachable only over the VPN. The database is treated like the Box credentials in sensitivity.
 - **Transport.** Plain gRPC over any routable path. TLS is optional and set by the deployment. The VPN, whichever it is, protects the link, and the plan assumes nothing about which. Without TLS the bearer tokens cross the VPN in clear text.
 - **Authorization.** Two scoped bearer tokens (ADR-0014, amended). The box token `FLEET_TOKEN` covers `FleetIngest` and `FleetWorker`. The client token `FLEET_CLIENT_TOKEN` covers `FleetQuery` and `FleetJobs`. Any other path is `PERMISSION_DENIED`. A box token holder can ingest and claim for any Box. A client token holder can read every Box's data and submit or cancel Jobs. A claim returns only the claiming Box's Job, and ingest and claim reject a `box` that does not match `box-<n>`.
-- **Git.** fleetd never pushes and holds no git credential in v1. It runs read-only git commands to count unpushed commits. ADR-0020 and ADR-0024 supersede this in part (built as library code, daemon wiring pending).
+- **Git.** fleetd never pushes and holds no git credential in v1. It runs read-only git commands to count unpushed commits. ADR-0020 and ADR-0024 supersede this in part (built and run by the daemon).
 - **Blast radius.** fleetd runs as `agent`, the same as workers. It adds no privilege and exposes no new inbound port beyond loopback.
 - **Secrets never printed.** fleetd logs event ids and types, never payloads, at default level.
 
@@ -602,7 +602,7 @@ Numbering continues the list above. All Decided 2026-10-24.
 
 ## ADRs
 
-All Accepted on 2026-10-24, 0011 to 0024. ADRs 0021 to 0023 are planned, not built. ADRs 0020 and 0024 are built as library code, daemon wiring pending. Index and status in `docs/adr/README.md`.
+All Accepted on 2026-10-24, 0011 to 0024. ADRs 0020 to 0024 are built: 0020 and 0024 run in the daemon, 0021 to 0023 in the server. Index and status in `docs/adr/README.md`.
 
 | ADR | Title | Relation |
 |---|---|---|
@@ -615,11 +615,11 @@ All Accepted on 2026-10-24, 0011 to 0024. ADRs 0021 to 0023 are planned, not bui
 | 0017 | Public repo and mise distribution | New. The pinned fleetd comes from a public release through mise. Licence Apache-2.0 |
 | 0018 | Ingest protocol | New. Unary `PushEvents`, per-batch ack. Supersedes the stream and ack parts of 0012 and the forwarder section of this plan |
 | 0019 | Events storage | New. Unpartitioned `events`, delete-based retention, box status computed on read. Supersedes the monthly-partition line of 0013 |
-| 0020 | Job runner in fleetd | New, built as library code, daemon wiring pending. fleetd child process in a git worktree, no pueue or `fleet-job`. Supersedes the "No git" rule of 0011 in part |
-| 0021 | Job protocol | New, planned. `FleetJobs`, `FleetWorker`, `ReportJob`, 120 s lease, 15 s reaper. Supersedes the claim sketch of 0016 |
-| 0022 | Job transcripts on the server | New, planned. Stream-json chunks in Postgres, 4 MiB cap. Amends 0013 |
-| 0023 | Two bearer token scopes | New, planned. Box and client tokens. Amends 0014 |
-| 0024 | Job git credentials and permission policy | New, built as library code, daemon wiring pending. Fine-grained PAT stripped from the agent environment, disposable Box flag. Amends 0011 |
+| 0020 | Job runner in fleetd | New, built and run by the daemon. fleetd child process in a git worktree, no pueue or `fleet-job`. Supersedes the "No git" rule of 0011 in part |
+| 0021 | Job protocol | New, built. `FleetJobs`, `FleetWorker`, `ReportJob`, 120 s lease, 15 s reaper. Supersedes the claim sketch of 0016 |
+| 0022 | Job transcripts on the server | New, built. Stream-json chunks in Postgres, 4 MiB cap. Amends 0013 |
+| 0023 | Two bearer token scopes | New, built. Box and client tokens. Amends 0014 |
+| 0024 | Job git credentials and permission policy | New, built and run by the daemon. Fine-grained PAT held by fleetd and stripped from the agent environment block, disposable Box flag. The agent shares fleetd's uid, so it can still read the token (ADR-0024 Known limit). Amends 0011 |
 
 Relation to the existing setup: the ssh polling in the picker conflicts with ADR-0015, hence the partial replacement. The existing design deferred `fleet-job` to its first phase. This plan builds it in Phase 3 of the fleetd rollout, which still fits. A pending check on the `workmux status --json` schema is absorbed by T5. Workers use the full global config, so hooks in the baked `settings.json` fire on the Box. Workmux hooks failing harmlessly on a Box is a pre-existing item and is orthogonal.
 

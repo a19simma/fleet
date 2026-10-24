@@ -267,8 +267,9 @@ fn probe_timeout(period: Duration) -> Duration {
 /// checkpoints the WAL and removes the socket file. While `FLEET_SERVER_URL` is set it
 /// also sends a heartbeat every 30 seconds with `FLEET_TOKEN` as the bearer token, and a
 /// job poller claims one job at a time. On shutdown the poller stops the running job's
-/// process group and the runner reports it `FAILED`, within 15 seconds. A bad URL or token
-/// disables the poller with a warning.
+/// process group and the runner reports it `FAILED`, within 15 seconds. The unit's
+/// `TimeoutStopSec=15` equals that grace, so systemd can send `SIGKILL` before the final
+/// report and cleanup finish. A bad URL or token disables the poller with a warning.
 ///
 /// # Errors
 ///

@@ -1,6 +1,6 @@
 # Job protocol
 
-Status: Accepted. Implementation is planned, not built. Supersedes the claim and lease sketch of ADR-0016 where they differ.
+Status: Accepted. Built: the server serves `FleetWorker` and `FleetJobs`, and the daemon claims and reports through them. Supersedes the claim and lease sketch of ADR-0016 where they differ.
 
 ADR-0016 placed claim and lease on `FleetIngest` and the heartbeat, with a `CLAIMED` state and a `job_attempts` table. ADR-0020 removes pueue, so a Job no longer needs an intermediate state before it runs.
 

@@ -13,12 +13,16 @@ pub const POLL_INTERVAL: Duration = Duration::from_secs(1);
 
 const TRUNCATED_MARKER: &str = "-- transcript truncated --";
 
+/// Drops control characters except newline and tab. Bidirectional override characters are
+/// not control characters and pass through.
 fn strip_controls(text: &str) -> String {
     text.chars()
         .filter(|c| !c.is_control() || matches!(c, '\n' | '\t'))
         .collect()
 }
 
+/// Writes one chunk, adding a newline when its text lacks one, then the truncation marker
+/// when the chunk is flagged truncated.
 fn write_chunk(out: &mut impl Write, chunk: &TranscriptChunk) -> std::io::Result<()> {
     let text = strip_controls(&chunk.text);
     if !text.is_empty() {
@@ -33,6 +37,8 @@ fn write_chunk(out: &mut impl Write, chunk: &TranscriptChunk) -> std::io::Result
     Ok(())
 }
 
+/// Prints the transcript in `seq` order. Chunks at or below the highest `seq` printed in an
+/// earlier page are skipped. Two chunks that share a `seq` inside one page both print.
 pub(crate) async fn logs(
     client: &mut Client,
     id: String,

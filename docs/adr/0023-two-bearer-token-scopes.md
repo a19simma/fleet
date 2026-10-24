@@ -1,6 +1,6 @@
 # Two bearer token scopes
 
-Status: Accepted. Implementation is planned, not built. Amends ADR-0014.
+Status: Accepted. Built: the server checks the box token and the client token by service path. Amends ADR-0014.
 
 ADR-0014 uses one shared token for ingest, claim, query and Job control, and says the services stay separate so a read credential can be added later. The laptop CLI now submits and cancels Jobs and reads transcripts, so it needs its own credential.
 
