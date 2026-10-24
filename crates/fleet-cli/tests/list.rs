@@ -5,7 +5,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use clap::Parser;
-use fleet_cli::{Cli, CliError, run};
+use fleet_cli::{Cli, CliError, run_with};
 use fleet_proto::v1::fleet_jobs_server::{FleetJobs, FleetJobsServer};
 use fleet_proto::v1::fleet_query_server::{FleetQuery, FleetQueryServer};
 use fleet_proto::v1::{
@@ -114,9 +114,10 @@ async fn cli(url: &str, args: &[&str]) -> (Result<(), CliError>, String) {
     let env: HashMap<String, String> =
         HashMap::from([("FLEET_CLIENT_TOKEN".to_owned(), TOKEN.to_owned())]);
     let mut out = Vec::new();
-    let result = run(
+    let result = run_with(
         parsed,
         move |name| env.get(name).cloned(),
+        false,
         &mut b"".as_slice(),
         &mut out,
     )
@@ -279,5 +280,38 @@ async fn watch_unknown_job_is_a_server_error() -> TestResult {
     let (res, _) = cli(&url, &["watch", "nope"]).await;
     let err = res.err().ok_or("expected failure")?;
     assert!(matches!(err, CliError::Rpc(_)), "{err}");
+    Ok(())
+}
+
+#[tokio::test]
+async fn list_accepts_a_reply_above_the_default_decode_limit() -> TestResult {
+    let big = "z".repeat(5 * 1024 * 1024);
+    let stub = Stub {
+        boxes: vec![BoxView {
+            r#box: big.clone(),
+            status: BoxStatus::Live as i32,
+            ..BoxView::default()
+        }],
+        ..Stub::default()
+    };
+    let url = serve(stub).await?;
+    let (res, out) = cli(&url, &["list"]).await;
+    res?;
+    assert!(out.contains(&big), "reply was cut");
+    Ok(())
+}
+
+#[tokio::test]
+async fn list_accepts_a_jobs_reply_above_the_default_decode_limit() -> TestResult {
+    let mut huge = job("job-1", JobState::Running, "run", "");
+    huge.pr_url = Some("u".repeat(5 * 1024 * 1024));
+    let stub = Stub {
+        jobs: vec![huge],
+        ..Stub::default()
+    };
+    let url = serve(stub).await?;
+    let (res, out) = cli(&url, &["list"]).await;
+    res?;
+    assert!(out.contains(&"u".repeat(5 * 1024 * 1024)), "reply was cut");
     Ok(())
 }

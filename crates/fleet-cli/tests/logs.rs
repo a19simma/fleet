@@ -5,7 +5,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use clap::Parser;
-use fleet_cli::{Cli, CliError, run};
+use fleet_cli::{Cli, CliError, run_with};
 use fleet_proto::v1::fleet_jobs_server::{FleetJobs, FleetJobsServer};
 use fleet_proto::v1::{
     CancelJobRequest, GetJobRequest, Job, JobState, ListJobsReply, ListJobsRequest,
@@ -14,7 +14,7 @@ use fleet_proto::v1::{
 use tokio::net::TcpListener;
 use tokio::time::Instant;
 use tokio_stream::wrappers::TcpListenerStream;
-use tonic::{Request, Response, Status};
+use tonic::{Code, Request, Response, Status};
 
 type TestResult = Result<(), Box<dyn std::error::Error>>;
 
@@ -22,7 +22,7 @@ const TOKEN: &str = "client-token-0123456789";
 
 #[derive(Clone)]
 struct Stub {
-    replies: Arc<Mutex<VecDeque<ReadTranscriptReply>>>,
+    replies: Arc<Mutex<VecDeque<Result<ReadTranscriptReply, Status>>>>,
     after: Arc<Mutex<Vec<u64>>>,
     end_state: JobState,
 }
@@ -72,8 +72,8 @@ impl FleetJobs for Stub {
         check(&request)?;
         lock(&self.after)?.push(request.into_inner().after_seq);
         let next = lock(&self.replies)?.pop_front();
-        next.map(Response::new)
-            .ok_or_else(|| Status::failed_precondition("script exhausted"))
+        next.unwrap_or_else(|| Err(Status::failed_precondition("script exhausted")))
+            .map(Response::new)
     }
 }
 
@@ -86,12 +86,22 @@ fn chunk(seq: u64, text: &str) -> TranscriptChunk {
     }
 }
 
-fn reply(chunks: Vec<TranscriptChunk>, done: bool) -> ReadTranscriptReply {
-    ReadTranscriptReply { chunks, done }
+type Scripted = Result<ReadTranscriptReply, Status>;
+
+#[expect(
+    clippy::unnecessary_wraps,
+    reason = "shares the Scripted type with fail"
+)]
+fn reply(chunks: Vec<TranscriptChunk>, done: bool) -> Scripted {
+    Ok(ReadTranscriptReply { chunks, done })
+}
+
+fn fail(code: Code) -> Scripted {
+    Err(Status::new(code, "scripted"))
 }
 
 async fn serve(
-    script: Vec<ReadTranscriptReply>,
+    script: Vec<Scripted>,
     end_state: JobState,
 ) -> Result<(String, Stub), Box<dyn std::error::Error>> {
     let listener = TcpListener::bind("127.0.0.1:0").await?;
@@ -116,9 +126,13 @@ async fn logs(url: &str, args: &[&str]) -> (Result<(), CliError>, String) {
         return (Err(CliError::Usage("parse".into())), String::new());
     };
     let mut out = Vec::new();
-    let result = run(
+    let result = run_with(
         parsed,
-        |name| (name == "FLEET_CLIENT_TOKEN").then(|| TOKEN.to_owned()),
+        |name| match name {
+            "FLEET_CLIENT_TOKEN" => Some(TOKEN.to_owned()),
+            _ => None,
+        },
+        false,
         &mut std::io::empty(),
         &mut out,
     )
@@ -194,5 +208,86 @@ async fn terminal_escapes_in_chunks_are_stripped_and_truncation_is_marked() -> T
     assert!(!out.contains('\u{1b}'), "{out:?}");
     assert!(out.starts_with("[31mred[0m\n"), "{out}");
     assert!(out.ends_with("-- transcript truncated --\n"), "{out}");
+    Ok(())
+}
+
+#[tokio::test(start_paused = true)]
+async fn follow_retries_transient_statuses_and_keeps_after_seq() -> TestResult {
+    for code in [Code::Unavailable, Code::DeadlineExceeded, Code::Aborted] {
+        let (url, stub) = serve(
+            vec![
+                reply(vec![chunk(1, "one\n"), chunk(2, "two\n")], false),
+                fail(code),
+                fail(code),
+                reply(vec![chunk(3, "three\n")], true),
+            ],
+            JobState::Succeeded,
+        )
+        .await?;
+        let started = Instant::now();
+        let (res, out) = logs(&url, &["job-1", "-f"]).await;
+        res?;
+        assert_eq!(out, "one\ntwo\nthree\n", "{code:?}");
+        assert_eq!(after(&stub)?, vec![0, 2, 2, 2], "{code:?}");
+        assert!(started.elapsed() >= Duration::from_secs(2));
+    }
+    Ok(())
+}
+
+#[tokio::test(start_paused = true)]
+async fn follow_does_not_retry_other_statuses() -> TestResult {
+    for code in [Code::Unauthenticated, Code::NotFound, Code::Internal] {
+        let (url, stub) = serve(
+            vec![fail(code), reply(vec![chunk(1, "x\n")], true)],
+            JobState::Succeeded,
+        )
+        .await?;
+        let (res, out) = logs(&url, &["job-1", "-f"]).await;
+        assert!(
+            matches!(res, Err(CliError::Rpc(ref s)) if s.code() == code),
+            "{code:?}"
+        );
+        assert_eq!(out, "");
+        assert_eq!(after(&stub)?, vec![0], "{code:?}");
+    }
+    Ok(())
+}
+
+#[tokio::test(start_paused = true)]
+async fn retries_are_bounded() -> TestResult {
+    let script = (0..20).map(|_| fail(Code::Unavailable)).collect();
+    let (url, stub) = serve(script, JobState::Succeeded).await?;
+    let (res, _) = logs(&url, &["job-1", "-f"]).await;
+    assert!(matches!(res, Err(CliError::Rpc(ref s)) if s.code() == Code::Unavailable));
+    assert_eq!(after(&stub)?.len(), 5);
+    Ok(())
+}
+
+#[tokio::test(start_paused = true)]
+async fn bidi_and_separator_characters_are_stripped_but_newline_and_tab_stay() -> TestResult {
+    let (url, _) = serve(
+        vec![reply(
+            vec![chunk(
+                1,
+                "a\u{202E}b\u{2028}c\u{2029}d\u{200B}e\u{FEFF}f\tg\n",
+            )],
+            true,
+        )],
+        JobState::Succeeded,
+    )
+    .await?;
+    let (res, out) = logs(&url, &["job-1"]).await;
+    res?;
+    assert_eq!(out, "abcdef\tg\n");
+    Ok(())
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_transcript_page_above_the_default_decode_limit_is_accepted() -> TestResult {
+    let big = "y".repeat(5 * 1024 * 1024);
+    let (url, _) = serve(vec![reply(vec![chunk(1, &big)], true)], JobState::Succeeded).await?;
+    let (res, out) = logs(&url, &["job-1"]).await;
+    res?;
+    assert_eq!(out.len(), big.len() + 1);
     Ok(())
 }

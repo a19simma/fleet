@@ -90,7 +90,7 @@ impl FleetJobs for Stub {
         request: Request<ListJobsRequest>,
     ) -> Result<Response<ListJobsReply>, Status> {
         check(&request)?;
-        let state = request.into_inner().state;
+        let ListJobsRequest { state, limit } = request.into_inner();
         let mut jobs = with_jobs(self, |jobs| {
             jobs.values()
                 .filter(|j| state.is_none_or(|s| s == j.state))
@@ -98,6 +98,9 @@ impl FleetJobs for Stub {
                 .collect::<Vec<Job>>()
         })?;
         jobs.sort_by(|a, b| a.job_id.cmp(&b.job_id));
+        if limit > 0 {
+            jobs.truncate(usize::try_from(limit).unwrap_or(usize::MAX));
+        }
         Ok(Response::new(ListJobsReply { jobs }))
     }
 
@@ -421,5 +424,55 @@ async fn connect_failure_has_exit_code_one() -> TestResult {
     let err = res.err().ok_or("expected failure")?;
     assert!(matches!(err, CliError::Connect(_)), "{err}");
     assert_eq!(err.exit_code(), 1);
+    Ok(())
+}
+
+async fn submit_n(url: &str, n: usize) -> TestResult {
+    for i in 0..n {
+        let prompt = format!("p{i}");
+        let (res, _) = cli(
+            url,
+            Some(TOKEN),
+            &["submit", "--repo", "o/r", "--base", "main", &prompt],
+        )
+        .await;
+        res?;
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn jobs_limit_is_forwarded_and_a_full_page_prints_a_notice() -> TestResult {
+    let (url, _) = serve().await?;
+    submit_n(&url, 3).await?;
+    let (res, out) = cli(&url, Some(TOKEN), &["jobs", "--limit", "2"]).await;
+    res?;
+    assert_eq!(out.lines().count(), 3, "{out}");
+    assert!(out.contains("showing 2 jobs"), "{out}");
+    assert!(out.contains("--limit"), "{out}");
+    Ok(())
+}
+
+#[tokio::test]
+async fn jobs_under_the_limit_print_no_notice() -> TestResult {
+    let (url, _) = serve().await?;
+    submit_n(&url, 3).await?;
+    let (res, out) = cli(&url, Some(TOKEN), &["jobs", "--limit", "5"]).await;
+    res?;
+    assert_eq!(out.lines().count(), 3, "{out}");
+    assert!(!out.contains("showing"), "{out}");
+    let (res, out) = cli(&url, Some(TOKEN), &["jobs"]).await;
+    res?;
+    assert!(!out.contains("showing"), "{out}");
+    Ok(())
+}
+
+#[tokio::test]
+async fn jobs_limit_outside_the_server_range_is_a_usage_error() -> TestResult {
+    let (url, _) = serve().await?;
+    for bad in ["0", "201", "x"] {
+        let (res, _) = cli(&url, Some(TOKEN), &["jobs", "--limit", bad]).await;
+        assert!(matches!(res, Err(CliError::Usage(_))), "{bad}");
+    }
     Ok(())
 }

@@ -2,11 +2,9 @@
 
 use std::io::Write;
 
-use fleet_proto::v1::fleet_jobs_client::FleetJobsClient;
-use fleet_proto::v1::fleet_query_client::FleetQueryClient;
 use fleet_proto::v1::{BoxStatus, BoxView, ListFleetRequest, ListJobsRequest};
 
-use super::{CliError, Config, bearer, open_channel, or_dash, sanitize, state_name};
+use super::{CliError, Session, or_dash, sanitize, state_name};
 
 const RECENT_JOBS: u32 = 20;
 
@@ -37,16 +35,14 @@ fn text_or_dash(text: &str) -> String {
 ///
 /// # Errors
 /// Returns [`CliError`] on connection failure, a server error status or an output failure.
-pub async fn list(config: &Config, out: &mut impl Write) -> Result<(), CliError> {
-    let channel = open_channel(config).await?;
-    let token = bearer(config)?;
-    let mut query = FleetQueryClient::with_interceptor(channel.clone(), token.clone());
-    let mut jobs = FleetJobsClient::with_interceptor(channel, token);
-    let fleet = query
+pub(crate) async fn list(session: &mut Session, out: &mut impl Write) -> Result<(), CliError> {
+    let fleet = session
+        .query
         .list_fleet(ListFleetRequest { r#box: None })
         .await?
         .into_inner();
-    let recent = jobs
+    let recent = session
+        .jobs
         .list_jobs(ListJobsRequest {
             state: None,
             limit: RECENT_JOBS,
