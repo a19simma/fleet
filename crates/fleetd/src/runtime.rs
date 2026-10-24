@@ -10,7 +10,7 @@ use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::{TcpListener, TcpStream, UnixListener, UnixStream};
 use tokio::signal::unix::{Signal, SignalKind, signal};
 use tokio::sync::watch;
-use tokio::task::{JoinError, JoinSet};
+use tokio::task::{JoinError, JoinHandle, JoinSet};
 use tokio::time::{Interval, MissedTickBehavior};
 
 use crate::Error;
@@ -157,13 +157,29 @@ async fn wait_for(mut rx: watch::Receiver<bool>) {
     let _ = rx.wait_for(|stop| *stop).await;
 }
 
+async fn exited(
+    slot: &mut Option<JoinHandle<()>>,
+    name: &'static str,
+) -> Result<ListenerExit, JoinError> {
+    let Some(handle) = slot.as_mut() else {
+        return std::future::pending().await;
+    };
+    let joined = handle.await;
+    *slot = None;
+    joined.map(|()| (name, Ok(())))
+}
+
 async fn first_exit(
     tasks: &mut JoinSet<ListenerExit>,
+    poller: &mut Option<JoinHandle<()>>,
+    heartbeat: &mut Option<JoinHandle<()>>,
     shutdown: impl Future<Output = ()>,
 ) -> Result<(), Error> {
     tokio::select! {
         () = shutdown => Ok(()),
         Some(joined) = tasks.join_next() => listener_exit(joined),
+        joined = exited(poller, "poller") => listener_exit(joined),
+        joined = exited(heartbeat, "heartbeat") => listener_exit(joined),
     }
 }
 
@@ -274,7 +290,8 @@ fn probe_timeout(period: Duration) -> Duration {
 /// # Errors
 ///
 /// Fails on config, queue or bind errors at startup. Fails after cleanup when a
-/// listener ends before `shutdown`, so the process exits non-zero.
+/// listener, the job poller or the heartbeat ends before `shutdown`, so the process exits
+/// non-zero.
 pub async fn run(config: Config, shutdown: impl Future<Output = ()>) -> Result<(), Error> {
     run_with_env(config, &|name| std::env::var(name).ok(), shutdown).await
 }
@@ -371,8 +388,8 @@ async fn run_with_store(
             .with_graceful_shutdown(wait_for(stop_rx.clone()))
             .into_future(),
     );
-    let poller = jobs.map(|poller| tokio::spawn(poller.run(wait_for(stop_rx.clone()))));
-    let heartbeat = heartbeat.map(|target| {
+    let mut poller = jobs.map(|poller| tokio::spawn(poller.run(wait_for(stop_rx.clone()))));
+    let mut heartbeat = heartbeat.map(|target| {
         tokio::spawn(target.run(heartbeat_identity, store.clone(), wait_for(stop_rx)))
     });
     let dog = tokio::spawn(watchdog(
@@ -387,18 +404,20 @@ async fn run_with_store(
     ));
     let _ = sd_notify::notify(&[NotifyState::Ready]);
 
-    let outcome = first_exit(&mut tasks, shutdown).await;
+    let outcome = first_exit(&mut tasks, &mut poller, &mut heartbeat, shutdown).await;
     tracing::info!("shutting down");
     let _ = sd_notify::notify(&[NotifyState::Stopping]);
     dog.abort();
     let _ = stop_tx.send(true);
-    if let Some(mut poller) = poller
-        && tokio::time::timeout(JOBS_GRACE, &mut poller).await.is_err()
+    if let Some(poller) = poller.as_mut()
+        && tokio::time::timeout(JOBS_GRACE, &mut *poller)
+            .await
+            .is_err()
     {
         poller.abort();
     }
-    if let Some(mut heartbeat) = heartbeat
-        && tokio::time::timeout(SHUTDOWN_GRACE, &mut heartbeat)
+    if let Some(heartbeat) = heartbeat.as_mut()
+        && tokio::time::timeout(SHUTDOWN_GRACE, &mut *heartbeat)
             .await
             .is_err()
     {
@@ -438,7 +457,7 @@ mod tests {
         Router::new().route("/healthz", get(|| async { "ok" }))
     }
 
-    async fn serve_tcp() -> (SocketAddr, tokio::task::JoinHandle<()>) {
+    async fn serve_tcp() -> (SocketAddr, JoinHandle<()>) {
         let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
         let addr = listener.local_addr().unwrap();
         let task = tokio::spawn(async move {
@@ -516,6 +535,48 @@ mod tests {
     async fn the_watchdog_interval_delays_missed_ticks() {
         let tick = watchdog_interval(Duration::from_millis(20));
         assert_eq!(tick.missed_tick_behavior(), MissedTickBehavior::Delay);
+    }
+
+    async fn exit_of(poller: Option<JoinHandle<()>>, heartbeat: Option<JoinHandle<()>>) -> bool {
+        let mut tasks = JoinSet::new();
+        let (mut poller, mut heartbeat) = (poller, heartbeat);
+        let outcome = tokio::time::timeout(
+            Duration::from_secs(5),
+            first_exit(
+                &mut tasks,
+                &mut poller,
+                &mut heartbeat,
+                std::future::pending(),
+            ),
+        )
+        .await;
+        matches!(outcome, Ok(Err(Error::Runtime(_)))) && poller.is_none() && heartbeat.is_none()
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_poller_that_ends_before_shutdown_is_fatal() {
+        assert!(exit_of(Some(tokio::spawn(async {})), None).await);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_heartbeat_that_ends_before_shutdown_is_fatal() {
+        assert!(exit_of(None, Some(tokio::spawn(async {}))).await);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_panicking_poller_is_fatal() {
+        let task = tokio::spawn(async { panic!("poller panic") });
+        assert!(exit_of(Some(task), None).await);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_running_poller_and_heartbeat_do_not_end_the_wait() {
+        let mut tasks = JoinSet::new();
+        let mut poller = Some(tokio::spawn(std::future::pending()));
+        let mut heartbeat = Some(tokio::spawn(std::future::pending()));
+        let outcome = first_exit(&mut tasks, &mut poller, &mut heartbeat, async {}).await;
+        assert!(outcome.is_ok());
+        assert!(poller.is_some() && heartbeat.is_some());
     }
 
     #[tokio::test(start_paused = true)]
@@ -694,7 +755,7 @@ mod tests {
     async fn a_listener_finishing_is_the_fatal_exit() {
         let mut tasks = JoinSet::new();
         serve(&mut tasks, "tcp", async { Ok(()) });
-        let outcome = first_exit(&mut tasks, std::future::pending()).await;
+        let outcome = first_exit(&mut tasks, &mut None, &mut None, std::future::pending()).await;
         assert!(matches!(outcome, Err(Error::Runtime(_))));
     }
 
@@ -702,6 +763,10 @@ mod tests {
     async fn shutdown_without_a_listener_exit_is_clean() {
         let mut tasks = JoinSet::new();
         serve(&mut tasks, "tcp", std::future::pending());
-        assert!(first_exit(&mut tasks, async {}).await.is_ok());
+        assert!(
+            first_exit(&mut tasks, &mut None, &mut None, async {})
+                .await
+                .is_ok()
+        );
     }
 }

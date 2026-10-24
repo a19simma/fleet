@@ -2,7 +2,10 @@
 //!
 //! While no job runs, the poller calls `ClaimJob` about every five seconds. It honours
 //! `next_in_s` from the reply up to [`MAX_IDLE_WAIT`] and backs off with full jitter on
-//! a claim error or a failed run. Concurrency is one:
+//! a claim error or a failed run, including a job whose workspace could not be prepared.
+//! A claim already in flight when shutdown starts gets [`CLAIM_GRACE`] to return, and a job
+//! it returns goes to the runner with shutdown already signalled, so the runner reports it.
+//! Concurrency is one:
 //! the next claim is not issued until the runner returns.
 //!
 //! The server URL must use `http` or `https`. This build of tonic has no TLS feature, so an
@@ -10,6 +13,7 @@
 
 use std::fmt;
 use std::future::Future;
+use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -42,6 +46,9 @@ pub const MAX_IDLE_WAIT: Duration = Duration::from_secs(300);
 
 /// Timeout applied to every `ClaimJob` call.
 pub const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Longest the poller waits for a claim already in flight when shutdown starts.
+pub const CLAIM_GRACE: Duration = Duration::from_secs(1);
 
 /// Longest the poller waits for a runner to return after it signals shutdown.
 pub const SHUTDOWN_GRACE: Duration = Duration::from_secs(10);
@@ -347,6 +354,10 @@ impl<R: JobRunner, G: Random> Poller<R, G> {
     /// claim faster than the schedule allows.
     pub async fn run(mut self, stop: impl Future<Output = ()> + Send) {
         tokio::pin!(stop);
+        let mut stop = Stop {
+            fut: stop,
+            fired: false,
+        };
         let (trigger, signal) = watch::channel(false);
         loop {
             let wait = match self.claim_or_stop(&mut stop).await {
@@ -368,18 +379,18 @@ impl<R: JobRunner, G: Random> Poller<R, G> {
                 }
             };
             tokio::select! {
-                () = &mut stop => return,
+                () = stop.fired() => return,
                 () = tokio::time::sleep(wait) => {}
             }
         }
     }
 
-    async fn run_job(
+    async fn run_job<F: Future<Output = ()>>(
         &mut self,
         job: Job,
         signal: &watch::Receiver<bool>,
         trigger: &watch::Sender<bool>,
-        stop: &mut (impl Future<Output = ()> + Unpin),
+        stop: &mut Stop<'_, F>,
     ) -> Option<Duration> {
         let runner = Arc::clone(&self.runner);
         let shutdown = Shutdown(signal.clone());
@@ -393,7 +404,7 @@ impl<R: JobRunner, G: Random> Poller<R, G> {
                 Ok(Err(_)) => self.runner_failed("job runner failed"),
                 Err(_) => self.runner_failed("job runner panicked"),
             }),
-            () = stop => {
+            () = stop.fired() => {
                 let _ = trigger.send(true);
                 if tokio::time::timeout(SHUTDOWN_GRACE, &mut handle).await.is_err() {
                     handle.abort();
@@ -409,13 +420,33 @@ impl<R: JobRunner, G: Random> Poller<R, G> {
         wait
     }
 
-    async fn claim_or_stop(
+    async fn claim_or_stop<F: Future<Output = ()>>(
         &mut self,
-        stop: &mut (impl Future<Output = ()> + Unpin),
+        stop: &mut Stop<'_, F>,
     ) -> Option<Result<Claimed, ClaimError>> {
+        let claim = self.claim();
+        tokio::pin!(claim);
         tokio::select! {
-            () = stop => None,
-            claimed = self.claim() => Some(claimed),
+            biased;
+            claimed = &mut claim => Some(claimed),
+            () = stop.fired() => match tokio::time::timeout(CLAIM_GRACE, claim).await {
+                Ok(Ok(claimed @ Claimed::Job(_))) => Some(Ok(claimed)),
+                _ => None,
+            },
+        }
+    }
+}
+
+struct Stop<'a, F> {
+    fut: Pin<&'a mut F>,
+    fired: bool,
+}
+
+impl<F: Future<Output = ()>> Stop<'_, F> {
+    async fn fired(&mut self) {
+        if !self.fired {
+            self.fut.as_mut().await;
+            self.fired = true;
         }
     }
 }

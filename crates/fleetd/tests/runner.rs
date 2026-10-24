@@ -53,6 +53,9 @@ term) trap 'echo t > "$path.marker"; exit 0' TERM; sleep 300 > "$path" & wait ;;
 closed) exec 1>&-; : > "$path.closed"; read x < "$path"; exit 0 ;;
 huge) head -c 3000000 /dev/zero | tr '\0' a; echo; echo next; exit 0 ;;
 reap) echo $$ > "$path"; read x < "$path.go"; exit 0 ;;
+flood) i=0; while [ $i -lt 100 ]; do printf '%01000d\n' 0; i=$((i+1)); done; exit 0 ;;
+orphan) perl -e 'use POSIX; POSIX::setsid(); open(F, ">", $ARGV[0]); print F $$; close F; exec "sleep", "300"' "$path" &
+  while [ ! -s "$path" ]; do sleep 0.05; done; exit 0 ;;
 esac
 "#;
 
@@ -492,7 +495,107 @@ async fn runner_caps_a_huge_stdout_line() -> TestResult {
     let chunks: Vec<_> = requests.iter().flat_map(|r| r.chunks.clone()).collect();
     assert_eq!(chunks.len(), 2);
     assert_eq!(chunks[0].text.len(), fleetd::runner::MAX_CHUNK_BYTES);
+    assert!(chunks[0].truncated);
     assert_eq!(chunks[1].text, "next\n");
+    assert!(!chunks[1].truncated);
+    Ok(())
+}
+
+struct Down(Arc<AtomicUsize>);
+
+impl Reporter for Down {
+    fn report(
+        &self,
+        _request: ReportJobRequest,
+    ) -> impl Future<Output = Result<ReportJobReply, Status>> + Send {
+        self.0.fetch_add(1, Ordering::SeqCst);
+        ready(Err(Status::unavailable("down")))
+    }
+}
+
+#[tokio::test]
+async fn a_failing_flush_does_not_block_the_pipe_on_every_line() -> TestResult {
+    let dir = TempDir::new()?;
+    let calls = Arc::new(AtomicUsize::new(0));
+    let mut cfg = config(false);
+    cfg.flush_interval = Duration::from_secs(5);
+    let agent = AgentRunner::new(cfg, Down(Arc::clone(&calls)), Redactor::default());
+    let (_trigger, shutdown) = Shutdown::channel();
+    let outcome = agent.run(&job("flood:"), dir.path(), shutdown).await?;
+    assert_eq!(outcome, AgentOutcome::Succeeded);
+    let made = calls.load(Ordering::SeqCst);
+    assert!((1..=4).contains(&made), "report calls: {made}");
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_setsid_descendant_holding_stdout_does_not_turn_success_into_timeout() -> TestResult {
+    let dir = TempDir::new()?;
+    let pid_file = dir.path().join("orphan.pid");
+    let mut cfg = config(false);
+    cfg.timeout = Duration::from_secs(30);
+    let (agent, _rx) = runner(cfg, 0);
+    let (_trigger, shutdown) = Shutdown::channel();
+    let started = std::time::Instant::now();
+    let outcome = agent
+        .run(
+            &job(&format!("orphan:{}", pid_file.display())),
+            dir.path(),
+            shutdown,
+        )
+        .await;
+    let elapsed = started.elapsed();
+    let pid = tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            if let Ok(text) = tokio::fs::read_to_string(&pid_file).await
+                && !text.is_empty()
+            {
+                return text;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await?;
+    assert!(Command::new("kill").arg(pid.trim()).status()?.success());
+    assert_eq!(outcome?, AgentOutcome::Succeeded);
+    assert!(elapsed < Duration::from_secs(10), "{elapsed:?}");
+    Ok(())
+}
+
+#[tokio::test(start_paused = true)]
+async fn keep_alive_renews_the_lease_while_the_work_runs() -> TestResult {
+    let mut cfg = config(false);
+    cfg.report_interval = Duration::from_secs(30);
+    let (agent, mut rx) = runner(cfg, 0);
+    let out = agent
+        .keep_alive(&job("x"), async {
+            tokio::time::sleep(Duration::from_secs(100)).await;
+            7
+        })
+        .await;
+    assert_eq!(out, 7);
+    let reports = drain(&mut rx);
+    assert_eq!(reports.len(), 3);
+    assert!(
+        reports
+            .iter()
+            .all(|r| r.job_id == "job1" && r.chunks.is_empty() && r.terminal_state.is_none())
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn fail_job_after_a_run_keeps_the_progress() -> TestResult {
+    let dir = TempDir::new()?;
+    let (agent, mut rx) = runner(config(false), 0);
+    let (_trigger, shutdown) = Shutdown::channel();
+    let outcome = agent.run(&job("stream:"), dir.path(), shutdown).await?;
+    assert_eq!(outcome, AgentOutcome::Succeeded);
+    agent.fail_job(&job("stream:"), "boom").await;
+    let requests = drain(&mut rx);
+    let last = requests.last().ok_or("no report")?;
+    assert_eq!(last.terminal_state, Some(JobState::Failed.into()));
+    assert_eq!(last.progress, "working on it");
     Ok(())
 }
 

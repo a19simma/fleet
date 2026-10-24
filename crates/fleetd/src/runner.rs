@@ -8,6 +8,14 @@
 //! cancel grace `SIGKILL`, then reports `CANCELLED`. A `FAILED_PRECONDITION` reply means the
 //! lease is gone: the group is killed, pending chunks are dropped and nothing more is sent.
 //!
+//! A report that fails does not stall the pipe: after a failure only the flush tick retries,
+//! so a dead server costs one timeout per tick, not one per line. After the agent exits,
+//! stdout is drained for at most [`STDOUT_DRAIN`], so a descendant that left the process
+//! group cannot hold the run open. A chunk cut to [`MAX_CHUNK_BYTES`] has `truncated` set.
+//! Chunk numbers and progress carry from [`AgentRunner::run`] into [`AgentRunner::finish`]
+//! and [`AgentRunner::fail_job`] for the same job, so the server keeps their chunks.
+//! [`AgentRunner::keep_alive`] and `finish` renew the lease while git steps run.
+//!
 //! After a successful run, [`AgentRunner::finish`] fetches `swarm/<job_id>` from the worktree
 //! into a throwaway bare repo, counts the commits, pushes the branch and opens the pull
 //! request with `gh` from that repo, then sends the terminal report. Every helper runs in
@@ -16,12 +24,14 @@
 //! names `fleetd askpass`, and the `GH_TOKEN` that helper prints, and `gh` only its own
 //! token. Push is limited to `file` and `https` remotes.
 
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
+use std::convert::Infallible;
 use std::ffi::OsString;
 use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::process::{ExitStatus, Stdio};
+use std::sync::{Mutex, PoisonError};
 use std::time::Duration;
 
 use fleet_core::Redactor;
@@ -79,6 +89,10 @@ pub const DEFAULT_TERMINAL_REPORT_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Default time a cancelled agent gets after `SIGTERM` before `SIGKILL`.
 pub const DEFAULT_CANCEL_GRACE: Duration = Duration::from_secs(10);
+
+/// Longest wait for stdout to close after the agent exits. A descendant that escaped the
+/// process group and holds the pipe cannot stretch the run past it.
+pub const STDOUT_DRAIN: Duration = Duration::from_secs(1);
 
 /// Pending chunk bytes that trigger an immediate report.
 pub const FLUSH_BYTES: usize = 64 * 1024;
@@ -217,6 +231,13 @@ pub struct AgentRunner<R> {
     config: RunConfig,
     reporter: R,
     redactor: Redactor,
+    carries: Mutex<HashMap<String, Carry>>,
+}
+
+#[derive(Debug, Default)]
+struct Carry {
+    next_seq: u64,
+    progress: String,
 }
 
 impl<R: Reporter> AgentRunner<R> {
@@ -226,6 +247,58 @@ impl<R: Reporter> AgentRunner<R> {
             config,
             reporter,
             redactor,
+            carries: Mutex::new(HashMap::new()),
+        }
+    }
+
+    fn carry_key(job: &Job) -> String {
+        format!("{}#{}", job.job_id, job.attempt)
+    }
+
+    fn stash(&self, job: &Job, carry: Carry) {
+        self.carries
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .insert(Self::carry_key(job), carry);
+    }
+
+    fn resume<'a>(&'a self, job: &'a Job) -> Stream<'a, R> {
+        let carry = self
+            .carries
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .remove(&Self::carry_key(job))
+            .unwrap_or_default();
+        Stream::new(
+            &self.reporter,
+            job,
+            self.config.terminal_report_timeout,
+            carry,
+        )
+    }
+
+    /// Runs `work` and renews the job lease while it runs.
+    ///
+    /// An empty `ReportJob` goes out every [`RunConfig::report_interval`] until `work`
+    /// completes. Report errors are ignored: the terminal report decides the outcome.
+    pub async fn keep_alive<T>(&self, job: &Job, work: impl Future<Output = T>) -> T {
+        self.alive(job, "", work).await
+    }
+
+    async fn alive<T>(&self, job: &Job, progress: &str, work: impl Future<Output = T>) -> T {
+        tokio::select! {
+            out = work => out,
+            never = self.renew(job, progress) => match never {},
+        }
+    }
+
+    async fn renew(&self, job: &Job, progress: &str) -> Infallible {
+        loop {
+            tokio::time::sleep(self.config.report_interval).await;
+            let _ = self
+                .reporter
+                .report(report_request(job, progress, Vec::new()))
+                .await;
         }
     }
 
@@ -252,7 +325,26 @@ impl<R: Reporter> AgentRunner<R> {
         cwd: &Path,
         shutdown: Shutdown,
     ) -> Result<AgentOutcome, RunError> {
-        let mut stream = Stream::new(&self.reporter, job, self.config.terminal_report_timeout);
+        let mut stream = Stream::new(
+            &self.reporter,
+            job,
+            self.config.terminal_report_timeout,
+            Carry::default(),
+        );
+        let result = self.run_stream(job, cwd, shutdown, &mut stream).await;
+        if matches!(result, Ok(AgentOutcome::Succeeded)) {
+            self.stash(job, stream.carry());
+        }
+        result
+    }
+
+    async fn run_stream(
+        &self,
+        job: &Job,
+        cwd: &Path,
+        shutdown: Shutdown,
+        stream: &mut Stream<'_, R>,
+    ) -> Result<AgentOutcome, RunError> {
         let Ok(mut child) = self.command(job, cwd).spawn() else {
             return Ok(stream.fail(None, ERR_START).await);
         };
@@ -267,7 +359,7 @@ impl<R: Reporter> AgentRunner<R> {
             shutdown,
         };
         let end = self
-            .drive(&mut child, stdout, &mut guard, &mut stream, &mut ctl)
+            .drive(&mut child, stdout, &mut guard, stream, &mut ctl)
             .await;
         if matches!(end, Err(End::Cancel)) {
             guard.terminate();
@@ -334,12 +426,16 @@ impl<R: Reporter> AgentRunner<R> {
         cwd: &Path,
         shutdown: Shutdown,
     ) -> Result<FinishOutcome, RunError> {
-        let mut stream = Stream::new(&self.reporter, job, self.config.terminal_report_timeout);
+        let mut stream = self.resume(job);
         let mut ctl = Ctl {
             deadline: Box::pin(tokio::time::sleep(self.config.finish_timeout)),
             shutdown,
         };
-        match ctl.race(self.publish(job, cwd)).await {
+        let progress = stream.progress.clone();
+        match ctl
+            .race(self.alive(job, &progress, self.publish(job, cwd)))
+            .await
+        {
             Ok(Ok(published)) => {
                 stream
                     .terminal(Terminal {
@@ -380,7 +476,7 @@ impl<R: Reporter> AgentRunner<R> {
     /// Sends a terminal `FAILED` report with a fixed `error`, for a job that failed before
     /// the agent started. The report waits at most [`RunConfig::terminal_report_timeout`].
     pub async fn fail_job(&self, job: &Job, error: &'static str) {
-        let mut stream = Stream::new(&self.reporter, job, self.config.terminal_report_timeout);
+        let mut stream = self.resume(job);
         stream.fail(None, error).await;
     }
 
@@ -611,6 +707,7 @@ impl<R: Reporter> AgentRunner<R> {
         let mut lines = LineReader::new(BufReader::new(stdout), MAX_CHUNK_BYTES);
         let mut open = true;
         let mut status = None;
+        let mut drain: Option<Pin<Box<Sleep>>> = None;
         let mut tick = tokio::time::interval(self.config.flush_interval);
         tick.set_missed_tick_behavior(MissedTickBehavior::Delay);
         let status = loop {
@@ -627,14 +724,16 @@ impl<R: Reporter> AgentRunner<R> {
                     }
                     if !matches!(read, Ok(true)) {
                         open = false;
-                    } else if stream.pending_bytes >= FLUSH_BYTES {
+                    } else if stream.pending_bytes >= FLUSH_BYTES && !stream.failing {
                         stream.flush(ctl).await?;
                     }
                 }
                 waited = child.wait(), if status.is_none() => {
                     guard.kill();
                     status = Some(waited);
+                    drain = Some(Box::pin(tokio::time::sleep(STDOUT_DRAIN)));
                 }
+                () = drain_expired(&mut drain) => open = false,
                 _ = tick.tick() => stream.beat(self.config.report_interval, ctl).await?,
                 () = &mut ctl.deadline => return Err(End::Timeout),
                 () = ctl.shutdown.requested() => return Err(End::Shutdown),
@@ -717,6 +816,13 @@ impl<R: AsyncBufRead + Unpin> LineReader<R> {
     }
 }
 
+async fn drain_expired(drain: &mut Option<Pin<Box<Sleep>>>) {
+    match drain {
+        Some(sleep) => sleep.as_mut().await,
+        None => std::future::pending().await,
+    }
+}
+
 enum End {
     Timeout,
     Shutdown,
@@ -765,21 +871,30 @@ struct Stream<'a, R> {
     terminal_timeout: Duration,
     cancel: bool,
     lost: bool,
+    failing: bool,
 }
 
 impl<'a, R: Reporter> Stream<'a, R> {
-    fn new(reporter: &'a R, job: &'a Job, terminal_timeout: Duration) -> Self {
+    fn new(reporter: &'a R, job: &'a Job, terminal_timeout: Duration, carry: Carry) -> Self {
         Self {
             reporter,
             job,
             pending: VecDeque::new(),
             pending_bytes: 0,
-            next_seq: 1,
-            progress: String::new(),
+            next_seq: carry.next_seq.max(1),
+            progress: carry.progress,
             last_report: Instant::now(),
             terminal_timeout,
             cancel: false,
             lost: false,
+            failing: false,
+        }
+    }
+
+    fn carry(&self) -> Carry {
+        Carry {
+            next_seq: self.next_seq,
+            progress: self.progress.clone(),
         }
     }
 
@@ -793,13 +908,13 @@ impl<'a, R: Reporter> Stream<'a, R> {
         }
         let mut text = clean.into_owned();
         text.push('\n');
-        cut(&mut text, MAX_CHUNK_BYTES);
+        let truncated = cut(&mut text, MAX_CHUNK_BYTES);
         self.pending_bytes += text.len();
         self.pending.push_back(TranscriptChunk {
             seq: self.next_seq,
             ts_ms: now_ms(),
             text,
-            truncated: false,
+            truncated,
         });
         self.next_seq += 1;
         while self.pending_bytes > MAX_BUFFER_BYTES {
@@ -840,6 +955,7 @@ impl<'a, R: Reporter> Stream<'a, R> {
                         self.pending_bytes -= dropped.text.len();
                     }
                     self.last_report = Instant::now();
+                    self.failing = false;
                     if self.pending.is_empty() {
                         return;
                     }
@@ -853,6 +969,7 @@ impl<'a, R: Reporter> Stream<'a, R> {
                 }
                 Err(status) => {
                     tracing::warn!(code = ?status.code(), "job report failed");
+                    self.failing = true;
                     return;
                 }
             }
@@ -873,15 +990,7 @@ impl<'a, R: Reporter> Stream<'a, R> {
     }
 
     fn request(&self, chunks: Vec<TranscriptChunk>) -> ReportJobRequest {
-        ReportJobRequest {
-            job_id: self.job.job_id.clone(),
-            attempt: self.job.attempt,
-            r#box: self.job.r#box.clone(),
-            phase: PHASE.to_owned(),
-            progress: self.progress.clone(),
-            chunks,
-            ..ReportJobRequest::default()
-        }
+        report_request(self.job, &self.progress, chunks)
     }
 
     async fn fail(&mut self, exit_code: Option<i32>, error: &'static str) -> AgentOutcome {
@@ -926,6 +1035,18 @@ impl<'a, R: Reporter> Stream<'a, R> {
             }
             Ok(_) => {}
         }
+    }
+}
+
+fn report_request(job: &Job, progress: &str, chunks: Vec<TranscriptChunk>) -> ReportJobRequest {
+    ReportJobRequest {
+        job_id: job.job_id.clone(),
+        attempt: job.attempt,
+        r#box: job.r#box.clone(),
+        phase: PHASE.to_owned(),
+        progress: progress.to_owned(),
+        chunks,
+        ..ReportJobRequest::default()
     }
 }
 
@@ -1051,14 +1172,16 @@ fn assistant_text(line: &str) -> Option<String> {
         })
 }
 
-fn cut(text: &mut String, max: usize) {
-    if text.len() > max {
-        let mut end = max;
-        while !text.is_char_boundary(end) {
-            end -= 1;
-        }
-        text.truncate(end);
+fn cut(text: &mut String, max: usize) -> bool {
+    if text.len() <= max {
+        return false;
     }
+    let mut end = max;
+    while !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    text.truncate(end);
+    true
 }
 
 #[cfg(test)]

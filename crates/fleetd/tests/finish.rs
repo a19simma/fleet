@@ -7,11 +7,12 @@ use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::OnceLock;
+use std::time::Duration;
 
 use fleet_core::Redactor;
 use fleet_proto::v1::{Job, JobState, ReportJobReply, ReportJobRequest};
 use fleetd::poller::Shutdown;
-use fleetd::runner::{AgentRunner, FinishOutcome, Reporter, RunConfig};
+use fleetd::runner::{AgentOutcome, AgentRunner, FinishOutcome, Reporter, RunConfig};
 use fleetd::workspace::Workspace;
 use tempfile::TempDir;
 use tokio::sync::mpsc;
@@ -42,6 +43,7 @@ root="$GIT_DIR/.."
 env > "$root/git-$sub.env"
 printf '%s\n' "$@" > "$root/git-$sub.args"
 if [ "$sub" = rev-list ] && [ -e "$root/emptycount" ]; then exit 0; fi
+if [ "$sub" = push ] && [ -e "$root/slow" ]; then sleep 1; fi
 exec git "$@"
 "#;
 
@@ -138,8 +140,17 @@ fn agent_with(
     rig: &Rig,
     askpass_bin: PathBuf,
 ) -> (AgentRunner<Fake>, mpsc::UnboundedReceiver<ReportJobRequest>) {
+    agent_paced(rig, askpass_bin, Duration::from_secs(30))
+}
+
+fn agent_paced(
+    rig: &Rig,
+    askpass_bin: PathBuf,
+    report_interval: Duration,
+) -> (AgentRunner<Fake>, mpsc::UnboundedReceiver<ReportJobRequest>) {
     let (tx, rx) = mpsc::unbounded_channel();
-    let mut config = RunConfig::new("claude", false);
+    let mut config = RunConfig::new("/bin/echo", false);
+    config.report_interval = report_interval;
     gh().clone_into(&mut config.gh_bin);
     git_wrapper().clone_into(&mut config.git_bin);
     config.askpass_bin = askpass_bin;
@@ -420,6 +431,50 @@ async fn a_job_without_a_pr_only_pushes() -> TestResult {
     let reports = drain(&mut rx);
     let last = reports.last().ok_or("no report")?;
     assert_eq!(last.pr_url, None);
+    Ok(())
+}
+
+#[tokio::test]
+async fn the_lease_is_renewed_while_the_push_runs() -> TestResult {
+    let rig = rig("ok").await?;
+    commit(&rig)?;
+    std::fs::write(rig.dir.path().join("slow"), "")?;
+    let (agent, mut rx) = agent_paced(
+        &rig,
+        PathBuf::from(env!("CARGO_BIN_EXE_fleetd")),
+        Duration::from_millis(100),
+    );
+    let (_trigger, shutdown) = Shutdown::channel();
+    agent
+        .finish(&job(&rig, true), &rig.worktree, shutdown)
+        .await?;
+    let reports = drain(&mut rx);
+    let renewals = reports
+        .iter()
+        .filter(|r| r.chunks.is_empty() && r.terminal_state.is_none())
+        .count();
+    assert!(renewals >= 3, "renewals: {renewals}");
+    Ok(())
+}
+
+#[tokio::test]
+async fn finish_continues_the_chunk_numbers_of_the_run() -> TestResult {
+    let rig = rig("fail").await?;
+    let (agent, mut rx) = agent(&rig);
+    let (_trigger, shutdown) = Shutdown::channel();
+    let ran = agent
+        .run(&job(&rig, true), &rig.worktree, shutdown.clone())
+        .await?;
+    assert_eq!(ran, AgentOutcome::Succeeded);
+    commit(&rig)?;
+    agent
+        .finish(&job(&rig, true), &rig.worktree, shutdown)
+        .await?;
+    let seqs: Vec<u64> = drain(&mut rx)
+        .iter()
+        .flat_map(|r| r.chunks.iter().map(|c| c.seq))
+        .collect();
+    assert_eq!(seqs, [1, 2]);
     Ok(())
 }
 
