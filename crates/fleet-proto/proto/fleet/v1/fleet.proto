@@ -11,6 +11,19 @@ service FleetQuery {
   rpc ListFleet(ListFleetRequest) returns (ListFleetReply);
 }
 
+service FleetJobs {
+  rpc SubmitJob(SubmitJobRequest) returns (Job);
+  rpc GetJob(GetJobRequest) returns (Job);
+  rpc ListJobs(ListJobsRequest) returns (ListJobsReply);
+  rpc CancelJob(CancelJobRequest) returns (Job);
+  rpc ReadTranscript(ReadTranscriptRequest) returns (ReadTranscriptReply);
+}
+
+service FleetWorker {
+  rpc ClaimJob(ClaimJobRequest) returns (ClaimJobReply);
+  rpc ReportJob(ReportJobRequest) returns (ReportJobReply);
+}
+
 message Envelope {
   string id = 1;
   uint32 schema_version = 2;
@@ -113,4 +126,111 @@ enum SessionState {
   SESSION_STATE_STALLED = 4;
   SESSION_STATE_ENDED = 5;
   SESSION_STATE_CRASHED = 6;
+}
+
+enum JobState {
+  JOB_STATE_UNSPECIFIED = 0;
+  JOB_STATE_QUEUED = 1;
+  JOB_STATE_RUNNING = 2;
+  JOB_STATE_SUCCEEDED = 3;
+  JOB_STATE_FAILED = 4;
+  JOB_STATE_CANCELLED = 5;
+  JOB_STATE_LOST = 6;
+}
+
+message Job {
+  string job_id = 1;
+  string idempotency_key = 2;
+  string prompt = 3;
+  string repo = 4;
+  string base_ref = 5;
+  bool open_pr = 6;
+  JobState state = 7;
+  string box = 8;
+  uint32 attempt = 9;
+  optional uint64 lease_expires_at_ms = 10;
+  string progress = 11;
+  optional int32 exit_code = 12;
+  optional string branch = 13;
+  optional string pr_url = 14;
+  optional string error = 15;
+  bool cancel_requested = 16;
+  uint64 created_at_ms = 17;
+  optional uint64 claimed_at_ms = 18;
+  optional uint64 finished_at_ms = 19;
+  string phase = 20;
+}
+
+message SubmitJobRequest {
+  string idempotency_key = 1;
+  string prompt = 2;
+  string repo = 3;
+  string base_ref = 4;
+  bool open_pr = 5;
+}
+
+message GetJobRequest {
+  string job_id = 1;
+}
+
+message ListJobsRequest {
+  optional JobState state = 1;
+  uint32 limit = 2;
+}
+
+message ListJobsReply {
+  repeated Job jobs = 1;
+}
+
+message CancelJobRequest {
+  string job_id = 1;
+}
+
+message TranscriptChunk {
+  uint64 seq = 1;
+  uint64 ts_ms = 2;
+  string text = 3;
+  bool truncated = 4;
+}
+
+message ReadTranscriptRequest {
+  string job_id = 1;
+  uint64 after_seq = 2;
+  uint32 limit = 3;
+}
+
+message ReadTranscriptReply {
+  repeated TranscriptChunk chunks = 1;
+  bool done = 2;
+}
+
+message ClaimJobRequest {
+  string box = 1;
+}
+
+message ClaimJobReply {
+  optional Job job = 1;
+  uint32 lease_s = 2;
+  uint32 next_in_s = 3;
+}
+
+message ReportJobRequest {
+  string job_id = 1;
+  uint32 attempt = 2;
+  string box = 3;
+  string phase = 4;
+  string progress = 5;
+  optional JobState terminal_state = 6;
+  optional string pr_url = 7;
+  optional string error = 8;
+  optional int32 exit_code = 9;
+  repeated TranscriptChunk chunks = 10;
+  optional string branch = 11;
+}
+
+message ReportJobReply {
+  uint64 lease_expires_at_ms = 1;
+  bool cancel_requested = 2;
+  uint64 acked_through_seq = 3;
+  bool transcript_truncated = 4;
 }
