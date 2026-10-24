@@ -13,6 +13,7 @@ const DEFAULT_PORT: u16 = 7071;
 const DEFAULT_QUEUE_MAX_BYTES: u64 = 256 * 1024 * 1024;
 const DEFAULT_QUEUE_MAX_AGE_SECS: u64 = 14 * 24 * 60 * 60;
 const DEFAULT_DEDUPE_SECS: u64 = 10;
+const DEFAULT_CLAUDE_BIN: &str = "claude";
 const DEFAULT_HOOK_EVENTS: [&str; 5] = [
     "SessionStart",
     "UserPromptSubmit",
@@ -33,6 +34,8 @@ struct FileConfig {
     secrets_file: Option<PathBuf>,
     box_name: Option<String>,
     dedupe_window_secs: Option<u64>,
+    claude_bin: Option<PathBuf>,
+    disposable: Option<bool>,
 }
 
 /// Where redaction secrets are read from.
@@ -65,6 +68,10 @@ pub struct Config {
     pub box_name: Option<String>,
     /// Window in which an identical hook body is dropped as a repeat.
     pub dedupe_window: Duration,
+    /// Agent binary that runs jobs.
+    pub claude_bin: PathBuf,
+    /// True when the box is disposable, which lets jobs run with permission checks off.
+    pub disposable: bool,
 }
 
 impl Config {
@@ -171,6 +178,10 @@ impl Config {
             dedupe_window: Duration::from_secs(
                 file.dedupe_window_secs.unwrap_or(DEFAULT_DEDUPE_SECS),
             ),
+            claude_bin: file
+                .claude_bin
+                .unwrap_or_else(|| PathBuf::from(DEFAULT_CLAUDE_BIN)),
+            disposable: file.disposable.unwrap_or(false),
         })
     }
 }
@@ -213,6 +224,17 @@ mod tests {
         assert_eq!(cfg.queue_max_age, Duration::from_secs(14 * 86_400));
         assert_eq!(cfg.hook_events.len(), 5);
         assert!(!cfg.secrets_file.required);
+    }
+
+    #[test]
+    fn job_settings_default_to_a_cautious_agent() {
+        let cfg = Config::resolve(None, &env_of(&[])).unwrap();
+        assert_eq!(cfg.claude_bin, PathBuf::from("claude"));
+        assert!(!cfg.disposable);
+        let file = "claude_bin = \"/opt/claude\"\ndisposable = true\n";
+        let cfg = Config::resolve(Some(file), &env_of(&[])).unwrap();
+        assert_eq!(cfg.claude_bin, PathBuf::from("/opt/claude"));
+        assert!(cfg.disposable);
     }
 
     #[test]

@@ -50,6 +50,13 @@ pub const SHUTDOWN_GRACE: Duration = Duration::from_secs(10);
 pub struct Shutdown(watch::Receiver<bool>);
 
 impl Shutdown {
+    /// A trigger and the signal it fires. Sending `true` requests shutdown.
+    #[must_use]
+    pub fn channel() -> (watch::Sender<bool>, Self) {
+        let (trigger, signal) = watch::channel(false);
+        (trigger, Self(signal))
+    }
+
     /// Completes once shutdown has been requested or the poller is gone.
     pub async fn requested(&mut self) {
         let _ = self.0.wait_for(|requested| *requested).await;

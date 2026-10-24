@@ -1,7 +1,10 @@
 //! Runs real git against a local bare repo. Own test binary because it spawns children.
 
-use std::path::Path;
+use std::os::unix::fs::PermissionsExt;
+use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::OnceLock;
+use std::time::Duration;
 
 use fleetd::workspace::{Workspace, WorkspaceError};
 use tempfile::TempDir;
@@ -116,5 +119,88 @@ async fn errors_carry_no_input() -> TestResult {
         .ok_or("expected error")?;
     let text = format!("{err} {err:?}");
     assert!(!text.contains("missing-secret-name"));
+    Ok(())
+}
+
+fn hanging_git() -> &'static Path {
+    static DIR: OnceLock<(TempDir, PathBuf)> = OnceLock::new();
+    let (_, path) = DIR.get_or_init(|| {
+        let dir = TempDir::new().unwrap_or_else(|_| std::process::abort());
+        let path = dir.path().join("git");
+        std::fs::write(&path, "#!/bin/sh\nexec sleep 300\n")
+            .unwrap_or_else(|_| std::process::abort());
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755))
+            .unwrap_or_else(|_| std::process::abort());
+        (dir, path)
+    });
+    path
+}
+
+#[tokio::test]
+async fn a_hung_git_command_is_killed_at_the_timeout() -> TestResult {
+    let dir = TempDir::new()?;
+    let ws =
+        Workspace::new(dir.path().join("jobs")).with_git(hanging_git(), Duration::from_millis(200));
+    let result = tokio::time::timeout(
+        Duration::from_secs(20),
+        ws.prepare("job1", "https://example.invalid/r.git", "main"),
+    )
+    .await?;
+    assert!(matches!(result, Err(WorkspaceError::GitTimeout("init"))));
+    Ok(())
+}
+
+fn forking_git() -> &'static Path {
+    static DIR: OnceLock<(TempDir, PathBuf)> = OnceLock::new();
+    let (_, path) = DIR.get_or_init(|| {
+        let dir = TempDir::new().unwrap_or_else(|_| std::process::abort());
+        let path = dir.path().join("git");
+        let script = "#!/bin/sh\ncase \"$3\" in\ninit)\nfor last; do :; done\nbase=$(dirname \"$last\")\nsleep 300 > \"$base/hold\" &\nread x < \"$base/ready\" ;;\nesac\nexit 0\n";
+        std::fs::write(&path, script).unwrap_or_else(|_| std::process::abort());
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755))
+            .unwrap_or_else(|_| std::process::abort());
+        (dir, path)
+    });
+    path
+}
+
+#[tokio::test]
+async fn a_background_descendant_of_a_clean_git_exit_is_killed() -> TestResult {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let dir = TempDir::new()?;
+    let cache = dir.path().join("jobs").join(".cache");
+    std::fs::create_dir_all(&cache)?;
+    for name in ["hold", "ready"] {
+        assert!(
+            Command::new("mkfifo")
+                .arg(cache.join(name))
+                .status()?
+                .success()
+        );
+    }
+    let hold = cache.join("hold");
+    let ready = cache.join("ready");
+    let (tx, opened) = tokio::sync::oneshot::channel();
+    let eof = tokio::spawn(async move {
+        let mut file = tokio::fs::File::open(hold).await?;
+        let _ = tx.send(());
+        let mut sink = Vec::new();
+        file.read_to_end(&mut sink).await
+    });
+    let ws =
+        Workspace::new(dir.path().join("jobs")).with_git(forking_git(), Duration::from_secs(60));
+    let repo = "https://example.invalid/r.git";
+    let (result, driven) = tokio::join!(ws.prepare("job1", repo, "main"), async {
+        tokio::time::timeout(Duration::from_secs(20), opened).await??;
+        let mut file = tokio::fs::OpenOptions::new()
+            .write(true)
+            .open(ready)
+            .await?;
+        file.write_all(b"go\n").await?;
+        Ok::<(), Box<dyn std::error::Error>>(())
+    });
+    driven?;
+    result?;
+    tokio::time::timeout(Duration::from_secs(20), eof).await???;
     Ok(())
 }

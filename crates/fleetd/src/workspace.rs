@@ -6,13 +6,19 @@
 use std::fmt;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
+use std::time::Duration;
 
 use tokio::process::Command;
+
+use crate::group::GroupGuard;
 
 const CACHE_DIR: &str = ".cache";
 const BRANCH_PREFIX: &str = "swarm/";
 const MAX_JOB_ID_LEN: usize = 64;
 const ALLOWED_PROTOCOLS: &str = "file:https:ssh:git";
+
+/// Longest a single git command may run before its process group is killed.
+pub const GIT_TIMEOUT: Duration = Duration::from_secs(300);
 
 /// Why a workspace could not be prepared.
 #[derive(Debug)]
@@ -28,6 +34,8 @@ pub enum WorkspaceError {
     Io(std::io::Error),
     /// A git command could not start or exited with failure.
     Git(&'static str),
+    /// A git command ran past [`GIT_TIMEOUT`] and was killed.
+    GitTimeout(&'static str),
 }
 
 impl fmt::Display for WorkspaceError {
@@ -38,6 +46,7 @@ impl fmt::Display for WorkspaceError {
             Self::InvalidJobId => write!(f, "job id rejected"),
             Self::Io(_) => write!(f, "workspace directory error"),
             Self::Git(step) => write!(f, "git {step} failed"),
+            Self::GitTimeout(step) => write!(f, "git {step} timed out"),
         }
     }
 }
@@ -46,7 +55,11 @@ impl std::error::Error for WorkspaceError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             Self::Io(err) => Some(err),
-            Self::InvalidRepo | Self::InvalidRef | Self::InvalidJobId | Self::Git(_) => None,
+            Self::InvalidRepo
+            | Self::InvalidRef
+            | Self::InvalidJobId
+            | Self::Git(_)
+            | Self::GitTimeout(_) => None,
         }
     }
 }
@@ -64,13 +77,27 @@ pub struct Checkout {
 #[derive(Debug, Clone)]
 pub struct Workspace {
     root: PathBuf,
+    git: PathBuf,
+    timeout: Duration,
 }
 
 impl Workspace {
     /// A workspace rooted at `root`. Mirrors live in `<root>/.cache`.
     #[must_use]
     pub fn new(root: impl Into<PathBuf>) -> Self {
-        Self { root: root.into() }
+        Self {
+            root: root.into(),
+            git: PathBuf::from("git"),
+            timeout: GIT_TIMEOUT,
+        }
+    }
+
+    /// Uses `git` as the git binary and `timeout` as the per-command limit.
+    #[must_use]
+    pub fn with_git(mut self, git: impl Into<PathBuf>, timeout: Duration) -> Self {
+        self.git = git.into();
+        self.timeout = timeout;
+        self
     }
 
     /// Fetches the bare mirror of `repo`, then runs `git worktree add -b swarm/<job_id>`
@@ -95,12 +122,12 @@ impl Workspace {
             .await
             .map_err(WorkspaceError::Io)?;
         let mirror = cache.join(format!("{:016x}.git", fnv1a(repo.as_bytes())));
-        sync_mirror(&mirror, repo).await?;
+        self.sync_mirror(&mirror, repo).await?;
 
         let path = self.root.join(job_id);
         let branch = format!("{BRANCH_PREFIX}{job_id}");
         let start = format!("origin/{base_ref}");
-        git(
+        self.git(
             &mirror,
             &[
                 "worktree",
@@ -117,54 +144,67 @@ impl Workspace {
     }
 }
 
-async fn sync_mirror(mirror: &Path, repo: &str) -> Result<(), WorkspaceError> {
-    if !mirror.join("HEAD").exists() {
-        let dir = mirror.to_str().ok_or(WorkspaceError::InvalidRepo)?;
-        git(
-            Path::new("."),
-            &["init", "--bare", "--quiet", "--", dir],
-            "init",
-        )
-        .await?;
-        git(
+impl Workspace {
+    async fn sync_mirror(&self, mirror: &Path, repo: &str) -> Result<(), WorkspaceError> {
+        if !mirror.join("HEAD").exists() {
+            let dir = mirror.to_str().ok_or(WorkspaceError::InvalidRepo)?;
+            self.git(
+                Path::new("."),
+                &["init", "--bare", "--quiet", "--", dir],
+                "init",
+            )
+            .await?;
+            self.git(
+                mirror,
+                &["remote", "add", "origin", "--", repo],
+                "remote add",
+            )
+            .await?;
+        }
+        self.git(
             mirror,
-            &["remote", "add", "origin", "--", repo],
-            "remote add",
-        )
-        .await?;
-    }
-    git(
-        mirror,
-        &[
+            &[
+                "fetch",
+                "--prune",
+                "--quiet",
+                "origin",
+                "+refs/heads/*:refs/remotes/origin/*",
+            ],
             "fetch",
-            "--prune",
-            "--quiet",
-            "origin",
-            "+refs/heads/*:refs/remotes/origin/*",
-        ],
-        "fetch",
-    )
-    .await
-}
-
-async fn git(dir: &Path, args: &[&str], step: &'static str) -> Result<(), WorkspaceError> {
-    let status = Command::new("git")
-        .arg("-C")
-        .arg(dir)
-        .args(args)
-        .env("GIT_TERMINAL_PROMPT", "0")
-        .env("GIT_ALLOW_PROTOCOL", ALLOWED_PROTOCOLS)
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .kill_on_drop(true)
-        .status()
+        )
         .await
-        .map_err(|_| WorkspaceError::Git(step))?;
-    if status.success() {
-        Ok(())
-    } else {
-        Err(WorkspaceError::Git(step))
+    }
+
+    async fn git(
+        &self,
+        dir: &Path,
+        args: &[&str],
+        step: &'static str,
+    ) -> Result<(), WorkspaceError> {
+        let mut child = Command::new(&self.git)
+            .arg("-C")
+            .arg(dir)
+            .args(args)
+            .env("GIT_TERMINAL_PROMPT", "0")
+            .env("GIT_ALLOW_PROTOCOL", ALLOWED_PROTOCOLS)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .process_group(0)
+            .kill_on_drop(true)
+            .spawn()
+            .map_err(|_| WorkspaceError::Git(step))?;
+        let mut guard = GroupGuard::new(child.id());
+        let waited = tokio::time::timeout(self.timeout, child.wait()).await;
+        guard.kill();
+        match waited {
+            Ok(Ok(status)) if status.success() => Ok(()),
+            Ok(_) => Err(WorkspaceError::Git(step)),
+            Err(_) => {
+                let _ = child.wait().await;
+                Err(WorkspaceError::GitTimeout(step))
+            }
+        }
     }
 }
 
