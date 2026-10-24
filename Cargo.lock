@@ -502,6 +502,7 @@ dependencies = [
  "axum",
  "clap",
  "fleet-core",
+ "rustix",
  "sd-notify",
  "serde",
  "serde_json",

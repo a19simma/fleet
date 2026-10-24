@@ -1,5 +1,6 @@
 use std::io;
 use std::net::{Ipv4Addr, SocketAddr};
+use std::os::unix::fs::MetadataExt;
 use std::path::Path;
 use std::time::Duration;
 
@@ -126,7 +127,7 @@ async fn forward(
         ));
     }
     let request = request_bytes(event, &body, job);
-    if config.socket_path.exists() {
+    if socket_usable(&config.socket_path) {
         let attempt = tokio::time::timeout(UNIX_TIMEOUT, async {
             match UnixStream::connect(&config.socket_path).await {
                 Ok(stream) => exchange(stream, &request).await,
@@ -146,6 +147,19 @@ async fn forward(
         Err(Attempt::Final(err)) => Err(err),
         Err(Attempt::NotDelivered) => Err(io::Error::other("hook request was not delivered")),
     }
+}
+
+/// Decides whether a socket at `path` owned by `socket_uid` may be trusted.
+///
+/// The path must be absolute and the owner must be `current_uid`, so a planted
+/// socket from another user is never sent a hook payload.
+fn socket_acceptable(path: &Path, socket_uid: u32, current_uid: u32) -> bool {
+    path.is_absolute() && socket_uid == current_uid
+}
+
+fn socket_usable(path: &Path) -> bool {
+    std::fs::metadata(path)
+        .is_ok_and(|meta| socket_acceptable(path, meta.uid(), rustix::process::geteuid().as_raw()))
 }
 
 enum Attempt {
@@ -198,5 +212,27 @@ async fn exchange(
         Err(Attempt::Final(io::Error::other(format!(
             "fleetd answered {status}"
         ))))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::path::Path;
+
+    use super::socket_acceptable;
+
+    #[test]
+    fn accepts_an_absolute_path_owned_by_the_current_uid() {
+        assert!(socket_acceptable(Path::new("/run/fleetd.sock"), 1000, 1000));
+    }
+
+    #[test]
+    fn refuses_a_relative_path() {
+        assert!(!socket_acceptable(Path::new("fleetd.sock"), 1000, 1000));
+    }
+
+    #[test]
+    fn refuses_a_socket_owned_by_another_uid() {
+        assert!(!socket_acceptable(Path::new("/run/fleetd.sock"), 0, 1000));
     }
 }
