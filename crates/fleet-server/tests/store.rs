@@ -2,7 +2,11 @@
 //! reads to create one database per test. A missing variable fails the test.
 
 use fleet_core::{BoxName, Envelope, EventId, Identity, Source};
-use fleet_proto::v1::{BoxStatus, BoxView, HeartbeatRequest, SessionState};
+use fleet_proto::v1::fleet_ingest_server::FleetIngest;
+use fleet_proto::v1::{
+    BoxStatus, BoxView, HeartbeatRequest, PushEventsRequest, QueuedEvent, SessionState,
+};
+use fleet_server::service::FleetService;
 use fleet_server::store::Store;
 use serde_json::{Value, json};
 use sqlx::PgPool;
@@ -252,6 +256,81 @@ async fn unsupported_schema_version_is_rejected(pool: PgPool) {
     assert_eq!(out.stored, 0);
     assert_eq!(out.rejected.len(), 1);
     assert_eq!(out.retry_from_seq, Some(1));
+}
+
+fn wire(seq: u64, schema_version: u32) -> QueuedEvent {
+    QueuedEvent {
+        seq,
+        envelope: Some(fleet_proto::v1::Envelope {
+            id: format!("{seq:0>26}"),
+            schema_version,
+            r#box: box_name(),
+            hostname: "h".into(),
+            machine_id: "m".into(),
+            boot_id: "b".into(),
+            source: "hook".into(),
+            kind: "hook.stop".into(),
+            ts_ms: 1,
+            payload_json: "{}".into(),
+            ..fleet_proto::v1::Envelope::default()
+        }),
+    }
+}
+
+async fn stored_events(pool: &PgPool) -> Result<i64, String> {
+    sqlx::query_scalar("SELECT count(*) FROM events")
+        .fetch_one(pool)
+        .await
+        .map_err(|err| err.to_string())
+}
+
+#[sqlx::test]
+async fn unsupported_event_mid_batch_holds_the_ack_and_resend_dedupes(pool: PgPool) {
+    let service = FleetService::new(Store::new(pool.clone()));
+    let batch = vec![wire(1, 1), wire(2, 2), wire(3, 1)];
+    let reply = service
+        .push_events(tonic::Request::new(PushEventsRequest {
+            events: batch.clone(),
+        }))
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(reply.acked_through_seq, 1);
+    let seqs: Vec<u64> = reply.rejected.iter().map(|r| r.seq).collect();
+    assert_eq!(seqs, vec![2]);
+    let first: i64 = sqlx::query_scalar("SELECT count(*) FROM events WHERE seq = 1")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(first, 1);
+    let before = stored_events(&pool).await.unwrap();
+    let again = service
+        .push_events(tonic::Request::new(PushEventsRequest { events: batch }))
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(again.acked_through_seq, 1);
+    assert_eq!(again.stored, 0);
+    assert_eq!(stored_events(&pool).await.unwrap(), before);
+}
+
+#[sqlx::test]
+async fn unsupported_first_event_acks_nothing_and_stores_the_valid_one(pool: PgPool) {
+    let service = FleetService::new(Store::new(pool.clone()));
+    let reply = service
+        .push_events(tonic::Request::new(PushEventsRequest {
+            events: vec![wire(1, 2), wire(2, 1)],
+        }))
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(reply.acked_through_seq, 0);
+    assert_eq!(reply.stored, 1);
+    let second: i64 = sqlx::query_scalar("SELECT count(*) FROM events WHERE seq = 2")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(second, 1);
 }
 
 #[sqlx::test]

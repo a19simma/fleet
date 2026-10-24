@@ -272,8 +272,9 @@ impl Store {
     /// timestamp beyond the year 9999, a number beyond the column range, a
     /// `schema_version` other than [`SCHEMA_VERSION`]) come back in
     /// [`IngestOutcome::rejected`]. The lowest `seq` rejected for its schema version is
-    /// also reported in [`IngestOutcome::retry_from_seq`]. Only the current schema version is accepted, since
-    /// no earlier one has shipped.
+    /// also reported in [`IngestOutcome::retry_from_seq`].
+    ///
+    /// Only the current schema version is accepted, since no earlier one has shipped.
     ///
     /// # Errors
     ///
