@@ -488,6 +488,9 @@ dependencies = [
  "fleet-proto",
  "serde_json",
  "sqlx",
+ "tokio",
+ "tonic",
+ "tracing",
 ]
 
 [[package]]
