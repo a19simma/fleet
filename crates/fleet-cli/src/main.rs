@@ -1,40 +1,21 @@
 //! fleet: the Fleet command line client.
 
 use std::io::Write;
+use std::process::ExitCode;
 
-use clap::{Parser, Subcommand};
+use clap::Parser;
+use fleet_cli::{Cli, run};
 
-#[derive(Parser)]
-#[command(name = "fleet", version, about = "Fleet command line client")]
-struct Cli {
-    #[command(subcommand)]
-    command: Command,
-}
-
-#[derive(Subcommand)]
-enum Command {
-    /// List every box and what it is doing.
-    List,
-}
-
-fn run(command: &Command) -> &'static str {
-    match command {
-        Command::List => "no boxes: fleet list is not implemented yet",
-    }
-}
-
-fn main() {
+#[tokio::main]
+async fn main() -> ExitCode {
     let cli = Cli::parse();
     let mut out = std::io::stdout();
-    let _ = writeln!(out, "{}", run(&cli.command));
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn list_is_a_stub() {
-        assert!(run(&Command::List).contains("not implemented"));
+    let mut stdin = std::io::stdin().lock();
+    match run(cli, |name| std::env::var(name).ok(), &mut stdin, &mut out).await {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(e) => {
+            let _ = writeln!(std::io::stderr(), "fleet: {e}");
+            ExitCode::from(e.exit_code())
+        }
     }
 }
