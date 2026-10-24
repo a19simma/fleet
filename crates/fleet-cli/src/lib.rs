@@ -1,6 +1,8 @@
 //! The `fleet` command line client: job submission and inspection over gRPC.
 
 pub mod config;
+pub mod list;
+pub mod watch;
 
 use std::fmt;
 use std::io::{Read, Write};
@@ -67,6 +69,11 @@ pub enum Command {
         /// Job id.
         id: String,
     },
+    /// Follow a job until it ends; exits 0 only on success.
+    Watch {
+        /// Job id.
+        id: String,
+    },
     /// Request cancellation of a job.
     Cancel {
         /// Job id.
@@ -87,6 +94,8 @@ pub enum CliError {
     Rpc(Status),
     /// Reading input or writing output failed.
     Io(std::io::Error),
+    /// A watched job ended in a state other than succeeded.
+    JobEnded(&'static str),
 }
 
 impl CliError {
@@ -94,7 +103,7 @@ impl CliError {
     pub fn exit_code(&self) -> u8 {
         match self {
             Self::Config(_) | Self::Usage(_) => 2,
-            Self::Connect(_) | Self::Rpc(_) | Self::Io(_) => 1,
+            Self::Connect(_) | Self::Rpc(_) | Self::Io(_) | Self::JobEnded(_) => 1,
         }
     }
 }
@@ -115,6 +124,7 @@ impl fmt::Display for CliError {
             Self::Connect(m) => write!(f, "cannot connect: {m}"),
             Self::Rpc(s) => write!(f, "server error {:?}: {}", s.code(), sanitize(s.message())),
             Self::Io(e) => write!(f, "{e}"),
+            Self::JobEnded(state) => write!(f, "job ended {state}"),
         }
     }
 }
@@ -154,7 +164,7 @@ impl tonic::service::Interceptor for Bearer {
     }
 }
 
-async fn connect(config: &Config) -> Result<Client, CliError> {
+async fn open_channel(config: &Config) -> Result<Channel, CliError> {
     let mut endpoint = Endpoint::from_shared(config.server.clone())
         .map_err(|e| CliError::Connect(e.to_string()))?;
     if config.uses_tls() {
@@ -168,14 +178,22 @@ async fn connect(config: &Config) -> Result<Client, CliError> {
             .tls_config(tls)
             .map_err(|e| CliError::Connect(e.to_string()))?;
     }
-    let channel = endpoint
+    endpoint
         .connect()
         .await
-        .map_err(|e| CliError::Connect(e.to_string()))?;
+        .map_err(|e| CliError::Connect(e.to_string()))
+}
+
+fn bearer(config: &Config) -> Result<Bearer, CliError> {
     let mut value = MetadataValue::try_from(config.bearer())
         .map_err(|_| CliError::Usage("token has invalid characters".into()))?;
     value.set_sensitive(true);
-    Ok(FleetJobsClient::with_interceptor(channel, Bearer(value)))
+    Ok(Bearer(value))
+}
+
+async fn connect(config: &Config) -> Result<Client, CliError> {
+    let channel = open_channel(config).await?;
+    Ok(FleetJobsClient::with_interceptor(channel, bearer(config)?))
 }
 
 fn parse_state(name: &str) -> Result<JobState, CliError> {
@@ -252,7 +270,12 @@ pub async fn run(
     } = cli;
     match command {
         Command::List => {
-            writeln!(out, "no boxes: fleet list is not implemented yet")?;
+            let config = Config::from_lookup(server, insecure, lookup)?;
+            list::list(&config, out).await?;
+        }
+        Command::Watch { id } => {
+            let config = Config::from_lookup(server, insecure, lookup)?;
+            watch::watch(&config, &id, out).await?;
         }
         Command::Submit {
             repo,
