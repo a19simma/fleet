@@ -2,12 +2,14 @@
 
 use std::collections::{BTreeMap, HashSet};
 use std::fmt;
+use std::time::Duration;
 
 use fleet_core::{BoxName, Envelope, EventId, SCHEMA_VERSION};
 use fleet_proto::v1::{
     BoxStatus, BoxView, HeartbeatRequest, Job, JobState, SessionState, SessionView,
     SubmitJobRequest,
 };
+use fleet_proto::validate_box;
 use serde_json::{Value, json};
 use sqlx::postgres::PgRow;
 use sqlx::{PgPool, Postgres, Row, Transaction};
@@ -122,6 +124,22 @@ VALUES ($1, $2, $3, $4, $5, 'swarm/' || $1, $6) \
 ON CONFLICT (idempotency_key) DO NOTHING \
 RETURNING job_id";
 
+const CLAIM_JOB: &str = "\
+UPDATE jobs SET state = 'RUNNING', box = $1, attempt = attempt + 1, \
+claimed_at = now(), lease_expires_at = now() + make_interval(secs => $2) \
+WHERE job_id = ( \
+SELECT job_id FROM jobs WHERE state = 'QUEUED' \
+ORDER BY created_at, job_id LIMIT 1 FOR UPDATE SKIP LOCKED) \
+RETURNING job_id, idempotency_key, prompt, repo, base_ref, open_pr, state, box, attempt, \
+progress, phase, branch, pr_url, error, exit_code, cancel_requested, \
+(EXTRACT(EPOCH FROM lease_expires_at) * 1000)::bigint AS lease_ms, \
+(EXTRACT(EPOCH FROM created_at) * 1000)::bigint AS created_ms, \
+(EXTRACT(EPOCH FROM claimed_at) * 1000)::bigint AS claimed_ms, \
+(EXTRACT(EPOCH FROM finished_at) * 1000)::bigint AS finished_ms";
+
+/// Lease granted to a claimed job when the store is not configured otherwise.
+pub const DEFAULT_LEASE: Duration = Duration::from_secs(120);
+
 const NOW_MS: &str = "SELECT (EXTRACT(EPOCH FROM now()) * 1000)::bigint";
 
 /// Last millisecond of the year 9999, the largest timestamp an event may carry.
@@ -139,6 +157,8 @@ pub enum StoreError {
     OutOfRange(&'static str),
     /// A job request failed validation.
     InvalidJob(JobInvalid),
+    /// A claim named an invalid box. The value is not kept.
+    InvalidBox,
     /// An idempotency key was reused with different submit parameters. The handler maps
     /// this to gRPC `ALREADY_EXISTS`.
     KeyConflict,
@@ -151,6 +171,7 @@ impl fmt::Display for StoreError {
             Self::Migrate(err) => write!(f, "migration error: {err}"),
             Self::OutOfRange(field) => write!(f, "stored {field} is out of range"),
             Self::InvalidJob(reason) => reason.fmt(f),
+            Self::InvalidBox => f.write_str("invalid box name"),
             Self::KeyConflict => f.write_str("idempotency key already used with other parameters"),
         }
     }
@@ -162,7 +183,7 @@ impl std::error::Error for StoreError {
             Self::Database(err) => Some(err),
             Self::Migrate(err) => Some(err),
             Self::InvalidJob(err) => Some(err),
-            Self::OutOfRange(_) | Self::KeyConflict => None,
+            Self::OutOfRange(_) | Self::InvalidBox | Self::KeyConflict => None,
         }
     }
 }
@@ -326,6 +347,7 @@ fn parse_count(value: Option<String>, bad: &mut u32) -> u64 {
 #[derive(Debug, Clone)]
 pub struct Store {
     pool: PgPool,
+    lease: Duration,
     #[cfg(test)]
     snapshot_gate: Option<std::sync::Arc<SnapshotGate>>,
 }
@@ -342,9 +364,17 @@ impl Store {
     pub fn new(pool: PgPool) -> Self {
         Self {
             pool,
+            lease: DEFAULT_LEASE,
             #[cfg(test)]
             snapshot_gate: None,
         }
+    }
+
+    /// Sets the lease a claim grants, [`DEFAULT_LEASE`] otherwise.
+    #[must_use]
+    pub fn with_lease(mut self, lease: Duration) -> Self {
+        self.lease = lease;
+        self
     }
 
     /// Applies the embedded migrations.
@@ -493,6 +523,28 @@ impl Store {
             return Err(StoreError::KeyConflict);
         }
         Ok(stored)
+    }
+
+    /// Claims the oldest queued job for `box_name`.
+    ///
+    /// One statement picks the head of the queue by `created_at` with
+    /// `FOR UPDATE SKIP LOCKED`, so concurrent claimers never take the same job. The job
+    /// becomes `RUNNING` with the box, the attempt incremented, `claimed_at` set and the
+    /// lease expiry one store lease after the claim. Cancelled and other non-queued jobs
+    /// are skipped. An empty queue returns `None`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StoreError::InvalidBox`] when `box_name` fails [`validate_box`], and
+    /// [`StoreError::Database`] when the statement fails.
+    pub async fn claim_job(&self, box_name: &str) -> Result<Option<Job>, StoreError> {
+        let name = validate_box(box_name).map_err(|_| StoreError::InvalidBox)?;
+        let row = sqlx::query(CLAIM_JOB)
+            .bind(name.as_str())
+            .bind(self.lease.as_secs_f64())
+            .fetch_optional(&self.pool)
+            .await?;
+        row.as_ref().map(job_from_row).transpose()
     }
 
     /// Starts a `REPEATABLE READ`, read only transaction, so every query in it sees one

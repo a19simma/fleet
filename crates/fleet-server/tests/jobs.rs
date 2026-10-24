@@ -204,3 +204,136 @@ async fn boundary_sizes_are_accepted(pool: PgPool) {
     assert!(!job.open_pr);
     assert_eq!(job.prompt.len(), MAX_PROMPT_BYTES);
 }
+
+fn claimer(n: u32) -> String {
+    format!("box-{n}")
+}
+
+async fn submit_n(store: &Store, n: usize) -> Vec<String> {
+    let mut ids = Vec::new();
+    for i in 0..n {
+        let job = store.submit_job(&request(&format!("k{i}"))).await.unwrap();
+        ids.push(job.job_id);
+    }
+    ids
+}
+
+#[sqlx::test]
+async fn concurrent_claims_are_exclusive(pool: PgPool) {
+    let store = store(pool).await;
+    let jobs = 12;
+    let mut expected = submit_n(&store, jobs).await;
+    let mut tasks = Vec::new();
+    for i in 0..24 {
+        let store = store.clone();
+        tasks.push(tokio::spawn(async move {
+            store.claim_job(&claimer(i % 4 + 1)).await
+        }));
+    }
+    let mut claimed = Vec::new();
+    let mut empty = 0;
+    for task in tasks {
+        match timeout(WAIT, task).await.unwrap().unwrap().unwrap() {
+            Some(job) => {
+                assert_eq!(job.state, i32::from(JobState::Running));
+                assert_eq!(job.attempt, 1);
+                claimed.push(job.job_id);
+            }
+            None => empty += 1,
+        }
+    }
+    claimed.sort();
+    expected.sort();
+    assert_eq!(claimed, expected);
+    assert_eq!(empty, 12);
+}
+
+#[sqlx::test]
+async fn claim_is_fifo(pool: PgPool) {
+    let store = store(pool.clone()).await;
+    let ids = submit_n(&store, 3).await;
+    let cancelled = store.submit_job(&request("late")).await.unwrap();
+    sqlx::query("UPDATE jobs SET state = 'CANCELLED' WHERE job_id = $1")
+        .bind(&cancelled.job_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+    let mut order = Vec::new();
+    for _ in 0..=ids.len() {
+        let claimed = timeout(WAIT, store.claim_job(&claimer(1)))
+            .await
+            .unwrap()
+            .unwrap();
+        order.extend(claimed.map(|job| job.job_id));
+    }
+    assert_eq!(order, ids);
+    let left: String = sqlx::query_scalar("SELECT state FROM jobs WHERE job_id = $1")
+        .bind(&cancelled.job_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(left, "CANCELLED");
+}
+
+#[sqlx::test]
+async fn claim_sets_lease_and_attempt(pool: PgPool) {
+    let lease = Duration::from_secs(45);
+    let store = store(pool.clone()).await.with_lease(lease);
+    let queued = store.submit_job(&request("k")).await.unwrap();
+    assert_eq!(queued.attempt, 0);
+    assert_eq!(queued.lease_expires_at_ms, None);
+    let job = timeout(WAIT, store.claim_job(&claimer(2)))
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    assert_eq!(job.job_id, queued.job_id);
+    assert_eq!(job.state, i32::from(JobState::Running));
+    assert_eq!(job.r#box, claimer(2));
+    assert_eq!(job.attempt, 1);
+    let claimed = job.claimed_at_ms.unwrap();
+    let expires = job.lease_expires_at_ms.unwrap();
+    assert_eq!(expires - claimed, 45_000);
+    assert!(claimed >= job.created_at_ms);
+    let default = Store::new(pool.clone());
+    default.submit_job(&request("k2")).await.unwrap();
+    let second = default.claim_job(&claimer(2)).await.unwrap().unwrap();
+    assert_eq!(
+        second.lease_expires_at_ms.unwrap() - second.claimed_at_ms.unwrap(),
+        120_000
+    );
+}
+
+#[sqlx::test]
+async fn empty_queue_returns_none(pool: PgPool) {
+    let store = store(pool.clone()).await;
+    let first = timeout(WAIT, store.claim_job(&claimer(1)))
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(first.is_none());
+    submit_n(&store, 1).await;
+    assert!(store.claim_job(&claimer(1)).await.unwrap().is_some());
+    assert!(store.claim_job(&claimer(1)).await.unwrap().is_none());
+}
+
+#[sqlx::test]
+async fn invalid_box_rejected_without_echo(pool: PgPool) {
+    let store = store(pool.clone()).await;
+    submit_n(&store, 1).await;
+    let secret = "s3cret-token";
+    for raw in [
+        secret.to_owned(),
+        String::new(),
+        format!("{}\n{secret}", claimer(1)),
+    ] {
+        let err = store.claim_job(&raw).await.unwrap_err();
+        assert!(matches!(err, StoreError::InvalidBox));
+        assert!(!format!("{err} {err:?}").contains(secret));
+    }
+    let state: String = sqlx::query_scalar("SELECT state FROM jobs")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(state, "QUEUED");
+}
