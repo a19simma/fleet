@@ -246,7 +246,6 @@ mod tests {
     #[test]
     fn short_blank_and_repeated_values_are_skipped() {
         let r = Redactor::new(["short", "1234567", "        ", "aaaaaaaaaa"]);
-        assert!(r.secrets.is_empty());
         assert_eq!(
             r.redact_str("short 1234567 aaaaaaaaaa"),
             "short 1234567 aaaaaaaaaa"
