@@ -12,12 +12,24 @@ publish = false
 [package.metadata.dist]
 dist = true
 
+[lib]
+name = "fleet_cli"
+path = "src/lib.rs"
+
 [[bin]]
 name = "fleet"
 path = "src/main.rs"
 
 [dependencies]
 clap.workspace = true
+fleet-proto.workspace = true
+tokio.workspace = true
+tonic = { workspace = true, features = ["tls-ring", "tls-webpki-roots"] }
+
+[dev-dependencies]
+rcgen = { version = "0.14.10", default-features = false, features = ["pem", "ring"] }
+tempfile.workspace = true
+tokio-stream.workspace = true
 
 [lints]
 workspace = true
