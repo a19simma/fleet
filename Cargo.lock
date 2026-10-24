@@ -589,8 +589,10 @@ version = "0.2.1"
 dependencies = [
  "axum",
  "clap",
+ "fleet-cli",
  "fleet-core",
  "fleet-proto",
+ "fleet-server",
  "hyper-util",
  "prost",
  "rustix",
