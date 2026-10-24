@@ -234,9 +234,13 @@ fn count(value: i64, field: &'static str) -> Result<u64, StoreError> {
     u64::try_from(value).map_err(|_| StoreError::OutOfRange(field))
 }
 
-fn parse_count(value: Option<String>, field: &'static str) -> Result<u64, StoreError> {
-    value.map_or(Ok(0), |text| {
-        text.parse().map_err(|_| StoreError::OutOfRange(field))
+fn parse_count(value: Option<String>, field: &'static str, name: &str) -> u64 {
+    let Some(text) = value else {
+        return 0;
+    };
+    text.parse().unwrap_or_else(|_| {
+        tracing::warn!(box_name = name, field, "stored queue value is not a count");
+        0
     })
 }
 
@@ -371,20 +375,25 @@ impl Store {
     ///
     /// Returns [`StoreError::Database`] when a query fails.
     pub async fn list_fleet(&self, only: Option<&str>) -> Result<(u64, Vec<BoxView>), StoreError> {
+        let mut tx = self.pool.begin().await?;
+        sqlx::query("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ, READ ONLY")
+            .execute(&mut *tx)
+            .await?;
         let as_of_ms = count(
             sqlx::query_scalar::<_, i64>(NOW_MS)
-                .fetch_one(&self.pool)
+                .fetch_one(&mut *tx)
                 .await?,
             "as_of_ms",
         )?;
         let box_rows = sqlx::query(LIST_BOXES)
             .bind(only)
-            .fetch_all(&self.pool)
+            .fetch_all(&mut *tx)
             .await?;
         let session_rows = sqlx::query(LIST_SESSIONS)
             .bind(only)
-            .fetch_all(&self.pool)
+            .fetch_all(&mut *tx)
             .await?;
+        tx.commit().await?;
 
         let mut sessions: BTreeMap<String, Vec<SessionView>> = BTreeMap::new();
         for row in &session_rows {
@@ -517,7 +526,6 @@ fn session_view(row: &PgRow) -> Result<SessionView, StoreError> {
 fn box_view(row: &PgRow, name: String, status: &str) -> Result<BoxView, StoreError> {
     let heartbeat_age: Option<i64> = row.try_get("heartbeat_age_s")?;
     Ok(BoxView {
-        r#box: name,
         hostname: row.try_get("hostname")?,
         status: box_status(status).into(),
         heartbeat_age_s: heartbeat_age
@@ -525,8 +533,13 @@ fn box_view(row: &PgRow, name: String, status: &str) -> Result<BoxView, StoreErr
             .transpose()?,
         boot_id: row.try_get("boot_id")?,
         fleetd_version: row.try_get("fleetd_version")?,
-        queue_pending: parse_count(row.try_get("queue_pending")?, "queue_pending")?,
-        queue_oldest_age_s: parse_count(row.try_get("queue_oldest_age_s")?, "queue_oldest_age_s")?,
+        queue_pending: parse_count(row.try_get("queue_pending")?, "queue_pending", &name),
+        queue_oldest_age_s: parse_count(
+            row.try_get("queue_oldest_age_s")?,
+            "queue_oldest_age_s",
+            &name,
+        ),
         sessions: Vec::new(),
+        r#box: name,
     })
 }

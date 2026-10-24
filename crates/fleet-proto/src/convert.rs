@@ -1,6 +1,6 @@
 use std::fmt;
 
-use fleet_core::{Envelope, EventId, Source};
+use fleet_core::{BoxName, Envelope, EventId, Source};
 use serde_json::Value;
 
 use crate::v1;
@@ -9,6 +9,8 @@ use crate::v1;
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum ConvertError {
+    /// The `box` field is not a valid box name.
+    InvalidBox(String),
     /// The `id` field is not a valid event id.
     InvalidId(String),
     /// The `source` field names no known source.
@@ -20,6 +22,7 @@ pub enum ConvertError {
 impl fmt::Display for ConvertError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::InvalidBox(raw) => write!(f, "invalid box name: {raw:?}"),
             Self::InvalidId(raw) => write!(f, "invalid event id: {raw:?}"),
             Self::InvalidSource(raw) => write!(f, "unknown source: {raw:?}"),
             Self::InvalidPayload(why) => write!(f, "payload is not valid JSON: {why}"),
@@ -54,6 +57,7 @@ impl TryFrom<v1::Envelope> for Envelope {
     type Error = ConvertError;
 
     fn try_from(wire: v1::Envelope) -> Result<Self, Self::Error> {
+        BoxName::new(&wire.r#box).map_err(|_| ConvertError::InvalidBox(wire.r#box.clone()))?;
         let id = wire
             .id
             .parse::<EventId>()
@@ -167,6 +171,13 @@ mod tests {
     #[test]
     fn rejects_bad_fields() {
         let good = v1::Envelope::from(&sample());
+
+        let mut wire = good.clone();
+        wire.r#box = "other".into();
+        assert_eq!(
+            Envelope::try_from(wire),
+            Err(ConvertError::InvalidBox("other".into()))
+        );
 
         let mut wire = good.clone();
         wire.id = "nope".into();

@@ -108,6 +108,14 @@ pub struct Config {
     pub token: Token,
 }
 
+/// Lists the listeners bound to a non-loopback address, as `(variable, address)`.
+pub fn exposed_binds(listen: &SocketAddr, health: &SocketAddr) -> Vec<(&'static str, SocketAddr)> {
+    [("FLEET_LISTEN", *listen), ("FLEET_HEALTH_LISTEN", *health)]
+        .into_iter()
+        .filter(|(_, addr)| !is_loopback(addr))
+        .collect()
+}
+
 /// Whether `addr` binds only the loopback interface, so nothing off the host can reach it.
 pub fn is_loopback(addr: &SocketAddr) -> bool {
     addr.ip().is_loopback()
@@ -184,6 +192,21 @@ mod tests {
         assert_eq!(config.listen.to_string(), "127.0.0.1:7070");
         assert_eq!(config.health_listen.to_string(), "0.0.0.0:7072");
         assert_eq!(config.token.expose(), TOKEN);
+    }
+
+    #[test]
+    fn exposed_binds_names_each_non_loopback_listener() {
+        let local: SocketAddr = "127.0.0.1:1".parse().unwrap();
+        let open: SocketAddr = "0.0.0.0:2".parse().unwrap();
+        assert_eq!(exposed_binds(&local, &local), vec![]);
+        assert_eq!(
+            exposed_binds(&local, &open),
+            vec![("FLEET_HEALTH_LISTEN", open)]
+        );
+        assert_eq!(
+            exposed_binds(&open, &open),
+            vec![("FLEET_LISTEN", open), ("FLEET_HEALTH_LISTEN", open)]
+        );
     }
 
     #[test]

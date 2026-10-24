@@ -570,6 +570,21 @@ async fn box_status_follows_heartbeat_age(pool: PgPool) {
 }
 
 #[sqlx::test]
+async fn bad_queue_value_does_not_fail_list_fleet(pool: PgPool) {
+    let store = Store::new(pool.clone());
+    store.ingest(&[(1, prompt("a", "go"))]).await.unwrap();
+    let name = BoxName::new(&box_name()).unwrap();
+    store.heartbeat(&name, &heartbeat()).await.unwrap();
+    sqlx::query("UPDATE boxes SET state = jsonb_set(state, '{queue_pending}', '\"junk\"')")
+        .execute(&pool)
+        .await
+        .unwrap();
+    let view = fleet(&store).await.unwrap();
+    assert_eq!(view.queue_pending, 0);
+    assert_eq!(view.queue_oldest_age_s, 7);
+}
+
+#[sqlx::test]
 async fn list_fleet_filters_by_box(pool: PgPool) {
     let store = Store::new(pool);
     store.ingest(&[(1, prompt("a", "go"))]).await.unwrap();
