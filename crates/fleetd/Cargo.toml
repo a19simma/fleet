@@ -30,6 +30,8 @@ tracing.workspace = true
 tracing-subscriber.workspace = true
 
 [dev-dependencies]
+fleet-cli = { path = "../fleet-cli" }
+fleet-server = { path = "../fleet-server" }
 hyper-util = { version = "0.1.21", features = ["tokio"] }
 tempfile.workspace = true
 tokio = { workspace = true, features = ["test-util"] }
