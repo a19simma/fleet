@@ -29,6 +29,19 @@ Recorded 2026-10-24 when the plan moved into the public repo.
 - ADRs 0011 to 0017 are Accepted.
 - Tailscale is not a hard dependency.
 
+## Amendments (job system)
+
+ADRs 0020 to 0024 reopen the v1 cut for Jobs. They are planned, not built. The v1 cut below is unchanged and describes v1.
+
+- **Out of v1 list.** `FleetJobs`, `ClaimJob`, claim and lease are designed in ADR-0021. `RenewLease` is replaced by `ReportJob`. Drain, the KEDA seam, `GetPreview` and `ListEvents` stay out.
+- **pueue and `fleet-job`.** Jobs no longer run as pueue tasks. fleetd runs them as child processes in git worktrees (ADR-0020). The non-goal "Jobs stay pueue tasks" is superseded for Jobs.
+- **Git.** The non-goal "fleetd pushing to git or holding git credentials" is superseded. fleetd pushes only `swarm/<job_id>` after the agent exits and holds a fine-grained token (ADR-0020, ADR-0024).
+- **Transcripts.** The non-goal "Storing transcripts on the server" is superseded for Job output, which the server stores at up to 4 MiB per Job (ADR-0022).
+- **Auth.** The single shared token becomes two scopes, box and client (ADR-0023).
+- **States.** The lifecycle drops `CLAIMED`. The lease is 120 s, renewed by `ReportJob`, with a 15 s reaper (ADR-0021). `retry_on_lost`, priority, `max_attempts` and `job_attempts` are cut.
+- **CLI.** `fleet submit`, `jobs`, `status`, `logs [-f]` and `cancel` are added (ADR-0021).
+- **Deployment.** Kubernetes runs the server. fleetd runs on Boxes.
+
 ## v1 cut
 
 Decided 2026-10-24. The phases below stay as the full map. v1 is the smallest slice that answers "what is every Box doing, and did anything die".
@@ -597,19 +610,24 @@ Numbering continues the list above. All Decided 2026-10-24.
 
 ## ADRs
 
-All Accepted on 2026-10-24, 0011 to 0019. Index and status in `docs/adr/README.md`.
+All Accepted on 2026-10-24, 0011 to 0024. ADRs 0020 to 0024 are planned, not built. Index and status in `docs/adr/README.md`.
 
 | ADR | Title | Relation |
 |---|---|---|
 | 0011 | fleetd box daemon | Adds fleetd to the Template contents. Supersedes none |
 | 0012 | Event model and delivery | New |
 | 0013 | Fleet server stack | New |
-| 0014 | Box to server bearer token | Adds a fourth baked credential to the three in Background. Supersedes none |
+| 0014 | Box to server bearer token | Adds a baked bearer token to the three credentials in Background. Supersedes none |
 | 0015 | Fleet reads from the server | Replaces the ssh polling and preview parts of the existing picker. Picker, line formats and connect stay |
 | 0016 | Job queue, claim and lease | New, parked sketch. Leaves manual scale-down in force |
 | 0017 | Public repo and mise distribution | New. The pinned fleetd comes from a public release through mise. Licence Apache-2.0 |
 | 0018 | Ingest protocol | New. Unary `PushEvents`, per-batch ack. Supersedes the stream and ack parts of 0012 and the forwarder section of this plan |
 | 0019 | Events storage | New. Unpartitioned `events`, delete-based retention, box status computed on read. Supersedes the monthly-partition line of 0013 |
+| 0020 | Job runner in fleetd | New, planned. fleetd child process in a git worktree, no pueue or `fleet-job`. Supersedes the "No git" rule of 0011 in part |
+| 0021 | Job protocol | New, planned. `FleetJobs`, `FleetWorker`, `ReportJob`, 120 s lease, 15 s reaper. Supersedes the claim sketch of 0016 |
+| 0022 | Job transcripts on the server | New, planned. Stream-json chunks in Postgres, 4 MiB cap. Amends 0013 |
+| 0023 | Two bearer token scopes | New, planned. Box and client tokens. Amends 0014 |
+| 0024 | Job git credentials and permission policy | New, planned. Fine-grained PAT stripped from the agent environment, disposable Box flag. Amends 0011 |
 
 Relation to the existing setup: the ssh polling in the picker conflicts with ADR-0015, hence the partial replacement. The existing design deferred `fleet-job` to its first phase. This plan builds it in Phase 3 of the fleetd rollout, which still fits. A pending check on the `workmux status --json` schema is absorbed by T5. Workers use the full global config, so hooks in the baked `settings.json` fire on the Box. Workmux hooks failing harmlessly on a Box is a pre-existing item and is orthogonal.
 

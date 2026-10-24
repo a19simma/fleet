@@ -1,6 +1,6 @@
 # Fleet server stack
 
-Status: Accepted. The monthly partitioning of `events` and its partition-drop retention are superseded by ADR-0019.
+Status: Accepted. Service layout and the "No transcripts" bullet amended by ADR-0021 and ADR-0022 (planned). The monthly partitioning of `events` and its partition-drop retention are superseded by ADR-0019.
 
 Fleet state must outlive the laptop's sleep and any single Box. The deployment stack is Rust with tonic, Kubernetes and Argo CD.
 
@@ -27,6 +27,12 @@ The Fleet server is a long-running service in Rust, with gRPC through tonic and 
 - The server is a new availability dependency. Boxes queue events while it is away (ADR-0012).
 - Tailscale is not a dependency. Any VPN or routable path works, and an existing VPN carries only ssh access and Template provisioning, outside fleet traffic.
 - Prompts are sensitive data at rest. The database follows the same care as Box credentials.
+
+## Amendments
+
+- **Services (ADR-0021), planned.** Claim and lease move off `FleetIngest` to a new box-scope service, `FleetWorker` (`ClaimJob`, `ReportJob`). `FleetIngest` keeps events and heartbeat. `FleetJobs` gains `GetJob`, `ListJobs` and `ReadTranscript`. `QueueDepth` and drain are not part of the first job system.
+- **Transcripts (ADR-0022), planned.** "No transcripts" now holds only for the session transcripts fleetd reads for previews. The server will store the stream-json output of Jobs in `job_transcript`, capped at 4 MiB per Job.
+- **Retention.** `job_attempts` is not created in the first job system, so only `jobs` and `job_transcript` exist. The one year retention of `jobs` stands. No transcript retention job is designed.
 
 ## Considered and rejected
 

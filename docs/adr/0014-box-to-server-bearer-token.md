@@ -1,6 +1,6 @@
 # Box to server bearer token
 
-Status: Accepted
+Status: Accepted. Single token superseded by two scopes in ADR-0023 (planned).
 
 fleetd must prove to the Fleet server that it is a Box of this swarm. The server is a hosted service reached over a VPN. The VPN may be Tailscale, netbird or another. The mechanism must work on any routable network path and must not read identity from the VPN.
 
@@ -48,10 +48,15 @@ The wire format stays `authorization: Bearer`, so fleetd changes only where it r
 
 ## Consequences
 
-- A fourth baked credential beside the existing three: a Claude subscription token, a git credential and a VPN auth key.
+- A baked bearer token, beside the existing three credentials: a Claude subscription token, a git credential and a VPN auth key.
 - Nothing in fleetd, server, proto or CLI depends on Tailscale, so a VPN switch needs no code change.
 - Box names in the database are claims until per-Box tokens exist.
 - A token rejected by the server queues events on the Box (ADR-0012). The heartbeat gap shows on the laptop side.
+
+## Amendments
+
+- **Two scopes (ADR-0023), planned.** One shared token no longer covers everything. The box token `FLEET_TOKEN` covers `FleetIngest` and `FleetWorker`. A second token, `FLEET_CLIENT_TOKEN`, covers `FleetQuery` and `FleetJobs`. A valid token outside its scope gets `PERMISSION_DENIED`. The "One token covers both write and read" and "any holder can read all Boxes and submit or cancel Jobs" statements describe the single-token state, which this amendment replaces once built.
+- **Credentials.** The job PAT of ADR-0024 is a new credential, separate from the baked git credential. It lives in `/etc/swarm/secrets.env` and is not baked into the Template.
 
 ## Considered and rejected
 

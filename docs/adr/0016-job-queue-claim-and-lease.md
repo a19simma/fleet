@@ -1,6 +1,6 @@
 # Job queue, claim and lease
 
-Status: Accepted
+Status: Accepted. The pueue runner, `CLAIMED` state, heartbeat lease and `retry_on_lost` are superseded by ADR-0020 and ADR-0021 (planned).
 
 A KEDA work queue will later feed Jobs, each a prompt. The first design choices fix how a Box gets work and how a lost Box is told from a slow one.
 
@@ -43,6 +43,18 @@ T5, T6, T9 and T10 touch this seam. They contradict one implicit assumption and 
 - A Box that dies mid Job leaves a `LOST` row for a human, not a silent retry.
 - Idempotent submit and one lease per Job give no double runs on a healthy server.
 - The claim path adds a second reason to keep the server up.
+
+## Amendments
+
+Accepted 2026-10-24: ADR-0020 and ADR-0021 build this seam and supersede the parts below. Planned, not built.
+
+- **Runner.** There is no `fleet-job`, no pueue group and no `free_slots`. fleetd runs the Job as a child process in a git worktree (ADR-0020). The pueue paragraphs of Phase 0 results no longer apply to Jobs.
+- **States.** `CLAIMED` is dropped. `ClaimJob` moves a Job from `QUEUED` straight to `RUNNING` and sets the Box, the attempt and the lease. The `CLAIMED` expiry rule (return to `QUEUED`) goes with it.
+- **Lease.** The lease is 120 s and renews through `ReportJob`, not the heartbeat (`running_job_ids`). The runner sends `ReportJob` at least every 30 s even when the agent is quiet (ADR-0021). A reaper every 15 s moves expired `RUNNING` rows to `LOST`.
+- **Retry.** `retry_on_lost` is cut. A `LOST` Job is never retried, and a human resubmits. There is no `job_attempts` table, priority or `max_attempts`, and the head of the queue is the oldest `created_at`.
+- **Services.** Claim is on `FleetWorker`, not `FleetIngest` (ADR-0021).
+- **Scaler and drain.** `QueueDepth`, drain and the KEDA read stay parked.
+- **Parked status.** "Nothing in it is built in v1" still describes v1. The Job system follows v1.
 
 ## Considered and rejected
 
