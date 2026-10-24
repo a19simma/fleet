@@ -19,6 +19,6 @@ pub use dump::dump;
 pub use error::Error;
 pub use events::{Enqueued, Limits, OVERFLOW_KIND, QueuedEvent};
 pub use hook::forward_hook;
-pub use runtime::{Progress, Signals, Supervisor, bind_socket, run, sleep_beating};
+pub use runtime::{Signals, bind_socket, run};
 pub use store::Store;
 pub use system::{fresh_id, now_ms, read_identity};

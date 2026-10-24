@@ -2,16 +2,15 @@ use std::future::Future;
 use std::net::{Ipv4Addr, SocketAddr};
 use std::os::unix::fs::{FileTypeExt, PermissionsExt};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use fleet_core::{HookAllowlist, Redactor};
 use sd_notify::NotifyState;
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream, UnixListener, UnixStream};
 use tokio::signal::unix::{Signal, SignalKind, signal};
 use tokio::sync::watch;
-use tokio::task::{AbortHandle, JoinError, JoinHandle};
+use tokio::task::{JoinError, JoinSet};
 
 use crate::Error;
 use crate::app::{AppState, hook_router, socket_router};
@@ -23,10 +22,8 @@ use crate::system::read_identity;
 const DEFAULT_WATCHDOG_PERIOD: Duration = Duration::from_secs(20);
 const MIN_WATCHDOG_PERIOD: Duration = Duration::from_millis(1);
 const SHUTDOWN_GRACE: Duration = Duration::from_secs(10);
-const STALL_LIMIT: Duration = Duration::from_secs(30);
-const PROBE_PERIOD: Duration = Duration::from_secs(10);
-const PROBE_TIMEOUT: Duration = Duration::from_secs(5);
-const MAX_SLICE: Duration = Duration::from_secs(10);
+const HEALTH_TIMEOUT: Duration = Duration::from_secs(3);
+const HEALTH_RESPONSE_LIMIT: u64 = 4096;
 
 /// Process signal streams for the daemon.
 ///
@@ -129,20 +126,24 @@ fn load_redactor(config: &Config) -> Result<Redactor, Error> {
     }
 }
 
-fn serve_task(
+type ListenerExit = (&'static str, std::io::Result<()>);
+
+fn serve(
+    tasks: &mut JoinSet<ListenerExit>,
+    name: &'static str,
     server: impl Future<Output = std::io::Result<()>> + Send + 'static,
-) -> JoinHandle<std::io::Result<()>> {
-    tokio::spawn(server)
+) {
+    tasks.spawn(async move { (name, server.await) });
 }
 
-fn listener_exit(
-    name: &'static str,
-    joined: Result<std::io::Result<()>, JoinError>,
-) -> Result<(), Error> {
-    let cause = match joined {
-        Ok(Ok(())) => std::io::Error::other("listener ended before shutdown"),
-        Ok(Err(err)) => err,
-        Err(err) => std::io::Error::other(err),
+fn listener_exit(joined: Result<ListenerExit, JoinError>) -> Result<(), Error> {
+    let (name, cause) = match joined {
+        Ok((name, Ok(()))) => (
+            name,
+            std::io::Error::other("listener ended before shutdown"),
+        ),
+        Ok((name, Err(err))) => (name, err),
+        Err(err) => ("listener", std::io::Error::other(err)),
     };
     tracing::error!(%cause, listener = name, "listener stopped, exiting");
     Err(Error::Runtime(cause))
@@ -152,151 +153,105 @@ async fn wait_for(mut rx: watch::Receiver<bool>) {
     let _ = rx.wait_for(|stop| *stop).await;
 }
 
-/// Progress counter that a supervised task bumps on each loop turn.
-///
-/// Clones share one counter. The [`Supervisor`] flags a task whose counter stops moving.
-#[derive(Debug, Clone, Default)]
-pub struct Progress(Arc<AtomicU64>);
-
-impl Progress {
-    /// Creates a counter at zero.
-    pub fn new() -> Self {
-        Self::default()
-    }
-
-    /// Records that the task made progress.
-    pub fn bump(&self) {
-        self.0.fetch_add(1, Ordering::Relaxed);
-    }
-
-    fn get(&self) -> u64 {
-        self.0.load(Ordering::Relaxed)
+async fn first_exit(
+    tasks: &mut JoinSet<ListenerExit>,
+    shutdown: impl Future<Output = ()>,
+) -> Result<(), Error> {
+    tokio::select! {
+        () = shutdown => Ok(()),
+        Some(joined) = tasks.join_next() => listener_exit(joined),
     }
 }
 
-/// Sleeps for `total` in slices of at most 10 seconds, bumping `progress` before each
-/// slice and once after the last, so a long backoff does not look like a stall.
-pub async fn sleep_beating(total: Duration, progress: &Progress) {
-    let deadline = tokio::time::Instant::now() + total;
-    loop {
-        progress.bump();
-        let left = deadline.saturating_duration_since(tokio::time::Instant::now());
-        if left.is_zero() {
-            return;
-        }
-        tokio::time::sleep(left.min(MAX_SLICE)).await;
-    }
-}
-
-#[derive(Debug)]
-struct Tracked {
-    name: &'static str,
-    progress: Progress,
-    seen: u64,
-    advanced_at: tokio::time::Instant,
-    handle: Option<AbortHandle>,
-}
-
-/// The set of tasks whose liveness gates the systemd watchdog.
-///
-/// A task is healthy while its [`Progress`] advanced within the last 30 seconds and, when
-/// it has a handle, the task has not finished.
-#[derive(Debug, Default)]
-pub struct Supervisor {
-    tasks: Vec<Tracked>,
-}
-
-impl Supervisor {
-    /// Creates an empty set.
-    pub fn new() -> Self {
-        Self::default()
-    }
-
-    /// Adds a task. Its 30 second window starts now. Pass the task's abort handle to
-    /// treat an early exit as unhealthy.
-    pub fn register(
-        &mut self,
-        name: &'static str,
-        progress: &Progress,
-        handle: Option<AbortHandle>,
-    ) {
-        self.tasks.push(Tracked {
-            name,
-            progress: progress.clone(),
-            seen: progress.get(),
-            advanced_at: tokio::time::Instant::now(),
-            handle,
-        });
-    }
-
-    /// Names of the tasks that are stalled or finished at `now`. Empty means healthy.
-    pub fn unhealthy(&mut self, now: tokio::time::Instant) -> Vec<&'static str> {
-        let mut bad = Vec::new();
-        for task in &mut self.tasks {
-            let count = task.progress.get();
-            if count != task.seen {
-                task.seen = count;
-                task.advanced_at = now;
-            }
-            let finished = task.handle.as_ref().is_some_and(AbortHandle::is_finished);
-            if finished || now.saturating_duration_since(task.advanced_at) > STALL_LIMIT {
-                bad.push(task.name);
-            }
-        }
-        bad
-    }
-}
-
+/// A listener the watchdog checks with a real `GET /healthz`.
 #[derive(Debug, Clone)]
-enum Probe {
+enum Listener {
     Tcp(SocketAddr),
     Unix(PathBuf),
 }
 
-impl Probe {
-    async fn connect(&self) -> std::io::Result<()> {
-        match self {
-            Self::Tcp(addr) => TcpStream::connect(addr).await.map(drop),
-            Self::Unix(path) => UnixStream::connect(path).await.map(drop),
+async fn healthz_ok(mut stream: impl AsyncRead + AsyncWrite + Unpin) -> std::io::Result<bool> {
+    stream
+        .write_all(b"GET /healthz HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
+        .await?;
+    let mut raw = Vec::new();
+    stream
+        .take(HEALTH_RESPONSE_LIMIT)
+        .read_to_end(&mut raw)
+        .await?;
+    let text = String::from_utf8_lossy(&raw);
+    let ok = text.starts_with("HTTP/1.1 200")
+        && text
+            .split_once("\r\n\r\n")
+            .is_some_and(|(_, body)| body.trim() == "ok");
+    Ok(ok)
+}
+
+impl Listener {
+    async fn healthy(&self) -> bool {
+        let check = async {
+            match self {
+                Self::Tcp(addr) => healthz_ok(TcpStream::connect(addr).await?).await,
+                Self::Unix(path) => healthz_ok(UnixStream::connect(path).await?).await,
+            }
+        };
+        match tokio::time::timeout(HEALTH_TIMEOUT, check).await {
+            Ok(Ok(true)) => true,
+            Ok(Ok(false)) => {
+                tracing::warn!(listener = ?self, "healthz did not answer 200 ok");
+                false
+            }
+            Ok(Err(err)) => {
+                tracing::warn!(%err, listener = ?self, "healthz round trip failed");
+                false
+            }
+            Err(_) => {
+                tracing::warn!(listener = ?self, "healthz round trip timed out");
+                false
+            }
         }
     }
 }
 
-async fn probe_loop(target: Probe, progress: Progress) {
-    let mut tick = tokio::time::interval(PROBE_PERIOD);
-    loop {
-        tick.tick().await;
-        match tokio::time::timeout(PROBE_TIMEOUT, target.connect()).await {
-            Ok(Ok(())) => progress.bump(),
-            Ok(Err(err)) => tracing::warn!(%err, probe = ?target, "listener probe failed"),
-            Err(_) => tracing::warn!(probe = ?target, "listener probe timed out"),
-        }
+async fn all_healthy(listeners: &[Listener]) -> bool {
+    let mut checks = JoinSet::new();
+    for listener in listeners {
+        let listener = listener.clone();
+        checks.spawn(async move { listener.healthy().await });
     }
+    let mut healthy = true;
+    while let Some(done) = checks.join_next().await {
+        healthy &= done.unwrap_or(false);
+    }
+    healthy
 }
 
-async fn watchdog(mut supervisor: Supervisor) {
-    let period = sd_notify::watchdog_enabled()
-        .map_or(DEFAULT_WATCHDOG_PERIOD, |limit| limit / 2)
-        .max(MIN_WATCHDOG_PERIOD);
+async fn watchdog(listeners: Vec<Listener>, period: Duration, ping: impl Fn()) {
     let mut tick = tokio::time::interval(period);
     loop {
         tick.tick().await;
-        let bad = supervisor.unhealthy(tokio::time::Instant::now());
-        if bad.is_empty() {
-            let _ = sd_notify::notify(&[NotifyState::Watchdog]);
+        if all_healthy(&listeners).await {
+            ping();
         } else {
-            tracing::error!(tasks = ?bad, "task stalled or ended, withholding watchdog ping");
+            tracing::error!("a listener failed its healthz check, withholding watchdog ping");
         }
     }
+}
+
+fn watchdog_period() -> Duration {
+    sd_notify::watchdog_enabled()
+        .map_or(DEFAULT_WATCHDOG_PERIOD, |limit| limit / 2)
+        .max(MIN_WATCHDOG_PERIOD)
 }
 
 /// Runs the daemon until `shutdown` resolves or a listener ends.
 ///
 /// Opens the queue, binds the loopback listener and the unix socket, sends `READY=1`,
-/// then pings the systemd watchdog while every supervised task advances. Each listener is
-/// probed by a connection to its own address every 10 seconds. On shutdown it stops the
-/// listeners, aborting any that outlast a 10 second grace period, checkpoints the WAL
-/// and removes the socket file.
+/// then pings the systemd watchdog every half `WatchdogSec`. Each tick makes one
+/// `GET /healthz` round trip to each listener and sends `WATCHDOG=1` only when every
+/// listener answers 200 within 3 seconds. On shutdown it stops the listeners, aborting
+/// any that outlast a 10 second grace period, checkpoints the WAL and removes the socket
+/// file.
 ///
 /// # Errors
 ///
@@ -327,67 +282,48 @@ pub async fn run(config: Config, shutdown: impl Future<Output = ()>) -> Result<(
         .map_err(Error::Runtime)?;
     let tcp_addr = tcp.local_addr().map_err(Error::Runtime)?;
     let socket = bind_socket(&config.socket_path)?;
-    tracing::info!(addr = ?tcp.local_addr().ok(), socket = %config.socket_path.display(), "listening");
+    tracing::info!(addr = %tcp_addr, socket = %config.socket_path.display(), "listening");
 
     let (stop_tx, stop_rx) = watch::channel(false);
-    let mut tcp_task = serve_task(
+    let mut tasks = JoinSet::new();
+    serve(
+        &mut tasks,
+        "tcp",
         axum::serve(tcp, hook_router(state.clone()))
             .with_graceful_shutdown(wait_for(stop_rx.clone()))
             .into_future(),
     );
-    let mut socket_task = serve_task(
+    serve(
+        &mut tasks,
+        "socket",
         axum::serve(socket, socket_router(state))
             .with_graceful_shutdown(wait_for(stop_rx))
             .into_future(),
     );
-    let tcp_progress = Progress::new();
-    let socket_progress = Progress::new();
-    let mut supervisor = Supervisor::new();
-    supervisor.register("tcp", &tcp_progress, Some(tcp_task.abort_handle()));
-    supervisor.register("socket", &socket_progress, Some(socket_task.abort_handle()));
-    let probes = [
-        tokio::spawn(probe_loop(Probe::Tcp(tcp_addr), tcp_progress)),
-        tokio::spawn(probe_loop(
-            Probe::Unix(config.socket_path.clone()),
-            socket_progress,
-        )),
-    ];
-    let dog = tokio::spawn(watchdog(supervisor));
+    let dog = tokio::spawn(watchdog(
+        vec![
+            Listener::Tcp(tcp_addr),
+            Listener::Unix(config.socket_path.clone()),
+        ],
+        watchdog_period(),
+        || {
+            let _ = sd_notify::notify(&[NotifyState::Watchdog]);
+        },
+    ));
     let _ = sd_notify::notify(&[NotifyState::Ready]);
 
-    let mut tcp_done = false;
-    let mut socket_done = false;
-    let outcome = tokio::select! {
-        () = shutdown => Ok(()),
-        joined = &mut tcp_task => {
-            tcp_done = true;
-            listener_exit("tcp", joined)
-        }
-        joined = &mut socket_task => {
-            socket_done = true;
-            listener_exit("socket", joined)
-        }
-    };
+    let outcome = first_exit(&mut tasks, shutdown).await;
     tracing::info!("shutting down");
     let _ = sd_notify::notify(&[NotifyState::Stopping]);
     dog.abort();
-    for probe in &probes {
-        probe.abort();
-    }
     let _ = stop_tx.send(true);
     let drained = tokio::time::timeout(SHUTDOWN_GRACE, async {
-        if !tcp_done {
-            let _ = (&mut tcp_task).await;
-        }
-        if !socket_done {
-            let _ = (&mut socket_task).await;
-        }
+        while tasks.join_next().await.is_some() {}
     })
     .await;
     if drained.is_err() {
         tracing::warn!("listeners did not drain in time, aborting them");
-        tcp_task.abort();
-        socket_task.abort();
+        tasks.abort_all();
     }
     let _ = std::fs::remove_file(&config.socket_path);
     let closed = store.close().await;
@@ -400,91 +336,89 @@ pub async fn run(config: Config, shutdown: impl Future<Output = ()>) -> Result<(
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use axum::Router;
+    use axum::routing::get;
+    use tempfile::TempDir;
+
     use super::*;
-    use tokio::time::{Instant, advance, sleep};
 
-    async fn step(by: Duration) {
-        advance(by).await;
-        tokio::task::yield_now().await;
+    fn app() -> Router {
+        Router::new().route("/healthz", get(|| async { "ok" }))
     }
 
-    #[tokio::test(start_paused = true)]
-    async fn beating_task_stays_healthy() {
-        let progress = Progress::new();
-        let beat = progress.clone();
+    async fn serve_tcp() -> (SocketAddr, tokio::task::JoinHandle<()>) {
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+        let addr = listener.local_addr().unwrap();
         let task = tokio::spawn(async move {
-            loop {
-                beat.bump();
-                sleep(Duration::from_secs(5)).await;
-            }
+            let _ = axum::serve(listener, app()).await;
         });
-        let mut sup = Supervisor::new();
-        sup.register("beater", &progress, Some(task.abort_handle()));
-        for _ in 0..30 {
-            step(Duration::from_secs(10)).await;
-            assert_eq!(sup.unhealthy(Instant::now()), Vec::<&str>::new());
-        }
+        (addr, task)
     }
 
-    #[tokio::test(start_paused = true)]
-    async fn stalled_task_is_flagged_after_thirty_seconds() {
-        let progress = Progress::new();
-        let beat = progress.clone();
-        let task = tokio::spawn(async move {
-            beat.bump();
-            std::future::pending::<()>().await;
-        });
-        tokio::task::yield_now().await;
-        let mut sup = Supervisor::new();
-        sup.register("stalled", &progress, Some(task.abort_handle()));
-        step(Duration::from_secs(1)).await;
-        assert_eq!(sup.unhealthy(Instant::now()), Vec::<&str>::new());
-        step(Duration::from_secs(28)).await;
-        assert_eq!(sup.unhealthy(Instant::now()), Vec::<&str>::new());
-        step(Duration::from_secs(2)).await;
-        assert_eq!(sup.unhealthy(Instant::now()), vec!["stalled"]);
+    async fn closed_addr() -> SocketAddr {
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+        listener.local_addr().unwrap()
     }
 
-    #[tokio::test(start_paused = true)]
-    async fn one_stalled_task_taints_the_set() {
-        let good = Progress::new();
-        let bad = Progress::new();
-        let beat = good.clone();
-        let task = tokio::spawn(async move {
-            loop {
-                beat.bump();
-                sleep(Duration::from_secs(5)).await;
-            }
-        });
-        let mut sup = Supervisor::new();
-        sup.register("good", &good, Some(task.abort_handle()));
-        sup.register("bad", &bad, None);
-        step(Duration::from_secs(31)).await;
-        assert_eq!(sup.unhealthy(Instant::now()), vec!["bad"]);
+    async fn pings_within(listeners: Vec<Listener>, wait: Duration) -> usize {
+        let count = Arc::new(AtomicUsize::new(0));
+        let seen = Arc::clone(&count);
+        let dog = tokio::spawn(watchdog(listeners, Duration::from_millis(20), move || {
+            seen.fetch_add(1, Ordering::SeqCst);
+        }));
+        tokio::time::sleep(wait).await;
+        dog.abort();
+        count.load(Ordering::SeqCst)
     }
 
-    #[tokio::test(start_paused = true)]
-    async fn finished_task_is_flagged_at_once() {
-        let progress = Progress::new();
-        let task = tokio::spawn(async {});
-        let mut sup = Supervisor::new();
-        sup.register("gone", &progress, Some(task.abort_handle()));
-        step(Duration::from_millis(1)).await;
-        assert_eq!(sup.unhealthy(Instant::now()), vec!["gone"]);
+    #[tokio::test]
+    async fn tick_pings_when_every_listener_answers() {
+        let dir = TempDir::new().unwrap();
+        let (addr, _tcp) = serve_tcp().await;
+        let path = dir.path().join("s.sock");
+        let unix = UnixListener::bind(&path).unwrap();
+        let _sock = tokio::spawn(async move {
+            let _ = axum::serve(unix, app()).await;
+        });
+        let listeners = vec![Listener::Tcp(addr), Listener::Unix(path)];
+        assert!(all_healthy(&listeners).await);
+        assert!(pings_within(listeners, Duration::from_millis(300)).await >= 1);
     }
 
-    #[tokio::test(start_paused = true)]
-    async fn long_backoff_sleep_keeps_the_task_healthy() {
-        let progress = Progress::new();
-        let beat = progress.clone();
-        let task = tokio::spawn(async move {
-            sleep_beating(Duration::from_secs(300), &beat).await;
+    #[tokio::test]
+    async fn tick_withholds_when_a_listener_is_closed() {
+        let (addr, _tcp) = serve_tcp().await;
+        let dead = closed_addr().await;
+        let listeners = vec![Listener::Tcp(addr), Listener::Tcp(dead)];
+        assert!(!all_healthy(&listeners).await);
+        assert_eq!(pings_within(listeners, Duration::from_millis(300)).await, 0);
+    }
+
+    #[tokio::test]
+    async fn tick_withholds_when_the_listener_answers_something_else() {
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let _task = tokio::spawn(async move {
+            let _ = axum::serve(listener, Router::new()).await;
         });
-        let mut sup = Supervisor::new();
-        sup.register("backoff", &progress, Some(task.abort_handle()));
-        for _ in 0..29 {
-            step(Duration::from_secs(10)).await;
-            assert_eq!(sup.unhealthy(Instant::now()), Vec::<&str>::new());
-        }
+        assert!(!all_healthy(&[Listener::Tcp(addr)]).await);
+    }
+
+    #[tokio::test]
+    async fn a_listener_finishing_is_the_fatal_exit() {
+        let mut tasks = JoinSet::new();
+        serve(&mut tasks, "tcp", async { Ok(()) });
+        let outcome = first_exit(&mut tasks, std::future::pending()).await;
+        assert!(matches!(outcome, Err(Error::Runtime(_))));
+    }
+
+    #[tokio::test]
+    async fn shutdown_without_a_listener_exit_is_clean() {
+        let mut tasks = JoinSet::new();
+        serve(&mut tasks, "tcp", std::future::pending());
+        assert!(first_exit(&mut tasks, async {}).await.is_ok());
     }
 }
