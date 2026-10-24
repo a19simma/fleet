@@ -181,6 +181,12 @@ mod tests {
         let err = client.heartbeat(heartbeat("alpha")).await.unwrap_err();
         assert_eq!(err.code(), Code::InvalidArgument);
         let err = client
+            .heartbeat(heartbeat("secret-raw-input"))
+            .await
+            .unwrap_err();
+        assert_eq!(err.message(), "invalid box name");
+        assert!(!err.message().contains("secret-raw-input"));
+        let err = client
             .push_events(push(vec![wire_event(1, "alpha", "{}")]))
             .await
             .unwrap_err();

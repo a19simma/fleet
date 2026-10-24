@@ -54,30 +54,23 @@ impl From<&Envelope> for v1::Envelope {
     }
 }
 
-/// A converted envelope together with its validated box name.
+/// Validates a client-supplied box name.
 ///
-/// Downstream code reads `box_name` and never re-validates the raw string in `envelope`.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Validated {
-    /// The validated box name, equal to `envelope.box_name`.
-    pub box_name: BoxName,
-    /// The converted envelope.
-    pub envelope: Envelope,
+/// This is the one place a raw box string is checked, for envelopes and heartbeats
+/// alike. The error never carries the raw value.
+///
+/// # Errors
+///
+/// Returns [`ConvertError::InvalidBox`] when `raw` is not a valid box name.
+pub fn validate_box(raw: &str) -> Result<BoxName, ConvertError> {
+    BoxName::new(raw).map_err(|_| ConvertError::InvalidBox)
 }
 
 impl TryFrom<v1::Envelope> for Envelope {
     type Error = ConvertError;
 
     fn try_from(wire: v1::Envelope) -> Result<Self, Self::Error> {
-        Validated::try_from(wire).map(|validated| validated.envelope)
-    }
-}
-
-impl TryFrom<v1::Envelope> for Validated {
-    type Error = ConvertError;
-
-    fn try_from(wire: v1::Envelope) -> Result<Self, Self::Error> {
-        let box_name = BoxName::new(&wire.r#box).map_err(|_| ConvertError::InvalidBox)?;
+        validate_box(&wire.r#box)?;
         let id = wire
             .id
             .parse::<EventId>()
@@ -88,7 +81,7 @@ impl TryFrom<v1::Envelope> for Validated {
             .map_err(|_| ConvertError::InvalidSource(wire.source.clone()))?;
         let payload = serde_json::from_str::<Value>(&wire.payload_json)
             .map_err(|err| ConvertError::InvalidPayload(err.to_string()))?;
-        let envelope = Envelope {
+        Ok(Self {
             id,
             schema_version: wire.schema_version,
             box_name: wire.r#box,
@@ -103,8 +96,7 @@ impl TryFrom<v1::Envelope> for Validated {
             workdir: wire.workdir,
             occurred_at: wire.occurred_at_ms,
             payload,
-        };
-        Ok(Self { box_name, envelope })
+        })
     }
 }
 
@@ -232,10 +224,15 @@ mod tests {
     }
 
     #[test]
-    fn validated_envelope_carries_the_box_name() {
-        let wire = v1::Envelope::from(&sample());
-        let checked = Validated::try_from(wire).map_err(|e| e.to_string());
-        assert_eq!(checked.map(|v| v.box_name.to_string()), Ok(box_name()));
+    fn validate_box_accepts_good_names_and_hides_bad_ones() {
+        assert_eq!(
+            validate_box(&box_name()).map(|name| name.to_string()),
+            Ok(box_name())
+        );
+        assert_eq!(
+            validate_box("secret-raw-input"),
+            Err(ConvertError::InvalidBox)
+        );
     }
 
     #[test]

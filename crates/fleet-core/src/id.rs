@@ -30,6 +30,27 @@ impl EventId {
         Self((ts << ENTROPY_BITS) | rand)
     }
 
+    /// Generates a fresh id from the system clock and process-seeded randomness.
+    ///
+    /// The timestamp prefix makes ids sort by creation time to the millisecond. The
+    /// 80 entropy bits come from the standard library's randomly keyed hasher, not from a
+    /// cryptographic source: use it for identifiers, never for secrets.
+    pub fn generate() -> Self {
+        use std::hash::{BuildHasher, Hasher};
+        use std::time::{SystemTime, UNIX_EPOCH};
+
+        let millis = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_or(0, |d| u64::try_from(d.as_millis()).unwrap_or(0));
+        let half = || {
+            let mut hasher = std::collections::hash_map::RandomState::new().build_hasher();
+            hasher.write_u64(millis);
+            u128::from(hasher.finish())
+        };
+        let entropy = (half() << 64) | half();
+        Self::new(millis, entropy)
+    }
+
     /// Derives a stable id from an event kind and the parts of its natural key.
     ///
     /// Each part is length prefixed, so `["ab", "c"]` and `["a", "bc"]` differ.
@@ -109,6 +130,15 @@ mod tests {
         let text = id.to_string();
         assert_eq!(text.len(), 26);
         assert_eq!(text.parse::<EventId>().unwrap(), id);
+    }
+
+    #[test]
+    fn generate_is_ulid_shaped_and_unique() {
+        let a = EventId::generate();
+        let b = EventId::generate();
+        assert_ne!(a, b);
+        assert_eq!(a.to_string().len(), 26);
+        assert_eq!(a.to_string().parse::<EventId>().unwrap(), a);
     }
 
     #[test]

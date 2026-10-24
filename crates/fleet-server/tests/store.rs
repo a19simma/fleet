@@ -585,7 +585,7 @@ async fn bad_queue_value_does_not_fail_list_fleet(pool: PgPool) {
 }
 
 #[sqlx::test]
-async fn list_fleet_reads_in_one_repeatable_read_transaction(pool: PgPool) {
+async fn begin_read_starts_a_repeatable_read_only_transaction(pool: PgPool) {
     let store = Store::new(pool);
     let mut tx = store.begin_read().await.unwrap();
     let level: String = sqlx::query_scalar("SHOW transaction_isolation")

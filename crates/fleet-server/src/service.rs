@@ -2,14 +2,14 @@
 
 use std::time::Duration;
 
-use fleet_core::{BoxName, Envelope};
+use fleet_core::Envelope;
 use fleet_proto::v1::fleet_ingest_server::{FleetIngest, FleetIngestServer};
 use fleet_proto::v1::fleet_query_server::{FleetQuery, FleetQueryServer};
 use fleet_proto::v1::{
     HeartbeatReply, HeartbeatRequest, ListFleetReply, ListFleetRequest, PushEventsReply,
     PushEventsRequest, QueuedEvent, Rejection,
 };
-use fleet_proto::{ConvertError, Validated};
+use fleet_proto::{ConvertError, validate_box};
 use tonic::transport::server::Router;
 use tonic::{Request, Response, Status};
 use tower::layer::util::{Identity, Stack};
@@ -37,10 +37,6 @@ const MAX_CONCURRENT_STREAMS: u32 = 32;
 fn storage_unavailable(err: &StoreError) -> Status {
     tracing::error!(%err, "storage failed");
     Status::unavailable("storage unavailable")
-}
-
-fn check_box(raw: &str) -> Result<BoxName, Status> {
-    BoxName::new(raw).map_err(|err| Status::invalid_argument(err.to_string()))
 }
 
 fn same_box(events: &[QueuedEvent]) -> Result<(), Status> {
@@ -114,8 +110,8 @@ impl FleetIngest for FleetService {
                 });
                 continue;
             }
-            match Validated::try_from(wire) {
-                Ok(checked) => valid.push((seq, checked.envelope)),
+            match Envelope::try_from(wire) {
+                Ok(envelope) => valid.push((seq, envelope)),
                 Err(ConvertError::InvalidBox) => {
                     return Err(Status::invalid_argument(
                         ConvertError::InvalidBox.to_string(),
@@ -156,7 +152,8 @@ impl FleetIngest for FleetService {
         request: Request<HeartbeatRequest>,
     ) -> Result<Response<HeartbeatReply>, Status> {
         let request = request.into_inner();
-        let name = check_box(&request.r#box)?;
+        let name = validate_box(&request.r#box)
+            .map_err(|err| Status::invalid_argument(err.to_string()))?;
         no_nul("hostname", &request.hostname)?;
         no_nul("machine_id", &request.machine_id)?;
         no_nul("boot_id", &request.boot_id)?;
