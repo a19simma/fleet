@@ -217,17 +217,17 @@ On `Stop`, fleetd emits `hook.stop` at once, with `last_assistant_message` as th
 
 ### Disk queue
 
-SQLite in WAL mode at `/var/lib/fleetd/queue.db` (systemd `StateDirectory=fleetd`). One table `events(seq integer primary key autoincrement, id text unique, ts, kind, priority, payload, state, attempts, next_try_at)`, where `payload` is the envelope JSON and a repeat of `id` is ignored. `synchronous=NORMAL` and a checkpoint on shutdown. The commit is the durability point.
+SQLite in WAL mode at `/var/lib/fleetd/queue.db` (systemd `StateDirectory=fleetd`). One table `events(seq integer primary key autoincrement, id text unique, ts, kind, priority, payload)`, where `payload` is the envelope JSON and a repeat of `id` is ignored. `synchronous=NORMAL` and a checkpoint on shutdown. The commit is the durability point.
 
-- **Cap.** 256 MiB of payload bytes or 14 days, whichever first. When over the byte cap, fleetd deletes the lowest priority, oldest rows first (tool, then status, then normal, then terminal), and records the count in one `fleetd.queue_overflow` event that later drops add to.
+- **Cap.** 256 MiB of payload bytes or 14 days, whichever first. When over the byte cap, fleetd deletes the lowest priority, oldest rows first (tool, then status, then normal, then terminal), and records the count in one `fleetd.queue_overflow` event that later drops add to. Once that marker is sent and acked it is deleted, and later drops create a new one.
 - **Survives.** fleetd restart, server outage, Box reboot. It does not survive Box destruction. fleetd reports pending count and oldest age in the heartbeat so the drain check can include "queue empty".
 - **Alternatives.** Append-only segment files are simpler but need hand-rolled crash recovery and cursor tracking. An embedded KV (redb, sled) has no ad hoc inspection. See ADR-0012.
 
 ### Forwarder
 
-- Unary `PushEvents` calls (ADR-0018). Batches of up to 100 events or 256 KiB or 500 ms, one box per batch.
-- A reply acks the batch through `acked_through_seq`. fleetd deletes those queued events, including any listed in `rejected`, which would never succeed.
-- Retry with exponential backoff, 1 s doubling to a 5 min cap, full jitter. Reset on first ack. `InvalidArgument` is not retried.
+- Unary `PushEvents` calls (ADR-0018). Batches of up to 100 events or 256 KiB or 500 ms, one box per batch. fleetd reads the batch with a read-only head peek and keeps no per-row delivery state in the queue.
+- A reply acks the batch through `acked_through_seq`. fleetd deletes every queued event with `seq` up to that value in one range delete, including any listed in `rejected`, which would never succeed.
+- Retry with exponential backoff, 1 s doubling to a 5 min cap, full jitter. Reset on first ack. The backoff is the forwarder's own in-memory state, not a column in the queue. `InvalidArgument` is not retried.
 - No `Hello` and no server high-water mark. After a gap fleetd resends from its queue and the server dedupes on `(box, id)`.
 
 ### workmux watcher
@@ -625,7 +625,7 @@ Terms used in this plan:
 - **Session state**: `active`, `working`, `idle`, `stalled`, `ended` or `crashed`, projected from events (ADR-0019). `crashed` is in the proto and no event sets it yet.
 - **Ack**: the reply to one `PushEvents` call. `acked_through_seq` covers every event in the batch, stored, duplicate or rejected (ADR-0018).
 - **Rejected event**: an event the server refused on its own merits, such as an unparseable payload. It is listed in the reply, acked and never retried.
-- **Inflight**: queued events fleetd has sent in a batch and not yet seen acked. They stay in the disk queue until the ack.
+- **Inflight**: queued events fleetd has sent in a batch and not yet seen acked. They stay in the disk queue, unmarked, until the range ack deletes them.
 - **Lease**: the time-limited claim a Box holds on a queued Job (ADR-0016).
 - Job states are defined in ADR-0016 and stay parked with the queue seam.
 

@@ -149,7 +149,6 @@ async fn hooks_enqueue_in_order_and_answer_empty_object() {
         ["hook.user_prompt_submit", "hook.stop", "hook.session_end"]
     );
     assert!(rows.windows(2).all(|w| w[0].seq < w[1].seq));
-    assert!(rows.iter().all(|r| r.state == "pending" && r.attempts == 0));
     let stop = &rows[1].payload;
     assert_eq!(stop["box"], "alpha");
     assert_eq!(stop["session_id"], "s-1");

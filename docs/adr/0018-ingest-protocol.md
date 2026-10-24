@@ -36,6 +36,7 @@ Supersedes the stream and ack parts of ADR-0012 (one stream, cumulative high-wat
 - The server cannot tell fleetd which events it already holds. fleetd learns only from the reply, so a long outage ends with a resend of the whole queue.
 - A malformed event is lost with a reason in the reply, and fleetd can log it.
 - A mixed-box batch is a client bug, so it fails loudly.
+- The local queue has no per-row delivery state. fleetd peeks the head of the queue in `seq` order, sends it, and deletes through `acked_through_seq` after a reply. There is no `inflight` state, no attempt counter and no retry time column, and a restart needs no reset. Backoff is the forwarder's local state. An overflow marker is a single row: the drop count merged into a marker after it was peeked is lost when its ack deletes the row, and the next drops create a new marker.
 
 ## Considered and rejected
 

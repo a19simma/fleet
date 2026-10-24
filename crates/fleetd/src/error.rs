@@ -69,11 +69,7 @@ impl From<sqlx::Error> for Error {
 
 impl From<sqlx::migrate::MigrateError> for Error {
     fn from(err: sqlx::migrate::MigrateError) -> Self {
-        match err {
-            sqlx::migrate::MigrateError::Execute(err)
-            | sqlx::migrate::MigrateError::ExecuteMigration(err, _) => Self::Db(err),
-            other => Self::Migrate(other),
-        }
+        Self::Migrate(err)
     }
 }
 

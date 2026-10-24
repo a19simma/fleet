@@ -6,8 +6,7 @@ use crate::store::Store;
 
 /// Prints queued events as JSON lines in `seq` order, up to `limit` of them.
 ///
-/// Each line holds `seq`, `id`, `ts`, `kind`, `state`, `attempts`, `next_try_at` and the
-/// stored envelope under `envelope`. Lines go straight to `out`.
+/// Each line holds `seq`, `id`, `ts`, `kind` and the stored envelope under `envelope`. Lines go straight to `out`.
 ///
 /// # Errors
 ///
