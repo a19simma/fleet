@@ -17,6 +17,7 @@ use crate::Error;
 use crate::app::{AppState, hook_router, socket_router};
 use crate::config::Config;
 use crate::events::Limits;
+use crate::heartbeat::Heartbeat;
 use crate::http1::{Failure, roundtrip};
 use crate::store::Store;
 use crate::system::read_identity;
@@ -261,7 +262,8 @@ fn probe_timeout(period: Duration) -> Duration {
 /// `GET /healthz` round trip to each listener and sends `WATCHDOG=1` only when every
 /// listener answers 200 within half the watchdog period, capped at 3 seconds. On
 /// shutdown it stops the listeners, aborting any that outlast a 10 second grace period,
-/// checkpoints the WAL and removes the socket file.
+/// checkpoints the WAL and removes the socket file. While `FLEET_SERVER_URL` is set it
+/// also sends a heartbeat every 30 seconds with `FLEET_TOKEN` as the bearer token.
 ///
 /// # Errors
 ///
@@ -279,7 +281,14 @@ pub async fn run(config: Config, shutdown: impl Future<Output = ()>) -> Result<(
         },
     )
     .await?;
-    run_with_store(config, store, identity, redactor, shutdown).await
+    let heartbeat = match Heartbeat::from_env(&|name| std::env::var(name).ok()) {
+        Ok(target) => target,
+        Err(err) => {
+            tracing::warn!(%err, "heartbeat disabled");
+            None
+        }
+    };
+    run_with_store(config, store, identity, redactor, heartbeat, shutdown).await
 }
 
 async fn bind_all(config: &Config) -> Result<(TcpListener, SocketAddr, UnixListener), Error> {
@@ -296,6 +305,7 @@ async fn run_with_store(
     store: Store,
     identity: Identity,
     redactor: Redactor,
+    heartbeat: Option<Heartbeat>,
     shutdown: impl Future<Output = ()>,
 ) -> Result<(), Error> {
     let (tcp, tcp_addr, socket) = match bind_all(&config).await {
@@ -307,6 +317,7 @@ async fn run_with_store(
             return Err(err);
         }
     };
+    let heartbeat_identity = identity.clone();
     let state = AppState::new(
         store.clone(),
         identity,
@@ -330,9 +341,12 @@ async fn run_with_store(
         &mut tasks,
         "socket",
         axum::serve(socket, socket_router(state))
-            .with_graceful_shutdown(wait_for(stop_rx))
+            .with_graceful_shutdown(wait_for(stop_rx.clone()))
             .into_future(),
     );
+    let heartbeat = heartbeat.map(|target| {
+        tokio::spawn(target.run(heartbeat_identity, store.clone(), wait_for(stop_rx)))
+    });
     let dog = tokio::spawn(watchdog(
         vec![
             Listener::Tcp(tcp_addr),
@@ -350,6 +364,13 @@ async fn run_with_store(
     let _ = sd_notify::notify(&[NotifyState::Stopping]);
     dog.abort();
     let _ = stop_tx.send(true);
+    if let Some(mut heartbeat) = heartbeat
+        && tokio::time::timeout(SHUTDOWN_GRACE, &mut heartbeat)
+            .await
+            .is_err()
+    {
+        heartbeat.abort();
+    }
     let drained = tokio::time::timeout(SHUTDOWN_GRACE, async {
         while tasks.join_next().await.is_some() {}
     })
@@ -374,6 +395,8 @@ mod tests {
 
     use axum::Router;
     use axum::routing::get;
+    use fleet_proto::v1::fleet_ingest_server::{FleetIngest, FleetIngestServer};
+    use fleet_proto::v1::{HeartbeatReply, HeartbeatRequest, PushEventsReply, PushEventsRequest};
     use tempfile::TempDir;
 
     use super::*;
@@ -537,6 +560,7 @@ mod tests {
             store.clone(),
             test_identity(),
             Redactor::default(),
+            None,
             std::future::pending(),
         )
         .await;
@@ -556,11 +580,77 @@ mod tests {
             store.clone(),
             test_identity(),
             Redactor::default(),
+            None,
             std::future::pending(),
         )
         .await;
         assert!(result.is_err());
         assert!(store.is_closed());
+        Ok(())
+    }
+
+    struct Counter(tokio::sync::mpsc::UnboundedSender<()>);
+
+    #[tonic::async_trait]
+    impl FleetIngest for Counter {
+        async fn push_events(
+            &self,
+            _request: tonic::Request<PushEventsRequest>,
+        ) -> Result<tonic::Response<PushEventsReply>, tonic::Status> {
+            Err(tonic::Status::unimplemented("unused"))
+        }
+
+        async fn heartbeat(
+            &self,
+            _request: tonic::Request<HeartbeatRequest>,
+        ) -> Result<tonic::Response<HeartbeatReply>, tonic::Status> {
+            let _ = self.0.send(());
+            Ok(tonic::Response::new(HeartbeatReply { next_in_s: 30 }))
+        }
+    }
+
+    #[tokio::test]
+    async fn a_server_target_spawns_the_heartbeat_and_shutdown_stops_it_first()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let wide = Duration::from_secs(5);
+        let (beats, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let incoming =
+            tonic::transport::server::TcpIncoming::bind((Ipv4Addr::LOCALHOST, 0).into())?;
+        let addr = incoming.local_addr()?;
+        tokio::spawn(
+            tonic::transport::Server::builder()
+                .add_service(FleetIngestServer::new(Counter(beats)))
+                .serve_with_incoming(incoming),
+        );
+        let target = Heartbeat::new(&format!("http://{addr}"), "runtime-token-0123456789")?
+            .with_period(Duration::from_millis(100));
+        let dir = TempDir::new()?;
+        let store = open_store(&dir).await?;
+        let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
+        let task = tokio::spawn(run_with_store(
+            test_config(&dir, 0)?,
+            store.clone(),
+            test_identity(),
+            Redactor::default(),
+            Some(target),
+            async move {
+                let _ = stopped.await;
+            },
+        ));
+        for _ in 0..2 {
+            tokio::time::timeout(wide, rx.recv())
+                .await?
+                .ok_or("stub closed")?;
+        }
+        let _ = stop.send(());
+        tokio::time::timeout(wide, task).await???;
+        assert!(store.is_closed());
+        while rx.try_recv().is_ok() {}
+        let late = tokio::time::timeout(Duration::from_millis(500), rx.recv()).await;
+        assert!(
+            late.is_err(),
+            "heartbeat sent after run_with_store returned"
+        );
         Ok(())
     }
 
