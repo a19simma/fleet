@@ -1,0 +1,116 @@
+syntax = "proto3";
+
+package fleet.v1;
+
+service FleetIngest {
+  rpc PushEvents(PushEventsRequest) returns (PushEventsReply);
+  rpc Heartbeat(HeartbeatRequest) returns (HeartbeatReply);
+}
+
+service FleetQuery {
+  rpc ListFleet(ListFleetRequest) returns (ListFleetReply);
+}
+
+message Envelope {
+  string id = 1;
+  uint32 schema_version = 2;
+  string box = 3;
+  string hostname = 4;
+  string machine_id = 5;
+  string boot_id = 6;
+  string source = 7;
+  string kind = 8;
+  uint64 ts_ms = 9;
+  optional string session_id = 10;
+  optional string prompt_id = 11;
+  optional string workdir = 12;
+  optional uint64 occurred_at_ms = 13;
+  string payload_json = 14;
+}
+
+message QueuedEvent {
+  uint64 seq = 1;
+  Envelope envelope = 2;
+}
+
+message PushEventsRequest {
+  repeated QueuedEvent events = 1;
+}
+
+message PushEventsReply {
+  uint64 acked_through_seq = 1;
+  uint32 stored = 2;
+  uint32 duplicate = 3;
+  repeated Rejection rejected = 4;
+}
+
+message Rejection {
+  uint64 seq = 1;
+  string reason = 2;
+}
+
+message HeartbeatRequest {
+  string box = 1;
+  string hostname = 2;
+  string machine_id = 3;
+  string boot_id = 4;
+  string fleetd_version = 5;
+  uint64 uptime_s = 6;
+  uint64 queue_pending = 7;
+  uint64 queue_oldest_age_s = 8;
+  optional uint64 last_ack_age_s = 9;
+}
+
+message HeartbeatReply {
+  uint32 next_in_s = 1;
+}
+
+message ListFleetRequest {
+  optional string box = 1;
+}
+
+message ListFleetReply {
+  uint64 as_of_ms = 1;
+  repeated BoxView boxes = 2;
+}
+
+message BoxView {
+  string box = 1;
+  string hostname = 2;
+  BoxStatus status = 3;
+  optional uint64 heartbeat_age_s = 4;
+  string boot_id = 5;
+  string fleetd_version = 6;
+  uint64 queue_pending = 7;
+  uint64 queue_oldest_age_s = 8;
+  repeated SessionView sessions = 9;
+}
+
+enum BoxStatus {
+  BOX_STATUS_UNSPECIFIED = 0;
+  BOX_STATUS_UNKNOWN = 1;
+  BOX_STATUS_LIVE = 2;
+  BOX_STATUS_STALE = 3;
+  BOX_STATUS_LOST = 4;
+}
+
+message SessionView {
+  string session_id = 1;
+  string kind = 2;
+  SessionState state = 3;
+  uint64 state_age_s = 4;
+  optional string workdir = 5;
+  optional string last_prompt = 6;
+  optional string last_message = 7;
+  uint64 last_event_age_s = 8;
+}
+
+enum SessionState {
+  SESSION_STATE_UNSPECIFIED = 0;
+  SESSION_STATE_ACTIVE = 1;
+  SESSION_STATE_WORKING = 2;
+  SESSION_STATE_IDLE = 3;
+  SESSION_STATE_STALLED = 4;
+  SESSION_STATE_ENDED = 5;
+  SESSION_STATE_CRASHED = 6;
+}

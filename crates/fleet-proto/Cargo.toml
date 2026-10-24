@@ -12,5 +12,16 @@ publish = false
 [package.metadata.dist]
 dist = false
 
+[dependencies]
+fleet-core.workspace = true
+prost.workspace = true
+serde_json.workspace = true
+tonic.workspace = true
+tonic-prost.workspace = true
+
+[build-dependencies]
+protoc-bin-vendored.workspace = true
+tonic-prost-build.workspace = true
+
 [lints]
 workspace = true
