@@ -18,7 +18,7 @@ pub use config::{Config, DEFAULT_CONFIG_PATH, DEFAULT_SECRETS_PATH, SecretsFile}
 pub use dump::dump;
 pub use error::Error;
 pub use events::{Enqueued, Limits, OVERFLOW_KIND, QueuedEvent};
-pub use hook::forward_hook;
+pub use hook::{forward_hook, forward_hook_as, run_hook};
 pub use runtime::{Signals, bind_socket, run};
 pub use store::Store;
 pub use system::{fresh_id, now_ms, read_identity};

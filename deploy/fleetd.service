@@ -8,7 +8,6 @@ Type=notify
 User=agent
 Group=agent
 EnvironmentFile=-/etc/swarm/box.env
-EnvironmentFile=-/etc/swarm/secrets.env
 Environment=XDG_RUNTIME_DIR=/run/user/1000
 ExecStart=/usr/local/bin/fleetd serve
 Restart=always

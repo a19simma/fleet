@@ -45,6 +45,11 @@ The reconciler adds a fifth `source`, `reconcile`, and three event types: `sessi
 - SQLite adds a dependency and a file to recover. A corrupt file is moved aside and a new one is created.
 - `schema_version` lets the server accept the current and previous version while Boxes are re-created in turn.
 
+## Amendments
+
+- **SessionStart hook.** `SessionStart` is a command hook, `fleetd hook SessionStart`, because Claude Code accepts only `command` and `mcp_tool` hooks for that event. It forwards to the same route and always exits 0.
+- **Job header.** The hook subcommand sends `X-Fleet-Job` from `FLEET_JOB_ID` when set. The http hooks rely on `allowedEnvVars` and remain untested on a live box.
+
 ## Considered and rejected
 
 - **At most once.** Drops events on any server blip.

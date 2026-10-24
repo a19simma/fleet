@@ -632,7 +632,7 @@ Terms used in this plan:
 ## Review follow-ups (deferred)
 
 - Rename `Queue` to `Store`, with free-function `events` and `registry` modules over `&mut SqliteConnection` and `sqlx::migrate!`, before the registry lands.
-- Replace the task set with a Supervisor that tracks per-task progress heartbeats for the watchdog.
+- Replace the task set with a watchdog tick that makes a real `/healthz` round trip to each listener and a `JoinSet` of listener tasks.
 - Flatten `Identity` into `Envelope`.
 - Closed: the FNV derived ids stay. The id is a dedupe key within one box, not a security boundary (ADR-0018).
 - Split `Error` into `ParseIdError` and `NotAnObject`.

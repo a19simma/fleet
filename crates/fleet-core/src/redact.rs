@@ -24,10 +24,19 @@ pub const PLACEHOLDER: &str = "[REDACTED]";
 ///
 /// When scrubbing an object key makes two keys equal, the later ones get a `#2`, `#3`
 /// suffix instead of overwriting the earlier value.
-#[derive(Debug, Clone, Default)]
+#[derive(Clone, Default)]
 pub struct Redactor {
     secrets: Vec<String>,
     skipped: Vec<String>,
+}
+
+impl std::fmt::Debug for Redactor {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Redactor")
+            .field("secrets", &self.secrets.len())
+            .field("skipped_keys", &self.skipped)
+            .finish()
+    }
 }
 
 fn usable(value: &str) -> bool {
@@ -246,6 +255,15 @@ mod tests {
     use serde_json::json;
 
     use super::*;
+
+    #[test]
+    fn debug_prints_the_count_and_skipped_keys_only() {
+        let r = Redactor::from_env_file("LONG=correct-horse-battery\nSHORT=ab\n");
+        let shown = format!("{r:?}");
+        assert!(!shown.contains("correct-horse"));
+        assert!(shown.contains("SHORT"));
+        assert!(shown.contains("secrets: 1"));
+    }
 
     #[test]
     fn len_counts_distinct_usable_secrets() {

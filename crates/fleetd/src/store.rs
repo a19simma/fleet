@@ -137,7 +137,8 @@ impl Store {
 
     /// Commits an event, ignoring a repeat of the same id, then enforces the caps.
     ///
-    /// The oldest, lowest priority events are dropped first when a cap is hit, and the drops are counted in a `fleetd.queue_overflow` event.
+    /// When a cap is hit, the lowest priority events are dropped first, then the oldest.
+    /// The drops are counted in a `fleetd.queue_overflow` event.
     ///
     /// # Errors
     ///

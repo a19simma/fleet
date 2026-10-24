@@ -4,7 +4,7 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 
 use clap::{Parser, Subcommand};
-use fleetd::{Config, Error, Signals, dump, forward_hook, run};
+use fleetd::{Config, Error, Signals, dump, run, run_hook};
 use tracing_subscriber::EnvFilter;
 
 #[derive(Parser)]
@@ -56,10 +56,7 @@ async fn execute(cli: Cli) -> Result<ExitCode, Error> {
             Ok(ExitCode::SUCCESS)
         }
         Command::Hook { event } => {
-            let sent = match Config::load(cli.config.as_deref()) {
-                Ok(config) => forward_hook(&config, &event, tokio::io::stdin()).await,
-                Err(err) => Err(err),
-            };
+            let sent = run_hook(cli.config.as_deref(), &event, tokio::io::stdin()).await;
             if let Err(err) = sent {
                 eprintln!("fleetd hook: {err}");
             }
