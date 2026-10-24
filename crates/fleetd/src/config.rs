@@ -38,6 +38,7 @@ struct FileConfig {
     claude_bin: Option<PathBuf>,
     gh_bin: Option<PathBuf>,
     disposable: Option<bool>,
+    jobs_dir: Option<PathBuf>,
 }
 
 /// Where redaction secrets are read from.
@@ -76,6 +77,9 @@ pub struct Config {
     pub gh_bin: PathBuf,
     /// True when the box is disposable, which lets jobs run with permission checks off.
     pub disposable: bool,
+    /// Directory for job worktrees and git mirrors. Defaults to `jobs` under
+    /// `STATE_DIRECTORY`, else `jobs` in the working directory.
+    pub jobs_dir: PathBuf,
 }
 
 impl Config {
@@ -187,6 +191,15 @@ impl Config {
                 .unwrap_or_else(|| PathBuf::from(DEFAULT_CLAUDE_BIN)),
             gh_bin: file.gh_bin.unwrap_or_else(|| PathBuf::from(DEFAULT_GH_BIN)),
             disposable: file.disposable.unwrap_or(false),
+            jobs_dir: env("FLEETD_JOBS_DIR")
+                .map(PathBuf::from)
+                .or(file.jobs_dir)
+                .unwrap_or_else(|| {
+                    env("STATE_DIRECTORY")
+                        .as_deref()
+                        .and_then(first_dir)
+                        .map_or_else(|| PathBuf::from("jobs"), |dir| dir.join("jobs"))
+                }),
         })
     }
 }
@@ -242,6 +255,12 @@ mod tests {
         assert_eq!(cfg.claude_bin, PathBuf::from("/opt/claude"));
         assert_eq!(cfg.gh_bin, PathBuf::from("/opt/gh"));
         assert!(cfg.disposable);
+        assert_eq!(cfg.jobs_dir, PathBuf::from("jobs"));
+        let state = |name: &str| (name == "STATE_DIRECTORY").then(|| "/var/lib/fleetd".to_owned());
+        let cfg = Config::resolve(None, &state).unwrap();
+        assert_eq!(cfg.jobs_dir, PathBuf::from("/var/lib/fleetd/jobs"));
+        let cfg = Config::resolve(Some("jobs_dir = \"/srv/j\"\n"), &state).unwrap();
+        assert_eq!(cfg.jobs_dir, PathBuf::from("/srv/j"));
     }
 
     #[test]

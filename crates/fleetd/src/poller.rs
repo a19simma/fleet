@@ -280,14 +280,7 @@ impl<R: JobRunner, G: Random> Poller<R, G> {
         runner: R,
         random: PollRandom<G>,
     ) -> Result<Self, Error> {
-        let uri: Uri = url.parse().map_err(|_| invalid(SERVER_URL_ENV))?;
-        if !matches!(uri.scheme_str(), Some("http" | "https")) {
-            return Err(invalid(SERVER_URL_ENV));
-        }
-        let endpoint = Endpoint::from_shared(url.to_owned())
-            .map_err(|_| invalid(SERVER_URL_ENV))?
-            .timeout(REQUEST_TIMEOUT);
-        Self::with_channel(endpoint.connect_lazy(), token, box_name, runner, random)
+        Self::with_channel(channel(url)?, token, box_name, runner, random)
     }
 
     /// Builds a poller over an existing channel.
@@ -425,6 +418,22 @@ impl<R: JobRunner, G: Random> Poller<R, G> {
             claimed = self.claim() => Some(claimed),
         }
     }
+}
+
+/// A lazy channel to `url` with [`REQUEST_TIMEOUT`] applied to every call.
+///
+/// # Errors
+///
+/// Fails when the URL is not an `http` or `https` URL. The error never holds the URL.
+pub fn channel(url: &str) -> Result<Channel, Error> {
+    let uri: Uri = url.parse().map_err(|_| invalid(SERVER_URL_ENV))?;
+    if !matches!(uri.scheme_str(), Some("http" | "https")) {
+        return Err(invalid(SERVER_URL_ENV));
+    }
+    let endpoint = Endpoint::from_shared(url.to_owned())
+        .map_err(|_| invalid(SERVER_URL_ENV))?
+        .timeout(REQUEST_TIMEOUT);
+    Ok(endpoint.connect_lazy())
 }
 
 fn bearer_header(token: &Token) -> Result<MetadataValue<tonic::metadata::Ascii>, Error> {

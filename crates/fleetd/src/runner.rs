@@ -368,6 +368,13 @@ impl<R: Reporter> AgentRunner<R> {
         }
     }
 
+    /// Sends a terminal `FAILED` report with a fixed `error`, for a job that failed before
+    /// the agent started. The report waits at most [`RunConfig::terminal_report_timeout`].
+    pub async fn fail_job(&self, job: &Job, error: &'static str) {
+        let mut stream = Stream::new(&self.reporter, job, self.config.terminal_report_timeout);
+        stream.fail(None, error).await;
+    }
+
     async fn publish(&self, job: &Job, cwd: &Path) -> Result<Published, Failure> {
         validate_job_id(&job.job_id).map_err(|_| Failure::bare(ERR_COMMITS))?;
         validate_repo(&job.repo).map_err(|_| Failure::bare(ERR_PUSH))?;

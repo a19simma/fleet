@@ -1,6 +1,6 @@
 # Job runner in fleetd
 
-Status: Accepted. The workspace, agent runner, push and pull request step, poller and gRPC reporter are built as library code, daemon wiring pending. No daemon runtime path calls them yet. Cancel and lease-lost handling are built in the runner, with the same daemon wiring pending. Supersedes the pueue and `fleet-job` parts of ADR-0016 and the "No git" rule of ADR-0011.
+Status: Accepted. The workspace, agent runner, push and pull request step, poller and gRPC reporter are built and run by the daemon while `FLEET_SERVER_URL` and `FLEET_TOKEN` are set. Cancel and lease-lost handling are built in the runner. Supersedes the pueue and `fleet-job` parts of ADR-0016 and the "No git" rule of ADR-0011.
 
 ADR-0016 sketched Jobs as pueue tasks started by `fleet-job`. pueue has no Kubernetes story, adds a callback and poll layer, and `fleet-job` does not exist. The goal is a Job that runs on a Box, shows up in the server and ends on a pushed branch with a pull request.
 

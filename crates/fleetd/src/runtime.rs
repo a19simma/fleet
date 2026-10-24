@@ -19,12 +19,14 @@ use crate::config::Config;
 use crate::events::Limits;
 use crate::heartbeat::Heartbeat;
 use crate::http1::{Failure, roundtrip};
+use crate::jobs::{self, JobPoller};
 use crate::store::Store;
 use crate::system::read_identity;
 
 const DEFAULT_WATCHDOG_PERIOD: Duration = Duration::from_secs(20);
 const MIN_WATCHDOG_PERIOD: Duration = Duration::from_millis(1);
 const SHUTDOWN_GRACE: Duration = Duration::from_secs(10);
+const JOBS_GRACE: Duration = Duration::from_secs(15);
 const MAX_HEALTH_TIMEOUT: Duration = Duration::from_secs(3);
 
 /// Process signal streams for the daemon.
@@ -263,13 +265,29 @@ fn probe_timeout(period: Duration) -> Duration {
 /// listener answers 200 within half the watchdog period, capped at 3 seconds. On
 /// shutdown it stops the listeners, aborting any that outlast a 10 second grace period,
 /// checkpoints the WAL and removes the socket file. While `FLEET_SERVER_URL` is set it
-/// also sends a heartbeat every 30 seconds with `FLEET_TOKEN` as the bearer token.
+/// also sends a heartbeat every 30 seconds with `FLEET_TOKEN` as the bearer token, and a
+/// job poller claims one job at a time. On shutdown the poller stops the running job's
+/// process group and the runner reports it `FAILED`, within 15 seconds. A bad URL or token
+/// disables the poller with a warning.
 ///
 /// # Errors
 ///
 /// Fails on config, queue or bind errors at startup. Fails after cleanup when a
 /// listener ends before `shutdown`, so the process exits non-zero.
 pub async fn run(config: Config, shutdown: impl Future<Output = ()>) -> Result<(), Error> {
+    run_with_env(config, &|name| std::env::var(name).ok(), shutdown).await
+}
+
+/// Runs the daemon like [`run`], reading `FLEET_SERVER_URL` and `FLEET_TOKEN` through `env`.
+///
+/// # Errors
+///
+/// Fails like [`run`].
+pub async fn run_with_env(
+    config: Config,
+    env: &(dyn Fn(&str) -> Option<String> + Sync),
+    shutdown: impl Future<Output = ()>,
+) -> Result<(), Error> {
     let identity = read_identity(config.box_name.as_deref());
     tracing::info!(box_name = %identity.box_name, boot_id = %identity.boot_id, "starting");
     let redactor = load_redactor(&config)?;
@@ -281,14 +299,21 @@ pub async fn run(config: Config, shutdown: impl Future<Output = ()>) -> Result<(
         },
     )
     .await?;
-    let heartbeat = match Heartbeat::from_env(&|name| std::env::var(name).ok()) {
+    let heartbeat = match Heartbeat::from_env(env) {
         Ok(target) => target,
         Err(err) => {
             tracing::warn!(%err, "heartbeat disabled");
             None
         }
     };
-    run_with_store(config, store, identity, redactor, heartbeat, shutdown).await
+    let jobs = match jobs::build(&config, env, &identity.box_name, redactor.clone()) {
+        Ok(poller) => poller,
+        Err(err) => {
+            tracing::warn!(%err, "job poller disabled");
+            None
+        }
+    };
+    run_with_store(config, store, identity, redactor, heartbeat, jobs, shutdown).await
 }
 
 async fn bind_all(config: &Config) -> Result<(TcpListener, SocketAddr, UnixListener), Error> {
@@ -306,6 +331,7 @@ async fn run_with_store(
     identity: Identity,
     redactor: Redactor,
     heartbeat: Option<Heartbeat>,
+    jobs: Option<JobPoller>,
     shutdown: impl Future<Output = ()>,
 ) -> Result<(), Error> {
     let (tcp, tcp_addr, socket) = match bind_all(&config).await {
@@ -344,6 +370,7 @@ async fn run_with_store(
             .with_graceful_shutdown(wait_for(stop_rx.clone()))
             .into_future(),
     );
+    let poller = jobs.map(|poller| tokio::spawn(poller.run(wait_for(stop_rx.clone()))));
     let heartbeat = heartbeat.map(|target| {
         tokio::spawn(target.run(heartbeat_identity, store.clone(), wait_for(stop_rx)))
     });
@@ -364,6 +391,11 @@ async fn run_with_store(
     let _ = sd_notify::notify(&[NotifyState::Stopping]);
     dog.abort();
     let _ = stop_tx.send(true);
+    if let Some(mut poller) = poller
+        && tokio::time::timeout(JOBS_GRACE, &mut poller).await.is_err()
+    {
+        poller.abort();
+    }
     if let Some(mut heartbeat) = heartbeat
         && tokio::time::timeout(SHUTDOWN_GRACE, &mut heartbeat)
             .await
@@ -561,6 +593,7 @@ mod tests {
             test_identity(),
             Redactor::default(),
             None,
+            None,
             std::future::pending(),
         )
         .await;
@@ -580,6 +613,7 @@ mod tests {
             store.clone(),
             test_identity(),
             Redactor::default(),
+            None,
             None,
             std::future::pending(),
         )
@@ -633,6 +667,7 @@ mod tests {
             test_identity(),
             Redactor::default(),
             Some(target),
+            None,
             async move {
                 let _ = stopped.await;
             },

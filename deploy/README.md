@@ -26,12 +26,13 @@ fleetd reads `/etc/fleetd/config.toml` when it exists, then these environment va
 | `FLEETD_DB` | SQLite queue file | `$STATE_DIRECTORY/queue.db`, else `./fleetd.db` |
 | `FLEETD_SOCKET` | unix socket, mode 0600 | `$RUNTIME_DIRECTORY/fleetd.sock`, else `./fleetd.sock` |
 | `FLEETD_SECRETS_FILE` | env file whose values are scrubbed from every event | `/etc/swarm/secrets.env`, optional |
+| `FLEETD_JOBS_DIR` | job worktrees and git mirrors | `$STATE_DIRECTORY/jobs`, else `./jobs` |
 
 A missing secrets file disables redaction and fleetd logs a warning only. It does not refuse to start.
 
-`EnvironmentFile=-/etc/swarm/box.env` in the unit loads variables from that file. It may set any variable in the table above (`FLEETD_PORT`, `FLEET_BOX_NAME`, `FLEETD_DB`, `FLEETD_SOCKET`, `FLEETD_SECRETS_FILE`). The `-` prefix makes the file optional: a missing file is not an error. The unit does not load the secrets file into the environment. fleetd reads it by path through `FLEETD_SECRETS_FILE` only, so the secrets feed the redaction list and nothing else. The unit sets `StateDirectory=fleetd` and `RuntimeDirectory=fleetd`, so systemd exports `STATE_DIRECTORY` and `RUNTIME_DIRECTORY` and the db and socket land in `/var/lib/fleetd` and `/run/fleetd`.
+`EnvironmentFile=-/etc/swarm/box.env` in the unit loads variables from that file. It may set any variable in the table above (`FLEETD_PORT`, `FLEET_BOX_NAME`, `FLEETD_DB`, `FLEETD_SOCKET`, `FLEETD_SECRETS_FILE`). The `-` prefix makes the file optional: a missing file is not an error. The unit also loads `/etc/swarm/secrets.env` into the environment, so `FLEET_TOKEN` and `GH_TOKEN` reach fleetd, and fleetd reads the same file by path through `FLEETD_SECRETS_FILE` for the redaction list. The agent child environment is stripped of `GH_TOKEN` and `FLEET_TOKEN`, but the agent runs as the same uid as fleetd and can read the fleetd process environment through `/proc` and any file fleetd reads, such as `/etc/swarm/secrets.env`. The PAT is therefore exposed to the agent on this box. Use a fine-grained PAT scoped to throwaway repos on disposable Boxes only. Per-job isolation (a separate uid or a credential broker) is not built. The unit sets `StateDirectory=fleetd` and `RuntimeDirectory=fleetd`, so systemd exports `STATE_DIRECTORY` and `RUNTIME_DIRECTORY` and the db and socket land in `/var/lib/fleetd` and `/run/fleetd`.
 
-Config file keys: `http_port`, `socket_path`, `db_path`, `queue_max_bytes`, `queue_max_age_secs`, `hook_events`, `secrets_file`, `box_name`, `dedupe_window_secs`. Unknown keys are an error. `hook_events` lists the hook names to record. Add a name there and a matching hook in the managed settings to record more events.
+Config file keys: `http_port`, `socket_path`, `db_path`, `queue_max_bytes`, `queue_max_age_secs`, `hook_events`, `secrets_file`, `box_name`, `dedupe_window_secs`, `claude_bin`, `gh_bin`, `disposable`, `jobs_dir`. Unknown keys are an error. `hook_events` lists the hook names to record. Add a name there and a matching hook in the managed settings to record more events.
 
 ## Hooks
 

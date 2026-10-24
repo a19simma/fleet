@@ -3,9 +3,9 @@
 //! Hooks and local tools post events. fleetd normalizes and redacts them, then commits
 //! each to a SQLite queue before it answers.
 //!
-//! The job side exists as library modules only: [`poller`] claims jobs, [`workspace`] prepares
-//! git worktrees, and [`runner`] runs the agent as a child process, then pushes the branch and
-//! opens the pull request. No daemon runtime path calls them yet; daemon wiring is pending.
+//! While `FLEET_SERVER_URL` and `FLEET_TOKEN` are set, the daemon also runs jobs: [`poller`]
+//! claims them, [`workspace`] prepares git worktrees, and [`runner`] runs the agent as a child
+//! process, then pushes the branch and opens the pull request.
 
 mod app;
 pub mod backoff;
@@ -18,6 +18,7 @@ mod group;
 pub mod heartbeat;
 mod hook;
 pub mod http1;
+mod jobs;
 pub mod poller;
 mod proc;
 pub mod runner;
@@ -32,6 +33,6 @@ pub use dump::dump;
 pub use error::Error;
 pub use events::{Enqueued, Limits, OVERFLOW_KIND, QueuedEvent};
 pub use hook::{forward_hook, run_hook};
-pub use runtime::{Signals, bind_socket, run};
+pub use runtime::{Signals, bind_socket, run, run_with_env};
 pub use store::Store;
 pub use system::{fresh_id, now_ms, read_identity};

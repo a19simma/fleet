@@ -1,6 +1,6 @@
 # fleetd box daemon
 
-Status: Accepted. The "No git" rule is superseded in part by ADR-0020 and ADR-0024 (built as library code, daemon wiring pending).
+Status: Accepted. The "No git" rule is superseded in part by ADR-0020 and ADR-0024 (built, run by the daemon).
 
 Hooks, workmux and pueue each hold part of what a Box is doing. workmux has no status-change or exit hook, and a `claude -p` run reports its cost only in its own output. Today the laptop reads Box state over ssh, so state exists only while the laptop is awake and polling.
 
@@ -39,7 +39,7 @@ Still unverified: a stalled listener with a hook `timeout`, the `http` hook type
 
 ## v1 cut and recovery (2026-10-24)
 
-v1 builds this ADR without `fleet-job`, claim and lease (the Job runner behind them is built as library code, daemon wiring pending, ADR-0020), drain, the KEDA seam and transcript summaries beyond the last assistant text (plan, v1 cut). The unix socket stays for `fleetd pueue-callback`.
+v1 builds this ADR without `fleet-job`, claim and lease (the Job runner behind them runs in the daemon, ADR-0020), drain, the KEDA seam and transcript summaries beyond the last assistant text (plan, v1 cut). The unix socket stays for `fleetd pueue-callback`.
 
 - **Session registry.** SQLite table `sessions_seen` in `queue.db`: `session_id`, `transcript_path`, `cwd`, `kind`, `last_seen_size`, `last_mtime`, `last_event_at`, `state`. Hooks upsert it. A registry change and the event it derives commit in one transaction.
 - **Reconciler.** At start and every 30 to 60 s (`reconcile_interval`, default 45 s) fleetd discovers `~/.claude/projects/*/*.jsonl` and `~/.local/state/workmux/agents/*.json`, stats every registered transcript (size and mtime only) and parses only a changed file from the last seen offset, for the last assistant text and last entry time. It runs the pane and process liveness check.
@@ -65,8 +65,8 @@ v1 builds this ADR without `fleet-job`, claim and lease (the Job runner behind t
 
 ## Amendments
 
-- **Git (ADR-0020, ADR-0024).** The "No git" rule is superseded in part. The agent runner, the push and pull request step and the gRPC reporter are built as library code. No daemon runtime path calls them yet: wiring them into the daemon is pending. Once wired, fleetd runs Jobs itself as child processes in git worktrees. After the agent exits 0 it counts commits ahead of the base ref, pushes only `swarm/<job_id>` and opens the pull request with `gh`, using a fine-grained token from `/etc/swarm/secrets.env` that the agent environment never sees. The push takes its credential only through `GIT_ASKPASS`, where the askpass program supplies the token, and not through `GH_TOKEN`. The push and `gh` helpers get an allowlisted environment, run with hooks off, and a job with no commits ends `SUCCEEDED` with no branch.
-- **Job source (ADR-0020), built as library code, daemon wiring pending.** The poller exists, and no daemon runtime path calls it yet. Once wired, the pueue and `fleet-job` Job path is replaced by the fleetd child process. The pueue poll and callback for non-Job tasks are unchanged.
+- **Git (ADR-0020, ADR-0024).** The "No git" rule is superseded in part. The agent runner, the push and pull request step and the gRPC reporter are built and run by the daemon while `FLEET_SERVER_URL` and `FLEET_TOKEN` are set. fleetd runs Jobs itself as child processes in git worktrees. After the agent exits 0 it counts commits ahead of the base ref, pushes only `swarm/<job_id>` and opens the pull request with `gh`, using a fine-grained token from `/etc/swarm/secrets.env`. The agent child environment is stripped of the token, but the agent shares fleetd's uid and can read it through `/proc` (see ADR-0024, Known limit). The push takes its credential only through `GIT_ASKPASS`, where the askpass program supplies the token, and not through `GH_TOKEN`. The push and `gh` helpers get an allowlisted environment, run with hooks off, and a job with no commits ends `SUCCEEDED` with no branch.
+- **Job source (ADR-0020), built and run by the daemon.** The poller starts with the daemon. The pueue and `fleet-job` Job path is replaced by the fleetd child process. The pueue poll and callback for non-Job tasks are unchanged.
 
 ## Considered and rejected
 
