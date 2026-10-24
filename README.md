@@ -6,7 +6,7 @@ Fleet shows what every agent box is doing and whether anything died. It has thre
 - `fleet-server`: the hosted service that stores box state.
 - `fleet`: the command line client.
 
-Status: pre-alpha. `fleetd` accepts Claude Code hooks on loopback and local events on a unix socket, normalizes and redacts them, and queues them in SQLite. A forwarder module (batched send, ack through the reply) is built but fleetd does not run it yet, so nothing leaves the queue. `fleet list` is a stub. `fleet-server` serves `FleetIngest` (`PushEvents`, `Heartbeat`) and `FleetQuery.ListFleet` over gRPC on Postgres, with a bearer token, and `GET /healthz`. `FLEET_DATABASE_URL` and `FLEET_TOKEN` are required. `FLEET_LISTEN` defaults to `127.0.0.1:7070` and `FLEET_HEALTH_LISTEN` to `0.0.0.0:7072`. The server warns at startup when either address is not loopback.
+Status: pre-alpha. `fleetd` accepts Claude Code hooks on loopback and local events on a unix socket, normalizes and redacts them, and queues them in SQLite. A forwarder module (batched send, ack through the reply) is built but fleetd does not run it yet, so nothing leaves the queue. While `FLEET_SERVER_URL` is set it sends a heartbeat to the server every 30 s with `FLEET_TOKEN`. `fleet list` is a stub. `fleet-server` serves `FleetIngest` (`PushEvents`, `Heartbeat`) and `FleetQuery.ListFleet` over gRPC on Postgres, with a bearer token, and `GET /healthz`. `FLEET_DATABASE_URL` and `FLEET_TOKEN` are required. `FLEET_LISTEN` defaults to `127.0.0.1:7070` and `FLEET_HEALTH_LISTEN` to `0.0.0.0:7072`. The server warns at startup when either address is not loopback.
 
 ## Install
 
