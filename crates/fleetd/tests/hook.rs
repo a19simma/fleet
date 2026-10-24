@@ -3,6 +3,7 @@
 #![expect(clippy::unwrap_used, reason = "test code asserts by panicking")]
 
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
 use fleet_core::{HookAllowlist, Identity, Redactor};
@@ -114,26 +115,110 @@ async fn rejects_oversized_input_and_bad_event_names() {
     );
 }
 
-#[tokio::test]
-async fn falls_back_to_loopback_when_the_socket_exchange_fails() {
-    let dir = TempDir::new().unwrap();
-    let (state, store) = state(&dir).await;
-    let tcp = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let config = config(&dir, tcp.local_addr().unwrap().port());
-    let dead = bind_socket(&config.socket_path).unwrap();
+type TestResult = Result<(), Box<dyn std::error::Error>>;
+
+async fn counting_tcp(
+    status_line: &'static str,
+) -> Result<(u16, Arc<AtomicUsize>), Box<dyn std::error::Error>> {
+    let tcp = TcpListener::bind("127.0.0.1:0").await?;
+    let port = tcp.local_addr()?.port();
+    let count = Arc::new(AtomicUsize::new(0));
+    let seen = Arc::clone(&count);
     tokio::spawn(async move {
         loop {
-            let Ok((stream, _)) = dead.accept().await else {
+            let Ok((mut stream, _)) = tcp.accept().await else {
                 break;
             };
-            drop(stream);
+            seen.fetch_add(1, Ordering::SeqCst);
+            let mut buf = [0u8; 4096];
+            let _ = stream.read(&mut buf).await;
+            let _ = stream.write_all(status_line.as_bytes()).await;
         }
     });
-    tokio::spawn(async move { axum::serve(tcp, hook_router(state)).await });
-    forward_hook(&config, "SessionStart", PAYLOAD.as_bytes())
-        .await
-        .unwrap();
-    assert_eq!(kinds(&store).await, vec!["hook.session_start".to_owned()]);
+    Ok((port, count))
+}
+
+#[tokio::test]
+async fn a_unix_500_is_final_and_sends_no_tcp_request() -> TestResult {
+    let dir = TempDir::new()?;
+    let (port, count) =
+        counting_tcp("HTTP/1.1 204 No Content\r\nContent-Length: 0\r\n\r\n").await?;
+    let config = config(&dir, port);
+    let sock = bind_socket(&config.socket_path)?;
+    tokio::spawn(async move {
+        loop {
+            let Ok((mut stream, _)) = sock.accept().await else {
+                break;
+            };
+            let mut buf = [0u8; 4096];
+            let _ = stream.read(&mut buf).await;
+            let _ = stream
+                .write_all(b"HTTP/1.1 500 Internal Server Error\r\nContent-Length: 0\r\n\r\n")
+                .await;
+        }
+    });
+    let result = forward_hook(&config, "SessionStart", PAYLOAD.as_bytes()).await;
+    assert!(result.is_err());
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert_eq!(count.load(Ordering::SeqCst), 0);
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_unix_connect_failure_falls_back_to_one_tcp_request() -> TestResult {
+    let dir = TempDir::new()?;
+    let (port, count) =
+        counting_tcp("HTTP/1.1 204 No Content\r\nContent-Length: 0\r\n\r\n").await?;
+    let config = config(&dir, port);
+    drop(bind_socket(&config.socket_path)?);
+    forward_hook(&config, "SessionStart", PAYLOAD.as_bytes()).await?;
+    assert_eq!(count.load(Ordering::SeqCst), 1);
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_hung_unix_server_still_lets_tcp_run() -> TestResult {
+    let dir = TempDir::new()?;
+    let (port, count) =
+        counting_tcp("HTTP/1.1 204 No Content\r\nContent-Length: 0\r\n\r\n").await?;
+    let config = config(&dir, port);
+    let sock = bind_socket(&config.socket_path)?;
+    tokio::spawn(async move {
+        while let Ok((stream, _)) = sock.accept().await {
+            tokio::spawn(async move {
+                tokio::time::sleep(Duration::from_secs(30)).await;
+                drop(stream);
+            });
+        }
+    });
+    let started = std::time::Instant::now();
+    forward_hook(&config, "SessionStart", PAYLOAD.as_bytes()).await?;
+    assert!(started.elapsed() < Duration::from_millis(2_000));
+    assert_eq!(count.load(Ordering::SeqCst), 1);
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_unix_close_without_a_status_line_fails_without_replay() -> TestResult {
+    let dir = TempDir::new()?;
+    let (port, count) =
+        counting_tcp("HTTP/1.1 204 No Content\r\nContent-Length: 0\r\n\r\n").await?;
+    let config = config(&dir, port);
+    let dead = bind_socket(&config.socket_path)?;
+    tokio::spawn(async move {
+        loop {
+            let Ok((mut stream, _)) = dead.accept().await else {
+                break;
+            };
+            let mut buf = [0u8; 4096];
+            let _ = stream.read(&mut buf).await;
+        }
+    });
+    let result = forward_hook(&config, "SessionStart", PAYLOAD.as_bytes()).await;
+    assert!(result.is_err());
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert_eq!(count.load(Ordering::SeqCst), 0);
+    Ok(())
 }
 
 async fn captured_request(job: Option<&str>) -> String {

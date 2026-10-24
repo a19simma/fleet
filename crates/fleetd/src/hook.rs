@@ -11,6 +11,7 @@ use crate::{Config, Error};
 const MAX_STDIN_BYTES: u64 = 1024 * 1024;
 const MAX_RESPONSE_BYTES: u64 = 64 * 1024;
 const TOTAL_TIMEOUT: Duration = Duration::from_secs(2);
+const UNIX_TIMEOUT: Duration = Duration::from_secs(1);
 const MAX_JOB_ID_BYTES: usize = 128;
 const JOB_ENV: &str = "FLEET_JOB_ID";
 
@@ -55,6 +56,13 @@ pub async fn run_hook(
 /// `FLEET_JOB_ID` env var as `X-Fleet-Job` when set. The whole call has a 2 second
 /// budget. Callers that must never block Claude Code should print the error to
 /// stderr and exit 0.
+///
+/// The unix attempt gets its own 1 second sub-budget and TCP gets the rest. TCP is
+/// tried only when the unix connect fails, a write fails, or the sub-budget ends
+/// before any HTTP status line arrives. Any status line from the socket is final,
+/// whatever its code. When the request was fully written and the socket then closes
+/// or errors without a status line, the outcome is unknown: the daemon may already
+/// have enqueued the event, so the hook is not replayed over TCP and fails.
 ///
 /// # Errors
 ///
@@ -115,14 +123,31 @@ async fn forward(
         ));
     }
     let request = request_bytes(event, &body, job);
-    if config.socket_path.exists()
-        && let Ok(stream) = UnixStream::connect(&config.socket_path).await
-        && matches!(exchange(stream, &request).await, Ok(()))
-    {
-        return Ok(());
+    if config.socket_path.exists() {
+        let attempt = tokio::time::timeout(UNIX_TIMEOUT, async {
+            match UnixStream::connect(&config.socket_path).await {
+                Ok(stream) => exchange(stream, &request).await,
+                Err(_) => Err(Attempt::NotDelivered),
+            }
+        })
+        .await;
+        match attempt {
+            Ok(Ok(())) => return Ok(()),
+            Ok(Err(Attempt::Final(err))) => return Err(err),
+            Ok(Err(Attempt::NotDelivered)) | Err(_) => {}
+        }
     }
     let addr = SocketAddr::from((Ipv4Addr::LOCALHOST, config.http_port));
-    exchange(TcpStream::connect(addr).await?, &request).await
+    match exchange(TcpStream::connect(addr).await?, &request).await {
+        Ok(()) => Ok(()),
+        Err(Attempt::Final(err)) => Err(err),
+        Err(Attempt::NotDelivered) => Err(io::Error::other("hook request was not delivered")),
+    }
+}
+
+enum Attempt {
+    NotDelivered,
+    Final(io::Error),
 }
 
 fn request_bytes(event: &str, body: &[u8], job: Option<&str>) -> Vec<u8> {
@@ -139,24 +164,36 @@ fn request_bytes(event: &str, body: &[u8], job: Option<&str>) -> Vec<u8> {
 async fn exchange(
     mut stream: impl AsyncRead + AsyncWrite + Unpin,
     request: &[u8],
-) -> io::Result<()> {
-    stream.write_all(request).await?;
-    stream.flush().await?;
+) -> Result<(), Attempt> {
+    if stream.write_all(request).await.is_err() || stream.flush().await.is_err() {
+        return Err(Attempt::NotDelivered);
+    }
     let mut response = Vec::new();
-    stream
-        .take(MAX_RESPONSE_BYTES)
-        .read_to_end(&mut response)
-        .await?;
+    let mut buf = [0u8; 1024];
+    while !response.contains(&b'\n') && (response.len() as u64) < MAX_RESPONSE_BYTES {
+        match stream.read(&mut buf).await {
+            Ok(0) => break,
+            Ok(n) => response.extend_from_slice(buf.get(..n).unwrap_or_default()),
+            Err(err) => return Err(Attempt::Final(err)),
+        }
+    }
     let text = String::from_utf8_lossy(&response);
     let status = text
         .lines()
         .next()
         .and_then(|line| line.split_whitespace().nth(1))
         .and_then(|code| code.parse::<u16>().ok())
-        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "malformed response"))?;
+        .ok_or_else(|| {
+            Attempt::Final(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "no status line from fleetd",
+            ))
+        })?;
     if (200..300).contains(&status) {
         Ok(())
     } else {
-        Err(io::Error::other(format!("fleetd answered {status}")))
+        Err(Attempt::Final(io::Error::other(format!(
+            "fleetd answered {status}"
+        ))))
     }
 }
