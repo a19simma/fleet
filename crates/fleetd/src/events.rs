@@ -306,30 +306,56 @@ pub async fn count(conn: &mut SqliteConnection) -> Result<u64, Error> {
 /// peeked head. The caller sends the batch and then calls [`ack_through`] with the highest
 /// `seq` the server acknowledged.
 ///
+/// A row whose envelope is not JSON is deleted and logged with its `seq` and the decode
+/// error, never the payload, so it cannot block the rows behind it.
+///
 /// # Errors
 ///
-/// Fails when a statement fails or a stored envelope is not JSON.
+/// Fails when a statement fails.
 pub async fn peek(
     conn: &mut SqliteConnection,
     limit_count: u32,
     limit_bytes: u64,
 ) -> Result<Vec<QueuedEvent>, Error> {
-    let rows = sqlx::query(
-        "SELECT seq, id, ts, kind, payload, LENGTH(CAST(payload AS BLOB)) AS bytes
-         FROM events ORDER BY seq ASC LIMIT ?",
-    )
-    .bind(i64::from(limit_count))
-    .fetch_all(&mut *conn)
-    .await?;
     let mut batch = Vec::new();
-    let mut total: u64 = 0;
-    for row in &rows {
-        let bytes = u64::try_from(row.try_get::<i64, _>("bytes")?).unwrap_or(u64::MAX);
-        if !batch.is_empty() && total.saturating_add(bytes) > limit_bytes {
+    while batch.is_empty() {
+        let rows = sqlx::query(
+            "SELECT seq, id, ts, kind, payload, LENGTH(CAST(payload AS BLOB)) AS bytes
+             FROM events ORDER BY seq ASC LIMIT ?",
+        )
+        .bind(i64::from(limit_count))
+        .fetch_all(&mut *conn)
+        .await?;
+        if rows.is_empty() {
             break;
         }
-        total = total.saturating_add(bytes);
-        batch.push(queued(row)?);
+        let mut total: u64 = 0;
+        let mut quarantined = false;
+        for row in &rows {
+            let bytes = u64::try_from(row.try_get::<i64, _>("bytes")?).unwrap_or(u64::MAX);
+            if !batch.is_empty() && total.saturating_add(bytes) > limit_bytes {
+                break;
+            }
+            match queued(row) {
+                Ok(event) => {
+                    total = total.saturating_add(bytes);
+                    batch.push(event);
+                }
+                Err(Error::Json(err)) => {
+                    let seq: i64 = row.try_get("seq")?;
+                    tracing::warn!(seq, error = %err, "dropping undecodable queued event");
+                    sqlx::query("DELETE FROM events WHERE seq = ?")
+                        .bind(seq)
+                        .execute(&mut *conn)
+                        .await?;
+                    quarantined = true;
+                }
+                Err(err) => return Err(err),
+            }
+        }
+        if !quarantined {
+            break;
+        }
     }
     if let Some(top) = batch.last() {
         sqlx::query("UPDATE queue_state SET peeked_seq = MAX(peeked_seq, ?) WHERE id = 1")

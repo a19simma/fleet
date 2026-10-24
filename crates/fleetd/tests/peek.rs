@@ -275,3 +275,36 @@ async fn overflow_after_a_peek_inserts_a_new_marker_and_the_count_survives_the_a
     assert_eq!(after.len(), 1);
     assert_eq!(after[0].1, kept);
 }
+
+async fn insert_raw(dir: &TempDir, seq: i64, payload: &str) -> Result<(), sqlx::Error> {
+    use sqlx::Connection;
+    let mut conn =
+        sqlx::SqliteConnection::connect(&format!("sqlite://{}", dir.path().join("q.db").display()))
+            .await?;
+    sqlx::query(
+        "INSERT INTO events (seq, id, ts, kind, priority, payload) VALUES (?, ?, ?, 'bad', 0, ?)",
+    )
+    .bind(seq)
+    .bind(format!("raw-{seq}"))
+    .bind(i64::try_from(now_ms()).unwrap_or(0))
+    .bind(payload)
+    .execute(&mut conn)
+    .await?;
+    conn.close().await
+}
+
+#[tokio::test]
+async fn an_undecodable_head_row_is_removed_and_delivery_continues() -> Result<(), sqlx::Error> {
+    let dir = TempDir::new().unwrap();
+    let store = open(&dir, BIG).await;
+    insert_raw(&dir, 1, "{not json").await?;
+    let good = fill(&store, "hook.stop", 2, 10).await;
+
+    let batch = store.peek(10, u64::MAX).await.unwrap();
+
+    assert_eq!(seqs(&batch), good);
+    assert_eq!(seqs(&store.list(None).await.unwrap()), good);
+    assert_eq!(store.ack_through(good[1]).await.unwrap(), 2);
+    assert_eq!(store.count().await.unwrap(), 0);
+    Ok(())
+}
