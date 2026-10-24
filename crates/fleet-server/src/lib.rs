@@ -4,5 +4,7 @@ pub mod auth;
 pub mod config;
 pub mod jobs;
 pub mod projection;
+pub mod reaper;
 pub mod service;
 pub mod store;
+pub mod supervise;

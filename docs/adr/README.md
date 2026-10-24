@@ -6,8 +6,8 @@ ADRs for fleetd, the Fleet server and the `fleet` CLI. The plan is in `../plan.m
 |---|---|---|
 | [0011](0011-fleetd-box-daemon.md) | fleetd box daemon | Accepted, "No git" rule superseded in part by 0020 and 0024 (built as library code, daemon wiring pending) |
 | [0012](0012-event-model-and-delivery.md) | Event model and delivery | Accepted, stream and ack parts superseded by 0018 |
-| [0013](0013-fleet-server-stack.md) | Fleet server stack | Accepted, service layout and "No transcripts" amended by 0021 and 0022 (planned), monthly partitions superseded by 0019 |
-| [0014](0014-box-to-server-bearer-token.md) | Box to server bearer token | Accepted, single token superseded by 0023 (planned) |
+| [0013](0013-fleet-server-stack.md) | Fleet server stack | Accepted, service layout and "No transcripts" amended by 0021 and 0022 (built in the server), monthly partitions superseded by 0019 |
+| [0014](0014-box-to-server-bearer-token.md) | Box to server bearer token | Accepted, single token superseded by 0023 (built in the server) |
 | [0015](0015-fleet-reads-from-the-server.md) | Fleet reads from the server | Accepted |
 | [0016](0016-job-queue-claim-and-lease.md) | Job queue, claim and lease | Accepted, pueue runner, `CLAIMED` state, heartbeat lease and `retry_on_lost` superseded by 0020 (built as library code, daemon wiring pending) and 0021 (planned) |
 | [0017](0017-public-repo-and-mise-distribution.md) | Public repo and mise distribution | Accepted |

@@ -1,4 +1,7 @@
 //! Bearer token check, applied once as a tower layer around the whole gRPC router.
+//!
+//! Two tokens, scoped by gRPC path: the box token covers `FleetIngest` and `FleetWorker`,
+//! the client token covers `FleetQuery` and `FleetJobs`. Any other path is denied.
 
 use std::convert::Infallible;
 use std::future::{Future, ready};
@@ -14,42 +17,80 @@ use tower::{Layer, Service};
 
 use crate::config::{Secret, Token};
 
+const INGEST: &str = "/fleet.v1.FleetIngest/";
+const WORKER: &str = "/fleet.v1.FleetWorker/";
+const QUERY: &str = "/fleet.v1.FleetQuery/";
+const JOBS: &str = "/fleet.v1.FleetJobs/";
+
+/// Which token a request carried.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Scope {
+    Box,
+    Client,
+}
+
 /// Requires `authorization: Bearer <token>` on every request, whatever the gRPC path.
 ///
 /// The whole header value is compared with [`constant_time_eq`], so a wrong scheme, a
-/// wrong token and a header with non-ASCII bytes all fail the same way.
+/// wrong token and a header with non-ASCII bytes all fail the same way. A valid token
+/// that does not cover the path gets `PERMISSION_DENIED`. Without a client token,
+/// `FleetJobs` is closed to everyone.
 #[derive(Debug, Clone)]
 pub struct BearerAuth {
-    expected: Secret,
+    box_token: Secret,
+    client_token: Option<Secret>,
 }
 
 impl BearerAuth {
-    /// Builds a check for `token`.
-    pub fn new(token: &Token) -> Self {
+    /// Builds a check for the box token and an optional client token.
+    pub fn new(box_token: &Token, client_token: Option<&Token>) -> Self {
+        let header = |token: &Token| Secret::new(format!("Bearer {}", token.expose()));
         Self {
-            expected: Secret::new(format!("Bearer {}", token.expose())),
+            box_token: header(box_token),
+            client_token: client_token.map(header),
         }
     }
 
-    /// The header value a request to `path` must carry.
-    ///
-    /// Every path takes the one box token today. Choosing the token per service path
-    /// changes only this function.
-    fn required(&self, _path: &str) -> &Secret {
-        &self.expected
+    fn scope_of(&self, header: &[u8]) -> Option<Scope> {
+        let is_box = constant_time_eq(header, self.box_token.expose().as_bytes());
+        let is_client = self
+            .client_token
+            .as_ref()
+            .is_some_and(|token| constant_time_eq(header, token.expose().as_bytes()));
+        if is_box {
+            Some(Scope::Box)
+        } else if is_client {
+            Some(Scope::Client)
+        } else {
+            None
+        }
     }
 
-    /// Checks `header` against the token `path` requires.
+    /// Allow-lists paths per scope: the box token takes `FleetIngest` and `FleetWorker`,
+    /// the client token takes `FleetQuery` and `FleetJobs`. Every other path is denied.
+    fn allows(scope: Scope, path: &str) -> bool {
+        match scope {
+            Scope::Box => path.starts_with(INGEST) || path.starts_with(WORKER),
+            Scope::Client => path.starts_with(QUERY) || path.starts_with(JOBS),
+        }
+    }
+
+    /// Checks the token first, then the path scope.
     ///
     /// # Errors
     ///
-    /// Returns `UNAUTHENTICATED` when the header is missing or does not match.
+    /// Returns `UNAUTHENTICATED` when the header is missing or matches no token, and
+    /// `PERMISSION_DENIED` when it matches a token whose scope excludes `path`.
     pub fn check(&self, path: &str, header: Option<&[u8]>) -> Result<(), Status> {
-        let given = header.unwrap_or_default();
-        if constant_time_eq(given, self.required(path).expose().as_bytes()) {
+        let scope = self
+            .scope_of(header.unwrap_or_default())
+            .ok_or_else(|| Status::unauthenticated("missing or invalid bearer token"))?;
+        if Self::allows(scope, path) {
             Ok(())
         } else {
-            Err(Status::unauthenticated("missing or invalid bearer token"))
+            Err(Status::permission_denied(
+                "bearer token not valid for this service",
+            ))
         }
     }
 }
@@ -99,7 +140,12 @@ where
                     .extensions()
                     .get::<TcpConnectInfo>()
                     .and_then(TcpConnectInfo::remote_addr);
-                tracing::warn!(?peer, "rejected request with a bad bearer token");
+                let code = status.code();
+                tracing::warn!(
+                    ?peer,
+                    ?code,
+                    "rejected request: unauthenticated or out of scope"
+                );
                 Box::pin(ready(Ok(status.into_http())))
             }
         }
@@ -117,7 +163,7 @@ mod tests {
 
     fn auth() -> Result<BearerAuth, String> {
         let token = Token::new(SECRET.into()).map_err(|err| err.to_string())?;
-        Ok(BearerAuth::new(&token))
+        Ok(BearerAuth::new(&token, None))
     }
 
     #[test]

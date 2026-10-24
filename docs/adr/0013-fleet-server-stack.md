@@ -8,10 +8,10 @@ Fleet state must outlive the laptop's sleep and any single Box. The deployment s
 
 The Fleet server is a long-running service in Rust, with gRPC through tonic and Postgres through sqlx.
 
-- **Services.** `FleetIngest` for Boxes (events, heartbeat, job claim and lease). `FleetQuery` for the laptop (fleet view, preview, events, watch stream; v1 has no watch stream). `FleetJobs` for submit, cancel, queue depth and drain (ADR-0016). One proto package, `fleet.v1`, shared with fleetd and the CLI as a crate.
+- **Services.** `FleetIngest` for Boxes (events, heartbeat). `FleetWorker` for Boxes (job claim and report). `FleetQuery` for the laptop (fleet view via `ListFleet`; v1 has no preview, events or watch stream rpc). `FleetJobs` for the laptop (submit, get, list, cancel and transcript reads, ADR-0016). One proto package, `fleet.v1`, shared with fleetd and the CLI as a crate.
 - **Storage.** Postgres. `events` partitioned monthly on `received_at`. Projections (`boxes`, `sessions`, `jobs`) update in the same transaction as the event insert. `LISTEN/NOTIFY` drives the `Watch` stream so replicas stay possible.
 - **Retention.** `events` 30 days, tool events 7 days, by dropping partitions. `jobs` and `job_attempts` 1 year.
-- **Location.** A hosted service reachable over a VPN. Any VPN works, for example Tailscale or netbird. The server address is plain config, `FLEET_SERVER_URL` in `/etc/swarm/box.env`, transport-agnostic: any routable network path, TLS optional by deployment. The server and proto read no VPN state, so a VPN switch is a config change plus a note here. Box auth is a bearer token (ADR-0014). The deploy target is not fixed by this ADR.
+- **Location.** A hosted service reachable over a VPN. Any VPN works, for example Tailscale or netbird. The server address is plain config, `FLEET_SERVER_URL` in `/etc/swarm/box.env`, transport-agnostic: any routable network path, TLS optional by deployment. The server and proto read no VPN state, so a VPN switch is a config change plus a note here. Box auth is a bearer token, and the laptop has its own client token (ADR-0014, amended 2026-10-24). The deploy target is not fixed by this ADR.
 - **No transcripts.** The server stores prompts and last messages, never transcripts or raw pueue logs.
 
 ## Decisions (2026-10-24)

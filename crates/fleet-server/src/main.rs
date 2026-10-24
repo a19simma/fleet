@@ -1,16 +1,18 @@
 //! fleet-server: serves the Fleet gRPC API and a plain health endpoint.
 
-use std::error::Error;
 use std::process::ExitCode;
 use std::str::FromStr;
+use std::sync::Arc;
 use std::time::Duration;
 
 use axum::Router;
 use axum::routing::get;
 use fleet_server::auth::BearerAuth;
 use fleet_server::config::{Config, exposed_binds, is_loopback};
+use fleet_server::reaper::{DEFAULT_REAP_PERIOD, run_reaper};
 use fleet_server::service::router;
 use fleet_server::store::Store;
+use fleet_server::supervise::{BoxError, supervise};
 use sqlx::postgres::{PgConnectOptions, PgPoolOptions};
 use tokio::net::TcpListener;
 use tokio::signal::unix::{SignalKind, signal};
@@ -21,8 +23,6 @@ use tracing_subscriber::EnvFilter;
 const MAX_CONNECTIONS: u32 = 10;
 const ACQUIRE_TIMEOUT: Duration = Duration::from_secs(5);
 const STATEMENT_TIMEOUT_MS: &str = "10000";
-
-type BoxError = Box<dyn Error + Send + Sync>;
 
 async fn termination() {
     let terminate = async {
@@ -88,13 +88,21 @@ async fn run() -> Result<(), BoxError> {
     );
 
     let (stop_tx, stop_rx) = watch::channel(false);
+    let stop_tx = Arc::new(stop_tx);
+    let signal_stop = Arc::clone(&stop_tx);
     tokio::spawn(async move {
         termination().await;
         tracing::info!("shutdown requested");
-        let _ = stop_tx.send(true);
+        signal_stop.send_replace(true);
     });
 
-    let auth = BearerAuth::new(&config.token);
+    let reaper = tokio::spawn(run_reaper(
+        store.clone(),
+        DEFAULT_REAP_PERIOD,
+        stop_rx.clone(),
+        None,
+    ));
+    let auth = BearerAuth::new(&config.token, config.client_token.as_ref());
     let grpc_server = async {
         router(&store, &auth)
             .serve_with_incoming_shutdown(grpc, stopped(stop_rx.clone()))
@@ -108,7 +116,8 @@ async fn run() -> Result<(), BoxError> {
             .await
             .map_err(BoxError::from)
     };
-    tokio::try_join!(grpc_server, health_server)?;
+    let served = async { tokio::try_join!(grpc_server, health_server).map(|_| ()) };
+    supervise(served, reaper, &stop_tx).await?;
     tracing::info!("fleet-server stopped");
     Ok(())
 }

@@ -2,17 +2,22 @@
 
 use std::collections::{BTreeMap, HashSet};
 use std::fmt;
+use std::time::Duration;
 
 use fleet_core::{BoxName, Envelope, EventId, SCHEMA_VERSION};
 use fleet_proto::v1::{
-    BoxStatus, BoxView, HeartbeatRequest, Job, JobState, SessionState, SessionView,
-    SubmitJobRequest,
+    BoxStatus, BoxView, HeartbeatRequest, Job, JobState, ReadTranscriptReply, ReportJobReply,
+    ReportJobRequest, SessionState, SessionView, SubmitJobRequest, TranscriptChunk,
 };
+use fleet_proto::validate_box;
 use serde_json::{Value, json};
 use sqlx::postgres::PgRow;
 use sqlx::{PgPool, Postgres, Row, Transaction};
 
-use crate::jobs::{JobInvalid, validate_submit};
+use crate::jobs::{
+    JobInvalid, MAX_PHASE_CHARS, MAX_PROGRESS_CHARS, MAX_TRANSCRIPT_BYTES, validate_job_id,
+    validate_submit, validate_terminal,
+};
 use crate::projection::{Projection, State, project};
 
 const INSERT_EVENTS: &str = "\
@@ -122,7 +127,99 @@ VALUES ($1, $2, $3, $4, $5, 'swarm/' || $1, $6) \
 ON CONFLICT (idempotency_key) DO NOTHING \
 RETURNING job_id";
 
+const SELECT_JOB_BY_ID: &str = "\
+SELECT job_id, idempotency_key, prompt, repo, base_ref, open_pr, state, box, attempt, \
+progress, phase, branch, pr_url, error, exit_code, cancel_requested, \
+(EXTRACT(EPOCH FROM lease_expires_at) * 1000)::bigint AS lease_ms, \
+(EXTRACT(EPOCH FROM created_at) * 1000)::bigint AS created_ms, \
+(EXTRACT(EPOCH FROM claimed_at) * 1000)::bigint AS claimed_ms, \
+(EXTRACT(EPOCH FROM finished_at) * 1000)::bigint AS finished_ms \
+FROM jobs WHERE job_id = $1";
+
+const LIST_JOBS: &str = "\
+SELECT job_id, idempotency_key, prompt, repo, base_ref, open_pr, state, box, attempt, \
+progress, phase, branch, pr_url, error, exit_code, cancel_requested, \
+(EXTRACT(EPOCH FROM lease_expires_at) * 1000)::bigint AS lease_ms, \
+(EXTRACT(EPOCH FROM created_at) * 1000)::bigint AS created_ms, \
+(EXTRACT(EPOCH FROM claimed_at) * 1000)::bigint AS claimed_ms, \
+(EXTRACT(EPOCH FROM finished_at) * 1000)::bigint AS finished_ms \
+FROM jobs WHERE $1::text IS NULL OR state = $1 \
+ORDER BY created_at DESC, job_id DESC LIMIT $2";
+
+const READ_TRANSCRIPT: &str = "\
+SELECT seq, ts_ms, chunk, truncated FROM job_transcript \
+WHERE job_id = $1 AND seq > $2 ORDER BY seq LIMIT $3";
+
+const CLAIM_JOB: &str = "\
+UPDATE jobs SET state = 'RUNNING', box = $1, attempt = attempt + 1, \
+claimed_at = now(), lease_expires_at = now() + make_interval(secs => $2) \
+WHERE job_id = ( \
+SELECT job_id FROM jobs WHERE state = 'QUEUED' \
+ORDER BY created_at, job_id LIMIT 1 FOR UPDATE SKIP LOCKED) \
+RETURNING job_id, idempotency_key, prompt, repo, base_ref, open_pr, state, box, attempt, \
+progress, phase, branch, pr_url, error, exit_code, cancel_requested, \
+(EXTRACT(EPOCH FROM lease_expires_at) * 1000)::bigint AS lease_ms, \
+(EXTRACT(EPOCH FROM created_at) * 1000)::bigint AS created_ms, \
+(EXTRACT(EPOCH FROM claimed_at) * 1000)::bigint AS claimed_ms, \
+(EXTRACT(EPOCH FROM finished_at) * 1000)::bigint AS finished_ms";
+
+const CANCEL_JOB: &str = "\
+UPDATE jobs SET \
+state = CASE WHEN state = 'QUEUED' THEN 'CANCELLED' ELSE state END, \
+finished_at = CASE WHEN state = 'QUEUED' THEN now() ELSE finished_at END, \
+cancel_requested = cancel_requested OR state = 'RUNNING' \
+WHERE job_id = $1 \
+RETURNING job_id, idempotency_key, prompt, repo, base_ref, open_pr, state, box, attempt, \
+progress, phase, branch, pr_url, error, exit_code, cancel_requested, \
+(EXTRACT(EPOCH FROM lease_expires_at) * 1000)::bigint AS lease_ms, \
+(EXTRACT(EPOCH FROM created_at) * 1000)::bigint AS created_ms, \
+(EXTRACT(EPOCH FROM claimed_at) * 1000)::bigint AS claimed_ms, \
+(EXTRACT(EPOCH FROM finished_at) * 1000)::bigint AS finished_ms";
+
+const REPORT_JOB: &str = "\
+UPDATE jobs SET phase = $4, progress = $5, \
+lease_expires_at = now() + make_interval(secs => $6), \
+state = COALESCE($7, state), \
+finished_at = CASE WHEN $7::text IS NULL THEN finished_at ELSE now() END, \
+pr_url = CASE WHEN $7::text IS NULL THEN pr_url ELSE $8 END, \
+error = CASE WHEN $7::text IS NULL THEN error ELSE $9 END, \
+exit_code = CASE WHEN $7::text IS NULL THEN exit_code ELSE $10 END, \
+branch = COALESCE($11, branch) \
+WHERE job_id = $1 AND attempt = $2 AND box = $3 AND state = 'RUNNING' \
+RETURNING cancel_requested, transcript_bytes, \
+(EXTRACT(EPOCH FROM lease_expires_at) * 1000)::bigint AS lease_ms";
+
+const REAP_EXPIRED: &str = "\
+UPDATE jobs SET state = 'LOST', finished_at = now(), error = 'lease expired' \
+WHERE state = 'RUNNING' AND lease_expires_at < now()";
+
+const TRANSCRIPT_TRUNCATED: &str = "\
+SELECT EXISTS (SELECT 1 FROM job_transcript WHERE job_id = $1 AND truncated)";
+
+const TRANSCRIPT_HAS_SEQ: &str = "\
+SELECT EXISTS (SELECT 1 FROM job_transcript WHERE job_id = $1 AND seq = $2)";
+
+const TRANSCRIPT_MAX_SEQ: &str = "\
+SELECT COALESCE(max(seq), 0) FROM job_transcript WHERE job_id = $1";
+
+const INSERT_CHUNK: &str = "\
+INSERT INTO job_transcript (job_id, seq, ts_ms, chunk, truncated) VALUES ($1, $2, $3, $4, $5)";
+
+const SET_TRANSCRIPT_BYTES: &str = "UPDATE jobs SET transcript_bytes = $2 WHERE job_id = $1";
+
+/// Lease granted to a claimed job when the store is not configured otherwise.
+pub const DEFAULT_LEASE: Duration = Duration::from_secs(120);
+
 const NOW_MS: &str = "SELECT (EXTRACT(EPOCH FROM now()) * 1000)::bigint";
+
+/// Jobs `list_jobs` returns when the request sets no limit.
+pub const DEFAULT_LIST_LIMIT: u32 = 50;
+/// Most jobs `list_jobs` returns.
+pub const MAX_LIST_LIMIT: u32 = 200;
+/// Chunks `read_transcript` returns when the request sets no limit.
+pub const DEFAULT_TRANSCRIPT_LIMIT: u32 = 100;
+/// Most chunks `read_transcript` returns.
+pub const MAX_TRANSCRIPT_LIMIT: u32 = 500;
 
 /// Last millisecond of the year 9999, the largest timestamp an event may carry.
 pub const MAX_TS_MS: u64 = 253_402_300_799_999;
@@ -139,9 +236,21 @@ pub enum StoreError {
     OutOfRange(&'static str),
     /// A job request failed validation.
     InvalidJob(JobInvalid),
+    /// A claim or report named an invalid box. The value is not kept.
+    InvalidBox,
     /// An idempotency key was reused with different submit parameters. The handler maps
     /// this to gRPC `ALREADY_EXISTS`.
     KeyConflict,
+    /// A report named a job that is missing, not running, held by another box or at
+    /// another attempt. The handler maps this to gRPC `FAILED_PRECONDITION`. No input is
+    /// kept.
+    StaleReport,
+    /// A transcript chunk has a sequence number or text the store cannot keep. No input is
+    /// kept.
+    InvalidChunk,
+    /// A get, cancel or transcript read named a job that does not exist. The handler maps
+    /// this to gRPC `NOT_FOUND`. No input is kept.
+    NotFound,
 }
 
 impl fmt::Display for StoreError {
@@ -151,7 +260,11 @@ impl fmt::Display for StoreError {
             Self::Migrate(err) => write!(f, "migration error: {err}"),
             Self::OutOfRange(field) => write!(f, "stored {field} is out of range"),
             Self::InvalidJob(reason) => reason.fmt(f),
+            Self::InvalidBox => f.write_str("invalid box name"),
             Self::KeyConflict => f.write_str("idempotency key already used with other parameters"),
+            Self::StaleReport => f.write_str("job is not running here at this attempt"),
+            Self::InvalidChunk => f.write_str("invalid transcript chunk"),
+            Self::NotFound => f.write_str("job not found"),
         }
     }
 }
@@ -162,7 +275,12 @@ impl std::error::Error for StoreError {
             Self::Database(err) => Some(err),
             Self::Migrate(err) => Some(err),
             Self::InvalidJob(err) => Some(err),
-            Self::OutOfRange(_) | Self::KeyConflict => None,
+            Self::OutOfRange(_)
+            | Self::InvalidBox
+            | Self::KeyConflict
+            | Self::StaleReport
+            | Self::InvalidChunk
+            | Self::NotFound => None,
         }
     }
 }
@@ -189,6 +307,18 @@ fn job_state(text: &str) -> Result<JobState, StoreError> {
         "LOST" => JobState::Lost,
         _ => return Err(StoreError::OutOfRange("job state")),
     })
+}
+
+fn job_state_text(state: JobState) -> &'static str {
+    match state {
+        JobState::Unspecified => "",
+        JobState::Queued => "QUEUED",
+        JobState::Running => "RUNNING",
+        JobState::Succeeded => "SUCCEEDED",
+        JobState::Failed => "FAILED",
+        JobState::Cancelled => "CANCELLED",
+        JobState::Lost => "LOST",
+    }
 }
 
 fn ms(value: Option<i64>, field: &'static str) -> Result<Option<u64>, StoreError> {
@@ -326,6 +456,7 @@ fn parse_count(value: Option<String>, bad: &mut u32) -> u64 {
 #[derive(Debug, Clone)]
 pub struct Store {
     pool: PgPool,
+    lease: Duration,
     #[cfg(test)]
     snapshot_gate: Option<std::sync::Arc<SnapshotGate>>,
 }
@@ -342,9 +473,22 @@ impl Store {
     pub fn new(pool: PgPool) -> Self {
         Self {
             pool,
+            lease: DEFAULT_LEASE,
             #[cfg(test)]
             snapshot_gate: None,
         }
+    }
+
+    /// The lease a claim grants and a report renews.
+    pub fn lease(&self) -> Duration {
+        self.lease
+    }
+
+    /// Sets the lease a claim grants, [`DEFAULT_LEASE`] otherwise.
+    #[must_use]
+    pub fn with_lease(mut self, lease: Duration) -> Self {
+        self.lease = lease;
+        self
     }
 
     /// Applies the embedded migrations.
@@ -493,6 +637,271 @@ impl Store {
             return Err(StoreError::KeyConflict);
         }
         Ok(stored)
+    }
+
+    /// Claims the oldest queued job for `box_name`.
+    ///
+    /// One statement picks the head of the queue by `created_at` with
+    /// `FOR UPDATE SKIP LOCKED`, so concurrent claimers never take the same job. The job
+    /// becomes `RUNNING` with the box, the attempt incremented, `claimed_at` set and the
+    /// lease expiry one store lease after the claim. Cancelled and other non-queued jobs
+    /// are skipped. An empty queue returns `None`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StoreError::InvalidBox`] when `box_name` fails [`validate_box`], and
+    /// [`StoreError::Database`] when the statement fails.
+    pub async fn claim_job(&self, box_name: &str) -> Result<Option<Job>, StoreError> {
+        let name = validate_box(box_name).map_err(|_| StoreError::InvalidBox)?;
+        let row = sqlx::query(CLAIM_JOB)
+            .bind(name.as_str())
+            .bind(self.lease.as_secs_f64())
+            .fetch_optional(&self.pool)
+            .await?;
+        row.as_ref().map(job_from_row).transpose()
+    }
+
+    /// Returns the job with `job_id`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StoreError::InvalidJob`] when `job_id` fails validation,
+    /// [`StoreError::NotFound`] when no job has it, and [`StoreError::Database`] when the
+    /// query fails.
+    pub async fn get_job(&self, job_id: &str) -> Result<Job, StoreError> {
+        validate_job_id(job_id)?;
+        let row = sqlx::query(SELECT_JOB_BY_ID)
+            .bind(job_id)
+            .fetch_optional(&self.pool)
+            .await?
+            .ok_or(StoreError::NotFound)?;
+        job_from_row(&row)
+    }
+
+    /// Lists jobs newest first, optionally only those in `state`.
+    ///
+    /// `state` is the wire value of a [`JobState`]. A `limit` of 0 means
+    /// [`DEFAULT_LIST_LIMIT`]; larger values are cut to [`MAX_LIST_LIMIT`].
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StoreError::InvalidJob`] when `state` is unspecified or unknown, and
+    /// [`StoreError::Database`] when the query fails.
+    pub async fn list_jobs(&self, state: Option<i32>, limit: u32) -> Result<Vec<Job>, StoreError> {
+        let state = state
+            .map(|raw| match JobState::try_from(raw) {
+                Ok(JobState::Unspecified) | Err(_) => Err(JobInvalid::State),
+                Ok(known) => Ok(job_state_text(known)),
+            })
+            .transpose()?;
+        let limit = match limit {
+            0 => DEFAULT_LIST_LIMIT,
+            n => n.min(MAX_LIST_LIMIT),
+        };
+        let rows = sqlx::query(LIST_JOBS)
+            .bind(state)
+            .bind(i64::from(limit))
+            .fetch_all(&self.pool)
+            .await?;
+        rows.iter().map(job_from_row).collect()
+    }
+
+    /// Reads transcript chunks of a job after `after_seq`, in `seq` order.
+    ///
+    /// A `limit` of 0 means [`DEFAULT_TRANSCRIPT_LIMIT`]; larger values are cut to
+    /// [`MAX_TRANSCRIPT_LIMIT`]. `done` is true when the job has ended and no chunk
+    /// follows the last one returned.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StoreError::InvalidJob`] when `job_id` fails validation,
+    /// [`StoreError::NotFound`] when no job has it, and [`StoreError::Database`] when a
+    /// query fails.
+    pub async fn read_transcript(
+        &self,
+        job_id: &str,
+        after_seq: u64,
+        limit: u32,
+    ) -> Result<ReadTranscriptReply, StoreError> {
+        let job = self.get_job(job_id).await?;
+        let limit = match limit {
+            0 => DEFAULT_TRANSCRIPT_LIMIT,
+            n => n.min(MAX_TRANSCRIPT_LIMIT),
+        };
+        let after = i64::try_from(after_seq).unwrap_or(i64::MAX);
+        let rows = sqlx::query(READ_TRANSCRIPT)
+            .bind(job_id)
+            .bind(after)
+            .bind(i64::from(limit) + 1)
+            .fetch_all(&self.pool)
+            .await?;
+        let more = rows.len() > limit as usize;
+        let chunks = rows
+            .iter()
+            .take(limit as usize)
+            .map(|row| {
+                Ok(TranscriptChunk {
+                    seq: count(row.try_get("seq")?, "seq")?,
+                    ts_ms: count(row.try_get("ts_ms")?, "ts_ms")?,
+                    text: row.try_get("chunk")?,
+                    truncated: row.try_get("truncated")?,
+                })
+            })
+            .collect::<Result<Vec<_>, StoreError>>()?;
+        let ended = !matches!(job.state(), JobState::Queued | JobState::Running);
+        Ok(ReadTranscriptReply {
+            chunks,
+            done: ended && !more,
+        })
+    }
+
+    /// Cancels a job.
+    ///
+    /// One statement decides by the stored state. A `QUEUED` job becomes `CANCELLED` at
+    /// once with `finished_at` set. A `RUNNING` job only gets `cancel_requested`; its box
+    /// sees the flag on the next report and ends the job. Any other state is returned
+    /// unchanged, so a repeat cancel is safe.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StoreError::InvalidJob`] when `job_id` fails validation,
+    /// [`StoreError::NotFound`] when no job has it, and [`StoreError::Database`] when the
+    /// statement fails.
+    pub async fn cancel_job(&self, job_id: &str) -> Result<Job, StoreError> {
+        validate_job_id(job_id)?;
+        let row = sqlx::query(CANCEL_JOB)
+            .bind(job_id)
+            .fetch_optional(&self.pool)
+            .await?
+            .ok_or(StoreError::NotFound)?;
+        job_from_row(&row)
+    }
+
+    /// Records a progress or final report from the box that holds the job and renews its
+    /// lease.
+    ///
+    /// One statement matches the job id, the attempt and the box on a `RUNNING` row, then
+    /// stores `phase` and `progress` and moves the lease expiry to one store lease from
+    /// now. Only that holder can append `chunks`, in the same transaction. `phase` is cut
+    /// to [`MAX_PHASE_CHARS`] characters and `progress` to [`MAX_PROGRESS_CHARS`].
+    ///
+    /// With `terminal_state` set to `SUCCEEDED`, `FAILED` or `CANCELLED`, the same
+    /// statement also ends the job: it stores the state, `finished_at`, `exit_code`,
+    /// `error` (cut to [`crate::jobs::MAX_ERROR_CHARS`] characters), `pr_url` and `branch`. The row is
+    /// then no longer `RUNNING`, so a second final report is stale. Result fields on a
+    /// report without `terminal_state` are ignored.
+    ///
+    /// A chunk whose `seq` is already stored is skipped and counts as acked. Once stored
+    /// bytes would pass [`MAX_TRANSCRIPT_BYTES`], one marker row with `truncated` set takes
+    /// the first dropped `seq`, and that chunk and every later one is dropped and acked.
+    /// The reply carries the new expiry, the cancel flag, `transcript_truncated` and
+    /// `acked_through_seq`, the highest `seq` stored or seen for the job.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StoreError::InvalidBox`] when the box fails [`validate_box`],
+    /// [`StoreError::InvalidJob`] when the terminal state, `pr_url`, `error` or `branch`
+    /// is invalid, [`StoreError::InvalidChunk`] when a chunk `seq` exceeds the database range
+    /// or its text holds a NUL character, [`StoreError::StaleReport`] when no running row
+    /// matches the job, attempt and box (a reaped `LOST` row no longer matches), and
+    /// [`StoreError::Database`] when a statement fails. A failed call stores nothing.
+    pub async fn report_job(
+        &self,
+        request: &ReportJobRequest,
+    ) -> Result<ReportJobReply, StoreError> {
+        let job_id = request.job_id.as_str();
+        let name = validate_box(&request.r#box).map_err(|_| StoreError::InvalidBox)?;
+        let attempt = i32::try_from(request.attempt).map_err(|_| StoreError::StaleReport)?;
+        let terminal = validate_terminal(request)?;
+        let mut rows = Vec::with_capacity(request.chunks.len());
+        for chunk in &request.chunks {
+            let seq = i64::try_from(chunk.seq).map_err(|_| StoreError::InvalidChunk)?;
+            if chunk.text.contains('\0') {
+                return Err(StoreError::InvalidChunk);
+            }
+            rows.push((seq, chunk.ts_ms.min(MAX_TS_MS), chunk));
+        }
+        let phase: String = request.phase.chars().take(MAX_PHASE_CHARS).collect();
+        let progress: String = request.progress.chars().take(MAX_PROGRESS_CHARS).collect();
+        let mut tx = self.pool.begin().await?;
+        let row = sqlx::query(REPORT_JOB)
+            .bind(job_id)
+            .bind(attempt)
+            .bind(name.as_str())
+            .bind(&phase)
+            .bind(&progress)
+            .bind(self.lease.as_secs_f64())
+            .bind(terminal.as_ref().map(|t| t.state))
+            .bind(terminal.as_ref().and_then(|t| t.pr_url.as_deref()))
+            .bind(terminal.as_ref().and_then(|t| t.error.as_deref()))
+            .bind(terminal.as_ref().and_then(|t| t.exit_code))
+            .bind(terminal.as_ref().and_then(|t| t.branch.as_deref()))
+            .fetch_optional(&mut *tx)
+            .await?
+            .ok_or(StoreError::StaleReport)?;
+        let lease_ms: Option<i64> = row.try_get("lease_ms")?;
+        let cancel_requested: bool = row.try_get("cancel_requested")?;
+        let stored: i64 = row.try_get("transcript_bytes")?;
+        let mut bytes =
+            usize::try_from(stored).map_err(|_| StoreError::OutOfRange("transcript"))?;
+        let mut truncated: bool = sqlx::query_scalar(TRANSCRIPT_TRUNCATED)
+            .bind(job_id)
+            .fetch_one(&mut *tx)
+            .await?;
+        let mut acked: i64 = sqlx::query_scalar(TRANSCRIPT_MAX_SEQ)
+            .bind(job_id)
+            .fetch_one(&mut *tx)
+            .await?;
+        for (seq, ts_ms, chunk) in rows {
+            acked = acked.max(seq);
+            let known: bool = sqlx::query_scalar(TRANSCRIPT_HAS_SEQ)
+                .bind(job_id)
+                .bind(seq)
+                .fetch_one(&mut *tx)
+                .await?;
+            if known || truncated {
+                continue;
+            }
+            let over = bytes.saturating_add(chunk.text.len()) > MAX_TRANSCRIPT_BYTES;
+            let text = if over { "" } else { chunk.text.as_str() };
+            sqlx::query(INSERT_CHUNK)
+                .bind(job_id)
+                .bind(seq)
+                .bind(i64::try_from(ts_ms).map_err(|_| StoreError::InvalidChunk)?)
+                .bind(text)
+                .bind(over)
+                .execute(&mut *tx)
+                .await?;
+            truncated = over;
+            bytes += text.len();
+        }
+        sqlx::query(SET_TRANSCRIPT_BYTES)
+            .bind(job_id)
+            .bind(i64::try_from(bytes).map_err(|_| StoreError::OutOfRange("transcript"))?)
+            .execute(&mut *tx)
+            .await?;
+        tx.commit().await?;
+        Ok(ReportJobReply {
+            lease_expires_at_ms: ms(lease_ms, "lease")?.unwrap_or_default(),
+            cancel_requested,
+            acked_through_seq: u64::try_from(acked).map_err(|_| StoreError::OutOfRange("seq"))?,
+            transcript_truncated: truncated,
+        })
+    }
+
+    /// Marks every `RUNNING` job whose lease has expired as `LOST` and returns how many.
+    ///
+    /// One statement tests `state = 'RUNNING'` and `lease_expires_at < now()` and sets
+    /// `state`, `finished_at` and the fixed `error` text `lease expired`, so a report that
+    /// renews the lease first wins and a report that arrives after the reap is stale. A
+    /// `LOST` job is never retried: the box may have pushed commits before it vanished.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StoreError::Database`] when the statement fails.
+    pub async fn reap_expired(&self) -> Result<u64, StoreError> {
+        let done = sqlx::query(REAP_EXPIRED).execute(&self.pool).await?;
+        Ok(done.rows_affected())
     }
 
     /// Starts a `REPEATABLE READ`, read only transaction, so every query in it sees one

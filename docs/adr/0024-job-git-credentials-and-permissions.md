@@ -8,7 +8,7 @@ Pushing a branch and opening a pull request need write access to the repo, and A
 
 - **Credential.** A fine-grained personal access token with contents and pull-requests write, scoped to named repos. It lives in `/etc/swarm/secrets.env` beside the other secrets, as `GH_TOKEN`. The first test scopes it to one throwaway repo.
 - **Who sees it.** fleetd's own `git` and `gh` child processes get it through `GIT_ASKPASS` and `GH_TOKEN`. The agent child environment strips `GH_TOKEN`, so the agent cannot read it. The redactor also masks the value in events and transcripts.
-- **Pull request.** `gh pr create --fill --head swarm/<id> --base <base>`, run by fleetd after the push (ADR-0020). The agent never pushes.
+- **Pull request.** `gh pr create --repo <repo> --head <branch> --base <base> --title <tip commit subject, capped> --body "Fleet job <id>"`, run by fleetd after the push (ADR-0020). The agent never pushes.
 - **Branch.** The result branch is `swarm/<job_id>`, the only branch namespace a Box may push (ADR-0016).
 - **Permissions.** fleetd config marks a Box disposable or not. Only a disposable Box runs Jobs with `--dangerously-skip-permissions`. Other Boxes get a configurable permission mode and tool allowlist. Not built: only `disposable` exists.
 - **Targets.** Each Job names its own `repo` and `base_ref`. An allowlist on fleetd (`FLEET_JOB_REPO_ALLOWLIST`) is planned for later and does not exist yet.
