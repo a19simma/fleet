@@ -117,6 +117,43 @@ async fn rejects_oversized_input_and_bad_event_names() {
 
 type TestResult = Result<(), Box<dyn std::error::Error>>;
 
+/// Reads one full HTTP request (headers plus `Content-Length` body) from `stream`.
+async fn read_request(
+    stream: &mut (impl AsyncReadExt + Unpin),
+) -> Result<(), Box<dyn std::error::Error>> {
+    let mut seen = Vec::new();
+    let mut buf = [0u8; 4096];
+    loop {
+        if let Some(end) = seen.windows(4).position(|w| w == b"\r\n\r\n") {
+            let head = String::from_utf8_lossy(seen.get(..end).unwrap_or_default()).to_lowercase();
+            let length = head
+                .lines()
+                .find_map(|line| line.strip_prefix("content-length:"))
+                .and_then(|value| value.trim().parse::<usize>().ok())
+                .unwrap_or(0);
+            if seen.len() >= end + 4 + length {
+                return Ok(());
+            }
+        }
+        let n = stream.read(&mut buf).await?;
+        if n == 0 {
+            return Err("peer closed before the request was complete".into());
+        }
+        seen.extend_from_slice(buf.get(..n).unwrap_or_default());
+    }
+}
+
+/// Reads the whole request, writes `status_line`, then closes the write side cleanly.
+async fn answer(
+    stream: &mut (impl AsyncReadExt + AsyncWriteExt + Unpin),
+    status_line: &[u8],
+) -> Result<(), Box<dyn std::error::Error>> {
+    read_request(stream).await?;
+    stream.write_all(status_line).await?;
+    stream.shutdown().await?;
+    Ok(())
+}
+
 async fn counting_tcp(
     status_line: &'static str,
 ) -> Result<(u16, Arc<AtomicUsize>), Box<dyn std::error::Error>> {
@@ -130,9 +167,7 @@ async fn counting_tcp(
                 break;
             };
             seen.fetch_add(1, Ordering::SeqCst);
-            let mut buf = [0u8; 4096];
-            let _ = stream.read(&mut buf).await;
-            let _ = stream.write_all(status_line.as_bytes()).await;
+            let _ = answer(&mut stream, status_line.as_bytes()).await;
         }
     });
     Ok((port, count))
@@ -150,11 +185,11 @@ async fn a_unix_500_is_final_and_sends_no_tcp_request() -> TestResult {
             let Ok((mut stream, _)) = sock.accept().await else {
                 break;
             };
-            let mut buf = [0u8; 4096];
-            let _ = stream.read(&mut buf).await;
-            let _ = stream
-                .write_all(b"HTTP/1.1 500 Internal Server Error\r\nContent-Length: 0\r\n\r\n")
-                .await;
+            let _ = answer(
+                &mut stream,
+                b"HTTP/1.1 500 Internal Server Error\r\nContent-Length: 0\r\n\r\n",
+            )
+            .await;
         }
     });
     let result = forward_hook(&config, "SessionStart", PAYLOAD.as_bytes()).await;
