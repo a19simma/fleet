@@ -1,6 +1,6 @@
 # Event model and delivery
 
-Status: Accepted
+Status: Accepted. The one-stream and cumulative-ack parts of Order and Dedupe are superseded by ADR-0018.
 
 Events come from four sources on a Box and must reach the Fleet server across laptop sleep, server restarts and network gaps. The server must be able to drop repeats without losing anything.
 

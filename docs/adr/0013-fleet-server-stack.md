@@ -1,6 +1,6 @@
 # Fleet server stack
 
-Status: Accepted
+Status: Accepted. The monthly partitioning of `events` and its partition-drop retention are superseded by ADR-0019.
 
 Fleet state must outlive the laptop's sleep and any single Box. The deployment stack is Rust with tonic, Kubernetes and Argo CD.
 

@@ -8,6 +8,8 @@ pub enum Error {
     InvalidId(String),
     /// A hook body is not a JSON object.
     NotAnObject,
+    /// A box name is not `box-` followed by one or more ASCII digits.
+    InvalidBoxName(String),
 }
 
 impl fmt::Display for Error {
@@ -15,6 +17,7 @@ impl fmt::Display for Error {
         match self {
             Self::InvalidId(raw) => write!(f, "invalid event id: {raw:?}"),
             Self::NotAnObject => write!(f, "hook body is not a JSON object"),
+            Self::InvalidBoxName(raw) => write!(f, "invalid box name: {raw:?}"),
         }
     }
 }

@@ -1,8 +1,8 @@
 # Plan: fleetd and the fleet server
 
-Status: draft. Phase 1 is in: the listeners, the SQLite queue and the hook normalizer. The pueue callback, forwarder, reconciler, watchers and heartbeat are not built. ADRs 0011 to 0017 are Accepted (2026-10-24). Decisions answered on 2026-10-24 are marked Decided below. Phase 0 finished on 2026-10-24: all ten tests ran on one Box (Claude Code 2.1.289, workmux 0.1.276, pueue 4.0.4). The results are folded in below. The records are `docs/phase0/T1.md` to `T10.md` in this repo, indexed by `docs/phase0/README.md`.
+Status: draft. Phase 1 is in: the listeners, the SQLite queue and the hook normalizer. The pueue callback, forwarder, reconciler, watchers and heartbeat are not built. The server is built (step 3): the `fleet.v1` proto, `FleetIngest`, `FleetQuery.ListFleet`, the Postgres store with the session projection, bearer auth, migrations at start and `GET /healthz`. ADRs 0011 to 0019 are Accepted (2026-10-24). Decisions answered on 2026-10-24 are marked Decided below. Phase 0 finished on 2026-10-24: all ten tests ran on one Box (Claude Code 2.1.289, workmux 0.1.276, pueue 4.0.4). The results are folded in below. The records are `docs/phase0/T1.md` to `T10.md` in this repo, indexed by `docs/phase0/README.md`.
 
-v1 cut and recovery design added 2026-10-24 (see v1 cut). ADRs 0011 to 0017 flipped to Accepted on 2026-10-24.
+v1 cut and recovery design added 2026-10-24 (see v1 cut). ADRs 0011 to 0017 flipped to Accepted on 2026-10-24. ADR-0018 (ingest protocol) and ADR-0019 (events storage) were added and Accepted the same day. They supersede the stream and ack parts of ADR-0012, the monthly-partition line of ADR-0013 and the forwarder section below.
 
 Network stance: the Fleet server is a hosted service reached over a VPN or any routable path, for example Tailscale or netbird. Tailscale is not a hard dependency. Nothing in fleetd, the server, the proto, the CLI or the ADRs depends on one VPN product. The server address is plain config and a VPN switch is a config change plus an ADR note. In the existing setup a VPN carries only ssh access to Boxes and Template provisioning, which are separate from fleet traffic.
 
@@ -157,13 +157,15 @@ Rules:
 - `SessionStart` cannot use an http hook: Claude Code accepts only `command` and `mcp_tool` hooks for it. The managed settings run `fleetd hook SessionStart`, which reads the stdin payload and POSTs it to the same `/hook/SessionStart` route over the unix socket, else loopback. It exits 0 on every failure. The other events stay http.
 - The same event can arrive once per settings source (T4). The hook lives only in managed settings, and fleetd also drops an exact repeat of a body seen in the last 10 s (proposed window).
 
+On the wire (`fleet.v1`, ADR-0018) the envelope has `id` for `event_id`, `kind` for `type`, `ts_ms` for the capture time and `occurred_at_ms`, and carries the payload as the string `payload_json`. `seq` travels beside it in `QueuedEvent`. `job_id` is not in the v1 envelope.
+
 Heartbeat and the box snapshot are state, not events. They go through the unary `Heartbeat` call, not the queue.
 
 ### Delivery
 
 - **At least once.** fleetd deletes a queued event only after the server acks it. A crash between send and ack resends. The guarantee starts at fleetd. Claude Code logs a failed http hook at ERROR, and the debug log shows a single attempt (T8), so treat it as not retried: a hook event fired while fleetd is down is lost. The workmux watcher, the pueue reconcile and a transcript read cover the gap.
-- **Dedupe.** Server primary key on `event_id`, plus unique `(box, boot_id, seq)`. Insert is `ON CONFLICT DO NOTHING`. Ack is idempotent.
-- **Ordering.** Per box, by `(boot_id, seq)`. fleetd sends in seq order on one stream and the server acks a cumulative high-water mark per `(box, boot_id)`. Across boxes there is no order. `occurred_at` is for display and can skew.
+- **Dedupe.** Server primary key `(box, id)`, with a non-unique index on `(box, boot_id, seq)`. Insert is `ON CONFLICT (box, id) DO NOTHING`. Ack is idempotent (ADR-0018). The id is a dedupe key, not a security boundary, so the FNV derived ids stay.
+- **Ordering.** Per box, by `(boot_id, seq)`. fleetd sends batches in seq order, and the server projects the new rows of a batch in seq order. Each unary reply acks the batch through its highest `seq`. Across boxes there is no order. `occurred_at` is for display and can skew.
 - **Derived ids.** Watcher events hash `(source, box, boot_id, natural key)`, for example `(state file path, status_ts)`. A watcher restart emits the same ids and the server drops the repeats. workmux writes a repeat `working` with an unchanged `status_ts` (T5), which hashes to the same id. `agent_crashed` and `agent_gone` hash `(pane id, last status_ts)`, so a race between `workmux wait`, the DELETE event and the liveness check emits one event.
 - **Backpressure.** A full queue drops the lowest priority events first (tool events, then `workmux.status_changed` duplicates) and emits `fleetd.queue_overflow` with the count. `job.result`, `pueue.task_finished` and hook `stop` and `session_end` are never dropped before others.
 
@@ -223,10 +225,10 @@ SQLite in WAL mode at `/var/lib/fleetd/queue.db` (systemd `StateDirectory=fleetd
 
 ### Forwarder
 
-- One long-lived bidirectional `PushEvents` stream. Batches of up to 100 events or 256 KiB or 500 ms.
-- Retry with exponential backoff, 1 s doubling to a 5 min cap, full jitter. Reset on first ack.
-- On connect fleetd sends `Hello` with box identity claim, boot id, fleetd version, last acked seq. The server replies with its high-water mark so fleetd skips events already stored.
-- Stream-level keepalive 20 s. A stalled stream is dropped after 60 s without an ack.
+- Unary `PushEvents` calls (ADR-0018). Batches of up to 100 events or 256 KiB or 500 ms, one box per batch.
+- A reply acks the batch through `acked_through_seq`. fleetd deletes those queued events, including any listed in `rejected`, which would never succeed.
+- Retry with exponential backoff, 1 s doubling to a 5 min cap, full jitter. Reset on first ack. `InvalidArgument` is not retried.
+- No `Hello` and no server high-water mark. After a gap fleetd resends from its queue and the server dedupes on `(box, id)`.
 
 ### workmux watcher
 
@@ -313,23 +315,53 @@ The directives live in `deploy/fleetd.service`. Hardening: `NoNewPrivileges`, `P
 
 ### Upgrade path
 
-Bake into the Template at a pinned version, checksummed. A new fleetd is a Template rebuild plus re-created Boxes. Iteration shortcut for development only: `scp` a binary to one Box and `systemctl restart fleetd`, lost at the next re-create. Protocol compatibility: `schema_version` on events and a `Hello` version check, server supports N and N-1, so Boxes of mixed vintage coexist during a rolling re-create.
+Bake into the Template at a pinned version, checksummed. A new fleetd is a Template rebuild plus re-created Boxes. Iteration shortcut for development only: `scp` a binary to one Box and `systemctl restart fleetd`, lost at the next re-create. Protocol compatibility: `schema_version` on events, server supports N and N-1, so Boxes of mixed vintage coexist during a rolling re-create.
 
 ## gRPC API sketch
 
-Package `fleet.v1`. Proto outline only.
+Package `fleet.v1`. `crates/fleet-proto/proto/fleet/v1/fleet.proto` holds the v1 subset below, which is built. The second block is the later sketch and is not in the proto yet.
 
 ```proto
 service FleetIngest {
-  rpc PushEvents(stream EventBatch) returns (stream Ack);
-  rpc Heartbeat(BoxState) returns (HeartbeatReply);
+  rpc PushEvents(PushEventsRequest) returns (PushEventsReply);
+  rpc Heartbeat(HeartbeatRequest) returns (HeartbeatReply);
+}
+
+service FleetQuery {
+  rpc ListFleet(ListFleetRequest) returns (ListFleetReply);
+}
+
+message Envelope { string id; uint32 schema_version; string box; string hostname; string machine_id;
+  string boot_id; string source; string kind; uint64 ts_ms; optional string session_id;
+  optional string prompt_id; optional string workdir; optional uint64 occurred_at_ms; string payload_json; }
+message QueuedEvent { uint64 seq; Envelope envelope; }
+message PushEventsRequest { repeated QueuedEvent events; }
+message PushEventsReply { uint64 acked_through_seq; uint32 stored; uint32 duplicate; repeated Rejection rejected; }
+message Rejection { uint64 seq; string reason; }
+message HeartbeatRequest { string box; string hostname; string machine_id; string boot_id; string fleetd_version;
+  uint64 uptime_s; uint64 queue_pending; uint64 queue_oldest_age_s; optional uint64 last_ack_age_s; }
+message HeartbeatReply { uint32 next_in_s; }
+message ListFleetRequest { optional string box; }
+message ListFleetReply { uint64 as_of_ms; repeated BoxView boxes; }
+message BoxView { string box; string hostname; BoxStatus status; optional uint64 heartbeat_age_s; string boot_id;
+  string fleetd_version; uint64 queue_pending; uint64 queue_oldest_age_s; repeated SessionView sessions; }
+message SessionView { string session_id; string kind; SessionState state; uint64 state_age_s; optional string workdir;
+  optional string last_prompt; optional string last_message; uint64 last_event_age_s; }
+enum BoxStatus { BOX_STATUS_UNSPECIFIED = 0; BOX_STATUS_UNKNOWN = 1; BOX_STATUS_LIVE = 2; BOX_STATUS_STALE = 3; BOX_STATUS_LOST = 4; }
+enum SessionState { SESSION_STATE_UNSPECIFIED = 0; SESSION_STATE_ACTIVE = 1; SESSION_STATE_WORKING = 2;
+  SESSION_STATE_IDLE = 3; SESSION_STATE_STALLED = 4; SESSION_STATE_ENDED = 5; SESSION_STATE_CRASHED = 6; }
+```
+
+Later, out of v1:
+
+```proto
+service FleetIngest {
   rpc ClaimJob(ClaimRequest) returns (ClaimReply);
   rpc RenewLease(RenewRequest) returns (RenewReply);
   rpc ReportJob(JobReport) returns (JobReportReply);
 }
 
 service FleetQuery {
-  rpc ListFleet(ListFleetRequest) returns (FleetView);
   rpc GetPreview(PreviewRequest) returns (Preview);
   rpc ListEvents(ListEventsRequest) returns (stream Event);
   rpc Watch(WatchRequest) returns (stream FleetUpdate);
@@ -343,23 +375,15 @@ service FleetJobs {
   rpc SetDrain(SetDrainRequest) returns (BoxView);
 }
 
-message Envelope { string event_id; uint32 schema_version; string box; string hostname; string machine_id;
-  string boot_id; uint64 seq; string source; string type; Timestamp occurred_at;
-  Timestamp captured_at; string session_id; string job_id; string workdir; Struct payload; }
-message EventBatch { Hello hello; repeated Envelope events; }
-message Ack { string boot_id; uint64 high_water_seq; }
-message BoxState { string boot_id; string fleetd_version; uint64 queue_pending; Duration queue_oldest;
-  repeated SessionState sessions; repeated TaskState tasks; repeated string running_job_ids;
-  bool draining; uint32 unpushed_commits; Health health; }
-message HeartbeatReply { bool drain; Duration next_in; }
 message ClaimRequest { string boot_id; uint32 free_slots; }
 message ClaimReply { Job job; Duration lease; }
 message Job { string job_id; string prompt; string repo; string base_ref; string result_branch;
   JobState state; string box; uint32 attempt; Timestamp lease_expires_at; JobResult result; }
 enum JobState { QUEUED = 0; CLAIMED = 1; RUNNING = 2; SUCCEEDED = 3; FAILED = 4; CANCELLED = 5; LOST = 6; }
 ```
+```
 
-The service split lets auth differ per service: all three services take the same shared bearer token for the proof of concept (decided 2026-10-24). The split stays in the proto so a separate read credential can be added later without an API change.
+The service split lets auth differ per service: every service takes the same shared bearer token for the proof of concept (decided 2026-10-24). The built server wraps `FleetIngest` and `FleetQuery` in one `BearerAuth` interceptor. The split stays in the proto so a separate read credential can be added later without an API change.
 
 ### Auth between box and server
 
@@ -375,16 +399,15 @@ Downsides: one leaked token exposes the fleet, and every Box holds it. Rotation 
 
 | Table | Key columns | Notes |
 |---|---|---|
-| `boxes` | `box` pk, `hostname`, `machine_id`, `first_seen`, `last_seen`, `status`, `boot_id`, `fleetd_version`, `draining`, `state jsonb` | `state` is the latest `BoxState`. Updated by heartbeat |
-| `box_boots` | `(box, boot_id)` pk, `started_at`, `high_water_seq` | Ingest cursor |
-| `events` | `event_id` pk, `(box, boot_id, seq)` unique, `source`, `type`, `occurred_at`, `received_at`, `session_id`, `job_id`, `payload jsonb` | Partitioned monthly on `received_at` |
-| `sessions` | `(box, session_key)` pk, `kind` (interactive or job), `status`, `status_ts`, `workdir`, `window_name`, `agent_session_id`, `prompt`, `last_message`, `last_event_at` | Projection from events and snapshots |
+| `boxes` | `box` pk, `hostname`, `machine_id`, `boot_id`, `fleetd_version`, `first_seen_at`, `last_event_at`, `last_heartbeat_at`, `state jsonb` | Built. `state` holds the queue figures of the latest heartbeat. Status is computed on read, not stored (ADR-0019). `draining` comes with drain |
+| `events` | `(box, id)` pk, `boot_id`, `seq`, `schema_version`, `source`, `kind`, `captured_at_ms`, `occurred_at_ms`, `received_at`, `session_id`, `prompt_id`, `workdir`, `payload jsonb` | Built. Not partitioned (ADR-0019). `job_id` is not a column yet |
+| `sessions` | `(box, session_id)` pk, `kind`, `state`, `state_at`, `workdir`, `last_prompt`, `last_message`, `last_notification`, `last_event_at`, `last_event_kind` | Built. Projection from new events, in the ingest transaction |
 | `jobs` | `job_id` pk, `idempotency_key` unique, `prompt`, `repo`, `base_ref`, `result_branch`, `state`, `box`, `attempt`, `max_attempts`, `priority`, `lease_expires_at`, `created_at`, `claimed_at`, `finished_at`, `cost_usd`, `result jsonb` | Queue and history in one table |
 | `job_attempts` | `(job_id, attempt)` pk, `box`, `boot_id`, `pueue_task_id`, `started_at`, `ended_at`, `outcome` | One row per claim |
 
-Indexes: `events(box, received_at desc)`, `events(session_id)`, `events(job_id)`, partial index `jobs(priority desc, created_at) where state='queued'`.
+Indexes: built are `events(box, boot_id, seq)`, `events(box, received_at desc)` and partial `events(session_id) where session_id is not null`. Later: `events(job_id)` and partial `jobs(priority desc, created_at) where state='queued'`.
 
-Retention (proposed): `events` 30 days, tool-event types 7 days, dropped by partition. `jobs` and `job_attempts` 1 year. `boxes` and `sessions` kept, `sessions` older than 90 days pruned. Prompts and last messages are stored, so the database is sensitive data (see security).
+Retention (proposed, ADR-0019): `events` 30 days, tool-event types 7 days, removed by `DELETE`, since the table is not partitioned. No job runs the delete yet. `jobs` and `job_attempts` 1 year. `boxes` and `sessions` kept, `sessions` older than 90 days pruned (not built). Prompts and last messages are stored, so the database is sensitive data (see security).
 
 Projections update in the same transaction as the event insert. The change feed for `Watch` uses `LISTEN/NOTIFY` so more than one server replica works.
 
@@ -574,7 +597,7 @@ Numbering continues the list above. All Decided 2026-10-24.
 
 ## ADRs
 
-All Accepted on 2026-10-24. Index and status in `docs/adr/README.md`.
+All Accepted on 2026-10-24, 0011 to 0019. Index and status in `docs/adr/README.md`.
 
 | ADR | Title | Relation |
 |---|---|---|
@@ -585,6 +608,8 @@ All Accepted on 2026-10-24. Index and status in `docs/adr/README.md`.
 | 0015 | Fleet reads from the server | Replaces the ssh polling and preview parts of the existing picker. Picker, line formats and connect stay |
 | 0016 | Job queue, claim and lease | New, parked sketch. Leaves manual scale-down in force |
 | 0017 | Public repo and mise distribution | New. The pinned fleetd comes from a public release through mise. Licence Apache-2.0 |
+| 0018 | Ingest protocol | New. Unary `PushEvents`, per-batch ack. Supersedes the stream and ack parts of 0012 and the forwarder section of this plan |
+| 0019 | Events storage | New. Unpartitioned `events`, delete-based retention, box status computed on read. Supersedes the monthly-partition line of 0013 |
 
 Relation to the existing setup: the ssh polling in the picker conflicts with ADR-0015, hence the partial replacement. The existing design deferred `fleet-job` to its first phase. This plan builds it in Phase 3 of the fleetd rollout, which still fits. A pending check on the `workmux status --json` schema is absorbed by T5. Workers use the full global config, so hooks in the baked `settings.json` fire on the Box. Workmux hooks failing harmlessly on a Box is a pre-existing item and is orthogonal.
 
@@ -596,6 +621,11 @@ Terms used in this plan:
 - **Fleet server**: the hosted service that stores events and Box snapshots.
 - **Event**: one record in the envelope of ADR-0012.
 - **Box snapshot**: the latest heartbeat state of a Box, kept on the Fleet server (ADR-0012).
+- **Box status**: `UNKNOWN`, `LIVE`, `STALE` or `LOST`, computed on read from the heartbeat age: none, under 90 s, under 10 min, beyond (ADR-0019).
+- **Session state**: `active`, `working`, `idle`, `stalled`, `ended` or `crashed`, projected from events (ADR-0019). `crashed` is in the proto and no event sets it yet.
+- **Ack**: the reply to one `PushEvents` call. `acked_through_seq` covers every event in the batch, stored, duplicate or rejected (ADR-0018).
+- **Rejected event**: an event the server refused on its own merits, such as an unparseable payload. It is listed in the reply, acked and never retried.
+- **Inflight**: queued events fleetd has sent in a batch and not yet seen acked. They stay in the disk queue until the ack.
 - **Lease**: the time-limited claim a Box holds on a queued Job (ADR-0016).
 - Job states are defined in ADR-0016 and stay parked with the queue seam.
 
@@ -604,13 +634,15 @@ Terms used in this plan:
 - Rename `Queue` to `Store`, with free-function `events` and `registry` modules over `&mut SqliteConnection` and `sqlx::migrate!`, before the registry lands.
 - Replace the task set with a Supervisor that tracks per-task progress heartbeats for the watchdog.
 - Flatten `Identity` into `Envelope`.
-- Choose a collision-resistant hash (blake3 or sha2) before derived ids persist.
+- Closed: the FNV derived ids stay. The id is a dedupe key within one box, not a security boundary (ADR-0018).
 - Split `Error` into `ParseIdError` and `NotAnObject`.
 - Add an `EVENT_FIELDS` table to the normalizer.
 - Build the image through a dist `github-custom-jobs` workflow_call, or ship a dist-built fleet-server archive.
 - SHA-pin actions and base images, split the push job so `packages:write` applies to tags only, and attest provenance.
 - Add `scripts/private-scan`.
 - Add an auth header to the hook endpoint.
+- Moved from the server build: schedule the delete-based retention of `events` and the pruning of old `sessions` (ADR-0019).
+- Moved from the server build: no TLS on the gRPC listener, which serves h2c and relies on the network path (ADR-0013, ADR-0014).
 - Dedupe raw against normalized payload size.
 - Fail closed on redaction when the secrets file is missing.
 - Redact encoded variants of secrets.

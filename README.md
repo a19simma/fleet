@@ -6,7 +6,7 @@ Fleet shows what every agent box is doing and whether anything died. It has thre
 - `fleet-server`: the hosted service that stores box state.
 - `fleet`: the command line client.
 
-Status: pre-alpha. `fleetd` accepts Claude Code hooks on loopback and local events on a unix socket, normalizes and redacts them, and queues them in SQLite. It does not forward them yet. `fleet list` is a stub. `fleet-server` prints its version.
+Status: pre-alpha. `fleetd` accepts Claude Code hooks on loopback and local events on a unix socket, normalizes and redacts them, and queues them in SQLite. It does not forward them yet. `fleet list` is a stub. `fleet-server` serves `FleetIngest` (`PushEvents`, `Heartbeat`) and `FleetQuery.ListFleet` over gRPC on Postgres, with a bearer token, and `GET /healthz`. Settings are `FLEET_DATABASE_URL`, `FLEET_TOKEN`, `FLEET_LISTEN` and `FLEET_HEALTH_LISTEN`.
 
 ## Install
 
@@ -39,6 +39,17 @@ cargo build --release --workspace
 ```
 
 Binaries land in `target/release/`.
+
+## Test
+
+The `fleet-server` store tests need a Postgres superuser URL in `DATABASE_URL`. `#[sqlx::test]` creates one database per test from it, and a test fails when the variable is missing. `compose.test.yaml` starts a matching `postgres:17`:
+
+```sh
+docker compose -f compose.test.yaml up -d --wait
+export DATABASE_URL=postgres://postgres:postgres@localhost:5432/postgres
+cargo test --workspace
+docker compose -f compose.test.yaml down
+```
 
 ## Run
 
