@@ -148,10 +148,10 @@ pub async fn enforce_caps(
 
 /// Adds `count` dropped events to the overflow marker.
 ///
-/// The newest `fleetd.queue_overflow` row is updated in place, so the queue holds at most
-/// one. A marker that was already sent and acked is gone, and the next drops create a new
-/// row with a higher `seq`. A count merged into a marker after that marker was peeked is
-/// lost when its ack deletes the row.
+/// The newest `fleetd.queue_overflow` row is updated in place while it has not been
+/// peeked, so the queue holds at most one unpeeked marker. A marker at or below the
+/// highest peeked `seq` may be in flight and is never changed: the next drops create a new
+/// row with a higher `seq`, so their count survives the ack of the old one.
 async fn record_overflow(
     conn: &mut SqliteConnection,
     template: &Envelope,
@@ -161,7 +161,8 @@ async fn record_overflow(
     let merged = sqlx::query(
         "UPDATE events SET payload = json_set(payload, '$.payload.dropped',
              COALESCE(json_extract(payload, '$.payload.dropped'), 0) + ?)
-         WHERE seq = (SELECT MAX(seq) FROM events WHERE kind = ?)",
+         WHERE seq = (SELECT MAX(seq) FROM events WHERE kind = ?)
+           AND seq > (SELECT peeked_seq FROM queue_state WHERE id = 1)",
     )
     .bind(signed(count))
     .bind(OVERFLOW_KIND)
@@ -301,8 +302,9 @@ pub async fn count(conn: &mut SqliteConnection) -> Result<u64, Error> {
 /// Returns up to `limit_count` rows in `seq` order and at most `limit_bytes` of stored
 /// envelope bytes. The batch stops at the first row that would cross the byte limit, which
 /// keeps `seq` order, but holds one row whenever the queue is not empty, so an event larger
-/// than the limit still gets sent alone. Rows keep no delivery state: the caller sends the
-/// batch and then calls [`ack_through`] with the highest `seq` the server acknowledged.
+/// than the limit still gets sent alone. The highest returned `seq` is recorded as the
+/// peeked head. The caller sends the batch and then calls [`ack_through`] with the highest
+/// `seq` the server acknowledged.
 ///
 /// # Errors
 ///
@@ -329,19 +331,30 @@ pub async fn peek(
         total = total.saturating_add(bytes);
         batch.push(queued(row)?);
     }
+    if let Some(top) = batch.last() {
+        sqlx::query("UPDATE queue_state SET peeked_seq = MAX(peeked_seq, ?) WHERE id = 1")
+            .bind(top.seq)
+            .execute(&mut *conn)
+            .await?;
+    }
     Ok(batch)
 }
 
-/// Deletes every row with `seq <= seq`. Rows that cap enforcement already evicted are
-/// simply absent, so a stale ack does nothing. Returns the number of rows deleted.
+/// Deletes every row with `seq <= min(seq, highest peeked seq)`.
+///
+/// An ack above the peeked head never reaches rows that were not sent. Rows that cap enforcement already evicted
+/// are simply absent, so a stale ack does nothing. Returns the number of rows deleted.
 ///
 /// # Errors
 ///
 /// Fails when the statement fails.
 pub async fn ack_through(conn: &mut SqliteConnection, seq: i64) -> Result<u64, Error> {
-    let done = sqlx::query("DELETE FROM events WHERE seq <= ?")
-        .bind(seq)
-        .execute(&mut *conn)
-        .await?;
+    let done = sqlx::query(
+        "DELETE FROM events
+         WHERE seq <= MIN(?, (SELECT peeked_seq FROM queue_state WHERE id = 1))",
+    )
+    .bind(seq)
+    .execute(&mut *conn)
+    .await?;
     Ok(done.rows_affected())
 }

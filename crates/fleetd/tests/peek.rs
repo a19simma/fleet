@@ -122,6 +122,7 @@ async fn ack_through_removes_the_range_and_is_idempotent() {
     let dir = TempDir::new().unwrap();
     let store = open(&dir, BIG).await;
     let stored = fill(&store, "hook.stop", 4, 10).await;
+    store.peek(4, u64::MAX).await.unwrap();
     assert_eq!(store.ack_through(stored[1]).await.unwrap(), 2);
     let rows = store.list(None).await.unwrap();
     assert_eq!(seqs(&rows), stored[2..].to_vec());
@@ -215,4 +216,62 @@ async fn evicting_a_peeked_row_is_harmless() {
     let rest = store.list(None).await.unwrap();
     assert!(rest.iter().all(|row| row.seq > top));
     assert!(rest.iter().any(|row| row.kind == "hook.stop"));
+}
+
+#[tokio::test]
+async fn ack_above_the_peeked_head_deletes_nothing_extra() {
+    let dir = TempDir::new().unwrap();
+    let store = open(&dir, BIG).await;
+    let stored = fill(&store, "hook.stop", 5, 10).await;
+    let batch = store.peek(2, u64::MAX).await.unwrap();
+    assert_eq!(seqs(&batch), stored[..2].to_vec());
+    assert_eq!(store.ack_through(i64::MAX).await.unwrap(), 2);
+    assert_eq!(seqs(&store.list(None).await.unwrap()), stored[2..].to_vec());
+}
+
+#[tokio::test]
+async fn ack_without_a_peek_deletes_nothing() {
+    let dir = TempDir::new().unwrap();
+    let store = open(&dir, BIG).await;
+    fill(&store, "hook.stop", 3, 10).await;
+    assert_eq!(store.ack_through(i64::MAX).await.unwrap(), 0);
+    assert_eq!(store.count().await.unwrap(), 3);
+}
+
+#[tokio::test]
+async fn overflow_after_a_peek_inserts_a_new_marker_and_the_count_survives_the_ack() {
+    let dir = TempDir::new().unwrap();
+    let probe = serde_json::to_string(&envelope("hook.stop", 400))
+        .unwrap()
+        .len() as u64;
+    let store = open(
+        &dir,
+        Limits {
+            max_bytes: probe * 5,
+            ..BIG
+        },
+    )
+    .await;
+    push(&store, "hook.stop", 1, 400).await;
+    push(&store, "hook.pre_tool_use", 8, 400).await;
+    let first = marker_counts(&store.list(None).await.unwrap());
+    assert_eq!(first.len(), 1);
+
+    let batch = store.peek(100, u64::MAX).await.unwrap();
+    let top = *seqs(&batch).last().unwrap();
+    assert!(marker_counts(&batch).iter().any(|m| m.0 == first[0].0));
+
+    push(&store, "hook.pre_tool_use", 4, 400).await;
+    let during = marker_counts(&store.list(None).await.unwrap());
+    let fresh: Vec<_> = during.iter().filter(|m| m.0 > top).collect();
+    assert_eq!(fresh.len(), 1);
+    let kept = fresh[0].1;
+    assert!(kept > 0);
+    let old = during.iter().find(|m| m.0 == first[0].0);
+    assert_eq!(old.map(|m| m.1), Some(first[0].1));
+
+    store.ack_through(top).await.unwrap();
+    let after = marker_counts(&store.list(None).await.unwrap());
+    assert_eq!(after.len(), 1);
+    assert_eq!(after[0].1, kept);
 }

@@ -190,7 +190,9 @@ impl Store {
         events::peek(&mut conn, limit_count, limit_bytes).await
     }
 
-    /// Deletes every event with `seq <= seq`. Returns how many were deleted.
+    /// Deletes every event with `seq` at or below both `seq` and the highest peeked `seq`.
+    ///
+    /// Returns how many were deleted.
     ///
     /// # Errors
     ///
