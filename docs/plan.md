@@ -1,6 +1,6 @@
 # Plan: fleetd and the fleet server
 
-Status: draft. Phase 1 is in: the listeners, the SQLite queue and the hook normalizer. The pueue callback, forwarder, reconciler, watchers and heartbeat are not built. The server is built (step 3): the `fleet.v1` proto, `FleetIngest`, `FleetQuery.ListFleet`, the Postgres store with the session projection, bearer auth, migrations at start and `GET /healthz`. ADRs 0011 to 0019 are Accepted (2026-10-24). Decisions answered on 2026-10-24 are marked Decided below. Phase 0 finished on 2026-10-24: all ten tests ran on one Box (Claude Code 2.1.289, workmux 0.1.276, pueue 4.0.4). The results are folded in below. The records are `docs/phase0/T1.md` to `T10.md` in this repo, indexed by `docs/phase0/README.md`.
+Status: draft. Phase 1 is in: the listeners, the SQLite queue and the hook normalizer. The pueue callback, forwarder, reconciler, watchers and heartbeat are not built. The server is built (step 3): the `fleet.v1` proto, `FleetIngest`, `FleetQuery.ListFleet`, the Postgres store with the session projection, bearer auth, migrations at start and `GET /healthz`. Decisions answered on 2026-10-24 are marked Decided below. Phase 0 finished on 2026-10-24: all ten tests ran on one Box (Claude Code 2.1.289, workmux 0.1.276, pueue 4.0.4). The results are folded in below. The records are `docs/phase0/T1.md` to `T10.md` in this repo, indexed by `docs/phase0/README.md`.
 
 v1 cut and recovery design added 2026-10-24 (see v1 cut). ADRs 0011 to 0017 flipped to Accepted on 2026-10-24. ADR-0018 (ingest protocol) and ADR-0019 (events storage) were added and Accepted the same day. They supersede the stream and ack parts of ADR-0012, the monthly-partition line of ADR-0013 and the forwarder section below.
 
@@ -295,7 +295,7 @@ Rules:
 - Rows in `ended` or `crashed` older than 30 days are pruned.
 - Poll cadences differ by cost. pueue stays at 5 s and `workmux status` at 10 s, since both are one process call. The transcript pass stats files only.
 - systemd runs `Restart=always`, `RestartSec=2`, `WatchdogSec=60`. fleetd sends `WATCHDOG=1` from a supervisor task only when the listener, the forwarder and the reconcile loop each made progress in the last 30 s, so a wedged loop restarts the daemon.
-- The server marks a Box `stale` after 90 s and `lost` after 10 min without a heartbeat. A server sweeper task sets the status, since missing heartbeats are not events.
+- The server marks a Box `stale` after 90 s and `lost` after 10 min without a heartbeat. Superseded by ADR-0019: the server derives the status at read time from the last heartbeat, and no sweeper task runs.
 
 ### Health and self-report
 
@@ -389,7 +389,7 @@ The service split lets auth differ per service: every service takes the same sha
 
 Decided (2026-10-24, ADR-0014): a shared bearer token for the proof of concept. fleetd sends gRPC metadata `authorization: Bearer <token>`. The token is `FLEET_TOKEN` in `/etc/swarm/secrets.env`, mode 0640 `root:agent` (the existing secrets pattern), sourced from `~/.config/fleet/token` on the laptop and baked like the other secrets. fleetd's redaction covers it. The server compares in constant time and answers `UNAUTHENTICATED` on a mismatch. It rejects a `box` that does not match `box-<n>`.
 
-Verified in Phase 0 (T7), with a throwaway python grpcio 1.84.1 server on loopback, plain, no TLS: no token and a wrong token both give `UNAUTHENTICATED`, and the right token gives OK, from a python client and from grpcurl 1.9.4. The metadata key must be lowercase `authorization`. The secrets file at 0640 `root:agent` is readable by `agent` and denied to `nobody`. The interceptor must wrap every service, because it also blocks gRPC reflection: `grpcurl` without `-proto` fails at reflection without a token. Behind the interceptor reflection leaks nothing, so it may stay on. Not run: a tonic client, TLS, and a real VPN path (Phase 1 pre-check).
+Verified in Phase 0 (T7), with a throwaway python grpcio 1.84.1 server on loopback, plain, no TLS: no token and a wrong token both give `UNAUTHENTICATED`, and the right token gives OK, from a python client and from grpcurl 1.9.4. The metadata key must be lowercase `authorization`. The secrets file at 0640 `root:agent` is readable by `agent` and denied to `nobody`. The interceptor must wrap every service, because it also blocks gRPC reflection: `grpcurl` without `-proto` fails at reflection without a token. Behind the interceptor reflection leaks nothing, so it may stay on. fleet-server does not serve reflection yet; use `-proto` with grpcurl. Not run: a tonic client, TLS, and a real VPN path (Phase 1 pre-check).
 
 Identity comes from the Box (configured name, hostname, machine-id, boot id), never from the VPN. A valid token proves swarm membership, not which Box, so box names are claims.
 
@@ -493,7 +493,7 @@ Parked sketch, no further design: KEDA is driven through the server. fleetd on t
 | `claude -p` started from a script on stdin | It swallows the script from stdin | `fleet-job` redirects stdin from `/dev/null` |
 | Hook event lost while fleetd is down | A session exists with no `session_start`, `stop` or `session_end` | Registry discovery emits `session.discovered`, `session.stalled` or `session.ended_unseen` with `source=reconcile`. Payloads are not recovered, only state and the last assistant text |
 | fleetd wedged but alive | No events, no restart | `WATCHDOG=1` only when listener, forwarder and reconcile each progressed. systemd restarts after `WatchdogSec` |
-| Box stops sending heartbeats | Stale data on the laptop | Server sweeper marks `stale` at 90 s and `lost` at 10 min |
+| Box stops sending heartbeats | Stale data on the laptop | The server derives `stale` at 90 s and `lost` at 10 min at read time (ADR-0019) |
 | Registry lost or rebuilt | Every old session looks new | Baseline run inserts old sessions as `ended` with no event |
 
 ## Phased rollout

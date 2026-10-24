@@ -18,7 +18,7 @@ pub enum State {
     Stalled,
     /// The session ended.
     Ended,
-    /// The session died without ending.
+    /// The session died without ending. No event kind sets it yet.
     Crashed,
 }
 
