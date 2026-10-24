@@ -8,6 +8,7 @@ mod config;
 mod dump;
 mod error;
 pub mod events;
+pub mod forwarder;
 mod hook;
 pub mod http1;
 mod runtime;

@@ -31,6 +31,14 @@ pub enum Error {
     Json(serde_json::Error),
     /// A write was attempted on a queue opened for inspection.
     ReadOnly,
+    /// The server answered a call with a gRPC error. Display shows the code only, never the
+    /// server's message, and the status is not exposed as the error source.
+    Rpc(Box<tonic::Status>),
+    /// The server acknowledged no event that was sent, so the queue cannot advance.
+    AckIgnored {
+        /// The `acked_through_seq` the server returned.
+        acked_through: u64,
+    },
 }
 
 impl fmt::Display for Error {
@@ -44,6 +52,13 @@ impl fmt::Display for Error {
             Self::Migrate(err) => write!(f, "queue migration error: {err}"),
             Self::Json(err) => write!(f, "json error: {err}"),
             Self::ReadOnly => write!(f, "queue was opened read-only"),
+            Self::Rpc(status) => write!(f, "server call failed with code {:?}", status.code()),
+            Self::AckIgnored { acked_through } => {
+                write!(
+                    f,
+                    "server acknowledged no sent event (through {acked_through})"
+                )
+            }
         }
     }
 }
@@ -56,7 +71,9 @@ impl std::error::Error for Error {
             Self::Db(err) => Some(err),
             Self::Migrate(err) => Some(err),
             Self::Json(err) => Some(err),
-            Self::InvalidValue { .. } | Self::ReadOnly => None,
+            Self::InvalidValue { .. } | Self::ReadOnly | Self::Rpc(_) | Self::AckIgnored { .. } => {
+                None
+            }
         }
     }
 }
