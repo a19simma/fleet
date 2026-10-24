@@ -1,10 +1,10 @@
-//! fleetd binary: `serve` (default), `dump` and `pueue-callback`.
+//! fleetd binary: `serve` (default), `dump`, `hook` and `pueue-callback`.
 
 use std::path::PathBuf;
 use std::process::ExitCode;
 
 use clap::{Parser, Subcommand};
-use fleetd::{Config, Error, Signals, dump, run};
+use fleetd::{Config, Error, Signals, dump, forward_hook, run};
 use tracing_subscriber::EnvFilter;
 
 #[derive(Parser)]
@@ -27,6 +27,11 @@ enum Command {
         #[arg(long)]
         limit: Option<u32>,
     },
+    /// Forward a Claude Code hook payload from stdin to the local fleetd. Always exits 0.
+    Hook {
+        /// Hook event name, for example `SessionStart`.
+        event: String,
+    },
     /// Report a finished pueue task. Not implemented yet.
     PueueCallback {
         /// pueue task id.
@@ -48,6 +53,16 @@ async fn execute(cli: Cli) -> Result<ExitCode, Error> {
         Command::Dump { limit } => {
             let config = Config::load(cli.config.as_deref())?;
             dump(&config.db_path, limit, &mut std::io::stdout()).await?;
+            Ok(ExitCode::SUCCESS)
+        }
+        Command::Hook { event } => {
+            let sent = match Config::load(cli.config.as_deref()) {
+                Ok(config) => forward_hook(&config, &event, tokio::io::stdin()).await,
+                Err(err) => Err(err),
+            };
+            if let Err(err) = sent {
+                eprintln!("fleetd hook: {err}");
+            }
             Ok(ExitCode::SUCCESS)
         }
         Command::PueueCallback { id, group } => {

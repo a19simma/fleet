@@ -154,6 +154,7 @@ Rules:
 - `permission_mode` is `auto` in `claude -p` and `default` in the interactive run. No logic depends on it.
 - `Notification` arrives late and best-effort (7.5 s in the one observation, see the T2 record). No state depends on it.
 - The POST body equals the command-hook stdin. Only the URL path carries the event name.
+- `SessionStart` cannot use an http hook: Claude Code accepts only `command` and `mcp_tool` hooks for it. The managed settings run `fleetd hook SessionStart`, which reads the stdin payload and POSTs it to the same `/hook/SessionStart` route over the unix socket, else loopback. It exits 0 on every failure. The other events stay http.
 - The same event can arrive once per settings source (T4). The hook lives only in managed settings, and fleetd also drops an exact repeat of a body seen in the last 10 s (proposed window).
 
 Heartbeat and the box snapshot are state, not events. They go through the unary `Heartbeat` call, not the queue.

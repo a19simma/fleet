@@ -8,6 +8,7 @@ mod config;
 mod dump;
 mod error;
 pub mod events;
+mod hook;
 mod runtime;
 mod store;
 mod system;
@@ -17,6 +18,7 @@ pub use config::{Config, DEFAULT_CONFIG_PATH, DEFAULT_SECRETS_PATH, SecretsFile}
 pub use dump::dump;
 pub use error::Error;
 pub use events::{Enqueued, Limits, OVERFLOW_KIND, QueuedEvent};
+pub use hook::forward_hook;
 pub use runtime::{Progress, Signals, Supervisor, bind_socket, run, sleep_beating};
 pub use store::Store;
 pub use system::{fresh_id, now_ms, read_identity};

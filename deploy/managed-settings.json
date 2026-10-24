@@ -3,7 +3,7 @@
     "SessionStart": [
       {
         "hooks": [
-          { "type": "http", "url": "http://127.0.0.1:7071/hook/SessionStart", "timeout": 5 }
+          { "type": "command", "command": "fleetd hook SessionStart", "timeout": 5 }
         ]
       }
     ],

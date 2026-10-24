@@ -35,7 +35,7 @@ Config file keys: `http_port`, `socket_path`, `db_path`, `queue_max_bytes`, `que
 
 ## Hooks
 
-The managed settings hold one http hook per default `hook_events` entry (`SessionStart`, `UserPromptSubmit`, `Stop`, `Notification`, `SessionEnd`), each with `"timeout": 5` seconds. They have no `onFailure`: on 2.1.289 it had no observable effect ([T8](../docs/phase0/T8.md)). A hook fired while fleetd is down was lost in the T8 runs, which saw no retry.
+The managed settings hold one hook per default `hook_events` entry (`SessionStart`, `UserPromptSubmit`, `Stop`, `Notification`, `SessionEnd`), each with `"timeout": 5` seconds. Four are http hooks. `SessionStart` is a command hook, `fleetd hook SessionStart`, because Claude Code accepts only `command` and `mcp_tool` hooks for that event. The subcommand reads the payload from stdin and POSTs it to `/hook/SessionStart` on the unix socket, else the loopback port, with the same config and env as the daemon. It caps input at 1 MiB and 2 seconds, prints errors to stderr only and always exits 0, so a down fleetd never blocks Claude Code. `fleetd` must be on the `PATH` of the Claude Code process. They have no `onFailure`: on 2.1.289 it had no observable effect ([T8](../docs/phase0/T8.md)). A hook fired while fleetd is down was lost in the T8 runs, which saw no retry.
 
 The `http` hook type in managed settings is untested on a live box. T3 and T4 covered http hooks and managed files separately.
 

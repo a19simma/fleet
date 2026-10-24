@@ -19,7 +19,7 @@ serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.154"
 sqlx = { version = "0.9.0", default-features = false, features = ["runtime-tokio", "sqlite"] }
 tempfile = "3.27.0"
-tokio = { version = "1.54.1", features = ["macros", "net", "rt-multi-thread", "signal", "sync", "time", "io-util"] }
+tokio = { version = "1.54.1", features = ["macros", "net", "rt-multi-thread", "signal", "sync", "time", "io-util", "io-std"] }
 toml = { version = "1.1.8", default-features = false, features = ["parse", "serde"] }
 tower = { version = "0.5.3", features = ["util"] }
 tracing = "0.1.44"
