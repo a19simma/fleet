@@ -25,19 +25,22 @@ RETURNING box, id";
 
 const UPSERT_SESSION: &str = "\
 INSERT INTO sessions AS s (box, session_id, kind, state, state_at, workdir, last_prompt, \
-    last_message, last_notification, last_event_at, last_event_kind) \
+    last_message, last_notification, last_event_at, last_event_kind, state_event_at) \
 SELECT $1::text, $2::text, $3::text, $4::text, \
     LEAST(to_timestamp($5::bigint::double precision / 1000.0), now()), \
     $6::text, $7::text, $8::text, $9::text, \
-    LEAST(to_timestamp($5::bigint::double precision / 1000.0), now()), $10::text \
+    LEAST(to_timestamp($5::bigint::double precision / 1000.0), now()), $10::text, \
+    LEAST(to_timestamp($5::bigint::double precision / 1000.0), now()) \
 WHERE $13::boolean OR EXISTS (SELECT 1 FROM sessions e WHERE e.box = $1 AND e.session_id = $2) \
 ON CONFLICT (box, session_id) DO UPDATE SET \
-    state = CASE WHEN $11::boolean AND EXCLUDED.last_event_at >= s.last_event_at \
+    state = CASE WHEN $11::boolean AND EXCLUDED.state_event_at >= s.state_event_at \
         AND (s.state <> 'ended' OR $12::boolean) \
         THEN EXCLUDED.state ELSE s.state END, \
-    state_at = CASE WHEN $11::boolean AND EXCLUDED.last_event_at >= s.last_event_at \
+    state_at = CASE WHEN $11::boolean AND EXCLUDED.state_event_at >= s.state_event_at \
         AND (s.state <> 'ended' OR $12::boolean) \
         AND s.state <> EXCLUDED.state THEN EXCLUDED.state_at ELSE s.state_at END, \
+    state_event_at = CASE WHEN $11::boolean \
+        THEN GREATEST(s.state_event_at, EXCLUDED.state_event_at) ELSE s.state_event_at END, \
     workdir = COALESCE(EXCLUDED.workdir, s.workdir), \
     last_prompt = COALESCE(EXCLUDED.last_prompt, s.last_prompt), \
     last_message = COALESCE(EXCLUDED.last_message, s.last_message), \

@@ -325,6 +325,27 @@ async fn batch_identity_comes_from_newest_new_event(pool: PgPool) {
 }
 
 #[sqlx::test]
+async fn late_state_event_survives_newer_notification(pool: PgPool) {
+    let store = Store::new(pool);
+    let stopped = at(stop("b", "done"), 1_790_000_010_000);
+    let note = at(
+        event("hook.notification", "n", "s", json!({"message": "hi"})),
+        1_790_000_020_000,
+    );
+    let stalled = at(
+        event("session.stalled", "t", "s", json!({})),
+        1_790_000_015_000,
+    );
+    store.ingest(&[(1, stopped)]).await.unwrap();
+    store.ingest(&[(2, note)]).await.unwrap();
+    store.ingest(&[(3, stalled)]).await.unwrap();
+    assert_eq!(
+        session_state(&store).await.unwrap().0,
+        SessionState::Stalled
+    );
+}
+
+#[sqlx::test]
 async fn older_prompt_after_stop_leaves_idle(pool: PgPool) {
     let store = Store::new(pool);
     let stopped = at(stop("b", "done"), 1_790_000_010_000);
