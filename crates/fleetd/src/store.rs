@@ -66,7 +66,8 @@ fn move_aside(path: &Path) -> Result<(), Error> {
 }
 
 impl Store {
-    /// Opens or creates the store at `path` and applies the migrations.
+    /// Opens or creates the store at `path`, applies the migrations and returns every
+    /// `inflight` event to `pending`.
     ///
     /// The first migration is idempotent, so a database created before migrations
     /// existed opens and is then recorded as migrated. A file that SQLite reports as
@@ -96,6 +97,21 @@ impl Store {
         if let Err(err) = sqlx::migrate!("./migrations").run(&pool).await {
             pool.close().await;
             return Err(err.into());
+        }
+        let reset = async {
+            let mut tx = pool.begin().await?;
+            let reset = events::reset_inflight(&mut tx).await?;
+            tx.commit().await?;
+            Ok::<_, Error>(reset)
+        }
+        .await;
+        match reset {
+            Ok(0) => {}
+            Ok(reset) => tracing::info!(reset, "returned inflight events to pending"),
+            Err(err) => {
+                pool.close().await;
+                return Err(err);
+            }
         }
         Ok(Self {
             pool,
@@ -161,6 +177,51 @@ impl Store {
     pub async fn count(&self) -> Result<u64, Error> {
         let mut conn = self.pool.acquire().await?;
         events::count(&mut conn).await
+    }
+
+    /// Claims up to `limit_count` due events, at most `limit_bytes` of envelopes but
+    /// always at least one when any is due, and marks them `inflight`.
+    ///
+    /// See [`events::claim`].
+    ///
+    /// # Errors
+    ///
+    /// Fails when the database write fails.
+    pub async fn claim(
+        &self,
+        limit_count: u32,
+        limit_bytes: u64,
+        now_ms: u64,
+    ) -> Result<Vec<QueuedEvent>, Error> {
+        let mut tx = self.begin().await?;
+        let batch = events::claim(&mut tx, limit_count, limit_bytes, now_ms).await?;
+        tx.commit().await?;
+        Ok(batch)
+    }
+
+    /// Deletes acknowledged `inflight` events. Returns how many were deleted.
+    ///
+    /// # Errors
+    ///
+    /// Fails when the database write fails.
+    pub async fn ack(&self, seqs: &[i64]) -> Result<u64, Error> {
+        let mut tx = self.begin().await?;
+        let deleted = events::ack(&mut tx, seqs).await?;
+        tx.commit().await?;
+        Ok(deleted)
+    }
+
+    /// Returns failed `inflight` events to `pending`, counts an attempt and delays them
+    /// until `retry_at`, milliseconds since the epoch. Returns how many were updated.
+    ///
+    /// # Errors
+    ///
+    /// Fails when the database write fails.
+    pub async fn nack(&self, seqs: &[i64], retry_at: u64) -> Result<u64, Error> {
+        let mut tx = self.begin().await?;
+        let updated = events::nack(&mut tx, seqs, retry_at).await?;
+        tx.commit().await?;
+        Ok(updated)
     }
 
     /// Checkpoints the WAL and closes the pool.

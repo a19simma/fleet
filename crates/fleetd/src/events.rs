@@ -7,6 +7,7 @@ use std::time::Duration;
 use fleet_core::{Envelope, Identity, Source};
 use serde::Serialize;
 use serde_json::{Value, json};
+use sqlx::sqlite::SqliteRow;
 use sqlx::{Row, SqliteConnection};
 
 use crate::Error;
@@ -56,7 +57,7 @@ pub struct QueuedEvent {
     pub ts: i64,
     /// Event kind.
     pub kind: String,
-    /// Delivery state, `pending` until the forwarder lands.
+    /// Delivery state: `pending`, or `inflight` while a claimed batch awaits its ack.
     pub state: String,
     /// Delivery attempts so far.
     pub attempts: i64,
@@ -65,6 +66,19 @@ pub struct QueuedEvent {
     /// The stored envelope.
     #[serde(rename = "envelope")]
     pub payload: Value,
+}
+
+impl QueuedEvent {
+    /// Rebuilds the stored envelope.
+    ///
+    /// The envelope carries no `seq`: send [`QueuedEvent::seq`] beside it.
+    ///
+    /// # Errors
+    ///
+    /// Fails when the stored JSON is not an envelope.
+    pub fn envelope(&self) -> Result<Envelope, Error> {
+        Ok(serde_json::from_value(self.payload.clone())?)
+    }
 }
 
 /// Running count of events removed by cap enforcement.
@@ -140,6 +154,12 @@ pub async fn enforce_caps(
     Ok(())
 }
 
+/// Adds `count` dropped events to the overflow marker.
+///
+/// Only a `pending` marker is updated in place. A marker that is `inflight` belongs to a
+/// send whose ack deletes the row, and merging into it would lose the new count with
+/// that ack. While one is inflight, the drops go to a separate pending marker, so there
+/// can be two markers until the first is acked or nacked.
 async fn record_overflow(
     conn: &mut SqliteConnection,
     template: &Envelope,
@@ -247,6 +267,20 @@ pub async fn insert(
     Ok(Enqueued::Stored { seq })
 }
 
+fn queued(row: &SqliteRow) -> Result<QueuedEvent, Error> {
+    let text: String = row.try_get("payload")?;
+    Ok(QueuedEvent {
+        seq: row.try_get("seq")?,
+        id: row.try_get("id")?,
+        ts: row.try_get("ts")?,
+        kind: row.try_get("kind")?,
+        state: row.try_get("state")?,
+        attempts: row.try_get("attempts")?,
+        next_try_at: row.try_get("next_try_at")?,
+        payload: serde_json::from_str(&text)?,
+    })
+}
+
 /// Lists stored rows in `seq` order.
 ///
 /// # Errors
@@ -263,21 +297,7 @@ pub async fn list(
     .bind(limit.map_or(-1, i64::from))
     .fetch_all(&mut *conn)
     .await?;
-    let mut events = Vec::with_capacity(rows.len());
-    for row in &rows {
-        let text: String = row.try_get("payload")?;
-        events.push(QueuedEvent {
-            seq: row.try_get("seq")?,
-            id: row.try_get("id")?,
-            ts: row.try_get("ts")?,
-            kind: row.try_get("kind")?,
-            state: row.try_get("state")?,
-            attempts: row.try_get("attempts")?,
-            next_try_at: row.try_get("next_try_at")?,
-            payload: serde_json::from_str(&text)?,
-        });
-    }
-    Ok(events)
+    rows.iter().map(queued).collect()
 }
 
 /// Number of stored events.
@@ -290,4 +310,112 @@ pub async fn count(conn: &mut SqliteConnection) -> Result<u64, Error> {
         .fetch_one(&mut *conn)
         .await?;
     Ok(u64::try_from(count).unwrap_or(0))
+}
+
+fn seq_array(seqs: &[i64]) -> Result<String, Error> {
+    Ok(serde_json::to_string(seqs)?)
+}
+
+/// Claims the next batch for delivery and marks it `inflight`.
+///
+/// Selects `pending` rows with `next_try_at <= now_ms` in `seq` order, at most
+/// `limit_count` of them and at most `limit_bytes` of stored envelope bytes. The batch
+/// stops at the first row that would cross the byte limit, which keeps `seq` order, but
+/// always holds one row, so an event larger than the limit still gets sent alone. The
+/// caller owns the transaction, so select and update commit together.
+///
+/// # Errors
+///
+/// Fails when a statement fails or a stored envelope is not JSON.
+pub async fn claim(
+    conn: &mut SqliteConnection,
+    limit_count: u32,
+    limit_bytes: u64,
+    now_ms: u64,
+) -> Result<Vec<QueuedEvent>, Error> {
+    let rows = sqlx::query(
+        "SELECT seq, id, ts, kind, payload, state, attempts, next_try_at,
+                LENGTH(CAST(payload AS BLOB)) AS bytes
+         FROM events WHERE state = 'pending' AND next_try_at <= ?
+         ORDER BY seq ASC LIMIT ?",
+    )
+    .bind(signed(now_ms))
+    .bind(i64::from(limit_count))
+    .fetch_all(&mut *conn)
+    .await?;
+    let mut batch = Vec::new();
+    let mut total: u64 = 0;
+    for row in &rows {
+        let bytes = u64::try_from(row.try_get::<i64, _>("bytes")?).unwrap_or(u64::MAX);
+        if !batch.is_empty() && total.saturating_add(bytes) > limit_bytes {
+            break;
+        }
+        total = total.saturating_add(bytes);
+        let mut event = queued(row)?;
+        "inflight".clone_into(&mut event.state);
+        batch.push(event);
+    }
+    if batch.is_empty() {
+        return Ok(batch);
+    }
+    let seqs: Vec<i64> = batch.iter().map(|event| event.seq).collect();
+    sqlx::query(
+        "UPDATE events SET state = 'inflight'
+         WHERE state = 'pending' AND seq IN (SELECT value FROM json_each(?))",
+    )
+    .bind(seq_array(&seqs)?)
+    .execute(&mut *conn)
+    .await?;
+    Ok(batch)
+}
+
+/// Deletes delivered rows. Only `inflight` rows are removed, so a stale ack of a row
+/// that cap enforcement already evicted or that went back to `pending` does nothing.
+/// Returns the number of rows deleted.
+///
+/// # Errors
+///
+/// Fails when a statement fails.
+pub async fn ack(conn: &mut SqliteConnection, seqs: &[i64]) -> Result<u64, Error> {
+    let done = sqlx::query(
+        "DELETE FROM events
+         WHERE state = 'inflight' AND seq IN (SELECT value FROM json_each(?))",
+    )
+    .bind(seq_array(seqs)?)
+    .execute(&mut *conn)
+    .await?;
+    Ok(done.rows_affected())
+}
+
+/// Returns failed rows to `pending`, adds one attempt and delays the next try until
+/// `retry_at`, milliseconds since the epoch. Only `inflight` rows change. Returns the
+/// number of rows updated.
+///
+/// # Errors
+///
+/// Fails when a statement fails.
+pub async fn nack(conn: &mut SqliteConnection, seqs: &[i64], retry_at: u64) -> Result<u64, Error> {
+    let done = sqlx::query(
+        "UPDATE events SET state = 'pending', attempts = attempts + 1, next_try_at = ?
+         WHERE state = 'inflight' AND seq IN (SELECT value FROM json_each(?))",
+    )
+    .bind(signed(retry_at))
+    .bind(seq_array(seqs)?)
+    .execute(&mut *conn)
+    .await?;
+    Ok(done.rows_affected())
+}
+
+/// Returns every `inflight` row to `pending` without counting an attempt. Run at
+/// startup, since a claim from a dead process has no sender left to ack it. Returns the
+/// number of rows reset.
+///
+/// # Errors
+///
+/// Fails when the statement fails.
+pub async fn reset_inflight(conn: &mut SqliteConnection) -> Result<u64, Error> {
+    let done = sqlx::query("UPDATE events SET state = 'pending' WHERE state = 'inflight'")
+        .execute(&mut *conn)
+        .await?;
+    Ok(done.rows_affected())
 }

@@ -158,6 +158,7 @@ async fn hook(
             if let Some(key) = key.filter(|_| outcome != Enqueued::Dropped) {
                 state.remember(key);
             }
+            tracing::debug!(event, "hook accepted");
             json_response(StatusCode::OK, &json!({}))
         }
         Err(err) => server_error(&err),

@@ -29,7 +29,7 @@ fleetd reads `/etc/fleetd/config.toml` when it exists, then these environment va
 
 A missing secrets file disables redaction and fleetd logs a warning only. It does not refuse to start.
 
-`EnvironmentFile=-/etc/swarm/box.env` in the unit loads variables from that file. It may set any variable in the table above (`FLEETD_PORT`, `FLEET_BOX_NAME`, `FLEETD_DB`, `FLEETD_SOCKET`, `FLEETD_SECRETS_FILE`). The `-` prefix makes the file optional: a missing file is not an error. The unit sets `StateDirectory=fleetd` and `RuntimeDirectory=fleetd`, so systemd exports `STATE_DIRECTORY` and `RUNTIME_DIRECTORY` and the db and socket land in `/var/lib/fleetd` and `/run/fleetd`.
+`EnvironmentFile=-/etc/swarm/box.env` in the unit loads variables from that file. It may set any variable in the table above (`FLEETD_PORT`, `FLEET_BOX_NAME`, `FLEETD_DB`, `FLEETD_SOCKET`, `FLEETD_SECRETS_FILE`). The `-` prefix makes the file optional: a missing file is not an error. A second line, `EnvironmentFile=-/etc/swarm/secrets.env`, loads the secrets file the same way, so its keys reach fleetd's environment as well as its redaction list. The unit sets `StateDirectory=fleetd` and `RuntimeDirectory=fleetd`, so systemd exports `STATE_DIRECTORY` and `RUNTIME_DIRECTORY` and the db and socket land in `/var/lib/fleetd` and `/run/fleetd`.
 
 Config file keys: `http_port`, `socket_path`, `db_path`, `queue_max_bytes`, `queue_max_age_secs`, `hook_events`, `secrets_file`, `box_name`, `dedupe_window_secs`. Unknown keys are an error. `hook_events` lists the hook names to record. Add a name there and a matching hook in the managed settings to record more events.
 
