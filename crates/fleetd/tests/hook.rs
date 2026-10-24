@@ -8,8 +8,7 @@ use std::time::Duration;
 
 use fleet_core::{HookAllowlist, Identity, Redactor};
 use fleetd::{
-    AppState, Config, Limits, Store, bind_socket, forward_hook, forward_hook_as, hook_router,
-    socket_router,
+    AppState, Config, Limits, Store, bind_socket, forward_hook, hook_router, socket_router,
 };
 use tempfile::TempDir;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -67,7 +66,7 @@ async fn posts_session_start_over_the_unix_socket() {
     let config = config(&dir, 1);
     let listener = bind_socket(&config.socket_path).unwrap();
     tokio::spawn(async move { axum::serve(listener, socket_router(state)).await });
-    forward_hook(&config, "SessionStart", PAYLOAD.as_bytes())
+    forward_hook(&config, "SessionStart", PAYLOAD.as_bytes(), None)
         .await
         .unwrap();
     assert_eq!(kinds(&store).await, vec!["hook.session_start".to_owned()]);
@@ -80,7 +79,7 @@ async fn posts_session_start_over_loopback_tcp() {
     let tcp = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let config = config(&dir, tcp.local_addr().unwrap().port());
     tokio::spawn(async move { axum::serve(tcp, hook_router(state)).await });
-    forward_hook(&config, "SessionStart", PAYLOAD.as_bytes())
+    forward_hook(&config, "SessionStart", PAYLOAD.as_bytes(), None)
         .await
         .unwrap();
     assert_eq!(kinds(&store).await, vec!["hook.session_start".to_owned()]);
@@ -94,7 +93,7 @@ async fn unreachable_server_is_an_error_the_caller_can_swallow() {
         tcp.local_addr().unwrap().port()
     };
     let config = config(&dir, port);
-    let result = forward_hook(&config, "SessionStart", PAYLOAD.as_bytes()).await;
+    let result = forward_hook(&config, "SessionStart", PAYLOAD.as_bytes(), None).await;
     assert!(result.is_err());
 }
 
@@ -104,12 +103,12 @@ async fn rejects_oversized_input_and_bad_event_names() {
     let config = config(&dir, 1);
     let big = vec![b'a'; 1024 * 1024 + 1];
     assert!(
-        forward_hook(&config, "SessionStart", big.as_slice())
+        forward_hook(&config, "SessionStart", big.as_slice(), None)
             .await
             .is_err()
     );
     assert!(
-        forward_hook(&config, "../x", PAYLOAD.as_bytes())
+        forward_hook(&config, "../x", PAYLOAD.as_bytes(), None)
             .await
             .is_err()
     );
@@ -192,7 +191,7 @@ async fn a_unix_500_is_final_and_sends_no_tcp_request() -> TestResult {
             .await;
         }
     });
-    let result = forward_hook(&config, "SessionStart", PAYLOAD.as_bytes()).await;
+    let result = forward_hook(&config, "SessionStart", PAYLOAD.as_bytes(), None).await;
     assert!(result.is_err());
     tokio::time::sleep(Duration::from_millis(100)).await;
     assert_eq!(count.load(Ordering::SeqCst), 0);
@@ -206,7 +205,7 @@ async fn a_unix_connect_failure_falls_back_to_one_tcp_request() -> TestResult {
         counting_tcp("HTTP/1.1 204 No Content\r\nContent-Length: 0\r\n\r\n").await?;
     let config = config(&dir, port);
     drop(bind_socket(&config.socket_path)?);
-    forward_hook(&config, "SessionStart", PAYLOAD.as_bytes()).await?;
+    forward_hook(&config, "SessionStart", PAYLOAD.as_bytes(), None).await?;
     assert_eq!(count.load(Ordering::SeqCst), 1);
     Ok(())
 }
@@ -227,7 +226,7 @@ async fn a_hung_unix_server_still_lets_tcp_run() -> TestResult {
         }
     });
     let started = std::time::Instant::now();
-    forward_hook(&config, "SessionStart", PAYLOAD.as_bytes()).await?;
+    forward_hook(&config, "SessionStart", PAYLOAD.as_bytes(), None).await?;
     assert!(started.elapsed() < Duration::from_millis(2_000));
     assert_eq!(count.load(Ordering::SeqCst), 1);
     Ok(())
@@ -249,7 +248,7 @@ async fn a_unix_close_without_a_status_line_fails_without_replay() -> TestResult
             let _ = stream.read(&mut buf).await;
         }
     });
-    let result = forward_hook(&config, "SessionStart", PAYLOAD.as_bytes()).await;
+    let result = forward_hook(&config, "SessionStart", PAYLOAD.as_bytes(), None).await;
     assert!(result.is_err());
     tokio::time::sleep(Duration::from_millis(100)).await;
     assert_eq!(count.load(Ordering::SeqCst), 0);
@@ -275,7 +274,7 @@ async fn captured_request(job: Option<&str>) -> String {
             .unwrap();
         String::from_utf8(seen).unwrap()
     });
-    forward_hook_as(&config, "SessionStart", PAYLOAD.as_bytes(), job)
+    forward_hook(&config, "SessionStart", PAYLOAD.as_bytes(), job)
         .await
         .unwrap();
     server.await.unwrap()

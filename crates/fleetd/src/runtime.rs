@@ -6,7 +6,7 @@ use std::time::Duration;
 
 use fleet_core::{HookAllowlist, Identity, Redactor};
 use sd_notify::NotifyState;
-use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::{TcpListener, TcpStream, UnixListener, UnixStream};
 use tokio::signal::unix::{Signal, SignalKind, signal};
 use tokio::sync::watch;
@@ -17,6 +17,7 @@ use crate::Error;
 use crate::app::{AppState, hook_router, socket_router};
 use crate::config::Config;
 use crate::events::Limits;
+use crate::http1::{Failure, roundtrip};
 use crate::store::Store;
 use crate::system::read_identity;
 
@@ -24,7 +25,6 @@ const DEFAULT_WATCHDOG_PERIOD: Duration = Duration::from_secs(20);
 const MIN_WATCHDOG_PERIOD: Duration = Duration::from_millis(1);
 const SHUTDOWN_GRACE: Duration = Duration::from_secs(10);
 const MAX_HEALTH_TIMEOUT: Duration = Duration::from_secs(3);
-const HEALTH_RESPONSE_LIMIT: u64 = 4096;
 
 /// Process signal streams for the daemon.
 ///
@@ -171,21 +171,13 @@ enum Listener {
     Unix(PathBuf),
 }
 
-async fn healthz_ok(mut stream: impl AsyncRead + AsyncWrite + Unpin) -> std::io::Result<bool> {
-    stream
-        .write_all(b"GET /healthz HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
-        .await?;
-    let mut raw = Vec::new();
-    stream
-        .take(HEALTH_RESPONSE_LIMIT)
-        .read_to_end(&mut raw)
-        .await?;
-    let text = String::from_utf8_lossy(&raw);
-    let ok = text.starts_with("HTTP/1.1 200")
-        && text
-            .split_once("\r\n\r\n")
-            .is_some_and(|(_, body)| body.trim() == "ok");
-    Ok(ok)
+async fn healthz_ok(stream: impl AsyncRead + AsyncWrite + Unpin) -> std::io::Result<bool> {
+    let request = b"GET /healthz HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n";
+    match roundtrip(stream, request).await {
+        Ok(response) => Ok(response.status == 200 && response.body.trim() == "ok"),
+        Err(Failure::NotSent) => Err(std::io::Error::other("healthz request was not sent")),
+        Err(Failure::Unanswered(err)) => Err(err),
+    }
 }
 
 impl Listener {
