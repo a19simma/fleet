@@ -1,6 +1,6 @@
 # fleetd box daemon
 
-Status: Accepted
+Status: Accepted. The "No git" rule is superseded in part by ADR-0020 and ADR-0024 (planned).
 
 Hooks, workmux and pueue each hold part of what a Box is doing. workmux has no status-change or exit hook, and a `claude -p` run reports its cost only in its own output. Today the laptop reads Box state over ssh, so state exists only while the laptop is awake and polling.
 
@@ -62,6 +62,11 @@ v1 builds this ADR without `fleet-job`, claim and lease, drain, the KEDA seam an
 - A fleetd fix costs a Template rebuild and re-created Boxes. Event and handshake versions keep mixed Boxes working (ADR-0012).
 - Adds fleetd to the Template contents.
 - The transcript read ties preview quality to the pinned Claude version.
+
+## Amendments
+
+- **Git (ADR-0020, ADR-0024), planned.** The "No git" rule is superseded in part. fleetd will run Jobs itself as child processes in git worktrees. After the agent exits it pushes only `swarm/<job_id>` and opens the pull request with `gh`, using a fine-grained token from `/etc/swarm/secrets.env` that the agent environment never sees. Read-only git commands to count unpushed commits stay. Not built yet.
+- **Job source (ADR-0020), planned.** The pueue and `fleet-job` Job path is replaced by the fleetd child process. The pueue poll and callback for non-Job tasks are unchanged.
 
 ## Considered and rejected
 

@@ -30,6 +30,10 @@ The existing picker has `fleet` ssh into each Box and poll tmux and pueue, so th
 - The CLI is a Rust binary with a compile step on the laptop. The nushell script stays only as the ssh fallback.
 - The server is a new dependency of the daily workflow.
 
+## Amendments
+
+- **Job commands (ADR-0021), planned.** The CLI adds `fleet submit`, `jobs`, `status`, `logs [-f]` and `cancel`, through `FleetJobs` with the client token (ADR-0023). `list` and `watch` are unchanged.
+
 ## Considered and rejected
 
 - **Keep polling, add caching.** Still needs a live laptop to fill the cache.
