@@ -1,0 +1,23 @@
+[package]
+name = "fleet-cli"
+description = "Fleet command line client"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+publish = false
+
+[package.metadata.dist]
+dist = true
+
+[[bin]]
+name = "fleet"
+path = "src/main.rs"
+
+[dependencies]
+clap.workspace = true
+
+[lints]
+workspace = true

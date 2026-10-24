@@ -1,0 +1,11 @@
+[workspace]
+members = ["cargo:."]
+
+[dist]
+cargo-dist-version = "0.33.1"
+ci = "github"
+installers = []
+targets = ["x86_64-unknown-linux-musl", "aarch64-unknown-linux-musl", "aarch64-apple-darwin"]
+unix-archive = ".tar.gz"
+checksum = "sha256"
+pr-run-mode = "plan"
