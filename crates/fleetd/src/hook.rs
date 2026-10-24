@@ -39,8 +39,11 @@ pub async fn run_hook(
     event: &str,
     input: impl AsyncRead + Unpin,
 ) -> Result<(), Error> {
+    let path = config_path.map(Path::to_path_buf);
     let work = async {
-        let config = Config::load(config_path)?;
+        let config = tokio::task::spawn_blocking(move || Config::load(path.as_deref()))
+            .await
+            .map_err(|err| Error::Runtime(io::Error::other(err)))??;
         forward_hook(&config, event, input).await
     };
     tokio::time::timeout(TOTAL_TIMEOUT, work)

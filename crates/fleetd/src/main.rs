@@ -60,7 +60,7 @@ async fn execute(cli: Cli) -> Result<ExitCode, Error> {
             if let Err(err) = sent {
                 eprintln!("fleetd hook: {err}");
             }
-            Ok(ExitCode::SUCCESS)
+            std::process::exit(0)
         }
         Command::PueueCallback { id, group } => {
             eprintln!("fleetd: pueue-callback is not implemented (task {id}, group {group})");
