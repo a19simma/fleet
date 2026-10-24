@@ -14,7 +14,8 @@ use tokio::task::{AbortHandle, JoinError, JoinHandle};
 use crate::Error;
 use crate::app::{AppState, hook_router, socket_router};
 use crate::config::Config;
-use crate::queue::{Limits, Queue};
+use crate::events::Limits;
+use crate::store::Store;
 use crate::system::read_identity;
 
 const DEFAULT_WATCHDOG_PERIOD: Duration = Duration::from_secs(20);
@@ -171,7 +172,7 @@ pub async fn run(config: Config, shutdown: impl Future<Output = ()>) -> Result<(
     let identity = read_identity(config.box_name.as_deref());
     tracing::info!(box_name = %identity.box_name, boot_id = %identity.boot_id, "starting");
     let redactor = load_redactor(&config)?;
-    let queue = Queue::open(
+    let store = Store::open(
         &config.db_path,
         Limits {
             max_bytes: config.queue_max_bytes,
@@ -180,7 +181,7 @@ pub async fn run(config: Config, shutdown: impl Future<Output = ()>) -> Result<(
     )
     .await?;
     let state = AppState::new(
-        queue.clone(),
+        store.clone(),
         identity,
         HookAllowlist::new(config.hook_events.iter().cloned()),
         redactor,
@@ -242,6 +243,6 @@ pub async fn run(config: Config, shutdown: impl Future<Output = ()>) -> Result<(
         socket_task.abort();
     }
     let _ = std::fs::remove_file(&config.socket_path);
-    let closed = queue.close().await;
+    let closed = store.close().await;
     outcome.and(closed)
 }

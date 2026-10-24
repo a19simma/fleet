@@ -13,7 +13,8 @@ use axum::routing::{get, post};
 use fleet_core::{Envelope, HookAllowlist, Identity, Redactor, normalize_hook};
 use serde_json::{Value, json};
 
-use crate::queue::{Enqueued, Queue};
+use crate::events::Enqueued;
+use crate::store::Store;
 use crate::system::{fresh_id, now_ms};
 
 const MAX_RECENT: usize = 4096;
@@ -22,7 +23,7 @@ const MAX_BODY_BYTES: usize = 1024 * 1024;
 /// Shared handler state.
 #[derive(Debug)]
 pub struct AppState {
-    queue: Queue,
+    store: Store,
     identity: Identity,
     allow: HookAllowlist,
     redactor: Redactor,
@@ -31,7 +32,7 @@ pub struct AppState {
 }
 
 impl AppState {
-    /// Builds state from the queue, box identity, hook allowlist, redactor and the
+    /// Builds state from the store, box identity, hook allowlist, redactor and the
     /// window in which an identical hook body counts as a repeat.
     ///
     /// Repeat detection is lossy. It lives in memory, so a restart forgets it. It keeps
@@ -40,14 +41,14 @@ impl AppState {
     /// A key is recorded only after the event is stored, and a hit does not extend the
     /// window.
     pub fn new(
-        queue: Queue,
+        store: Store,
         identity: Identity,
         allow: HookAllowlist,
         redactor: Redactor,
         dedupe_window: Duration,
     ) -> Arc<Self> {
         Arc::new(Self {
-            queue,
+            store,
             identity,
             allow,
             redactor,
@@ -90,7 +91,7 @@ impl AppState {
 
     async fn store(&self, mut envelope: Envelope) -> Result<Enqueued, crate::Error> {
         self.redactor.redact_envelope(&mut envelope);
-        self.queue.enqueue(&envelope, now_ms()).await
+        self.store.enqueue(&envelope, now_ms()).await
     }
 }
 

@@ -25,6 +25,8 @@ pub enum Error {
     Runtime(std::io::Error),
     /// The SQLite queue failed.
     Db(sqlx::Error),
+    /// Applying the schema migrations failed.
+    Migrate(sqlx::migrate::MigrateError),
     /// A stored or incoming JSON document could not be handled.
     Json(serde_json::Error),
     /// A write was attempted on a queue opened for inspection.
@@ -39,6 +41,7 @@ impl fmt::Display for Error {
             Self::Io { path, source } => write!(f, "{}: {source}", path.display()),
             Self::Runtime(err) => write!(f, "runtime error: {err}"),
             Self::Db(err) => write!(f, "queue database error: {err}"),
+            Self::Migrate(err) => write!(f, "queue migration error: {err}"),
             Self::Json(err) => write!(f, "json error: {err}"),
             Self::ReadOnly => write!(f, "queue was opened read-only"),
         }
@@ -51,6 +54,7 @@ impl std::error::Error for Error {
             Self::ConfigFile(err) => Some(err),
             Self::Io { source, .. } | Self::Runtime(source) => Some(source),
             Self::Db(err) => Some(err),
+            Self::Migrate(err) => Some(err),
             Self::Json(err) => Some(err),
             Self::InvalidValue { .. } | Self::ReadOnly => None,
         }
@@ -60,6 +64,16 @@ impl std::error::Error for Error {
 impl From<sqlx::Error> for Error {
     fn from(err: sqlx::Error) -> Self {
         Self::Db(err)
+    }
+}
+
+impl From<sqlx::migrate::MigrateError> for Error {
+    fn from(err: sqlx::migrate::MigrateError) -> Self {
+        match err {
+            sqlx::migrate::MigrateError::Execute(err)
+            | sqlx::migrate::MigrateError::ExecuteMigration(err, _) => Self::Db(err),
+            other => Self::Migrate(other),
+        }
     }
 }
 

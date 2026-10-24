@@ -19,7 +19,7 @@ fleet-core.workspace = true
 sd-notify.workspace = true
 serde.workspace = true
 serde_json.workspace = true
-sqlx.workspace = true
+sqlx = { workspace = true, features = ["migrate", "macros"] }
 tokio.workspace = true
 toml.workspace = true
 tracing.workspace = true

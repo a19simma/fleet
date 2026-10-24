@@ -12,7 +12,7 @@ use axum::body::{Body, to_bytes};
 use axum::http::{Request, StatusCode};
 use fleet_core::{Envelope, EventId, HookAllowlist, Identity, Redactor, Source};
 use fleetd::{
-    AppState, Enqueued, Limits, Queue, bind_socket, dump, fresh_id, hook_router, now_ms,
+    AppState, Enqueued, Limits, Store, bind_socket, dump, fresh_id, hook_router, now_ms,
     socket_router,
 };
 use serde_json::{Value, json};
@@ -37,14 +37,14 @@ fn identity() -> Identity {
 
 struct Harness {
     dir: TempDir,
-    queue: Queue,
+    queue: Store,
     state: Arc<AppState>,
 }
 
 impl Harness {
     async fn new(limits: Limits, redactor: Redactor) -> Self {
         let dir = TempDir::new().unwrap();
-        let queue = Queue::open(&dir.path().join("q.db"), limits).await.unwrap();
+        let queue = Store::open(&dir.path().join("q.db"), limits).await.unwrap();
         let state = AppState::new(
             queue.clone(),
             identity(),
@@ -491,7 +491,7 @@ async fn corrupt_queue_file_is_moved_aside_and_replaced() {
     let dir = TempDir::new().unwrap();
     let path = dir.path().join("q.db");
     std::fs::write(&path, vec![b'x'; 4096]).unwrap();
-    let queue = Queue::open(&path, BIG).await.unwrap();
+    let queue = Store::open(&path, BIG).await.unwrap();
     assert_eq!(queue.count().await.unwrap(), 0);
     let moved: Vec<_> = std::fs::read_dir(dir.path())
         .unwrap()
@@ -499,6 +499,40 @@ async fn corrupt_queue_file_is_moved_aside_and_replaced() {
         .filter(|name| name.starts_with("q.db.corrupt-"))
         .collect();
     assert_eq!(moved.len(), 1);
+}
+
+#[tokio::test]
+async fn database_from_before_migrations_opens_and_keeps_rows() {
+    use sqlx::Connection;
+    let dir = TempDir::new().unwrap();
+    let path = dir.path().join("q.db");
+    let mut conn =
+        sqlx::SqliteConnection::connect(&format!("sqlite://{}?mode=rwc", path.display()))
+            .await
+            .unwrap();
+    for statement in [
+        "CREATE TABLE events (
+            seq INTEGER PRIMARY KEY AUTOINCREMENT,
+            id TEXT NOT NULL UNIQUE,
+            ts INTEGER NOT NULL,
+            kind TEXT NOT NULL,
+            priority INTEGER NOT NULL,
+            payload TEXT NOT NULL,
+            state TEXT NOT NULL DEFAULT 'pending',
+            attempts INTEGER NOT NULL DEFAULT 0,
+            next_try_at INTEGER NOT NULL DEFAULT 0
+        )",
+        "CREATE INDEX events_drop_order ON events (priority, seq)",
+        "CREATE INDEX events_ts ON events (ts)",
+        "INSERT INTO events (id, ts, kind, priority, payload) VALUES ('old', 1, 'hook.stop', 3, '{}')",
+    ] {
+        sqlx::query(statement).execute(&mut conn).await.unwrap();
+    }
+    conn.close().await.unwrap();
+    let store = Store::open(&path, BIG).await.unwrap();
+    assert_eq!(store.count().await.unwrap(), 1);
+    let again = Store::open(&path, BIG).await.unwrap();
+    assert_eq!(again.count().await.unwrap(), 1);
 }
 
 #[tokio::test]
