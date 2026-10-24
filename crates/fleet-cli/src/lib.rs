@@ -2,6 +2,7 @@
 
 pub mod config;
 pub mod list;
+pub mod logs;
 pub mod watch;
 
 use std::fmt;
@@ -74,6 +75,14 @@ pub enum Command {
         /// Job id.
         id: String,
     },
+    /// Print a job transcript.
+    Logs {
+        /// Job id.
+        id: String,
+        /// Keep polling until the job ends; exit nonzero unless it succeeded.
+        #[arg(short, long)]
+        follow: bool,
+    },
     /// Request cancellation of a job.
     Cancel {
         /// Job id.
@@ -94,7 +103,7 @@ pub enum CliError {
     Rpc(Status),
     /// Reading input or writing output failed.
     Io(std::io::Error),
-    /// A watched job ended in a state other than succeeded.
+    /// A watched or followed job ended in a state other than succeeded.
     JobEnded(&'static str),
 }
 
@@ -326,6 +335,10 @@ pub async fn run(
                 .await?
                 .into_inner();
             write_status(out, &job)?;
+        }
+        Command::Logs { id, follow } => {
+            let mut client = session(server, insecure, lookup).await?;
+            logs::logs(&mut client, id, follow, out).await?;
         }
         Command::Cancel { id } => {
             let mut client = session(server, insecure, lookup).await?;
