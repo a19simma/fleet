@@ -491,6 +491,8 @@ dependencies = [
  "sqlx",
  "tokio",
  "tonic",
+ "tonic-prost",
+ "tower",
  "tracing",
  "tracing-subscriber",
 ]

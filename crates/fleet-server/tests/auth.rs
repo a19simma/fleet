@@ -181,10 +181,57 @@ mod tests {
         let err = client.heartbeat(heartbeat("alpha")).await.unwrap_err();
         assert_eq!(err.code(), Code::InvalidArgument);
         let err = client
+            .heartbeat(heartbeat("secret-raw-input"))
+            .await
+            .unwrap_err();
+        assert_eq!(err.message(), "invalid box name");
+        assert!(!err.message().contains("secret-raw-input"));
+        let err = client
             .push_events(push(vec![wire_event(1, "alpha", "{}")]))
             .await
             .unwrap_err();
         assert_eq!(err.code(), Code::InvalidArgument);
+    }
+
+    async fn call_unknown_path(addr: SocketAddr, header: Header) -> Result<(), Status> {
+        let mut grpc = tonic::client::Grpc::new(channel(addr));
+        grpc.ready()
+            .await
+            .map_err(|err| Status::internal(err.to_string()))?;
+        let meta = header.apply(Request::new(()))?;
+        let mut request = Request::new(push(Vec::new()));
+        *request.metadata_mut() = meta.metadata().clone();
+        let path = tonic::codegen::http::uri::PathAndQuery::from_static("/other.v1.Other/Nope");
+        let codec = tonic_prost::ProstCodec::<PushEventsRequest, PushEventsRequest>::default();
+        grpc.unary(request, path, codec).await.map(|_| ())
+    }
+
+    #[tokio::test]
+    async fn the_layer_covers_paths_no_service_serves() {
+        let addr = spawn();
+        for header in bad_headers() {
+            let shown = format!("{:?}", header.0);
+            let err = call_unknown_path(addr, header).await.unwrap_err();
+            assert_eq!(err.code(), Code::Unauthenticated, "{shown}");
+        }
+        let err = call_unknown_path(addr, Header::right()).await.unwrap_err();
+        assert_eq!(err.code(), Code::Unimplemented);
+    }
+
+    #[tokio::test]
+    async fn invalid_box_error_does_not_echo_the_raw_name() {
+        let addr = spawn();
+        let mut client = ingest(addr, Header::right());
+        let err = client
+            .push_events(push(vec![wire_event(1, "raw-secret-name", "{}")]))
+            .await
+            .unwrap_err();
+        assert_eq!(err.code(), Code::InvalidArgument);
+        assert!(
+            !err.message().contains("raw-secret-name"),
+            "{}",
+            err.message()
+        );
     }
 
     #[tokio::test]

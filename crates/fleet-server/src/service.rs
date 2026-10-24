@@ -2,16 +2,17 @@
 
 use std::time::Duration;
 
-use fleet_core::{BoxName, Envelope};
+use fleet_core::Envelope;
 use fleet_proto::v1::fleet_ingest_server::{FleetIngest, FleetIngestServer};
 use fleet_proto::v1::fleet_query_server::{FleetQuery, FleetQueryServer};
 use fleet_proto::v1::{
     HeartbeatReply, HeartbeatRequest, ListFleetReply, ListFleetRequest, PushEventsReply,
     PushEventsRequest, QueuedEvent, Rejection,
 };
-use tonic::service::interceptor::InterceptedService;
+use fleet_proto::{ConvertError, validate_box};
 use tonic::transport::server::Router;
 use tonic::{Request, Response, Status};
+use tower::layer::util::{Identity, Stack};
 
 use crate::auth::BearerAuth;
 use crate::store::{Store, StoreError};
@@ -38,25 +39,20 @@ fn storage_unavailable(err: &StoreError) -> Status {
     Status::unavailable("storage unavailable")
 }
 
-fn check_box(raw: &str) -> Result<BoxName, Status> {
-    BoxName::new(raw).map_err(|err| Status::invalid_argument(err.to_string()))
-}
-
-fn batch_box(events: &[QueuedEvent]) -> Result<Option<BoxName>, Status> {
+fn same_box(events: &[QueuedEvent]) -> Result<(), Status> {
     let mut names = events
         .iter()
         .filter_map(|event| event.envelope.as_ref())
         .map(|envelope| envelope.r#box.as_str());
     let Some(first) = names.next() else {
-        return Ok(None);
+        return Ok(());
     };
-    let name = check_box(first)?;
     if names.any(|other| other != first) {
         return Err(Status::invalid_argument(
             "every event in a request must carry the same box",
         ));
     }
-    Ok(Some(name))
+    Ok(())
 }
 
 fn no_nul(field: &str, value: &str) -> Result<(), Status> {
@@ -93,7 +89,7 @@ impl FleetIngest for FleetService {
                 "a request may carry at most {MAX_EVENTS_PER_PUSH} events"
             )));
         }
-        batch_box(&events)?;
+        same_box(&events)?;
         let max_seq = events.iter().map(|event| event.seq).max().unwrap_or(0);
 
         let mut valid: Vec<(u64, Envelope)> = Vec::with_capacity(events.len());
@@ -116,6 +112,11 @@ impl FleetIngest for FleetService {
             }
             match Envelope::try_from(wire) {
                 Ok(envelope) => valid.push((seq, envelope)),
+                Err(ConvertError::InvalidBox) => {
+                    return Err(Status::invalid_argument(
+                        ConvertError::InvalidBox.to_string(),
+                    ));
+                }
                 Err(err) => rejected.push(Rejection {
                     seq,
                     reason: err.to_string(),
@@ -151,7 +152,8 @@ impl FleetIngest for FleetService {
         request: Request<HeartbeatRequest>,
     ) -> Result<Response<HeartbeatReply>, Status> {
         let request = request.into_inner();
-        let name = check_box(&request.r#box)?;
+        let name = validate_box(&request.r#box)
+            .map_err(|err| Status::invalid_argument(err.to_string()))?;
         no_nul("hostname", &request.hostname)?;
         no_nul("machine_id", &request.machine_id)?;
         no_nul("boot_id", &request.boot_id)?;
@@ -182,26 +184,22 @@ impl FleetQuery for FleetService {
     }
 }
 
-/// Builds the gRPC router with both services behind `auth`.
+/// Builds the gRPC router with `auth` applied once as a layer over every service.
 ///
 /// The server applies a 30 second request timeout, 8 concurrent requests and 32
 /// concurrent streams per connection, an HTTP/2 keepalive ping every 30 seconds and a
 /// 1 MiB request message limit.
-pub fn router(store: &Store, auth: &BearerAuth) -> Router {
+pub fn router(store: &Store, auth: &BearerAuth) -> Router<Stack<BearerAuth, Identity>> {
     let service = FleetService::new(store.clone());
-    let ingest = InterceptedService::new(
-        FleetIngestServer::new(service.clone()).max_decoding_message_size(MAX_MESSAGE_BYTES),
-        auth.clone(),
-    );
-    let query = InterceptedService::new(
-        FleetQueryServer::new(service).max_decoding_message_size(MAX_MESSAGE_BYTES),
-        auth.clone(),
-    );
+    let ingest =
+        FleetIngestServer::new(service.clone()).max_decoding_message_size(MAX_MESSAGE_BYTES);
+    let query = FleetQueryServer::new(service).max_decoding_message_size(MAX_MESSAGE_BYTES);
     tonic::transport::Server::builder()
         .timeout(REQUEST_TIMEOUT)
         .concurrency_limit_per_connection(CONCURRENCY_PER_CONNECTION)
         .http2_keepalive_interval(Some(KEEPALIVE_INTERVAL))
         .max_concurrent_streams(MAX_CONCURRENT_STREAMS)
+        .layer(auth.clone())
         .add_service(ingest)
         .add_service(query)
 }

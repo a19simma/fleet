@@ -9,8 +9,9 @@ use crate::v1;
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum ConvertError {
-    /// The `box` field is not a valid box name.
-    InvalidBox(String),
+    /// The `box` field is not a valid box name. The raw value is not kept, so an error
+    /// message never echoes client input.
+    InvalidBox,
     /// The `id` field is not a valid event id.
     InvalidId(String),
     /// The `source` field names no known source.
@@ -22,7 +23,7 @@ pub enum ConvertError {
 impl fmt::Display for ConvertError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::InvalidBox(raw) => write!(f, "invalid box name: {raw:?}"),
+            Self::InvalidBox => f.write_str("invalid box name"),
             Self::InvalidId(raw) => write!(f, "invalid event id: {raw:?}"),
             Self::InvalidSource(raw) => write!(f, "unknown source: {raw:?}"),
             Self::InvalidPayload(why) => write!(f, "payload is not valid JSON: {why}"),
@@ -53,11 +54,23 @@ impl From<&Envelope> for v1::Envelope {
     }
 }
 
+/// Validates a client-supplied box name.
+///
+/// This is the one place a raw box string is checked, for envelopes and heartbeats
+/// alike. The error never carries the raw value.
+///
+/// # Errors
+///
+/// Returns [`ConvertError::InvalidBox`] when `raw` is not a valid box name.
+pub fn validate_box(raw: &str) -> Result<BoxName, ConvertError> {
+    BoxName::new(raw).map_err(|_| ConvertError::InvalidBox)
+}
+
 impl TryFrom<v1::Envelope> for Envelope {
     type Error = ConvertError;
 
     fn try_from(wire: v1::Envelope) -> Result<Self, Self::Error> {
-        BoxName::new(&wire.r#box).map_err(|_| ConvertError::InvalidBox(wire.r#box.clone()))?;
+        validate_box(&wire.r#box)?;
         let id = wire
             .id
             .parse::<EventId>()
@@ -174,10 +187,7 @@ mod tests {
 
         let mut wire = good.clone();
         wire.r#box = "other".into();
-        assert_eq!(
-            Envelope::try_from(wire),
-            Err(ConvertError::InvalidBox("other".into()))
-        );
+        assert_eq!(Envelope::try_from(wire), Err(ConvertError::InvalidBox));
 
         let mut wire = good.clone();
         wire.id = "nope".into();
@@ -199,6 +209,30 @@ mod tests {
             Envelope::try_from(wire),
             Err(ConvertError::InvalidPayload(_))
         ));
+    }
+
+    #[test]
+    fn invalid_box_message_does_not_echo_the_input() {
+        let mut wire = v1::Envelope::from(&sample());
+        wire.r#box = "secret-raw-input".into();
+        let message = match Envelope::try_from(wire) {
+            Err(err) => err.to_string(),
+            Ok(_) => String::new(),
+        };
+        assert!(message.contains("invalid box name"), "{message}");
+        assert!(!message.contains("secret-raw-input"), "{message}");
+    }
+
+    #[test]
+    fn validate_box_accepts_good_names_and_hides_bad_ones() {
+        assert_eq!(
+            validate_box(&box_name()).map(|name| name.to_string()),
+            Ok(box_name())
+        );
+        assert_eq!(
+            validate_box("secret-raw-input"),
+            Err(ConvertError::InvalidBox)
+        );
     }
 
     #[test]
