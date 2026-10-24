@@ -1,14 +1,18 @@
-//! Postgres storage: ingest transaction, heartbeat upsert and fleet read model.
+//! Postgres storage: ingest transaction, heartbeat upsert, fleet read model and jobs.
 
 use std::collections::{BTreeMap, HashSet};
 use std::fmt;
 
-use fleet_core::{BoxName, Envelope, SCHEMA_VERSION};
-use fleet_proto::v1::{BoxStatus, BoxView, HeartbeatRequest, SessionState, SessionView};
+use fleet_core::{BoxName, Envelope, EventId, SCHEMA_VERSION};
+use fleet_proto::v1::{
+    BoxStatus, BoxView, HeartbeatRequest, Job, JobState, SessionState, SessionView,
+    SubmitJobRequest,
+};
 use serde_json::{Value, json};
 use sqlx::postgres::PgRow;
 use sqlx::{PgPool, Postgres, Row, Transaction};
 
+use crate::jobs::{JobInvalid, validate_submit};
 use crate::projection::{Projection, State, project};
 
 const INSERT_EVENTS: &str = "\
@@ -103,6 +107,21 @@ FROM sessions \
 WHERE $1::text IS NULL OR box = $1 \
 ORDER BY box, last_event_at DESC, session_id";
 
+const SELECT_JOB_BY_KEY: &str = "\
+SELECT job_id, idempotency_key, prompt, repo, base_ref, open_pr, state, box, attempt, \
+progress, phase, branch, pr_url, error, exit_code, cancel_requested, \
+(EXTRACT(EPOCH FROM lease_expires_at) * 1000)::bigint AS lease_ms, \
+(EXTRACT(EPOCH FROM created_at) * 1000)::bigint AS created_ms, \
+(EXTRACT(EPOCH FROM claimed_at) * 1000)::bigint AS claimed_ms, \
+(EXTRACT(EPOCH FROM finished_at) * 1000)::bigint AS finished_ms \
+FROM jobs WHERE idempotency_key = $1";
+
+const INSERT_JOB: &str = "\
+INSERT INTO jobs (job_id, idempotency_key, prompt, repo, base_ref, branch, open_pr) \
+VALUES ($1, $2, $3, $4, $5, 'swarm/' || $1, $6) \
+ON CONFLICT (idempotency_key) DO NOTHING \
+RETURNING job_id";
+
 const NOW_MS: &str = "SELECT (EXTRACT(EPOCH FROM now()) * 1000)::bigint";
 
 /// Last millisecond of the year 9999, the largest timestamp an event may carry.
@@ -118,6 +137,11 @@ pub enum StoreError {
     Migrate(sqlx::migrate::MigrateError),
     /// A stored value does not fit the type the read model needs.
     OutOfRange(&'static str),
+    /// A job request failed validation.
+    InvalidJob(JobInvalid),
+    /// An idempotency key was reused with different submit parameters. The handler maps
+    /// this to gRPC `ALREADY_EXISTS`.
+    KeyConflict,
 }
 
 impl fmt::Display for StoreError {
@@ -126,6 +150,8 @@ impl fmt::Display for StoreError {
             Self::Database(err) => write!(f, "database error: {err}"),
             Self::Migrate(err) => write!(f, "migration error: {err}"),
             Self::OutOfRange(field) => write!(f, "stored {field} is out of range"),
+            Self::InvalidJob(reason) => reason.fmt(f),
+            Self::KeyConflict => f.write_str("idempotency key already used with other parameters"),
         }
     }
 }
@@ -135,7 +161,8 @@ impl std::error::Error for StoreError {
         match self {
             Self::Database(err) => Some(err),
             Self::Migrate(err) => Some(err),
-            Self::OutOfRange(_) => None,
+            Self::InvalidJob(err) => Some(err),
+            Self::OutOfRange(_) | Self::KeyConflict => None,
         }
     }
 }
@@ -144,6 +171,57 @@ impl From<sqlx::Error> for StoreError {
     fn from(err: sqlx::Error) -> Self {
         Self::Database(err)
     }
+}
+
+impl From<JobInvalid> for StoreError {
+    fn from(err: JobInvalid) -> Self {
+        Self::InvalidJob(err)
+    }
+}
+
+fn job_state(text: &str) -> Result<JobState, StoreError> {
+    Ok(match text {
+        "QUEUED" => JobState::Queued,
+        "RUNNING" => JobState::Running,
+        "SUCCEEDED" => JobState::Succeeded,
+        "FAILED" => JobState::Failed,
+        "CANCELLED" => JobState::Cancelled,
+        "LOST" => JobState::Lost,
+        _ => return Err(StoreError::OutOfRange("job state")),
+    })
+}
+
+fn ms(value: Option<i64>, field: &'static str) -> Result<Option<u64>, StoreError> {
+    value.map(|v| count(v, field)).transpose()
+}
+
+fn job_from_row(row: &PgRow) -> Result<Job, StoreError> {
+    let state: String = row.try_get("state")?;
+    let attempt: i32 = row.try_get("attempt")?;
+    Ok(Job {
+        job_id: row.try_get("job_id")?,
+        idempotency_key: row
+            .try_get::<Option<String>, _>("idempotency_key")?
+            .unwrap_or_default(),
+        prompt: row.try_get("prompt")?,
+        repo: row.try_get("repo")?,
+        base_ref: row.try_get("base_ref")?,
+        open_pr: row.try_get("open_pr")?,
+        state: job_state(&state)?.into(),
+        r#box: row.try_get("box")?,
+        attempt: u32::try_from(attempt).map_err(|_| StoreError::OutOfRange("attempt"))?,
+        lease_expires_at_ms: ms(row.try_get("lease_ms")?, "lease_expires_at")?,
+        progress: row.try_get("progress")?,
+        exit_code: row.try_get("exit_code")?,
+        branch: row.try_get("branch")?,
+        pr_url: row.try_get("pr_url")?,
+        error: row.try_get("error")?,
+        cancel_requested: row.try_get("cancel_requested")?,
+        created_at_ms: count(row.try_get("created_ms")?, "created_at")?,
+        claimed_at_ms: ms(row.try_get("claimed_ms")?, "claimed_at")?,
+        finished_at_ms: ms(row.try_get("finished_ms")?, "finished_at")?,
+        phase: row.try_get("phase")?,
+    })
 }
 
 impl From<sqlx::migrate::MigrateError> for StoreError {
@@ -376,6 +454,45 @@ impl Store {
             .execute(&self.pool)
             .await?;
         Ok(())
+    }
+
+    /// Queues a job, or returns the one already stored under the same idempotency key.
+    ///
+    /// The request is validated once, by [`validate_submit`]. The job id is a fresh
+    /// ULID-shaped [`EventId`]. The insert uses `ON CONFLICT (idempotency_key) DO NOTHING`,
+    /// so concurrent submits with one key create one row. The stored row is then compared
+    /// with the request on prompt, repo, base ref and `open_pr`: identical parameters
+    /// return the stored job unchanged, any difference is refused.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StoreError::InvalidJob`] when the request fails validation,
+    /// [`StoreError::KeyConflict`] when the key exists with different parameters, and
+    /// [`StoreError::Database`] when a query fails.
+    pub async fn submit_job(&self, request: &SubmitJobRequest) -> Result<Job, StoreError> {
+        let job = validate_submit(request)?;
+        sqlx::query(INSERT_JOB)
+            .bind(EventId::generate().to_string())
+            .bind(&job.key)
+            .bind(&job.prompt)
+            .bind(&job.repo)
+            .bind(&job.base_ref)
+            .bind(job.open_pr)
+            .fetch_optional(&self.pool)
+            .await?;
+        let row = sqlx::query(SELECT_JOB_BY_KEY)
+            .bind(&job.key)
+            .fetch_one(&self.pool)
+            .await?;
+        let stored = job_from_row(&row)?;
+        if stored.prompt != job.prompt
+            || stored.repo != job.repo
+            || stored.base_ref != job.base_ref
+            || stored.open_pr != job.open_pr
+        {
+            return Err(StoreError::KeyConflict);
+        }
+        Ok(stored)
     }
 
     /// Starts a `REPEATABLE READ`, read only transaction, so every query in it sees one
