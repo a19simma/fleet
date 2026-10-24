@@ -6,8 +6,8 @@ use std::time::Duration;
 
 use fleet_core::{BoxName, Envelope, EventId, SCHEMA_VERSION};
 use fleet_proto::v1::{
-    BoxStatus, BoxView, HeartbeatRequest, Job, JobState, ReportJobReply, ReportJobRequest,
-    SessionState, SessionView, SubmitJobRequest,
+    BoxStatus, BoxView, HeartbeatRequest, Job, JobState, ReadTranscriptReply, ReportJobReply,
+    ReportJobRequest, SessionState, SessionView, SubmitJobRequest, TranscriptChunk,
 };
 use fleet_proto::validate_box;
 use serde_json::{Value, json};
@@ -15,8 +15,8 @@ use sqlx::postgres::PgRow;
 use sqlx::{PgPool, Postgres, Row, Transaction};
 
 use crate::jobs::{
-    JobInvalid, MAX_PHASE_CHARS, MAX_PROGRESS_CHARS, MAX_TRANSCRIPT_BYTES, validate_submit,
-    validate_terminal,
+    JobInvalid, MAX_PHASE_CHARS, MAX_PROGRESS_CHARS, MAX_TRANSCRIPT_BYTES, validate_job_id,
+    validate_submit, validate_terminal,
 };
 use crate::projection::{Projection, State, project};
 
@@ -127,6 +127,29 @@ VALUES ($1, $2, $3, $4, $5, 'swarm/' || $1, $6) \
 ON CONFLICT (idempotency_key) DO NOTHING \
 RETURNING job_id";
 
+const SELECT_JOB_BY_ID: &str = "\
+SELECT job_id, idempotency_key, prompt, repo, base_ref, open_pr, state, box, attempt, \
+progress, phase, branch, pr_url, error, exit_code, cancel_requested, \
+(EXTRACT(EPOCH FROM lease_expires_at) * 1000)::bigint AS lease_ms, \
+(EXTRACT(EPOCH FROM created_at) * 1000)::bigint AS created_ms, \
+(EXTRACT(EPOCH FROM claimed_at) * 1000)::bigint AS claimed_ms, \
+(EXTRACT(EPOCH FROM finished_at) * 1000)::bigint AS finished_ms \
+FROM jobs WHERE job_id = $1";
+
+const LIST_JOBS: &str = "\
+SELECT job_id, idempotency_key, prompt, repo, base_ref, open_pr, state, box, attempt, \
+progress, phase, branch, pr_url, error, exit_code, cancel_requested, \
+(EXTRACT(EPOCH FROM lease_expires_at) * 1000)::bigint AS lease_ms, \
+(EXTRACT(EPOCH FROM created_at) * 1000)::bigint AS created_ms, \
+(EXTRACT(EPOCH FROM claimed_at) * 1000)::bigint AS claimed_ms, \
+(EXTRACT(EPOCH FROM finished_at) * 1000)::bigint AS finished_ms \
+FROM jobs WHERE $1::text IS NULL OR state = $1 \
+ORDER BY created_at DESC, job_id DESC LIMIT $2";
+
+const READ_TRANSCRIPT: &str = "\
+SELECT seq, ts_ms, chunk, truncated FROM job_transcript \
+WHERE job_id = $1 AND seq > $2 ORDER BY seq LIMIT $3";
+
 const CLAIM_JOB: &str = "\
 UPDATE jobs SET state = 'RUNNING', box = $1, attempt = attempt + 1, \
 claimed_at = now(), lease_expires_at = now() + make_interval(secs => $2) \
@@ -189,6 +212,15 @@ pub const DEFAULT_LEASE: Duration = Duration::from_secs(120);
 
 const NOW_MS: &str = "SELECT (EXTRACT(EPOCH FROM now()) * 1000)::bigint";
 
+/// Jobs `list_jobs` returns when the request sets no limit.
+pub const DEFAULT_LIST_LIMIT: u32 = 50;
+/// Most jobs `list_jobs` returns.
+pub const MAX_LIST_LIMIT: u32 = 200;
+/// Chunks `read_transcript` returns when the request sets no limit.
+pub const DEFAULT_TRANSCRIPT_LIMIT: u32 = 100;
+/// Most chunks `read_transcript` returns.
+pub const MAX_TRANSCRIPT_LIMIT: u32 = 500;
+
 /// Last millisecond of the year 9999, the largest timestamp an event may carry.
 pub const MAX_TS_MS: u64 = 253_402_300_799_999;
 
@@ -204,7 +236,7 @@ pub enum StoreError {
     OutOfRange(&'static str),
     /// A job request failed validation.
     InvalidJob(JobInvalid),
-    /// A claim named an invalid box. The value is not kept.
+    /// A claim or report named an invalid box. The value is not kept.
     InvalidBox,
     /// An idempotency key was reused with different submit parameters. The handler maps
     /// this to gRPC `ALREADY_EXISTS`.
@@ -216,8 +248,8 @@ pub enum StoreError {
     /// A transcript chunk has a sequence number or text the store cannot keep. No input is
     /// kept.
     InvalidChunk,
-    /// A cancel named a job that does not exist. The handler maps this to gRPC `NOT_FOUND`.
-    /// No input is kept.
+    /// A get, cancel or transcript read named a job that does not exist. The handler maps
+    /// this to gRPC `NOT_FOUND`. No input is kept.
     NotFound,
 }
 
@@ -275,6 +307,18 @@ fn job_state(text: &str) -> Result<JobState, StoreError> {
         "LOST" => JobState::Lost,
         _ => return Err(StoreError::OutOfRange("job state")),
     })
+}
+
+fn job_state_text(state: JobState) -> &'static str {
+    match state {
+        JobState::Unspecified => "",
+        JobState::Queued => "QUEUED",
+        JobState::Running => "RUNNING",
+        JobState::Succeeded => "SUCCEEDED",
+        JobState::Failed => "FAILED",
+        JobState::Cancelled => "CANCELLED",
+        JobState::Lost => "LOST",
+    }
 }
 
 fn ms(value: Option<i64>, field: &'static str) -> Result<Option<u64>, StoreError> {
@@ -617,6 +661,100 @@ impl Store {
         row.as_ref().map(job_from_row).transpose()
     }
 
+    /// Returns the job with `job_id`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StoreError::InvalidJob`] when `job_id` fails validation,
+    /// [`StoreError::NotFound`] when no job has it, and [`StoreError::Database`] when the
+    /// query fails.
+    pub async fn get_job(&self, job_id: &str) -> Result<Job, StoreError> {
+        validate_job_id(job_id)?;
+        let row = sqlx::query(SELECT_JOB_BY_ID)
+            .bind(job_id)
+            .fetch_optional(&self.pool)
+            .await?
+            .ok_or(StoreError::NotFound)?;
+        job_from_row(&row)
+    }
+
+    /// Lists jobs newest first, optionally only those in `state`.
+    ///
+    /// `state` is the wire value of a [`JobState`]. A `limit` of 0 means
+    /// [`DEFAULT_LIST_LIMIT`]; larger values are cut to [`MAX_LIST_LIMIT`].
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StoreError::InvalidJob`] when `state` is unspecified or unknown, and
+    /// [`StoreError::Database`] when the query fails.
+    pub async fn list_jobs(&self, state: Option<i32>, limit: u32) -> Result<Vec<Job>, StoreError> {
+        let state = state
+            .map(|raw| match JobState::try_from(raw) {
+                Ok(JobState::Unspecified) | Err(_) => Err(JobInvalid::State),
+                Ok(known) => Ok(job_state_text(known)),
+            })
+            .transpose()?;
+        let limit = match limit {
+            0 => DEFAULT_LIST_LIMIT,
+            n => n.min(MAX_LIST_LIMIT),
+        };
+        let rows = sqlx::query(LIST_JOBS)
+            .bind(state)
+            .bind(i64::from(limit))
+            .fetch_all(&self.pool)
+            .await?;
+        rows.iter().map(job_from_row).collect()
+    }
+
+    /// Reads transcript chunks of a job after `after_seq`, in `seq` order.
+    ///
+    /// A `limit` of 0 means [`DEFAULT_TRANSCRIPT_LIMIT`]; larger values are cut to
+    /// [`MAX_TRANSCRIPT_LIMIT`]. `done` is true when the job has ended and no chunk
+    /// follows the last one returned.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StoreError::InvalidJob`] when `job_id` fails validation,
+    /// [`StoreError::NotFound`] when no job has it, and [`StoreError::Database`] when a
+    /// query fails.
+    pub async fn read_transcript(
+        &self,
+        job_id: &str,
+        after_seq: u64,
+        limit: u32,
+    ) -> Result<ReadTranscriptReply, StoreError> {
+        let job = self.get_job(job_id).await?;
+        let limit = match limit {
+            0 => DEFAULT_TRANSCRIPT_LIMIT,
+            n => n.min(MAX_TRANSCRIPT_LIMIT),
+        };
+        let after = i64::try_from(after_seq).unwrap_or(i64::MAX);
+        let rows = sqlx::query(READ_TRANSCRIPT)
+            .bind(job_id)
+            .bind(after)
+            .bind(i64::from(limit) + 1)
+            .fetch_all(&self.pool)
+            .await?;
+        let more = rows.len() > limit as usize;
+        let chunks = rows
+            .iter()
+            .take(limit as usize)
+            .map(|row| {
+                Ok(TranscriptChunk {
+                    seq: count(row.try_get("seq")?, "seq")?,
+                    ts_ms: count(row.try_get("ts_ms")?, "ts_ms")?,
+                    text: row.try_get("chunk")?,
+                    truncated: row.try_get("truncated")?,
+                })
+            })
+            .collect::<Result<Vec<_>, StoreError>>()?;
+        let ended = !matches!(job.state(), JobState::Queued | JobState::Running);
+        Ok(ReadTranscriptReply {
+            chunks,
+            done: ended && !more,
+        })
+    }
+
     /// Cancels a job.
     ///
     /// One statement decides by the stored state. A `QUEUED` job becomes `CANCELLED` at
@@ -626,9 +764,11 @@ impl Store {
     ///
     /// # Errors
     ///
-    /// Returns [`StoreError::NotFound`] when no job has `job_id`, and
-    /// [`StoreError::Database`] when the statement fails.
+    /// Returns [`StoreError::InvalidJob`] when `job_id` fails validation,
+    /// [`StoreError::NotFound`] when no job has it, and [`StoreError::Database`] when the
+    /// statement fails.
     pub async fn cancel_job(&self, job_id: &str) -> Result<Job, StoreError> {
+        validate_job_id(job_id)?;
         let row = sqlx::query(CANCEL_JOB)
             .bind(job_id)
             .fetch_optional(&self.pool)

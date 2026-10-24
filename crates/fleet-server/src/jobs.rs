@@ -36,7 +36,8 @@ pub enum JobInvalid {
     /// The repository is not an `https://` URL of bounded length without whitespace or
     /// credentials in the authority.
     Repo,
-    /// The base ref is empty, too long or has whitespace or control characters.
+    /// The base ref is empty, too long, starts with `-` or has whitespace or control
+    /// characters.
     BaseRef,
     /// The terminal state is not `SUCCEEDED`, `FAILED` or `CANCELLED`.
     TerminalState,
@@ -46,6 +47,10 @@ pub enum JobInvalid {
     Error,
     /// The branch is empty, too long or has whitespace or control characters.
     Branch,
+    /// The job id is empty, too long or has characters outside printable ASCII.
+    JobId,
+    /// The state filter is not a known job state.
+    State,
 }
 
 impl fmt::Display for JobInvalid {
@@ -59,6 +64,8 @@ impl fmt::Display for JobInvalid {
             Self::PrUrl => "invalid pr url",
             Self::Error => "invalid error text",
             Self::Branch => "invalid branch",
+            Self::JobId => "invalid job id",
+            Self::State => "invalid state filter",
         })
     }
 }
@@ -89,6 +96,22 @@ fn bare_token(text: &str, max: usize) -> bool {
     !text.is_empty() && text.len() <= max && text.bytes().all(|b| b.is_ascii_graphic())
 }
 
+/// Longest accepted job id, in bytes.
+pub const MAX_JOB_ID_BYTES: usize = 64;
+
+/// Validates a job id taken from a client request.
+///
+/// # Errors
+///
+/// Returns [`JobInvalid::JobId`] without the offending value.
+pub(crate) fn validate_job_id(job_id: &str) -> Result<(), JobInvalid> {
+    if bare_token(job_id, MAX_JOB_ID_BYTES) {
+        Ok(())
+    } else {
+        Err(JobInvalid::JobId)
+    }
+}
+
 /// Validates a submit request. This is the only check on these fields.
 ///
 /// # Errors
@@ -111,7 +134,7 @@ pub fn validate_submit(request: &SubmitJobRequest) -> Result<NewJob, JobInvalid>
     {
         return Err(JobInvalid::Repo);
     }
-    if !bare_token(&request.base_ref, MAX_BASE_REF_BYTES) {
+    if !bare_token(&request.base_ref, MAX_BASE_REF_BYTES) || request.base_ref.starts_with('-') {
         return Err(JobInvalid::BaseRef);
     }
     Ok(NewJob {

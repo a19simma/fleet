@@ -36,7 +36,7 @@ Decided 2026-10-24. The phases below stay as the full map. v1 is the smallest sl
 In v1:
 
 - fleetd: loopback http hook listener, SQLite queue, forwarder, session registry and reconciler (see Recovery and reconcile), workmux watcher using `workmux wait` exit codes, pueue poll plus the finish callback (id and group only), heartbeat. The unix socket stays, because the `fleetd pueue-callback` subcommand writes to it.
-- Server: `FleetIngest` (`PushEvents`, `Heartbeat`), `FleetQuery.ListFleet` and `FleetWorker` (`ClaimJob`, `ReportJob`) on Postgres, shared bearer token (ADR-0014).
+- Server: `FleetIngest` (`PushEvents`, `Heartbeat`), `FleetQuery.ListFleet` and `FleetWorker` (`ClaimJob`, `ReportJob`) and `FleetJobs` (`SubmitJob`, `GetJob`, `ListJobs`, `CancelJob`, `ReadTranscript`) on Postgres, shared bearer token (ADR-0014).
 - CLI: `fleet list` and `fleet watch`. `fleet watch` polls `ListFleet` from the client and prints changes (decision 10).
 
 Out of v1: drain and `SetDrain`, the KEDA seam, `fleet-job`, `GetPreview`, `ListEvents`, the `Watch` rpc, and transcript summaries beyond the last assistant text. v1 has no Job cost, since cost arrives only through `fleet-job` (decision 12, deferred).
@@ -381,7 +381,7 @@ enum JobState { QUEUED = 0; RUNNING = 2; SUCCEEDED = 3; FAILED = 4; CANCELLED = 
 ```
 ```
 
-The service split lets auth differ per service: every service takes the same shared bearer token for the proof of concept (decided 2026-10-24). The built server wraps `FleetIngest` and `FleetQuery` in one `BearerAuth` interceptor. The split stays in the proto so a separate read credential can be added later without an API change.
+The service split lets auth differ per service: every service takes the same shared bearer token for the proof of concept (decided 2026-10-24). The built server wraps `FleetIngest`, `FleetQuery`, `FleetWorker` and `FleetJobs` in one `BearerAuth` interceptor. The split stays in the proto so a separate read credential can be added later without an API change.
 
 ### Auth between box and server
 
