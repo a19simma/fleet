@@ -135,6 +135,13 @@ pub struct Envelope {
     /// Claude prompt id, the correlation id of one turn, when known.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub prompt_id: Option<String>,
+    /// Working directory of the session when known.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workdir: Option<String>,
+    /// Time the source says the event happened, milliseconds since the Unix epoch, when
+    /// known. Advisory: the box clock `ts` is the capture time.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub occurred_at: Option<u64>,
     /// Kind specific JSON object.
     pub payload: Value,
 }
@@ -142,8 +149,8 @@ pub struct Envelope {
 impl Envelope {
     /// Builds an envelope from the box identity and event fields.
     ///
-    /// The schema version is [`SCHEMA_VERSION`], `session_id` and `prompt_id` are `None`
-    /// and the payload is an empty JSON object.
+    /// The schema version is [`SCHEMA_VERSION`], `session_id`, `prompt_id`, `workdir` and
+    /// `occurred_at` are `None` and the payload is an empty JSON object.
     pub fn new(identity: &Identity, id: EventId, source: Source, kind: &str, ts: u64) -> Self {
         Self {
             id,
@@ -157,6 +164,8 @@ impl Envelope {
             ts,
             session_id: None,
             prompt_id: None,
+            workdir: None,
+            occurred_at: None,
             payload: Value::Object(serde_json::Map::new()),
         }
     }
@@ -213,5 +222,41 @@ mod tests {
         assert_eq!(json["source"], "fleetd");
         assert!(json.get("session_id").is_none());
         assert_eq!(serde_json::from_value::<Envelope>(json).unwrap(), env);
+    }
+
+    #[test]
+    fn new_fields_roundtrip_when_set() {
+        let identity = Identity {
+            box_name: "alpha".into(),
+            hostname: "h".into(),
+            machine_id: "m".into(),
+            boot_id: "b".into(),
+        };
+        let mut env = Envelope::new(&identity, EventId::new(1, 2), Source::Hook, "hook.stop", 5);
+        env.workdir = Some("/work/repo".into());
+        env.occurred_at = Some(4);
+        let json = serde_json::to_value(&env).unwrap();
+        assert_eq!(json["workdir"], "/work/repo");
+        assert_eq!(json["occurred_at"], 4);
+        assert_eq!(serde_json::from_value::<Envelope>(json).unwrap(), env);
+    }
+
+    #[test]
+    fn old_json_without_new_fields_deserializes() {
+        let json = serde_json::json!({
+            "id": EventId::new(1, 2).to_string(),
+            "schema_version": 1,
+            "box": "alpha",
+            "hostname": "h",
+            "machine_id": "m",
+            "boot_id": "b",
+            "source": "hook",
+            "kind": "hook.stop",
+            "ts": 9,
+            "payload": {}
+        });
+        let env = serde_json::from_value::<Envelope>(json).unwrap();
+        assert_eq!(env.workdir, None);
+        assert_eq!(env.occurred_at, None);
     }
 }
