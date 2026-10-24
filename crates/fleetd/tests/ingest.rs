@@ -6,6 +6,7 @@ use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 use std::process::Command;
 use std::sync::Arc;
+use std::sync::{Mutex, MutexGuard, PoisonError};
 use std::time::Duration;
 
 use axum::body::{Body, to_bytes};
@@ -437,8 +438,19 @@ async fn unix_socket_accepts_envelopes_with_mode_0600() {
     server.abort();
 }
 
+static FORK_LOCK: Mutex<()> = Mutex::new(());
+
+/// Serialises child-process spawns against code that needs a listener fd nobody else holds.
+///
+/// A fork in another test thread copies every open fd into the child until it execs.
+/// A stale listener closed by the test would then still accept connections through that copy.
+fn fork_lock() -> MutexGuard<'static, ()> {
+    FORK_LOCK.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
 #[tokio::test]
 async fn bind_replaces_a_stale_socket_file() {
+    let _fork = fork_lock();
     let dir = TempDir::new().unwrap();
     let sock = dir.path().join("s.sock");
     drop(std::os::unix::net::UnixListener::bind(&sock).unwrap());
@@ -600,6 +612,7 @@ async fn dump_subcommand_prints_the_queue() {
 
     let bin = env!("CARGO_BIN_EXE_fleetd");
     let run = |args: &[&str], db: &Path| {
+        let _fork = fork_lock();
         Command::new(bin)
             .env_clear()
             .env("FLEETD_DB", db)
@@ -618,6 +631,7 @@ async fn dump_subcommand_prints_the_queue() {
 
 #[test]
 fn pueue_callback_is_a_stub() {
+    let _fork = fork_lock();
     let out = Command::new(env!("CARGO_BIN_EXE_fleetd"))
         .env_clear()
         .args(["pueue-callback", "7", "fleet"])
