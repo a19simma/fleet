@@ -18,7 +18,7 @@ Jobs are rows in the server's Postgres, driven by two new gRPC services in packa
 - **Cancel.** `CancelJob` on a `QUEUED` Job sets `CANCELLED` at once. On a `RUNNING` Job it sets `cancel_requested`, which the next `ReportJob` reply returns.
 - **Submit.** The idempotency key is unique and nullable, so a retried submit does not duplicate.
 - **Schema.** Migration `0003_jobs.sql` adds `jobs` (`job_id` as a ULID, `idempotency_key`, `prompt`, `repo`, `base_ref`, `branch`, `open_pr`, `state`, `box`, `attempt`, `lease_expires_at`, `phase`, `progress` capped at 200 chars, `pr_url`, `error`, `exit_code`, `cancel_requested`, `transcript_bytes`, `created_at`, `claimed_at`, `finished_at`) and `job_transcript` (ADR-0022).
-- **Errors.** `UNAUTHENTICATED` for a bad or missing token, `PERMISSION_DENIED` for a token whose scope does not cover the path (ADR-0023), `FAILED_PRECONDITION` for a stale attempt or box, `InvalidArgument` for a bad `box-<n>` name, never retried (ADR-0018). The 1 MiB decode limit stays.
+- **Errors.** `UNAUTHENTICATED` for a bad or missing token, `PERMISSION_DENIED` for a token whose scope does not cover the path (ADR-0023), `FAILED_PRECONDITION` for a stale attempt or box, `INVALID_ARGUMENT` for a bad `box-<n>` name, never retried (ADR-0018). The 1 MiB decode limit stays.
 - **CLI.** `fleet submit --repo --base [--no-pr] <prompt|->`, `jobs [--state]`, `status <id>`, `logs <id> [-f]` (polls `ReadTranscript` every 1 s) and `cancel <id>`. `list` and `watch` stay as ADR-0015 plans them.
 - **Pull only.** The server never connects to a Box (ADR-0016).
 

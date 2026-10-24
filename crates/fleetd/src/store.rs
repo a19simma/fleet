@@ -172,9 +172,9 @@ impl Store {
         events::count(&mut conn).await
     }
 
-    /// Reads the head of the queue without changing it: up to `limit_count` events,
-    /// at most `limit_bytes` of envelopes but always at least one when the queue is not
-    /// empty.
+    /// Reads the head of the queue and records the highest returned `seq` as the peeked
+    /// head: up to `limit_count` events, at most `limit_bytes` of envelopes but always at
+    /// least one when the queue is not empty.
     ///
     /// See [`events::peek`].
     ///

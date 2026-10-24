@@ -54,4 +54,4 @@ sudo -u agent env FLEETD_DB=/var/lib/fleetd/queue.db fleetd dump --limit 20
 sqlite3 /var/lib/fleetd/queue.db 'select seq, kind, state from events order by seq'
 ```
 
-`fleetd dump` prints one JSON object per queued event. The unit runs with `Type=notify` and a 60 second watchdog. Every half `WatchdogSec` fleetd makes a real `GET /healthz` round trip to the loopback listener and the unix socket. It sends the watchdog ping only when both answer 200 within 3 seconds, so a wedged or ended listener makes systemd restart it.
+`fleetd dump` prints one JSON object per queued event. The unit runs with `Type=notify` and a 60 second watchdog. Every half `WatchdogSec` fleetd makes a real `GET /healthz` round trip to the loopback listener and the unix socket. It sends the watchdog ping only when both answer 200 with body `ok` within 3 seconds, so a wedged or ended listener makes systemd restart it.

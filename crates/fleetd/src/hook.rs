@@ -56,8 +56,7 @@ pub async fn run_hook(
 /// Forwards one Claude Code hook payload to the local fleetd.
 ///
 /// Reads `input` up to 1 MiB, then POSTs it to `/hook/<event>`. It uses the unix
-/// socket in `config` when that path exists and falls back to the loopback port when
-/// the socket cannot be reached or the exchange over it fails. `job` is sent as
+/// socket in `config` when that path exists, else the loopback port. `job` is sent as
 /// `X-Fleet-Job` after it is sanitised to printable ASCII and capped at 128 bytes; an
 /// empty result sends no header. The call has no overall deadline: [`run_hook`] owns
 /// the 2 second budget, and callers that must never block Claude Code should use it.

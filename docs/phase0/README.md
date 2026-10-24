@@ -41,7 +41,7 @@ These become Phase 1 pre-checks in the plan.
 5. A tonic client sending `authorization: Bearer <token>`, ideally over a real VPN path with and without TLS.
 6. The workmux `waiting` status. No test made an agent ask for input.
 7. Repeated T10 lag samples. One sample per mode showed the final entry missing at `Stop` and present at 2 s. Also test long turns, many tool calls, `--resume` and disk load, and read at `SessionEnd` without a sleeping `Stop` hook. The T10 `SessionEnd` read came about 2 s after `Stop` only because its `Stop` hook slept.
-8. The `X-Fleet-Job` header with `allowedEnvVars`. No test covered it.
+8. The `X-Fleet-Job` header with `allowedEnvVars`. No test covered it, and the route was never built: only the `SessionStart` command hook sends the header (ADR-0012).
 9. Whether the user's own `workmux set-window-status done` `Stop` hook still fires beside a managed file. T4 did not observe it.
 10. The `Notification` delay. T2 records one at 7.5 s by file timestamps, yet it was absent from a listing made about 25 s after the prompt. Unexplained.
 

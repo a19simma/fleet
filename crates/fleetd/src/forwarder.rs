@@ -63,9 +63,11 @@ fn shrink_to_cap(request: &mut PushEventsRequest) {
 /// Sends the head of the queue once and deletes what the server acknowledged.
 ///
 /// Returns `None` when the queue is empty. The request is halved until it fits the
-/// server's decode limit. A single event over that limit is sent alone; the server rejects
-/// it; it stays queued; A13 decides what happens to it. Rows that are not envelopes are
-/// deleted without a call when no row in the batch decodes, and are skipped otherwise.
+/// server's decode limit. A single event over that limit stays in the request alone and
+/// the server rejects it, which surfaces as [`Error::Rpc`]. [`drain`] propagates the
+/// error, [`run`] logs it and sleeps `max_wait`, and the event stays queued, so it blocks
+/// the events behind it. Rows that are not envelopes are deleted without a call when no
+/// row in the batch decodes, and are skipped otherwise.
 /// The acknowledgement is clamped to the highest `seq` actually sent.
 ///
 /// # Errors

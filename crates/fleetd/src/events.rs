@@ -297,7 +297,7 @@ pub async fn count(conn: &mut SqliteConnection) -> Result<u64, Error> {
     Ok(u64::try_from(count).unwrap_or(0))
 }
 
-/// Reads the head of the queue without changing it.
+/// Reads the head of the queue and persists the highest returned `seq` as the peeked head.
 ///
 /// Returns up to `limit_count` rows in `seq` order and at most `limit_bytes` of stored
 /// envelope bytes. The batch stops at the first row that would cross the byte limit, which
@@ -368,8 +368,9 @@ pub async fn peek(
 
 /// Deletes every row with `seq <= min(seq, highest peeked seq)`.
 ///
-/// An ack above the peeked head never reaches rows that were not sent. Rows that cap enforcement already evicted
-/// are simply absent, so a stale ack does nothing. Returns the number of rows deleted.
+/// An ack above the peeked head never reaches rows that were not sent. Rows that cap
+/// enforcement already evicted are simply absent, so a stale ack does nothing. Returns the
+/// number of rows deleted.
 ///
 /// # Errors
 ///
