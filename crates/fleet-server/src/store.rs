@@ -6,8 +6,8 @@ use std::time::Duration;
 
 use fleet_core::{BoxName, Envelope, EventId, SCHEMA_VERSION};
 use fleet_proto::v1::{
-    BoxStatus, BoxView, HeartbeatRequest, Job, JobState, ReportJobReply, SessionState, SessionView,
-    SubmitJobRequest, TranscriptChunk,
+    BoxStatus, BoxView, HeartbeatRequest, Job, JobState, ReportJobReply, ReportJobRequest,
+    SessionState, SessionView, SubmitJobRequest,
 };
 use fleet_proto::validate_box;
 use serde_json::{Value, json};
@@ -16,6 +16,7 @@ use sqlx::{PgPool, Postgres, Row, Transaction};
 
 use crate::jobs::{
     JobInvalid, MAX_PHASE_CHARS, MAX_PROGRESS_CHARS, MAX_TRANSCRIPT_BYTES, validate_submit,
+    validate_terminal,
 };
 use crate::projection::{Projection, State, project};
 
@@ -139,9 +140,28 @@ progress, phase, branch, pr_url, error, exit_code, cancel_requested, \
 (EXTRACT(EPOCH FROM claimed_at) * 1000)::bigint AS claimed_ms, \
 (EXTRACT(EPOCH FROM finished_at) * 1000)::bigint AS finished_ms";
 
+const CANCEL_JOB: &str = "\
+UPDATE jobs SET \
+state = CASE WHEN state = 'QUEUED' THEN 'CANCELLED' ELSE state END, \
+finished_at = CASE WHEN state = 'QUEUED' THEN now() ELSE finished_at END, \
+cancel_requested = cancel_requested OR state = 'RUNNING' \
+WHERE job_id = $1 \
+RETURNING job_id, idempotency_key, prompt, repo, base_ref, open_pr, state, box, attempt, \
+progress, phase, branch, pr_url, error, exit_code, cancel_requested, \
+(EXTRACT(EPOCH FROM lease_expires_at) * 1000)::bigint AS lease_ms, \
+(EXTRACT(EPOCH FROM created_at) * 1000)::bigint AS created_ms, \
+(EXTRACT(EPOCH FROM claimed_at) * 1000)::bigint AS claimed_ms, \
+(EXTRACT(EPOCH FROM finished_at) * 1000)::bigint AS finished_ms";
+
 const REPORT_JOB: &str = "\
 UPDATE jobs SET phase = $4, progress = $5, \
-lease_expires_at = now() + make_interval(secs => $6) \
+lease_expires_at = now() + make_interval(secs => $6), \
+state = COALESCE($7, state), \
+finished_at = CASE WHEN $7::text IS NULL THEN finished_at ELSE now() END, \
+pr_url = CASE WHEN $7::text IS NULL THEN pr_url ELSE $8 END, \
+error = CASE WHEN $7::text IS NULL THEN error ELSE $9 END, \
+exit_code = CASE WHEN $7::text IS NULL THEN exit_code ELSE $10 END, \
+branch = COALESCE($11, branch) \
 WHERE job_id = $1 AND attempt = $2 AND box = $3 AND state = 'RUNNING' \
 RETURNING cancel_requested, transcript_bytes, \
 (EXTRACT(EPOCH FROM lease_expires_at) * 1000)::bigint AS lease_ms";
@@ -192,6 +212,9 @@ pub enum StoreError {
     /// A transcript chunk has a sequence number or text the store cannot keep. No input is
     /// kept.
     InvalidChunk,
+    /// A cancel named a job that does not exist. The handler maps this to gRPC `NOT_FOUND`.
+    /// No input is kept.
+    NotFound,
 }
 
 impl fmt::Display for StoreError {
@@ -205,6 +228,7 @@ impl fmt::Display for StoreError {
             Self::KeyConflict => f.write_str("idempotency key already used with other parameters"),
             Self::StaleReport => f.write_str("job is not running here at this attempt"),
             Self::InvalidChunk => f.write_str("invalid transcript chunk"),
+            Self::NotFound => f.write_str("job not found"),
         }
     }
 }
@@ -219,7 +243,8 @@ impl std::error::Error for StoreError {
             | Self::InvalidBox
             | Self::KeyConflict
             | Self::StaleReport
-            | Self::InvalidChunk => None,
+            | Self::InvalidChunk
+            | Self::NotFound => None,
         }
     }
 }
@@ -583,12 +608,39 @@ impl Store {
         row.as_ref().map(job_from_row).transpose()
     }
 
-    /// Records a progress report from the box that holds `job_id` and renews its lease.
+    /// Cancels a job.
+    ///
+    /// One statement decides by the stored state. A `QUEUED` job becomes `CANCELLED` at
+    /// once with `finished_at` set. A `RUNNING` job only gets `cancel_requested`; its box
+    /// sees the flag on the next report and ends the job. Any other state is returned
+    /// unchanged, so a repeat cancel is safe.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StoreError::NotFound`] when no job has `job_id`, and
+    /// [`StoreError::Database`] when the statement fails.
+    pub async fn cancel_job(&self, job_id: &str) -> Result<Job, StoreError> {
+        let row = sqlx::query(CANCEL_JOB)
+            .bind(job_id)
+            .fetch_optional(&self.pool)
+            .await?
+            .ok_or(StoreError::NotFound)?;
+        job_from_row(&row)
+    }
+
+    /// Records a progress or final report from the box that holds the job and renews its
+    /// lease.
     ///
     /// One statement matches the job id, the attempt and the box on a `RUNNING` row, then
     /// stores `phase` and `progress` and moves the lease expiry to one store lease from
     /// now. Only that holder can append `chunks`, in the same transaction. `phase` is cut
     /// to [`MAX_PHASE_CHARS`] characters and `progress` to [`MAX_PROGRESS_CHARS`].
+    ///
+    /// With `terminal_state` set to `SUCCEEDED`, `FAILED` or `CANCELLED`, the same
+    /// statement also ends the job: it stores the state, `finished_at`, `exit_code`,
+    /// `error` (cut to [`crate::jobs::MAX_ERROR_CHARS`] characters), `pr_url` and `branch`. The row is
+    /// then no longer `RUNNING`, so a second final report is stale. Result fields on a
+    /// report without `terminal_state` are ignored.
     ///
     /// A chunk whose `seq` is already stored is skipped and counts as acked. Once stored
     /// bytes would pass [`MAX_TRANSCRIPT_BYTES`], one marker row with `truncated` set takes
@@ -598,32 +650,30 @@ impl Store {
     ///
     /// # Errors
     ///
-    /// Returns [`StoreError::InvalidBox`] when `box_name` fails [`validate_box`],
-    /// [`StoreError::InvalidChunk`] when a chunk `seq` exceeds the database range or its
+    /// Returns [`StoreError::InvalidBox`] when the box fails [`validate_box`],
+    /// [`StoreError::InvalidJob`] when the terminal state, `pr_url`, `error` or `branch`
+    /// is invalid, [`StoreError::InvalidChunk`] when a chunk `seq` exceeds the database range or its
     /// text holds a NUL character, [`StoreError::StaleReport`] when no running row matches
     /// the job, attempt and box, and [`StoreError::Database`] when a statement fails. A
     /// failed call stores nothing.
     pub async fn report_job(
         &self,
-        job_id: &str,
-        attempt: u32,
-        box_name: &str,
-        phase: &str,
-        progress: &str,
-        chunks: &[TranscriptChunk],
+        request: &ReportJobRequest,
     ) -> Result<ReportJobReply, StoreError> {
-        let name = validate_box(box_name).map_err(|_| StoreError::InvalidBox)?;
-        let attempt = i32::try_from(attempt).map_err(|_| StoreError::StaleReport)?;
-        let mut rows = Vec::with_capacity(chunks.len());
-        for chunk in chunks {
+        let job_id = request.job_id.as_str();
+        let name = validate_box(&request.r#box).map_err(|_| StoreError::InvalidBox)?;
+        let attempt = i32::try_from(request.attempt).map_err(|_| StoreError::StaleReport)?;
+        let terminal = validate_terminal(request)?;
+        let mut rows = Vec::with_capacity(request.chunks.len());
+        for chunk in &request.chunks {
             let seq = i64::try_from(chunk.seq).map_err(|_| StoreError::InvalidChunk)?;
             if chunk.text.contains('\0') {
                 return Err(StoreError::InvalidChunk);
             }
             rows.push((seq, chunk.ts_ms.min(MAX_TS_MS), chunk));
         }
-        let phase: String = phase.chars().take(MAX_PHASE_CHARS).collect();
-        let progress: String = progress.chars().take(MAX_PROGRESS_CHARS).collect();
+        let phase: String = request.phase.chars().take(MAX_PHASE_CHARS).collect();
+        let progress: String = request.progress.chars().take(MAX_PROGRESS_CHARS).collect();
         let mut tx = self.pool.begin().await?;
         let row = sqlx::query(REPORT_JOB)
             .bind(job_id)
@@ -632,6 +682,11 @@ impl Store {
             .bind(&phase)
             .bind(&progress)
             .bind(self.lease.as_secs_f64())
+            .bind(terminal.as_ref().map(|t| t.state))
+            .bind(terminal.as_ref().and_then(|t| t.pr_url.as_deref()))
+            .bind(terminal.as_ref().and_then(|t| t.error.as_deref()))
+            .bind(terminal.as_ref().and_then(|t| t.exit_code))
+            .bind(terminal.as_ref().and_then(|t| t.branch.as_deref()))
             .fetch_optional(&mut *tx)
             .await?
             .ok_or(StoreError::StaleReport)?;
