@@ -32,57 +32,80 @@ impl fmt::Display for ConfigError {
 
 impl std::error::Error for ConfigError {}
 
-/// The shared bearer token boxes and the CLI present. Its `Debug` output hides the value.
+/// Shortest accepted bearer token, in characters.
+pub const MIN_TOKEN_LEN: usize = 32;
+
+/// A string whose `Debug` output hides the value, so a derived `Debug` on a holder never
+/// prints it.
 #[derive(Clone, PartialEq, Eq)]
-pub struct Token(String);
+pub struct Secret(String);
+
+impl Secret {
+    /// Wraps a secret value.
+    pub fn new(raw: String) -> Self {
+        Self(raw)
+    }
+
+    /// The secret text.
+    pub fn expose(&self) -> &str {
+        &self.0
+    }
+}
+
+impl fmt::Debug for Secret {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("<redacted>")
+    }
+}
+
+/// The shared bearer token boxes and the CLI present. Its `Debug` output hides the value.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Token(Secret);
 
 impl Token {
     /// Wraps a token.
     ///
     /// # Errors
     ///
-    /// Returns [`ConfigError::Missing`] for an empty token.
+    /// Returns [`ConfigError::Missing`] for an empty token and [`ConfigError::Invalid`]
+    /// for one shorter than [`MIN_TOKEN_LEN`] characters or with leading or trailing
+    /// whitespace.
     pub fn new(raw: String) -> Result<Self, ConfigError> {
         if raw.is_empty() {
             return Err(ConfigError::Missing("FLEET_TOKEN"));
         }
-        Ok(Self(raw))
+        if raw.trim() != raw {
+            return Err(ConfigError::Invalid {
+                var: "FLEET_TOKEN",
+                reason: "must not have leading or trailing whitespace".to_owned(),
+            });
+        }
+        if raw.chars().count() < MIN_TOKEN_LEN {
+            return Err(ConfigError::Invalid {
+                var: "FLEET_TOKEN",
+                reason: format!("must be at least {MIN_TOKEN_LEN} characters"),
+            });
+        }
+        Ok(Self(Secret::new(raw)))
     }
 
     /// The token text.
     pub fn expose(&self) -> &str {
-        &self.0
-    }
-}
-
-impl fmt::Debug for Token {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str("Token(<redacted>)")
+        self.0.expose()
     }
 }
 
 /// Server settings.
-#[derive(Clone)]
+#[derive(Debug, Clone)]
 pub struct Config {
     /// Address of the gRPC listener.
     pub listen: SocketAddr,
     /// Address of the health listener.
     pub health_listen: SocketAddr,
     /// Postgres connection URL.
-    pub database_url: String,
+    pub database_url: Secret,
     /// Bearer token the gRPC services require.
     pub token: Token,
-}
-
-impl fmt::Debug for Config {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("Config")
-            .field("listen", &self.listen)
-            .field("health_listen", &self.health_listen)
-            .field("database_url", &"<redacted>")
-            .field("token", &self.token)
-            .finish()
-    }
 }
 
 fn address(
@@ -124,7 +147,7 @@ impl Config {
         Ok(Self {
             listen: address(&lookup, "FLEET_LISTEN", DEFAULT_LISTEN)?,
             health_listen: address(&lookup, "FLEET_HEALTH_LISTEN", DEFAULT_HEALTH_LISTEN)?,
-            database_url,
+            database_url: Secret::new(database_url),
             token,
         })
     }
@@ -135,6 +158,8 @@ mod tests {
     use std::collections::HashMap;
 
     use super::*;
+
+    const TOKEN: &str = "0123456789abcdef0123456789abcdef";
 
     fn lookup(pairs: &[(&str, &str)]) -> impl Fn(&str) -> Option<String> {
         let map: HashMap<String, String> = pairs
@@ -148,19 +173,19 @@ mod tests {
     fn defaults_apply() {
         let config = Config::from_lookup(lookup(&[
             ("FLEET_DATABASE_URL", "postgres://u:pw@h/db"),
-            ("FLEET_TOKEN", "t"),
+            ("FLEET_TOKEN", TOKEN),
         ]))
         .unwrap();
         assert_eq!(config.listen.to_string(), "0.0.0.0:7070");
         assert_eq!(config.health_listen.to_string(), "0.0.0.0:7072");
-        assert_eq!(config.token.expose(), "t");
+        assert_eq!(config.token.expose(), TOKEN);
     }
 
     #[test]
     fn overrides_apply() {
         let config = Config::from_lookup(lookup(&[
             ("FLEET_DATABASE_URL", "postgres://h/db"),
-            ("FLEET_TOKEN", "t"),
+            ("FLEET_TOKEN", TOKEN),
             ("FLEET_LISTEN", "127.0.0.1:9000"),
             ("FLEET_HEALTH_LISTEN", "127.0.0.1:9001"),
         ]))
@@ -185,7 +210,7 @@ mod tests {
     #[test]
     fn missing_database_url_refuses_start() {
         assert_eq!(
-            Config::from_lookup(lookup(&[("FLEET_TOKEN", "t")])).unwrap_err(),
+            Config::from_lookup(lookup(&[("FLEET_TOKEN", TOKEN)])).unwrap_err(),
             ConfigError::Missing("FLEET_DATABASE_URL")
         );
     }
@@ -194,7 +219,7 @@ mod tests {
     fn bad_address_is_reported() {
         let err = Config::from_lookup(lookup(&[
             ("FLEET_DATABASE_URL", "postgres://h/db"),
-            ("FLEET_TOKEN", "t"),
+            ("FLEET_TOKEN", TOKEN),
             ("FLEET_LISTEN", "nope"),
         ]))
         .unwrap_err();
@@ -208,10 +233,29 @@ mod tests {
     }
 
     #[test]
+    fn short_or_padded_token_refuses_start() {
+        let url = ("FLEET_DATABASE_URL", "postgres://h/db");
+        let padded = format!(" {TOKEN}");
+        for token in ["short", padded.as_str(), "0123456789abcdef0123456789abcde"] {
+            let err = Config::from_lookup(lookup(&[url, ("FLEET_TOKEN", token)])).unwrap_err();
+            assert!(
+                matches!(
+                    err,
+                    ConfigError::Invalid {
+                        var: "FLEET_TOKEN",
+                        ..
+                    }
+                ),
+                "{token:?}"
+            );
+        }
+    }
+
+    #[test]
     fn debug_hides_secrets() {
         let config = Config::from_lookup(lookup(&[
             ("FLEET_DATABASE_URL", "postgres://u:hunter2@h/db"),
-            ("FLEET_TOKEN", "s3cret-token"),
+            ("FLEET_TOKEN", "s3cret-token-0123456789abcdefghij"),
         ]))
         .unwrap();
         let shown = format!("{config:?} {:?}", config.token);

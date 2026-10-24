@@ -30,6 +30,16 @@ fn event(kind: &str, tag: &str, session: &str, payload: Value) -> Envelope {
     env
 }
 
+fn at(mut env: Envelope, ts: u64) -> Envelope {
+    env.ts = ts;
+    env
+}
+
+fn on_boot(mut env: Envelope, boot: &str) -> Envelope {
+    boot.clone_into(&mut env.boot_id);
+    env
+}
+
 fn prompt(tag: &str, text: &str) -> Envelope {
     event(
         "hook.user_prompt_submit",
@@ -212,6 +222,160 @@ async fn nul_payload_is_rejected_and_acked_without_failing_the_batch(pool: PgPoo
     assert_eq!((out.stored, out.duplicate), (1, 0));
     assert_eq!(out.rejected.len(), 1);
     assert_eq!(out.rejected.first().map(|r| r.0), Some(1));
+}
+
+#[sqlx::test]
+async fn out_of_range_timestamps_are_rejected_and_acked(pool: PgPool) {
+    let store = Store::new(pool);
+    let far = 9_000_000_000_000_000_000;
+    let mut occurred = prompt("b", "go");
+    occurred.occurred_at = Some(far);
+    let out = store
+        .ingest(&[
+            (1, at(prompt("a", "go"), far)),
+            (2, occurred),
+            (3, prompt("c", "ok")),
+        ])
+        .await
+        .unwrap();
+    assert_eq!((out.stored, out.duplicate), (1, 0));
+    let seqs: Vec<u64> = out.rejected.iter().map(|r| r.0).collect();
+    assert_eq!(seqs, vec![1, 2]);
+}
+
+#[sqlx::test]
+async fn unsupported_schema_version_is_rejected(pool: PgPool) {
+    let store = Store::new(pool);
+    let mut old = prompt("a", "go");
+    old.schema_version = 2;
+    let out = store.ingest(&[(1, old)]).await.unwrap();
+    assert_eq!(out.stored, 0);
+    assert_eq!(out.rejected.len(), 1);
+}
+
+#[sqlx::test]
+async fn duplicate_resend_leaves_box_row_unchanged(pool: PgPool) {
+    let store = Store::new(pool.clone());
+    store
+        .ingest(&[(1, on_boot(prompt("a", "go"), "boot-a"))])
+        .await
+        .unwrap();
+    let before: (String, bool) =
+        sqlx::query_as("SELECT boot_id, last_event_at < now() - interval '1 second' FROM boxes")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    sqlx::query("UPDATE boxes SET last_event_at = now() - interval '1 hour'")
+        .execute(&pool)
+        .await
+        .unwrap();
+    let stamp = |pool: PgPool| async move {
+        sqlx::query_as::<_, (String, String)>("SELECT boot_id, last_event_at::text FROM boxes")
+            .fetch_one(&pool)
+            .await
+            .unwrap()
+    };
+    let first = stamp(pool.clone()).await;
+    let out = store
+        .ingest(&[(1, on_boot(prompt("a", "go"), "boot-b"))])
+        .await
+        .unwrap();
+    assert_eq!((out.stored, out.duplicate), (0, 1));
+    assert_eq!(stamp(pool).await, first);
+    assert_eq!(before.0, "boot-a");
+}
+
+#[sqlx::test]
+async fn older_boot_does_not_overwrite_newer_identity(pool: PgPool) {
+    let store = Store::new(pool.clone());
+    let newer = at(on_boot(prompt("a", "go"), "boot-new"), 1_790_000_005_000);
+    let older = at(on_boot(prompt("b", "go"), "boot-old"), 1_790_000_001_000);
+    store.ingest(&[(1, newer)]).await.unwrap();
+    store.ingest(&[(1, older)]).await.unwrap();
+    assert_eq!(fleet(&store).await.unwrap().boot_id, "boot-new");
+}
+
+#[sqlx::test]
+async fn batch_identity_comes_from_newest_new_event(pool: PgPool) {
+    let store = Store::new(pool);
+    let newer = at(on_boot(prompt("a", "go"), "boot-new"), 1_790_000_005_000);
+    let older = at(on_boot(prompt("b", "go"), "boot-old"), 1_790_000_001_000);
+    store.ingest(&[(5, older), (1, newer)]).await.unwrap();
+    assert_eq!(fleet(&store).await.unwrap().boot_id, "boot-new");
+}
+
+#[sqlx::test]
+async fn older_prompt_after_stop_leaves_idle(pool: PgPool) {
+    let store = Store::new(pool);
+    let stopped = at(stop("b", "done"), 1_790_000_010_000);
+    let late_prompt = at(prompt("a", "go"), 1_790_000_005_000);
+    store.ingest(&[(2, stopped)]).await.unwrap();
+    store.ingest(&[(1, late_prompt)]).await.unwrap();
+    assert_eq!(session_state(&store).await.unwrap().0, SessionState::Idle);
+}
+
+#[sqlx::test]
+async fn literal_escape_text_is_stored_and_real_nul_is_rejected(pool: PgPool) {
+    let store = Store::new(pool.clone());
+    let typed = event(
+        "hook.stop",
+        "t",
+        "s",
+        json!({"last_assistant_message": "the text \\u0000 is fine"}),
+    );
+    let nul_value = event("hook.stop", "v", "s", json!({"a": ["x\u{0}"]}));
+    let nul_key = event("hook.stop", "k", "s", json!({"a\u{0}b": 1}));
+    let out = store
+        .ingest(&[(1, typed), (2, nul_value), (3, nul_key)])
+        .await
+        .unwrap();
+    assert_eq!(out.stored, 1);
+    let seqs: Vec<u64> = out.rejected.iter().map(|r| r.0).collect();
+    assert_eq!(seqs, vec![2, 3]);
+    let view = fleet(&store).await.unwrap();
+    assert_eq!(
+        view.sessions.first().unwrap().last_message.as_deref(),
+        Some("the text \\u0000 is fine")
+    );
+}
+
+#[sqlx::test]
+async fn notification_without_a_row_creates_none(pool: PgPool) {
+    let store = Store::new(pool.clone());
+    let note = event("hook.notification", "n", "s", json!({"message": "hi"}));
+    let out = store.ingest(&[(1, note)]).await.unwrap();
+    assert_eq!(out.stored, 1);
+    let rows: i64 = sqlx::query_scalar("SELECT count(*) FROM sessions")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(rows, 0);
+
+    store.ingest(&[(2, prompt("a", "go"))]).await.unwrap();
+    let again = event("hook.notification", "n2", "s", json!({"message": "later"}));
+    store.ingest(&[(3, again)]).await.unwrap();
+    let kept: Option<String> = sqlx::query_scalar("SELECT last_notification FROM sessions")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(kept.as_deref(), Some("later"));
+    assert_eq!(
+        session_state(&store).await.unwrap().0,
+        SessionState::Working
+    );
+}
+
+#[sqlx::test]
+async fn empty_heartbeat_version_keeps_stored_value(pool: PgPool) {
+    let store = Store::new(pool);
+    let name = BoxName::new(&box_name()).unwrap();
+    store.heartbeat(&name, &heartbeat()).await.unwrap();
+    let bare = HeartbeatRequest {
+        fleetd_version: String::new(),
+        ..heartbeat()
+    };
+    store.heartbeat(&name, &bare).await.unwrap();
+    assert_eq!(fleet(&store).await.unwrap().fleetd_version, "0.2.1");
 }
 
 fn heartbeat() -> HeartbeatRequest {

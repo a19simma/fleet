@@ -2,6 +2,7 @@
 
 use std::error::Error;
 use std::process::ExitCode;
+use std::str::FromStr;
 use std::time::Duration;
 
 use axum::Router;
@@ -10,7 +11,7 @@ use fleet_server::auth::BearerAuth;
 use fleet_server::config::Config;
 use fleet_server::service::router;
 use fleet_server::store::Store;
-use sqlx::postgres::PgPoolOptions;
+use sqlx::postgres::{PgConnectOptions, PgPoolOptions};
 use tokio::net::TcpListener;
 use tokio::signal::unix::{SignalKind, signal};
 use tokio::sync::watch;
@@ -19,6 +20,7 @@ use tracing_subscriber::EnvFilter;
 
 const MAX_CONNECTIONS: u32 = 10;
 const ACQUIRE_TIMEOUT: Duration = Duration::from_secs(5);
+const STATEMENT_TIMEOUT_MS: &str = "10000";
 
 type BoxError = Box<dyn Error + Send + Sync>;
 
@@ -51,14 +53,22 @@ async fn stopped(mut rx: watch::Receiver<bool>) {
 
 async fn run() -> Result<(), BoxError> {
     let config = Config::from_env()?;
+    let options = PgConnectOptions::from_str(config.database_url.expose())?
+        .options([("statement_timeout", STATEMENT_TIMEOUT_MS)]);
     let pool = PgPoolOptions::new()
         .max_connections(MAX_CONNECTIONS)
         .acquire_timeout(ACQUIRE_TIMEOUT)
-        .connect(&config.database_url)
+        .connect_with(options)
         .await?;
     let store = Store::new(pool);
     store.migrate().await?;
 
+    if config.listen.ip().is_unspecified() {
+        tracing::warn!(
+            listen = %config.listen,
+            "FLEET_LISTEN is a wildcard address and the gRPC listener is plaintext h2c; keep it behind a TLS-terminating gateway"
+        );
+    }
     let grpc = TcpIncoming::from(TcpListener::bind(config.listen).await?);
     let health = TcpListener::bind(config.health_listen).await?;
     tracing::info!(

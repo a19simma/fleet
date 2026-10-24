@@ -58,6 +58,8 @@ pub struct Projection {
     pub session_kind: String,
     /// State the event sets.
     pub state: State,
+    /// Whether the event may create the session row when none exists.
+    pub creates_row: bool,
     /// Whether `state` applies to an existing row. False leaves an existing row's state.
     pub apply_state: bool,
     /// Whether the event may move an `ended` row out of `ended`.
@@ -84,6 +86,7 @@ fn is_synthetic(payload: &Value) -> bool {
 ///
 /// A row that is `ended` reopens only on `hook.session_start` or a non-synthetic
 /// `hook.user_prompt_submit`. `session.discovered` sets state only when no row exists.
+/// `hook.notification` records its text on an existing row and never creates one.
 pub fn project(env: &Envelope) -> Option<Projection> {
     let session_id = env.session_id.as_deref().filter(|id| !id.is_empty())?;
     let payload = &env.payload;
@@ -91,6 +94,7 @@ pub fn project(env: &Envelope) -> Option<Projection> {
         session_id: session_id.to_owned(),
         session_kind: text(payload, "kind").unwrap_or_else(|| DEFAULT_SESSION_KIND.to_owned()),
         state: State::Active,
+        creates_row: true,
         apply_state: true,
         reopen: false,
         workdir: env.workdir.clone().or_else(|| text(payload, "cwd")),
@@ -118,6 +122,7 @@ pub fn project(env: &Envelope) -> Option<Projection> {
         }
         kind::HOOK_NOTIFICATION => {
             projection.apply_state = false;
+            projection.creates_row = false;
             projection.notification = text(payload, "message");
         }
         "session.stalled" => projection.state = State::Stalled,
@@ -185,7 +190,7 @@ mod tests {
     #[test]
     fn notification_never_touches_state() {
         let got = project(&event("hook.notification", json!({"message": "needs you"}))).unwrap();
-        assert!(!got.apply_state);
+        assert!(!got.apply_state && !got.creates_row);
         assert_eq!(got.notification.as_deref(), Some("needs you"));
     }
 

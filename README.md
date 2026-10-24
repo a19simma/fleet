@@ -51,6 +51,14 @@ cargo test --workspace
 docker compose -f compose.test.yaml down
 ```
 
+The `docker compose` plugin may be missing. This `docker run` starts the same database, published on loopback only:
+
+```sh
+docker run -d --rm --name fleet-test-pg -e POSTGRES_PASSWORD=postgres -p 127.0.0.1:5432:5432 --tmpfs /var/lib/postgresql/data postgres:17
+docker exec fleet-test-pg pg_isready
+docker rm -fv fleet-test-pg
+```
+
 ## Run
 
 ```sh
@@ -59,6 +67,8 @@ curl http://127.0.0.1:7071/healthz
 curl -X POST http://127.0.0.1:7071/hook/Stop -d '{"session_id":"s-1","last_assistant_message":"ok"}'
 target/release/fleetd dump
 ```
+
+`fleet-server` serves plaintext h2c gRPC and does no TLS itself. Run it behind a TLS-terminating Gateway or ingress. It logs a warning at start when `FLEET_LISTEN` is a wildcard address. `FLEET_TOKEN` must be at least 32 characters with no surrounding whitespace.
 
 fleetd binds 127.0.0.1 only and listens on the unix socket for `POST /event`. Settings, the systemd unit and the Claude Code hook config are in `deploy/README.md`.
 

@@ -1,6 +1,6 @@
 use std::fmt;
 
-use fleet_core::{BoxName, Envelope, EventId, Source};
+use fleet_core::{Envelope, EventId, Source};
 use serde_json::Value;
 
 use crate::v1;
@@ -9,8 +9,6 @@ use crate::v1;
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum ConvertError {
-    /// The `box` field is not a valid box name.
-    InvalidBox(String),
     /// The `id` field is not a valid event id.
     InvalidId(String),
     /// The `source` field names no known source.
@@ -22,7 +20,6 @@ pub enum ConvertError {
 impl fmt::Display for ConvertError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::InvalidBox(raw) => write!(f, "invalid box name: {raw:?}"),
             Self::InvalidId(raw) => write!(f, "invalid event id: {raw:?}"),
             Self::InvalidSource(raw) => write!(f, "unknown source: {raw:?}"),
             Self::InvalidPayload(why) => write!(f, "payload is not valid JSON: {why}"),
@@ -31,29 +28,6 @@ impl fmt::Display for ConvertError {
 }
 
 impl std::error::Error for ConvertError {}
-
-fn source_name(source: Source) -> &'static str {
-    match source {
-        Source::Hook => "hook",
-        Source::Workmux => "workmux",
-        Source::Pueue => "pueue",
-        Source::Job => "job",
-        Source::Fleetd => "fleetd",
-        Source::Reconcile => "reconcile",
-    }
-}
-
-fn parse_source(raw: &str) -> Result<Source, ConvertError> {
-    match raw {
-        "hook" => Ok(Source::Hook),
-        "workmux" => Ok(Source::Workmux),
-        "pueue" => Ok(Source::Pueue),
-        "job" => Ok(Source::Job),
-        "fleetd" => Ok(Source::Fleetd),
-        "reconcile" => Ok(Source::Reconcile),
-        other => Err(ConvertError::InvalidSource(other.to_owned())),
-    }
-}
 
 impl From<&Envelope> for v1::Envelope {
     fn from(env: &Envelope) -> Self {
@@ -64,7 +38,7 @@ impl From<&Envelope> for v1::Envelope {
             hostname: env.hostname.clone(),
             machine_id: env.machine_id.clone(),
             boot_id: env.boot_id.clone(),
-            source: source_name(env.source).to_owned(),
+            source: env.source.as_str().to_owned(),
             kind: env.kind.clone(),
             ts_ms: env.ts,
             session_id: env.session_id.clone(),
@@ -80,19 +54,20 @@ impl TryFrom<v1::Envelope> for Envelope {
     type Error = ConvertError;
 
     fn try_from(wire: v1::Envelope) -> Result<Self, Self::Error> {
-        let box_name =
-            BoxName::new(&wire.r#box).map_err(|_| ConvertError::InvalidBox(wire.r#box.clone()))?;
         let id = wire
             .id
             .parse::<EventId>()
             .map_err(|_| ConvertError::InvalidId(wire.id.clone()))?;
-        let source = parse_source(&wire.source)?;
+        let source = wire
+            .source
+            .parse::<Source>()
+            .map_err(|_| ConvertError::InvalidSource(wire.source.clone()))?;
         let payload = serde_json::from_str::<Value>(&wire.payload_json)
             .map_err(|err| ConvertError::InvalidPayload(err.to_string()))?;
         Ok(Self {
             id,
             schema_version: wire.schema_version,
-            box_name: box_name.as_str().to_owned(),
+            box_name: wire.r#box,
             hostname: wire.hostname,
             machine_id: wire.machine_id,
             boot_id: wire.boot_id,
@@ -192,13 +167,6 @@ mod tests {
     #[test]
     fn rejects_bad_fields() {
         let good = v1::Envelope::from(&sample());
-
-        let mut wire = good.clone();
-        wire.r#box = "alpha".into();
-        assert_eq!(
-            Envelope::try_from(wire),
-            Err(ConvertError::InvalidBox("alpha".into()))
-        );
 
         let mut wire = good.clone();
         wire.id = "nope".into();

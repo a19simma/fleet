@@ -3,9 +3,9 @@
 use std::collections::{BTreeMap, HashSet};
 use std::fmt;
 
-use fleet_core::{BoxName, Envelope};
+use fleet_core::{BoxName, Envelope, SCHEMA_VERSION};
 use fleet_proto::v1::{BoxStatus, BoxView, HeartbeatRequest, SessionState, SessionView};
-use serde_json::json;
+use serde_json::{Value, json};
 use sqlx::postgres::PgRow;
 use sqlx::{PgPool, Postgres, Row, Transaction};
 
@@ -26,14 +26,17 @@ RETURNING box, id";
 const UPSERT_SESSION: &str = "\
 INSERT INTO sessions AS s (box, session_id, kind, state, state_at, workdir, last_prompt, \
     last_message, last_notification, last_event_at, last_event_kind) \
-VALUES ($1, $2, $3, $4::text, \
+SELECT $1::text, $2::text, $3::text, $4::text, \
     LEAST(to_timestamp($5::bigint::double precision / 1000.0), now()), \
     $6::text, $7::text, $8::text, $9::text, \
-    LEAST(to_timestamp($5::bigint::double precision / 1000.0), now()), $10::text) \
+    LEAST(to_timestamp($5::bigint::double precision / 1000.0), now()), $10::text \
+WHERE $13::boolean OR EXISTS (SELECT 1 FROM sessions e WHERE e.box = $1 AND e.session_id = $2) \
 ON CONFLICT (box, session_id) DO UPDATE SET \
-    state = CASE WHEN $11::boolean AND (s.state <> 'ended' OR $12::boolean) \
+    state = CASE WHEN $11::boolean AND EXCLUDED.last_event_at >= s.last_event_at \
+        AND (s.state <> 'ended' OR $12::boolean) \
         THEN EXCLUDED.state ELSE s.state END, \
-    state_at = CASE WHEN $11::boolean AND (s.state <> 'ended' OR $12::boolean) \
+    state_at = CASE WHEN $11::boolean AND EXCLUDED.last_event_at >= s.last_event_at \
+        AND (s.state <> 'ended' OR $12::boolean) \
         AND s.state <> EXCLUDED.state THEN EXCLUDED.state_at ELSE s.state_at END, \
     workdir = COALESCE(EXCLUDED.workdir, s.workdir), \
     last_prompt = COALESCE(EXCLUDED.last_prompt, s.last_prompt), \
@@ -44,10 +47,17 @@ ON CONFLICT (box, session_id) DO UPDATE SET \
         THEN EXCLUDED.last_event_kind ELSE s.last_event_kind END";
 
 const TOUCH_BOX: &str = "\
-INSERT INTO boxes AS b (box, hostname, machine_id, boot_id, last_event_at) \
-VALUES ($1, $2, $3, $4, now()) \
-ON CONFLICT (box) DO UPDATE SET hostname = EXCLUDED.hostname, \
-    machine_id = EXCLUDED.machine_id, boot_id = EXCLUDED.boot_id, last_event_at = now()";
+INSERT INTO boxes AS b (box, hostname, machine_id, boot_id, last_event_at, identity_at_ms) \
+VALUES ($1, $2, $3, $4, now(), $5) \
+ON CONFLICT (box) DO UPDATE SET \
+    hostname = CASE WHEN EXCLUDED.identity_at_ms >= b.identity_at_ms \
+        THEN EXCLUDED.hostname ELSE b.hostname END, \
+    machine_id = CASE WHEN EXCLUDED.identity_at_ms >= b.identity_at_ms \
+        THEN EXCLUDED.machine_id ELSE b.machine_id END, \
+    boot_id = CASE WHEN EXCLUDED.identity_at_ms >= b.identity_at_ms \
+        THEN EXCLUDED.boot_id ELSE b.boot_id END, \
+    identity_at_ms = GREATEST(b.identity_at_ms, EXCLUDED.identity_at_ms), \
+    last_event_at = now()";
 
 const UPSERT_HEARTBEAT: &str = "\
 INSERT INTO boxes AS b (box, hostname, machine_id, boot_id, fleetd_version, \
@@ -55,7 +65,8 @@ INSERT INTO boxes AS b (box, hostname, machine_id, boot_id, fleetd_version, \
 VALUES ($1, $2, $3, $4, $5, now(), $6::text::jsonb) \
 ON CONFLICT (box) DO UPDATE SET hostname = EXCLUDED.hostname, \
     machine_id = EXCLUDED.machine_id, boot_id = EXCLUDED.boot_id, \
-    fleetd_version = EXCLUDED.fleetd_version, last_heartbeat_at = now(), \
+    fleetd_version = COALESCE(NULLIF(EXCLUDED.fleetd_version, ''), b.fleetd_version), \
+    last_heartbeat_at = now(), \
     state = EXCLUDED.state";
 
 const LIST_BOXES: &str = "\
@@ -83,6 +94,9 @@ ORDER BY box, last_event_at DESC, session_id";
 
 const NOW_MS: &str = "SELECT (EXTRACT(EPOCH FROM now()) * 1000)::bigint";
 
+/// Last millisecond of the year 9999, the largest timestamp an event may carry.
+pub const MAX_TS_MS: u64 = 253_402_300_799_999;
+
 /// Why a store call failed.
 #[derive(Debug)]
 #[non_exhaustive]
@@ -91,6 +105,8 @@ pub enum StoreError {
     Database(sqlx::Error),
     /// Applying the embedded migrations failed.
     Migrate(sqlx::migrate::MigrateError),
+    /// A stored value does not fit the type the read model needs.
+    OutOfRange(&'static str),
 }
 
 impl fmt::Display for StoreError {
@@ -98,6 +114,7 @@ impl fmt::Display for StoreError {
         match self {
             Self::Database(err) => write!(f, "database error: {err}"),
             Self::Migrate(err) => write!(f, "migration error: {err}"),
+            Self::OutOfRange(field) => write!(f, "stored {field} is out of range"),
         }
     }
 }
@@ -107,6 +124,7 @@ impl std::error::Error for StoreError {
         match self {
             Self::Database(err) => Some(err),
             Self::Migrate(err) => Some(err),
+            Self::OutOfRange(_) => None,
         }
     }
 }
@@ -143,7 +161,18 @@ struct Prepared {
     envelope: Envelope,
 }
 
-fn has_nul(env: &Envelope, payload: &str) -> bool {
+fn value_has_nul(value: &Value) -> bool {
+    match value {
+        Value::String(text) => text.contains('\0'),
+        Value::Array(items) => items.iter().any(value_has_nul),
+        Value::Object(map) => map
+            .iter()
+            .any(|(key, item)| key.contains('\0') || value_has_nul(item)),
+        Value::Null | Value::Bool(_) | Value::Number(_) => false,
+    }
+}
+
+fn has_nul(env: &Envelope) -> bool {
     let fields = [
         env.box_name.as_str(),
         env.hostname.as_str(),
@@ -156,40 +185,45 @@ fn has_nul(env: &Envelope, payload: &str) -> bool {
         || optional
             .iter()
             .any(|f| f.as_deref().is_some_and(|v| v.contains('\0')))
-        || payload.contains("\\u0000")
+        || value_has_nul(&env.payload)
 }
 
 fn prepare(seq: u64, env: &Envelope) -> Result<Prepared, String> {
-    let payload = env.payload.to_string();
-    if has_nul(env, &payload) {
+    if env.schema_version != SCHEMA_VERSION {
+        return Err(format!("unsupported schema_version {}", env.schema_version));
+    }
+    if has_nul(env) {
         return Err("event contains a NUL character".to_owned());
     }
     let out_of_range = |field: &str| format!("{field} out of range");
+    let timestamp = |value: u64, field: &str| {
+        if value > MAX_TS_MS {
+            return Err(out_of_range(field));
+        }
+        i64::try_from(value).map_err(|_| out_of_range(field))
+    };
     Ok(Prepared {
         seq: i64::try_from(seq).map_err(|_| out_of_range("seq"))?,
-        captured_at_ms: i64::try_from(env.ts).map_err(|_| out_of_range("ts_ms"))?,
+        captured_at_ms: timestamp(env.ts, "ts_ms")?,
         occurred_at_ms: env
             .occurred_at
-            .map(i64::try_from)
-            .transpose()
-            .map_err(|_| out_of_range("occurred_at_ms"))?,
+            .map(|value| timestamp(value, "occurred_at_ms"))
+            .transpose()?,
         schema_version: i32::try_from(env.schema_version)
             .map_err(|_| out_of_range("schema_version"))?,
-        payload,
+        payload: env.payload.to_string(),
         envelope: env.clone(),
     })
 }
 
-fn to_count(value: usize) -> u32 {
-    u32::try_from(value).unwrap_or(u32::MAX)
+fn count(value: i64, field: &'static str) -> Result<u64, StoreError> {
+    u64::try_from(value).map_err(|_| StoreError::OutOfRange(field))
 }
 
-fn to_u64(value: Option<i64>) -> u64 {
-    value.and_then(|v| u64::try_from(v).ok()).unwrap_or(0)
-}
-
-fn parse_u64(value: Option<String>) -> u64 {
-    value.and_then(|v| v.parse().ok()).unwrap_or(0)
+fn parse_count(value: Option<String>, field: &'static str) -> Result<u64, StoreError> {
+    value.map_or(Ok(0), |text| {
+        text.parse().map_err(|_| StoreError::OutOfRange(field))
+    })
 }
 
 /// Postgres-backed storage for events, box state and the session projection.
@@ -218,9 +252,13 @@ impl Store {
     ///
     /// Each `(seq, envelope)` inserts with `ON CONFLICT (box, id) DO NOTHING`. The session
     /// projection then runs over the rows that were new, in `seq` order, and the box row's
-    /// `last_event_at` moves to now. A repeated event changes nothing. Events that cannot
-    /// be stored (a NUL character, a number beyond the column range) come back in
-    /// [`IngestOutcome::rejected`].
+    /// `last_event_at` moves to now when at least one event was new. The box identity
+    /// comes from the newest new event and an older one never replaces a newer one. A
+    /// repeated event changes nothing. Events that cannot be stored (a NUL character, a
+    /// timestamp beyond the year 9999, a number beyond the column range, a
+    /// `schema_version` other than [`SCHEMA_VERSION`]) come back in
+    /// [`IngestOutcome::rejected`]. Only the current schema version is accepted, since
+    /// no earlier one has shipped.
     ///
     /// # Errors
     ///
@@ -235,32 +273,40 @@ impl Store {
             }
         }
         rows.sort_by_key(|row| row.seq);
-        let Some(last) = rows.last() else {
+        if rows.is_empty() {
             return Ok(outcome);
-        };
-        let identity = last.envelope.clone();
+        }
+        let batch_len = u32::try_from(rows.len()).map_err(|_| StoreError::OutOfRange("batch"))?;
 
         let mut tx = self.pool.begin().await?;
         let mut fresh = insert_events(&mut tx, &rows).await?;
+        let mut newest: Option<&Prepared> = None;
         for row in &rows {
             let key = (row.envelope.box_name.clone(), row.envelope.id.to_string());
             if !fresh.remove(&key) {
                 continue;
             }
             outcome.stored += 1;
+            if newest.is_none_or(|n| (row.captured_at_ms, row.seq) >= (n.captured_at_ms, n.seq)) {
+                newest = Some(row);
+            }
             if let Some(projection) = project(&row.envelope) {
                 apply_projection(&mut tx, &row.envelope, row.captured_at_ms, &projection).await?;
             }
         }
-        sqlx::query(TOUCH_BOX)
-            .bind(&identity.box_name)
-            .bind(&identity.hostname)
-            .bind(&identity.machine_id)
-            .bind(&identity.boot_id)
-            .execute(&mut *tx)
-            .await?;
+        if let Some(row) = newest {
+            let identity = &row.envelope;
+            sqlx::query(TOUCH_BOX)
+                .bind(&identity.box_name)
+                .bind(&identity.hostname)
+                .bind(&identity.machine_id)
+                .bind(&identity.boot_id)
+                .bind(row.captured_at_ms)
+                .execute(&mut *tx)
+                .await?;
+        }
         tx.commit().await?;
-        outcome.duplicate = to_count(rows.len()).saturating_sub(outcome.stored);
+        outcome.duplicate = batch_len.saturating_sub(outcome.stored);
         Ok(outcome)
     }
 
@@ -303,12 +349,12 @@ impl Store {
     ///
     /// Returns [`StoreError::Database`] when a query fails.
     pub async fn list_fleet(&self, only: Option<&str>) -> Result<(u64, Vec<BoxView>), StoreError> {
-        let as_of_ms = to_u64(
+        let as_of_ms = count(
             sqlx::query_scalar::<_, i64>(NOW_MS)
                 .fetch_one(&self.pool)
-                .await
-                .ok(),
-        );
+                .await?,
+            "as_of_ms",
+        )?;
         let box_rows = sqlx::query(LIST_BOXES)
             .bind(only)
             .fetch_all(&self.pool)
@@ -348,15 +394,7 @@ async fn insert_events(
     let boots: Vec<&str> = rows.iter().map(|r| r.envelope.boot_id.as_str()).collect();
     let seqs: Vec<i64> = rows.iter().map(|r| r.seq).collect();
     let versions: Vec<i32> = rows.iter().map(|r| r.schema_version).collect();
-    let sources: Vec<String> = rows
-        .iter()
-        .map(|r| {
-            serde_json::to_value(r.envelope.source)
-                .ok()
-                .and_then(|v| v.as_str().map(str::to_owned))
-                .unwrap_or_default()
-        })
-        .collect();
+    let sources: Vec<&str> = rows.iter().map(|r| r.envelope.source.as_str()).collect();
     let kinds: Vec<&str> = rows.iter().map(|r| r.envelope.kind.as_str()).collect();
     let captured: Vec<i64> = rows.iter().map(|r| r.captured_at_ms).collect();
     let occurred: Vec<Option<i64>> = rows.iter().map(|r| r.occurred_at_ms).collect();
@@ -412,6 +450,7 @@ async fn apply_projection(
         .bind(&env.kind)
         .bind(projection.apply_state)
         .bind(projection.reopen)
+        .bind(projection.creates_row)
         .execute(&mut **tx)
         .await?;
     Ok(())
@@ -439,31 +478,33 @@ fn box_status(raw: &str) -> BoxStatus {
     }
 }
 
-fn session_view(row: &PgRow) -> Result<SessionView, sqlx::Error> {
+fn session_view(row: &PgRow) -> Result<SessionView, StoreError> {
     let state: String = row.try_get("state")?;
     Ok(SessionView {
         session_id: row.try_get("session_id")?,
         kind: row.try_get("kind")?,
         state: session_state(&state).into(),
-        state_age_s: to_u64(row.try_get("state_age_s")?),
+        state_age_s: count(row.try_get("state_age_s")?, "state_age_s")?,
         workdir: row.try_get("workdir")?,
         last_prompt: row.try_get("last_prompt")?,
         last_message: row.try_get("last_message")?,
-        last_event_age_s: to_u64(row.try_get("last_event_age_s")?),
+        last_event_age_s: count(row.try_get("last_event_age_s")?, "last_event_age_s")?,
     })
 }
 
-fn box_view(row: &PgRow, name: String, status: &str) -> Result<BoxView, sqlx::Error> {
+fn box_view(row: &PgRow, name: String, status: &str) -> Result<BoxView, StoreError> {
     let heartbeat_age: Option<i64> = row.try_get("heartbeat_age_s")?;
     Ok(BoxView {
         r#box: name,
         hostname: row.try_get("hostname")?,
         status: box_status(status).into(),
-        heartbeat_age_s: heartbeat_age.and_then(|v| u64::try_from(v).ok()),
+        heartbeat_age_s: heartbeat_age
+            .map(|age| count(age, "heartbeat_age_s"))
+            .transpose()?,
         boot_id: row.try_get("boot_id")?,
         fleetd_version: row.try_get("fleetd_version")?,
-        queue_pending: parse_u64(row.try_get("queue_pending")?),
-        queue_oldest_age_s: parse_u64(row.try_get("queue_oldest_age_s")?),
+        queue_pending: parse_count(row.try_get("queue_pending")?, "queue_pending")?,
+        queue_oldest_age_s: parse_count(row.try_get("queue_oldest_age_s")?, "queue_oldest_age_s")?,
         sessions: Vec::new(),
     })
 }

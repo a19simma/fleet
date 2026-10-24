@@ -10,6 +10,8 @@ pub enum Error {
     NotAnObject,
     /// A box name is not `box-` followed by one or more ASCII digits.
     InvalidBoxName(String),
+    /// An event source name is not one of the known sources.
+    InvalidSource(String),
 }
 
 impl fmt::Display for Error {
@@ -18,6 +20,7 @@ impl fmt::Display for Error {
             Self::InvalidId(raw) => write!(f, "invalid event id: {raw:?}"),
             Self::NotAnObject => write!(f, "hook body is not a JSON object"),
             Self::InvalidBoxName(raw) => write!(f, "invalid box name: {raw:?}"),
+            Self::InvalidSource(raw) => write!(f, "unknown source: {raw:?}"),
         }
     }
 }

@@ -25,7 +25,7 @@ mod tests {
     use tonic::transport::{Channel, Endpoint};
     use tonic::{Code, Request, Status};
 
-    const TOKEN: &str = "test-token";
+    const TOKEN: &str = "test-token-0123456789abcdef0123456789";
 
     fn box_name(n: u32) -> String {
         format!("box-{n}")
@@ -81,7 +81,11 @@ mod tests {
             Header(None),
             Header(Some(b"Bearer wrong".to_vec())),
             Header(Some(TOKEN.as_bytes().to_vec())),
-            Header(Some("Bearer t\u{e9}st-token".as_bytes().to_vec())),
+            Header(Some(
+                "Bearer t\u{e9}st-token-0123456789abcdef0123456789"
+                    .as_bytes()
+                    .to_vec(),
+            )),
             Header(Some(b"Bearer \xff\xfe".to_vec())),
         ]
     }
@@ -193,6 +197,49 @@ mod tests {
         ];
         let err = client.push_events(push(events)).await.unwrap_err();
         assert_eq!(err.code(), Code::InvalidArgument);
+    }
+
+    #[tokio::test]
+    async fn more_than_the_event_cap_is_invalid_argument() {
+        let addr = spawn();
+        let mut client = ingest(addr, Header::right());
+        let name = box_name(1);
+        let at_cap: Vec<QueuedEvent> = (1..=500).map(|seq| wire_event(seq, &name, "{")).collect();
+        let reply = client.push_events(push(at_cap)).await.unwrap().into_inner();
+        assert_eq!(reply.rejected.len(), 500);
+
+        let over: Vec<QueuedEvent> = (1..=501).map(|seq| wire_event(seq, &name, "{")).collect();
+        let err = client.push_events(push(over)).await.unwrap_err();
+        assert_eq!(err.code(), Code::InvalidArgument);
+    }
+
+    #[tokio::test]
+    async fn oversize_payload_is_rejected_and_acked() {
+        let addr = spawn();
+        let mut client = ingest(addr, Header::right());
+        let big = format!("\"{}\"", "a".repeat(256 * 1024));
+        let events = vec![wire_event(4, &box_name(1), &big)];
+        let reply = client.push_events(push(events)).await.unwrap().into_inner();
+        assert_eq!(reply.acked_through_seq, 4);
+        let seqs: Vec<u64> = reply.rejected.iter().map(|r| r.seq).collect();
+        assert_eq!(seqs, vec![4]);
+    }
+
+    #[tokio::test]
+    async fn nul_in_heartbeat_identity_is_invalid_argument() {
+        let addr = spawn();
+        let mut client = ingest(addr, Header::right());
+        for field in 0..4 {
+            let mut request = heartbeat(&box_name(1));
+            match field {
+                0 => request.hostname = "a\0b".into(),
+                1 => request.machine_id = "a\0b".into(),
+                2 => request.boot_id = "a\0b".into(),
+                _ => request.fleetd_version = "a\0b".into(),
+            }
+            let err = client.heartbeat(request).await.unwrap_err();
+            assert_eq!(err.code(), Code::InvalidArgument, "field {field}");
+        }
     }
 
     #[tokio::test]

@@ -13,7 +13,7 @@ ADR-0012 and the plan sketched `PushEvents` as one long-lived bidirectional stre
 - **Dedupe key.** `(box, id)`. The insert is `ON CONFLICT (box, id) DO NOTHING`. A resent batch yields `duplicate` counts and projects nothing a second time. `(box, boot_id, seq)` has a non-unique index and is not a constraint.
 - **No `Hello`, no high-water mark.** The server keeps no per-box ingest cursor and has no `box_boots` table. After a gap fleetd resends from its queue and the dedupe key absorbs the overlap.
 - **Box check.** The box name must match `box-<digits>`. Every event in a request must carry the same box. An invalid name or a mixed batch fails the whole request with `InvalidArgument`. fleetd does not retry that code.
-- **Per-event rejects.** An event whose envelope is missing, whose `id` or `source` does not parse, whose `payload_json` is not JSON, whose numbers exceed the column range, or that holds a NUL character goes into `rejected` and is acked. Retrying it would never succeed.
+- **Per-event rejects.** An event whose envelope is missing, whose `id` or `source` does not parse, whose `payload_json` is not JSON or exceeds 256 KiB, whose timestamps pass the end of year 9999, whose numbers exceed the column range, whose `schema_version` is not 1, or that holds a NUL character in a field, payload key or payload string goes into `rejected` and is acked. Retrying it would never succeed.
 - **Storage failure.** A database error returns `Unavailable` and stores nothing.
 - **Wire shape.** The envelope travels as flat fields with `ts_ms` (capture time) and `payload_json` (the payload as a JSON string), not as a protobuf `Struct`. `session_id`, `prompt_id`, `workdir` and `occurred_at_ms` are proto3 `optional`, so absent and empty differ.
 - **Heartbeat.** `Heartbeat` is a separate unary call. The server stamps `last_heartbeat_at` with its own clock and stores the queue figures from the request. It replies with `next_in_s`, 30 in this build.
@@ -24,7 +24,9 @@ Supersedes the stream and ack parts of ADR-0012 (one stream, cumulative high-wat
 ## Decisions (2026-10-24)
 
 - Accepted 2026-10-24.
-- The server does not enforce a batch size. The tonic default message limit of 4 MiB applies. The forwarder limits of 100 events, 256 KiB or 500 ms stay a fleetd choice.
+- A request carries at most 500 events, or the call fails with `InvalidArgument`. The server decodes messages up to 1 MiB, applies a 30 second request timeout, 8 concurrent requests and 32 streams per connection, and pings every 30 seconds. Postgres statements time out after 10 seconds. The forwarder limits of 100 events, 256 KiB or 500 ms stay a fleetd choice.
+- The server accepts `schema_version` 1 only. ADR-0012 asks for the current and previous version, and no earlier version has shipped. The window opens when version 2 is defined.
+- A `Notification` for a session with no row stores the event and creates no row, since it sets `last_notification` only (ADR-0019). Box identity (`hostname`, `machine_id`, `boot_id`) follows the newest new event by capture time, so a late batch from an older boot does not overwrite it.
 
 ## Consequences
 

@@ -1,35 +1,26 @@
 //! Bearer token check for the gRPC services.
 
-use std::sync::Arc;
-
 use fleet_core::constant_time_eq;
 use tonic::service::Interceptor;
 use tonic::{Request, Status};
 
-use crate::config::Token;
+use crate::config::{Secret, Token};
 
 /// A tonic interceptor that requires `authorization: Bearer <token>`.
 ///
 /// The whole header value is compared with [`constant_time_eq`], so a wrong scheme, a
 /// wrong token and a header with non-ASCII bytes all fail the same way.
-#[derive(Clone)]
+#[derive(Debug, Clone)]
 pub struct BearerAuth {
-    expected: Arc<[u8]>,
+    expected: Secret,
 }
 
 impl BearerAuth {
     /// Builds a check for `token`.
     pub fn new(token: &Token) -> Self {
-        let expected = format!("Bearer {}", token.expose());
         Self {
-            expected: Arc::from(expected.into_bytes()),
+            expected: Secret::new(format!("Bearer {}", token.expose())),
         }
-    }
-}
-
-impl std::fmt::Debug for BearerAuth {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str("BearerAuth(<redacted>)")
     }
 }
 
@@ -39,9 +30,10 @@ impl Interceptor for BearerAuth {
             .metadata()
             .get("authorization")
             .map_or(&[][..], |value| value.as_bytes());
-        if constant_time_eq(given, &self.expected) {
+        if constant_time_eq(given, self.expected.expose().as_bytes()) {
             Ok(request)
         } else {
+            tracing::warn!(peer = ?request.remote_addr(), "rejected request with a bad bearer token");
             Err(Status::unauthenticated("missing or invalid bearer token"))
         }
     }
@@ -55,8 +47,10 @@ mod tests {
 
     use super::*;
 
+    const SECRET: &str = "secret-0123456789abcdef0123456789";
+
     fn auth() -> BearerAuth {
-        BearerAuth::new(&Token::new("secret".into()).unwrap())
+        BearerAuth::new(&Token::new(SECRET.into()).unwrap())
     }
 
     fn request_with(value: Option<&[u8]>) -> Request<()> {
@@ -71,21 +65,25 @@ mod tests {
 
     #[test]
     fn right_token_passes() {
-        assert!(auth().call(request_with(Some(b"Bearer secret"))).is_ok());
+        assert!(
+            auth()
+                .call(request_with(Some(format!("Bearer {SECRET}").as_bytes())))
+                .is_ok()
+        );
     }
 
     #[test]
     fn missing_wrong_and_malformed_fail() {
-        let cases: [Option<&[u8]>; 6] = [
+        let cases: [Option<Vec<u8>>; 6] = [
             None,
-            Some(b"Bearer wrong"),
-            Some(b"secret"),
-            Some(b"bearer secret"),
-            Some(b"Bearer secret "),
-            Some("Bearer s\u{e9}cret".as_bytes()),
+            Some(b"Bearer wrong".to_vec()),
+            Some(SECRET.as_bytes().to_vec()),
+            Some(format!("bearer {SECRET}").into_bytes()),
+            Some(format!("Bearer {SECRET} ").into_bytes()),
+            Some("Bearer s\u{e9}cret".as_bytes().to_vec()),
         ];
         for case in cases {
-            let err = auth().call(request_with(case)).unwrap_err();
+            let err = auth().call(request_with(case.as_deref())).unwrap_err();
             assert_eq!(err.code(), Code::Unauthenticated, "{case:?}");
         }
     }

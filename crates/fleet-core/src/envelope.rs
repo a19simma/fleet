@@ -1,7 +1,9 @@
+use std::str::FromStr;
+
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use crate::EventId;
+use crate::{Error, EventId};
 
 /// Envelope schema version emitted by this build.
 pub const SCHEMA_VERSION: u32 = 1;
@@ -54,6 +56,36 @@ pub enum Source {
     Fleetd,
     /// The event came from the registry reconciler.
     Reconcile,
+}
+
+impl Source {
+    /// The lowercase wire name, the same text serde uses.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Hook => "hook",
+            Self::Workmux => "workmux",
+            Self::Pueue => "pueue",
+            Self::Job => "job",
+            Self::Fleetd => "fleetd",
+            Self::Reconcile => "reconcile",
+        }
+    }
+}
+
+impl FromStr for Source {
+    type Err = Error;
+
+    fn from_str(raw: &str) -> Result<Self, Self::Err> {
+        match raw {
+            "hook" => Ok(Self::Hook),
+            "workmux" => Ok(Self::Workmux),
+            "pueue" => Ok(Self::Pueue),
+            "job" => Ok(Self::Job),
+            "fleetd" => Ok(Self::Fleetd),
+            "reconcile" => Ok(Self::Reconcile),
+            other => Err(Error::InvalidSource(other.to_owned())),
+        }
+    }
 }
 
 /// Identity of the box an event came from.
@@ -179,6 +211,28 @@ impl Envelope {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn source_names_roundtrip_and_match_serde() {
+        for source in [
+            Source::Hook,
+            Source::Workmux,
+            Source::Pueue,
+            Source::Job,
+            Source::Fleetd,
+            Source::Reconcile,
+        ] {
+            assert_eq!(source.as_str().parse::<Source>(), Ok(source));
+            assert_eq!(
+                serde_json::to_value(source).unwrap(),
+                serde_json::json!(source.as_str())
+            );
+        }
+        assert_eq!(
+            "other".parse::<Source>(),
+            Err(Error::InvalidSource("other".into()))
+        );
+    }
 
     #[test]
     fn priority_ranks_kinds() {
