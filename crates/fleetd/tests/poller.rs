@@ -15,8 +15,8 @@ use fleet_proto::v1::fleet_worker_server::{FleetWorker, FleetWorkerServer};
 use fleet_proto::v1::{ClaimJobReply, ClaimJobRequest, Job, ReportJobReply, ReportJobRequest};
 use fleetd::backoff::Random;
 use fleetd::poller::{
-    Claimed, GrpcReporter, JobRunner, MAX_IDLE_WAIT, PollRandom, Poller, REQUEST_TIMEOUT, RunError,
-    SHUTDOWN_GRACE, Shutdown, Token,
+    CLAIM_GRACE, Claimed, GrpcReporter, JobRunner, MAX_IDLE_WAIT, PollRandom, Poller,
+    REQUEST_TIMEOUT, RunError, SHUTDOWN_GRACE, Shutdown, Token,
 };
 use fleetd::runner::Reporter;
 use hyper_util::rt::TokioIo;
@@ -50,6 +50,7 @@ enum Step {
     Hang,
     Idle(u32),
     Job(&'static str),
+    SlowJob(&'static str),
 }
 
 #[derive(Default)]
@@ -102,6 +103,17 @@ impl FleetWorker for Stub {
                 lease_s: 0,
                 next_in_s,
             })),
+            Step::SlowJob(id) => {
+                tokio::time::sleep(Duration::from_millis(200)).await;
+                Ok(Response::new(ClaimJobReply {
+                    job: Some(Job {
+                        job_id: id.to_owned(),
+                        ..Job::default()
+                    }),
+                    lease_s: 60,
+                    next_in_s: 0,
+                }))
+            }
             Step::Job(id) => Ok(Response::new(ClaimJobReply {
                 job: Some(Job {
                     job_id: id.to_owned(),
@@ -488,7 +500,19 @@ async fn shutdown_during_a_claim_stops_the_poller() -> Test {
     let rig = rig(vec![Step::Hang]);
     let running = start(poller(&rig, Double::new(Mode::Ok), 0.5)?);
     rig.shared.arrived.notified().await;
-    running.stop_within(Duration::from_secs(1)).await
+    running.stop_within(CLAIM_GRACE * 2).await
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_claim_in_flight_at_shutdown_still_reaches_the_runner() -> Test {
+    let rig = rig(vec![Step::SlowJob("job-a")]);
+    let runner = Double::new(Mode::Gate);
+    let running = start(poller(&rig, runner.clone(), 0.5)?);
+    rig.shared.arrived.notified().await;
+    running.stop_within(CLAIM_GRACE * 2).await?;
+    assert_eq!(runner.started(), ["job-a"]);
+    assert!(runner.saw_shutdown.load(Ordering::SeqCst));
+    Ok(())
 }
 
 #[tokio::test(start_paused = true)]

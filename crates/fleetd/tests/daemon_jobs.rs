@@ -5,6 +5,7 @@
 use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 use std::process::Command;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
@@ -43,6 +44,8 @@ struct Stub(Arc<Worker>);
 
 struct Worker {
     job: Mutex<Option<Job>>,
+    repeat: bool,
+    claims: AtomicUsize,
     reports: mpsc::UnboundedSender<(String, ReportJobRequest)>,
 }
 
@@ -63,16 +66,18 @@ impl FleetWorker for Stub {
         if bearer(request.metadata()) != format!("Bearer {TOKEN}") {
             return Err(Status::unauthenticated("bad token"));
         }
-        let job = self
-            .0
-            .job
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .take()
-            .map(|mut job| {
-                job.r#box = request.into_inner().r#box;
-                job
-            });
+        self.0.claims.fetch_add(1, Ordering::SeqCst);
+        let mut slot = self.0.job.lock().unwrap_or_else(PoisonError::into_inner);
+        let job = if self.0.repeat {
+            slot.clone()
+        } else {
+            slot.take()
+        };
+        drop(slot);
+        let job = job.map(|mut job| {
+            job.r#box = request.into_inner().r#box;
+            job
+        });
         Ok(Response::new(ClaimJobReply {
             lease_s: 60,
             next_in_s: if job.is_some() { 0 } else { 60 },
@@ -118,9 +123,18 @@ struct Launched {
     server: tokio::task::JoinHandle<Result<(), tonic::transport::Error>>,
     origin: std::path::PathBuf,
     box_name: String,
+    worker: Arc<Worker>,
 }
 
 async fn launch(dir: &TempDir, agent: &str) -> Result<Launched, Box<dyn std::error::Error>> {
+    launch_with(dir, agent, None).await
+}
+
+async fn launch_with(
+    dir: &TempDir,
+    agent: &str,
+    repo: Option<String>,
+) -> Result<Launched, Box<dyn std::error::Error>> {
     let origin = dir.path().join("origin.git");
     let seed = dir.path().join("seed");
     std::fs::create_dir(&origin)?;
@@ -144,13 +158,17 @@ async fn launch(dir: &TempDir, agent: &str) -> Result<Launched, Box<dyn std::err
         job: Mutex::new(Some(Job {
             job_id: "job1".into(),
             prompt: "add hello.txt".into(),
-            repo: format!("file://{}", origin.display()),
+            repo: repo
+                .clone()
+                .unwrap_or_else(|| format!("file://{}", origin.display())),
             base_ref: "main".into(),
             open_pr: true,
             attempt: 1,
             ..Job::default()
         })),
         reports,
+        repeat: repo.is_some(),
+        claims: AtomicUsize::new(0),
     });
     let listener = TcpListener::bind(("127.0.0.1", 0)).await?;
     let url = format!("http://{}", listener.local_addr()?);
@@ -193,6 +211,7 @@ async fn launch(dir: &TempDir, agent: &str) -> Result<Launched, Box<dyn std::err
         server,
         origin,
         box_name,
+        worker,
     })
 }
 
@@ -206,6 +225,7 @@ async fn the_daemon_runs_a_claimed_job_to_a_pushed_branch_and_a_pull_request() -
         server,
         origin,
         box_name,
+        ..
     } = launch(&dir, AGENT).await?;
 
     let terminal = tokio::time::timeout(Duration::from_secs(60), async {
@@ -262,5 +282,43 @@ async fn a_job_cut_short_by_shutdown_still_loses_its_worktree_and_scratch() -> T
     server.abort();
     assert!(!jobs.join("job1").exists());
     assert!(!jobs.join(".finish-job1").exists());
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_failed_prepare_backs_the_poller_off() -> TestResult {
+    let dir = TempDir::new()?;
+    let missing = format!("file://{}", dir.path().join("missing.git").display());
+    let Launched {
+        mut inbox,
+        stop,
+        daemon,
+        server,
+        worker,
+        ..
+    } = launch_with(&dir, AGENT, Some(missing)).await?;
+
+    let failed = tokio::time::timeout(Duration::from_secs(30), async {
+        while let Some((_, report)) = inbox.recv().await {
+            if report.terminal_state.is_some() {
+                return Some(report);
+            }
+        }
+        None
+    })
+    .await?
+    .ok_or("no terminal report")?;
+    assert_eq!(failed.terminal_state, Some(JobState::Failed.into()));
+    assert_eq!(
+        failed.error.as_deref(),
+        Some("workspace could not be prepared")
+    );
+
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    let claims = worker.claims.load(Ordering::SeqCst);
+    let _ = stop.send(());
+    tokio::time::timeout(Duration::from_secs(30), daemon).await???;
+    server.abort();
+    assert!(claims <= 8, "claims: {claims}");
     Ok(())
 }

@@ -17,21 +17,25 @@ use crate::poller::{
     GrpcReporter, JobRunner, PollRandom, Poller, RunError, SERVER_URL_ENV, Shutdown, TOKEN_ENV,
     Token, channel,
 };
-use crate::runner::{AgentOutcome, AgentRunner, RunConfig};
+use crate::runner::{AgentOutcome, AgentRunner, Reporter, RunConfig};
 use crate::workspace::{RepoPolicy, Workspace};
 
 const ERR_WORKSPACE: &str = "workspace could not be prepared";
 
 /// The poller the daemon runs.
-pub(crate) type JobPoller = Poller<DaemonRunner>;
+pub(crate) type JobPoller = Poller<DaemonRunner<GrpcReporter>>;
 
 /// Runs one claimed job from checkout to terminal report.
-pub(crate) struct DaemonRunner {
+pub(crate) struct DaemonRunner<R> {
     workspace: Workspace,
-    agent: AgentRunner<GrpcReporter>,
+    agent: AgentRunner<R>,
 }
 
-impl DaemonRunner {
+impl<R: Reporter> DaemonRunner<R> {
+    fn new(workspace: Workspace, agent: AgentRunner<R>) -> Self {
+        Self { workspace, agent }
+    }
+
     async fn execute(&self, job: &Job, path: &Path, shutdown: Shutdown) -> Result<(), RunError> {
         let outcome = self.agent.run(job, path, shutdown.clone()).await?;
         if matches!(outcome, AgentOutcome::Succeeded) {
@@ -43,11 +47,14 @@ impl DaemonRunner {
     }
 }
 
-impl JobRunner for DaemonRunner {
+impl<R: Reporter + 'static> JobRunner for DaemonRunner<R> {
     async fn run(&self, job: Job, shutdown: Shutdown) -> Result<(), RunError> {
         let mut prepare_stop = shutdown.clone();
         let prepared = tokio::select! {
-            prepared = self.workspace.prepare(&job.job_id, &job.repo, &job.base_ref) => prepared,
+            prepared = self.agent.keep_alive(
+                &job,
+                self.workspace.prepare(&job.job_id, &job.repo, &job.base_ref),
+            ) => prepared,
             () = prepare_stop.requested() => {
                 self.agent.fail_job(&job, "agent stopped by daemon shutdown").await;
                 return Err(RunError);
@@ -56,11 +63,11 @@ impl JobRunner for DaemonRunner {
         let Ok(checkout) = prepared else {
             tracing::warn!("job workspace could not be prepared");
             self.agent.fail_job(&job, ERR_WORKSPACE).await;
-            return Ok(());
+            return Err(RunError);
         };
         let result = self.execute(&job, &checkout.path, shutdown).await;
         if self.workspace.remove(&job.job_id, &job.repo).await.is_err() {
-            tracing::warn!(job_id = %job.job_id, "job workspace could not be removed");
+            tracing::warn!("job workspace could not be removed");
         }
         result
     }
@@ -96,10 +103,10 @@ pub(crate) fn build(
         policy = policy.with_file_repos();
     }
     run.repo_policy = policy.clone();
-    let runner = DaemonRunner {
-        workspace: Workspace::new(PathBuf::from(&config.jobs_dir)).with_policy(policy),
-        agent: AgentRunner::new(run, reporter, redactor),
-    };
+    let runner = DaemonRunner::new(
+        Workspace::new(PathBuf::from(&config.jobs_dir)).with_policy(policy),
+        AgentRunner::new(run, reporter, redactor),
+    );
     Poller::with_channel(
         channel,
         &token,
@@ -108,4 +115,67 @@ pub(crate) fn build(
         PollRandom::system(),
     )
     .map(Some)
+}
+
+#[cfg(test)]
+mod tests {
+    use std::os::unix::fs::PermissionsExt;
+    use std::time::Duration;
+
+    use fleet_proto::v1::{ReportJobReply, ReportJobRequest};
+    use tokio::sync::mpsc;
+    use tonic::Status;
+
+    use super::*;
+
+    type TestResult = Result<(), Box<dyn std::error::Error>>;
+
+    struct Recorder(mpsc::UnboundedSender<ReportJobRequest>);
+
+    impl Reporter for Recorder {
+        fn report(
+            &self,
+            request: ReportJobRequest,
+        ) -> impl Future<Output = Result<ReportJobReply, Status>> + Send {
+            let _ = self.0.send(request);
+            std::future::ready(Ok(ReportJobReply::default()))
+        }
+    }
+
+    #[tokio::test]
+    async fn a_slow_prepare_renews_the_lease_before_it_returns() -> TestResult {
+        let dir = tempfile::TempDir::new()?;
+        let git = dir.path().join("slow-git");
+        std::fs::write(&git, "#!/bin/sh\nsleep 1\nexit 1\n")?;
+        std::fs::set_permissions(&git, std::fs::Permissions::from_mode(0o755))?;
+        let mut cfg = RunConfig::new("claude", false);
+        cfg.report_interval = Duration::from_millis(100);
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let runner = DaemonRunner::new(
+            Workspace::new(dir.path().join("jobs")).with_git(&git, Duration::from_secs(10)),
+            AgentRunner::new(cfg, Recorder(tx), Redactor::default()),
+        );
+        let job = Job {
+            job_id: "job1".into(),
+            repo: "file:///nonexistent.git".into(),
+            base_ref: "main".into(),
+            attempt: 1,
+            ..Job::default()
+        };
+        let (_trigger, shutdown) = Shutdown::channel();
+        assert!(runner.run(job, shutdown).await.is_err());
+        let mut renewals = 0;
+        let mut terminal = false;
+        while let Ok(report) = rx.try_recv() {
+            if report.terminal_state.is_some() {
+                terminal = true;
+            } else if report.chunks.is_empty() {
+                assert!(!terminal);
+                renewals += 1;
+            }
+        }
+        assert!(terminal);
+        assert!(renewals >= 2, "renewals: {renewals}");
+        Ok(())
+    }
 }
