@@ -33,7 +33,7 @@ fleetd reads `/etc/fleetd/config.toml` when it exists, then these environment va
 | `FLEETD_SOCKET` | unix socket, mode 0600 | `$RUNTIME_DIRECTORY/fleetd.sock`, else `./fleetd.sock` |
 | `FLEETD_SECRETS_FILE` | env file whose values are scrubbed from every event | `/etc/swarm/secrets.env`, optional |
 | `FLEETD_JOBS_DIR` | job worktrees and git mirrors (the mirror cache lives under it) | `$STATE_DIRECTORY/jobs`, else `./jobs` |
-| `FLEET_SERVER_URL` | server URL. While set, fleetd heartbeats and polls for jobs | unset, no server link |
+| `FLEET_SERVER_URL` | server URL, `http://` or `https://`. While set, fleetd heartbeats and polls for jobs. `https://` uses TLS with the bundled webpki roots and sends the token encrypted to the gateway. A bad or untrusted certificate fails the call within 11 seconds and the error never holds the token. The gateway-to-pod hop depends on the cluster: plaintext h2c unless a `BackendTLSPolicy` or mesh is configured | unset, no server link |
 | `FLEET_TOKEN` | box bearer token for the server. Required when `FLEET_SERVER_URL` is set | unset |
 | `GH_TOKEN` | GitHub PAT for the job push, the private repo mirror fetch and `gh pr create`, passed to `fleetd askpass` and `gh` only | unset |
 

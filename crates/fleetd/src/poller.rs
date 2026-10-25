@@ -8,8 +8,10 @@
 //! Concurrency is one:
 //! the next claim is not issued until the runner returns.
 //!
-//! The server URL must use `http` or `https`. This build of tonic has no TLS feature, so an
-//! `https` URL passes the scheme check and then fails every claim at connect time.
+//! The server URL must use `http` or `https`. An `https` URL gets TLS with the webpki roots,
+//! the same provider and roots as the laptop CLI, and the bearer token travels inside it.
+//! A certificate the roots do not vouch for fails the call. A handshake that never completes is
+//! cut off by [`CALL_BACKSTOP`], because the channel timeout does not cover it.
 
 use std::fmt;
 use std::future::Future;
@@ -23,12 +25,13 @@ use tokio::sync::watch;
 use tonic::codegen::http::Uri;
 use tonic::metadata::MetadataValue;
 use tonic::service::interceptor::InterceptedService;
-use tonic::transport::{Channel, Endpoint};
+use tonic::transport::Channel;
 use tonic::{Code, Request, Status};
 
 use crate::Error;
 use crate::backoff::{Backoff, Random, SystemRandom};
 use crate::runner::Reporter;
+use crate::transport::endpoint;
 
 /// Environment variable that enables the poller and names the server.
 pub const SERVER_URL_ENV: &str = "FLEET_SERVER_URL";
@@ -46,6 +49,10 @@ pub const MAX_IDLE_WAIT: Duration = Duration::from_secs(300);
 
 /// Timeout applied to every `ClaimJob` call.
 pub const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Hard bound on a claim or report call. It exceeds [`REQUEST_TIMEOUT`] so the channel timeout
+/// fires first on a slow reply, and it catches a TLS handshake that never completes.
+pub const CALL_BACKSTOP: Duration = Duration::from_secs(11);
 
 /// Longest the poller waits for a claim already in flight when shutdown starts.
 pub const CLAIM_GRACE: Duration = Duration::from_secs(1);
@@ -210,8 +217,7 @@ impl GrpcReporter {
 impl Reporter for GrpcReporter {
     async fn report(&self, request: ReportJobRequest) -> Result<ReportJobReply, Status> {
         let mut client = self.client.lock().await;
-        client
-            .report_job(request)
+        backstop(client.report_job(request))
             .await
             .map(tonic::Response::into_inner)
     }
@@ -329,13 +335,11 @@ impl<R: JobRunner, G: Random> Poller<R, G> {
     ///
     /// Fails with the gRPC status code when the call fails.
     pub async fn claim(&mut self) -> Result<Claimed, ClaimError> {
-        let reply = self
-            .client
-            .claim_job(ClaimJobRequest {
-                r#box: self.box_name.clone(),
-            })
-            .await?
-            .into_inner();
+        let reply = backstop(self.client.claim_job(ClaimJobRequest {
+            r#box: self.box_name.clone(),
+        }))
+        .await?
+        .into_inner();
         Ok(match reply.job {
             Some(job) => Claimed::Job(Box::new(job)),
             None => Claimed::Idle(self.idle_wait(reply.next_in_s)),
@@ -458,17 +462,32 @@ impl<F: Future<Output = ()>> Stop<'_, F> {
     }
 }
 
+async fn backstop<T>(call: impl Future<Output = Result<T, Status>>) -> Result<T, Status> {
+    tokio::time::timeout(CALL_BACKSTOP, call)
+        .await
+        .unwrap_or_else(|_| Err(Status::deadline_exceeded("call timed out")))
+}
+
 /// A lazy channel to `url` with [`REQUEST_TIMEOUT`] applied to every call.
 ///
 /// # Errors
 ///
 /// Fails when the URL is not an `http` or `https` URL. The error never holds the URL.
 pub fn channel(url: &str) -> Result<Channel, Error> {
+    channel_with_ca(url, None)
+}
+
+/// Like [`channel`], and for an `https` URL also trusts the PEM certificate in `ca_pem`.
+///
+/// # Errors
+///
+/// Fails when the URL is not an `http` or `https` URL. The error never holds the URL.
+pub fn channel_with_ca(url: &str, ca_pem: Option<&[u8]>) -> Result<Channel, Error> {
     let uri: Uri = url.parse().map_err(|_| invalid(SERVER_URL_ENV))?;
     if !matches!(uri.scheme_str(), Some("http" | "https")) {
         return Err(invalid(SERVER_URL_ENV));
     }
-    let endpoint = Endpoint::from_shared(url.to_owned())
+    let endpoint = endpoint(url, ca_pem)
         .map_err(|_| invalid(SERVER_URL_ENV))?
         .timeout(REQUEST_TIMEOUT);
     Ok(endpoint.connect_lazy())

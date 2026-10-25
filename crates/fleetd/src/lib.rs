@@ -27,6 +27,7 @@ pub mod runner;
 mod runtime;
 mod store;
 mod system;
+pub mod transport;
 pub mod workspace;
 
 pub use app::{AppState, hook_router, socket_router};

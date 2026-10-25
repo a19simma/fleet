@@ -11,10 +11,11 @@ use fleet_proto::v1::fleet_ingest_client::FleetIngestClient;
 use tokio::time::{Instant, MissedTickBehavior};
 use tonic::Request;
 use tonic::metadata::{Ascii, MetadataValue};
-use tonic::transport::{Channel, Endpoint};
+use tonic::transport::Channel;
 
 use crate::Store;
 use crate::system::now_ms;
+use crate::transport::endpoint;
 
 /// Time between heartbeats. The server marks a box stale after 90 seconds of silence.
 pub const HEARTBEAT_PERIOD: Duration = Duration::from_secs(30);
@@ -106,8 +107,18 @@ impl Heartbeat {
     /// Fails when the URL is not an endpoint, or the token is empty or not valid in a
     /// header.
     pub fn new(url: &str, token: &str) -> Result<Self, TargetError> {
-        let endpoint =
-            Endpoint::from_shared(url.to_owned()).map_err(|_| TargetError::InvalidUrl)?;
+        Self::new_with_ca(url, token, None)
+    }
+
+    /// Like [`Heartbeat::new`], and for an `https` URL also trusts the PEM certificate in
+    /// `ca_pem`.
+    ///
+    /// # Errors
+    ///
+    /// Fails when the URL is not an endpoint, or the token is empty or not valid in a
+    /// header.
+    pub fn new_with_ca(url: &str, token: &str, ca_pem: Option<&[u8]>) -> Result<Self, TargetError> {
+        let endpoint = endpoint(url, ca_pem).map_err(|_| TargetError::InvalidUrl)?;
         if token.is_empty() {
             return Err(TargetError::MissingToken);
         }

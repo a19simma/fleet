@@ -24,7 +24,7 @@ path = "src/main.rs"
 clap.workspace = true
 fleet-proto.workspace = true
 tokio.workspace = true
-tonic = { workspace = true, features = ["tls-ring", "tls-webpki-roots"] }
+tonic.workspace = true
 
 [dev-dependencies]
 rcgen = { version = "0.14.10", default-features = false, features = ["pem", "ring"] }
