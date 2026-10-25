@@ -814,7 +814,10 @@ impl<R: Reporter> AgentRunner<R> {
         let mut open = true;
         let mut status = None;
         let mut drain: Option<Pin<Box<Sleep>>> = None;
-        let mut tick = tokio::time::interval(self.config.flush_interval);
+        let mut tick = tokio::time::interval_at(
+            Instant::now() + self.config.flush_interval,
+            self.config.flush_interval,
+        );
         tick.set_missed_tick_behavior(MissedTickBehavior::Delay);
         let status = loop {
             if !open && let Some(done) = status.take() {

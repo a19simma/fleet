@@ -378,16 +378,18 @@ async fn runner_resends_chunks_after_a_failed_report() -> TestResult {
 async fn runner_caps_a_report_by_chunk_count() -> TestResult {
     common::bounded(Box::pin(async {
         let dir = TempDir::new()?;
-        let mut cfg = config(false);
-        cfg.report_interval = Duration::from_millis(50);
-        let (agent, mut rx) = runner(cfg, 2);
+        let (agent, mut rx) = slow_flush(0);
         let (_trigger, shutdown) = Shutdown::channel();
         agent.run(&job("burst:"), dir.path(), shutdown).await?;
         let requests = drain(&mut rx);
-        assert!(
-            requests
-                .iter()
-                .all(|r| r.chunks.len() <= MAX_CHUNKS_PER_REPORT)
+        let sizes: Vec<_> = requests.iter().map(|r| r.chunks.len()).collect();
+        assert_eq!(
+            sizes,
+            [
+                MAX_CHUNKS_PER_REPORT,
+                MAX_CHUNKS_PER_REPORT,
+                700 - 2 * MAX_CHUNKS_PER_REPORT
+            ]
         );
         let seqs: Vec<_> = requests
             .iter()
