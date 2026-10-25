@@ -152,7 +152,9 @@ mod tests {
         cfg.report_interval = Duration::from_millis(100);
         let (tx, mut rx) = mpsc::unbounded_channel();
         let runner = DaemonRunner::new(
-            Workspace::new(dir.path().join("jobs")).with_git(&git, Duration::from_secs(10)),
+            Workspace::new(dir.path().join("jobs"))
+                .with_policy(RepoPolicy::new(Vec::<String>::new()).with_file_repos())
+                .with_git(&git, Duration::from_secs(10)),
             AgentRunner::new(cfg, Recorder(tx), Redactor::default()),
         );
         let job = Job {
