@@ -198,6 +198,10 @@ fn worker_error(err: &StoreError) -> Status {
         }
         StoreError::InvalidChunk => Status::invalid_argument("invalid transcript chunk"),
         StoreError::InvalidJob(_) => Status::invalid_argument("invalid job report"),
+        StoreError::InvalidTelemetry => Status::invalid_argument("invalid job telemetry"),
+        StoreError::TelemetryTooLarge => {
+            Status::invalid_argument("too many telemetry events in one report")
+        }
         StoreError::NotFound => Status::not_found("job not found"),
         other => storage_unavailable(other),
     }
@@ -378,6 +382,8 @@ mod tests {
         let cases = [
             (StoreError::StaleReport, Code::FailedPrecondition),
             (StoreError::InvalidChunk, Code::InvalidArgument),
+            (StoreError::InvalidTelemetry, Code::InvalidArgument),
+            (StoreError::TelemetryTooLarge, Code::InvalidArgument),
             (
                 StoreError::InvalidJob(JobInvalid::PrUrl),
                 Code::InvalidArgument,

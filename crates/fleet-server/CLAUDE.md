@@ -6,3 +6,4 @@
 - **Reaper tests.** Postgres and tokio paused time do not mix. `expired_lease_becomes_lost` uses a 1 s lease, a 100 ms reaper period, real time, a `Notify` the reaper signals, and a 5 s `timeout`. Never `sleep`.
 - **Changed claims.** When a commit changes a claim, grep the whole tree (docs, README, ADRs, doc comments) for the old wording and fix every present-tense hit.
 - **Box names in tests.** The validator only accepts `box-<digits>`, but verify.sh's private-pattern grep rejects that literal in source. Build names at runtime, as `format!("box-{n}")`, never write the literal.
+- **Wide row asserts.** Tuples above 12 fields lack `Debug` and trip `clippy::type_complexity`. Read wide rows in tests as `SELECT (to_jsonb(t) - 'job_id')::text` and compare with `serde_json::json!`.

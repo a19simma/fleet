@@ -8,3 +8,4 @@ pub mod reaper;
 pub mod service;
 pub mod store;
 pub mod supervise;
+pub mod telemetry;

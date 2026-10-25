@@ -10,6 +10,18 @@ pub use convert::{ConvertError, queued_event, validate_box};
 /// Most transcript chunks one report may carry. The server rejects more.
 pub const MAX_CHUNKS_PER_REPORT: usize = 256;
 
+/// Most telemetry events one report may carry. The server rejects more.
+pub const MAX_EVENTS_PER_REPORT: usize = 256;
+
+/// Telemetry events stored per job. The server drops events with a `seq` at or above this.
+pub const MAX_EVENTS_PER_JOB: u32 = 2000;
+
+/// Longest stored `cmd` of a telemetry event, in bytes.
+pub const MAX_EVENT_CMD_BYTES: usize = 512;
+
+/// Longest stored `detail` of a telemetry event, in bytes.
+pub const MAX_EVENT_DETAIL_BYTES: usize = 1024;
+
 /// Generated `fleet.v1` messages and services.
 #[expect(
     missing_docs,

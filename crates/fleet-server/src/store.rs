@@ -18,6 +18,7 @@ use crate::jobs::{
     MAX_TRANSCRIPT_ROWS, MIN_CHUNK_COST_BYTES, validate_job_id, validate_submit, validate_terminal,
 };
 use crate::projection::{Projection, State, project};
+use crate::telemetry;
 
 const INSERT_EVENTS: &str = "\
 INSERT INTO events (box, id, boot_id, seq, schema_version, source, kind, captured_at_ms, \
@@ -252,6 +253,10 @@ pub enum StoreError {
     /// A transcript chunk has a sequence number or text the store cannot keep. No input is
     /// kept.
     InvalidChunk,
+    /// A telemetry event or summary has a value the store cannot keep. No input is kept.
+    InvalidTelemetry,
+    /// A report carries more telemetry events than [`fleet_proto::MAX_EVENTS_PER_REPORT`].
+    TelemetryTooLarge,
     /// A get, cancel or transcript read named a job that does not exist. The handler maps
     /// this to gRPC `NOT_FOUND`. No input is kept.
     NotFound,
@@ -267,6 +272,8 @@ impl fmt::Display for StoreError {
             Self::KeyConflict => f.write_str("idempotency key already used with other parameters"),
             Self::StaleReport => f.write_str("job is not running here at this attempt"),
             Self::InvalidChunk => f.write_str("invalid transcript chunk"),
+            Self::InvalidTelemetry => f.write_str("invalid job telemetry"),
+            Self::TelemetryTooLarge => f.write_str("too many telemetry events in one report"),
             Self::NotFound => f.write_str("job not found"),
         }
     }
@@ -282,6 +289,8 @@ impl std::error::Error for StoreError {
             | Self::KeyConflict
             | Self::StaleReport
             | Self::InvalidChunk
+            | Self::InvalidTelemetry
+            | Self::TelemetryTooLarge
             | Self::NotFound => None,
         }
     }
@@ -871,12 +880,18 @@ impl Store {
     ///
     /// A `CANCELLED` final report matches only when `cancel_requested` is set.
     ///
+    /// Telemetry `events` and the `summary` go in through [`crate::telemetry`] in the same
+    /// transaction, so only the holder of the running job can write them. A repeated event
+    /// `seq` is skipped, and the summary replaces the stored snapshot.
+    ///
     /// # Errors
     ///
     /// Returns [`StoreError::InvalidJob`] when the terminal state, `pr_url`, `error` or
     /// `branch` is invalid, [`StoreError::InvalidChunk`] when a report has too many chunks,
     /// a `seq` is 0, out of the database range or not increasing, or a chunk text holds a
-    /// NUL character, [`StoreError::StaleReport`] when no running row matches the job,
+    /// NUL character, [`StoreError::TelemetryTooLarge`] when a report carries too many
+    /// events, [`StoreError::InvalidTelemetry`] when an event or the summary holds a value
+    /// the store cannot keep, [`StoreError::StaleReport`] when no running row matches the job,
     /// attempt and box (a reaped `LOST` row no longer matches) or a `CANCELLED` report
     /// arrives without a cancel request, and [`StoreError::Database`] when a statement
     /// fails. A failed call stores nothing.
@@ -889,6 +904,7 @@ impl Store {
         let attempt = i32::try_from(request.attempt).map_err(|_| StoreError::StaleReport)?;
         let terminal = validate_terminal(request)?;
         let rows = check_chunks(&request.chunks)?;
+        let telemetry = telemetry::check(&request.events, request.summary.as_ref())?;
         let phase: String = request.phase.chars().take(MAX_PHASE_CHARS).collect();
         let progress: String = request.progress.chars().take(MAX_PROGRESS_CHARS).collect();
         let mut tx = self.pool.begin().await?;
@@ -943,6 +959,7 @@ impl Store {
                     .await?;
             }
         }
+        telemetry::persist(&mut tx, job_id, &telemetry).await?;
         let mut acked: i64 = sqlx::query_scalar(TRANSCRIPT_PREFIX)
             .bind(job_id)
             .fetch_one(&mut *tx)
