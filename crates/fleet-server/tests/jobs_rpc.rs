@@ -10,8 +10,9 @@ use std::time::Duration;
 use fleet_core::BoxName;
 use fleet_proto::v1::fleet_jobs_client::FleetJobsClient;
 use fleet_proto::v1::{
-    CancelJobRequest, GetJobRequest, JobState, ListJobsRequest, ReadTranscriptRequest,
-    ReportJobRequest, SubmitJobRequest, TranscriptChunk,
+    CancelJobRequest, GetJobRequest, JobEvent, JobEventKind, JobState, JobSummary, ListJobsRequest,
+    ReadJobEventsRequest, ReadTranscriptRequest, ReportJobRequest, SubmitJobRequest,
+    TranscriptChunk,
 };
 use fleet_server::auth::BearerAuth;
 use fleet_server::config::Token;
@@ -430,4 +431,293 @@ async fn list_limit_is_capped(pool: PgPool) {
         .into_inner()
         .jobs;
     assert_eq!(default.len(), 50);
+}
+
+fn events_request(job_id: &str, after_seq: Option<u32>, limit: u32) -> ReadJobEventsRequest {
+    ReadJobEventsRequest {
+        job_id: job_id.to_owned(),
+        after_seq,
+        limit,
+    }
+}
+
+fn tool_event(seq: u32) -> JobEvent {
+    JobEvent {
+        seq,
+        ts_ms: 5_000 + u64::from(seq),
+        kind: JobEventKind::Tool.into(),
+        ..JobEvent::default()
+    }
+}
+
+async fn send_events(store: &Store, job_id: &str, seqs: std::ops::Range<u32>) {
+    for start in seqs.clone().step_by(200) {
+        let end = (start + 200).min(seqs.end);
+        let mut request = report(job_id, Vec::new(), false);
+        request.events = (start..end).map(tool_event).collect();
+        store.report_job(&boxed(1), &request).await.unwrap();
+    }
+}
+
+async fn running_job(store: &Store, jobs: &mut Jobs) -> String {
+    let job = jobs
+        .submit_job(submit_request("k1"))
+        .await
+        .unwrap()
+        .into_inner();
+    store.claim_job(&boxed(1)).await.unwrap().unwrap();
+    job.job_id
+}
+
+fn seqs(events: &[JobEvent]) -> Vec<u32> {
+    events.iter().map(|event| event.seq).collect()
+}
+
+#[sqlx::test]
+async fn read_job_events_pages_by_keyset(pool: PgPool) {
+    let store = store(pool).await;
+    let mut jobs = spawn(&store);
+    let id = running_job(&store, &mut jobs).await;
+
+    let none = timeout(WAIT, jobs.read_job_events(events_request(&id, None, 0)))
+        .await
+        .unwrap()
+        .unwrap()
+        .into_inner();
+    assert_eq!(seqs(&none.events), Vec::<u32>::new());
+    assert_eq!(none.next_seq, 0);
+
+    send_events(&store, &id, 0..5).await;
+
+    let first = jobs
+        .read_job_events(events_request(&id, None, 2))
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(seqs(&first.events), [0, 1]);
+    assert_eq!(first.next_seq, 1);
+
+    let second = jobs
+        .read_job_events(events_request(&id, Some(first.next_seq), 2))
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(seqs(&second.events), [2, 3]);
+    assert_eq!(second.next_seq, 3);
+
+    let third = jobs
+        .read_job_events(events_request(&id, Some(3), 2))
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(seqs(&third.events), [4]);
+    assert_eq!(third.next_seq, 4);
+
+    let at_end = jobs
+        .read_job_events(events_request(&id, Some(4), 2))
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(seqs(&at_end.events), Vec::<u32>::new());
+    assert_eq!(at_end.next_seq, 4);
+
+    let past = jobs
+        .read_job_events(events_request(&id, Some(99), 0))
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(seqs(&past.events), Vec::<u32>::new());
+    assert_eq!(past.next_seq, 99);
+
+    let zero = jobs
+        .read_job_events(events_request(&id, Some(0), 0))
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(seqs(&zero.events), [1, 2, 3, 4]);
+}
+
+#[sqlx::test]
+async fn read_job_events_clamps_the_limit(pool: PgPool) {
+    let store = store(pool).await;
+    let mut jobs = spawn(&store);
+    let id = running_job(&store, &mut jobs).await;
+    send_events(&store, &id, 0..1_100).await;
+
+    let default = jobs
+        .read_job_events(events_request(&id, None, 0))
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(default.events.len(), 200);
+    assert_eq!(default.next_seq, 199);
+
+    let one = jobs
+        .read_job_events(events_request(&id, None, 1))
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(one.events.len(), 1);
+
+    let exact = jobs
+        .read_job_events(events_request(&id, None, 1_000))
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(exact.events.len(), 1_000);
+    assert_eq!(exact.next_seq, 999);
+
+    let clamped = jobs
+        .read_job_events(events_request(&id, None, 5_000))
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(clamped.events.len(), 1_000);
+    assert_eq!(clamped.next_seq, 999);
+
+    let rest = jobs
+        .read_job_events(events_request(&id, Some(999), 5_000))
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(rest.events.len(), 100);
+    assert_eq!(rest.next_seq, 1_099);
+}
+
+#[sqlx::test]
+async fn read_job_events_returns_every_field(pool: PgPool) {
+    let store = store(pool).await;
+    let mut jobs = spawn(&store);
+    let id = running_job(&store, &mut jobs).await;
+    let full = JobEvent {
+        seq: 7,
+        ts_ms: 1_234,
+        kind: JobEventKind::Tool.into(),
+        tool_use_id: Some("tu1".to_owned()),
+        tool: Some("Bash".to_owned()),
+        ok: Some(false),
+        exit_code: Some(-2),
+        dur_ms: Some(31),
+        out_bytes: Some(4_096),
+        out_hash: Some("ab12".to_owned()),
+        cmd: Some("ls -la".to_owned()),
+        detail: Some("note".to_owned()),
+    };
+    let kinds = [
+        JobEventKind::Denial,
+        JobEventKind::ApiRetry,
+        JobEventKind::Phase,
+        JobEventKind::Stuck,
+    ];
+    let mut request = report(&id, Vec::new(), false);
+    request.events = vec![full.clone()];
+    request
+        .events
+        .extend(kinds.iter().enumerate().map(|(i, kind)| JobEvent {
+            seq: 8 + u32::try_from(i).unwrap(),
+            kind: (*kind).into(),
+            ..JobEvent::default()
+        }));
+    store.report_job(&boxed(1), &request).await.unwrap();
+
+    let reply = jobs
+        .read_job_events(events_request(&id, None, 0))
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(reply.events[0], full);
+    let got: Vec<_> = reply.events[1..].iter().map(JobEvent::kind).collect();
+    assert_eq!(got, kinds);
+    assert_eq!(reply.events[1].tool, None);
+    assert_eq!(reply.events[1].ok, None);
+    assert_eq!(reply.events[1].dur_ms, None);
+}
+
+#[sqlx::test]
+async fn read_job_events_rejects_unknown_and_invalid_jobs(pool: PgPool) {
+    let store = store(pool.clone()).await;
+    let mut jobs = spawn(&store);
+    let id = running_job(&store, &mut jobs).await;
+
+    let missing = jobs
+        .read_job_events(events_request("01ARZ3NDEKTSV4RRFFQ69G5FAV", None, 0))
+        .await
+        .unwrap_err();
+    assert_eq!(missing.code(), Code::NotFound);
+    let empty = jobs
+        .read_job_events(events_request("", None, 0))
+        .await
+        .unwrap_err();
+    assert_eq!(empty.code(), Code::InvalidArgument);
+    let bad = jobs
+        .read_job_events(events_request("bad id\u{0}", None, 0))
+        .await
+        .unwrap_err();
+    assert_eq!(bad.code(), Code::InvalidArgument);
+    assert!(!bad.message().contains("bad id"));
+
+    pool.close().await;
+    let down = jobs
+        .read_job_events(events_request(&id, None, 0))
+        .await
+        .unwrap_err();
+    assert_eq!(down.code(), Code::Unavailable);
+    assert_eq!(down.message(), "storage unavailable");
+}
+
+#[sqlx::test]
+async fn get_job_carries_the_summary_only_when_stored(pool: PgPool) {
+    let store = store(pool).await;
+    let mut jobs = spawn(&store);
+    let id = running_job(&store, &mut jobs).await;
+
+    let before = jobs.get_job(get(&id)).await.unwrap().into_inner();
+    assert_eq!(before.summary, None);
+
+    let summary = JobSummary {
+        turns: Some(1),
+        duration_ms: Some(2),
+        duration_api_ms: Some(3),
+        stop_reason: Some("end_turn".to_owned()),
+        result_subtype: Some("success".to_owned()),
+        cost_est_usd: Some(0.25),
+        tokens_in: Some(4),
+        tokens_out: Some(5),
+        tokens_cache_read: Some(6),
+        tokens_cache_write: Some(7),
+        tool_calls: Some(8),
+        tool_errors: Some(9),
+        bash_calls: Some(10),
+        bash_nonzero: Some(11),
+        denials: Some(12),
+        api_retries: Some(13),
+        first_edit_ms: Some(0),
+        complete: true,
+        missing: vec!["a".to_owned(), "b".to_owned()],
+    };
+    let mut request = report(&id, Vec::new(), false);
+    request.summary = Some(summary.clone());
+    store.report_job(&boxed(1), &request).await.unwrap();
+
+    let after = jobs.get_job(get(&id)).await.unwrap().into_inner();
+    assert_eq!(after.summary, Some(summary));
+
+    let sparse = JobSummary {
+        turns: Some(2),
+        complete: false,
+        missing: vec!["cost_est_usd".to_owned()],
+        ..JobSummary::default()
+    };
+    let mut request = report(&id, Vec::new(), false);
+    request.summary = Some(sparse.clone());
+    store.report_job(&boxed(1), &request).await.unwrap();
+    let replaced = jobs.get_job(get(&id)).await.unwrap().into_inner();
+    assert_eq!(replaced.summary, Some(sparse));
+    let listed = jobs
+        .list_jobs(ListJobsRequest::default())
+        .await
+        .unwrap()
+        .into_inner()
+        .jobs;
+    assert_eq!(listed[0].summary, None);
 }

@@ -6,8 +6,8 @@ use std::time::Duration;
 
 use fleet_core::{BoxName, Envelope, EventId, SCHEMA_VERSION};
 use fleet_proto::v1::{
-    BoxStatus, BoxView, HeartbeatRequest, Job, JobState, ReadTranscriptReply, ReportJobReply,
-    ReportJobRequest, SessionState, SessionView, SubmitJobRequest, TranscriptChunk,
+    BoxStatus, BoxView, HeartbeatRequest, Job, JobState, ReadJobEventsReply, ReadTranscriptReply,
+    ReportJobReply, ReportJobRequest, SessionState, SessionView, SubmitJobRequest, TranscriptChunk,
 };
 use serde_json::{Value, json};
 use sqlx::postgres::PgRow;
@@ -227,6 +227,10 @@ pub const MAX_LIST_LIMIT: u32 = 200;
 pub const DEFAULT_TRANSCRIPT_LIMIT: u32 = 100;
 /// Most chunks `read_transcript` returns.
 pub const MAX_TRANSCRIPT_LIMIT: u32 = 500;
+/// Events `read_job_events` returns when the request sets no limit.
+pub const DEFAULT_EVENTS_LIMIT: u32 = 200;
+/// Most events `read_job_events` returns.
+pub const MAX_EVENTS_LIMIT: u32 = 1000;
 
 /// Last millisecond of the year 9999, the largest timestamp an event may carry.
 pub const MAX_TS_MS: u64 = 253_402_300_799_999;
@@ -397,7 +401,7 @@ fn job_state_text(state: JobState) -> &'static str {
     }
 }
 
-fn ms(value: Option<i64>, field: &'static str) -> Result<Option<u64>, StoreError> {
+pub(crate) fn ms(value: Option<i64>, field: &'static str) -> Result<Option<u64>, StoreError> {
     value.map(|v| count(v, field)).transpose()
 }
 
@@ -427,6 +431,7 @@ fn job_from_row(row: &PgRow) -> Result<Job, StoreError> {
         claimed_at_ms: ms(row.try_get("claimed_ms")?, "claimed_at")?,
         finished_at_ms: ms(row.try_get("finished_ms")?, "finished_at")?,
         phase: row.try_get("phase")?,
+        summary: None,
     })
 }
 
@@ -514,7 +519,7 @@ fn prepare(seq: u64, env: &Envelope) -> Result<Prepared, String> {
     })
 }
 
-fn count(value: i64, field: &'static str) -> Result<u64, StoreError> {
+pub(crate) fn count(value: i64, field: &'static str) -> Result<u64, StoreError> {
     u64::try_from(value).map_err(|_| StoreError::OutOfRange(field))
 }
 
@@ -827,6 +832,47 @@ impl Store {
             chunks,
             done: ended && !more,
         })
+    }
+
+    /// Returns the job with `job_id` and its telemetry summary, when one is stored.
+    ///
+    /// # Errors
+    ///
+    /// Returns the errors of [`Store::get_job`].
+    pub async fn get_job_with_summary(&self, job_id: &str) -> Result<Job, StoreError> {
+        let mut job = self.get_job(job_id).await?;
+        job.summary = telemetry::read_summary(&self.pool, job_id).await?;
+        Ok(job)
+    }
+
+    /// Reads telemetry events of a job after `after_seq`, in `seq` order.
+    ///
+    /// `after_seq` is exclusive and `None` starts at the first event, whose `seq` may be 0.
+    /// A `limit` of 0 means [`DEFAULT_EVENTS_LIMIT`]; larger values are cut to
+    /// [`MAX_EVENTS_LIMIT`]. `next_seq` is the `seq` of the last event returned, else
+    /// `after_seq` (0 when unset): a client keeps its own cursor and stops on an empty page.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StoreError::InvalidJob`] when `job_id` fails validation,
+    /// [`StoreError::NotFound`] when no job has it, and [`StoreError::Database`] when a
+    /// query fails.
+    pub async fn read_job_events(
+        &self,
+        job_id: &str,
+        after_seq: Option<u32>,
+        limit: u32,
+    ) -> Result<ReadJobEventsReply, StoreError> {
+        self.get_job(job_id).await?;
+        let limit = match limit {
+            0 => DEFAULT_EVENTS_LIMIT,
+            n => n.min(MAX_EVENTS_LIMIT),
+        };
+        let events = telemetry::read_events(&self.pool, job_id, after_seq, limit).await?;
+        let next_seq = events
+            .last()
+            .map_or_else(|| after_seq.unwrap_or(0), |event| event.seq);
+        Ok(ReadJobEventsReply { events, next_seq })
     }
 
     /// Cancels a job.

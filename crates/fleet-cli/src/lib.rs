@@ -3,6 +3,7 @@
 pub mod config;
 pub mod list;
 pub mod logs;
+pub mod telemetry;
 pub mod watch;
 
 use std::fmt;
@@ -90,6 +91,9 @@ pub enum Command {
     Status {
         /// Job id.
         id: String,
+        /// Also list the job's tool calls.
+        #[arg(long)]
+        tools: bool,
     },
     /// Follow a job until it ends; exits 0 only on success.
     Watch {
@@ -339,7 +343,11 @@ fn write_status(out: &mut impl Write, job: &Job) -> std::io::Result<()> {
     writeln!(out, "branch: {}", or_dash(job.branch.as_ref()))?;
     writeln!(out, "pr_url: {}", or_dash(job.pr_url.as_ref()))?;
     writeln!(out, "exit_code: {}", or_dash(job.exit_code.as_ref()))?;
-    writeln!(out, "error: {}", free_or_dash(job.error.as_ref()))
+    writeln!(out, "error: {}", free_or_dash(job.error.as_ref()))?;
+    if let Some(summary) = &job.summary {
+        telemetry::write_summary(out, summary)?;
+    }
+    Ok(())
 }
 
 fn read_prompt(prompt: String, stdin: &mut impl Read) -> Result<String, CliError> {
@@ -466,13 +474,16 @@ pub async fn run_with(
                 )?;
             }
         }
-        Command::Status { id } => {
+        Command::Status { id, tools } => {
             let mut client = session(server, insecure, lookup, timeouts).await?.jobs;
             let job = client
-                .get_job(GetJobRequest { job_id: id })
+                .get_job(GetJobRequest { job_id: id.clone() })
                 .await?
                 .into_inner();
             write_status(out, &job)?;
+            if tools {
+                telemetry::write_tools(&mut client, &id, out).await?;
+            }
         }
         Command::Logs { id, follow } => {
             let client = session(server, insecure, lookup, timeouts).await?.jobs;

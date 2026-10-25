@@ -36,6 +36,13 @@ impl FleetJobs for Empty {
     async fn cancel_job(&self, _: Request<CancelJobRequest>) -> Result<Response<Job>, Status> {
         Err(Status::unimplemented("not used"))
     }
+    async fn read_job_events(
+        &self,
+        _: Request<fleet_proto::v1::ReadJobEventsRequest>,
+    ) -> Result<Response<fleet_proto::v1::ReadJobEventsReply>, Status> {
+        Err(Status::unimplemented("not used"))
+    }
+
     async fn read_transcript(
         &self,
         _: Request<ReadTranscriptRequest>,

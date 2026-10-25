@@ -49,7 +49,7 @@ Decided 2026-10-24. The phases below stay as the full map. v1 is the smallest sl
 In v1:
 
 - fleetd: loopback http hook listener, SQLite queue, forwarder, session registry and reconciler (see Recovery and reconcile), workmux watcher using `workmux wait` exit codes, pueue poll plus the finish callback (id and group only), heartbeat. The unix socket stays, because the `fleetd pueue-callback` subcommand writes to it.
-- Server: `FleetIngest` (`PushEvents`, `Heartbeat`), `FleetQuery.ListFleet` and `FleetWorker` (`ClaimJob`, `ReportJob`) and `FleetJobs` (`SubmitJob`, `GetJob`, `ListJobs`, `CancelJob`, `ReadTranscript`) on Postgres, two scoped bearer tokens (see Authorization).
+- Server: `FleetIngest` (`PushEvents`, `Heartbeat`), `FleetQuery.ListFleet` and `FleetWorker` (`ClaimJob`, `ReportJob`) and `FleetJobs` (`SubmitJob`, `GetJob`, `ListJobs`, `CancelJob`, `ReadTranscript`, `ReadJobEvents`) on Postgres, two scoped bearer tokens (see Authorization).
 - CLI: `fleet list` and `fleet watch`. `fleet watch` polls `ListFleet` from the client and prints changes (decision 10).
 
 Out of v1: drain and `SetDrain`, the KEDA seam, `fleet-job`, `GetPreview`, `ListEvents`, the `Watch` rpc, and transcript summaries beyond the last assistant text. v1 has no Job cost, since cost arrives only through `fleet-job` (decision 12, deferred).

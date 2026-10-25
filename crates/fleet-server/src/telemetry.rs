@@ -4,9 +4,9 @@ use fleet_proto::v1::{JobEvent, JobEventKind, JobSummary};
 use fleet_proto::{
     MAX_EVENT_CMD_BYTES, MAX_EVENT_DETAIL_BYTES, MAX_EVENTS_PER_JOB, MAX_EVENTS_PER_REPORT,
 };
-use sqlx::{Postgres, Transaction};
+use sqlx::{PgPool, Postgres, Row, Transaction};
 
-use crate::store::{MAX_TS_MS, StoreError};
+use crate::store::{MAX_TS_MS, StoreError, count, ms};
 
 /// Longest stored tool name and tool call id, in bytes.
 const MAX_NAME_BYTES: usize = 128;
@@ -45,6 +45,17 @@ ON CONFLICT (job_id) DO UPDATE SET turns = EXCLUDED.turns, \
     bash_nonzero = EXCLUDED.bash_nonzero, denials = EXCLUDED.denials, \
     api_retries = EXCLUDED.api_retries, first_edit_ms = EXCLUDED.first_edit_ms, \
     complete = EXCLUDED.complete, missing = EXCLUDED.missing, updated_at = now()";
+
+const READ_JOB_EVENTS: &str = "\
+SELECT seq, ts_ms, kind, tool_use_id, tool, ok, exit_code, dur_ms, out_bytes, out_hash, cmd, \
+    detail \
+FROM job_event WHERE job_id = $1 AND seq > $2::bigint ORDER BY seq LIMIT $3";
+
+const READ_JOB_SUMMARY: &str = "\
+SELECT turns, duration_ms, duration_api_ms, stop_reason, result_subtype, cost_est_usd, \
+    tokens_in, tokens_out, tokens_cache_read, tokens_cache_write, tool_calls, tool_errors, \
+    bash_calls, bash_nonzero, denials, api_retries, first_edit_ms, complete, missing \
+FROM job_summary WHERE job_id = $1";
 
 #[derive(Default)]
 struct EventColumns {
@@ -280,4 +291,91 @@ pub(crate) async fn persist(
             .await?;
     }
     Ok(())
+}
+
+fn kind_from_name(name: &str) -> Result<JobEventKind, StoreError> {
+    match name {
+        "tool" => Ok(JobEventKind::Tool),
+        "denial" => Ok(JobEventKind::Denial),
+        "api_retry" => Ok(JobEventKind::ApiRetry),
+        "phase" => Ok(JobEventKind::Phase),
+        "stuck" => Ok(JobEventKind::Stuck),
+        _ => Err(StoreError::OutOfRange("kind")),
+    }
+}
+
+/// Reads up to `limit` events of a job in `seq` order.
+///
+/// `after` is exclusive; `None` starts at the first event, whose `seq` may be 0. The job
+/// must exist: the caller checks it.
+pub(crate) async fn read_events(
+    pool: &PgPool,
+    job_id: &str,
+    after: Option<u32>,
+    limit: u32,
+) -> Result<Vec<JobEvent>, StoreError> {
+    let after = after.map_or(-1, i64::from);
+    let rows = sqlx::query(READ_JOB_EVENTS)
+        .bind(job_id)
+        .bind(after)
+        .bind(i64::from(limit))
+        .fetch_all(pool)
+        .await?;
+    rows.iter()
+        .map(|row| {
+            let kind: String = row.try_get("kind")?;
+            Ok(JobEvent {
+                seq: u32::try_from(row.try_get::<i32, _>("seq")?)
+                    .map_err(|_| StoreError::OutOfRange("seq"))?,
+                ts_ms: count(row.try_get("ts_ms")?, "ts_ms")?,
+                kind: kind_from_name(&kind)?.into(),
+                tool_use_id: row.try_get("tool_use_id")?,
+                tool: row.try_get("tool")?,
+                ok: row.try_get("ok")?,
+                exit_code: row.try_get("exit_code")?,
+                dur_ms: ms(row.try_get("dur_ms")?, "dur_ms")?,
+                out_bytes: ms(row.try_get("out_bytes")?, "out_bytes")?,
+                out_hash: row.try_get("out_hash")?,
+                cmd: row.try_get("cmd")?,
+                detail: row.try_get("detail")?,
+            })
+        })
+        .collect()
+}
+
+/// Reads the stored summary of a job, or `None` when no report has carried one.
+pub(crate) async fn read_summary(
+    pool: &PgPool,
+    job_id: &str,
+) -> Result<Option<JobSummary>, StoreError> {
+    let Some(row) = sqlx::query(READ_JOB_SUMMARY)
+        .bind(job_id)
+        .fetch_optional(pool)
+        .await?
+    else {
+        return Ok(None);
+    };
+    let figure =
+        |name: &'static str| -> Result<Option<u64>, StoreError> { ms(row.try_get(name)?, name) };
+    Ok(Some(JobSummary {
+        turns: figure("turns")?,
+        duration_ms: figure("duration_ms")?,
+        duration_api_ms: figure("duration_api_ms")?,
+        stop_reason: row.try_get("stop_reason")?,
+        result_subtype: row.try_get("result_subtype")?,
+        cost_est_usd: row.try_get("cost_est_usd")?,
+        tokens_in: figure("tokens_in")?,
+        tokens_out: figure("tokens_out")?,
+        tokens_cache_read: figure("tokens_cache_read")?,
+        tokens_cache_write: figure("tokens_cache_write")?,
+        tool_calls: figure("tool_calls")?,
+        tool_errors: figure("tool_errors")?,
+        bash_calls: figure("bash_calls")?,
+        bash_nonzero: figure("bash_nonzero")?,
+        denials: figure("denials")?,
+        api_retries: figure("api_retries")?,
+        first_edit_ms: figure("first_edit_ms")?,
+        complete: row.try_get("complete")?,
+        missing: row.try_get("missing")?,
+    }))
 }

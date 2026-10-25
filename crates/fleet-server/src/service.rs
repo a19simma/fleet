@@ -10,8 +10,9 @@ use fleet_proto::v1::fleet_worker_server::{FleetWorker, FleetWorkerServer};
 use fleet_proto::v1::{
     CancelJobRequest, ClaimJobReply, ClaimJobRequest, GetJobRequest, HeartbeatReply,
     HeartbeatRequest, Job, ListFleetReply, ListFleetRequest, ListJobsReply, ListJobsRequest,
-    PushEventsReply, PushEventsRequest, QueuedEvent, ReadTranscriptReply, ReadTranscriptRequest,
-    Rejection, ReportJobReply, ReportJobRequest, SubmitJobRequest,
+    PushEventsReply, PushEventsRequest, QueuedEvent, ReadJobEventsReply, ReadJobEventsRequest,
+    ReadTranscriptReply, ReadTranscriptRequest, Rejection, ReportJobReply, ReportJobRequest,
+    SubmitJobRequest,
 };
 use fleet_proto::{ConvertError, validate_box};
 use tonic::transport::server::Router;
@@ -278,7 +279,7 @@ impl FleetJobs for FleetService {
     async fn get_job(&self, request: Request<GetJobRequest>) -> Result<Response<Job>, Status> {
         let job = self
             .store
-            .get_job(&request.into_inner().job_id)
+            .get_job_with_summary(&request.into_inner().job_id)
             .await
             .map_err(|err| jobs_error(&err))?;
         Ok(Response::new(job))
@@ -317,6 +318,19 @@ impl FleetJobs for FleetService {
         let reply = self
             .store
             .read_transcript(&request.job_id, request.after_seq, request.limit)
+            .await
+            .map_err(|err| jobs_error(&err))?;
+        Ok(Response::new(reply))
+    }
+
+    async fn read_job_events(
+        &self,
+        request: Request<ReadJobEventsRequest>,
+    ) -> Result<Response<ReadJobEventsReply>, Status> {
+        let request = request.into_inner();
+        let reply = self
+            .store
+            .read_job_events(&request.job_id, request.after_seq, request.limit)
             .await
             .map_err(|err| jobs_error(&err))?;
         Ok(Response::new(reply))

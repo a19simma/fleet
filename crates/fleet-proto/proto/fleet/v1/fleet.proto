@@ -17,6 +17,7 @@ service FleetJobs {
   rpc ListJobs(ListJobsRequest) returns (ListJobsReply);
   rpc CancelJob(CancelJobRequest) returns (Job);
   rpc ReadTranscript(ReadTranscriptRequest) returns (ReadTranscriptReply);
+  rpc ReadJobEvents(ReadJobEventsRequest) returns (ReadJobEventsReply);
 }
 
 service FleetWorker {
@@ -159,6 +160,7 @@ message Job {
   optional uint64 claimed_at_ms = 18;
   optional uint64 finished_at_ms = 19;
   string phase = 20;
+  optional JobSummary summary = 21;
 }
 
 message SubmitJobRequest {
@@ -278,7 +280,7 @@ message JobSummary {
 
 message ReadJobEventsRequest {
   string job_id = 1;
-  uint32 after_seq = 2;
+  optional uint32 after_seq = 2;
   uint32 limit = 3;
 }
 
