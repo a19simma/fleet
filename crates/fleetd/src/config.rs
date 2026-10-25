@@ -389,7 +389,7 @@ mod tests {
         let cfg = Config::resolve(Some(file), &env_of(&[])).unwrap();
         assert_eq!(cfg.repo_hosts, ["git.example.com", "github.com"]);
         let cfg = Config::resolve(Some("repo_hosts = []"), &env_of(&[])).unwrap();
-        assert!(cfg.repo_hosts.is_empty());
+        assert_eq!(cfg.repo_hosts, Vec::<String>::new());
     }
 
     #[test]

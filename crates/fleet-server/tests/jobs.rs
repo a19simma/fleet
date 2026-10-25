@@ -806,7 +806,7 @@ async fn report_chunk_limits_reject_the_whole_report(pool: PgPool) {
             .unwrap_err();
         assert!(matches!(err, StoreError::InvalidChunk));
     }
-    assert!(stored_rows(&pool).await.is_empty());
+    assert_eq!(stored_rows(&pool).await, Vec::<(i64, String, bool)>::new());
     let exact = store
         .report_plain(
             id,
