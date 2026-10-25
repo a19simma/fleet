@@ -14,7 +14,7 @@ use fleet_core::Redactor;
 use fleet_proto::MAX_CHUNKS_PER_REPORT;
 use fleet_proto::v1::{Job, JobState, ReportJobReply, ReportJobRequest};
 use fleetd::poller::{RunError, Shutdown};
-use fleetd::runner::{AgentOutcome, AgentRunner, Interrupt, Reporter, RunConfig};
+use fleetd::runner::{AgentOutcome, AgentRunner, ChildWait, Interrupt, Reporter, RunConfig};
 use tempfile::TempDir;
 use tokio::sync::{mpsc, oneshot};
 use tonic::Status;
@@ -41,7 +41,6 @@ const SECRET_NAMES: [&str; 9] = [
 type TestResult = Result<(), Box<dyn std::error::Error>>;
 
 const START_BAND: Duration = Duration::from_secs(5);
-const REAP_ATTEMPTS: usize = 10;
 
 const SCRIPT: &str = r#"#!/bin/sh
 mode=${2%%:*}
@@ -63,7 +62,6 @@ term) trap 'echo t > "$path.marker"; exit 0' TERM; sleep 300 > "$path" & wait ;;
 closed) exec 1>&-; : > "$path.closed"; read x < "$path"; exit 0 ;;
 burst) i=0; while [ $i -lt 700 ]; do echo x; i=$((i+1)); done; exit 0 ;;
 huge) head -c 3000000 /dev/zero | tr '\0' a; echo; echo next; exit 0 ;;
-reap) echo $$ > "$path"; read x < "$path.go"; exit 0 ;;
 big) i=0; while [ $i -lt 200 ]; do printf '%01000d\n' 0; i=$((i+1)); done; : > "$path.done"; read x < "$path"; exit 0 ;;
 flood) i=0; while [ $i -lt 100 ]; do printf '%01000d\n' 0; i=$((i+1)); done; exit 0 ;;
 orphan) perl -e 'use POSIX; POSIX::setsid(); open(F, ">", $ARGV[0]); print F $$; close F; exec "sleep", "300"' "$path" &
@@ -662,47 +660,33 @@ async fn fail_job_after_a_run_keeps_the_progress() -> TestResult {
     .await
 }
 
+struct Unawaitable(tokio::process::Child);
+
+impl ChildWait for Unawaitable {
+    async fn wait(&mut self) -> std::io::Result<std::process::ExitStatus> {
+        self.0.wait().await?;
+        Err(std::io::Error::from_raw_os_error(
+            rustix::io::Errno::CHILD.raw_os_error(),
+        ))
+    }
+}
+
 #[tokio::test]
 async fn runner_reports_failed_when_the_child_cannot_be_awaited() -> TestResult {
     common::bounded(Box::pin(async {
         let dir = TempDir::new()?;
-        for attempt in 0..REAP_ATTEMPTS {
-            let pid_path = fifo(dir.path(), &format!("reap{attempt}"))?;
-            let go = fifo(dir.path(), &format!("reap{attempt}.go"))?;
-            let (agent, mut rx) = runner(config(false), 0);
-            let (_trigger, shutdown) = Shutdown::channel();
-            let prompt = format!("reap:{}", pid_path.display());
-            let job = job(&prompt);
-            let (outcome, driven) = tokio::join!(agent.run(&job, dir.path(), shutdown), async {
-                let raw = tokio::fs::read_to_string(&pid_path).await?;
-                let pid = rustix::process::Pid::from_raw(raw.trim().parse()?).ok_or("bad pid")?;
-                let (entering, entered) = oneshot::channel();
-                let reaper = std::thread::spawn(move || {
-                    let _ = entering.send(());
-                    match rustix::process::waitpid(Some(pid), rustix::process::WaitOptions::empty())
-                    {
-                        Ok(_) => Ok(true),
-                        Err(rustix::io::Errno::CHILD) => Ok(false),
-                        Err(errno) => Err(errno),
-                    }
-                });
-                entered.await?;
-                release(&go).await?;
-                let joined = tokio::task::spawn_blocking(move || reaper.join()).await?;
-                let won = joined.map_err(|_| "reaper panicked")??;
-                Ok::<bool, Box<dyn std::error::Error>>(won)
-            });
-            if !driven? {
-                continue;
-            }
-            assert!(matches!(outcome, Err(RunError)));
-            let requests = drain(&mut rx);
-            let last = requests.last().ok_or("no report")?;
-            assert_eq!(last.terminal_state, Some(JobState::Failed.into()));
-            assert_eq!(last.error.as_deref(), Some("agent could not be awaited"));
-            return Ok(());
-        }
-        Err("the runner reaped the child before the test in every attempt".into())
+        let (agent, mut rx) = runner(config(false), 0);
+        let (_trigger, shutdown) = Shutdown::channel();
+        let job = job("stream:");
+        let outcome = agent
+            .run_with(&job, dir.path(), shutdown, Unawaitable)
+            .await;
+        assert!(matches!(outcome, Err(RunError)));
+        let requests = drain(&mut rx);
+        let last = requests.last().ok_or("no report")?;
+        assert_eq!(last.terminal_state, Some(JobState::Failed.into()));
+        assert_eq!(last.error.as_deref(), Some("agent could not be awaited"));
+        Ok(())
     }))
     .await
 }
