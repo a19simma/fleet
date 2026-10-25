@@ -196,7 +196,6 @@ fn worker_error(err: &StoreError) -> Status {
         StoreError::StaleReport => {
             Status::failed_precondition("report does not match the running job")
         }
-        StoreError::InvalidBox => Status::invalid_argument("invalid box name"),
         StoreError::InvalidChunk => Status::invalid_argument("invalid transcript chunk"),
         StoreError::InvalidJob(_) => Status::invalid_argument("invalid job report"),
         StoreError::NotFound => Status::not_found("job not found"),
@@ -214,7 +213,7 @@ impl FleetWorker for FleetService {
             .map_err(|err| Status::invalid_argument(err.to_string()))?;
         let job = self
             .store
-            .claim_job(name.as_str())
+            .claim_job(&name)
             .await
             .map_err(|err| worker_error(&err))?;
         let lease_s = if job.is_some() {
@@ -233,13 +232,12 @@ impl FleetWorker for FleetService {
         &self,
         request: Request<ReportJobRequest>,
     ) -> Result<Response<ReportJobReply>, Status> {
-        let mut request = request.into_inner();
+        let request = request.into_inner();
         let name = validate_box(&request.r#box)
             .map_err(|err| Status::invalid_argument(err.to_string()))?;
-        request.r#box = name.to_string();
         let reply = self
             .store
-            .report_job(&request)
+            .report_job(&name, &request)
             .await
             .map_err(|err| worker_error(&err))?;
         Ok(Response::new(reply))
@@ -252,7 +250,7 @@ fn jobs_error(err: &StoreError) -> Status {
             Status::already_exists("idempotency key already used with other parameters")
         }
         StoreError::NotFound => Status::not_found("job not found"),
-        StoreError::InvalidJob(_) | StoreError::InvalidChunk | StoreError::InvalidBox => {
+        StoreError::InvalidJob(_) | StoreError::InvalidChunk => {
             Status::invalid_argument("invalid job request")
         }
         other => storage_unavailable(other),
@@ -379,7 +377,6 @@ mod tests {
     fn worker_errors_map_to_fixed_statuses() {
         let cases = [
             (StoreError::StaleReport, Code::FailedPrecondition),
-            (StoreError::InvalidBox, Code::InvalidArgument),
             (StoreError::InvalidChunk, Code::InvalidArgument),
             (
                 StoreError::InvalidJob(JobInvalid::PrUrl),

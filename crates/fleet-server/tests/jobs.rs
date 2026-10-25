@@ -5,12 +5,14 @@
 
 use std::time::Duration;
 
+use fleet_core::BoxName;
 use fleet_proto::v1::{
     JobState, ReportJobReply, ReportJobRequest, SubmitJobRequest, TranscriptChunk,
 };
 use fleet_server::jobs::{
-    MAX_BASE_REF_BYTES, MAX_ERROR_CHARS, MAX_KEY_BYTES, MAX_PHASE_CHARS, MAX_PR_URL_BYTES,
-    MAX_PROGRESS_CHARS, MAX_PROMPT_BYTES, MAX_REPO_BYTES, MAX_TRANSCRIPT_BYTES,
+    MAX_BASE_REF_BYTES, MAX_BRANCH_BYTES, MAX_CHUNKS_PER_REPORT, MAX_ERROR_CHARS, MAX_KEY_BYTES,
+    MAX_PHASE_CHARS, MAX_PR_URL_BYTES, MAX_PROGRESS_CHARS, MAX_PROMPT_BYTES, MAX_REPO_BYTES,
+    MAX_TRANSCRIPT_BYTES, MAX_TRANSCRIPT_ROWS, MIN_CHUNK_COST_BYTES,
 };
 use fleet_server::reaper::{MAX_BACKOFF, backoff_after, error_kind, run_reaper};
 use fleet_server::store::{Store, StoreError};
@@ -42,15 +44,18 @@ impl Plain for Store {
         progress: &str,
         chunks: &[TranscriptChunk],
     ) -> Result<ReportJobReply, StoreError> {
-        self.report_job(&ReportJobRequest {
-            job_id: job_id.to_owned(),
-            attempt,
-            r#box: box_name.to_owned(),
-            phase: phase.to_owned(),
-            progress: progress.to_owned(),
-            chunks: chunks.to_vec(),
-            ..ReportJobRequest::default()
-        })
+        self.report_job(
+            &BoxName::new(box_name).unwrap(),
+            &ReportJobRequest {
+                job_id: job_id.to_owned(),
+                attempt,
+                r#box: box_name.to_owned(),
+                phase: phase.to_owned(),
+                progress: progress.to_owned(),
+                chunks: chunks.to_vec(),
+                ..ReportJobRequest::default()
+            },
+        )
         .await
     }
 }
@@ -223,6 +228,12 @@ async fn invalid_input_is_rejected_without_echo(pool: PgPool) {
     with("repo long", &|r| {
         r.repo = format!("https://{}", long(MAX_REPO_BYTES));
     });
+    with("repo backslash", &|r| {
+        r.repo = format!("https://example.com\\{secret}/org/repo.git");
+    });
+    with("repo backslash userinfo", &|r| {
+        r.repo = format!("https://example.com\\@{secret}/repo.git");
+    });
     with("ref empty", &|r| r.base_ref = String::new());
     with("ref long", &|r| r.base_ref = long(MAX_BASE_REF_BYTES));
     with("ref newline", &|r| r.base_ref = format!("a\n{secret}"));
@@ -251,6 +262,10 @@ fn claimer(n: u32) -> String {
     format!("box-{n}")
 }
 
+fn boxed(n: u32) -> BoxName {
+    BoxName::new(&claimer(n)).unwrap()
+}
+
 async fn submit_n(store: &Store, n: usize) -> Vec<String> {
     let mut ids = Vec::new();
     for i in 0..n {
@@ -269,7 +284,7 @@ async fn concurrent_claims_are_exclusive(pool: PgPool) {
     for i in 0..24 {
         let store = store.clone();
         tasks.push(tokio::spawn(async move {
-            store.claim_job(&claimer(i % 4 + 1)).await
+            store.claim_job(&boxed(i % 4 + 1)).await
         }));
     }
     let mut claimed = Vec::new();
@@ -302,7 +317,7 @@ async fn claim_is_fifo(pool: PgPool) {
         .unwrap();
     let mut order = Vec::new();
     for _ in 0..=ids.len() {
-        let claimed = timeout(WAIT, store.claim_job(&claimer(1)))
+        let claimed = timeout(WAIT, store.claim_job(&boxed(1)))
             .await
             .unwrap()
             .unwrap();
@@ -324,7 +339,7 @@ async fn claim_sets_lease_and_attempt(pool: PgPool) {
     let queued = store.submit_job(&request("k")).await.unwrap();
     assert_eq!(queued.attempt, 0);
     assert_eq!(queued.lease_expires_at_ms, None);
-    let job = timeout(WAIT, store.claim_job(&claimer(2)))
+    let job = timeout(WAIT, store.claim_job(&boxed(2)))
         .await
         .unwrap()
         .unwrap()
@@ -339,7 +354,7 @@ async fn claim_sets_lease_and_attempt(pool: PgPool) {
     assert!(claimed >= job.created_at_ms);
     let default = Store::new(pool.clone());
     default.submit_job(&request("k2")).await.unwrap();
-    let second = default.claim_job(&claimer(2)).await.unwrap().unwrap();
+    let second = default.claim_job(&boxed(2)).await.unwrap().unwrap();
     assert_eq!(
         second.lease_expires_at_ms.unwrap() - second.claimed_at_ms.unwrap(),
         120_000
@@ -349,40 +364,23 @@ async fn claim_sets_lease_and_attempt(pool: PgPool) {
 #[sqlx::test]
 async fn empty_queue_returns_none(pool: PgPool) {
     let store = store(pool.clone()).await;
-    let first = timeout(WAIT, store.claim_job(&claimer(1)))
+    let first = timeout(WAIT, store.claim_job(&boxed(1)))
         .await
         .unwrap()
         .unwrap();
     assert!(first.is_none());
     submit_n(&store, 1).await;
-    assert!(store.claim_job(&claimer(1)).await.unwrap().is_some());
-    assert!(store.claim_job(&claimer(1)).await.unwrap().is_none());
-}
-
-#[sqlx::test]
-async fn invalid_box_rejected_without_echo(pool: PgPool) {
-    let store = store(pool.clone()).await;
-    submit_n(&store, 1).await;
-    let secret = "s3cret-token";
-    for raw in [
-        secret.to_owned(),
-        String::new(),
-        format!("{}\n{secret}", claimer(1)),
-    ] {
-        let err = store.claim_job(&raw).await.unwrap_err();
-        assert!(matches!(err, StoreError::InvalidBox));
-        assert!(!format!("{err} {err:?}").contains(secret));
-    }
-    let state: String = sqlx::query_scalar("SELECT state FROM jobs")
-        .fetch_one(&pool)
-        .await
-        .unwrap();
-    assert_eq!(state, "QUEUED");
+    assert!(store.claim_job(&boxed(1)).await.unwrap().is_some());
+    assert!(store.claim_job(&boxed(1)).await.unwrap().is_none());
 }
 
 async fn claimed(store: &Store, box_name: &str) -> fleet_proto::v1::Job {
     store.submit_job(&request("rk")).await.unwrap();
-    store.claim_job(box_name).await.unwrap().unwrap()
+    store
+        .claim_job(&BoxName::new(box_name).unwrap())
+        .await
+        .unwrap()
+        .unwrap()
 }
 
 async fn set_lease_in_past(pool: &PgPool) {
@@ -466,11 +464,6 @@ async fn stale_attempt_rejected(pool: PgPool) {
         assert!(matches!(err, StoreError::StaleReport));
         assert!(!format!("{err} {err:?}").contains(secret));
     }
-    let err = store
-        .report_plain(&job.job_id, job.attempt, secret, "x", "x", &[])
-        .await
-        .unwrap_err();
-    assert!(matches!(err, StoreError::InvalidBox));
     for state in ["QUEUED", "SUCCEEDED", "LOST", "CANCELLED", "FAILED"] {
         sqlx::query("UPDATE jobs SET state = $1")
             .bind(state)
@@ -550,7 +543,7 @@ async fn transcript_dedupes_and_caps(pool: PgPool) {
     assert!(matches!(nul, Err(StoreError::InvalidChunk)));
     assert_eq!(rows().await.len(), 2);
 
-    let fill = "z".repeat(MAX_TRANSCRIPT_BYTES - 2);
+    let fill = "z".repeat(MAX_TRANSCRIPT_BYTES - 2 * MIN_CHUNK_COST_BYTES);
     let full = store
         .report_plain(id, job.attempt, &claimer(1), "r", "p", &[chunk(3, &fill)])
         .await
@@ -642,7 +635,7 @@ async fn cancel_queued_is_immediate(pool: PgPool) {
         row_state(&pool).await,
         ("CANCELLED".to_owned(), false, true)
     );
-    assert!(store.claim_job(&claimer(1)).await.unwrap().is_none());
+    assert!(store.claim_job(&boxed(1)).await.unwrap().is_none());
     let again = store.cancel_job(&job.job_id).await.unwrap();
     assert_eq!(again, cancelled);
 }
@@ -707,7 +700,7 @@ async fn terminal_report_ends_job_once(pool: PgPool) {
     report.pr_url = Some("https://example.com/org/repo/pull/1".to_owned());
     report.exit_code = Some(0);
     report.chunks = vec![chunk(1, "last")];
-    timeout(WAIT, store.report_job(&report))
+    timeout(WAIT, store.report_job(&boxed(1), &report))
         .await
         .unwrap()
         .unwrap();
@@ -724,7 +717,9 @@ async fn terminal_report_ends_job_once(pool: PgPool) {
     assert_eq!(state, "SUCCEEDED");
     assert_eq!(pr.as_deref(), Some("https://example.com/org/repo/pull/1"));
     assert_eq!((err, code, finished), (None, Some(0), true));
-    let again = store.report_job(&terminal(&job, JobState::Failed)).await;
+    let again = store
+        .report_job(&boxed(1), &terminal(&job, JobState::Failed))
+        .await;
     assert!(matches!(again, Err(StoreError::StaleReport)));
     let state: String = sqlx::query_scalar("SELECT state FROM jobs")
         .fetch_one(&pool)
@@ -740,7 +735,7 @@ async fn terminal_failed_and_cancelled_store_error_and_code(pool: PgPool) {
     let mut report = terminal(&job, JobState::Failed);
     report.error = Some("e".repeat(MAX_ERROR_CHARS + 50));
     report.exit_code = Some(2);
-    store.report_job(&report).await.unwrap();
+    store.report_job(&boxed(1), &report).await.unwrap();
     let (state, err, code): (String, String, i32) =
         sqlx::query_as("SELECT state, error, exit_code FROM jobs")
             .fetch_one(&pool)
@@ -753,14 +748,177 @@ async fn terminal_failed_and_cancelled_store_error_and_code(pool: PgPool) {
         .execute(&pool)
         .await
         .unwrap();
+    let unrequested = store
+        .report_job(&boxed(1), &terminal(&job, JobState::Cancelled))
+        .await;
+    assert!(matches!(unrequested, Err(StoreError::StaleReport)));
+    assert_eq!(row_state(&pool).await, ("RUNNING".to_owned(), false, false));
+    store.cancel_job(&job.job_id).await.unwrap();
     store
-        .report_job(&terminal(&job, JobState::Cancelled))
+        .report_job(&boxed(1), &terminal(&job, JobState::Cancelled))
+        .await
+        .unwrap();
+    assert_eq!(row_state(&pool).await, ("CANCELLED".to_owned(), true, true));
+}
+
+#[sqlx::test]
+async fn terminal_branch_with_swarm_prefix_is_stored(pool: PgPool) {
+    let store = store(pool.clone()).await;
+    let job = claimed(&store, &claimer(1)).await;
+    let mut report = terminal(&job, JobState::Succeeded);
+    report.branch = Some(format!("swarm/{}", job.job_id));
+    report.pr_url = Some("https://example.com/org/repo/pull/2?x=1#y".to_owned());
+    store.report_job(&boxed(1), &report).await.unwrap();
+    let branch: Option<String> = sqlx::query_scalar("SELECT branch FROM jobs")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(branch, report.branch);
+}
+
+async fn stored_rows(pool: &PgPool) -> Vec<(i64, String, bool)> {
+    sqlx::query_as("SELECT seq, chunk, truncated FROM job_transcript ORDER BY seq")
+        .fetch_all(pool)
+        .await
+        .unwrap()
+}
+
+#[sqlx::test]
+async fn report_chunk_limits_reject_the_whole_report(pool: PgPool) {
+    let store = store(pool.clone()).await;
+    let job = claimed(&store, &claimer(1)).await;
+    let id = job.job_id.as_str();
+    let name = claimer(1);
+    let many: Vec<_> = (1..=u64::try_from(MAX_CHUNKS_PER_REPORT).unwrap() + 1)
+        .map(|seq| chunk(seq, "x"))
+        .collect();
+    let bad = [
+        many.clone(),
+        vec![chunk(0, "x")],
+        vec![chunk(1, "ok"), chunk(3, "x"), chunk(2, "y")],
+        vec![chunk(1, "ok"), chunk(1, "dup")],
+        vec![chunk(1, "ok"), chunk(u64::MAX, "x")],
+    ];
+    for chunks in &bad {
+        let err = store
+            .report_plain(id, job.attempt, &name, "r", "p", chunks)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, StoreError::InvalidChunk));
+    }
+    assert!(stored_rows(&pool).await.is_empty());
+    let exact = store
+        .report_plain(
+            id,
+            job.attempt,
+            &name,
+            "r",
+            "p",
+            &many[..MAX_CHUNKS_PER_REPORT],
+        )
         .await
         .unwrap();
     assert_eq!(
-        row_state(&pool).await,
-        ("CANCELLED".to_owned(), false, true)
+        exact.acked_through_seq,
+        u64::try_from(MAX_CHUNKS_PER_REPORT).unwrap()
     );
+    assert_eq!(stored_rows(&pool).await.len(), MAX_CHUNKS_PER_REPORT);
+}
+
+#[sqlx::test]
+async fn ack_covers_only_the_contiguous_stored_prefix(pool: PgPool) {
+    let store = store(pool.clone()).await;
+    let job = claimed(&store, &claimer(1)).await;
+    let id = job.job_id.as_str();
+    let name = claimer(1);
+    let ack = |chunks: Vec<TranscriptChunk>| {
+        let store = &store;
+        let name = &name;
+        async move {
+            store
+                .report_plain(id, job.attempt, name, "r", "p", &chunks)
+                .await
+                .unwrap()
+                .acked_through_seq
+        }
+    };
+    assert_eq!(ack(vec![chunk(2, "b")]).await, 0);
+    assert_eq!(ack(vec![chunk(4, "d"), chunk(5, "e")]).await, 0);
+    assert_eq!(ack(vec![chunk(1, "a")]).await, 2);
+    assert_eq!(ack(Vec::new()).await, 2);
+    assert_eq!(ack(vec![chunk(3, "c")]).await, 5);
+    assert_eq!(ack(vec![chunk(9, "i")]).await, 5);
+    assert_eq!(stored_rows(&pool).await.len(), 6);
+}
+
+#[sqlx::test]
+async fn empty_chunks_are_charged_the_minimum(pool: PgPool) {
+    let store = store(pool.clone()).await;
+    let job = claimed(&store, &claimer(1)).await;
+    let near = i64::try_from(MAX_TRANSCRIPT_BYTES - MIN_CHUNK_COST_BYTES).unwrap();
+    sqlx::query("UPDATE jobs SET transcript_bytes = $1")
+        .bind(near)
+        .execute(&pool)
+        .await
+        .unwrap();
+    let reply = store
+        .report_plain(
+            &job.job_id,
+            job.attempt,
+            &claimer(1),
+            "r",
+            "p",
+            &[chunk(1, ""), chunk(2, ""), chunk(3, "")],
+        )
+        .await
+        .unwrap();
+    assert!(reply.transcript_truncated);
+    assert_eq!(reply.acked_through_seq, 3);
+    assert_eq!(
+        stored_rows(&pool).await,
+        [(1, String::new(), false), (2, String::new(), true)]
+    );
+    let bytes: i64 = sqlx::query_scalar("SELECT transcript_bytes FROM jobs")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(bytes, i64::try_from(MAX_TRANSCRIPT_BYTES).unwrap());
+}
+
+#[sqlx::test]
+async fn transcript_rows_are_capped(pool: PgPool) {
+    let store = store(pool.clone()).await;
+    let job = claimed(&store, &claimer(1)).await;
+    sqlx::query(
+        "INSERT INTO job_transcript (job_id, seq, ts_ms, chunk) \
+         SELECT $1, g, 1, '' FROM generate_series(1, $2::bigint) g",
+    )
+    .bind(&job.job_id)
+    .bind(MAX_TRANSCRIPT_ROWS)
+    .execute(&pool)
+    .await
+    .unwrap();
+    let next = u64::try_from(MAX_TRANSCRIPT_ROWS).unwrap() + 1;
+    let reply = store
+        .report_plain(
+            &job.job_id,
+            job.attempt,
+            &claimer(1),
+            "r",
+            "p",
+            &[chunk(next, "x"), chunk(next + 1, "y")],
+        )
+        .await
+        .unwrap();
+    assert!(reply.transcript_truncated);
+    assert_eq!(reply.acked_through_seq, next + 1);
+    let last: (i64, String, bool) = sqlx::query_as(
+        "SELECT seq, chunk, truncated FROM job_transcript ORDER BY seq DESC LIMIT 1",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(last, (i64::try_from(next).unwrap(), String::new(), true));
 }
 
 #[sqlx::test]
@@ -793,11 +951,31 @@ async fn invalid_terminal_report_is_refused_without_echo(pool: PgPool) {
     let mut bad = terminal(&job, JobState::Failed);
     bad.error = Some(format!("{secret}\0"));
     cases.push(bad);
-    let mut bad = terminal(&job, JobState::Failed);
-    bad.branch = Some(format!("{secret} x"));
-    cases.push(bad);
+    for url in [
+        format!("https://{secret}@phish.example/x"),
+        format!("https://user:{secret}@phish.example/x"),
+        format!("https://example.com\\{secret}"),
+        format!("https://example.com/a\\{secret}"),
+    ] {
+        let mut bad = terminal(&job, JobState::Succeeded);
+        bad.pr_url = Some(url);
+        cases.push(bad);
+    }
+    for branch in [
+        format!("{secret} x"),
+        format!("swarm/{secret} x"),
+        format!("main-{secret}"),
+        format!("-swarm/{secret}"),
+        format!("--upload-pack={secret}"),
+        format!("-{secret}"),
+        format!("swarm/{}", "b".repeat(MAX_BRANCH_BYTES)),
+    ] {
+        let mut bad = terminal(&job, JobState::Failed);
+        bad.branch = Some(branch);
+        cases.push(bad);
+    }
     for report in &cases {
-        let err = store.report_job(report).await.unwrap_err();
+        let err = store.report_job(&boxed(1), report).await.unwrap_err();
         assert!(matches!(err, StoreError::InvalidJob(_)), "{err}");
         assert!(!format!("{err} {err:?}").contains(secret));
     }
@@ -812,7 +990,7 @@ async fn progress_report_ignores_result_fields(pool: PgPool) {
     report.terminal_state = None;
     report.pr_url = Some("https://example.com/x".to_owned());
     report.exit_code = Some(7);
-    store.report_job(&report).await.unwrap();
+    store.report_job(&boxed(1), &report).await.unwrap();
     let (state, pr, code): (String, Option<String>, Option<i32>) =
         sqlx::query_as("SELECT state, pr_url, exit_code FROM jobs")
             .fetch_one(&pool)
@@ -868,7 +1046,7 @@ async fn expired_lease_becomes_lost(pool: PgPool) {
         )
         .await;
     assert!(matches!(late, Err(StoreError::StaleReport)));
-    assert!(store.claim_job(&claimer(2)).await.unwrap().is_none());
+    assert!(store.claim_job(&boxed(2)).await.unwrap().is_none());
 }
 
 #[sqlx::test]
@@ -877,7 +1055,7 @@ async fn reap_spares_live_and_finished_jobs(pool: PgPool) {
     let job = claimed(&store, &claimer(1)).await;
     assert_eq!(store.reap_expired().await.unwrap(), 0);
     store
-        .report_job(&terminal(&job, JobState::Succeeded))
+        .report_job(&boxed(1), &terminal(&job, JobState::Succeeded))
         .await
         .unwrap();
     set_lease_in_past(&pool).await;
