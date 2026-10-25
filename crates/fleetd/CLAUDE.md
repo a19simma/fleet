@@ -6,7 +6,7 @@
 - **Start races.** A freshly written script can take over 100 ms to start on macOS, so a report heartbeat proves nothing about the child. Gate a kill on a signal from the child: a fifo the child's descendant opens, read by a test task that sends on a oneshot once its `open` returns. Reading the same fifo to EOF proves the whole process group died.
 - **Lease heartbeat.** The runner reports at least every 30 s. Tests shrink `report_interval` and `flush_interval`.
 - **Escaped descendants.** A `setsid` descendant must finish `setsid` before the agent script exits, because the exit kills the process group. The script waits for the pid file the descendant writes, and the test kills that pid.
-- **Surviving descendants hang the test binary.** A red kill test leaves `sleep 300` holding the runner fifo, and the runtime drop blocks on the fifo `open` in `tokio::fs`. When a mutation run hangs, `pkill -f "sleep 300"` once the test reports FAILED. Send mutation-run output to a file, not a pipe.
+- **Surviving descendants hang the test binary.** A red kill test leaves `sleep 300` holding the runner fifo, and the runtime drop blocks on the fifo `open` in `tokio::fs`.
 
 ## Askpass test
 
