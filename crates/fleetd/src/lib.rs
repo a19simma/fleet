@@ -28,6 +28,7 @@ pub mod runner;
 mod runtime;
 mod store;
 mod system;
+pub mod telemetry;
 pub mod transport;
 pub mod workspace;
 

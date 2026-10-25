@@ -1,0 +1,2 @@
+{"type":"assistant","message":{"id":"msg_e1","role":"assistant","content":[{"type":"tool_use","id":"toolu_e1","name":"Bash","input":{"command":"false"}}],"usage":{"input_tokens":3,"output_tokens":5,"cache_read_input_tokens":7,"cache_creation_input_tokens":11}}}
+{"type":"user","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_e1","content":"boom","is_error":true}]}}
