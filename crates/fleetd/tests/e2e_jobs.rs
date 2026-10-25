@@ -129,7 +129,7 @@ async fn a_submitted_job_runs_to_a_pushed_branch_and_a_pull_request(pool: PgPool
     .await;
     submitted?;
     let job_id = out.trim().to_owned();
-    assert!(!job_id.is_empty());
+    assert_ne!(job_id, "");
     sqlx::query("UPDATE jobs SET repo = $1 WHERE job_id = $2")
         .bind(format!("file://{}", origin.display()))
         .bind(&job_id)

@@ -331,7 +331,7 @@ async fn rows_that_are_not_envelopes_are_dropped_without_a_call() {
 
     assert_eq!(deleted, 3);
     assert_eq!(store.count().await.unwrap(), 0);
-    assert!(stub.sizes().is_empty());
+    assert_eq!(stub.sizes(), Vec::<usize>::new());
 }
 
 #[tokio::test]
@@ -391,7 +391,7 @@ async fn run_flushes_a_partial_batch_after_the_wait() {
     }
     tokio::time::sleep(Duration::from_millis(500)).await;
     assert_eq!(store.count().await.unwrap(), 3);
-    assert!(stub.sizes().is_empty());
+    assert_eq!(stub.sizes(), Vec::<usize>::new());
 
     within(async {
         while store.count().await.unwrap() > 0 {
@@ -513,7 +513,7 @@ async fn a_lone_oversized_event_stays_queued() {
 
     assert!(matches!(&err, Error::Rpc(_)), "{err}");
     assert_eq!(store.count().await.unwrap(), 1);
-    assert!(stub.sizes().is_empty());
+    assert_eq!(stub.sizes(), Vec::<usize>::new());
 }
 
 #[tokio::test]

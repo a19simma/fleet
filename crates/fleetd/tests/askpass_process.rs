@@ -45,7 +45,7 @@ fn a_password_prompt_prints_only_the_token() -> TestResult {
     )?;
     assert!(out.status.success());
     assert_eq!(String::from_utf8(out.stdout)?, format!("{TOKEN}\n"));
-    assert!(out.stderr.is_empty());
+    assert_eq!(out.stderr, Vec::<u8>::new());
     Ok(())
 }
 
@@ -102,7 +102,7 @@ fn a_host_list_in_the_environment_does_not_widen_the_token_host() -> TestResult 
         Some("github.com,gitlab.com"),
     )?;
     assert!(!out.status.success());
-    assert!(out.stdout.is_empty());
+    assert_eq!(out.stdout, Vec::<u8>::new());
     Ok(())
 }
 
@@ -119,7 +119,7 @@ fn a_username_prompt_prints_the_fixed_username() -> TestResult {
 fn an_unknown_prompt_prints_nothing_and_fails() -> TestResult {
     let out = askpass("Passphrase for key: ", Some(TOKEN))?;
     assert!(!out.status.success());
-    assert!(out.stdout.is_empty());
+    assert_eq!(out.stdout, Vec::<u8>::new());
     assert!(!String::from_utf8(out.stderr)?.contains(TOKEN));
     Ok(())
 }
@@ -128,6 +128,6 @@ fn an_unknown_prompt_prints_nothing_and_fails() -> TestResult {
 fn a_password_prompt_without_a_token_prints_nothing_and_fails() -> TestResult {
     let out = askpass("Password for 'https://github.com': ", None)?;
     assert!(!out.status.success());
-    assert!(out.stdout.is_empty());
+    assert_eq!(out.stdout, Vec::<u8>::new());
     Ok(())
 }

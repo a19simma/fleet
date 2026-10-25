@@ -342,7 +342,7 @@ async fn read_transcript_pages_and_done(pool: PgPool) {
         .unwrap()
         .unwrap()
         .into_inner();
-    assert!(empty.chunks.is_empty());
+    assert_eq!(empty.chunks, Vec::<TranscriptChunk>::new());
     assert!(!empty.done);
 
     store
@@ -399,7 +399,7 @@ async fn read_transcript_pages_and_done(pool: PgPool) {
         .await
         .unwrap()
         .into_inner();
-    assert!(past.chunks.is_empty());
+    assert_eq!(past.chunks, Vec::<TranscriptChunk>::new());
     assert!(past.done);
 }
 

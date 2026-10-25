@@ -171,7 +171,7 @@ async fn https_claim_fails_bounded_without_the_ca_and_never_echoes_the_token() -
     assert!(started.elapsed() < BOUND, "{:?}", started.elapsed());
     let shown = format!("{err} {err:?}");
     assert!(!shown.contains(TOKEN), "{shown}");
-    assert!(fixture.stub.seen().is_empty());
+    assert_eq!(fixture.stub.seen(), Vec::<String>::new());
     Ok(())
 }
 
@@ -185,7 +185,7 @@ async fn https_claim_rejects_a_different_ca() -> Test {
         .err()
         .ok_or("expected failure")?;
     assert!(!format!("{err:?}").contains(TOKEN));
-    assert!(fixture.stub.seen().is_empty());
+    assert_eq!(fixture.stub.seen(), Vec::<String>::new());
     Ok(())
 }
 

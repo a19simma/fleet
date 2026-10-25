@@ -12,7 +12,7 @@ use std::time::Duration;
 
 use fleet_core::Redactor;
 use fleet_proto::MAX_CHUNKS_PER_REPORT;
-use fleet_proto::v1::{Job, JobState, ReportJobReply, ReportJobRequest};
+use fleet_proto::v1::{Job, JobState, ReportJobReply, ReportJobRequest, TranscriptChunk};
 use fleetd::poller::{RunError, Shutdown};
 use fleetd::runner::{AgentOutcome, AgentRunner, ChildWait, Interrupt, Reporter, RunConfig};
 use tempfile::TempDir;
@@ -101,6 +101,10 @@ impl Reporter for Fake {
         &self,
         request: ReportJobRequest,
     ) -> impl Future<Output = Result<ReportJobReply, Status>> + Send {
+        #[expect(
+            deprecated,
+            reason = "try_update needs rust 1.95, above the workspace MSRV"
+        )]
         let failing = self
             .fail_first
             .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1))
@@ -919,13 +923,13 @@ async fn chunks_left_by_a_failed_final_flush_reach_the_server_before_the_termina
         let (_trigger, shutdown) = Shutdown::channel();
         let outcome = agent.run(&job("stream:"), dir.path(), shutdown).await?;
         assert_eq!(outcome, AgentOutcome::Succeeded);
-        assert!(drain(&mut rx).is_empty());
+        assert_eq!(drain(&mut rx), Vec::<ReportJobRequest>::new());
         agent.fail_job(&job("stream:"), "boom").await;
         let requests = drain(&mut rx);
         assert_eq!(seqs(&requests), vec![1, 2]);
         let last = requests.last().ok_or("no report")?;
         assert_eq!(last.terminal_state, Some(JobState::Failed.into()));
-        assert!(last.chunks.is_empty());
+        assert_eq!(last.chunks, Vec::<TranscriptChunk>::new());
         Ok(())
     }))
     .await
