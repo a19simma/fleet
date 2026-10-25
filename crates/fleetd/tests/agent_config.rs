@@ -180,16 +180,12 @@ fn the_embedded_bundle_carries_the_commit_permissions_and_no_attribution() -> Te
     };
     assert_eq!(
         list("allow"),
-        [
-            "Bash(git add *)",
-            "Bash(git commit *)",
-            "Bash(git status *)",
-            "Bash(git diff *)",
-            "Bash(git log *)",
-            "Bash(git checkout -b *)"
-        ]
+        ["Read", "Edit", "Write", "Glob", "Grep", "Bash"]
     );
-    assert_eq!(list("deny"), ["Bash(git push *)", "Bash(gh *)"]);
+    assert_eq!(
+        list("deny"),
+        ["Bash(git push *)", "Bash(gh *)", "Bash(curl *)"]
+    );
     assert_eq!(settings["attribution"]["commit"], "");
     assert_eq!(settings["attribution"]["pr"], "");
     let keys: Vec<&String> = settings.as_object().ok_or("object")?.keys().collect();

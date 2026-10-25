@@ -1,14 +1,7 @@
 {
   "permissions": {
-    "allow": [
-      "Bash(git add *)",
-      "Bash(git commit *)",
-      "Bash(git status *)",
-      "Bash(git diff *)",
-      "Bash(git log *)",
-      "Bash(git checkout -b *)"
-    ],
-    "deny": ["Bash(git push *)", "Bash(gh *)"]
+    "allow": ["Read", "Edit", "Write", "Glob", "Grep", "Bash"],
+    "deny": ["Bash(git push *)", "Bash(gh *)", "Bash(curl *)"]
   },
   "attribution": { "commit": "", "pr": "" }
 }

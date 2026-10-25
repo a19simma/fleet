@@ -1155,7 +1155,7 @@ async fn the_job_dir_holds_the_bundle_during_the_run_and_is_gone_after() -> Test
         assert_eq!(outcome, AgentOutcome::Succeeded);
         let all = text(&drain(&mut rx));
         assert!(all.contains("Commit finished work"));
-        assert!(all.contains("\"Bash(git commit *)\""));
+        assert!(all.contains("\"Edit\""));
         assert!(all.contains("\"Bash(git push *)\""));
         assert!(all.contains("\"Bash(gh *)\""));
         assert!(all.contains("\"attribution\""));
@@ -1214,7 +1214,7 @@ async fn a_bundle_override_reaches_the_job_home() -> TestResult {
         agent.run(&job("dir:"), dir.path(), shutdown).await?;
         let all = text(&drain(&mut rx));
         assert!(all.contains("operator persona"));
-        assert!(all.contains("\"Bash(git commit *)\""));
+        assert!(all.contains("\"Edit\""));
         Ok(())
     }))
     .await

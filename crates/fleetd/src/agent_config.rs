@@ -269,3 +269,62 @@ fn remove_if_present(path: &Path) -> io::Result<()> {
         _ => Ok(()),
     }
 }
+
+#[cfg(test)]
+mod default_bundle_tests {
+    use super::{EMBEDDED, SETTINGS};
+    use crate::runner::DENIED_TOOLS;
+    use serde_json::Value;
+
+    fn settings() -> Value {
+        let raw = EMBEDDED
+            .iter()
+            .find(|(name, _)| *name == SETTINGS)
+            .map(|(_, body)| *body)
+            .expect("embedded settings");
+        serde_json::from_str(raw).expect("settings json")
+    }
+
+    fn list(value: &Value, key: &str) -> Vec<String> {
+        value["permissions"][key]
+            .as_array()
+            .expect("array")
+            .iter()
+            .map(|v| v.as_str().expect("string").to_owned())
+            .collect()
+    }
+
+    #[test]
+    fn allow_lets_a_job_edit_and_run_tools() {
+        let allow = list(&settings(), "allow");
+        for tool in ["Read", "Edit", "Write", "Glob", "Grep", "Bash"] {
+            assert!(allow.iter().any(|a| a == tool), "missing {tool}");
+        }
+    }
+
+    #[test]
+    fn deny_holds_push_gh_and_curl() {
+        let deny = list(&settings(), "deny");
+        for pattern in ["Bash(git push *)", "Bash(gh *)", "Bash(curl *)"] {
+            assert!(deny.iter().any(|d| d == pattern), "missing {pattern}");
+        }
+    }
+
+    #[test]
+    fn default_mode_is_never_bypass() {
+        let value = settings();
+        let mode = value["permissions"]["defaultMode"].as_str().unwrap_or("");
+        assert_ne!(mode, "bypassPermissions");
+        assert!(value.get("defaultMode").is_none());
+    }
+
+    #[test]
+    fn argv_floor_is_a_subset_of_bundle_deny() {
+        let deny = list(&settings(), "deny");
+        assert!(DENIED_TOOLS.contains(&"Bash(git push *)"));
+        assert!(DENIED_TOOLS.contains(&"Bash(gh *)"));
+        for pattern in DENIED_TOOLS {
+            assert!(deny.iter().any(|d| d == pattern), "bundle lacks {pattern}");
+        }
+    }
+}

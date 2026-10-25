@@ -95,7 +95,7 @@ const AGENT_ENV: [&str; 12] = [
     "DISABLE_TELEMETRY",
 ];
 const AGENT_ENV_PREFIX: &str = "LC_";
-const DENIED_TOOLS: [&str; 2] = ["Bash(git push *)", "Bash(gh *)"];
+pub(crate) const DENIED_TOOLS: [&str; 2] = ["Bash(git push *)", "Bash(gh *)"];
 
 /// Appended to the agent's system prompt.
 pub const AGENT_PROTOCOL: &str = "You run as an unattended fleet job. Commit finished work on the current branch with a semantic message (type(scope): subject). Never push and never run gh: the daemon publishes the branch. Add no attribution lines to commits or pull requests.";
