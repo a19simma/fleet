@@ -106,31 +106,131 @@ fn only_mirror(root: &Path) -> Result<PathBuf, Box<dyn std::error::Error>> {
 }
 
 #[tokio::test]
-async fn a_half_built_mirror_without_an_origin_recovers() -> TestResult {
+async fn a_mirror_with_a_stale_remote_still_fetches_the_job_repo() -> TestResult {
     let dir = TempDir::new()?;
     let repo = fixture(dir.path())?;
     let root = dir.path().join("jobs");
     let ws = workspace(&root);
     ws.prepare("job1", &repo, "main").await?;
     let mirror = only_mirror(&root)?;
-    git(&mirror, &["remote", "remove", "origin"])?;
+    git(&mirror, &["remote", "add", "origin", "/nowhere.git"])?;
     let second = ws.prepare("job2", &repo, "main").await?;
     assert_eq!(std::fs::read_to_string(second.path.join("a.txt"))?, "one");
-    assert_eq!(git(&mirror, &["remote", "get-url", "origin"])?, repo);
     Ok(())
 }
 
 #[tokio::test]
-async fn a_mirror_with_a_stale_origin_url_is_repointed() -> TestResult {
+async fn a_planted_url_rewrite_in_the_mirror_does_not_redirect_the_fetch() -> TestResult {
+    let dir = TempDir::new()?;
+    let repo = fixture(dir.path())?;
+    let decoy_dir = dir.path().join("decoy");
+    std::fs::create_dir(&decoy_dir)?;
+    let decoy = fixture(&decoy_dir)?;
+    let decoy_seed = decoy_dir.join("seed");
+    std::fs::write(decoy_seed.join("evil.txt"), "evil")?;
+    git(&decoy_seed, &["add", "."])?;
+    git(&decoy_seed, &["commit", "--quiet", "-m", "evil"])?;
+    git(&decoy_seed, &["push", "--quiet", &decoy, "main"])?;
+
+    let root = dir.path().join("jobs");
+    let ws = workspace(&root);
+    ws.prepare("job1", &repo, "main").await?;
+    let mirror = only_mirror(&root)?;
+    git(
+        &mirror,
+        &["config", &format!("url.{decoy}.insteadOf"), &repo],
+    )?;
+    let second = ws.prepare("job2", &repo, "main").await?;
+    assert_eq!(std::fs::read_to_string(second.path.join("a.txt"))?, "one");
+    assert!(!second.path.join("evil.txt").exists());
+    Ok(())
+}
+
+#[tokio::test]
+async fn planted_http_credential_and_include_config_is_removed_before_the_fetch() -> TestResult {
     let dir = TempDir::new()?;
     let repo = fixture(dir.path())?;
     let root = dir.path().join("jobs");
     let ws = workspace(&root);
     ws.prepare("job1", &repo, "main").await?;
     let mirror = only_mirror(&root)?;
-    git(&mirror, &["remote", "set-url", "origin", "/nowhere.git"])?;
+    for (key, value) in [
+        ("http.proxy", "http://127.0.0.1:9"),
+        ("http.sslVerify", "false"),
+        ("http.curloptResolve", "github.com:443:127.0.0.1"),
+        ("http.https://github.com/.proxy", "http://127.0.0.1:9"),
+        ("credential.helper", "!cat >/dev/null"),
+        ("core.sshCommand", "false"),
+        ("include.path", "/nowhere"),
+        ("remote.origin.url", "/nowhere.git"),
+    ] {
+        git(&mirror, &["config", key, value])?;
+    }
     ws.prepare("job2", &repo, "main").await?;
-    assert_eq!(git(&mirror, &["remote", "get-url", "origin"])?, repo);
+    let config = std::fs::read_to_string(mirror.join("config"))?;
+    for gone in [
+        "http",
+        "credential",
+        "sshCommand",
+        "include",
+        "remote",
+        "url",
+    ] {
+        assert!(!config.contains(gone), "{gone} {config}");
+    }
+    assert!(config.contains("bare = true"), "{config}");
+    assert!(!mirror.join("config.fleetd-new").exists());
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_symlinked_mirror_config_is_replaced_not_followed() -> TestResult {
+    let dir = TempDir::new()?;
+    let repo = fixture(dir.path())?;
+    let root = dir.path().join("jobs");
+    let ws = workspace(&root);
+    ws.prepare("job1", &repo, "main").await?;
+    let mirror = only_mirror(&root)?;
+    let victim = dir.path().join("victim");
+    std::fs::write(&victim, "keep")?;
+    std::fs::remove_file(mirror.join("config"))?;
+    std::os::unix::fs::symlink(&victim, mirror.join("config"))?;
+    ws.prepare("job2", &repo, "main").await?;
+    assert_eq!(std::fs::read_to_string(&victim)?, "keep");
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_symlinked_staging_file_is_removed_not_followed() -> TestResult {
+    let dir = TempDir::new()?;
+    let repo = fixture(dir.path())?;
+    let root = dir.path().join("jobs");
+    let ws = workspace(&root);
+    ws.prepare("job1", &repo, "main").await?;
+    let mirror = only_mirror(&root)?;
+    let victim = dir.path().join("victim");
+    std::fs::write(&victim, "keep")?;
+    std::os::unix::fs::symlink(&victim, mirror.join("config.fleetd-new"))?;
+    ws.prepare("job2", &repo, "main").await?;
+    assert_eq!(std::fs::read_to_string(&victim)?, "keep");
+    assert!(!mirror.join("config.fleetd-new").exists());
+    Ok(())
+}
+
+#[tokio::test]
+async fn the_mirror_dir_is_a_sha256_hex_name() -> TestResult {
+    let dir = TempDir::new()?;
+    let repo = fixture(dir.path())?;
+    let root = dir.path().join("jobs");
+    workspace(&root).prepare("job1", &repo, "main").await?;
+    let name = only_mirror(&root)?
+        .file_name()
+        .ok_or("name")?
+        .to_string_lossy()
+        .into_owned();
+    let stem = name.strip_suffix(".git").ok_or("suffix")?;
+    assert_eq!(stem.len(), 64, "{name}");
+    assert!(stem.bytes().all(|b| b.is_ascii_hexdigit()), "{name}");
     Ok(())
 }
 

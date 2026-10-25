@@ -5,7 +5,6 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 
 use clap::{Parser, Subcommand};
-use fleetd::workspace::RepoPolicy;
 use fleetd::{Config, Error, Signals, askpass, dump, run, run_hook};
 use tracing_subscriber::EnvFilter;
 
@@ -36,7 +35,7 @@ enum Command {
     },
     /// Answer a git credential prompt for `GIT_ASKPASS`: the token from `GH_TOKEN` for a
     /// password prompt, a fixed username for a username prompt, else nothing and exit 1.
-    /// Answers only when the prompt names a host in `FLEETD_ASKPASS_HOSTS`.
+    /// Answers only when the prompt names the host in `FLEETD_ASKPASS_HOST`.
     Askpass {
         /// The prompt git passes as its only argument.
         prompt: String,
@@ -73,9 +72,8 @@ async fn execute(cli: Cli) -> Result<ExitCode, Error> {
         }
         Command::Askpass { prompt } => {
             let token = std::env::var("GH_TOKEN").ok();
-            let hosts = std::env::var(askpass::HOSTS_ENV).unwrap_or_default();
-            let policy = RepoPolicy::new(hosts.split(',').filter(|host| !host.is_empty()));
-            let printed = askpass::answer(&prompt, token.as_deref(), &policy)
+            let host = std::env::var(askpass::HOST_ENV).unwrap_or_default();
+            let printed = askpass::answer(&prompt, token.as_deref(), &host)
                 .is_some_and(|text| writeln!(std::io::stdout(), "{text}").is_ok());
             Ok(if printed {
                 ExitCode::SUCCESS

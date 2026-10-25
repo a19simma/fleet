@@ -14,12 +14,12 @@ fn askpass(prompt: &str, token: Option<&str>) -> Result<Output, std::io::Error> 
 fn askpass_for(
     prompt: &str,
     token: Option<&str>,
-    hosts: Option<&str>,
+    host: Option<&str>,
 ) -> Result<Output, std::io::Error> {
     let mut command = Command::new(env!("CARGO_BIN_EXE_fleetd"));
     command.args(["askpass", prompt]).env_clear();
-    if let Some(hosts) = hosts {
-        command.env("FLEETD_ASKPASS_HOSTS", hosts);
+    if let Some(host) = host {
+        command.env("FLEETD_ASKPASS_HOST", host);
     }
     if let Some(token) = token {
         command.env("GH_TOKEN", token);
@@ -69,18 +69,30 @@ fn a_prompt_for_another_host_prints_nothing_and_fails() -> TestResult {
 }
 
 #[test]
-fn a_missing_or_empty_host_list_answers_nothing() -> TestResult {
-    for hosts in [None, Some(""), Some(",")] {
-        let out = askpass_for("Password for 'https://github.com': ", Some(TOKEN), hosts)?;
-        assert!(!out.status.success(), "{hosts:?}");
-        assert!(out.stdout.is_empty(), "{hosts:?}");
+fn a_missing_or_empty_token_host_answers_nothing() -> TestResult {
+    for host in [None, Some(""), Some(",")] {
+        let out = askpass_for("Password for 'https://github.com': ", Some(TOKEN), host)?;
+        assert!(!out.status.success(), "{host:?}");
+        assert!(out.stdout.is_empty(), "{host:?}");
     }
     let out = askpass_for(
         "Password for 'https://git.example.com/a': ",
         Some(TOKEN),
-        Some("github.com,git.example.com"),
+        Some("git.example.com"),
     )?;
     assert_eq!(String::from_utf8(out.stdout)?, format!("{TOKEN}\n"));
+    Ok(())
+}
+
+#[test]
+fn a_host_list_in_the_environment_does_not_widen_the_token_host() -> TestResult {
+    let out = askpass_for(
+        "Password for 'https://gitlab.com/a': ",
+        Some(TOKEN),
+        Some("github.com,gitlab.com"),
+    )?;
+    assert!(!out.status.success());
+    assert!(out.stdout.is_empty());
     Ok(())
 }
 
