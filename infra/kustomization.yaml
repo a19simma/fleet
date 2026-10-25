@@ -5,4 +5,4 @@ resources:
   - service.yaml
 images:
   - name: ghcr.io/a19simma/fleet-server
-    newTag: 0.2.3
+    newTag: 0.2.5
