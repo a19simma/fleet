@@ -201,7 +201,15 @@ async fn planted_http_credential_and_include_config_is_removed_before_the_fetch(
             assert!(!config.contains(gone), "{gone} {config}");
         }
         assert!(config.contains("bare = true"), "{config}");
-        assert!(!mirror.join("config.fleetd-new").exists());
+        let staged = std::fs::read_dir(&mirror)?
+            .filter_map(Result::ok)
+            .filter(|e| {
+                e.file_name()
+                    .to_string_lossy()
+                    .starts_with("config.fleetd-new")
+            })
+            .count();
+        assert_eq!(staged, 0);
         Ok(())
     }))
     .await
@@ -228,7 +236,84 @@ async fn a_symlinked_mirror_config_is_replaced_not_followed() -> TestResult {
 }
 
 #[tokio::test]
-async fn a_symlinked_staging_file_is_removed_not_followed() -> TestResult {
+async fn a_planted_commondir_in_the_mirror_does_not_redirect_the_fetch() -> TestResult {
+    common::bounded(Box::pin(async {
+        let dir = TempDir::new()?;
+        let repo = fixture(dir.path())?;
+        let decoy_dir = dir.path().join("decoy");
+        std::fs::create_dir(&decoy_dir)?;
+        let decoy = fixture(&decoy_dir)?;
+        let decoy_seed = decoy_dir.join("seed");
+        std::fs::write(decoy_seed.join("evil.txt"), "evil")?;
+        git(&decoy_seed, &["add", "."])?;
+        git(&decoy_seed, &["commit", "--quiet", "-m", "evil"])?;
+        git(&decoy_seed, &["push", "--quiet", &decoy, "main"])?;
+        let evil = dir.path().join("evil.git");
+        git(
+            dir.path(),
+            &["clone", "--quiet", "--bare", &decoy, "evil.git"],
+        )?;
+        git(&evil, &["config", &format!("url.{decoy}.insteadOf"), &repo])?;
+
+        let root = dir.path().join("jobs");
+        let ws = workspace(&root);
+        ws.prepare("job1", &repo, "main").await?;
+        let mirror = only_mirror(&root)?;
+        std::fs::write(
+            mirror.join("commondir"),
+            evil.to_str().ok_or("path")?.as_bytes(),
+        )?;
+        let second = ws.prepare("job2", &repo, "main").await?;
+        assert_eq!(std::fs::read_to_string(second.path.join("a.txt"))?, "one");
+        assert!(!second.path.join("evil.txt").exists());
+        assert!(!mirror.join("commondir").exists());
+        Ok(())
+    }))
+    .await
+}
+
+#[tokio::test]
+async fn a_pin_holds_against_a_commondir_planted_after_the_cleanup() -> TestResult {
+    common::bounded(Box::pin(async {
+        let dir = TempDir::new()?;
+        let repo = fixture(dir.path())?;
+        let decoy_dir = dir.path().join("decoy");
+        std::fs::create_dir(&decoy_dir)?;
+        let decoy = fixture(&decoy_dir)?;
+        let decoy_seed = decoy_dir.join("seed");
+        std::fs::write(decoy_seed.join("evil.txt"), "evil")?;
+        git(&decoy_seed, &["add", "."])?;
+        git(&decoy_seed, &["commit", "--quiet", "-m", "evil"])?;
+        git(&decoy_seed, &["push", "--quiet", &decoy, "main"])?;
+        let evil = dir.path().join("evil.git");
+        git(
+            dir.path(),
+            &["clone", "--quiet", "--bare", &decoy, "evil.git"],
+        )?;
+        git(&evil, &["config", &format!("url.{decoy}.insteadOf"), &repo])?;
+
+        let root = dir.path().join("jobs");
+        workspace(&root).prepare("job1", &repo, "main").await?;
+        let evil_path = evil.to_str().ok_or("path")?.to_owned();
+        let planting = workspace(&root).with_before_fetch(move |mirror| {
+            let _ = std::fs::write(mirror.join("commondir"), evil_path.as_bytes());
+        });
+        let outcome = planting.prepare("job2", &repo, "main").await;
+        assert!(matches!(outcome, Err(WorkspaceError::Git("fetch"))));
+        assert!(
+            git(
+                &evil,
+                &["rev-parse", "--verify", "refs/remotes/origin/main"]
+            )
+            .is_err()
+        );
+        Ok(())
+    }))
+    .await
+}
+
+#[tokio::test]
+async fn a_planted_config_worktree_in_the_mirror_is_removed_before_the_fetch() -> TestResult {
     common::bounded(Box::pin(async {
         let dir = TempDir::new()?;
         let repo = fixture(dir.path())?;
@@ -236,12 +321,83 @@ async fn a_symlinked_staging_file_is_removed_not_followed() -> TestResult {
         let ws = workspace(&root);
         ws.prepare("job1", &repo, "main").await?;
         let mirror = only_mirror(&root)?;
-        let victim = dir.path().join("victim");
-        std::fs::write(&victim, "keep")?;
-        std::os::unix::fs::symlink(&victim, mirror.join("config.fleetd-new"))?;
+        std::fs::write(mirror.join("config.worktree"), "[core]\n\tbare = false\n")?;
         ws.prepare("job2", &repo, "main").await?;
-        assert_eq!(std::fs::read_to_string(&victim)?, "keep");
-        assert!(!mirror.join("config.fleetd-new").exists());
+        assert!(!mirror.join("config.worktree").exists());
+        Ok(())
+    }))
+    .await
+}
+
+#[tokio::test]
+async fn a_second_prepare_of_the_same_job_after_remove_succeeds_and_remove_deletes_the_branch()
+-> TestResult {
+    common::bounded(Box::pin(async {
+        let dir = TempDir::new()?;
+        let repo = fixture(dir.path())?;
+        let root = dir.path().join("jobs");
+        let ws = workspace(&root);
+        ws.prepare("job1", &repo, "main").await?;
+        ws.remove("job1", &repo).await?;
+        let mirror = only_mirror(&root)?;
+        assert!(
+            git(
+                &mirror,
+                &["rev-parse", "--verify", "--quiet", "refs/heads/swarm/job1"]
+            )
+            .is_err()
+        );
+        let again = ws.prepare("job1", &repo, "main").await?;
+        assert_eq!(std::fs::read_to_string(again.path.join("a.txt"))?, "one");
+        Ok(())
+    }))
+    .await
+}
+
+#[tokio::test]
+async fn a_second_prepare_of_the_same_job_replaces_an_aborted_one() -> TestResult {
+    common::bounded(Box::pin(async {
+        let dir = TempDir::new()?;
+        let repo = fixture(dir.path())?;
+        let root = dir.path().join("jobs");
+        let ws = workspace(&root);
+        let first = ws.prepare("job1", &repo, "main").await?;
+        std::fs::write(first.path.join("stray.txt"), "x")?;
+        let again = ws.prepare("job1", &repo, "main").await?;
+        assert_eq!(std::fs::read_to_string(again.path.join("a.txt"))?, "one");
+        assert!(!again.path.join("stray.txt").exists());
+        let mirror = only_mirror(&root)?;
+        git(&mirror, &["branch", "swarm/job2", "origin/main"])?;
+        let third = ws.prepare("job2", &repo, "main").await?;
+        assert_eq!(std::fs::read_to_string(third.path.join("a.txt"))?, "one");
+        Ok(())
+    }))
+    .await
+}
+
+#[tokio::test]
+async fn stale_lock_files_in_the_mirror_are_cleared_before_the_fetch() -> TestResult {
+    common::bounded(Box::pin(async {
+        let dir = TempDir::new()?;
+        let repo = fixture(dir.path())?;
+        let root = dir.path().join("jobs");
+        let ws = workspace(&root);
+        ws.prepare("job1", &repo, "main").await?;
+        let mirror = only_mirror(&root)?;
+        let locks = [
+            mirror.join("shallow.lock"),
+            mirror.join("refs/remotes/origin/main.lock"),
+            mirror.join("worktrees/job1/index.lock"),
+        ];
+        for lock in &locks {
+            std::fs::write(lock, "")?;
+        }
+        std::fs::write(mirror.join("keep.txt"), "keep")?;
+        ws.prepare("job2", &repo, "main").await?;
+        for lock in &locks {
+            assert!(!lock.exists(), "{lock:?}");
+        }
+        assert!(mirror.join("keep.txt").exists());
         Ok(())
     }))
     .await
