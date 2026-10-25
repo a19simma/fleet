@@ -8,8 +8,8 @@ RUN rustup target add x86_64-unknown-linux-musl aarch64-unknown-linux-musl
 WORKDIR /src
 COPY Cargo.toml Cargo.lock ./
 COPY crates ./crates
-RUN --mount=type=cache,target=/usr/local/cargo/registry \
-    --mount=type=cache,target=/src/target \
+RUN --mount=type=cache,target=/usr/local/cargo/registry,sharing=locked \
+    --mount=type=cache,target=/src/target,sharing=locked \
     case "$TARGETARCH" in \
       amd64) triple=x86_64-unknown-linux-musl ;; \
       arm64) triple=aarch64-unknown-linux-musl ;; \
