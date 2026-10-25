@@ -6,10 +6,18 @@ use std::process::Command;
 use std::sync::OnceLock;
 use std::time::Duration;
 
-use fleetd::workspace::{Workspace, WorkspaceError};
+use fleetd::workspace::{RepoPolicy, Workspace, WorkspaceError};
 use tempfile::TempDir;
 
 type TestResult = Result<(), Box<dyn std::error::Error>>;
+
+fn local_policy() -> RepoPolicy {
+    RepoPolicy::new(Vec::<String>::new()).with_file_repos()
+}
+
+fn workspace(root: impl Into<PathBuf>) -> Workspace {
+    Workspace::new(root).with_policy(local_policy())
+}
 
 fn git(dir: &Path, args: &[&str]) -> Result<String, Box<dyn std::error::Error>> {
     let out = Command::new("git")
@@ -47,7 +55,7 @@ fn fixture(dir: &Path) -> Result<String, Box<dyn std::error::Error>> {
 async fn worktree_on_branch() -> TestResult {
     let dir = TempDir::new()?;
     let repo = fixture(dir.path())?;
-    let ws = Workspace::new(dir.path().join("jobs"));
+    let ws = workspace(dir.path().join("jobs"));
 
     let first = ws.prepare("job1", &repo, "main").await?;
     assert_eq!(first.branch, "swarm/job1");
@@ -78,11 +86,60 @@ async fn worktree_on_branch() -> TestResult {
 }
 
 #[tokio::test]
+async fn a_job_id_of_the_longest_accepted_length_prepares() -> TestResult {
+    let dir = TempDir::new()?;
+    let repo = fixture(dir.path())?;
+    let id = format!("A_{}", "z9".repeat(31));
+    assert_eq!(id.len(), 64);
+    let checkout = workspace(dir.path().join("jobs"))
+        .prepare(&id, &repo, "main")
+        .await?;
+    assert_eq!(checkout.branch, format!("swarm/{id}"));
+    Ok(())
+}
+
+fn only_mirror(root: &Path) -> Result<PathBuf, Box<dyn std::error::Error>> {
+    Ok(std::fs::read_dir(root.join(".cache"))?
+        .next()
+        .ok_or("no mirror")??
+        .path())
+}
+
+#[tokio::test]
+async fn a_half_built_mirror_without_an_origin_recovers() -> TestResult {
+    let dir = TempDir::new()?;
+    let repo = fixture(dir.path())?;
+    let root = dir.path().join("jobs");
+    let ws = workspace(&root);
+    ws.prepare("job1", &repo, "main").await?;
+    let mirror = only_mirror(&root)?;
+    git(&mirror, &["remote", "remove", "origin"])?;
+    let second = ws.prepare("job2", &repo, "main").await?;
+    assert_eq!(std::fs::read_to_string(second.path.join("a.txt"))?, "one");
+    assert_eq!(git(&mirror, &["remote", "get-url", "origin"])?, repo);
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_mirror_with_a_stale_origin_url_is_repointed() -> TestResult {
+    let dir = TempDir::new()?;
+    let repo = fixture(dir.path())?;
+    let root = dir.path().join("jobs");
+    let ws = workspace(&root);
+    ws.prepare("job1", &repo, "main").await?;
+    let mirror = only_mirror(&root)?;
+    git(&mirror, &["remote", "set-url", "origin", "/nowhere.git"])?;
+    ws.prepare("job2", &repo, "main").await?;
+    assert_eq!(git(&mirror, &["remote", "get-url", "origin"])?, repo);
+    Ok(())
+}
+
+#[tokio::test]
 async fn remove_deletes_the_worktree_and_scratch_and_keeps_the_mirror() -> TestResult {
     let dir = TempDir::new()?;
     let repo = fixture(dir.path())?;
     let root = dir.path().join("jobs");
-    let ws = Workspace::new(&root);
+    let ws = workspace(&root);
     let checkout = ws.prepare("job1", &repo, "main").await?;
     std::fs::create_dir(root.join(".finish-job1"))?;
     ws.remove("job1", &repo).await?;
@@ -104,7 +161,7 @@ async fn remove_deletes_the_worktree_and_scratch_and_keeps_the_mirror() -> TestR
 async fn rejects_unsafe_inputs_before_running_git() -> TestResult {
     let dir = TempDir::new()?;
     let root = dir.path().join("jobs");
-    let ws = Workspace::new(&root);
+    let ws = Workspace::new(&root).with_policy(RepoPolicy::new(["example.com"]).with_file_repos());
     let repos = [
         "--upload-pack=touch /tmp/x",
         "-oProxyCommand=x",
@@ -122,7 +179,10 @@ async fn rejects_unsafe_inputs_before_running_git() -> TestResult {
         let err = ws.prepare("job1", "/repo.git", name).await;
         assert!(matches!(err, Err(WorkspaceError::InvalidRef)), "{name}");
     }
-    for id in ["", "-x", "a/b", "a b", "../x"] {
+    let long = "a".repeat(65);
+    for id in [
+        "", "-x", "a/b", "a b", "../x", "a-b", "a.b", "a:b", "a~b", "a\u{e9}", "a\nb", &long,
+    ] {
         let err = ws.prepare(id, "/repo.git", "main").await;
         assert!(matches!(err, Err(WorkspaceError::InvalidJobId)), "{id}");
     }
@@ -133,7 +193,7 @@ async fn rejects_unsafe_inputs_before_running_git() -> TestResult {
 #[tokio::test]
 async fn errors_carry_no_input() -> TestResult {
     let dir = TempDir::new()?;
-    let ws = Workspace::new(dir.path().join("jobs"));
+    let ws = workspace(dir.path().join("jobs"));
     let secret = dir.path().join("missing-secret-name.git");
     let err = ws
         .prepare("job1", secret.to_str().ok_or("path")?, "main")
@@ -162,11 +222,10 @@ fn hanging_git() -> &'static Path {
 #[tokio::test]
 async fn a_hung_git_command_is_killed_at_the_timeout() -> TestResult {
     let dir = TempDir::new()?;
-    let ws =
-        Workspace::new(dir.path().join("jobs")).with_git(hanging_git(), Duration::from_millis(200));
+    let ws = workspace(dir.path().join("jobs")).with_git(hanging_git(), Duration::from_millis(200));
     let result = tokio::time::timeout(
         Duration::from_secs(20),
-        ws.prepare("job1", "https://example.invalid/r.git", "main"),
+        ws.prepare("job1", "/missing.git", "main"),
     )
     .await?;
     assert!(matches!(result, Err(WorkspaceError::GitTimeout("init"))));
@@ -178,7 +237,7 @@ fn forking_git() -> &'static Path {
     let (_, path) = DIR.get_or_init(|| {
         let dir = TempDir::new().unwrap_or_else(|_| std::process::abort());
         let path = dir.path().join("git");
-        let script = "#!/bin/sh\ncase \"$3\" in\ninit)\nfor last; do :; done\nbase=$(dirname \"$last\")\nsleep 300 > \"$base/hold\" &\nread x < \"$base/ready\" ;;\nesac\nexit 0\n";
+        let script = "#!/bin/sh\nsub=\nfor a; do [ \"$a\" = init ] && sub=init; done\ncase \"$sub\" in\ninit)\nfor last; do :; done\nbase=$(dirname \"$last\")\nsleep 300 > \"$base/hold\" &\nread x < \"$base/ready\" ;;\nesac\nexit 0\n";
         std::fs::write(&path, script).unwrap_or_else(|_| std::process::abort());
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755))
             .unwrap_or_else(|_| std::process::abort());
@@ -210,9 +269,8 @@ async fn a_background_descendant_of_a_clean_git_exit_is_killed() -> TestResult {
         let mut sink = Vec::new();
         file.read_to_end(&mut sink).await
     });
-    let ws =
-        Workspace::new(dir.path().join("jobs")).with_git(forking_git(), Duration::from_secs(60));
-    let repo = "https://example.invalid/r.git";
+    let ws = workspace(dir.path().join("jobs")).with_git(forking_git(), Duration::from_secs(60));
+    let repo = "/missing.git";
     let (result, driven) = tokio::join!(ws.prepare("job1", repo, "main"), async {
         tokio::time::timeout(Duration::from_secs(20), opened).await??;
         let mut file = tokio::fs::OpenOptions::new()

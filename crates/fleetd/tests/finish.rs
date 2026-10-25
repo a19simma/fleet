@@ -12,7 +12,7 @@ use fleet_core::Redactor;
 use fleet_proto::v1::{Job, JobState, ReportJobReply, ReportJobRequest};
 use fleetd::poller::Shutdown;
 use fleetd::runner::{AgentRunner, FinishOutcome, Reporter, RunConfig};
-use fleetd::workspace::Workspace;
+use fleetd::workspace::{RepoPolicy, Workspace};
 use tempfile::TempDir;
 use tokio::sync::mpsc;
 use tonic::Status;
@@ -34,7 +34,7 @@ const GIT: &str = r#"#!/bin/sh
 sub=
 for a in "$@"; do
   case "$a" in
-  -c | core.* | credential.*) ;;
+  -c | core.* | credential.* | http.*) ;;
   *) sub=$a; break ;;
   esac
 done
@@ -121,6 +121,7 @@ async fn rig(mode: &str) -> Result<Rig, Box<dyn std::error::Error>> {
     std::fs::write(dir.path().join("mode"), mode)?;
     let root = dir.path().join("work");
     let checkout = Workspace::new(&root)
+        .with_policy(test_policy())
         .prepare("job1", &origin.to_string_lossy(), "main")
         .await?;
     Ok(Rig {
@@ -134,12 +135,25 @@ fn agent(rig: &Rig) -> (AgentRunner<Fake>, mpsc::UnboundedReceiver<ReportJobRequ
     agent_with(rig, PathBuf::from(env!("CARGO_BIN_EXE_fleetd")))
 }
 
+fn test_policy() -> RepoPolicy {
+    RepoPolicy::new(Vec::<String>::new()).with_file_repos()
+}
+
 fn agent_with(
     rig: &Rig,
     askpass_bin: PathBuf,
 ) -> (AgentRunner<Fake>, mpsc::UnboundedReceiver<ReportJobRequest>) {
+    agent_with_policy(rig, askpass_bin, test_policy())
+}
+
+fn agent_with_policy(
+    rig: &Rig,
+    askpass_bin: PathBuf,
+    policy: RepoPolicy,
+) -> (AgentRunner<Fake>, mpsc::UnboundedReceiver<ReportJobRequest>) {
     let (tx, rx) = mpsc::unbounded_channel();
     let mut config = RunConfig::new("claude", false);
+    config.repo_policy = policy;
     gh().clone_into(&mut config.gh_bin);
     git_wrapper().clone_into(&mut config.git_bin);
     config.askpass_bin = askpass_bin;
@@ -492,6 +506,7 @@ async fn credentialed_children_get_only_their_credential_and_scratch_dirs() -> T
     let mut push = set(&common);
     push.insert("GIT_ASKPASS".into());
     push.insert("GH_TOKEN".into());
+    push.insert("FLEETD_ASKPASS_HOSTS".into());
     assert_eq!(keys(&recorded(&rig, "push")?), push);
     for sub in ["init", "fetch", "rev-list", "log"] {
         assert_eq!(keys(&recorded(&rig, sub)?), set(&common), "{sub}");
@@ -606,5 +621,97 @@ async fn an_askpass_path_with_quotes_and_substitutions_runs_as_one_file() -> Tes
     assert!(out.status.success());
     assert_eq!(String::from_utf8(out.stdout)?, "ran\n");
     assert!(!probe.path().join("pwned").exists());
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_job_repo_outside_the_policy_never_reaches_a_push() -> TestResult {
+    let rig = rig("ok").await?;
+    commit(&rig)?;
+    let policy = RepoPolicy::new(["github.com"]);
+    let (agent, mut rx) =
+        agent_with_policy(&rig, PathBuf::from(env!("CARGO_BIN_EXE_fleetd")), policy);
+    for repo in [
+        "https://attacker.example/x.git",
+        "https://github.com@attacker.example/x.git",
+        "https://github.com:8443/x.git",
+        "http://github.com/x.git",
+        "ssh://github.com/x.git",
+        "git://github.com/x.git",
+        "file:///tmp/x.git",
+        "/tmp/x.git",
+    ] {
+        let (_trigger, shutdown) = Shutdown::channel();
+        let mut bad = job(&rig, true);
+        repo.clone_into(&mut bad.repo);
+        let outcome = agent.finish(&bad, &rig.worktree, shutdown).await?;
+        assert_eq!(
+            outcome,
+            FinishOutcome::Failed {
+                error: "git push failed"
+            },
+            "{repo}"
+        );
+        let reports = drain(&mut rx);
+        let last = reports.last().ok_or("no report")?;
+        assert_eq!(last.terminal_state, Some(JobState::Failed.into()));
+    }
+    assert!(!rig.dir.path().join("work").join("git-push.env").exists());
+    assert!(!rig.dir.path().join("gh.env").exists());
+    Ok(())
+}
+
+#[tokio::test]
+async fn the_push_disables_redirect_following() -> TestResult {
+    let rig = rig("ok").await?;
+    commit(&rig)?;
+    let (agent, _rx) = agent(&rig);
+    let (_trigger, shutdown) = Shutdown::channel();
+    agent
+        .finish(&job(&rig, false), &rig.worktree, shutdown)
+        .await?;
+    let args = std::fs::read_to_string(rig.dir.path().join("work").join("git-push.args"))?;
+    let lines: Vec<&str> = args.lines().collect();
+    assert!(
+        lines
+            .windows(2)
+            .any(|w| w == ["-c", "http.followRedirects=false"]),
+        "{args}"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn the_push_allows_only_https_and_names_the_allowed_hosts() -> TestResult {
+    let rig = rig("ok").await?;
+    commit(&rig)?;
+    let policy = RepoPolicy::new(["origin.test", "git.example"]);
+    let (agent, _rx) = agent_with_policy(&rig, PathBuf::from(env!("CARGO_BIN_EXE_fleetd")), policy);
+    let (_trigger, shutdown) = Shutdown::channel();
+    let mut remote = job(&rig, false);
+    "https://origin.test/x.git".clone_into(&mut remote.repo);
+    let outcome = agent.finish(&remote, &rig.worktree, shutdown).await?;
+    assert!(matches!(outcome, FinishOutcome::Failed { .. }));
+    let push = recorded(&rig, "push")?;
+    assert!(push.contains("GIT_ALLOW_PROTOCOL=https\n"), "{push}");
+    assert!(
+        push.contains("FLEETD_ASKPASS_HOSTS=origin.test,git.example\n"),
+        "{push}"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn the_test_policy_adds_the_file_transport_to_the_push() -> TestResult {
+    let rig = rig("ok").await?;
+    commit(&rig)?;
+    let (agent, _rx) = agent(&rig);
+    let (_trigger, shutdown) = Shutdown::channel();
+    agent
+        .finish(&job(&rig, false), &rig.worktree, shutdown)
+        .await?;
+    let push = recorded(&rig, "push")?;
+    assert!(push.contains("GIT_ALLOW_PROTOCOL=file:https\n"), "{push}");
+    assert!(push.contains("FLEETD_ASKPASS_HOSTS=\n"), "{push}");
     Ok(())
 }

@@ -171,7 +171,9 @@ async fn launch(dir: &TempDir, agent: &str) -> Result<Launched, Box<dyn std::err
         dir.path().join("secrets.env").to_string_lossy(),
     );
     std::fs::write(dir.path().join("secrets.env"), "")?;
-    let config = Config::resolve(Some(&file), &|_| None)?;
+    let mut config = Config::resolve(Some(&file), &|_| None)?;
+    config.allow_file_repos = true;
+    config.repo_hosts.clear();
     let env = move |name: &str| match name {
         "FLEET_SERVER_URL" => Some(url.clone()),
         "FLEET_TOKEN" => Some(TOKEN.to_owned()),

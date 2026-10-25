@@ -15,6 +15,7 @@ const DEFAULT_QUEUE_MAX_AGE_SECS: u64 = 14 * 24 * 60 * 60;
 const DEFAULT_DEDUPE_SECS: u64 = 10;
 const DEFAULT_CLAUDE_BIN: &str = "claude";
 const DEFAULT_GH_BIN: &str = "gh";
+const DEFAULT_REPO_HOSTS: [&str; 1] = ["github.com"];
 const DEFAULT_HOOK_EVENTS: [&str; 5] = [
     "SessionStart",
     "UserPromptSubmit",
@@ -39,6 +40,7 @@ struct FileConfig {
     gh_bin: Option<PathBuf>,
     disposable: Option<bool>,
     jobs_dir: Option<PathBuf>,
+    repo_hosts: Option<Vec<String>>,
 }
 
 /// Where redaction secrets are read from.
@@ -80,6 +82,13 @@ pub struct Config {
     /// Directory for job worktrees and git mirrors. Defaults to `jobs` under
     /// `STATE_DIRECTORY`, else `jobs` in the working directory.
     pub jobs_dir: PathBuf,
+    /// Hosts a job repo may name, lowercase. Jobs run only https repos on these hosts, with
+    /// no port. Defaults to `github.com`. An empty list rejects every repo.
+    pub repo_hosts: Vec<String>,
+    /// Admits `file://` and absolute-path repos. Always false from [`Config::resolve`],
+    /// which has no file key or environment variable for it. Only code that builds a
+    /// `Config` for a test sets it.
+    pub allow_file_repos: bool,
 }
 
 impl Config {
@@ -105,8 +114,9 @@ impl Config {
     ///
     /// # Errors
     ///
-    /// Fails on invalid TOML, an unparsable `FLEETD_PORT`, or a zero
-    /// `queue_max_bytes` or `queue_max_age_secs`. An empty environment value counts as unset.
+    /// Fails on invalid TOML, an unparsable `FLEETD_PORT`, a zero
+    /// `queue_max_bytes` or `queue_max_age_secs`, or a `repo_hosts` entry that is not a bare
+    /// host name. An empty environment value counts as unset.
     pub fn resolve(
         file: Option<&str>,
         env: &dyn Fn(&str) -> Option<String>,
@@ -167,6 +177,7 @@ impl Config {
                 value: "0".to_owned(),
             });
         }
+        let repo_hosts = resolve_repo_hosts(file.repo_hosts)?;
         Ok(Self {
             http_port,
             socket_path,
@@ -200,6 +211,30 @@ impl Config {
                         .and_then(first_dir)
                         .map_or_else(|| PathBuf::from("jobs"), |dir| dir.join("jobs"))
                 }),
+            repo_hosts,
+            allow_file_repos: false,
+        })
+    }
+}
+
+fn resolve_repo_hosts(raw: Option<Vec<String>>) -> Result<Vec<String>, Error> {
+    let hosts = raw.map_or_else(
+        || DEFAULT_REPO_HOSTS.map(str::to_owned).to_vec(),
+        |hosts| hosts.iter().map(|h| h.to_ascii_lowercase()).collect(),
+    );
+    let bare = |host: &String| {
+        !host.is_empty()
+            && !host.starts_with(['.', '-'])
+            && host
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b == b'.' || b == b'-')
+    };
+    if hosts.iter().all(bare) {
+        Ok(hosts)
+    } else {
+        Err(Error::InvalidValue {
+            name: "repo_hosts",
+            value: "<redacted>".to_owned(),
         })
     }
 }
@@ -322,6 +357,44 @@ mod tests {
     fn file_values_apply_without_env() {
         let cfg = Config::resolve(Some("http_port = 9000"), &env_of(&[])).unwrap();
         assert_eq!(cfg.http_port, 9000);
+    }
+
+    #[test]
+    fn repo_hosts_default_to_github_and_normalise_case() {
+        let cfg = Config::resolve(None, &env_of(&[])).unwrap();
+        assert_eq!(cfg.repo_hosts, vec!["github.com".to_owned()]);
+        assert!(!cfg.allow_file_repos);
+        let file = "repo_hosts = [\"Git.Example.com\", \"github.com\"]";
+        let cfg = Config::resolve(Some(file), &env_of(&[])).unwrap();
+        assert_eq!(cfg.repo_hosts, ["git.example.com", "github.com"]);
+        let cfg = Config::resolve(Some("repo_hosts = []"), &env_of(&[])).unwrap();
+        assert!(cfg.repo_hosts.is_empty());
+    }
+
+    #[test]
+    fn repo_hosts_reject_anything_but_a_bare_host() {
+        for bad in [
+            "",
+            "a b",
+            "a/b",
+            "a:443",
+            "u@h",
+            "-h",
+            ".h",
+            "a,b",
+            "https://h",
+        ] {
+            let file = format!("repo_hosts = [\"{bad}\"]");
+            assert!(Config::resolve(Some(&file), &env_of(&[])).is_err(), "{bad}");
+        }
+    }
+
+    #[test]
+    fn no_file_key_or_env_admits_local_repos() {
+        assert!(Config::resolve(Some("allow_file = true"), &env_of(&[])).is_err());
+        assert!(Config::resolve(Some("allow_file_repos = true"), &env_of(&[])).is_err());
+        let env = env_of(&[("FLEETD_ALLOW_FILE", "1"), ("FLEETD_ALLOW_FILE_REPOS", "1")]);
+        assert!(!Config::resolve(None, &env).unwrap().allow_file_repos);
     }
 
     #[test]
