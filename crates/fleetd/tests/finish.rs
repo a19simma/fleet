@@ -47,15 +47,30 @@ if [ "$sub" = push ] && [ -e "$root/slow" ]; then sleep 1; fi
 exec git "$@"
 "#;
 
-struct Fake(mpsc::UnboundedSender<ReportJobRequest>);
+#[derive(Clone, Copy, PartialEq)]
+enum Reply {
+    Ok,
+    Stale,
+    Cancel,
+}
+
+struct Fake(mpsc::UnboundedSender<ReportJobRequest>, Reply);
 
 impl Reporter for Fake {
     fn report(
         &self,
         request: ReportJobRequest,
     ) -> impl Future<Output = Result<ReportJobReply, Status>> + Send {
+        let renewal = request.chunks.is_empty() && request.terminal_state.is_none();
         let _ = self.0.send(request);
-        ready(Ok(ReportJobReply::default()))
+        match self.1 {
+            Reply::Stale if renewal => ready(Err(Status::failed_precondition("stale"))),
+            Reply::Cancel if renewal => ready(Ok(ReportJobReply {
+                cancel_requested: true,
+                ..ReportJobReply::default()
+            })),
+            _ => ready(Ok(ReportJobReply::default())),
+        }
     }
 }
 
@@ -164,11 +179,34 @@ fn agent_paced(
     agent_build(rig, askpass_bin, test_policy(), report_interval)
 }
 
+fn agent_replying(
+    rig: &Rig,
+    reply: Reply,
+) -> (AgentRunner<Fake>, mpsc::UnboundedReceiver<ReportJobRequest>) {
+    agent_assemble(
+        rig,
+        PathBuf::from(env!("CARGO_BIN_EXE_fleetd")),
+        test_policy(),
+        Duration::from_millis(100),
+        reply,
+    )
+}
+
 fn agent_build(
     rig: &Rig,
     askpass_bin: PathBuf,
     policy: RepoPolicy,
     report_interval: Duration,
+) -> (AgentRunner<Fake>, mpsc::UnboundedReceiver<ReportJobRequest>) {
+    agent_assemble(rig, askpass_bin, policy, report_interval, Reply::Ok)
+}
+
+fn agent_assemble(
+    rig: &Rig,
+    askpass_bin: PathBuf,
+    policy: RepoPolicy,
+    report_interval: Duration,
+    reply: Reply,
 ) -> (AgentRunner<Fake>, mpsc::UnboundedReceiver<ReportJobRequest>) {
     let (tx, rx) = mpsc::unbounded_channel();
     let mut config = RunConfig::new("/bin/echo", false);
@@ -200,7 +238,7 @@ fn agent_build(
     env.extend(std::env::var_os("PATH").map(|path| ("PATH".into(), path)));
     config.base_env = env;
     (
-        AgentRunner::new(config, Fake(tx), Redactor::new(["hunter2-hunter2"])),
+        AgentRunner::new(config, Fake(tx, reply), Redactor::new(["hunter2-hunter2"])),
         rx,
     )
 }
@@ -477,6 +515,39 @@ async fn the_lease_is_renewed_while_the_push_runs() -> TestResult {
         .filter(|r| r.chunks.is_empty() && r.terminal_state.is_none())
         .count();
     assert!(renewals >= 3, "renewals: {renewals}");
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_lost_lease_skips_the_push_and_the_terminal_report() -> TestResult {
+    let rig = rig("ok").await?;
+    commit(&rig)?;
+    std::fs::write(rig.dir.path().join("slow"), "")?;
+    let (agent, mut rx) = agent_replying(&rig, Reply::Stale);
+    let (_trigger, shutdown) = Shutdown::channel();
+    let outcome = agent
+        .finish(&job(&rig, true), &rig.worktree, shutdown)
+        .await?;
+    assert_eq!(outcome, FinishOutcome::Lost);
+    assert!(!pushed(&rig)?);
+    assert!(drain(&mut rx).iter().all(|r| r.terminal_state.is_none()));
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_cancel_reply_stops_the_push_and_reports_cancelled() -> TestResult {
+    let rig = rig("ok").await?;
+    commit(&rig)?;
+    std::fs::write(rig.dir.path().join("slow"), "")?;
+    let (agent, mut rx) = agent_replying(&rig, Reply::Cancel);
+    let (_trigger, shutdown) = Shutdown::channel();
+    let outcome = agent
+        .finish(&job(&rig, true), &rig.worktree, shutdown)
+        .await?;
+    assert_eq!(outcome, FinishOutcome::Cancelled);
+    let reports = drain(&mut rx);
+    let last = reports.last().ok_or("no report")?;
+    assert_eq!(last.terminal_state, Some(JobState::Cancelled.into()));
     Ok(())
 }
 

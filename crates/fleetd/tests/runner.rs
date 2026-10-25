@@ -5,16 +5,16 @@ use std::future::{Future, ready};
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::sync::Arc;
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
 use fleet_core::Redactor;
 use fleet_proto::MAX_CHUNKS_PER_REPORT;
 use fleet_proto::v1::{Job, JobState, ReportJobReply, ReportJobRequest};
 use fleetd::poller::{RunError, Shutdown};
-use fleetd::runner::{AgentOutcome, AgentRunner, Reporter, RunConfig};
+use fleetd::runner::{AgentOutcome, AgentRunner, Interrupt, Reporter, RunConfig};
 use tempfile::TempDir;
 use tokio::io::AsyncReadExt;
 use tokio::sync::{mpsc, oneshot};
@@ -55,6 +55,7 @@ closed) exec 1>&-; : > "$path.closed"; read x < "$path"; exit 0 ;;
 burst) i=0; while [ $i -lt 700 ]; do echo x; i=$((i+1)); done; exit 0 ;;
 huge) head -c 3000000 /dev/zero | tr '\0' a; echo; echo next; exit 0 ;;
 reap) echo $$ > "$path"; read x < "$path.go"; exit 0 ;;
+big) i=0; while [ $i -lt 200 ]; do printf '%01000d\n' 0; i=$((i+1)); done; : > "$path.done"; read x < "$path"; exit 0 ;;
 flood) i=0; while [ $i -lt 100 ]; do printf '%01000d\n' 0; i=$((i+1)); done; exit 0 ;;
 orphan) perl -e 'use POSIX; POSIX::setsid(); open(F, ">", $ARGV[0]); print F $$; close F; exec "sleep", "300"' "$path" &
   while [ ! -s "$path" ]; do sleep 0.05; done; exit 0 ;;
@@ -355,6 +356,7 @@ async fn runner_resends_chunks_after_a_failed_report() -> TestResult {
     let (agent, mut rx) = runner(cfg, 1);
     let (_trigger, shutdown) = Shutdown::channel();
     agent.run(&job("stream:"), dir.path(), shutdown).await?;
+    agent.fail_job(&job("stream:"), "boom").await;
     let chunks: Vec<_> = drain(&mut rx)
         .iter()
         .flat_map(|r| r.chunks.iter().map(|c| c.seq))
@@ -597,7 +599,7 @@ async fn keep_alive_renews_the_lease_while_the_work_runs() -> TestResult {
             7
         })
         .await;
-    assert_eq!(out, 7);
+    assert_eq!(out, Ok(7));
     let reports = drain(&mut rx);
     assert_eq!(reports.len(), 3);
     assert!(
@@ -844,5 +846,146 @@ async fn a_stale_terminal_report_leaves_the_outcome_unchanged() -> TestResult {
         sent.iter().filter(|r| r.terminal_state.is_some()).count(),
         1
     );
+    Ok(())
+}
+
+fn slow_flush(fail_first: usize) -> (AgentRunner<Fake>, mpsc::UnboundedReceiver<ReportJobRequest>) {
+    let mut cfg = config(false);
+    cfg.flush_interval = Duration::from_secs(3600);
+    cfg.report_interval = Duration::from_secs(3600);
+    runner(cfg, fail_first)
+}
+
+fn seqs(requests: &[ReportJobRequest]) -> Vec<u64> {
+    requests
+        .iter()
+        .flat_map(|r| r.chunks.iter().map(|c| c.seq))
+        .collect()
+}
+
+#[tokio::test]
+async fn chunks_left_by_a_failed_final_flush_reach_the_server_before_the_terminal() -> TestResult {
+    let dir = TempDir::new()?;
+    let (agent, mut rx) = slow_flush(1);
+    let (_trigger, shutdown) = Shutdown::channel();
+    let outcome = agent.run(&job("stream:"), dir.path(), shutdown).await?;
+    assert_eq!(outcome, AgentOutcome::Succeeded);
+    assert!(drain(&mut rx).is_empty());
+    agent.fail_job(&job("stream:"), "boom").await;
+    let requests = drain(&mut rx);
+    assert_eq!(seqs(&requests), vec![1, 2]);
+    let last = requests.last().ok_or("no report")?;
+    assert_eq!(last.terminal_state, Some(JobState::Failed.into()));
+    assert!(last.chunks.is_empty());
+    Ok(())
+}
+
+#[tokio::test]
+async fn the_terminal_report_retries_queued_chunks_until_they_are_delivered() -> TestResult {
+    let dir = TempDir::new()?;
+    let (agent, mut rx) = slow_flush(2);
+    let (_trigger, shutdown) = Shutdown::channel();
+    agent.run(&job("stream:"), dir.path(), shutdown).await?;
+    agent.fail_job(&job("stream:"), "boom").await;
+    let requests = drain(&mut rx);
+    assert_eq!(seqs(&requests), vec![1, 2]);
+    let last = requests.last().ok_or("no report")?;
+    assert_eq!(last.terminal_state, Some(JobState::Failed.into()));
+    Ok(())
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_lost_lease_stops_the_guarded_work() -> TestResult {
+    let mut cfg = config(false);
+    cfg.report_interval = Duration::from_secs(30);
+    let (agent, mut rx, switch) = switched(cfg, 0);
+    switch.lost.store(true, Ordering::SeqCst);
+    let out = agent
+        .keep_alive(&job("x"), async {
+            tokio::time::sleep(Duration::from_secs(100)).await;
+            7
+        })
+        .await;
+    assert_eq!(out, Err(Interrupt::Lost));
+    assert!(drain(&mut rx).iter().all(|r| r.terminal_state.is_none()));
+    Ok(())
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_cancel_reply_stops_the_guarded_work() -> TestResult {
+    let mut cfg = config(false);
+    cfg.report_interval = Duration::from_secs(30);
+    let (agent, _rx, switch) = switched(cfg, 0);
+    switch.cancel.store(true, Ordering::SeqCst);
+    let out = agent
+        .keep_alive(&job("x"), async {
+            tokio::time::sleep(Duration::from_secs(100)).await;
+            7
+        })
+        .await;
+    assert_eq!(out, Err(Interrupt::Cancelled));
+    Ok(())
+}
+
+struct Gate {
+    first: Mutex<Option<oneshot::Receiver<()>>>,
+}
+
+impl Reporter for Gate {
+    fn report(
+        &self,
+        _request: ReportJobRequest,
+    ) -> impl Future<Output = Result<ReportJobReply, Status>> + Send {
+        let gate = self
+            .first
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .take();
+        async move {
+            Ok(ReportJobReply {
+                cancel_requested: match gate {
+                    Some(release) => release.await.is_ok(),
+                    None => false,
+                },
+                ..ReportJobReply::default()
+            })
+        }
+    }
+}
+
+#[tokio::test]
+async fn a_report_in_flight_does_not_stop_stdout_reads_or_delay_a_cancel() -> TestResult {
+    let dir = TempDir::new()?;
+    let hold = fifo(dir.path(), "hold")?;
+    let (release, gate) = oneshot::channel();
+    let agent = AgentRunner::new(
+        config(false),
+        Gate {
+            first: Mutex::new(Some(gate)),
+        },
+        Redactor::default(),
+    );
+    let (_trigger, shutdown) = Shutdown::channel();
+    let prompt = format!("big:{}", hold.display());
+    let job = job(&prompt);
+    let marker = dir.path().join("hold.done");
+    let (outcome, driven) = tokio::join!(
+        tokio::time::timeout(
+            Duration::from_secs(30),
+            agent.run(&job, dir.path(), shutdown)
+        ),
+        async {
+            tokio::time::timeout(Duration::from_secs(10), async {
+                while !marker.exists() {
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                }
+            })
+            .await?;
+            let _ = release.send(());
+            Ok::<(), Box<dyn std::error::Error>>(())
+        }
+    );
+    driven?;
+    assert_eq!(outcome??, AgentOutcome::Cancelled);
     Ok(())
 }
