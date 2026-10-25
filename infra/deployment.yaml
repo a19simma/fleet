@@ -24,7 +24,7 @@ spec:
           type: RuntimeDefault
       containers:
         - name: fleet-server
-          image: ghcr.io/a19simma/fleet-server:0.2.1
+          image: ghcr.io/a19simma/fleet-server:0.2.3
           ports:
             - name: grpc
               containerPort: 7070
