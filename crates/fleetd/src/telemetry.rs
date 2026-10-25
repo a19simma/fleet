@@ -290,6 +290,20 @@ impl Telemetry {
     ///
     /// Returns the events stored for this line. Never panics on bad input.
     pub fn feed_line(&mut self, line: &str, ts_ms: u64) -> Vec<JobEvent> {
+        self.feed_line_with(line, ts_ms, &str::to_owned)
+    }
+
+    /// Like [`Telemetry::feed_line`], with `redact` applied to decoded `tool`, `cmd` and `detail`
+    /// text before it is cut at its cap, so a cut cannot leave a prefix of a secret that only
+    /// matched after JSON decoding.
+    ///
+    /// The parser stays pure: `redact` is the caller's seam and does no I/O here.
+    pub fn feed_line_with(
+        &mut self,
+        line: &str,
+        ts_ms: u64,
+        redact: &dyn Fn(&str) -> String,
+    ) -> Vec<JobEvent> {
         let mut out = Vec::new();
         let Ok(value) = serde_json::from_str::<Value>(line) else {
             self.ignored += 1;
@@ -300,8 +314,10 @@ impl Telemetry {
         match (kind, subtype) {
             (Some("system"), Some("init")) => {}
             (Some("system"), Some("api_retry")) => self.on_retry(&value, ts_ms, &mut out),
-            (Some("system"), Some("permission_denied")) => self.on_denied(&value, ts_ms, &mut out),
-            (Some("assistant"), _) => self.on_assistant(&value, ts_ms),
+            (Some("system"), Some("permission_denied")) => {
+                self.on_denied(&value, ts_ms, redact, &mut out);
+            }
+            (Some("assistant"), _) => self.on_assistant(&value, ts_ms, redact),
             (Some("user"), _) => self.on_user(&value, ts_ms, &mut out),
             (Some("result"), _) => self.on_result(&value),
             _ => self.ignored += 1,
@@ -432,7 +448,13 @@ impl Telemetry {
         self.emit(event, out);
     }
 
-    fn on_denied(&mut self, value: &Value, ts_ms: u64, out: &mut Vec<JobEvent>) {
+    fn on_denied(
+        &mut self,
+        value: &Value,
+        ts_ms: u64,
+        redact: &dyn Fn(&str) -> String,
+        out: &mut Vec<JobEvent>,
+    ) {
         self.observed = true;
         self.denials += 1;
         let text = |name: &str| value.get(name).and_then(Value::as_str);
@@ -440,14 +462,14 @@ impl Telemetry {
             ts_ms,
             kind: EventKind::Denial,
             tool_use_id: text("tool_use_id").map(str::to_owned),
-            tool: text("tool_name").map(str::to_owned),
-            detail: text("message").map(|message| cap(message, self.limits.detail_cap)),
+            tool: text("tool_name").map(redact),
+            detail: text("message").map(|message| cap(&redact(message), self.limits.detail_cap)),
             ..JobEvent::default()
         };
         self.emit(event, out);
     }
 
-    fn on_assistant(&mut self, value: &Value, ts_ms: u64) {
+    fn on_assistant(&mut self, value: &Value, ts_ms: u64, redact: &dyn Fn(&str) -> String) {
         self.observed = true;
         let Some(message) = value.get("message") else {
             return;
@@ -468,12 +490,12 @@ impl Telemetry {
             .flatten();
         for block in blocks {
             if block.get("type").and_then(Value::as_str) == Some("tool_use") {
-                self.on_tool_use(block, ts_ms);
+                self.on_tool_use(block, ts_ms, redact);
             }
         }
     }
 
-    fn on_tool_use(&mut self, block: &Value, ts_ms: u64) {
+    fn on_tool_use(&mut self, block: &Value, ts_ms: u64, redact: &dyn Fn(&str) -> String) {
         let Some(id) = block.get("id").and_then(Value::as_str) else {
             self.ignored += 1;
             return;
@@ -498,11 +520,11 @@ impl Telemetry {
         let cmd = input
             .and_then(|input| input.get(key))
             .and_then(Value::as_str)
-            .map(|cmd| cap(cmd, self.limits.cmd_cap));
+            .map(|cmd| cap(&redact(cmd), self.limits.cmd_cap));
         self.pending.insert(
             id.to_owned(),
             Pending {
-                tool: tool.to_owned(),
+                tool: redact(tool),
                 cmd,
                 ts_ms,
             },

@@ -6,19 +6,22 @@ use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::OnceLock;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
 use fleet_core::Redactor;
 use fleet_proto::MAX_CHUNKS_PER_REPORT;
-use fleet_proto::v1::{Job, JobState, ReportJobReply, ReportJobRequest, TranscriptChunk};
+use fleet_proto::v1::{
+    Job, JobEvent, JobEventKind, JobState, ReportJobReply, ReportJobRequest, TranscriptChunk,
+};
 use fleetd::agent_config::{Bundle, JOB_EMAIL, JOB_NAME};
 use fleetd::poller::{RunError, Shutdown};
 use fleetd::runner::{
     AGENT_PROTOCOL, AgentOutcome, AgentRunner, ChildWait, Interrupt, Reporter, RunConfig,
     STRIPPED_ENV,
 };
+use serde_json::json;
 use tempfile::TempDir;
 use tokio::sync::{mpsc, oneshot};
 use tonic::Status;
@@ -58,6 +61,10 @@ stream)
   echo 'token hunter2-hunter2 end'
   exit 0 ;;
 exit3) echo out; exit 3 ;;
+cat) cat "$path"; exit 0 ;;
+catfail) cat "$path"; exit 3 ;;
+cathold) cat "${path%%|*}"; sleep 300 > "${path#*|}" & wait ;;
+sleepy) cat "$path"; sleep 0.4; cat "$path.second"; exit 0 ;;
 env) env; exit 0 ;;
 dir) printf 'dir=%s\n' "$HOME"; cat "$HOME/.claude/CLAUDE.md" "$HOME/.claude/settings.json" "$HOME/.gitconfig"; ls -d "$XDG_CONFIG_HOME" "$XDG_CACHE_HOME" "$XDG_STATE_HOME" "$XDG_DATA_HOME"; exit "${path:-0}" ;;
 args) printf 'arg=%s\n' "$@"; exit 0 ;;
@@ -96,6 +103,8 @@ struct Switch {
     cancel: AtomicBool,
     lost: AtomicBool,
     stale_terminal: AtomicBool,
+    fail_mask: AtomicU64,
+    calls: AtomicUsize,
 }
 
 struct Fake {
@@ -109,14 +118,17 @@ impl Reporter for Fake {
         &self,
         request: ReportJobRequest,
     ) -> impl Future<Output = Result<ReportJobReply, Status>> + Send {
+        let call = self.switch.calls.fetch_add(1, Ordering::SeqCst) + 1;
+        let masked = (self.switch.fail_mask.load(Ordering::SeqCst) >> call) & 1 == 1;
         #[expect(
             deprecated,
             reason = "try_update needs rust 1.95, above the workspace MSRV"
         )]
-        let failing = self
-            .fail_first
-            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1))
-            .is_ok();
+        let failing = masked
+            || self
+                .fail_first
+                .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1))
+                .is_ok();
         if failing {
             return ready(Err(Status::unavailable("down")));
         }
@@ -993,11 +1005,21 @@ async fn a_stale_terminal_report_leaves_the_outcome_unchanged() -> TestResult {
     .await
 }
 
-fn slow_flush(fail_first: usize) -> (AgentRunner<Fake>, mpsc::UnboundedReceiver<ReportJobRequest>) {
+fn slow_cfg() -> RunConfig {
     let mut cfg = config(false);
     cfg.flush_interval = Duration::from_secs(3600);
     cfg.report_interval = Duration::from_secs(3600);
-    runner(cfg, fail_first)
+    cfg
+}
+
+fn slow_report() -> RunConfig {
+    let mut cfg = config(false);
+    cfg.report_interval = Duration::from_secs(3600);
+    cfg
+}
+
+fn slow_flush(fail_first: usize) -> (AgentRunner<Fake>, mpsc::UnboundedReceiver<ReportJobRequest>) {
+    runner(slow_cfg(), fail_first)
 }
 
 fn seqs(requests: &[ReportJobRequest]) -> Vec<u64> {
@@ -1237,6 +1259,443 @@ async fn a_spawn_failure_logs_the_program_and_error_kind_but_not_the_prompt() ->
         assert!(out.contains("absent-claude"), "{out}");
         assert!(out.contains("NotFound"), "{out}");
         assert!(!out.contains("prompt-with-private-words"), "{out}");
+        Ok(())
+    }))
+    .await
+}
+
+fn bash_use(id: &str, command: &str) -> String {
+    json!({"type":"assistant","message":{"id":format!("m{id}"),"content":[
+        {"type":"tool_use","id":id,"name":"Bash","input":{"command":command}}]}})
+    .to_string()
+}
+
+fn tool_ok(id: &str) -> String {
+    json!({"type":"user","message":{"content":[
+        {"type":"tool_result","tool_use_id":id,"content":"out"}]}})
+    .to_string()
+}
+
+fn denied(id: &str, message: &str) -> String {
+    json!({"type":"system","subtype":"permission_denied","tool_name":"Bash",
+        "tool_use_id":id,"message":message})
+    .to_string()
+}
+
+fn result_line() -> String {
+    json!({"type":"result","subtype":"success","num_turns":3,"duration_ms":10,
+        "duration_api_ms":5,"total_cost_usd":0.5,
+        "usage":{"input_tokens":7,"output_tokens":8}})
+    .to_string()
+}
+
+fn secret_run() -> Vec<String> {
+    vec![
+        json!({"type":"system","subtype":"init"}).to_string(),
+        bash_use("t1", "echo hunter2-hunter2 done"),
+        tool_ok("t1"),
+        denied("t2", "denied hunter2-hunter2 here"),
+        "not json {{{".to_owned(),
+        result_line(),
+    ]
+}
+
+fn fixture(dir: &Path, name: &str, lines: &[String]) -> Result<PathBuf, std::io::Error> {
+    let path = dir.join(name);
+    std::fs::write(&path, format!("{}\n", lines.join("\n")))?;
+    Ok(path)
+}
+
+fn events(requests: &[ReportJobRequest]) -> Vec<JobEvent> {
+    requests.iter().flat_map(|r| r.events.clone()).collect()
+}
+
+fn terminal(requests: &[ReportJobRequest]) -> Result<&ReportJobRequest, &'static str> {
+    requests
+        .iter()
+        .find(|r| r.terminal_state.is_some())
+        .ok_or("no terminal report")
+}
+
+#[tokio::test]
+async fn telemetry_events_and_summary_reach_a_failed_run_redacted() -> TestResult {
+    common::bounded(Box::pin(async {
+        let dir = TempDir::new()?;
+        let file = fixture(dir.path(), "run.jsonl", &secret_run())?;
+        let (agent, mut rx) = runner(config(false), 0);
+        let (_trigger, shutdown) = Shutdown::channel();
+        let prompt = format!("catfail:{}", file.display());
+        let outcome = agent.run(&job(&prompt), dir.path(), shutdown).await?;
+        assert!(matches!(outcome, AgentOutcome::Failed { .. }));
+        let requests = drain(&mut rx);
+        let sent = events(&requests);
+        assert_eq!(sent.iter().map(|e| e.seq).collect::<Vec<_>>(), [0, 1]);
+        assert_eq!(sent[0].kind, i32::from(JobEventKind::Tool));
+        assert_eq!(sent[1].kind, i32::from(JobEventKind::Denial));
+        assert!(
+            sent[0]
+                .cmd
+                .as_deref()
+                .is_some_and(|c| c.contains("[REDACTED]"))
+        );
+        assert!(
+            sent[1]
+                .detail
+                .as_deref()
+                .is_some_and(|d| d.contains("[REDACTED]"))
+        );
+        assert!(!format!("{requests:?}").contains("hunter2"));
+        let summary = terminal(&requests)?.summary.clone().ok_or("no summary")?;
+        assert!(summary.complete);
+        assert_eq!(summary.turns, Some(3));
+        assert_eq!(summary.tool_calls, Some(1));
+        assert_eq!(summary.denials, Some(1));
+        assert!(
+            requests
+                .iter()
+                .filter(|r| r.terminal_state.is_none())
+                .all(|r| r.summary.is_none())
+        );
+        Ok(())
+    }))
+    .await
+}
+
+#[tokio::test]
+async fn a_timed_out_run_sends_its_events_and_a_summary() -> TestResult {
+    common::bounded(Box::pin(async {
+        let dir = TempDir::new()?;
+        let file = fixture(dir.path(), "run.jsonl", &secret_run())?;
+        let hold = fifo(dir.path(), "hold")?;
+        let reader = hold_reader(&hold);
+        let mut cfg = config(false);
+        cfg.timeout = START_BAND;
+        let (agent, mut rx) = runner(cfg, 0);
+        let (_trigger, shutdown) = Shutdown::channel();
+        let prompt = format!("cathold:{}|{}", file.display(), hold.display());
+        agent.run(&job(&prompt), dir.path(), shutdown).await?;
+        let requests = drain(&mut rx);
+        assert_eq!(events(&requests).len(), 2);
+        let summary = terminal(&requests)?.summary.clone().ok_or("no summary")?;
+        assert!(summary.complete);
+        reader.wait_eof().await?;
+        Ok(())
+    }))
+    .await
+}
+
+#[tokio::test]
+async fn a_cancelled_run_sends_its_events_and_a_summary() -> TestResult {
+    common::bounded(Box::pin(async {
+        let dir = TempDir::new()?;
+        let file = fixture(dir.path(), "run.jsonl", &secret_run())?;
+        let hold = fifo(dir.path(), "hold")?;
+        let mut reader = hold_reader(&hold);
+        let (agent, mut rx, switch) = switched(fast_beat(), 0);
+        let (_trigger, shutdown) = Shutdown::channel();
+        let prompt = format!("cathold:{}|{}", file.display(), hold.display());
+        let job = job(&prompt);
+        let (outcome, driven) = tokio::join!(
+            tokio::time::timeout(
+                Duration::from_secs(20),
+                agent.run(&job, dir.path(), shutdown)
+            ),
+            async {
+                reader.wait_opened().await?;
+                switch.cancel.store(true, Ordering::SeqCst);
+                Ok::<(), Box<dyn std::error::Error>>(())
+            }
+        );
+        driven?;
+        assert_eq!(outcome??, AgentOutcome::Cancelled);
+        let requests = drain(&mut rx);
+        assert_eq!(events(&requests).len(), 2);
+        let last = terminal(&requests)?;
+        assert_eq!(last.terminal_state, Some(JobState::Cancelled.into()));
+        assert!(last.summary.is_some());
+        reader.wait_eof().await?;
+        Ok(())
+    }))
+    .await
+}
+
+#[tokio::test]
+async fn a_failed_report_resends_the_same_events_once() -> TestResult {
+    common::bounded(Box::pin(async {
+        let dir = TempDir::new()?;
+        let file = fixture(dir.path(), "run.jsonl", &secret_run())?;
+        let (agent, mut rx) = slow_flush(2);
+        let (_trigger, shutdown) = Shutdown::channel();
+        let prompt = format!("cat:{}", file.display());
+        let outcome = agent.run(&job(&prompt), dir.path(), shutdown).await?;
+        assert_eq!(outcome, AgentOutcome::Succeeded);
+        assert_eq!(drain(&mut rx), Vec::<ReportJobRequest>::new());
+        agent.fail_job(&job(&prompt), "boom").await;
+        let requests = drain(&mut rx);
+        assert_eq!(
+            events(&requests).iter().map(|e| e.seq).collect::<Vec<_>>(),
+            [0, 1]
+        );
+        assert!(terminal(&requests)?.summary.is_some());
+        Ok(())
+    }))
+    .await
+}
+
+#[tokio::test]
+async fn a_backlog_over_256_events_splits_across_reports_with_ascending_seq() -> TestResult {
+    common::bounded(Box::pin(async {
+        let dir = TempDir::new()?;
+        let uses: Vec<_> = (0..300)
+            .map(|i| json!({"type":"tool_use","id":format!("t{i}"),"name":"Bash","input":{"command":"ls"}}))
+            .collect();
+        let results: Vec<_> = (0..300)
+            .map(|i| json!({"type":"tool_result","tool_use_id":format!("t{i}"),"content":"o"}))
+            .collect();
+        let lines = [
+            json!({"type":"assistant","message":{"id":"m","content":uses}}).to_string(),
+            json!({"type":"user","message":{"content":results}}).to_string(),
+        ];
+        let file = fixture(dir.path(), "run.jsonl", &lines)?;
+        let (agent, mut rx) = slow_flush(0);
+        let (_trigger, shutdown) = Shutdown::channel();
+        let prompt = format!("cat:{}", file.display());
+        agent.run(&job(&prompt), dir.path(), shutdown).await?;
+        let requests = drain(&mut rx);
+        let sizes: Vec<_> = requests
+            .iter()
+            .map(|r| r.events.len())
+            .filter(|n| *n > 0)
+            .collect();
+        assert_eq!(sizes, [256, 44]);
+        let seqs: Vec<_> = events(&requests).iter().map(|e| e.seq).collect();
+        assert_eq!(seqs, (0..300).collect::<Vec<u32>>());
+        Ok(())
+    }))
+    .await
+}
+
+#[tokio::test]
+async fn an_events_only_backlog_survives_failed_reports_until_sent() -> TestResult {
+    common::bounded(Box::pin(async {
+        let dir = TempDir::new()?;
+        let uses: Vec<_> = (0..300)
+            .map(|i| json!({"type":"tool_use","id":format!("t{i}"),"name":"Bash","input":{"command":"ls"}}))
+            .collect();
+        let results: Vec<_> = (0..300)
+            .map(|i| json!({"type":"tool_result","tool_use_id":format!("t{i}"),"content":"o"}))
+            .collect();
+        let lines = [
+            json!({"type":"assistant","message":{"id":"m","content":uses}}).to_string(),
+            json!({"type":"user","message":{"content":results}}).to_string(),
+        ];
+        let file = fixture(dir.path(), "run.jsonl", &lines)?;
+        let (agent, mut rx, switch) = switched(slow_cfg(), 0);
+        switch.fail_mask.store(0b1100, Ordering::SeqCst);
+        let (_trigger, shutdown) = Shutdown::channel();
+        let prompt = format!("cat:{}", file.display());
+        agent.run(&job(&prompt), dir.path(), shutdown).await?;
+        agent.fail_job(&job(&prompt), "boom").await;
+        let requests = drain(&mut rx);
+        let seqs: Vec<_> = events(&requests).iter().map(|e| e.seq).collect();
+        assert_eq!(seqs, (0..300).collect::<Vec<u32>>());
+        assert!(terminal(&requests)?.summary.is_some());
+        Ok(())
+    }))
+    .await
+}
+
+#[tokio::test]
+async fn a_running_job_sends_an_events_only_backlog_without_waiting_for_the_report_interval()
+-> TestResult {
+    common::bounded(Box::pin(async {
+        let dir = TempDir::new()?;
+        let uses: Vec<_> = (0..300)
+            .map(|i| json!({"type":"tool_use","id":format!("t{i}"),"name":"Bash","input":{"command":"ls"}}))
+            .collect();
+        let results: Vec<_> = (0..300)
+            .map(|i| json!({"type":"tool_result","tool_use_id":format!("t{i}"),"content":"o"}))
+            .collect();
+        let lines = [
+            json!({"type":"assistant","message":{"id":"m","content":uses}}).to_string(),
+            json!({"type":"user","message":{"content":results}}).to_string(),
+        ];
+        let file = fixture(dir.path(), "run.jsonl", &lines)?;
+        let hold = fifo(dir.path(), "hold")?;
+        let mut reader = hold_reader(&hold);
+        let (agent, mut rx) = runner(slow_report(), 0);
+        let (trigger, shutdown) = Shutdown::channel();
+        let prompt = format!("cathold:{}|{}", file.display(), hold.display());
+        let job = job(&prompt);
+        let (outcome, seen) = tokio::join!(
+            tokio::time::timeout(
+                Duration::from_secs(30),
+                agent.run(&job, dir.path(), shutdown)
+            ),
+            async {
+                reader.wait_opened().await?;
+                let mut count = 0;
+                while count < 300 {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                    count += events(&drain(&mut rx)).len();
+                }
+                let _ = trigger.send(true);
+                Ok::<usize, Box<dyn std::error::Error>>(count)
+            }
+        );
+        assert_eq!(seen?, 300);
+        assert!(matches!(outcome?, Err(RunError)));
+        reader.wait_eof().await?;
+        Ok(())
+    }))
+    .await
+}
+
+#[tokio::test]
+async fn event_time_is_measured_from_job_start() -> TestResult {
+    common::bounded(Box::pin(async {
+        let dir = TempDir::new()?;
+        let first = fixture(
+            dir.path(),
+            "run.jsonl",
+            &[bash_use("a", "ls"), tool_ok("a")],
+        )?;
+        fixture(
+            dir.path(),
+            "run.jsonl.second",
+            &[bash_use("b", "ls"), tool_ok("b")],
+        )?;
+        let (agent, mut rx) = runner(config(false), 0);
+        let (_trigger, shutdown) = Shutdown::channel();
+        let prompt = format!("sleepy:{}", first.display());
+        agent.run(&job(&prompt), dir.path(), shutdown).await?;
+        let sent = events(&drain(&mut rx));
+        assert_eq!(sent.len(), 2);
+        assert!(sent[1].ts_ms >= sent[0].ts_ms + 300);
+        assert!(sent[1].ts_ms < 20_000);
+        Ok(())
+    }))
+    .await
+}
+
+#[tokio::test]
+async fn garbage_lines_leave_the_transcript_byte_identical() -> TestResult {
+    common::bounded(Box::pin(async {
+        let dir = TempDir::new()?;
+        let lines = vec![
+            json!({"type":"system","subtype":"init"}).to_string(),
+            "not json".to_owned(),
+            String::new(),
+            "[1,2,3]".to_owned(),
+            "null".to_owned(),
+            "\"str\"".to_owned(),
+            "[".repeat(5000),
+            json!({"type":"user","message":{"content":"x"}}).to_string(),
+            json!({"type":"user","message":{"content":[{"type":"tool_result"}]}}).to_string(),
+            json!({"type":"assistant","message":{"content":[{"type":"tool_use"}]}}).to_string(),
+            "x".repeat(200_000),
+            bash_use("t1", "ls"),
+        ];
+        let file = fixture(dir.path(), "run.jsonl", &lines)?;
+        let (agent, mut rx) = runner(config(false), 0);
+        let (_trigger, shutdown) = Shutdown::channel();
+        let prompt = format!("cat:{}", file.display());
+        let outcome = agent.run(&job(&prompt), dir.path(), shutdown).await?;
+        assert_eq!(outcome, AgentOutcome::Succeeded);
+        agent.fail_job(&job(&prompt), "boom").await;
+        let requests = drain(&mut rx);
+        assert_eq!(text(&requests), std::fs::read_to_string(&file)?);
+        assert_eq!(events(&requests), Vec::<JobEvent>::new());
+        let summary = terminal(&requests)?.summary.clone().ok_or("no summary")?;
+        assert!(!summary.complete);
+        assert!(summary.missing.contains(&"result".to_owned()));
+        Ok(())
+    }))
+    .await
+}
+
+const ESCAPED: &str = "ab\"cd\\ef\ngh-zzTAIL";
+
+fn unicode_escaped(text: &str) -> String {
+    text.replace('\\', "\\u005c")
+        .replace('"', "\\u0022")
+        .replace('\n', "\\u000a")
+}
+
+#[tokio::test]
+async fn an_escaped_secret_at_the_command_and_detail_caps_leaves_no_prefix() -> TestResult {
+    common::bounded(Box::pin(async {
+        let dir = TempDir::new()?;
+        let command = format!("{}{ESCAPED}", "a".repeat(500));
+        let message = format!("{}{ESCAPED}", "b".repeat(1010));
+        let raw_use = format!(
+            "{{\"type\":\"assistant\",\"message\":{{\"id\":\"m2\",\"content\":[{{\"type\":\"tool_use\",\"id\":\"t2\",\"name\":\"Bash\",\"input\":{{\"command\":\"{}\"}}}}]}}}}",
+            unicode_escaped(&command)
+        );
+        let raw_denial = format!(
+            "{{\"type\":\"system\",\"subtype\":\"permission_denied\",\"tool_name\":\"Bash\",\"tool_use_id\":\"d2\",\"message\":\"{}\"}}",
+            unicode_escaped(&message)
+        );
+        let lines = [
+            bash_use("t1", &command),
+            tool_ok("t1"),
+            denied("d1", &message),
+            raw_use,
+            tool_ok("t2"),
+            raw_denial,
+        ];
+        let file = fixture(dir.path(), "run.jsonl", &lines)?;
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let fake = Fake {
+            tx,
+            fail_first: AtomicUsize::new(0),
+            switch: Arc::new(Switch::default()),
+        };
+        let agent = AgentRunner::new(config(false), fake, Redactor::new([ESCAPED]));
+        let (_trigger, shutdown) = Shutdown::channel();
+        let prompt = format!("cat:{}", file.display());
+        agent.run(&job(&prompt), dir.path(), shutdown).await?;
+        let sent = events(&drain(&mut rx));
+        assert_eq!(sent.len(), 4);
+        for event in &sent {
+            let fields = [&event.tool_use_id, &event.tool, &event.cmd, &event.detail];
+            for field in fields.into_iter().flatten() {
+                for end in 6..=ESCAPED.len() {
+                    assert!(!field.contains(&ESCAPED[..end]), "prefix of {end} bytes leaked");
+                }
+            }
+        }
+        for event in sent.iter().filter(|e| e.kind == i32::from(JobEventKind::Tool)) {
+            let cmd = event.cmd.as_deref().ok_or("no cmd")?;
+            assert_eq!(cmd.len(), 510);
+            assert!(cmd.ends_with("[REDACTED]"));
+        }
+        for event in sent.iter().filter(|e| e.kind == i32::from(JobEventKind::Denial)) {
+            let detail = event.detail.as_deref().ok_or("no detail")?;
+            assert_eq!(detail.len(), 1020);
+            assert!(detail.ends_with("[REDACTED]"));
+        }
+        Ok(())
+    }))
+    .await
+}
+
+#[tokio::test]
+async fn a_secret_at_the_command_cap_is_redacted_before_the_cut() -> TestResult {
+    common::bounded(Box::pin(async {
+        let dir = TempDir::new()?;
+        let command = format!("{} hunter2-hunter2 tail", "a".repeat(505));
+        let lines = [bash_use("t1", &command), tool_ok("t1")];
+        let file = fixture(dir.path(), "run.jsonl", &lines)?;
+        let (agent, mut rx) = runner(config(false), 0);
+        let (_trigger, shutdown) = Shutdown::channel();
+        let prompt = format!("cat:{}", file.display());
+        agent.run(&job(&prompt), dir.path(), shutdown).await?;
+        let sent = events(&drain(&mut rx));
+        let cmd = sent.first().and_then(|e| e.cmd.clone()).ok_or("no cmd")?;
+        assert_eq!(cmd.len(), 512);
+        assert!(cmd.ends_with(" [REDAC"));
+        assert!(!cmd.contains("hunt"));
         Ok(())
     }))
     .await

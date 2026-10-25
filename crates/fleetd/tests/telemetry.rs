@@ -246,6 +246,41 @@ fn cmd_truncation_respects_char_boundaries() {
     assert_eq!(events.first().unwrap().cmd.as_deref(), Some("\u{e9}"));
 }
 
+fn mask(text: &str) -> String {
+    text.replace("SECRETVALUE", "[R]")
+}
+
+#[test]
+fn redaction_runs_before_the_cut_on_cmd_detail_and_tool() {
+    let mut telemetry = Telemetry::new(limits(100, 1 << 20, 12, 12));
+    let use_line = tool_use(
+        "a",
+        "SECRETVALUE",
+        &json!({"file_path":"aaaaaaaaSECRETVALUE"}),
+    );
+    telemetry.feed_line_with(&use_line, 0, &mask);
+    let result = tool_result("a", &json!("out"), false);
+    let tool = telemetry.feed_line_with(&result, 1, &mask);
+    assert_eq!(tool.first().unwrap().cmd.as_deref(), Some("aaaaaaaa[R]"));
+    assert_eq!(tool.first().unwrap().tool.as_deref(), Some("[R]"));
+    let denial = json!({"type":"system","subtype":"permission_denied",
+        "tool_name":"SECRETVALUE","tool_use_id":"d","message":"aaaaaaaaSECRETVALUE"})
+    .to_string();
+    let denied = telemetry.feed_line_with(&denial, 2, &mask);
+    assert_eq!(
+        denied.first().unwrap().detail.as_deref(),
+        Some("aaaaaaaa[R]")
+    );
+    assert_eq!(denied.first().unwrap().tool.as_deref(), Some("[R]"));
+}
+
+#[test]
+fn feed_line_keeps_text_unredacted() {
+    let mut telemetry = Telemetry::new(limits(100, 1 << 20, 12, 12));
+    let events = pair(&mut telemetry, "a", "aaaaaaaaSECRETVALUE", 0);
+    assert_eq!(events.first().unwrap().cmd.as_deref(), Some("aaaaaaaaSECR"));
+}
+
 #[test]
 fn cmd_for_file_tools_is_the_file_path() {
     let mut telemetry = Telemetry::new(Limits::default());

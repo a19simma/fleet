@@ -5,7 +5,8 @@
 //!
 //! While `FLEET_SERVER_URL` and `FLEET_TOKEN` are set, the daemon also runs jobs: [`poller`]
 //! claims them, [`workspace`] prepares git worktrees, and [`runner`] runs the agent as a child
-//! process, then pushes the branch and opens the pull request. The push's `GIT_ASKPASS` is
+//! process, then pushes the branch and opens the pull request. Each run also reports tool events
+//! and a summary parsed from the agent's output ([`telemetry`]). The push's `GIT_ASKPASS` is
 //! `fleetd askpass` ([`askpass`]).
 
 pub mod agent_config;
@@ -16,6 +17,7 @@ mod config;
 mod dump;
 mod error;
 pub mod events;
+mod feed;
 pub mod forwarder;
 mod group;
 pub mod heartbeat;

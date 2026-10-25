@@ -16,6 +16,13 @@
 //! delivered or [`RunConfig::terminal_report_timeout`] passes. After the agent exits,
 //! stdout is drained for at most [`STDOUT_DRAIN`], so a descendant that left the process
 //! group cannot hold the run open. A chunk cut to [`MAX_CHUNK_BYTES`] has `truncated` set.
+//!
+//! Each redacted line also feeds a per-job parser ([`crate::telemetry`], wrapped in a private
+//! `feed` module). Its events ride the same reports in batches of at most 256, keep their
+//! `seq`, and stay queued until a report succeeds, so a retry resends the same events. At
+//! most 4096 events wait: the oldest drop first and are counted. A parser fault only bumps a
+//! counter and never touches the transcript. The terminal report carries the summary. A lost
+//! lease sends no terminal report, so it sends no summary.
 //! Chunk numbers and progress carry from [`AgentRunner::run`] into [`AgentRunner::finish`]
 //! and [`AgentRunner::fail_job`] for the same job, so the server keeps their chunks.
 //! [`AgentRunner::keep_alive`] and `finish` renew the lease while git steps run, and stop the
@@ -56,10 +63,12 @@ use tonic::{Code, Status};
 
 use crate::agent_config::{Bundle, JOB_EMAIL, JOB_NAME, JobDir};
 use crate::askpass;
+use crate::feed::Feed;
 use crate::group::GroupGuard;
 use crate::now_ms;
 use crate::poller::{RunError, Shutdown};
 use crate::proc::{CAPTURE_BYTES, CaptureError, Captured, capture};
+use crate::telemetry::Terminal as Ending;
 use crate::workspace::{RepoPolicy, validate_job_id, validate_ref, validate_repo};
 
 /// Variables that never reach the agent's environment block, however it is configured.
@@ -355,6 +364,7 @@ struct Carry {
     progress: String,
     pending: VecDeque<TranscriptChunk>,
     pending_bytes: usize,
+    feed: Option<Feed>,
 }
 
 impl<R: Reporter> AgentRunner<R> {
@@ -1252,11 +1262,13 @@ type ReportFuture<'a> = Pin<Box<dyn Future<Output = Result<ReportJobReply, Statu
 
 struct InFlight<'a> {
     upto: u64,
+    events_upto: Option<u32>,
     future: ReportFuture<'a>,
 }
 
 struct Reply {
     upto: u64,
+    events_upto: Option<u32>,
     result: Result<ReportJobReply, Status>,
 }
 
@@ -1265,6 +1277,7 @@ struct Stream<'a, R> {
     job: &'a Job,
     pending: VecDeque<TranscriptChunk>,
     pending_bytes: usize,
+    feed: Feed,
     in_flight: Option<InFlight<'a>>,
     next_seq: u64,
     progress: String,
@@ -1282,6 +1295,7 @@ impl<'a, R: Reporter> Stream<'a, R> {
             job,
             pending: carry.pending,
             pending_bytes: carry.pending_bytes,
+            feed: carry.feed.unwrap_or_else(|| Feed::new(Instant::now())),
             in_flight: None,
             next_seq: carry.next_seq.max(1),
             progress: carry.progress,
@@ -1299,6 +1313,7 @@ impl<'a, R: Reporter> Stream<'a, R> {
             progress: self.progress.clone(),
             pending: std::mem::take(&mut self.pending),
             pending_bytes: std::mem::take(&mut self.pending_bytes),
+            feed: Some(std::mem::replace(&mut self.feed, Feed::new(Instant::now()))),
         }
     }
 
@@ -1307,6 +1322,7 @@ impl<'a, R: Reporter> Stream<'a, R> {
             return;
         }
         let clean = redactor.redact_str(line);
+        self.feed.line(redactor, &clean, Instant::now());
         if let Some(text) = assistant_text(&clean) {
             self.progress = text.chars().take(MAX_PROGRESS_CHARS).collect();
         }
@@ -1330,9 +1346,16 @@ impl<'a, R: Reporter> Stream<'a, R> {
     }
 
     fn beat(&mut self, report_interval: Duration) {
-        if !self.pending.is_empty() || self.last_report.elapsed() >= report_interval {
+        if !self.pending.is_empty()
+            || !self.feed.backlog_empty()
+            || self.last_report.elapsed() >= report_interval
+        {
             self.start();
         }
+    }
+
+    fn drained(&self) -> bool {
+        self.pending.is_empty() && self.feed.backlog_empty()
     }
 
     fn in_flight(&self) -> bool {
@@ -1346,9 +1369,13 @@ impl<'a, R: Reporter> Stream<'a, R> {
         let count = self.batch_len();
         let chunks: Vec<_> = self.pending.iter().take(count).cloned().collect();
         let upto = chunks.last().map_or(0, |chunk| chunk.seq);
-        let request = self.request(chunks);
+        let events = self.feed.batch();
+        let events_upto = events.last().map(|event| event.seq);
+        let mut request = self.request(chunks);
+        request.events = events;
         self.in_flight = Some(InFlight {
             upto,
+            events_upto,
             future: Box::pin(self.reporter.report(request)),
         });
     }
@@ -1359,8 +1386,13 @@ impl<'a, R: Reporter> Stream<'a, R> {
         };
         let result = flying.future.as_mut().await;
         let upto = flying.upto;
+        let events_upto = flying.events_upto;
         self.in_flight = None;
-        Reply { upto, result }
+        Reply {
+            upto,
+            events_upto,
+            result,
+        }
     }
 
     fn settle(&mut self, reply: Reply) -> Result<(), End> {
@@ -1371,6 +1403,9 @@ impl<'a, R: Reporter> Stream<'a, R> {
                     if let Some(sent) = self.pending.pop_front() {
                         self.pending_bytes -= sent.text.len();
                     }
+                }
+                if let Some(upto) = reply.events_upto {
+                    self.feed.ack(upto);
                 }
                 self.last_report = Instant::now();
                 self.failing = false;
@@ -1391,9 +1426,6 @@ impl<'a, R: Reporter> Stream<'a, R> {
         } else if self.cancel {
             Err(End::Cancel)
         } else {
-            if !self.failing && !self.pending.is_empty() {
-                self.start();
-            }
             Ok(())
         }
     }
@@ -1417,7 +1449,7 @@ impl<'a, R: Reporter> Stream<'a, R> {
             }
             let reply = self.reply().await;
             let _ = self.settle(reply);
-            if self.lost || self.failing || self.pending.is_empty() {
+            if self.lost || self.failing || self.drained() {
                 return;
             }
         }
@@ -1481,7 +1513,7 @@ impl<'a, R: Reporter> Stream<'a, R> {
             if self.lost {
                 return;
             }
-            if self.pending.is_empty() {
+            if self.drained() {
                 break;
             }
             tokio::time::sleep(RETRY_PAUSE).await;
@@ -1492,6 +1524,7 @@ impl<'a, R: Reporter> Stream<'a, R> {
         request.exit_code = end.exit_code;
         request.branch = end.branch;
         request.pr_url = end.pr_url;
+        request.summary = Some(self.feed.finish(ending(end.state, end.error)));
         match self.reporter.report(request).await {
             Err(status) if status.code() == Code::FailedPrecondition => {
                 tracing::info!("job already ended");
@@ -1513,6 +1546,15 @@ fn report_request(job: &Job, progress: &str, chunks: Vec<TranscriptChunk>) -> Re
         progress: progress.to_owned(),
         chunks,
         ..ReportJobRequest::default()
+    }
+}
+
+fn ending(state: JobState, error: Option<&str>) -> Ending {
+    match (state, error) {
+        (JobState::Succeeded, _) => Ending::Succeeded,
+        (JobState::Cancelled, _) => Ending::Cancelled,
+        (_, Some(ERR_TIMEOUT | ERR_FINISH_TIMEOUT)) => Ending::TimedOut,
+        _ => Ending::Failed,
     }
 }
 
@@ -1666,8 +1708,23 @@ fn cut(text: &mut String, max: usize) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::LineReader;
+    use super::{ERR_FINISH_TIMEOUT, ERR_TIMEOUT, Ending, JobState, LineReader, ending};
     use tokio::io::BufReader;
+
+    #[test]
+    fn the_terminal_state_and_error_pick_the_telemetry_ending() {
+        let cases = [
+            (JobState::Succeeded, None, Ending::Succeeded),
+            (JobState::Cancelled, None, Ending::Cancelled),
+            (JobState::Failed, None, Ending::Failed),
+            (JobState::Failed, Some("boom"), Ending::Failed),
+            (JobState::Failed, Some(ERR_TIMEOUT), Ending::TimedOut),
+            (JobState::Failed, Some(ERR_FINISH_TIMEOUT), Ending::TimedOut),
+        ];
+        for (state, error, expected) in cases {
+            assert_eq!(ending(state, error), expected);
+        }
+    }
 
     #[tokio::test]
     async fn a_huge_line_is_capped_before_it_is_buffered() {

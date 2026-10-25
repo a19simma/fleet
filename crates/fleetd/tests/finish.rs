@@ -1212,3 +1212,48 @@ async fn a_publish_failure_logs_a_redacted_stderr_tail_of_at_most_512_bytes() ->
     }))
     .await
 }
+
+#[tokio::test]
+async fn every_terminal_report_from_finish_carries_a_summary() -> TestResult {
+    common::bounded(Box::pin(async {
+        let ok = rig("ok").await?;
+        commit(&ok)?;
+        let (runner, mut rx) = agent(&ok);
+        let (_trigger, shutdown) = Shutdown::channel();
+        let outcome = runner
+            .finish(&job(&ok, true), &ok.worktree, shutdown)
+            .await?;
+        assert!(matches!(outcome, FinishOutcome::Succeeded { .. }));
+        let reports = drain(&mut rx);
+        let last = reports.last().ok_or("no report")?;
+        assert_eq!(last.terminal_state, Some(JobState::Succeeded.into()));
+        assert!(last.summary.as_ref().is_some_and(|s| !s.complete));
+
+        let bad = rig("fail").await?;
+        commit(&bad)?;
+        let (runner, mut rx) = agent(&bad);
+        let (_trigger, shutdown) = Shutdown::channel();
+        runner
+            .finish(&job(&bad, true), &bad.worktree, shutdown)
+            .await?;
+        let reports = drain(&mut rx);
+        let last = reports.last().ok_or("no report")?;
+        assert_eq!(last.terminal_state, Some(JobState::Failed.into()));
+        assert!(last.summary.is_some());
+
+        let stopped = rig("ok").await?;
+        commit(&stopped)?;
+        std::fs::write(stopped.dir.path().join("work").join("hold"), "")?;
+        let (agent, mut rx) = agent_replying(&stopped, Reply::Cancel);
+        let (_trigger, shutdown) = Shutdown::channel();
+        agent
+            .finish(&job(&stopped, true), &stopped.worktree, shutdown)
+            .await?;
+        let reports = drain(&mut rx);
+        let last = reports.last().ok_or("no report")?;
+        assert_eq!(last.terminal_state, Some(JobState::Cancelled.into()));
+        assert!(last.summary.is_some());
+        Ok(())
+    }))
+    .await
+}
