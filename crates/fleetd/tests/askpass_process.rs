@@ -24,7 +24,17 @@ fn askpass_for(
     if let Some(token) = token {
         command.env("GH_TOKEN", token);
     }
-    command.output()
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = tx.send(command.output());
+    });
+    rx.recv_timeout(std::time::Duration::from_secs(60))
+        .unwrap_or_else(|_| {
+            Err(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "askpass hung",
+            ))
+        })
 }
 
 #[test]

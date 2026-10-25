@@ -20,6 +20,9 @@ use tokio::sync::{mpsc, oneshot};
 use tokio_stream::wrappers::TcpListenerStream;
 use tonic::{Request, Response, Status};
 
+#[path = "common/bounded.rs"]
+mod common;
+
 type TestResult = Result<(), Box<dyn std::error::Error>>;
 
 const TOKEN: &str = "daemon-test-token-0123456789";
@@ -217,108 +220,117 @@ async fn launch_with(
 
 #[tokio::test]
 async fn the_daemon_runs_a_claimed_job_to_a_pushed_branch_and_a_pull_request() -> TestResult {
-    let dir = TempDir::new()?;
-    let Launched {
-        mut inbox,
-        stop,
-        daemon,
-        server,
-        origin,
-        box_name,
-        ..
-    } = launch(&dir, AGENT).await?;
+    common::bounded(Box::pin(async {
+        let dir = TempDir::new()?;
+        let Launched {
+            mut inbox,
+            stop,
+            daemon,
+            server,
+            origin,
+            box_name,
+            ..
+        } = launch(&dir, AGENT).await?;
 
-    let terminal = tokio::time::timeout(Duration::from_secs(60), async {
-        while let Some((auth, report)) = inbox.recv().await {
-            assert_eq!(auth, format!("Bearer {TOKEN}"));
-            if report.terminal_state.is_some() {
-                return Some(report);
+        let terminal = tokio::time::timeout(Duration::from_secs(60), async {
+            while let Some((auth, report)) = inbox.recv().await {
+                assert_eq!(auth, format!("Bearer {TOKEN}"));
+                if report.terminal_state.is_some() {
+                    return Some(report);
+                }
             }
-        }
-        None
-    })
-    .await?
-    .ok_or("no terminal report")?;
-    assert_eq!(terminal.job_id, "job1");
-    assert_eq!(terminal.r#box, box_name);
-    assert_eq!(terminal.attempt, 1);
-    assert_eq!(terminal.terminal_state, Some(JobState::Succeeded.into()));
-    assert_eq!(terminal.pr_url.as_deref(), Some(PR_URL));
-    assert_eq!(terminal.branch.as_deref(), Some("swarm/job1"));
-    assert_eq!(
-        git(&origin, &["show", "swarm/job1:hello.txt"])?.trim(),
-        "fake-agent-output"
-    );
+            None
+        })
+        .await?
+        .ok_or("no terminal report")?;
+        assert_eq!(terminal.job_id, "job1");
+        assert_eq!(terminal.r#box, box_name);
+        assert_eq!(terminal.attempt, 1);
+        assert_eq!(terminal.terminal_state, Some(JobState::Succeeded.into()));
+        assert_eq!(terminal.pr_url.as_deref(), Some(PR_URL));
+        assert_eq!(terminal.branch.as_deref(), Some("swarm/job1"));
+        assert_eq!(
+            git(&origin, &["show", "swarm/job1:hello.txt"])?.trim(),
+            "fake-agent-output"
+        );
 
-    let _ = stop.send(());
-    tokio::time::timeout(Duration::from_secs(30), daemon).await???;
-    server.abort();
-    assert!(!dir.path().join("jobs").join("job1").exists());
-    assert!(!dir.path().join("jobs").join(".finish-job1").exists());
-    assert!(dir.path().join("jobs").join(".cache").is_dir());
-    Ok(())
+        let _ = stop.send(());
+        tokio::time::timeout(Duration::from_secs(30), daemon).await???;
+        server.abort();
+        assert!(!dir.path().join("jobs").join("job1").exists());
+        assert!(!dir.path().join("jobs").join(".finish-job1").exists());
+        assert!(dir.path().join("jobs").join(".cache").is_dir());
+        Ok(())
+    }))
+    .await
 }
 
 #[tokio::test]
 async fn a_job_cut_short_by_shutdown_still_loses_its_worktree_and_scratch() -> TestResult {
-    let dir = TempDir::new()?;
-    let Launched {
-        mut inbox,
-        stop,
-        daemon,
-        server,
-        ..
-    } = launch(&dir, BLOCKING_AGENT).await?;
+    common::bounded(Box::pin(async {
+        let dir = TempDir::new()?;
+        let Launched {
+            mut inbox,
+            stop,
+            daemon,
+            server,
+            ..
+        } = launch(&dir, BLOCKING_AGENT).await?;
 
-    tokio::time::timeout(Duration::from_secs(60), inbox.recv())
-        .await?
-        .ok_or("no report")?;
-    let jobs = dir.path().join("jobs");
-    assert!(jobs.join("job1").is_dir());
-    assert!(jobs.join(".finish-job1").is_dir());
+        tokio::time::timeout(Duration::from_secs(60), inbox.recv())
+            .await?
+            .ok_or("no report")?;
+        let jobs = dir.path().join("jobs");
+        assert!(jobs.join("job1").is_dir());
+        assert!(jobs.join(".finish-job1").is_dir());
 
-    let _ = stop.send(());
-    tokio::time::timeout(Duration::from_secs(30), daemon).await???;
-    server.abort();
-    assert!(!jobs.join("job1").exists());
-    assert!(!jobs.join(".finish-job1").exists());
-    Ok(())
+        let _ = stop.send(());
+        tokio::time::timeout(Duration::from_secs(30), daemon).await???;
+        server.abort();
+        assert!(!jobs.join("job1").exists());
+        assert!(!jobs.join(".finish-job1").exists());
+        Ok(())
+    }))
+    .await
 }
 
 #[tokio::test]
 async fn a_failed_prepare_backs_the_poller_off() -> TestResult {
-    let dir = TempDir::new()?;
-    let missing = format!("file://{}", dir.path().join("missing.git").display());
-    let Launched {
-        mut inbox,
-        stop,
-        daemon,
-        server,
-        worker,
-        ..
-    } = launch_with(&dir, AGENT, Some(missing)).await?;
+    common::bounded(Box::pin(async {
+        let dir = TempDir::new()?;
+        let missing = format!("file://{}", dir.path().join("missing.git").display());
+        let Launched {
+            mut inbox,
+            stop,
+            daemon,
+            server,
+            worker,
+            ..
+        } = launch_with(&dir, AGENT, Some(missing)).await?;
 
-    let failed = tokio::time::timeout(Duration::from_secs(30), async {
-        while let Some((_, report)) = inbox.recv().await {
-            if report.terminal_state.is_some() {
-                return Some(report);
+        let failed = tokio::time::timeout(Duration::from_secs(30), async {
+            while let Some((_, report)) = inbox.recv().await {
+                if report.terminal_state.is_some() {
+                    return Some(report);
+                }
             }
-        }
-        None
-    })
-    .await?
-    .ok_or("no terminal report")?;
-    assert_eq!(failed.terminal_state, Some(JobState::Failed.into()));
-    assert_eq!(
-        failed.error.as_deref(),
-        Some("workspace could not be prepared")
-    );
+            None
+        })
+        .await?
+        .ok_or("no terminal report")?;
+        assert_eq!(failed.terminal_state, Some(JobState::Failed.into()));
+        assert_eq!(
+            failed.error.as_deref(),
+            Some("workspace could not be prepared")
+        );
 
-    tokio::time::sleep(Duration::from_secs(2)).await;
-    let claims = worker.claims.load(Ordering::SeqCst);
-    let _ = stop.send(());
-    tokio::time::timeout(Duration::from_secs(30), daemon).await???;
-    server.abort();
-    assert!(claims <= 8, "claims: {claims}");
-    Ok(())
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        let claims = worker.claims.load(Ordering::SeqCst);
+        let _ = stop.send(());
+        tokio::time::timeout(Duration::from_secs(30), daemon).await???;
+        server.abort();
+        assert!(claims <= 8, "claims: {claims}");
+        Ok(())
+    }))
+    .await
 }

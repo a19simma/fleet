@@ -18,6 +18,9 @@ use tempfile::TempDir;
 use tokio::sync::mpsc;
 use tonic::Status;
 
+#[path = "common/bounded.rs"]
+mod common;
+
 type TestResult = Result<(), Box<dyn std::error::Error>>;
 
 const GH: &str = r#"#!/bin/sh
@@ -278,50 +281,53 @@ fn pushed(rig: &Rig) -> Result<bool, Box<dyn std::error::Error>> {
 
 #[tokio::test]
 async fn finish_pushes_and_opens_pr() -> TestResult {
-    let rig = rig("ok").await?;
-    commit(&rig)?;
-    let (agent, mut rx) = agent(&rig);
-    let (_trigger, shutdown) = Shutdown::channel();
-    let outcome = agent
-        .finish(&job(&rig, true), &rig.worktree, shutdown)
-        .await?;
-    assert_eq!(
-        outcome,
-        FinishOutcome::Succeeded {
-            branch: Some("swarm/job1".into()),
-            pr_url: Some("https://example.invalid/pr/7".into()),
-        }
-    );
-    assert!(pushed(&rig)?);
-    let reports = drain(&mut rx);
-    let last = reports.last().ok_or("no report")?;
-    assert_eq!(last.terminal_state, Some(JobState::Succeeded.into()));
-    assert_eq!(last.branch.as_deref(), Some("swarm/job1"));
-    assert_eq!(last.pr_url.as_deref(), Some("https://example.invalid/pr/7"));
-    let args = std::fs::read_to_string(rig.dir.path().join("gh.args"))?;
-    assert_eq!(
-        args.lines().collect::<Vec<_>>(),
-        [
-            "pr",
-            "create",
-            "--repo",
-            &rig.origin.to_string_lossy(),
-            "--head",
-            "swarm/job1",
-            "--base",
-            "main",
-            "--title",
-            "work",
-            "--body",
-            "Fleet job job1",
-        ]
-    );
-    let env = std::fs::read_to_string(rig.dir.path().join("gh.env"))?;
-    assert!(env.contains("GH_TOKEN=not-a-real-gh-value"));
-    assert!(!env.contains("FLEET_TOKEN"));
-    assert!(!env.contains("KEPT_VALUE"));
-    assert!(!env.contains("GIT_ASKPASS"));
-    Ok(())
+    common::bounded(Box::pin(async {
+        let rig = rig("ok").await?;
+        commit(&rig)?;
+        let (agent, mut rx) = agent(&rig);
+        let (_trigger, shutdown) = Shutdown::channel();
+        let outcome = agent
+            .finish(&job(&rig, true), &rig.worktree, shutdown)
+            .await?;
+        assert_eq!(
+            outcome,
+            FinishOutcome::Succeeded {
+                branch: Some("swarm/job1".into()),
+                pr_url: Some("https://example.invalid/pr/7".into()),
+            }
+        );
+        assert!(pushed(&rig)?);
+        let reports = drain(&mut rx);
+        let last = reports.last().ok_or("no report")?;
+        assert_eq!(last.terminal_state, Some(JobState::Succeeded.into()));
+        assert_eq!(last.branch.as_deref(), Some("swarm/job1"));
+        assert_eq!(last.pr_url.as_deref(), Some("https://example.invalid/pr/7"));
+        let args = std::fs::read_to_string(rig.dir.path().join("gh.args"))?;
+        assert_eq!(
+            args.lines().collect::<Vec<_>>(),
+            [
+                "pr",
+                "create",
+                "--repo",
+                &rig.origin.to_string_lossy(),
+                "--head",
+                "swarm/job1",
+                "--base",
+                "main",
+                "--title",
+                "work",
+                "--body",
+                "Fleet job job1",
+            ]
+        );
+        let env = std::fs::read_to_string(rig.dir.path().join("gh.env"))?;
+        assert!(env.contains("GH_TOKEN=not-a-real-gh-value"));
+        assert!(!env.contains("FLEET_TOKEN"));
+        assert!(!env.contains("KEPT_VALUE"));
+        assert!(!env.contains("GIT_ASKPASS"));
+        Ok(())
+    }))
+    .await
 }
 
 fn recorded(rig: &Rig, sub: &str) -> Result<String, Box<dyn std::error::Error>> {
@@ -333,39 +339,43 @@ fn recorded(rig: &Rig, sub: &str) -> Result<String, Box<dyn std::error::Error>> 
 #[tokio::test]
 async fn only_the_push_gets_the_askpass_and_no_helper_runs_with_tokens_in_the_agent_repo()
 -> TestResult {
-    let rig = rig("ok").await?;
-    commit(&rig)?;
-    let (agent, _rx) = agent(&rig);
-    let (_trigger, shutdown) = Shutdown::channel();
-    agent
-        .finish(&job(&rig, true), &rig.worktree, shutdown)
-        .await?;
-    let push = recorded(&rig, "push")?;
-    assert!(push.contains(&format!(
-        "GIT_ASKPASS='{}' askpass\n",
-        env!("CARGO_BIN_EXE_fleetd")
-    )));
-    assert!(!push.contains("/not/a/real/askpass"));
-    assert!(push.contains("GH_TOKEN=not-a-real-gh-value\n"));
-    let args = std::fs::read_to_string(rig.dir.path().join("work").join("git-push.args"))?;
-    assert!(!args.contains("not-a-real-gh-value"));
-    assert!(args.contains("push"));
-    assert!(!push.contains("GITHUB_TOKEN"));
-    assert!(!push.contains("GH_ENTERPRISE_TOKEN"));
-    assert!(push.contains("GIT_CONFIG_GLOBAL=/dev/null"));
-    assert!(push.contains("GIT_CONFIG_NOSYSTEM=1"));
-    for sub in ["init", "fetch", "rev-list", "log"] {
-        let env = recorded(&rig, sub)?;
-        assert!(!env.contains("GH_TOKEN"), "{sub}");
-        assert!(!env.contains("GIT_ASKPASS"), "{sub}");
-        assert!(!env.contains("FLEET_TOKEN"), "{sub}");
-        assert!(env.contains("GIT_CONFIG_GLOBAL=/dev/null"), "{sub}");
-    }
-    Ok(())
+    common::bounded(Box::pin(async {
+        let rig = rig("ok").await?;
+        commit(&rig)?;
+        let (agent, _rx) = agent(&rig);
+        let (_trigger, shutdown) = Shutdown::channel();
+        agent
+            .finish(&job(&rig, true), &rig.worktree, shutdown)
+            .await?;
+        let push = recorded(&rig, "push")?;
+        assert!(push.contains(&format!(
+            "GIT_ASKPASS='{}' askpass\n",
+            env!("CARGO_BIN_EXE_fleetd")
+        )));
+        assert!(!push.contains("/not/a/real/askpass"));
+        assert!(push.contains("GH_TOKEN=not-a-real-gh-value\n"));
+        let args = std::fs::read_to_string(rig.dir.path().join("work").join("git-push.args"))?;
+        assert!(!args.contains("not-a-real-gh-value"));
+        assert!(args.contains("push"));
+        assert!(!push.contains("GITHUB_TOKEN"));
+        assert!(!push.contains("GH_ENTERPRISE_TOKEN"));
+        assert!(push.contains("GIT_CONFIG_GLOBAL=/dev/null"));
+        assert!(push.contains("GIT_CONFIG_NOSYSTEM=1"));
+        for sub in ["init", "fetch", "rev-list", "log"] {
+            let env = recorded(&rig, sub)?;
+            assert!(!env.contains("GH_TOKEN"), "{sub}");
+            assert!(!env.contains("GIT_ASKPASS"), "{sub}");
+            assert!(!env.contains("FLEET_TOKEN"), "{sub}");
+            assert!(env.contains("GIT_CONFIG_GLOBAL=/dev/null"), "{sub}");
+        }
+        Ok(())
+    }))
+    .await
 }
 
 #[tokio::test]
 async fn planted_agent_config_neither_runs_nor_redirects_the_push() -> TestResult {
+    common::bounded(Box::pin(async {
     let rig = rig("ok").await?;
     commit(&rig)?;
     let marker = rig.dir.path().join("marker");
@@ -421,187 +431,213 @@ async fn planted_agent_config_neither_runs_nor_redirects_the_push() -> TestResul
     assert!(!marker.exists());
     assert!(!redirected.exists());
     Ok(())
+    }))
+    .await
 }
 
 #[tokio::test]
 async fn an_empty_commit_count_fails_instead_of_meaning_zero() -> TestResult {
-    let rig = rig("ok").await?;
-    commit(&rig)?;
-    std::fs::write(rig.dir.path().join("work").join("emptycount"), "")?;
-    let (agent, mut rx) = agent(&rig);
-    let (_trigger, shutdown) = Shutdown::channel();
-    let outcome = agent
-        .finish(&job(&rig, true), &rig.worktree, shutdown)
-        .await?;
-    assert_eq!(
-        outcome,
-        FinishOutcome::Failed {
-            error: "job commits could not be inspected"
-        }
-    );
-    assert!(!pushed(&rig)?);
-    let reports = drain(&mut rx);
-    let last = reports.last().ok_or("no report")?;
-    assert_eq!(last.terminal_state, Some(JobState::Failed.into()));
-    Ok(())
+    common::bounded(Box::pin(async {
+        let rig = rig("ok").await?;
+        commit(&rig)?;
+        std::fs::write(rig.dir.path().join("work").join("emptycount"), "")?;
+        let (agent, mut rx) = agent(&rig);
+        let (_trigger, shutdown) = Shutdown::channel();
+        let outcome = agent
+            .finish(&job(&rig, true), &rig.worktree, shutdown)
+            .await?;
+        assert_eq!(
+            outcome,
+            FinishOutcome::Failed {
+                error: "job commits could not be inspected"
+            }
+        );
+        assert!(!pushed(&rig)?);
+        let reports = drain(&mut rx);
+        let last = reports.last().ok_or("no report")?;
+        assert_eq!(last.terminal_state, Some(JobState::Failed.into()));
+        Ok(())
+    }))
+    .await
 }
 
 #[tokio::test]
 async fn no_changes_succeeds() -> TestResult {
-    let rig = rig("fail").await?;
-    let (agent, mut rx) = agent(&rig);
-    let (_trigger, shutdown) = Shutdown::channel();
-    let outcome = agent
-        .finish(&job(&rig, true), &rig.worktree, shutdown)
-        .await?;
-    assert_eq!(
-        outcome,
-        FinishOutcome::Succeeded {
-            branch: None,
-            pr_url: None,
-        }
-    );
-    assert!(!pushed(&rig)?);
-    assert!(!rig.dir.path().join("gh.args").exists());
-    let reports = drain(&mut rx);
-    let last = reports.last().ok_or("no report")?;
-    assert_eq!(last.terminal_state, Some(JobState::Succeeded.into()));
-    assert_eq!(last.branch, None);
-    assert_eq!(last.pr_url, None);
-    Ok(())
+    common::bounded(Box::pin(async {
+        let rig = rig("fail").await?;
+        let (agent, mut rx) = agent(&rig);
+        let (_trigger, shutdown) = Shutdown::channel();
+        let outcome = agent
+            .finish(&job(&rig, true), &rig.worktree, shutdown)
+            .await?;
+        assert_eq!(
+            outcome,
+            FinishOutcome::Succeeded {
+                branch: None,
+                pr_url: None,
+            }
+        );
+        assert!(!pushed(&rig)?);
+        assert!(!rig.dir.path().join("gh.args").exists());
+        let reports = drain(&mut rx);
+        let last = reports.last().ok_or("no report")?;
+        assert_eq!(last.terminal_state, Some(JobState::Succeeded.into()));
+        assert_eq!(last.branch, None);
+        assert_eq!(last.pr_url, None);
+        Ok(())
+    }))
+    .await
 }
 
 #[tokio::test]
 async fn a_job_without_a_pr_only_pushes() -> TestResult {
-    let rig = rig("fail").await?;
-    commit(&rig)?;
-    let (agent, mut rx) = agent(&rig);
-    let (_trigger, shutdown) = Shutdown::channel();
-    let outcome = agent
-        .finish(&job(&rig, false), &rig.worktree, shutdown)
-        .await?;
-    assert_eq!(
-        outcome,
-        FinishOutcome::Succeeded {
-            branch: Some("swarm/job1".into()),
-            pr_url: None,
-        }
-    );
-    assert!(pushed(&rig)?);
-    assert!(!rig.dir.path().join("gh.args").exists());
-    let reports = drain(&mut rx);
-    let last = reports.last().ok_or("no report")?;
-    assert_eq!(last.pr_url, None);
-    Ok(())
+    common::bounded(Box::pin(async {
+        let rig = rig("fail").await?;
+        commit(&rig)?;
+        let (agent, mut rx) = agent(&rig);
+        let (_trigger, shutdown) = Shutdown::channel();
+        let outcome = agent
+            .finish(&job(&rig, false), &rig.worktree, shutdown)
+            .await?;
+        assert_eq!(
+            outcome,
+            FinishOutcome::Succeeded {
+                branch: Some("swarm/job1".into()),
+                pr_url: None,
+            }
+        );
+        assert!(pushed(&rig)?);
+        assert!(!rig.dir.path().join("gh.args").exists());
+        let reports = drain(&mut rx);
+        let last = reports.last().ok_or("no report")?;
+        assert_eq!(last.pr_url, None);
+        Ok(())
+    }))
+    .await
 }
 
 #[tokio::test]
 async fn the_lease_is_renewed_while_the_push_runs() -> TestResult {
-    let rig = rig("ok").await?;
-    commit(&rig)?;
-    std::fs::write(rig.dir.path().join("slow"), "")?;
-    let (agent, mut rx) = agent_paced(
-        &rig,
-        PathBuf::from(env!("CARGO_BIN_EXE_fleetd")),
-        Duration::from_millis(100),
-    );
-    let (_trigger, shutdown) = Shutdown::channel();
-    agent
-        .finish(&job(&rig, true), &rig.worktree, shutdown)
-        .await?;
-    let reports = drain(&mut rx);
-    let renewals = reports
-        .iter()
-        .filter(|r| r.chunks.is_empty() && r.terminal_state.is_none())
-        .count();
-    assert!(renewals >= 3, "renewals: {renewals}");
-    Ok(())
+    common::bounded(Box::pin(async {
+        let rig = rig("ok").await?;
+        commit(&rig)?;
+        std::fs::write(rig.dir.path().join("slow"), "")?;
+        let (agent, mut rx) = agent_paced(
+            &rig,
+            PathBuf::from(env!("CARGO_BIN_EXE_fleetd")),
+            Duration::from_millis(100),
+        );
+        let (_trigger, shutdown) = Shutdown::channel();
+        agent
+            .finish(&job(&rig, true), &rig.worktree, shutdown)
+            .await?;
+        let reports = drain(&mut rx);
+        let renewals = reports
+            .iter()
+            .filter(|r| r.chunks.is_empty() && r.terminal_state.is_none())
+            .count();
+        assert!(renewals >= 3, "renewals: {renewals}");
+        Ok(())
+    }))
+    .await
 }
 
 #[tokio::test]
 async fn a_lost_lease_skips_the_push_and_the_terminal_report() -> TestResult {
-    let rig = rig("ok").await?;
-    commit(&rig)?;
-    std::fs::write(rig.dir.path().join("slow"), "")?;
-    let (agent, mut rx) = agent_replying(&rig, Reply::Stale);
-    let (_trigger, shutdown) = Shutdown::channel();
-    let outcome = agent
-        .finish(&job(&rig, true), &rig.worktree, shutdown)
-        .await?;
-    assert_eq!(outcome, FinishOutcome::Lost);
-    assert!(!pushed(&rig)?);
-    assert!(drain(&mut rx).iter().all(|r| r.terminal_state.is_none()));
-    Ok(())
+    common::bounded(Box::pin(async {
+        let rig = rig("ok").await?;
+        commit(&rig)?;
+        std::fs::write(rig.dir.path().join("slow"), "")?;
+        let (agent, mut rx) = agent_replying(&rig, Reply::Stale);
+        let (_trigger, shutdown) = Shutdown::channel();
+        let outcome = agent
+            .finish(&job(&rig, true), &rig.worktree, shutdown)
+            .await?;
+        assert_eq!(outcome, FinishOutcome::Lost);
+        assert!(!pushed(&rig)?);
+        assert!(drain(&mut rx).iter().all(|r| r.terminal_state.is_none()));
+        Ok(())
+    }))
+    .await
 }
 
 #[tokio::test]
 async fn a_cancel_reply_stops_the_push_and_reports_cancelled() -> TestResult {
-    let rig = rig("ok").await?;
-    commit(&rig)?;
-    std::fs::write(rig.dir.path().join("slow"), "")?;
-    let (agent, mut rx) = agent_replying(&rig, Reply::Cancel);
-    let (_trigger, shutdown) = Shutdown::channel();
-    let outcome = agent
-        .finish(&job(&rig, true), &rig.worktree, shutdown)
-        .await?;
-    assert_eq!(outcome, FinishOutcome::Cancelled);
-    let reports = drain(&mut rx);
-    let last = reports.last().ok_or("no report")?;
-    assert_eq!(last.terminal_state, Some(JobState::Cancelled.into()));
-    Ok(())
+    common::bounded(Box::pin(async {
+        let rig = rig("ok").await?;
+        commit(&rig)?;
+        std::fs::write(rig.dir.path().join("slow"), "")?;
+        let (agent, mut rx) = agent_replying(&rig, Reply::Cancel);
+        let (_trigger, shutdown) = Shutdown::channel();
+        let outcome = agent
+            .finish(&job(&rig, true), &rig.worktree, shutdown)
+            .await?;
+        assert_eq!(outcome, FinishOutcome::Cancelled);
+        let reports = drain(&mut rx);
+        let last = reports.last().ok_or("no report")?;
+        assert_eq!(last.terminal_state, Some(JobState::Cancelled.into()));
+        Ok(())
+    }))
+    .await
 }
 
 #[tokio::test]
 async fn finish_continues_the_chunk_numbers_of_the_run() -> TestResult {
-    let rig = rig("fail").await?;
-    let (agent, mut rx) = agent(&rig);
-    let (_trigger, shutdown) = Shutdown::channel();
-    let ran = agent
-        .run(&job(&rig, true), &rig.worktree, shutdown.clone())
-        .await?;
-    assert_eq!(ran, AgentOutcome::Succeeded);
-    commit(&rig)?;
-    agent
-        .finish(&job(&rig, true), &rig.worktree, shutdown)
-        .await?;
-    let seqs: Vec<u64> = drain(&mut rx)
-        .iter()
-        .flat_map(|r| r.chunks.iter().map(|c| c.seq))
-        .collect();
-    assert_eq!(seqs, [1, 2]);
-    Ok(())
+    common::bounded(Box::pin(async {
+        let rig = rig("fail").await?;
+        let (agent, mut rx) = agent(&rig);
+        let (_trigger, shutdown) = Shutdown::channel();
+        let ran = agent
+            .run(&job(&rig, true), &rig.worktree, shutdown.clone())
+            .await?;
+        assert_eq!(ran, AgentOutcome::Succeeded);
+        commit(&rig)?;
+        agent
+            .finish(&job(&rig, true), &rig.worktree, shutdown)
+            .await?;
+        let seqs: Vec<u64> = drain(&mut rx)
+            .iter()
+            .flat_map(|r| r.chunks.iter().map(|c| c.seq))
+            .collect();
+        assert_eq!(seqs, [1, 2]);
+        Ok(())
+    }))
+    .await
 }
 
 #[tokio::test]
 async fn a_gh_failure_reports_a_fixed_error() -> TestResult {
-    let rig = rig("fail").await?;
-    commit(&rig)?;
-    let (agent, mut rx) = agent(&rig);
-    let (_trigger, shutdown) = Shutdown::channel();
-    let outcome = agent
-        .finish(&job(&rig, true), &rig.worktree, shutdown)
-        .await?;
-    assert_eq!(
-        outcome,
-        FinishOutcome::Failed {
-            error: "pull request could not be opened"
-        }
-    );
-    let reports = drain(&mut rx);
-    let last = reports.last().ok_or("no report")?;
-    assert_eq!(last.terminal_state, Some(JobState::Failed.into()));
-    assert_eq!(
-        last.error.as_deref(),
-        Some("pull request could not be opened")
-    );
-    assert_eq!(last.pr_url, None);
-    let text: String = reports
-        .iter()
-        .flat_map(|r| r.chunks.iter().map(|c| c.text.as_str()))
-        .collect();
-    assert!(text.contains("boom [REDACTED] detail"));
-    assert!(!text.contains("hunter2"));
-    Ok(())
+    common::bounded(Box::pin(async {
+        let rig = rig("fail").await?;
+        commit(&rig)?;
+        let (agent, mut rx) = agent(&rig);
+        let (_trigger, shutdown) = Shutdown::channel();
+        let outcome = agent
+            .finish(&job(&rig, true), &rig.worktree, shutdown)
+            .await?;
+        assert_eq!(
+            outcome,
+            FinishOutcome::Failed {
+                error: "pull request could not be opened"
+            }
+        );
+        let reports = drain(&mut rx);
+        let last = reports.last().ok_or("no report")?;
+        assert_eq!(last.terminal_state, Some(JobState::Failed.into()));
+        assert_eq!(
+            last.error.as_deref(),
+            Some("pull request could not be opened")
+        );
+        assert_eq!(last.pr_url, None);
+        let text: String = reports
+            .iter()
+            .flat_map(|r| r.chunks.iter().map(|c| c.text.as_str()))
+            .collect();
+        assert!(text.contains("boom [REDACTED] detail"));
+        assert!(!text.contains("hunter2"));
+        Ok(())
+    }))
+    .await
 }
 
 fn keys(env: &str) -> std::collections::BTreeSet<String> {
@@ -617,250 +653,279 @@ fn set(names: &[&str]) -> std::collections::BTreeSet<String> {
 
 #[tokio::test]
 async fn credentialed_children_get_only_their_credential_and_scratch_dirs() -> TestResult {
-    let rig = rig("ok").await?;
-    commit(&rig)?;
-    let (agent, _rx) = agent(&rig);
-    let (_trigger, shutdown) = Shutdown::channel();
-    agent
-        .finish(&job(&rig, true), &rig.worktree, shutdown)
-        .await?;
-    let common = [
-        "PATH",
-        "HOME",
-        "XDG_CONFIG_HOME",
-        "XDG_CACHE_HOME",
-        "XDG_DATA_HOME",
-        "XDG_STATE_HOME",
-        "GIT_DIR",
-        "GIT_CONFIG_GLOBAL",
-        "GIT_CONFIG_NOSYSTEM",
-        "GIT_TERMINAL_PROMPT",
-        "GH_PROMPT_DISABLED",
-        "GIT_ALLOW_PROTOCOL",
-    ];
-    let mut push = set(&common);
-    push.insert("GIT_ASKPASS".into());
-    push.insert("GH_TOKEN".into());
-    push.insert("FLEETD_ASKPASS_HOST".into());
-    assert_eq!(keys(&recorded(&rig, "push")?), push);
-    for sub in ["init", "fetch", "rev-list", "log"] {
-        assert_eq!(keys(&recorded(&rig, sub)?), set(&common), "{sub}");
-    }
-    let mut gh = set(&common);
-    gh.remove("GIT_ALLOW_PROTOCOL");
-    gh.extend(
-        [
-            "GH_TOKEN",
-            "GH_ENTERPRISE_TOKEN",
-            "GH_CONFIG_DIR",
-            "GH_NO_UPDATE_NOTIFIER",
-            "GH_BROWSER",
-            "GH_EDITOR",
-            "GH_PAGER",
-            "PAGER",
-        ]
-        .map(String::from),
-    );
-    let env = std::fs::read_to_string(rig.dir.path().join("gh.env"))?;
-    let mut seen = keys(&env);
-    seen.remove("GIT_ALLOW_PROTOCOL");
-    assert_eq!(seen, gh);
-    let real = rig.dir.path().to_string_lossy().into_owned();
-    for line in env
-        .lines()
-        .filter(|l| l.starts_with("HOME=") || l.starts_with("GH_CONFIG_DIR="))
-    {
-        assert!(line.contains(".finish-job1"), "{line}");
-    }
-    assert!(!env.contains(&format!("HOME={real}\n")));
-    Ok(())
+    common::bounded(Box::pin(async {
+        let rig = rig("ok").await?;
+        commit(&rig)?;
+        let (agent, _rx) = agent(&rig);
+        let (_trigger, shutdown) = Shutdown::channel();
+        agent
+            .finish(&job(&rig, true), &rig.worktree, shutdown)
+            .await?;
+        let common = [
+            "PATH",
+            "HOME",
+            "XDG_CONFIG_HOME",
+            "XDG_CACHE_HOME",
+            "XDG_DATA_HOME",
+            "XDG_STATE_HOME",
+            "GIT_DIR",
+            "GIT_CONFIG_GLOBAL",
+            "GIT_CONFIG_NOSYSTEM",
+            "GIT_TERMINAL_PROMPT",
+            "GH_PROMPT_DISABLED",
+            "GIT_ALLOW_PROTOCOL",
+        ];
+        let mut push = set(&common);
+        push.insert("GIT_ASKPASS".into());
+        push.insert("GH_TOKEN".into());
+        push.insert("FLEETD_ASKPASS_HOST".into());
+        assert_eq!(keys(&recorded(&rig, "push")?), push);
+        for sub in ["init", "fetch", "rev-list", "log"] {
+            assert_eq!(keys(&recorded(&rig, sub)?), set(&common), "{sub}");
+        }
+        let mut gh = set(&common);
+        gh.remove("GIT_ALLOW_PROTOCOL");
+        gh.extend(
+            [
+                "GH_TOKEN",
+                "GH_ENTERPRISE_TOKEN",
+                "GH_CONFIG_DIR",
+                "GH_NO_UPDATE_NOTIFIER",
+                "GH_BROWSER",
+                "GH_EDITOR",
+                "GH_PAGER",
+                "PAGER",
+            ]
+            .map(String::from),
+        );
+        let env = std::fs::read_to_string(rig.dir.path().join("gh.env"))?;
+        let mut seen = keys(&env);
+        seen.remove("GIT_ALLOW_PROTOCOL");
+        assert_eq!(seen, gh);
+        let real = rig.dir.path().to_string_lossy().into_owned();
+        for line in env
+            .lines()
+            .filter(|l| l.starts_with("HOME=") || l.starts_with("GH_CONFIG_DIR="))
+        {
+            assert!(line.contains(".finish-job1"), "{line}");
+        }
+        assert!(!env.contains(&format!("HOME={real}\n")));
+        Ok(())
+    }))
+    .await
 }
 
 #[tokio::test]
 async fn planted_real_home_config_is_never_read_by_gh_or_push() -> TestResult {
-    let rig = rig("ok").await?;
-    commit(&rig)?;
-    let marker = rig.dir.path().join("marker");
-    let hook = format!("sh -c 'echo run >> {}'", marker.display());
-    let ssh = rig.dir.path().join(".ssh");
-    std::fs::create_dir(&ssh)?;
-    std::fs::write(
-        ssh.join("config"),
-        format!("Host *\n\tProxyCommand {hook}\n\tLocalCommand {hook}\n"),
-    )?;
-    for dir in [
-        rig.dir.path().join(".config/gh"),
-        rig.dir.path().join("xdg/gh"),
-        rig.dir.path().join("ghreal"),
-    ] {
-        std::fs::create_dir_all(&dir)?;
+    common::bounded(Box::pin(async {
+        let rig = rig("ok").await?;
+        commit(&rig)?;
+        let marker = rig.dir.path().join("marker");
+        let hook = format!("sh -c 'echo run >> {}'", marker.display());
+        let ssh = rig.dir.path().join(".ssh");
+        std::fs::create_dir(&ssh)?;
         std::fs::write(
-            dir.join("config.yml"),
-            format!("http_unix_socket: /nonexistent\nbrowser: {hook}\neditor: {hook}\n"),
+            ssh.join("config"),
+            format!("Host *\n\tProxyCommand {hook}\n\tLocalCommand {hook}\n"),
         )?;
-    }
-    let (agent, _rx) = agent(&rig);
-    let (_trigger, shutdown) = Shutdown::channel();
-    let outcome = agent
-        .finish(&job(&rig, true), &rig.worktree, shutdown)
-        .await?;
-    assert!(matches!(outcome, FinishOutcome::Succeeded { .. }));
-    assert!(!marker.exists());
-    assert!(!rig.dir.path().join("gh.sawconfig").exists());
-    Ok(())
+        for dir in [
+            rig.dir.path().join(".config/gh"),
+            rig.dir.path().join("xdg/gh"),
+            rig.dir.path().join("ghreal"),
+        ] {
+            std::fs::create_dir_all(&dir)?;
+            std::fs::write(
+                dir.join("config.yml"),
+                format!("http_unix_socket: /nonexistent\nbrowser: {hook}\neditor: {hook}\n"),
+            )?;
+        }
+        let (agent, _rx) = agent(&rig);
+        let (_trigger, shutdown) = Shutdown::channel();
+        let outcome = agent
+            .finish(&job(&rig, true), &rig.worktree, shutdown)
+            .await?;
+        assert!(matches!(outcome, FinishOutcome::Succeeded { .. }));
+        assert!(!marker.exists());
+        assert!(!rig.dir.path().join("gh.sawconfig").exists());
+        Ok(())
+    }))
+    .await
 }
 
 #[tokio::test]
 async fn a_title_over_the_limit_is_cut_at_a_char_boundary() -> TestResult {
-    let rig = rig("ok").await?;
-    std::fs::write(rig.worktree.join("b.txt"), "b")?;
-    git(&rig.worktree, &["add", "."])?;
-    let subject = "é".repeat(300);
-    git(&rig.worktree, &["commit", "--quiet", "-m", &subject])?;
-    let (agent, _rx) = agent(&rig);
-    let (_trigger, shutdown) = Shutdown::channel();
-    agent
-        .finish(&job(&rig, true), &rig.worktree, shutdown)
-        .await?;
-    let args = std::fs::read_to_string(rig.dir.path().join("gh.args"))?;
-    let title = args.lines().nth(9).ok_or("no title")?;
-    assert_eq!(title, "é".repeat(256));
-    Ok(())
+    common::bounded(Box::pin(async {
+        let rig = rig("ok").await?;
+        std::fs::write(rig.worktree.join("b.txt"), "b")?;
+        git(&rig.worktree, &["add", "."])?;
+        let subject = "é".repeat(300);
+        git(&rig.worktree, &["commit", "--quiet", "-m", &subject])?;
+        let (agent, _rx) = agent(&rig);
+        let (_trigger, shutdown) = Shutdown::channel();
+        agent
+            .finish(&job(&rig, true), &rig.worktree, shutdown)
+            .await?;
+        let args = std::fs::read_to_string(rig.dir.path().join("gh.args"))?;
+        let title = args.lines().nth(9).ok_or("no title")?;
+        assert_eq!(title, "é".repeat(256));
+        Ok(())
+    }))
+    .await
 }
 
 #[tokio::test]
 async fn an_askpass_path_with_quotes_and_substitutions_runs_as_one_file() -> TestResult {
-    let rig = rig("ok").await?;
-    commit(&rig)?;
-    let odd = rig.dir.path().join("it's $(touch pwned) x");
-    std::fs::create_dir(&odd)?;
-    let bin = odd.join("askpass");
-    std::fs::write(&bin, "#!/bin/sh\necho ran\n")?;
-    std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755))?;
-    let (agent, _rx) = agent_with(&rig, bin);
-    let (_trigger, shutdown) = Shutdown::channel();
-    agent
-        .finish(&job(&rig, true), &rig.worktree, shutdown)
-        .await?;
-    let push = recorded(&rig, "push")?;
-    let line = push
-        .lines()
-        .find_map(|line| line.strip_prefix("GIT_ASKPASS="))
-        .ok_or("no askpass")?;
-    let probe = TempDir::new()?;
-    let out = Command::new("sh")
-        .arg("-c")
-        .arg(format!("{line} prompt"))
-        .current_dir(probe.path())
-        .output()?;
-    assert!(out.status.success());
-    assert_eq!(String::from_utf8(out.stdout)?, "ran\n");
-    assert!(!probe.path().join("pwned").exists());
-    Ok(())
+    common::bounded(Box::pin(async {
+        let rig = rig("ok").await?;
+        commit(&rig)?;
+        let odd = rig.dir.path().join("it's $(touch pwned) x");
+        std::fs::create_dir(&odd)?;
+        let bin = odd.join("askpass");
+        std::fs::write(&bin, "#!/bin/sh\necho ran\n")?;
+        std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755))?;
+        let (agent, _rx) = agent_with(&rig, bin);
+        let (_trigger, shutdown) = Shutdown::channel();
+        agent
+            .finish(&job(&rig, true), &rig.worktree, shutdown)
+            .await?;
+        let push = recorded(&rig, "push")?;
+        let line = push
+            .lines()
+            .find_map(|line| line.strip_prefix("GIT_ASKPASS="))
+            .ok_or("no askpass")?;
+        let probe = TempDir::new()?;
+        let out = Command::new("sh")
+            .arg("-c")
+            .arg(format!("{line} prompt"))
+            .current_dir(probe.path())
+            .output()?;
+        assert!(out.status.success());
+        assert_eq!(String::from_utf8(out.stdout)?, "ran\n");
+        assert!(!probe.path().join("pwned").exists());
+        Ok(())
+    }))
+    .await
 }
 
 #[tokio::test]
 async fn a_job_repo_outside_the_policy_never_reaches_a_push() -> TestResult {
-    let rig = rig("ok").await?;
-    commit(&rig)?;
-    let policy = RepoPolicy::new(["github.com"]);
-    let (agent, mut rx) =
-        agent_with_policy(&rig, PathBuf::from(env!("CARGO_BIN_EXE_fleetd")), policy);
-    for repo in [
-        "https://attacker.example/x.git",
-        "https://github.com@attacker.example/x.git",
-        "https://github.com:8443/x.git",
-        "http://github.com/x.git",
-        "ssh://github.com/x.git",
-        "git://github.com/x.git",
-        "file:///tmp/x.git",
-        "/tmp/x.git",
-    ] {
-        let (_trigger, shutdown) = Shutdown::channel();
-        let mut bad = job(&rig, true);
-        repo.clone_into(&mut bad.repo);
-        let outcome = agent.finish(&bad, &rig.worktree, shutdown).await?;
-        assert_eq!(
-            outcome,
-            FinishOutcome::Failed {
-                error: "git push failed"
-            },
-            "{repo}"
-        );
-        let reports = drain(&mut rx);
-        let last = reports.last().ok_or("no report")?;
-        assert_eq!(last.terminal_state, Some(JobState::Failed.into()));
-    }
-    assert!(!rig.dir.path().join("work").join("git-push.env").exists());
-    assert!(!rig.dir.path().join("gh.env").exists());
-    Ok(())
+    common::bounded(Box::pin(async {
+        let rig = rig("ok").await?;
+        commit(&rig)?;
+        let policy = RepoPolicy::new(["github.com"]);
+        let (agent, mut rx) =
+            agent_with_policy(&rig, PathBuf::from(env!("CARGO_BIN_EXE_fleetd")), policy);
+        for repo in [
+            "https://attacker.example/x.git",
+            "https://github.com@attacker.example/x.git",
+            "https://github.com:8443/x.git",
+            "http://github.com/x.git",
+            "ssh://github.com/x.git",
+            "git://github.com/x.git",
+            "file:///tmp/x.git",
+            "/tmp/x.git",
+        ] {
+            let (_trigger, shutdown) = Shutdown::channel();
+            let mut bad = job(&rig, true);
+            repo.clone_into(&mut bad.repo);
+            let outcome = agent.finish(&bad, &rig.worktree, shutdown).await?;
+            assert_eq!(
+                outcome,
+                FinishOutcome::Failed {
+                    error: "git push failed"
+                },
+                "{repo}"
+            );
+            let reports = drain(&mut rx);
+            let last = reports.last().ok_or("no report")?;
+            assert_eq!(last.terminal_state, Some(JobState::Failed.into()));
+        }
+        assert!(!rig.dir.path().join("work").join("git-push.env").exists());
+        assert!(!rig.dir.path().join("gh.env").exists());
+        Ok(())
+    }))
+    .await
 }
 
 #[tokio::test]
 async fn the_push_disables_redirect_following() -> TestResult {
-    let rig = rig("ok").await?;
-    commit(&rig)?;
-    let (agent, _rx) = agent(&rig);
-    let (_trigger, shutdown) = Shutdown::channel();
-    agent
-        .finish(&job(&rig, false), &rig.worktree, shutdown)
-        .await?;
-    let args = std::fs::read_to_string(rig.dir.path().join("work").join("git-push.args"))?;
-    let lines: Vec<&str> = args.lines().collect();
-    assert!(
-        lines
-            .windows(2)
-            .any(|w| w == ["-c", "http.followRedirects=false"]),
-        "{args}"
-    );
-    Ok(())
+    common::bounded(Box::pin(async {
+        let rig = rig("ok").await?;
+        commit(&rig)?;
+        let (agent, _rx) = agent(&rig);
+        let (_trigger, shutdown) = Shutdown::channel();
+        agent
+            .finish(&job(&rig, false), &rig.worktree, shutdown)
+            .await?;
+        let args = std::fs::read_to_string(rig.dir.path().join("work").join("git-push.args"))?;
+        let lines: Vec<&str> = args.lines().collect();
+        assert!(
+            lines
+                .windows(2)
+                .any(|w| w == ["-c", "http.followRedirects=false"]),
+            "{args}"
+        );
+        Ok(())
+    }))
+    .await
 }
 
 #[tokio::test]
 async fn the_push_allows_only_https_and_names_the_token_host() -> TestResult {
-    let rig = rig("ok").await?;
-    commit(&rig)?;
-    let policy = RepoPolicy::new(["origin.test", "git.example"])
-        .with_token_host(Some("origin.test".to_owned()));
-    let (agent, _rx) = agent_with_policy(&rig, PathBuf::from(env!("CARGO_BIN_EXE_fleetd")), policy);
-    let (_trigger, shutdown) = Shutdown::channel();
-    let mut remote = job(&rig, false);
-    "https://origin.test/x.git".clone_into(&mut remote.repo);
-    let outcome = agent.finish(&remote, &rig.worktree, shutdown).await?;
-    assert!(matches!(outcome, FinishOutcome::Failed { .. }));
-    let push = recorded(&rig, "push")?;
-    assert!(push.contains("GIT_ALLOW_PROTOCOL=https\n"), "{push}");
-    assert!(push.contains("FLEETD_ASKPASS_HOST=origin.test\n"), "{push}");
-    Ok(())
+    common::bounded(Box::pin(async {
+        let rig = rig("ok").await?;
+        commit(&rig)?;
+        let policy = RepoPolicy::new(["origin.test", "git.example"])
+            .with_token_host(Some("origin.test".to_owned()));
+        let (agent, _rx) =
+            agent_with_policy(&rig, PathBuf::from(env!("CARGO_BIN_EXE_fleetd")), policy);
+        let (_trigger, shutdown) = Shutdown::channel();
+        let mut remote = job(&rig, false);
+        "https://origin.test/x.git".clone_into(&mut remote.repo);
+        let outcome = agent.finish(&remote, &rig.worktree, shutdown).await?;
+        assert!(matches!(outcome, FinishOutcome::Failed { .. }));
+        let push = recorded(&rig, "push")?;
+        assert!(push.contains("GIT_ALLOW_PROTOCOL=https\n"), "{push}");
+        assert!(push.contains("FLEETD_ASKPASS_HOST=origin.test\n"), "{push}");
+        Ok(())
+    }))
+    .await
 }
 
 #[tokio::test]
 async fn a_second_repo_host_never_receives_the_token_host_credential() -> TestResult {
-    let rig = rig("ok").await?;
-    commit(&rig)?;
-    let policy = RepoPolicy::new(["github.com", "gitlab.com"]);
-    let (agent, _rx) = agent_with_policy(&rig, PathBuf::from(env!("CARGO_BIN_EXE_fleetd")), policy);
-    let (_trigger, shutdown) = Shutdown::channel();
-    let mut remote = job(&rig, false);
-    "https://gitlab.com/o/x.git".clone_into(&mut remote.repo);
-    agent.finish(&remote, &rig.worktree, shutdown).await?;
-    let push = recorded(&rig, "push")?;
-    assert!(push.contains("FLEETD_ASKPASS_HOST=github.com\n"), "{push}");
-    assert!(!push.contains("gitlab.com"), "{push}");
-    Ok(())
+    common::bounded(Box::pin(async {
+        let rig = rig("ok").await?;
+        commit(&rig)?;
+        let policy = RepoPolicy::new(["github.com", "gitlab.com"]);
+        let (agent, _rx) =
+            agent_with_policy(&rig, PathBuf::from(env!("CARGO_BIN_EXE_fleetd")), policy);
+        let (_trigger, shutdown) = Shutdown::channel();
+        let mut remote = job(&rig, false);
+        "https://gitlab.com/o/x.git".clone_into(&mut remote.repo);
+        agent.finish(&remote, &rig.worktree, shutdown).await?;
+        let push = recorded(&rig, "push")?;
+        assert!(push.contains("FLEETD_ASKPASS_HOST=github.com\n"), "{push}");
+        assert!(!push.contains("gitlab.com"), "{push}");
+        Ok(())
+    }))
+    .await
 }
 
 #[tokio::test]
 async fn the_test_policy_adds_the_file_transport_to_the_push() -> TestResult {
-    let rig = rig("ok").await?;
-    commit(&rig)?;
-    let (agent, _rx) = agent(&rig);
-    let (_trigger, shutdown) = Shutdown::channel();
-    agent
-        .finish(&job(&rig, false), &rig.worktree, shutdown)
-        .await?;
-    let push = recorded(&rig, "push")?;
-    assert!(push.contains("GIT_ALLOW_PROTOCOL=file:https\n"), "{push}");
-    assert!(push.contains("FLEETD_ASKPASS_HOST=\n"), "{push}");
-    Ok(())
+    common::bounded(Box::pin(async {
+        let rig = rig("ok").await?;
+        commit(&rig)?;
+        let (agent, _rx) = agent(&rig);
+        let (_trigger, shutdown) = Shutdown::channel();
+        agent
+            .finish(&job(&rig, false), &rig.worktree, shutdown)
+            .await?;
+        let push = recorded(&rig, "push")?;
+        assert!(push.contains("GIT_ALLOW_PROTOCOL=file:https\n"), "{push}");
+        assert!(push.contains("FLEETD_ASKPASS_HOST=\n"), "{push}");
+        Ok(())
+    }))
+    .await
 }

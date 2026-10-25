@@ -22,6 +22,9 @@ use tokio::sync::oneshot;
 use tokio::time::{Instant, timeout};
 use tonic::transport::server::TcpIncoming;
 
+#[path = "common/bounded.rs"]
+mod common;
+
 type TestResult = Result<(), Box<dyn std::error::Error>>;
 
 const BOX_TOKEN: &str = "e2e-box-token-0123456789abcdef0123456789";
@@ -80,6 +83,7 @@ async fn fleet(url: &str, args: &[&str]) -> (Result<(), CliError>, String) {
 
 #[sqlx::test(migrations = false)]
 async fn a_submitted_job_runs_to_a_pushed_branch_and_a_pull_request(pool: PgPool) -> TestResult {
+    common::bounded(Box::pin(async {
     let dir = TempDir::new()?;
     let origin = dir.path().join("origin.git");
     let seed = dir.path().join("seed");
@@ -195,4 +199,6 @@ async fn a_submitted_job_runs_to_a_pushed_branch_and_a_pull_request(pool: PgPool
     timeout(Duration::from_secs(30), daemon).await???;
     server.abort();
     Ok(())
+    }))
+    .await
 }
