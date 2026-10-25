@@ -8,13 +8,18 @@
 //! cancel grace `SIGKILL`, then reports `CANCELLED`. A `FAILED_PRECONDITION` reply means the
 //! lease is gone: the group is killed, pending chunks are dropped and nothing more is sent.
 //!
-//! A report that fails does not stall the pipe: after a failure only the flush tick retries,
-//! so a dead server costs one timeout per tick, not one per line. After the agent exits,
+//! A report runs as an in-flight future inside the read loop, so a slow or hung server never
+//! stops stdout reads, cancel or the child's exit from being seen. At most one report is in
+//! flight. After a failure only the flush tick retries, so a dead server costs one timeout
+//! per tick, not one per line. Chunks that no report delivered stay queued and travel with
+//! the carry into [`AgentRunner::finish`], and the terminal report retries until they are
+//! delivered or [`RunConfig::terminal_report_timeout`] passes. After the agent exits,
 //! stdout is drained for at most [`STDOUT_DRAIN`], so a descendant that left the process
 //! group cannot hold the run open. A chunk cut to [`MAX_CHUNK_BYTES`] has `truncated` set.
 //! Chunk numbers and progress carry from [`AgentRunner::run`] into [`AgentRunner::finish`]
 //! and [`AgentRunner::fail_job`] for the same job, so the server keeps their chunks.
-//! [`AgentRunner::keep_alive`] and `finish` renew the lease while git steps run.
+//! [`AgentRunner::keep_alive`] and `finish` renew the lease while git steps run, and stop the
+//! work when a renewal shows the lease gone or the job cancelled.
 //!
 //! After a successful run, [`AgentRunner::finish`] fetches `swarm/<job_id>` from the worktree
 //! into a throwaway bare repo, counts the commits, pushes the branch and opens the pull
@@ -25,7 +30,6 @@
 //! token. Push is limited to `https` remotes on the [`RepoPolicy`] hosts.
 
 use std::collections::{HashMap, VecDeque};
-use std::convert::Infallible;
 use std::ffi::OsString;
 use std::future::Future;
 use std::path::{Path, PathBuf};
@@ -74,6 +78,9 @@ const MAX_TITLE_CHARS: usize = 256;
 /// Default longest time for the whole finish step, and for each helper in it.
 pub const DEFAULT_FINISH_TIMEOUT: Duration = Duration::from_secs(300);
 
+/// Default longest time for preparing the workspace.
+pub const DEFAULT_PREPARE_TIMEOUT: Duration = Duration::from_secs(300);
+
 const TAIL_BYTES: usize = 2048;
 const MAX_PR_URL_BYTES: usize = 2048;
 
@@ -110,6 +117,8 @@ pub const MAX_CHUNK_BYTES: usize = 256 * 1024;
 
 /// Longest progress text, in characters.
 pub const MAX_PROGRESS_CHARS: usize = 200;
+
+const RETRY_PAUSE: Duration = Duration::from_millis(200);
 
 const PHASE: &str = "agent";
 const ERR_START: &str = "agent could not start";
@@ -165,6 +174,8 @@ pub struct RunConfig {
     pub report_interval: Duration,
     /// Time between `SIGTERM` and `SIGKILL` when the server asks to cancel.
     pub cancel_grace: Duration,
+    /// Longest time for preparing the workspace, lease renewals included.
+    pub prepare_timeout: Duration,
     /// Longest wait for the terminal report. Past it the report is dropped, so a hung
     /// server cannot hold the runner after the process group is dead.
     pub terminal_report_timeout: Duration,
@@ -182,6 +193,7 @@ impl RunConfig {
             askpass_bin: std::env::current_exe().unwrap_or_else(|_| PathBuf::from("fleetd")),
             repo_policy: RepoPolicy::default(),
             finish_timeout: DEFAULT_FINISH_TIMEOUT,
+            prepare_timeout: DEFAULT_PREPARE_TIMEOUT,
             disposable,
             timeout: DEFAULT_TIMEOUT,
             flush_interval: DEFAULT_FLUSH_INTERVAL,
@@ -229,6 +241,20 @@ pub enum FinishOutcome {
         /// A fixed description of the failure.
         error: &'static str,
     },
+    /// A lease renewal showed the lease gone. The work was dropped and nothing more was sent.
+    Lost,
+    /// A lease renewal asked to cancel. The work was dropped and a `CANCELLED` report attempted.
+    Cancelled,
+}
+
+/// Why guarded work stopped before it finished.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum Interrupt {
+    /// A renewal was rejected as stale, so the lease is gone.
+    Lost,
+    /// A renewal carried `cancel_requested`.
+    Cancelled,
 }
 
 /// Runs the agent for claimed jobs.
@@ -244,6 +270,8 @@ pub struct AgentRunner<R> {
 struct Carry {
     next_seq: u64,
     progress: String,
+    pending: VecDeque<TranscriptChunk>,
+    pending_bytes: usize,
 }
 
 impl<R: Reporter> AgentRunner<R> {
@@ -283,29 +311,65 @@ impl<R: Reporter> AgentRunner<R> {
         )
     }
 
+    /// The longest time the caller should let the workspace step run.
+    #[must_use]
+    pub const fn prepare_timeout(&self) -> Duration {
+        self.config.prepare_timeout
+    }
+
     /// Runs `work` and renews the job lease while it runs.
     ///
     /// An empty `ReportJob` goes out every [`RunConfig::report_interval`] until `work`
-    /// completes. Report errors are ignored: the terminal report decides the outcome.
-    pub async fn keep_alive<T>(&self, job: &Job, work: impl Future<Output = T>) -> T {
+    /// completes. A `FAILED_PRECONDITION` reply drops `work` and gives
+    /// [`Interrupt::Lost`], a reply with `cancel_requested` gives [`Interrupt::Cancelled`].
+    /// Other report errors are ignored: the terminal report decides the outcome.
+    ///
+    /// # Errors
+    ///
+    /// Returns the [`Interrupt`] that stopped `work`.
+    pub async fn keep_alive<T>(
+        &self,
+        job: &Job,
+        work: impl Future<Output = T>,
+    ) -> Result<T, Interrupt> {
         self.alive(job, "", work).await
     }
 
-    async fn alive<T>(&self, job: &Job, progress: &str, work: impl Future<Output = T>) -> T {
+    async fn alive<T>(
+        &self,
+        job: &Job,
+        progress: &str,
+        work: impl Future<Output = T>,
+    ) -> Result<T, Interrupt> {
         tokio::select! {
-            out = work => out,
-            never = self.renew(job, progress) => match never {},
+            out = work => Ok(out),
+            stop = self.renew(job, progress) => Err(stop),
         }
     }
 
-    async fn renew(&self, job: &Job, progress: &str) -> Infallible {
+    async fn renew(&self, job: &Job, progress: &str) -> Interrupt {
         loop {
             tokio::time::sleep(self.config.report_interval).await;
-            let _ = self
+            match self
                 .reporter
                 .report(report_request(job, progress, Vec::new()))
-                .await;
+                .await
+            {
+                Err(status) if status.code() == Code::FailedPrecondition => {
+                    tracing::warn!("job lease lost");
+                    return Interrupt::Lost;
+                }
+                Ok(reply) if reply.cancel_requested => return Interrupt::Cancelled,
+                _ => {}
+            }
         }
+    }
+
+    /// Sends a terminal `CANCELLED` report, for a job cancelled before the agent started.
+    /// The report waits at most [`RunConfig::terminal_report_timeout`].
+    pub async fn cancel_job(&self, job: &Job) {
+        let mut stream = self.resume(job);
+        stream.cancelled().await;
     }
 
     /// Runs `claude -p <prompt> --output-format stream-json --verbose` in `cwd`.
@@ -381,15 +445,7 @@ impl<R: Reporter> AgentRunner<R> {
             },
             Err(End::Timeout) => Ok(stream.fail(None, ERR_TIMEOUT).await),
             Err(End::Cancel) => {
-                stream
-                    .terminal(Terminal {
-                        state: JobState::Cancelled,
-                        exit_code: None,
-                        error: None,
-                        branch: None,
-                        pr_url: None,
-                    })
-                    .await;
+                stream.cancelled().await;
                 Ok(AgentOutcome::Cancelled)
             }
             Err(End::Lost) => Ok(AgentOutcome::Lost),
@@ -442,7 +498,12 @@ impl<R: Reporter> AgentRunner<R> {
             .race(self.alive(job, &progress, self.publish(job, cwd)))
             .await
         {
-            Ok(Ok(published)) => {
+            Ok(Err(Interrupt::Lost)) => Ok(FinishOutcome::Lost),
+            Ok(Err(Interrupt::Cancelled)) => {
+                stream.cancelled().await;
+                Ok(FinishOutcome::Cancelled)
+            }
+            Ok(Ok(Ok(published))) => {
                 stream
                     .terminal(Terminal {
                         state: JobState::Succeeded,
@@ -457,7 +518,7 @@ impl<R: Reporter> AgentRunner<R> {
                     pr_url: published.pr_url,
                 })
             }
-            Ok(Err(failure)) => {
+            Ok(Ok(Err(failure))) => {
                 for line in failure.tail.lines() {
                     stream.push(&self.redactor, line);
                 }
@@ -737,7 +798,7 @@ impl<R: Reporter> AgentRunner<R> {
                     if !matches!(read, Ok(true)) {
                         open = false;
                     } else if stream.pending_bytes >= FLUSH_BYTES && !stream.failing {
-                        stream.flush(ctl).await?;
+                        stream.start();
                     }
                 }
                 waited = child.wait(), if status.is_none() => {
@@ -746,7 +807,8 @@ impl<R: Reporter> AgentRunner<R> {
                     drain = Some(Box::pin(tokio::time::sleep(STDOUT_DRAIN)));
                 }
                 () = drain_expired(&mut drain) => open = false,
-                _ = tick.tick() => stream.beat(self.config.report_interval, ctl).await?,
+                reply = stream.reply(), if stream.in_flight() => stream.settle(reply)?,
+                _ = tick.tick() => stream.beat(self.config.report_interval),
                 () = &mut ctl.deadline => return Err(End::Timeout),
                 () = ctl.shutdown.requested() => return Err(End::Shutdown),
             }
@@ -872,11 +934,24 @@ impl Ctl {
     }
 }
 
+type ReportFuture<'a> = Pin<Box<dyn Future<Output = Result<ReportJobReply, Status>> + Send + 'a>>;
+
+struct InFlight<'a> {
+    upto: u64,
+    future: ReportFuture<'a>,
+}
+
+struct Reply {
+    upto: u64,
+    result: Result<ReportJobReply, Status>,
+}
+
 struct Stream<'a, R> {
     reporter: &'a R,
     job: &'a Job,
     pending: VecDeque<TranscriptChunk>,
     pending_bytes: usize,
+    in_flight: Option<InFlight<'a>>,
     next_seq: u64,
     progress: String,
     last_report: Instant,
@@ -891,8 +966,9 @@ impl<'a, R: Reporter> Stream<'a, R> {
         Self {
             reporter,
             job,
-            pending: VecDeque::new(),
-            pending_bytes: 0,
+            pending: carry.pending,
+            pending_bytes: carry.pending_bytes,
+            in_flight: None,
             next_seq: carry.next_seq.max(1),
             progress: carry.progress,
             last_report: Instant::now(),
@@ -903,10 +979,12 @@ impl<'a, R: Reporter> Stream<'a, R> {
         }
     }
 
-    fn carry(&self) -> Carry {
+    fn carry(&mut self) -> Carry {
         Carry {
             next_seq: self.next_seq,
             progress: self.progress.clone(),
+            pending: std::mem::take(&mut self.pending),
+            pending_bytes: std::mem::take(&mut self.pending_bytes),
         }
     }
 
@@ -937,11 +1015,73 @@ impl<'a, R: Reporter> Stream<'a, R> {
         }
     }
 
-    async fn beat(&mut self, report_interval: Duration, ctl: &mut Ctl) -> Result<(), End> {
+    fn beat(&mut self, report_interval: Duration) {
         if !self.pending.is_empty() || self.last_report.elapsed() >= report_interval {
-            self.flush(ctl).await?;
+            self.start();
         }
-        Ok(())
+    }
+
+    fn in_flight(&self) -> bool {
+        self.in_flight.is_some()
+    }
+
+    fn start(&mut self) {
+        if self.in_flight.is_some() || self.lost {
+            return;
+        }
+        let count = self.batch_len();
+        let chunks: Vec<_> = self.pending.iter().take(count).cloned().collect();
+        let upto = chunks.last().map_or(0, |chunk| chunk.seq);
+        let request = self.request(chunks);
+        self.in_flight = Some(InFlight {
+            upto,
+            future: Box::pin(self.reporter.report(request)),
+        });
+    }
+
+    async fn reply(&mut self) -> Reply {
+        let Some(flying) = self.in_flight.as_mut() else {
+            return std::future::pending().await;
+        };
+        let result = flying.future.as_mut().await;
+        let upto = flying.upto;
+        self.in_flight = None;
+        Reply { upto, result }
+    }
+
+    fn settle(&mut self, reply: Reply) -> Result<(), End> {
+        match reply.result {
+            Ok(reply_ok) => {
+                self.cancel |= reply_ok.cancel_requested;
+                while self.pending.front().is_some_and(|c| c.seq <= reply.upto) {
+                    if let Some(sent) = self.pending.pop_front() {
+                        self.pending_bytes -= sent.text.len();
+                    }
+                }
+                self.last_report = Instant::now();
+                self.failing = false;
+            }
+            Err(status) if status.code() == Code::FailedPrecondition => {
+                tracing::warn!("job lease lost");
+                self.lost = true;
+                self.pending.clear();
+                self.pending_bytes = 0;
+            }
+            Err(status) => {
+                tracing::warn!(code = ?status.code(), "job report failed");
+                self.failing = true;
+            }
+        }
+        if self.lost {
+            Err(End::Lost)
+        } else if self.cancel {
+            Err(End::Cancel)
+        } else {
+            if !self.failing && !self.pending.is_empty() {
+                self.start();
+            }
+            Ok(())
+        }
     }
 
     async fn flush(&mut self, ctl: &mut Ctl) -> Result<(), End> {
@@ -957,33 +1097,14 @@ impl<'a, R: Reporter> Stream<'a, R> {
 
     async fn send_pending(&mut self) {
         loop {
-            let count = self.batch_len();
-            let chunks: Vec<_> = self.pending.iter().take(count).cloned().collect();
-            let request = self.request(chunks);
-            match self.reporter.report(request).await {
-                Ok(reply) => {
-                    self.cancel |= reply.cancel_requested;
-                    for dropped in self.pending.drain(..count) {
-                        self.pending_bytes -= dropped.text.len();
-                    }
-                    self.last_report = Instant::now();
-                    self.failing = false;
-                    if self.pending.is_empty() {
-                        return;
-                    }
-                }
-                Err(status) if status.code() == Code::FailedPrecondition => {
-                    tracing::warn!("job lease lost");
-                    self.lost = true;
-                    self.pending.clear();
-                    self.pending_bytes = 0;
-                    return;
-                }
-                Err(status) => {
-                    tracing::warn!(code = ?status.code(), "job report failed");
-                    self.failing = true;
-                    return;
-                }
+            self.start();
+            if self.in_flight.is_none() {
+                return;
+            }
+            let reply = self.reply().await;
+            let _ = self.settle(reply);
+            if self.lost || self.failing || self.pending.is_empty() {
+                return;
             }
         }
     }
@@ -1029,10 +1150,27 @@ impl<'a, R: Reporter> Stream<'a, R> {
         }
     }
 
+    async fn cancelled(&mut self) {
+        self.terminal(Terminal {
+            state: JobState::Cancelled,
+            exit_code: None,
+            error: None,
+            branch: None,
+            pr_url: None,
+        })
+        .await;
+    }
+
     async fn send_terminal(&mut self, end: Terminal) {
-        self.send_pending().await;
-        if self.lost {
-            return;
+        loop {
+            self.send_pending().await;
+            if self.lost {
+                return;
+            }
+            if self.pending.is_empty() {
+                break;
+            }
+            tokio::time::sleep(RETRY_PAUSE).await;
         }
         let mut request = self.request(Vec::new());
         request.terminal_state = Some(end.state.into());

@@ -50,8 +50,15 @@ pub const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
 /// Longest the poller waits for a claim already in flight when shutdown starts.
 pub const CLAIM_GRACE: Duration = Duration::from_secs(1);
 
-/// Longest the poller waits for a runner to return after it signals shutdown.
-pub const SHUTDOWN_GRACE: Duration = Duration::from_secs(10);
+/// Longest the poller waits for a runner to return after it signals shutdown. It exceeds the
+/// default terminal report timeout plus the stdout drain, so the runner can report the stop.
+pub const SHUTDOWN_GRACE: Duration = Duration::from_secs(15);
+
+const _: () = assert!(
+    SHUTDOWN_GRACE.as_secs()
+        > crate::runner::DEFAULT_TERMINAL_REPORT_TIMEOUT.as_secs()
+            + crate::runner::STDOUT_DRAIN.as_secs()
+);
 
 /// A clone-able signal that the poller is shutting down.
 #[derive(Debug, Clone)]
