@@ -95,6 +95,24 @@ impl<R: Reporter + 'static> JobRunner for DaemonRunner<R> {
     }
 }
 
+fn job_workspace(
+    config: &Config,
+    run: &mut RunConfig,
+    env: &dyn Fn(&str) -> Option<String>,
+) -> Workspace {
+    let mut policy = RepoPolicy::new(config.repo_hosts.iter().cloned())
+        .with_token_host(config.token_host.clone());
+    if config.allow_file_repos {
+        policy = policy.with_file_repos();
+    }
+    run.repo_policy = policy.clone();
+    let mut workspace = Workspace::new(PathBuf::from(&config.jobs_dir)).with_policy(policy);
+    if let Some(token) = env("GH_TOKEN") {
+        workspace = workspace.with_credential(run.askpass_bin.clone(), token);
+    }
+    workspace
+}
+
 /// Builds the poller when `FLEET_SERVER_URL` is set and non-empty, else `None`.
 ///
 /// # Errors
@@ -120,15 +138,8 @@ pub(crate) fn build(
     let reporter = GrpcReporter::new(channel.clone(), &token)?;
     let mut run = RunConfig::new(&config.claude_bin, config.disposable);
     run.gh_bin.clone_from(&config.gh_bin);
-    let mut policy = RepoPolicy::new(config.repo_hosts.iter().cloned());
-    if config.allow_file_repos {
-        policy = policy.with_file_repos();
-    }
-    run.repo_policy = policy.clone();
-    let runner = DaemonRunner::new(
-        Workspace::new(PathBuf::from(&config.jobs_dir)).with_policy(policy),
-        AgentRunner::new(run, reporter, redactor),
-    );
+    let workspace = job_workspace(config, &mut run, env);
+    let runner = DaemonRunner::new(workspace, AgentRunner::new(run, reporter, redactor));
     Poller::with_channel(
         channel,
         &token,
@@ -163,6 +174,29 @@ mod tests {
             let _ = self.0.send(request);
             std::future::ready(Ok(ReportJobReply::default()))
         }
+    }
+
+    #[tokio::test]
+    async fn the_gh_token_env_value_reaches_the_mirror_fetch() -> TestResult {
+        let dir = tempfile::TempDir::new()?;
+        let git = dir.path().join("rec-git");
+        std::fs::write(
+            &git,
+            "#!/bin/sh\ncase \"$*\" in\n*\" fetch \"*) printf %s \"$GH_TOKEN\" > \"$(dirname \"$HOME\")/tok\" ;;\nesac\nexit 0\n",
+        )?;
+        std::fs::set_permissions(&git, std::fs::Permissions::from_mode(0o755))?;
+        let jobs = dir.path().join("jobs");
+        let mut config = Config::resolve(None, &|_| None)?;
+        config.jobs_dir.clone_from(&jobs);
+        let mut run = RunConfig::new("claude", false);
+        let env = |name: &str| (name == "GH_TOKEN").then(|| String::from("tok-wired"));
+        let workspace =
+            job_workspace(&config, &mut run, &env).with_git(&git, Duration::from_secs(10));
+        workspace
+            .prepare("job1", "https://github.com/o/r.git", "main")
+            .await?;
+        assert_eq!(std::fs::read_to_string(jobs.join("tok"))?, "tok-wired");
+        Ok(())
     }
 
     #[tokio::test]

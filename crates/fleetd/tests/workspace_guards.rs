@@ -95,7 +95,7 @@ const REPO: &str = "https://github.com/o/r.git";
 #[tokio::test]
 async fn every_call_runs_with_a_cleared_environment() -> TestResult {
     let (_dir, _root, all) = run(default_run(), REPO).await?;
-    assert_eq!(all.len(), 4);
+    assert_eq!(all.len(), 3);
     let expected = [
         "GIT_ALLOW_PROTOCOL",
         "GIT_CONFIG_GLOBAL",
@@ -190,16 +190,44 @@ async fn the_config_overrides_come_before_the_subcommand() -> TestResult {
         let words: Vec<&str> = call.args.split(' ').collect();
         assert_eq!(words[0], "-C", "{}", call.args);
         assert_eq!(
-            &words[2..8],
+            &words[2..16],
             [
                 "-c",
                 "core.hooksPath=/dev/null",
                 "-c",
                 "core.fsmonitor=",
                 "-c",
-                "http.followRedirects=false"
+                "http.followRedirects=false",
+                "-c",
+                "http.proxy=",
+                "-c",
+                "http.sslVerify=true",
+                "-c",
+                "http.curloptResolve=",
+                "-c",
+                "credential.helper="
             ]
         );
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn every_call_pins_proxy_tls_resolve_and_credential_helper() -> TestResult {
+    let (_dir, _root, all) = run(default_run(), REPO).await?;
+    for pin in [
+        "http.proxy=",
+        "http.sslVerify=true",
+        "http.curloptResolve=",
+        "credential.helper=",
+    ] {
+        for call in &all {
+            assert!(
+                call.args.contains(&format!(" -c {pin} ")),
+                "{pin} {}",
+                call.args
+            );
+        }
     }
     Ok(())
 }
@@ -225,39 +253,137 @@ async fn git_is_limited_to_https_unless_the_test_policy_adds_file() -> TestResul
 }
 
 #[tokio::test]
-async fn the_mirror_origin_is_set_on_every_sync_and_added_when_set_url_fails() -> TestResult {
+async fn the_mirror_fetches_by_explicit_url_and_configures_no_remote() -> TestResult {
     let (_dir, _root, all) = run(default_run(), REPO).await?;
     let subs: Vec<&str> = all
         .iter()
-        .filter_map(|c| c.args.split(' ').nth(8))
+        .filter_map(|c| c.args.split(' ').nth(16))
         .collect();
-    assert_eq!(subs, ["init", "remote", "fetch", "worktree"]);
+    assert_eq!(subs, ["init", "fetch", "worktree"]);
     assert!(
         all[1]
             .args
-            .contains("remote set-url origin -- https://github.com/o/r.git")
+            .ends_with("fetch --prune --quiet -- https://github.com/o/r.git +refs/heads/*:refs/remotes/origin/*"),
+        "{}",
+        all[1].args
     );
-    assert!(!all.iter().any(|c| c.args.contains("remote add")));
+    assert!(!all.iter().any(|c| c.args.contains(" remote ")));
+    Ok(())
+}
 
+#[tokio::test]
+async fn the_mirror_is_named_by_the_sha256_of_the_repo_url() -> TestResult {
+    let names = |all: &[Call]| -> Vec<String> {
+        all.iter()
+            .filter(|c| c.args.contains(" init "))
+            .filter_map(|c| c.args.rsplit('/').next().map(str::to_owned))
+            .collect()
+    };
+    let (_dir, _root, first) = run(default_run(), REPO).await?;
+    let (_dir, _root, second) = run(default_run(), "https://github.com/o/s.git").await?;
+    let (a, b) = (names(&first), names(&second));
+    assert_eq!(a.len(), 1);
+    assert_ne!(a, b);
+    for name in a.iter().chain(&b) {
+        let stem = name.strip_suffix(".git").ok_or("suffix")?;
+        assert_eq!(stem.len(), 64, "{name}");
+        assert!(stem.bytes().all(|c| c.is_ascii_hexdigit()), "{name}");
+    }
+    assert_eq!(
+        a[0],
+        "bc3fbd4dd8dbadfc9793e2a816228cf8fa84d7954992c487a510aced135fecdf.git"
+    );
+    Ok(())
+}
+
+fn with_credential(root: &Path, policy: RepoPolicy) -> Workspace {
+    workspace(root, policy).with_credential("/opt/fleetd bin/fleetd", "tok-for-fetch".to_owned())
+}
+
+#[tokio::test]
+async fn only_the_fetch_child_carries_the_scoped_credential() -> TestResult {
     let dir = TempDir::new()?;
-    let base = dir.path().to_path_buf();
-    let root = base.join("jobs");
-    std::fs::create_dir(&root)?;
-    std::fs::write(root.join("seturl-fails"), "")?;
-    workspace(&root, default_run())
+    let root = dir.path().join("jobs");
+    with_credential(&root, default_run())
         .prepare("job1", REPO, "main")
         .await?;
     let all = calls(&root)?;
-    let adds = all
+    for call in &all {
+        let fetch = call.args.contains(" fetch ");
+        assert_eq!(call.env.contains_key("GH_TOKEN"), fetch, "{}", call.args);
+        assert_eq!(call.env.contains_key("GIT_ASKPASS"), fetch, "{}", call.args);
+        assert_eq!(
+            call.env.contains_key("FLEETD_ASKPASS_HOST"),
+            fetch,
+            "{}",
+            call.args
+        );
+    }
+    let fetch = all
         .iter()
-        .filter(|c| {
-            c.args
-                .contains("remote add origin -- https://github.com/o/r.git")
-        })
-        .count();
-    assert_eq!(adds, 1);
-    assert!(all.iter().any(|c| c.args.contains(" fetch ")));
+        .find(|c| c.args.contains(" fetch "))
+        .ok_or("fetch")?;
+    assert_eq!(fetch.env["GH_TOKEN"], "tok-for-fetch");
+    assert_eq!(fetch.env["FLEETD_ASKPASS_HOST"], "github.com");
+    assert_eq!(fetch.env["GIT_ASKPASS"], "'/opt/fleetd bin/fleetd' askpass");
     Ok(())
+}
+
+#[tokio::test]
+async fn a_fetch_from_another_allowed_host_carries_no_credential() -> TestResult {
+    let dir = TempDir::new()?;
+    let root = dir.path().join("jobs");
+    let policy = RepoPolicy::new(["github.com", "gitlab.com"]);
+    with_credential(&root, policy)
+        .prepare("job1", "https://gitlab.com/o/r.git", "main")
+        .await?;
+    for call in calls(&root)? {
+        for name in ["GH_TOKEN", "GIT_ASKPASS", "FLEETD_ASKPASS_HOST"] {
+            assert!(!call.env.contains_key(name), "{name} {}", call.args);
+        }
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn an_empty_token_or_no_token_host_gives_the_fetch_no_credential() -> TestResult {
+    for (policy, token) in [
+        (default_run(), ""),
+        (RepoPolicy::new(["git.example.com"]), "tok"),
+    ] {
+        let dir = TempDir::new()?;
+        let root = dir.path().join("jobs");
+        let repo = if token.is_empty() {
+            REPO
+        } else {
+            "https://git.example.com/o/r.git"
+        };
+        workspace(&root, policy)
+            .with_credential("/bin/fleetd", token.to_owned())
+            .prepare("job1", repo, "main")
+            .await?;
+        for call in calls(&root)? {
+            assert!(!call.env.contains_key("GH_TOKEN"), "{}", call.args);
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn the_token_host_defaults_to_github_and_must_be_an_allowed_host() {
+    assert_eq!(default_run().token_host(), Some("github.com"));
+    assert_eq!(RepoPolicy::new(["git.example.com"]).token_host(), None);
+    let two = RepoPolicy::new(["github.com", "gitlab.com"]);
+    let moved = two.clone().with_token_host(Some("gitlab.com".to_owned()));
+    assert_eq!(moved.token_host(), Some("gitlab.com"));
+    let stray = two.with_token_host(Some("evil.example".to_owned()));
+    assert_eq!(stray.token_host(), None);
+}
+
+#[test]
+fn the_workspace_debug_output_hides_the_token() {
+    let ws = Workspace::new("/x").with_credential("/bin/fleetd", "tok-for-fetch".to_owned());
+    assert!(!format!("{ws:?}").contains("tok-for-fetch"));
 }
 
 #[tokio::test]

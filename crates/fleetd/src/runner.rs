@@ -158,7 +158,7 @@ pub struct RunConfig {
     /// default.
     pub askpass_bin: PathBuf,
     /// Repos a job may push to. The push runs with only these hosts, and the askpass helper
-    /// answers only for them.
+    /// answers only for the token host.
     pub repo_policy: RepoPolicy,
     /// Git binary used to fetch, count, log and push commits, `git` by default.
     pub git_bin: PathBuf,
@@ -753,10 +753,10 @@ impl<R: Reporter> AgentRunner<R> {
             Scope::Clean => command.env("GIT_ALLOW_PROTOCOL", "file"),
             Scope::Push => command
                 .env("GIT_ALLOW_PROTOCOL", self.config.repo_policy.protocols())
-                .env("GIT_ASKPASS", askpass_command(&self.config.askpass_bin))
+                .env("GIT_ASKPASS", askpass::command(&self.config.askpass_bin))
                 .env(
-                    askpass::HOSTS_ENV,
-                    self.config.repo_policy.hosts().join(","),
+                    askpass::HOST_ENV,
+                    self.config.repo_policy.token_host().unwrap_or_default(),
                 ),
             Scope::Gh => command
                 .env("GH_CONFIG_DIR", dir.join(GH_CONFIG_DIR))
@@ -1233,10 +1233,6 @@ impl IntoFailure for CaptureError {
             Self::Timeout => Failure::bare(ERR_FINISH_TIMEOUT),
         }
     }
-}
-
-fn askpass_command(bin: &Path) -> String {
-    format!("'{}' askpass", bin.to_string_lossy().replace('\'', "'\\''"))
 }
 
 const HOME_DIR: &str = "home";

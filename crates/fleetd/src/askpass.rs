@@ -2,13 +2,19 @@
 //!
 //! git runs the helper with the prompt as its only argument. The token comes from the
 //! helper's own environment, never from argv, and nothing here logs or formats it. The
-//! helper answers only when the prompt names a host the [`RepoPolicy`] allows, so a job
-//! that points git at another host gets no token.
+//! helper answers only when the prompt names the one token host, so a job that points git at
+//! another host, even one in `repo_hosts`, gets no token.
 
-use crate::workspace::RepoPolicy;
+use std::path::Path;
 
-/// Environment variable that carries the allowed hosts to the helper, comma separated.
-pub const HOSTS_ENV: &str = "FLEETD_ASKPASS_HOSTS";
+/// Environment variable that carries the token host to the helper.
+pub const HOST_ENV: &str = "FLEETD_ASKPASS_HOST";
+
+/// The `GIT_ASKPASS` value that runs `<bin> askpass`, with `bin` shell-quoted.
+#[must_use]
+pub fn command(bin: &Path) -> String {
+    format!("'{}' askpass", bin.to_string_lossy().replace('\'', "'\\''"))
+}
 
 /// The fixed username GitHub accepts for a token over https.
 pub const USERNAME: &str = "x-access-token";
@@ -24,10 +30,11 @@ fn prompt_host(prompt: &str) -> Option<&str> {
 }
 
 /// The text to print for `prompt`, or `None` when it is not a credential prompt, it does
-/// not name a host `policy` allows, or the token is missing or empty.
+/// not name `token_host`, `token_host` is empty, or the token is missing or empty.
 #[must_use]
-pub fn answer(prompt: &str, token: Option<&str>, policy: &RepoPolicy) -> Option<String> {
-    if !prompt_host(prompt).is_some_and(|host| policy.allows_host(host)) {
+pub fn answer(prompt: &str, token: Option<&str>, token_host: &str) -> Option<String> {
+    let named = prompt_host(prompt).is_some_and(|host| host.eq_ignore_ascii_case(token_host));
+    if token_host.is_empty() || !named {
         None
     } else if prompt.starts_with("Username") {
         Some(USERNAME.to_owned())
@@ -42,46 +49,35 @@ pub fn answer(prompt: &str, token: Option<&str>, policy: &RepoPolicy) -> Option<
 mod tests {
     use super::*;
 
-    fn policy() -> RepoPolicy {
-        RepoPolicy::new(["github.com"])
-    }
+    const HOST: &str = "github.com";
 
     #[test]
     fn a_password_prompt_gets_the_token() {
         let prompt = "Password for 'https://x-access-token@github.com': ";
-        assert_eq!(
-            answer(prompt, Some("tok"), &policy()).as_deref(),
-            Some("tok")
-        );
+        assert_eq!(answer(prompt, Some("tok"), HOST).as_deref(), Some("tok"));
     }
 
     #[test]
     fn a_username_prompt_gets_the_fixed_username() {
         let prompt = "Username for 'https://github.com': ";
-        assert_eq!(
-            answer(prompt, Some("tok"), &policy()).as_deref(),
-            Some(USERNAME)
-        );
-        assert_eq!(answer(prompt, None, &policy()).as_deref(), Some(USERNAME));
+        assert_eq!(answer(prompt, Some("tok"), HOST).as_deref(), Some(USERNAME));
+        assert_eq!(answer(prompt, None, HOST).as_deref(), Some(USERNAME));
     }
 
     #[test]
     fn anything_else_gets_nothing() {
         let host = "for 'https://github.com': ";
-        assert_eq!(answer("Passphrase for key: ", Some("tok"), &policy()), None);
-        assert_eq!(answer("", Some("tok"), &policy()), None);
-        assert_eq!(answer("Enter token", Some("tok"), &policy()), None);
-        assert_eq!(
-            answer(&format!("Other {host}"), Some("tok"), &policy()),
-            None
-        );
+        assert_eq!(answer("Passphrase for key: ", Some("tok"), HOST), None);
+        assert_eq!(answer("", Some("tok"), HOST), None);
+        assert_eq!(answer("Enter token", Some("tok"), HOST), None);
+        assert_eq!(answer(&format!("Other {host}"), Some("tok"), HOST), None);
     }
 
     #[test]
     fn a_missing_or_empty_token_gets_nothing() {
         let prompt = "Password for 'https://github.com': ";
-        assert_eq!(answer(prompt, None, &policy()), None);
-        assert_eq!(answer(prompt, Some(""), &policy()), None);
+        assert_eq!(answer(prompt, None, HOST), None);
+        assert_eq!(answer(prompt, Some(""), HOST), None);
     }
 
     #[test]
@@ -102,25 +98,45 @@ mod tests {
             "Password for 'https://github.com'@attacker.example': ",
         ];
         for prompt in prompts {
-            assert_eq!(answer(prompt, Some("tok"), &policy()), None, "{prompt}");
+            assert_eq!(answer(prompt, Some("tok"), HOST), None, "{prompt}");
         }
     }
 
     #[test]
-    fn an_empty_policy_answers_nothing() {
-        let prompt = "Password for 'https://github.com': ";
+    fn only_the_token_host_gets_the_token() {
+        let gitlab = "Password for 'https://gitlab.com/o/r.git': ";
+        assert_eq!(answer(gitlab, Some("tok"), HOST), None);
         assert_eq!(
-            answer(prompt, Some("tok"), &RepoPolicy::new(Vec::<String>::new())),
+            answer("Username for 'https://gitlab.com': ", Some("tok"), HOST),
             None
         );
+        assert_eq!(
+            answer(gitlab, Some("tok"), "gitlab.com").as_deref(),
+            Some("tok")
+        );
+        let github = "Password for 'https://github.com/o/r.git': ";
+        assert_eq!(answer(github, Some("tok"), "gitlab.com"), None);
     }
 
     #[test]
-    fn the_host_match_ignores_case_and_userinfo_on_an_allowed_host() {
+    fn an_empty_token_host_answers_nothing() {
+        let prompt = "Password for 'https://github.com': ";
+        assert_eq!(answer(prompt, Some("tok"), ""), None);
+        assert_eq!(answer("Password for 'https://': ", Some("tok"), ""), None);
+    }
+
+    #[test]
+    fn the_host_match_ignores_case_and_userinfo_on_the_token_host() {
         let prompt = "Password for 'https://x@GitHub.com/org/repo.git': ";
+        assert_eq!(answer(prompt, Some("tok"), HOST).as_deref(), Some("tok"));
+    }
+
+    #[test]
+    fn the_command_quotes_the_binary_path() {
+        assert_eq!(command(Path::new("/a b/fleetd")), "'/a b/fleetd' askpass");
         assert_eq!(
-            answer(prompt, Some("tok"), &policy()).as_deref(),
-            Some("tok")
+            command(Path::new("/it's/fleetd")),
+            "'/it'\\''s/fleetd' askpass"
         );
     }
 }

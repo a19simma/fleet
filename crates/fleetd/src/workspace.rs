@@ -9,8 +9,11 @@ use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::time::Duration;
 
+use sha2::{Digest, Sha256};
+use tokio::io::AsyncWriteExt;
 use tokio::process::Command;
 
+use crate::askpass;
 use crate::group::GroupGuard;
 
 const CACHE_DIR: &str = ".cache";
@@ -20,6 +23,25 @@ const HOME_DIR: &str = ".git-home";
 const DEFAULT_REPO_HOST: &str = "github.com";
 const PROTOCOLS: &str = "https";
 const PROTOCOLS_WITH_FILE: &str = "file:https";
+const MIRROR_CONFIG: &str =
+    "[core]\n\trepositoryformatversion = 0\n\tfilemode = true\n\tbare = true\n";
+const MIRROR_CONFIG_STAGING: &str = "config.fleetd-new";
+const PINNED_CONFIG: [&str; 14] = [
+    "-c",
+    "core.hooksPath=/dev/null",
+    "-c",
+    "core.fsmonitor=",
+    "-c",
+    "http.followRedirects=false",
+    "-c",
+    "http.proxy=",
+    "-c",
+    "http.sslVerify=true",
+    "-c",
+    "http.curloptResolve=",
+    "-c",
+    "credential.helper=",
+];
 
 /// Longest a single git command may run before its process group is killed.
 pub const GIT_TIMEOUT: Duration = Duration::from_secs(300);
@@ -32,6 +54,7 @@ pub const GIT_TIMEOUT: Duration = Duration::from_secs(300);
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RepoPolicy {
     hosts: Vec<String>,
+    token_host: Option<String>,
     allow_file: bool,
 }
 
@@ -42,17 +65,38 @@ impl Default for RepoPolicy {
 }
 
 impl RepoPolicy {
-    /// A policy that admits https repos on exactly `hosts`. No port is admitted.
+    /// A policy that admits https repos on exactly `hosts`. No port is admitted. The token
+    /// host is `github.com` when `hosts` lists it, else none.
     #[must_use]
     pub fn new<I, S>(hosts: I) -> Self
     where
         I: IntoIterator<Item = S>,
         S: Into<String>,
     {
+        let hosts: Vec<String> = hosts.into_iter().map(Into::into).collect();
+        let token_host = hosts
+            .iter()
+            .any(|h| h.eq_ignore_ascii_case(DEFAULT_REPO_HOST))
+            .then(|| DEFAULT_REPO_HOST.to_owned());
         Self {
-            hosts: hosts.into_iter().map(Into::into).collect(),
+            hosts,
+            token_host,
             allow_file: false,
         }
+    }
+
+    /// Sets the one host whose credential prompts get the token. A host that is not an
+    /// allowed host is dropped, so the token host is always one of [`RepoPolicy::hosts`].
+    #[must_use]
+    pub fn with_token_host(mut self, host: Option<String>) -> Self {
+        self.token_host = host.filter(|h| self.allows_host(h));
+        self
+    }
+
+    /// The host whose credential prompts get the token, if any.
+    #[must_use]
+    pub fn token_host(&self) -> Option<&str> {
+        self.token_host.as_deref()
     }
 
     /// Also admits `file://` urls and absolute paths, and the `file` git transport. Meant
@@ -140,6 +184,20 @@ pub struct Checkout {
     pub branch: String,
 }
 
+#[derive(Clone)]
+struct Credential {
+    askpass_bin: PathBuf,
+    token: String,
+}
+
+impl fmt::Debug for Credential {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Credential")
+            .field("askpass_bin", &self.askpass_bin)
+            .finish_non_exhaustive()
+    }
+}
+
 /// Creates job worktrees under a configurable root.
 #[derive(Debug, Clone)]
 pub struct Workspace {
@@ -148,6 +206,7 @@ pub struct Workspace {
     timeout: Duration,
     policy: RepoPolicy,
     path_env: Option<OsString>,
+    credential: Option<Credential>,
 }
 
 impl Workspace {
@@ -160,7 +219,20 @@ impl Workspace {
             timeout: GIT_TIMEOUT,
             policy: RepoPolicy::default(),
             path_env: std::env::var_os("PATH"),
+            credential: None,
         }
+    }
+
+    /// Lets the mirror fetch of a repo on the policy's token host authenticate through
+    /// `<askpass_bin> askpass` with `token`. Only that one git child gets the token, never
+    /// the init, worktree or prune calls. An empty token clears it.
+    #[must_use]
+    pub fn with_credential(mut self, askpass_bin: impl Into<PathBuf>, token: String) -> Self {
+        self.credential = (!token.is_empty()).then(|| Credential {
+            askpass_bin: askpass_bin.into(),
+            token,
+        });
+        self
     }
 
     /// Uses `policy` to judge repos instead of the default, https on `github.com`.
@@ -178,8 +250,8 @@ impl Workspace {
         self
     }
 
-    /// Fetches the bare mirror of `repo`, then runs `git worktree add -b swarm/<job_id>`
-    /// from `origin/<base_ref>`.
+    /// Resets the bare mirror's config, fetches `repo` into it by explicit url, then runs
+    /// `git worktree add -b swarm/<job_id>` from `origin/<base_ref>`.
     ///
     /// # Errors
     ///
@@ -260,7 +332,44 @@ impl Workspace {
     fn mirror_path(&self, repo: &str) -> PathBuf {
         self.root
             .join(CACHE_DIR)
-            .join(format!("{:016x}.git", fnv1a(repo.as_bytes())))
+            .join(format!("{:x}.git", Sha256::digest(repo.as_bytes())))
+    }
+
+    async fn reset_mirror_config(mirror: &Path) -> Result<(), WorkspaceError> {
+        if !mirror.join("HEAD").exists() {
+            return Ok(());
+        }
+        let staging = mirror.join(MIRROR_CONFIG_STAGING);
+        match tokio::fs::remove_file(&staging).await {
+            Ok(()) => {}
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+            Err(err) => return Err(WorkspaceError::Io(err)),
+        }
+        let mut file = tokio::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&staging)
+            .await
+            .map_err(WorkspaceError::Io)?;
+        file.write_all(MIRROR_CONFIG.as_bytes())
+            .await
+            .map_err(WorkspaceError::Io)?;
+        drop(file);
+        tokio::fs::rename(&staging, mirror.join("config"))
+            .await
+            .map_err(WorkspaceError::Io)
+    }
+
+    fn fetch_credential(&self, repo: &str) -> Option<(&Credential, &str)> {
+        let credential = self.credential.as_ref()?;
+        let token_host = self.policy.token_host()?;
+        let authority = repo
+            .strip_prefix("https://")?
+            .split(['/', '?', '#'])
+            .next()?;
+        authority
+            .eq_ignore_ascii_case(token_host)
+            .then_some((credential, token_host))
     }
 
     async fn sync_mirror(&self, mirror: &Path, repo: &str) -> Result<(), WorkspaceError> {
@@ -273,34 +382,19 @@ impl Workspace {
             )
             .await?;
         }
-        match self
-            .git(
-                mirror,
-                &["remote", "set-url", "origin", "--", repo],
-                "remote set-url",
-            )
-            .await
-        {
-            Err(WorkspaceError::Git(_)) => {
-                self.git(
-                    mirror,
-                    &["remote", "add", "origin", "--", repo],
-                    "remote add",
-                )
-                .await?;
-            }
-            other => other?,
-        }
-        self.git(
+        Self::reset_mirror_config(mirror).await?;
+        self.run_git(
             mirror,
             &[
                 "fetch",
                 "--prune",
                 "--quiet",
-                "origin",
+                "--",
+                repo,
                 "+refs/heads/*:refs/remotes/origin/*",
             ],
             "fetch",
+            self.fetch_credential(repo),
         )
         .await
     }
@@ -311,6 +405,16 @@ impl Workspace {
         args: &[&str],
         step: &'static str,
     ) -> Result<(), WorkspaceError> {
+        self.run_git(dir, args, step, None).await
+    }
+
+    async fn run_git(
+        &self,
+        dir: &Path,
+        args: &[&str],
+        step: &'static str,
+        credential: Option<(&Credential, &str)>,
+    ) -> Result<(), WorkspaceError> {
         let home = self.root.join(HOME_DIR);
         tokio::fs::create_dir_all(&home)
             .await
@@ -320,17 +424,16 @@ impl Workspace {
         if let Some(path) = &self.path_env {
             command.env("PATH", path);
         }
+        if let Some((credential, host)) = credential {
+            command
+                .env("GIT_ASKPASS", askpass::command(&credential.askpass_bin))
+                .env(askpass::HOST_ENV, host)
+                .env("GH_TOKEN", &credential.token);
+        }
         let mut child = command
             .arg("-C")
             .arg(dir)
-            .args([
-                "-c",
-                "core.hooksPath=/dev/null",
-                "-c",
-                "core.fsmonitor=",
-                "-c",
-                "http.followRedirects=false",
-            ])
+            .args(PINNED_CONFIG)
             .args(args)
             .env("HOME", &home)
             .env("XDG_CONFIG_HOME", home.join(".config"))
@@ -357,12 +460,6 @@ impl Workspace {
             }
         }
     }
-}
-
-fn fnv1a(bytes: &[u8]) -> u64 {
-    bytes.iter().fold(0xcbf2_9ce4_8422_2325, |hash, byte| {
-        (hash ^ u64::from(*byte)).wrapping_mul(0x0100_0000_01b3)
-    })
 }
 
 pub(crate) fn validate_job_id(id: &str) -> Result<(), WorkspaceError> {

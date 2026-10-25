@@ -16,6 +16,7 @@ const DEFAULT_DEDUPE_SECS: u64 = 10;
 const DEFAULT_CLAUDE_BIN: &str = "claude";
 const DEFAULT_GH_BIN: &str = "gh";
 const DEFAULT_REPO_HOSTS: [&str; 1] = ["github.com"];
+const DEFAULT_TOKEN_HOST: &str = "github.com";
 const DEFAULT_HOOK_EVENTS: [&str; 5] = [
     "SessionStart",
     "UserPromptSubmit",
@@ -41,6 +42,7 @@ struct FileConfig {
     disposable: Option<bool>,
     jobs_dir: Option<PathBuf>,
     repo_hosts: Option<Vec<String>>,
+    token_host: Option<String>,
 }
 
 /// Where redaction secrets are read from.
@@ -85,6 +87,10 @@ pub struct Config {
     /// Hosts a job repo may name, lowercase. Jobs run only https repos on these hosts, with
     /// no port. Defaults to `github.com`. An empty list rejects every repo.
     pub repo_hosts: Vec<String>,
+    /// The one host whose prompts receive `GH_TOKEN`, lowercase. Config file only. Defaults to
+    /// `github.com` when `repo_hosts` lists it, else none. An explicit value must be in
+    /// `repo_hosts`. A host in `repo_hosts` other than this one never gets the token.
+    pub token_host: Option<String>,
     /// Admits `file://` and absolute-path repos. Always false from [`Config::resolve`],
     /// which has no file key or environment variable for it. Only code that builds a
     /// `Config` for a test sets it.
@@ -115,8 +121,9 @@ impl Config {
     /// # Errors
     ///
     /// Fails on invalid TOML, an unparsable `FLEETD_PORT`, a zero
-    /// `queue_max_bytes` or `queue_max_age_secs`, or a `repo_hosts` entry that is not a bare
-    /// host name. An empty environment value counts as unset.
+    /// `queue_max_bytes` or `queue_max_age_secs`, a `repo_hosts` entry that is not a bare
+    /// host name, or a `token_host` that is not in `repo_hosts`. An empty environment value
+    /// counts as unset.
     pub fn resolve(
         file: Option<&str>,
         env: &dyn Fn(&str) -> Option<String>,
@@ -178,6 +185,7 @@ impl Config {
             });
         }
         let repo_hosts = resolve_repo_hosts(file.repo_hosts)?;
+        let token_host = resolve_token_host(file.token_host, &repo_hosts)?;
         Ok(Self {
             http_port,
             socket_path,
@@ -212,6 +220,7 @@ impl Config {
                         .map_or_else(|| PathBuf::from("jobs"), |dir| dir.join("jobs"))
                 }),
             repo_hosts,
+            token_host,
             allow_file_repos: false,
         })
     }
@@ -236,6 +245,18 @@ fn resolve_repo_hosts(raw: Option<Vec<String>>) -> Result<Vec<String>, Error> {
             name: "repo_hosts",
             value: "<redacted>".to_owned(),
         })
+    }
+}
+
+fn resolve_token_host(raw: Option<String>, repo_hosts: &[String]) -> Result<Option<String>, Error> {
+    let listed = |host: &str| repo_hosts.iter().any(|h| h == host);
+    match raw.map(|host| host.to_ascii_lowercase()) {
+        Some(host) if listed(&host) => Ok(Some(host)),
+        Some(_) => Err(Error::InvalidValue {
+            name: "token_host",
+            value: "<redacted>".to_owned(),
+        }),
+        None => Ok(listed(DEFAULT_TOKEN_HOST).then(|| DEFAULT_TOKEN_HOST.to_owned())),
     }
 }
 
@@ -387,6 +408,40 @@ mod tests {
             let file = format!("repo_hosts = [\"{bad}\"]");
             assert!(Config::resolve(Some(&file), &env_of(&[])).is_err(), "{bad}");
         }
+    }
+
+    #[test]
+    fn token_host_defaults_to_github_when_listed() {
+        let cfg = Config::resolve(None, &env_of(&[])).unwrap();
+        assert_eq!(cfg.token_host.as_deref(), Some("github.com"));
+        let file = "repo_hosts = [\"gitlab.com\", \"github.com\"]";
+        let cfg = Config::resolve(Some(file), &env_of(&[])).unwrap();
+        assert_eq!(cfg.token_host.as_deref(), Some("github.com"));
+        let cfg = Config::resolve(Some("repo_hosts = [\"gitlab.com\"]"), &env_of(&[])).unwrap();
+        assert_eq!(cfg.token_host, None);
+        let cfg = Config::resolve(Some("repo_hosts = []"), &env_of(&[])).unwrap();
+        assert_eq!(cfg.token_host, None);
+    }
+
+    #[test]
+    fn token_host_names_one_listed_host_and_normalises_case() {
+        let file = "repo_hosts = [\"github.com\", \"gitlab.com\"]\ntoken_host = \"GitLab.com\"";
+        let cfg = Config::resolve(Some(file), &env_of(&[])).unwrap();
+        assert_eq!(cfg.token_host.as_deref(), Some("gitlab.com"));
+    }
+
+    #[test]
+    fn token_host_outside_repo_hosts_is_rejected_and_has_no_env_override() {
+        for file in [
+            "token_host = \"gitlab.com\"",
+            "repo_hosts = []\ntoken_host = \"github.com\"",
+            "token_host = \"\"",
+        ] {
+            assert!(Config::resolve(Some(file), &env_of(&[])).is_err(), "{file}");
+        }
+        let env = env_of(&[("FLEETD_TOKEN_HOST", "evil.example")]);
+        let cfg = Config::resolve(None, &env).unwrap();
+        assert_eq!(cfg.token_host.as_deref(), Some("github.com"));
     }
 
     #[test]

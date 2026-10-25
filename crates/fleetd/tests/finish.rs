@@ -641,7 +641,7 @@ async fn credentialed_children_get_only_their_credential_and_scratch_dirs() -> T
     let mut push = set(&common);
     push.insert("GIT_ASKPASS".into());
     push.insert("GH_TOKEN".into());
-    push.insert("FLEETD_ASKPASS_HOSTS".into());
+    push.insert("FLEETD_ASKPASS_HOST".into());
     assert_eq!(keys(&recorded(&rig, "push")?), push);
     for sub in ["init", "fetch", "rev-list", "log"] {
         assert_eq!(keys(&recorded(&rig, sub)?), set(&common), "{sub}");
@@ -817,10 +817,11 @@ async fn the_push_disables_redirect_following() -> TestResult {
 }
 
 #[tokio::test]
-async fn the_push_allows_only_https_and_names_the_allowed_hosts() -> TestResult {
+async fn the_push_allows_only_https_and_names_the_token_host() -> TestResult {
     let rig = rig("ok").await?;
     commit(&rig)?;
-    let policy = RepoPolicy::new(["origin.test", "git.example"]);
+    let policy = RepoPolicy::new(["origin.test", "git.example"])
+        .with_token_host(Some("origin.test".to_owned()));
     let (agent, _rx) = agent_with_policy(&rig, PathBuf::from(env!("CARGO_BIN_EXE_fleetd")), policy);
     let (_trigger, shutdown) = Shutdown::channel();
     let mut remote = job(&rig, false);
@@ -829,10 +830,23 @@ async fn the_push_allows_only_https_and_names_the_allowed_hosts() -> TestResult 
     assert!(matches!(outcome, FinishOutcome::Failed { .. }));
     let push = recorded(&rig, "push")?;
     assert!(push.contains("GIT_ALLOW_PROTOCOL=https\n"), "{push}");
-    assert!(
-        push.contains("FLEETD_ASKPASS_HOSTS=origin.test,git.example\n"),
-        "{push}"
-    );
+    assert!(push.contains("FLEETD_ASKPASS_HOST=origin.test\n"), "{push}");
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_second_repo_host_never_receives_the_token_host_credential() -> TestResult {
+    let rig = rig("ok").await?;
+    commit(&rig)?;
+    let policy = RepoPolicy::new(["github.com", "gitlab.com"]);
+    let (agent, _rx) = agent_with_policy(&rig, PathBuf::from(env!("CARGO_BIN_EXE_fleetd")), policy);
+    let (_trigger, shutdown) = Shutdown::channel();
+    let mut remote = job(&rig, false);
+    "https://gitlab.com/o/x.git".clone_into(&mut remote.repo);
+    agent.finish(&remote, &rig.worktree, shutdown).await?;
+    let push = recorded(&rig, "push")?;
+    assert!(push.contains("FLEETD_ASKPASS_HOST=github.com\n"), "{push}");
+    assert!(!push.contains("gitlab.com"), "{push}");
     Ok(())
 }
 
@@ -847,6 +861,6 @@ async fn the_test_policy_adds_the_file_transport_to_the_push() -> TestResult {
         .await?;
     let push = recorded(&rig, "push")?;
     assert!(push.contains("GIT_ALLOW_PROTOCOL=file:https\n"), "{push}");
-    assert!(push.contains("FLEETD_ASKPASS_HOSTS=\n"), "{push}");
+    assert!(push.contains("FLEETD_ASKPASS_HOST=\n"), "{push}");
     Ok(())
 }
