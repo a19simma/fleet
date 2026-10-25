@@ -432,9 +432,15 @@ async fn remove_deletes_the_worktree_and_scratch_and_keeps_the_mirror() -> TestR
         let ws = workspace(&root);
         let checkout = ws.prepare("job1", &repo, "main").await?;
         std::fs::create_dir(root.join(".finish-job1"))?;
+        std::fs::create_dir_all(root.join(".agent").join("job1"))?;
+        std::fs::create_dir_all(root.join(".agent").join("job1.tmp"))?;
+        std::fs::create_dir_all(root.join(".agent").join("job1b"))?;
         ws.remove("job1", &repo).await?;
         assert!(!checkout.path.exists());
         assert!(!root.join(".finish-job1").exists());
+        assert!(!root.join(".agent").join("job1").exists());
+        assert!(!root.join(".agent").join("job1.tmp").exists());
+        assert!(root.join(".agent").join("job1b").exists());
         assert_eq!(std::fs::read_dir(root.join(".cache"))?.count(), 1);
         let mirror = std::fs::read_dir(root.join(".cache"))?
             .next()

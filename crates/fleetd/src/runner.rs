@@ -28,8 +28,14 @@
 //! dirs, so no agent-writable config is read. The push carries only `GIT_ASKPASS`, which
 //! names `fleetd askpass`, and the `GH_TOKEN` that helper prints, and `gh` only its own
 //! token. Push is limited to `https` remotes on the [`RepoPolicy`] hosts.
+//!
+//! The agent runs with `HOME` and `CLAUDE_CONFIG_DIR` in a per-job directory
+//! ([`crate::agent_config`]) and an allowlisted environment, never the operator's home. Before
+//! the fetch, [`AgentRunner::finish`] commits whatever the agent left uncommitted in the
+//! worktree, unless the staged diff holds a value the redactor knows.
 
-use std::collections::{HashMap, VecDeque};
+use std::borrow::Cow;
+use std::collections::{BTreeSet, HashMap, VecDeque};
 use std::ffi::OsString;
 use std::future::Future;
 use std::io;
@@ -48,17 +54,20 @@ use tokio::process::{Child, ChildStdout, Command};
 use tokio::time::{Instant, MissedTickBehavior, Sleep};
 use tonic::{Code, Status};
 
+use crate::agent_config::{Bundle, JOB_EMAIL, JOB_NAME, JobDir};
 use crate::askpass;
 use crate::group::GroupGuard;
 use crate::now_ms;
 use crate::poller::{RunError, Shutdown};
-use crate::proc::{CaptureError, Captured, capture};
+use crate::proc::{CAPTURE_BYTES, CaptureError, Captured, capture};
 use crate::workspace::{RepoPolicy, validate_job_id, validate_ref, validate_repo};
 
-/// Variables removed from the agent's own environment block.
+/// Variables that never reach the agent's environment block, however it is configured.
 ///
-/// The agent runs as fleetd's uid and can still read the fleetd environment through
-/// `/proc` (ADR-0024 Known limit). The push child keeps `GH_TOKEN` and `GIT_ASKPASS`.
+/// The agent environment is an allowlist, so this list is the test oracle and the check for
+/// `agent_env_passthrough`. The agent runs as fleetd's uid and can still read the fleetd
+/// environment through `/proc` (ADR-0024 Known limit). The push child keeps `GH_TOKEN` and
+/// `GIT_ASKPASS`.
 pub const STRIPPED_ENV: [&str; 9] = [
     "GH_TOKEN",
     "GITHUB_TOKEN",
@@ -70,6 +79,26 @@ pub const STRIPPED_ENV: [&str; 9] = [
     "FLEET_TOKEN",
     "FLEET_CLIENT_TOKEN",
 ];
+
+const AGENT_ENV: [&str; 12] = [
+    "PATH",
+    "LANG",
+    "TERM",
+    "CLAUDE_CODE_OAUTH_TOKEN",
+    "HTTP_PROXY",
+    "HTTPS_PROXY",
+    "NO_PROXY",
+    "http_proxy",
+    "https_proxy",
+    "no_proxy",
+    "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC",
+    "DISABLE_TELEMETRY",
+];
+const AGENT_ENV_PREFIX: &str = "LC_";
+const DENIED_TOOLS: [&str; 2] = ["Bash(git push *)", "Bash(gh *)"];
+
+/// Appended to the agent's system prompt.
+pub const AGENT_PROTOCOL: &str = "You run as an unattended fleet job. Commit finished work on the current branch with a semantic message (type(scope): subject). Never push and never run gh: the daemon publishes the branch. Add no attribution lines to commits or pull requests.";
 
 const CLEAN_ENV: [&str; 1] = ["PATH"];
 const PUSH_ENV: [&str; 2] = ["PATH", "GH_TOKEN"];
@@ -133,6 +162,34 @@ const ERR_PUSH: &str = "git push failed";
 const ERR_PR: &str = "pull request could not be opened";
 const ERR_PR_URL: &str = "pull request url was not returned";
 const ERR_FINISH_TIMEOUT: &str = "finish step timed out";
+const ERR_SECRET: &str = "uncommitted changes held a secret value";
+const MAX_DIFF_BYTES: u64 = 32 * 1024 * 1024;
+const LOG_TAIL_BYTES: usize = 512;
+const NO_CHANGES_NOTE: &str = "fleet: no_changes";
+const FALLBACK_GUARDS: [&str; 16] = [
+    "-c",
+    "core.hooksPath=/dev/null",
+    "-c",
+    "core.fsmonitor=",
+    "-c",
+    "commit.gpgsign=false",
+    "-c",
+    "core.sshCommand=",
+    "-c",
+    "credential.helper=",
+    "-c",
+    "gc.auto=0",
+    "-c",
+    "maintenance.auto=false",
+    "-c",
+    "core.pager=cat",
+];
+
+/// True when `name` may not reach the agent: a [`STRIPPED_ENV`] name or a `FLEETD_` one.
+#[must_use]
+pub fn env_forbidden(name: &str) -> bool {
+    STRIPPED_ENV.contains(&name) || name.starts_with("FLEETD_")
+}
 
 /// Sends one `ReportJob` call. The seam lets tests run without a server.
 pub trait Reporter: Send + Sync {
@@ -180,8 +237,16 @@ pub struct RunConfig {
     /// Longest wait for the terminal report. Past it the report is dropped, so a hung
     /// server cannot hold the runner after the process group is dead.
     pub terminal_report_timeout: Duration,
-    /// Environment the agent inherits, before [`STRIPPED_ENV`] is removed.
+    /// Environment the agent inherits from, filtered by the allowlist and
+    /// [`RunConfig::env_passthrough`].
     pub base_env: Vec<(OsString, OsString)>,
+    /// Extra names the agent inherits from [`RunConfig::base_env`]. A [`STRIPPED_ENV`] or
+    /// `FLEETD_` name is ignored here.
+    pub env_passthrough: Vec<String>,
+    /// Files for the per-job `home/.claude`, the embedded bundle by default.
+    pub bundle: Bundle,
+    /// Directory that holds `.agent/<job id>`, the parent of the worktree when absent.
+    pub jobs_dir: Option<PathBuf>,
 }
 
 impl RunConfig {
@@ -202,6 +267,9 @@ impl RunConfig {
             cancel_grace: DEFAULT_CANCEL_GRACE,
             terminal_report_timeout: DEFAULT_TERMINAL_REPORT_TIMEOUT,
             base_env: std::env::vars_os().collect(),
+            env_passthrough: Vec::new(),
+            bundle: Bundle::default(),
+            jobs_dir: None,
         }
     }
 }
@@ -447,8 +515,29 @@ impl<R: Reporter> AgentRunner<R> {
         stream: &mut Stream<'_, R>,
         wrap: impl FnOnce(Child) -> W + Send,
     ) -> Result<AgentOutcome, RunError> {
-        let Ok(mut child) = self.command(job, cwd).spawn() else {
-            return Ok(stream.fail(None, ERR_START).await);
+        let root = self
+            .config
+            .jobs_dir
+            .as_deref()
+            .or_else(|| cwd.parent())
+            .unwrap_or(cwd);
+        let job_dir = match JobDir::create(root, &job.job_id, &self.config.bundle) {
+            Ok(dir) => dir,
+            Err(err) => {
+                tracing::warn!(kind = ?err.kind(), "agent config dir could not be created");
+                return Ok(stream.fail(None, ERR_START).await);
+            }
+        };
+        let mut child = match self.command(job, cwd, &job_dir.home()).spawn() {
+            Ok(child) => child,
+            Err(err) => {
+                tracing::warn!(
+                    program = %self.config.claude_bin.display(),
+                    kind = ?err.kind(),
+                    "agent could not be spawned"
+                );
+                return Ok(stream.fail(None, ERR_START).await);
+            }
         };
         let mut guard = GroupGuard::new(child.id());
         let Some(stdout) = child.stdout.take() else {
@@ -537,6 +626,10 @@ impl<R: Reporter> AgentRunner<R> {
                 Ok(FinishOutcome::Cancelled)
             }
             Ok(Ok(Ok(published))) => {
+                if published.branch.is_none() {
+                    tracing::info!("job ended with no changes");
+                    stream.push(&self.redactor, NO_CHANGES_NOTE);
+                }
                 stream
                     .terminal(Terminal {
                         state: JobState::Succeeded,
@@ -552,6 +645,11 @@ impl<R: Reporter> AgentRunner<R> {
                 })
             }
             Ok(Ok(Err(failure))) => {
+                tracing::warn!(
+                    error = failure.error,
+                    stderr_tail = %self.log_tail(&failure.tail),
+                    "job publish step failed"
+                );
                 for line in failure.tail.lines() {
                     stream.push(&self.redactor, line);
                 }
@@ -587,6 +685,7 @@ impl<R: Reporter> AgentRunner<R> {
         let branch = format!("swarm/{}", job.job_id);
         let scratch = Scratch::create(cwd, &job.job_id).map_err(|()| Failure::bare(ERR_COMMITS))?;
         let dir = scratch.path();
+        self.commit_leftovers(job, cwd, dir).await?;
         if !self.ahead(job, &branch, cwd, dir).await? {
             return Ok(Published {
                 branch: None,
@@ -632,6 +731,129 @@ impl<R: Reporter> AgentRunner<R> {
             branch: Some(branch),
             pr_url: Some(pr_url),
         })
+    }
+
+    fn log_tail(&self, stderr: &str) -> String {
+        let redacted = self.redactor.redact_str(stderr);
+        let mut start = redacted.len().saturating_sub(LOG_TAIL_BYTES);
+        while !redacted.is_char_boundary(start) {
+            start += 1;
+        }
+        redacted.get(start..).unwrap_or_default().to_owned()
+    }
+
+    async fn commit_leftovers(&self, job: &Job, cwd: &Path, dir: &Path) -> Result<(), Failure> {
+        let tree = Scope::Tree(cwd);
+        let listed = self
+            .helper(
+                &self.config.git_bin,
+                dir,
+                &["config", "--list", "--name-only"],
+                tree,
+            )
+            .await
+            .map_err(|e| e.failure(ERR_COMMITS))?;
+        if !listed.success {
+            return Err(Failure::bare(ERR_COMMITS));
+        }
+        let mut guards: Vec<String> = FALLBACK_GUARDS.map(str::to_owned).to_vec();
+        for name in filter_drivers(&listed.stdout).ok_or_else(|| Failure::bare(ERR_COMMITS))? {
+            for (key, value) in [
+                ("clean", ""),
+                ("smudge", ""),
+                ("process", ""),
+                ("required", "false"),
+            ] {
+                guards.push("-c".to_owned());
+                guards.push(format!("filter.{name}.{key}={value}"));
+            }
+        }
+        let status = self
+            .guarded(
+                dir,
+                &guards,
+                tree,
+                &["status", "--porcelain"],
+                CAPTURE_BYTES,
+            )
+            .await
+            .map_err(|e| e.failure(ERR_COMMITS))?;
+        if !status.success {
+            return Err(Failure::bare(ERR_COMMITS));
+        }
+        if status.stdout.trim().is_empty() {
+            return Ok(());
+        }
+        let added = self
+            .guarded(dir, &guards, tree, &["add", "-A"], CAPTURE_BYTES)
+            .await
+            .map_err(|e| e.failure(ERR_COMMITS))?;
+        if !added.success {
+            return Err(Failure::bare(ERR_COMMITS));
+        }
+        let staged = self
+            .guarded(
+                dir,
+                &guards,
+                tree,
+                &[
+                    "diff",
+                    "--cached",
+                    "--text",
+                    "--no-ext-diff",
+                    "--no-textconv",
+                    "--no-color",
+                ],
+                MAX_DIFF_BYTES,
+            )
+            .await
+            .map_err(|e| e.failure(ERR_COMMITS))?;
+        if !staged.success || staged.truncated {
+            return Err(Failure::bare(ERR_COMMITS));
+        }
+        if matches!(self.redactor.redact_str(&staged.stdout), Cow::Owned(_)) {
+            return Err(Failure::bare(ERR_SECRET));
+        }
+        if staged.stdout.is_empty() {
+            return Ok(());
+        }
+        let message = format!("chore: uncommitted job changes (fleet job {})", job.job_id);
+        let committed = self
+            .guarded(
+                dir,
+                &guards,
+                tree,
+                &[
+                    "commit",
+                    "--quiet",
+                    "--no-verify",
+                    "--no-gpg-sign",
+                    "-m",
+                    &message,
+                ],
+                CAPTURE_BYTES,
+            )
+            .await
+            .map_err(|e| e.failure(ERR_COMMITS))?;
+        if committed.success {
+            Ok(())
+        } else {
+            Err(Failure::bare(ERR_COMMITS))
+        }
+    }
+
+    async fn guarded(
+        &self,
+        dir: &Path,
+        guards: &[String],
+        tree: Scope<'_>,
+        rest: &[&str],
+        limit: u64,
+    ) -> Result<Captured, CaptureError> {
+        let mut args: Vec<&str> = guards.iter().map(String::as_str).collect();
+        args.extend_from_slice(rest);
+        self.helper_limited(&self.config.git_bin, dir, &args, tree, limit)
+            .await
     }
 
     async fn ahead(
@@ -751,7 +973,19 @@ impl<R: Reporter> AgentRunner<R> {
         bin: &Path,
         dir: &Path,
         args: &[&str],
-        scope: Scope,
+        scope: Scope<'_>,
+    ) -> Result<Captured, CaptureError> {
+        self.helper_limited(bin, dir, args, scope, CAPTURE_BYTES)
+            .await
+    }
+
+    async fn helper_limited(
+        &self,
+        bin: &Path,
+        dir: &Path,
+        args: &[&str],
+        scope: Scope<'_>,
+        limit: u64,
     ) -> Result<Captured, CaptureError> {
         let home = dir.join(HOME_DIR);
         let mut command = Command::new(bin);
@@ -770,7 +1004,7 @@ impl<R: Reporter> AgentRunner<R> {
             .env("GIT_TERMINAL_PROMPT", "0")
             .env("GH_PROMPT_DISABLED", "1");
         let allowed: &[&str] = match scope {
-            Scope::Clean => &CLEAN_ENV,
+            Scope::Clean | Scope::Tree(_) => &CLEAN_ENV,
             Scope::Push => &PUSH_ENV,
             Scope::Gh => &GH_ENV,
         };
@@ -783,7 +1017,7 @@ impl<R: Reporter> AgentRunner<R> {
                 .map(|(name, value)| (name, value)),
         );
         match scope {
-            Scope::Clean => command.env("GIT_ALLOW_PROTOCOL", "file"),
+            Scope::Clean | Scope::Tree(_) => command.env("GIT_ALLOW_PROTOCOL", "file"),
             Scope::Push => command
                 .env("GIT_ALLOW_PROTOCOL", self.config.repo_policy.protocols())
                 .envs(askpass::env(&self.config.askpass_bin))
@@ -799,7 +1033,16 @@ impl<R: Reporter> AgentRunner<R> {
                 .env("GH_PAGER", "cat")
                 .env("PAGER", "cat"),
         };
-        capture(command, self.config.finish_timeout).await
+        if let Scope::Tree(work) = scope {
+            command
+                .current_dir(work)
+                .env_remove("GIT_DIR")
+                .env("GIT_AUTHOR_NAME", JOB_NAME)
+                .env("GIT_AUTHOR_EMAIL", JOB_EMAIL)
+                .env("GIT_COMMITTER_NAME", JOB_NAME)
+                .env("GIT_COMMITTER_EMAIL", JOB_EMAIL);
+        }
+        capture(command, self.config.finish_timeout, limit).await
     }
 
     async fn drive<W: ChildWait>(
@@ -854,7 +1097,22 @@ impl<R: Reporter> AgentRunner<R> {
         Ok(status)
     }
 
-    fn command(&self, job: &Job, cwd: &Path) -> Command {
+    fn agent_env_kept(&self, name: &OsString) -> bool {
+        let Some(name) = name.to_str() else {
+            return false;
+        };
+        !env_forbidden(name)
+            && (AGENT_ENV.contains(&name)
+                || name.starts_with(AGENT_ENV_PREFIX)
+                || self
+                    .config
+                    .env_passthrough
+                    .iter()
+                    .any(|extra| extra == name))
+    }
+
+    fn command(&self, job: &Job, cwd: &Path, home: &Path) -> Command {
+        let claude = home.join(".claude");
         let mut command = Command::new(&self.config.claude_bin);
         command
             .args([
@@ -863,6 +1121,10 @@ impl<R: Reporter> AgentRunner<R> {
                 "--output-format",
                 "stream-json",
                 "--verbose",
+                "--setting-sources",
+                "user",
+                "--append-system-prompt",
+                AGENT_PROTOCOL,
             ])
             .current_dir(cwd)
             .env_clear()
@@ -870,11 +1132,24 @@ impl<R: Reporter> AgentRunner<R> {
                 self.config
                     .base_env
                     .iter()
-                    .filter(|(name, _)| !STRIPPED_ENV.iter().any(|bad| name == bad))
+                    .filter(|(name, _)| self.agent_env_kept(name))
                     .map(|(name, value)| (name, value)),
             )
             .env("FLEET_JOB_ID", &job.job_id)
             .env("SWARM_BOX", "1")
+            .env("HOME", home)
+            .env("CLAUDE_CONFIG_DIR", &claude)
+            .env("XDG_CONFIG_HOME", home.join(".config"))
+            .env("XDG_CACHE_HOME", home.join(".cache"))
+            .env("XDG_STATE_HOME", home.join(".local").join("state"))
+            .env("XDG_DATA_HOME", home.join(".local").join("share"))
+            .env("DISABLE_AUTOUPDATER", "1")
+            .env("GIT_CONFIG_GLOBAL", home.join(".gitconfig"))
+            .env("GIT_TERMINAL_PROMPT", "0")
+            .env("GIT_AUTHOR_NAME", JOB_NAME)
+            .env("GIT_AUTHOR_EMAIL", JOB_EMAIL)
+            .env("GIT_COMMITTER_NAME", JOB_NAME)
+            .env("GIT_COMMITTER_EMAIL", JOB_EMAIL)
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::null())
@@ -882,7 +1157,10 @@ impl<R: Reporter> AgentRunner<R> {
             .kill_on_drop(true);
         if self.config.disposable {
             command.arg("--dangerously-skip-permissions");
+        } else {
+            command.args(["--permission-mode", "dontAsk"]);
         }
+        command.arg("--disallowedTools").args(DENIED_TOOLS);
         command
     }
 }
@@ -1252,10 +1530,11 @@ struct Published {
 }
 
 #[derive(Clone, Copy)]
-enum Scope {
+enum Scope<'a> {
     Clean,
     Push,
     Gh,
+    Tree(&'a Path),
 }
 
 trait IntoFailure {
@@ -1322,6 +1601,23 @@ impl Failure {
             tail: stderr[start..].to_owned(),
         }
     }
+}
+
+fn filter_drivers(listing: &str) -> Option<BTreeSet<String>> {
+    let mut names = BTreeSet::new();
+    for line in listing.lines() {
+        let Some(rest) = line.strip_prefix("filter.") else {
+            continue;
+        };
+        let Some((name, _)) = rest.rsplit_once('.') else {
+            continue;
+        };
+        if name.contains('=') {
+            return None;
+        }
+        names.insert(name.to_owned());
+    }
+    Some(names)
 }
 
 fn pr_url(stdout: &str) -> Option<String> {

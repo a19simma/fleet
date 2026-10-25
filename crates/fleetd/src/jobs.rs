@@ -12,6 +12,7 @@ use fleet_proto::v1::Job;
 use tonic::transport::Channel;
 
 use crate::Error;
+use crate::agent_config::Bundle;
 use crate::config::Config;
 use crate::poller::{
     GrpcReporter, JobRunner, PollRandom, Poller, RunError, SERVER_URL_ENV, Shutdown, TOKEN_ENV,
@@ -142,6 +143,15 @@ pub(crate) fn build(
     let reporter = GrpcReporter::new(channel.clone(), &token)?;
     let mut run = RunConfig::new(&config.claude_bin, config.disposable);
     run.gh_bin.clone_from(&config.gh_bin);
+    run.jobs_dir = Some(config.jobs_dir.clone());
+    run.env_passthrough
+        .clone_from(&config.agent_env_passthrough);
+    if let Some(dir) = &config.agent_config_dir {
+        run.bundle = Bundle::from_dir(dir).map_err(|err| Error::InvalidValue {
+            name: "agent_config_dir",
+            value: err.to_string(),
+        })?;
+    }
     let workspace = job_workspace(config, &mut run, env).with_redactor(redactor.clone());
     let runner = DaemonRunner::new(workspace, AgentRunner::new(run, reporter, redactor));
     Poller::with_channel(

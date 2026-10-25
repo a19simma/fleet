@@ -13,17 +13,24 @@ use std::time::Duration;
 use fleet_core::Redactor;
 use fleet_proto::MAX_CHUNKS_PER_REPORT;
 use fleet_proto::v1::{Job, JobState, ReportJobReply, ReportJobRequest, TranscriptChunk};
+use fleetd::agent_config::{Bundle, JOB_EMAIL, JOB_NAME};
 use fleetd::poller::{RunError, Shutdown};
-use fleetd::runner::{AgentOutcome, AgentRunner, ChildWait, Interrupt, Reporter, RunConfig};
+use fleetd::runner::{
+    AGENT_PROTOCOL, AgentOutcome, AgentRunner, ChildWait, Interrupt, Reporter, RunConfig,
+    STRIPPED_ENV,
+};
 use tempfile::TempDir;
 use tokio::sync::{mpsc, oneshot};
 use tonic::Status;
 
 #[path = "common/bounded.rs"]
 mod common;
+#[path = "common/logs.rs"]
+mod logs;
 #[path = "common/reader.rs"]
 mod reader;
 
+use logs::capture_logs;
 use reader::{Reader, hold_reader};
 
 const SECRET_NAMES: [&str; 9] = [
@@ -52,6 +59,7 @@ stream)
   exit 0 ;;
 exit3) echo out; exit 3 ;;
 env) env; exit 0 ;;
+dir) printf 'dir=%s\n' "$HOME"; cat "$HOME/.claude/CLAUDE.md" "$HOME/.claude/settings.json" "$HOME/.gitconfig"; ls -d "$XDG_CONFIG_HOME" "$XDG_CACHE_HOME" "$XDG_STATE_HOME" "$XDG_DATA_HOME"; exit "${path:-0}" ;;
 args) printf 'arg=%s\n' "$@"; exit 0 ;;
 quiet) read x < "$path"; exit 0 ;;
 hold) sleep 300 > "$path" & wait ;;
@@ -139,11 +147,32 @@ fn script() -> &'static Path {
     path
 }
 
+fn jobs_dir() -> PathBuf {
+    static ROOT: OnceLock<TempDir> = OnceLock::new();
+    static NEXT: AtomicUsize = AtomicUsize::new(0);
+    let root = ROOT.get_or_init(|| TempDir::new().unwrap_or_else(|_| std::process::abort()));
+    root.path()
+        .join(NEXT.fetch_add(1, Ordering::SeqCst).to_string())
+}
+
 fn base_env() -> Vec<(OsString, OsString)> {
     let mut env = vec![
         ("GH_TOKEN".into(), "not-a-real-gh-value".into()),
         ("FLEET_TOKEN".into(), "not-a-real-fleet-value".into()),
         ("KEPT_VALUE".into(), "kept".into()),
+        ("HOME".into(), "/real/operator/home".into()),
+        ("XDG_RUNTIME_DIR".into(), "/run/user/1000".into()),
+        ("XDG_CONFIG_HOME".into(), "/real/operator/config".into()),
+        ("LANG".into(), "C.UTF-8".into()),
+        ("LC_ALL".into(), "C.UTF-8".into()),
+        ("TERM".into(), "dumb".into()),
+        ("CLAUDE_CODE_OAUTH_TOKEN".into(), "oauth-pass".into()),
+        ("HTTPS_PROXY".into(), "http://proxy.invalid:3128".into()),
+        ("NO_PROXY".into(), "localhost".into()),
+        ("DISABLE_TELEMETRY".into(), "1".into()),
+        ("EXTRA_PASS".into(), "extra".into()),
+        ("FLEETD_ASKPASS".into(), "1".into()),
+        ("FLEETD_ASKPASS_HOST".into(), "github.com".into()),
     ];
     env.extend(
         SECRET_NAMES
@@ -157,6 +186,7 @@ fn base_env() -> Vec<(OsString, OsString)> {
 fn config(disposable: bool) -> RunConfig {
     let mut config = RunConfig::new(script(), disposable);
     config.base_env = base_env();
+    config.jobs_dir = Some(jobs_dir());
     config.flush_interval = Duration::from_millis(20);
     config
 }
@@ -292,21 +322,70 @@ async fn runner_streams_and_maps_exit() -> TestResult {
     .await
 }
 
+fn env_map(all: &str) -> std::collections::BTreeMap<&str, &str> {
+    all.lines()
+        .filter_map(|line| line.split_once('='))
+        .collect()
+}
+
 #[tokio::test]
-async fn runner_env_has_no_gh_token() -> TestResult {
+async fn runner_env_is_an_allowlist_with_a_home_under_the_job_dir() -> TestResult {
     common::bounded(Box::pin(async {
         let dir = TempDir::new()?;
         let (_trigger, shutdown) = Shutdown::channel();
-        let (agent, mut rx) = runner(config(false), 0);
+        let mut cfg = config(false);
+        cfg.env_passthrough = vec![
+            "EXTRA_PASS".into(),
+            "GH_TOKEN".into(),
+            "FLEETD_ASKPASS".into(),
+        ];
+        let jobs = cfg.jobs_dir.clone().ok_or("jobs dir")?;
+        let (agent, mut rx) = runner(cfg, 0);
         agent.run(&job("env:"), dir.path(), shutdown).await?;
         let all = text(&drain(&mut rx));
-        for name in SECRET_NAMES {
-            assert!(!all.contains(&format!("{name}=")), "{name} leaked");
-        }
+        let env = env_map(&all);
+        let home = jobs.join(".agent").join("job1").join("home");
+        let home = home.to_string_lossy();
+        assert_eq!(env.get("HOME"), Some(&&*home));
+        assert!(!all.contains("/real/operator"));
+        assert!(!env.contains_key("XDG_RUNTIME_DIR"));
         assert!(!all.contains("not-a-real"));
-        assert!(all.contains("KEPT_VALUE=kept"));
-        assert!(all.contains("FLEET_JOB_ID=job1"));
-        assert!(all.contains("SWARM_BOX=1"));
+        for name in STRIPPED_ENV {
+            assert!(!env.contains_key(name), "{name} leaked");
+        }
+        assert!(env.keys().all(|name| !name.starts_with("FLEETD_ASKPASS")));
+        assert!(!env.contains_key("KEPT_VALUE"));
+        for (name, value) in [
+            ("LANG", "C.UTF-8"),
+            ("LC_ALL", "C.UTF-8"),
+            ("TERM", "dumb"),
+            ("CLAUDE_CODE_OAUTH_TOKEN", "oauth-pass"),
+            ("HTTPS_PROXY", "http://proxy.invalid:3128"),
+            ("NO_PROXY", "localhost"),
+            ("DISABLE_TELEMETRY", "1"),
+            ("EXTRA_PASS", "extra"),
+            ("FLEET_JOB_ID", "job1"),
+            ("SWARM_BOX", "1"),
+            ("DISABLE_AUTOUPDATER", "1"),
+            ("GIT_TERMINAL_PROMPT", "0"),
+            ("GIT_AUTHOR_NAME", JOB_NAME),
+            ("GIT_AUTHOR_EMAIL", JOB_EMAIL),
+            ("GIT_COMMITTER_NAME", JOB_NAME),
+            ("GIT_COMMITTER_EMAIL", JOB_EMAIL),
+        ] {
+            assert_eq!(env.get(name), Some(&value), "{name}");
+        }
+        for (name, tail) in [
+            ("CLAUDE_CONFIG_DIR", "home/.claude"),
+            ("XDG_CONFIG_HOME", "home/.config"),
+            ("XDG_CACHE_HOME", "home/.cache"),
+            ("XDG_STATE_HOME", "home/.local/state"),
+            ("XDG_DATA_HOME", "home/.local/share"),
+            ("GIT_CONFIG_GLOBAL", "home/.gitconfig"),
+        ] {
+            let want = jobs.join(".agent").join("job1").join(tail);
+            assert_eq!(env.get(name), Some(&&*want.to_string_lossy()), "{name}");
+        }
         Ok(())
     }))
     .await
@@ -325,7 +404,18 @@ async fn runner_skips_permissions_only_on_a_disposable_box() -> TestResult {
             let all = text(&drain(&mut rx));
             assert!(all.contains("arg=-p\narg=args:\n"));
             assert!(all.contains("arg=--output-format\narg=stream-json\narg=--verbose\n"));
+            assert!(all.contains("arg=--setting-sources\narg=user\n"));
+            assert!(all.contains(&format!(
+                "arg=--append-system-prompt\narg={AGENT_PROTOCOL}\n"
+            )));
+            assert!(all.contains("arg=--disallowedTools\narg=Bash(git push *)\narg=Bash(gh *)\n"));
+            assert!(!all.contains("--bare"));
+            assert!(!all.contains("disableBypassPermissionsMode"));
             assert_eq!(all.contains("--dangerously-skip-permissions"), expected);
+            assert_eq!(
+                all.contains("arg=--permission-mode\narg=dontAsk\n"),
+                !expected
+            );
         }
         Ok(())
     }))
@@ -1048,6 +1138,105 @@ async fn a_report_in_flight_does_not_stop_stdout_reads_or_delay_a_cancel() -> Te
         );
         driven?;
         assert_eq!(outcome??, AgentOutcome::Cancelled);
+        Ok(())
+    }))
+    .await
+}
+
+#[tokio::test]
+async fn the_job_dir_holds_the_bundle_during_the_run_and_is_gone_after() -> TestResult {
+    common::bounded(Box::pin(async {
+        let dir = TempDir::new()?;
+        let (_trigger, shutdown) = Shutdown::channel();
+        let cfg = config(false);
+        let jobs = cfg.jobs_dir.clone().ok_or("jobs dir")?;
+        let (agent, mut rx) = runner(cfg, 0);
+        let outcome = agent.run(&job("dir:"), dir.path(), shutdown).await?;
+        assert_eq!(outcome, AgentOutcome::Succeeded);
+        let all = text(&drain(&mut rx));
+        assert!(all.contains("Commit finished work"));
+        assert!(all.contains("\"Bash(git commit *)\""));
+        assert!(all.contains("\"Bash(git push *)\""));
+        assert!(all.contains("\"Bash(gh *)\""));
+        assert!(all.contains("\"attribution\""));
+        assert!(all.contains(&format!("name = {JOB_NAME}")));
+        assert!(all.contains(&format!("email = {JOB_EMAIL}")));
+        assert!(all.contains("gpgsign = false"));
+        assert!(all.contains("/home/.config"));
+        assert!(all.contains("/home/.local/share"));
+        assert!(!jobs.join(".agent").join("job1").exists());
+        assert!(!jobs.join(".agent").join("job1.tmp").exists());
+        Ok(())
+    }))
+    .await
+}
+
+#[tokio::test]
+async fn the_job_dir_is_gone_after_a_failed_run_and_a_failed_start() -> TestResult {
+    common::bounded(Box::pin(async {
+        let dir = TempDir::new()?;
+        let (_trigger, shutdown) = Shutdown::channel();
+        let cfg = config(false);
+        let jobs = cfg.jobs_dir.clone().ok_or("jobs dir")?;
+        let (agent, _rx) = runner(cfg, 0);
+        let outcome = agent
+            .run(&job("dir:3"), dir.path(), shutdown.clone())
+            .await?;
+        assert!(matches!(
+            outcome,
+            AgentOutcome::Failed {
+                exit_code: Some(3),
+                ..
+            }
+        ));
+        assert!(!jobs.join(".agent").join("job1").exists());
+        let mut missing = config(false);
+        missing.claude_bin = dir.path().join("absent");
+        let jobs = missing.jobs_dir.clone().ok_or("jobs dir")?;
+        let (agent, _rx) = runner(missing, 0);
+        agent.run(&job("dir:"), dir.path(), shutdown).await?;
+        assert!(!jobs.join(".agent").join("job1").exists());
+        Ok(())
+    }))
+    .await
+}
+
+#[tokio::test]
+async fn a_bundle_override_reaches_the_job_home() -> TestResult {
+    common::bounded(Box::pin(async {
+        let dir = TempDir::new()?;
+        let bundle = TempDir::new()?;
+        std::fs::write(bundle.path().join("CLAUDE.md"), "operator persona")?;
+        let (_trigger, shutdown) = Shutdown::channel();
+        let mut cfg = config(false);
+        cfg.bundle = Bundle::from_dir(bundle.path())?;
+        let (agent, mut rx) = runner(cfg, 0);
+        agent.run(&job("dir:"), dir.path(), shutdown).await?;
+        let all = text(&drain(&mut rx));
+        assert!(all.contains("operator persona"));
+        assert!(all.contains("\"Bash(git commit *)\""));
+        Ok(())
+    }))
+    .await
+}
+
+#[tokio::test]
+async fn a_spawn_failure_logs_the_program_and_error_kind_but_not_the_prompt() -> TestResult {
+    common::bounded(Box::pin(async {
+        let dir = TempDir::new()?;
+        let (logs, _guard) = capture_logs();
+        let mut cfg = config(false);
+        cfg.claude_bin = dir.path().join("absent-claude");
+        let (agent, _rx) = runner(cfg, 0);
+        let (_trigger, shutdown) = Shutdown::channel();
+        agent
+            .run(&job("prompt-with-private-words"), dir.path(), shutdown)
+            .await?;
+        let out = logs.text();
+        assert!(out.contains("agent could not be spawned"), "{out}");
+        assert!(out.contains("absent-claude"), "{out}");
+        assert!(out.contains("NotFound"), "{out}");
+        assert!(!out.contains("prompt-with-private-words"), "{out}");
         Ok(())
     }))
     .await

@@ -13,14 +13,15 @@ use tokio::process::Command;
 
 use crate::group::GroupGuard;
 
-const CAPTURE_BYTES: u64 = 64 * 1024;
+pub(crate) const CAPTURE_BYTES: u64 = 64 * 1024;
 
-/// What a finished command left behind. Output is cut at 64 KiB.
+/// What a finished command left behind. Output is cut at the capture limit.
 #[derive(Debug)]
 pub(crate) struct Captured {
     pub(crate) success: bool,
     pub(crate) stdout: String,
     pub(crate) stderr: String,
+    pub(crate) truncated: bool,
 }
 
 /// Why a command produced no result.
@@ -30,10 +31,12 @@ pub(crate) enum CaptureError {
     Timeout,
 }
 
-/// Runs `command` in its own process group with no stdin, then kills the group.
+/// Runs `command` in its own process group with no stdin, then kills the group. Each stream
+/// is cut at `limit` bytes, and `truncated` is set when either held more.
 pub(crate) async fn capture(
     mut command: Command,
     timeout: Duration,
+    limit: u64,
 ) -> Result<Captured, CaptureError> {
     command
         .stdin(Stdio::null())
@@ -45,14 +48,15 @@ pub(crate) async fn capture(
     let mut guard = GroupGuard::new(child.id());
     let stdout = child.stdout.take();
     let stderr = child.stderr.take();
-    let work = async { tokio::join!(read(stdout), read(stderr), child.wait()) };
+    let work = async { tokio::join!(read(stdout, limit), read(stderr, limit), child.wait()) };
     let result = tokio::time::timeout(timeout, work).await;
     guard.kill();
     match result {
-        Ok((stdout, stderr, Ok(status))) => Ok(Captured {
+        Ok(((stdout, cut_out), (stderr, cut_err), Ok(status))) => Ok(Captured {
             success: status.success(),
             stdout,
             stderr,
+            truncated: cut_out || cut_err,
         }),
         Ok(_) => Err(CaptureError::Start),
         Err(_) => {
@@ -62,12 +66,14 @@ pub(crate) async fn capture(
     }
 }
 
-async fn read(pipe: Option<impl AsyncRead + Unpin>) -> String {
+async fn read(pipe: Option<impl AsyncRead + Unpin>, limit: u64) -> (String, bool) {
     let Some(mut pipe) = pipe else {
-        return String::new();
+        return (String::new(), false);
     };
     let mut buf = Vec::new();
-    let _ = (&mut pipe).take(CAPTURE_BYTES).read_to_end(&mut buf).await;
-    let _ = tokio::io::copy(&mut pipe, &mut tokio::io::sink()).await;
-    String::from_utf8_lossy(&buf).into_owned()
+    let _ = (&mut pipe).take(limit).read_to_end(&mut buf).await;
+    let dropped = tokio::io::copy(&mut pipe, &mut tokio::io::sink())
+        .await
+        .unwrap_or(0);
+    (String::from_utf8_lossy(&buf).into_owned(), dropped > 0)
 }

@@ -1,0 +1,14 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(git add *)",
+      "Bash(git commit *)",
+      "Bash(git status *)",
+      "Bash(git diff *)",
+      "Bash(git log *)",
+      "Bash(git checkout -b *)"
+    ],
+    "deny": ["Bash(git push *)", "Bash(gh *)"]
+  },
+  "attribution": { "commit": "", "pr": "" }
+}

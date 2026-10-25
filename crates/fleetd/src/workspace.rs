@@ -17,6 +17,7 @@ use sha2::{Digest, Sha256};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::process::Command;
 
+use crate::agent_config::AGENT_DIR;
 use crate::askpass;
 use crate::group::GroupGuard;
 
@@ -359,7 +360,8 @@ impl Workspace {
 }
 
 impl Workspace {
-    /// Removes the job's worktree and its `.finish-<job_id>` scratch dir, then prunes the
+    /// Removes the job's worktree, its `.finish-<job_id>` scratch dir and its `.agent/<job_id>`
+    /// agent config dir with the staging dir, then prunes the
     /// mirror's worktree records and deletes the job's branch. The bare mirror stays. Every
     /// step runs even when an earlier one fails.
     ///
@@ -373,6 +375,8 @@ impl Workspace {
         for path in [
             self.root.join(job_id),
             self.root.join(format!(".finish-{job_id}")),
+            self.root.join(AGENT_DIR).join(job_id),
+            self.root.join(AGENT_DIR).join(format!("{job_id}.tmp")),
         ] {
             match tokio::fs::remove_dir_all(&path).await {
                 Ok(()) => {}

@@ -43,6 +43,8 @@ struct FileConfig {
     jobs_dir: Option<PathBuf>,
     repo_hosts: Option<Vec<String>>,
     token_host: Option<String>,
+    agent_config_dir: Option<PathBuf>,
+    agent_env_passthrough: Option<Vec<String>>,
 }
 
 /// Where redaction secrets are read from.
@@ -91,6 +93,12 @@ pub struct Config {
     /// `github.com` when `repo_hosts` lists it, else none. An explicit value must be in
     /// `repo_hosts`. A host in `repo_hosts` other than this one never gets the token.
     pub token_host: Option<String>,
+    /// Directory copied over the embedded agent config bundle, config file only. Unset uses
+    /// the embedded bundle alone. See [`crate::agent_config`] for what it may hold.
+    pub agent_config_dir: Option<PathBuf>,
+    /// Extra environment variable names the agent inherits from fleetd, config file only.
+    /// Names that hold fleetd credentials or start with `FLEETD_` are rejected.
+    pub agent_env_passthrough: Vec<String>,
     /// Admits `file://` and absolute-path repos. Always false from [`Config::resolve`],
     /// which has no file key or environment variable for it. Only code that builds a
     /// `Config` for a test sets it.
@@ -186,6 +194,7 @@ impl Config {
         }
         let repo_hosts = resolve_repo_hosts(file.repo_hosts)?;
         let token_host = resolve_token_host(file.token_host, &repo_hosts)?;
+        let agent_env_passthrough = resolve_passthrough(file.agent_env_passthrough)?;
         Ok(Self {
             http_port,
             socket_path,
@@ -221,6 +230,8 @@ impl Config {
                 }),
             repo_hosts,
             token_host,
+            agent_config_dir: file.agent_config_dir,
+            agent_env_passthrough,
             allow_file_repos: false,
         })
     }
@@ -243,6 +254,26 @@ fn resolve_repo_hosts(raw: Option<Vec<String>>) -> Result<Vec<String>, Error> {
     } else {
         Err(Error::InvalidValue {
             name: "repo_hosts",
+            value: "<redacted>".to_owned(),
+        })
+    }
+}
+
+fn resolve_passthrough(raw: Option<Vec<String>>) -> Result<Vec<String>, Error> {
+    let names = raw.unwrap_or_default();
+    let valid = |name: &String| {
+        let mut bytes = name.bytes();
+        bytes
+            .next()
+            .is_some_and(|b| b.is_ascii_alphabetic() || b == b'_')
+            && bytes.all(|b| b.is_ascii_alphanumeric() || b == b'_')
+            && !crate::runner::env_forbidden(name)
+    };
+    if names.iter().all(valid) {
+        Ok(names)
+    } else {
+        Err(Error::InvalidValue {
+            name: "agent_env_passthrough",
             value: "<redacted>".to_owned(),
         })
     }
@@ -311,12 +342,32 @@ mod tests {
         assert_eq!(cfg.claude_bin, PathBuf::from("/opt/claude"));
         assert_eq!(cfg.gh_bin, PathBuf::from("/opt/gh"));
         assert!(cfg.disposable);
+        assert_eq!(cfg.agent_config_dir, None);
+        assert_eq!(cfg.agent_env_passthrough, Vec::<String>::new());
         assert_eq!(cfg.jobs_dir, PathBuf::from("jobs"));
         let state = |name: &str| (name == "STATE_DIRECTORY").then(|| "/var/lib/fleetd".to_owned());
         let cfg = Config::resolve(None, &state).unwrap();
         assert_eq!(cfg.jobs_dir, PathBuf::from("/var/lib/fleetd/jobs"));
         let cfg = Config::resolve(Some("jobs_dir = \"/srv/j\"\n"), &state).unwrap();
         assert_eq!(cfg.jobs_dir, PathBuf::from("/srv/j"));
+    }
+
+    #[test]
+    fn agent_keys_resolve_and_a_credential_name_is_rejected() {
+        let file = "agent_config_dir = \"/etc/fleetd/agent\"\nagent_env_passthrough = [\"ANTHROPIC_BASE_URL\", \"CLAUDE_CODE_USE_BEDROCK\"]\n";
+        let cfg = Config::resolve(Some(file), &env_of(&[])).unwrap();
+        assert_eq!(
+            cfg.agent_config_dir,
+            Some(PathBuf::from("/etc/fleetd/agent"))
+        );
+        assert_eq!(
+            cfg.agent_env_passthrough,
+            ["ANTHROPIC_BASE_URL", "CLAUDE_CODE_USE_BEDROCK"]
+        );
+        for bad in ["GH_TOKEN", "FLEETD_ASKPASS", "FLEET_TOKEN", "A=B", "", "1X"] {
+            let file = format!("agent_env_passthrough = [\"{bad}\"]\n");
+            assert!(Config::resolve(Some(&file), &env_of(&[])).is_err(), "{bad}");
+        }
     }
 
     #[test]

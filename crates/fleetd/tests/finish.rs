@@ -20,6 +20,8 @@ use tonic::Status;
 
 #[path = "common/bounded.rs"]
 mod common;
+#[path = "common/logs.rs"]
+mod logs;
 
 type TestResult = Result<(), Box<dyn std::error::Error>>;
 
@@ -31,6 +33,7 @@ if [ -f "$HOME/.config/gh/config.yml" ] || [ -f "$GH_CONFIG_DIR/config.yml" ]; t
 case "$(cat "$root/mode")" in
 ok) echo "created"; echo "https://example.invalid/pr/7"; exit 0 ;;
 fail) echo "boom hunter2-hunter2 detail" >&2; exit 1 ;;
+long) head -c 2000 /dev/zero | tr '\0' x >&2; echo " END hunter2-hunter2" >&2; exit 1 ;;
 esac
 "#;
 
@@ -38,11 +41,11 @@ const GIT: &str = r#"#!/bin/sh
 sub=
 for a in "$@"; do
   case "$a" in
-  -c | core.* | credential.* | http.*) ;;
+  -c | core.* | credential.* | http.* | commit.* | gc.* | maintenance.* | filter.*) ;;
   *) sub=$a; break ;;
   esac
 done
-root="$GIT_DIR/.."
+root="${GIT_DIR:-$PWD}/.."
 env > "$root/git-$sub.env"
 printf '%s\n' "$@" > "$root/git-$sub.args"
 if [ "$sub" = rev-list ] && [ -e "$root/emptycount" ]; then exit 0; fi
@@ -86,6 +89,39 @@ fn gh() -> &'static Path {
         let dir = TempDir::new().unwrap_or_else(|_| std::process::abort());
         let path = dir.path().join("gh");
         std::fs::write(&path, GH).unwrap_or_else(|_| std::process::abort());
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755))
+            .unwrap_or_else(|_| std::process::abort());
+        (dir, path)
+    });
+    path
+}
+
+const CLAUDE: &str = r#"#!/bin/sh
+case "${2#*:}" in
+write) echo agent > new.txt ;;
+commit) echo agent > new.txt; git add -A; git commit -q -m "feat: by the agent" ;;
+secret) echo "key hunter2-hunter2" > leak.txt ;;
+trap)
+  echo agent > new.txt
+  printf '* filter=evil\n' > .gitattributes
+  git config filter.evil.clean "touch '$FLEET_TEST_MARKS/filter'; cat"
+  git config core.fsmonitor "touch '$FLEET_TEST_MARKS/fsmonitor'"
+  hooks=$(git rev-parse --git-path hooks)
+  mkdir -p "$hooks"
+  printf '#!/bin/sh\ntouch "%s/hook"\n' "$FLEET_TEST_MARKS" > "$hooks/pre-commit"
+  printf '#!/bin/sh\ntouch "%s/hook"\n' "$FLEET_TEST_MARKS" > "$hooks/commit-msg"
+  chmod +x "$hooks/pre-commit" "$hooks/commit-msg"
+  ;;
+esac
+exit 0
+"#;
+
+fn claude() -> &'static Path {
+    static DIR: OnceLock<(TempDir, PathBuf)> = OnceLock::new();
+    let (_, path) = DIR.get_or_init(|| {
+        let dir = TempDir::new().unwrap_or_else(|_| std::process::abort());
+        let path = dir.path().join("claude");
+        std::fs::write(&path, CLAUDE).unwrap_or_else(|_| std::process::abort());
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755))
             .unwrap_or_else(|_| std::process::abort());
         (dir, path)
@@ -935,6 +971,243 @@ async fn the_test_policy_adds_the_file_transport_to_the_push() -> TestResult {
         let push = recorded(&rig, "push")?;
         assert!(push.contains("GIT_ALLOW_PROTOCOL=file:https\n"), "{push}");
         assert!(push.contains("FLEETD_ASKPASS_HOST=\n"), "{push}");
+        Ok(())
+    }))
+    .await
+}
+
+fn claude_agent(
+    rig: &Rig,
+) -> Result<
+    (AgentRunner<Fake>, mpsc::UnboundedReceiver<ReportJobRequest>),
+    Box<dyn std::error::Error>,
+> {
+    let marks = rig.dir.path().join("marks");
+    std::fs::create_dir_all(&marks)?;
+    let (tx, rx) = mpsc::unbounded_channel();
+    let mut config = RunConfig::new(claude(), false);
+    config.repo_policy = test_policy();
+    gh().clone_into(&mut config.gh_bin);
+    git_wrapper().clone_into(&mut config.git_bin);
+    config.askpass_bin = PathBuf::from(env!("CARGO_BIN_EXE_fleetd"));
+    config.jobs_dir = Some(rig.dir.path().join("work"));
+    config.env_passthrough = vec!["FLEET_TEST_MARKS".into()];
+    let mut env: Vec<(OsString, OsString)> = vec![
+        ("HOME".into(), rig.dir.path().into()),
+        ("FLEET_TEST_MARKS".into(), marks.into()),
+    ];
+    env.extend(std::env::var_os("PATH").map(|path| ("PATH".into(), path)));
+    config.base_env = env;
+    Ok((
+        AgentRunner::new(
+            config,
+            Fake(tx, Reply::Ok),
+            Redactor::new(["hunter2-hunter2"]),
+        ),
+        rx,
+    ))
+}
+
+async fn run_then_finish(
+    rig: &Rig,
+    agent: &AgentRunner<Fake>,
+    prompt: &str,
+) -> Result<FinishOutcome, Box<dyn std::error::Error>> {
+    let (_trigger, shutdown) = Shutdown::channel();
+    let mut job = job(rig, true);
+    job.prompt = prompt.to_owned();
+    let ran = agent.run(&job, &rig.worktree, shutdown.clone()).await?;
+    assert_eq!(ran, AgentOutcome::Succeeded);
+    Ok(agent.finish(&job, &rig.worktree, shutdown).await?)
+}
+
+fn ahead(rig: &Rig) -> Result<String, Box<dyn std::error::Error>> {
+    Ok(
+        git(&rig.origin, &["rev-list", "--count", "main..swarm/job1"])?
+            .trim()
+            .to_owned(),
+    )
+}
+
+#[tokio::test]
+async fn uncommitted_agent_work_is_committed_once_and_published() -> TestResult {
+    common::bounded(Box::pin(async {
+        let rig = rig("ok").await?;
+        let (agent, _rx) = claude_agent(&rig)?;
+        let outcome = run_then_finish(&rig, &agent, "x:write").await?;
+        assert_eq!(
+            outcome,
+            FinishOutcome::Succeeded {
+                branch: Some("swarm/job1".into()),
+                pr_url: Some("https://example.invalid/pr/7".into()),
+            }
+        );
+        assert_eq!(ahead(&rig)?, "1");
+        let log = git(&rig.origin, &["log", "-1", "--format=%s|%an|%ae|%cn", "swarm/job1"])?;
+        assert_eq!(
+            log.trim(),
+            "chore: uncommitted job changes (fleet job job1)|Fleet Job|fleet-job@fleet.invalid|Fleet Job"
+        );
+        assert_eq!(git(&rig.origin, &["show", "swarm/job1:new.txt"])?, "agent\n");
+        Ok(())
+    }))
+    .await
+}
+
+#[tokio::test]
+async fn work_the_agent_committed_gets_no_extra_commit() -> TestResult {
+    common::bounded(Box::pin(async {
+        let rig = rig("ok").await?;
+        let (agent, _rx) = claude_agent(&rig)?;
+        let outcome = run_then_finish(&rig, &agent, "x:commit").await?;
+        assert!(matches!(
+            outcome,
+            FinishOutcome::Succeeded {
+                branch: Some(_),
+                ..
+            }
+        ));
+        assert_eq!(ahead(&rig)?, "1");
+        let subject = git(&rig.origin, &["log", "-1", "--format=%s", "swarm/job1"])?;
+        assert_eq!(subject.trim(), "feat: by the agent");
+        Ok(())
+    }))
+    .await
+}
+
+#[tokio::test]
+async fn a_clean_tree_with_no_commits_succeeds_with_a_no_changes_note() -> TestResult {
+    common::bounded(Box::pin(async {
+        let rig = rig("fail").await?;
+        let (agent, mut rx) = claude_agent(&rig)?;
+        let (logs, _guard) = logs::capture_logs();
+        let outcome = run_then_finish(&rig, &agent, "x:none").await?;
+        assert_eq!(
+            outcome,
+            FinishOutcome::Succeeded {
+                branch: None,
+                pr_url: None,
+            }
+        );
+        assert!(!pushed(&rig)?);
+        assert_eq!(
+            git(&rig.worktree, &["rev-list", "--count", "origin/main..HEAD"])?.trim(),
+            "0"
+        );
+        let reports = drain(&mut rx);
+        let last = reports.last().ok_or("no report")?;
+        assert_eq!(last.terminal_state, Some(JobState::Succeeded.into()));
+        let text: String = reports
+            .iter()
+            .flat_map(|r| r.chunks.iter().map(|c| c.text.as_str()))
+            .collect();
+        assert!(text.contains("no_changes"), "{text}");
+        assert!(logs.text().contains("no changes"));
+        Ok(())
+    }))
+    .await
+}
+
+#[tokio::test]
+async fn a_job_with_changes_carries_no_no_changes_note() -> TestResult {
+    common::bounded(Box::pin(async {
+        let rig = rig("ok").await?;
+        let (agent, mut rx) = claude_agent(&rig)?;
+        run_then_finish(&rig, &agent, "x:write").await?;
+        let text: String = drain(&mut rx)
+            .iter()
+            .flat_map(|r| r.chunks.iter().map(|c| c.text.clone()))
+            .collect();
+        assert!(!text.contains("no_changes"));
+        Ok(())
+    }))
+    .await
+}
+
+#[tokio::test]
+async fn planted_hooks_filters_and_fsmonitor_do_not_run_during_the_fallback() -> TestResult {
+    common::bounded(Box::pin(async {
+        let rig = rig("ok").await?;
+        let (agent, _rx) = claude_agent(&rig)?;
+        let outcome = run_then_finish(&rig, &agent, "x:trap").await?;
+        assert!(matches!(
+            outcome,
+            FinishOutcome::Succeeded {
+                branch: Some(_),
+                ..
+            }
+        ));
+        let marks: Vec<_> = std::fs::read_dir(rig.dir.path().join("marks"))?
+            .map(|e| e.map(|e| e.file_name()))
+            .collect::<Result<_, _>>()?;
+        assert!(marks.is_empty(), "ran: {marks:?}");
+        assert_eq!(ahead(&rig)?, "1");
+        assert_eq!(
+            git(&rig.origin, &["show", "swarm/job1:new.txt"])?,
+            "agent\n"
+        );
+        assert!(git(&rig.origin, &["show", "swarm/job1:.gitattributes"])?.contains("filter=evil"));
+        Ok(())
+    }))
+    .await
+}
+
+#[tokio::test]
+async fn a_staged_secret_fails_the_job_and_nothing_is_committed() -> TestResult {
+    common::bounded(Box::pin(async {
+        let rig = rig("ok").await?;
+        let (agent, mut rx) = claude_agent(&rig)?;
+        let outcome = run_then_finish(&rig, &agent, "x:secret").await?;
+        assert_eq!(
+            outcome,
+            FinishOutcome::Failed {
+                error: "uncommitted changes held a secret value"
+            }
+        );
+        assert!(!pushed(&rig)?);
+        assert_eq!(
+            git(&rig.worktree, &["rev-list", "--count", "origin/main..HEAD"])?.trim(),
+            "0"
+        );
+        let reports = drain(&mut rx);
+        let last = reports.last().ok_or("no report")?;
+        assert_eq!(last.terminal_state, Some(JobState::Failed.into()));
+        assert_eq!(
+            last.error.as_deref(),
+            Some("uncommitted changes held a secret value")
+        );
+        let text: String = reports
+            .iter()
+            .flat_map(|r| r.chunks.iter().map(|c| c.text.as_str()))
+            .collect();
+        assert!(!text.contains("hunter2"));
+        Ok(())
+    }))
+    .await
+}
+
+#[tokio::test]
+async fn a_publish_failure_logs_a_redacted_stderr_tail_of_at_most_512_bytes() -> TestResult {
+    common::bounded(Box::pin(async {
+        let rig = rig("long").await?;
+        commit(&rig)?;
+        let (agent, _rx) = agent(&rig);
+        let (logs, _guard) = logs::capture_logs();
+        let (_trigger, shutdown) = Shutdown::channel();
+        agent
+            .finish(&job(&rig, true), &rig.worktree, shutdown)
+            .await?;
+        let out = logs.text();
+        assert!(out.contains("job publish step failed"), "{out}");
+        assert!(out.contains("END [REDACTED]"), "{out}");
+        assert!(!out.contains("hunter2"), "{out}");
+        let line = out
+            .lines()
+            .find(|l| l.contains("job publish step failed"))
+            .ok_or("no log line")?;
+        let tail = line.split_once("stderr_tail=").ok_or("no tail")?.1;
+        let tail_xs = tail.matches('x').count();
+        assert!((400..=512).contains(&tail_xs), "{tail_xs}");
         Ok(())
     }))
     .await

@@ -8,6 +8,7 @@
 //! process, then pushes the branch and opens the pull request. The push's `GIT_ASKPASS` is
 //! `fleetd askpass` ([`askpass`]).
 
+pub mod agent_config;
 mod app;
 pub mod askpass;
 pub mod backoff;
