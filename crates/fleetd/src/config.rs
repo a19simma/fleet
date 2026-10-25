@@ -17,12 +17,14 @@ const DEFAULT_CLAUDE_BIN: &str = "claude";
 const DEFAULT_GH_BIN: &str = "gh";
 const DEFAULT_REPO_HOSTS: [&str; 1] = ["github.com"];
 const DEFAULT_TOKEN_HOST: &str = "github.com";
-const DEFAULT_HOOK_EVENTS: [&str; 5] = [
+const DEFAULT_HOOK_EVENTS: [&str; 7] = [
     "SessionStart",
     "UserPromptSubmit",
     "Stop",
     "Notification",
     "SessionEnd",
+    "PostToolUse",
+    "PostToolUseFailure",
 ];
 
 #[derive(Debug, Default, Deserialize)]
@@ -327,7 +329,9 @@ mod tests {
         assert_eq!(cfg.box_name, None);
         assert_eq!(cfg.queue_max_bytes, 256 * 1024 * 1024);
         assert_eq!(cfg.queue_max_age, Duration::from_secs(14 * 86_400));
-        assert_eq!(cfg.hook_events.len(), 5);
+        assert_eq!(cfg.hook_events.len(), 7);
+        assert!(cfg.hook_events.iter().any(|e| e == "PostToolUse"));
+        assert!(cfg.hook_events.iter().any(|e| e == "PostToolUseFailure"));
         assert!(!cfg.secrets_file.required);
     }
 

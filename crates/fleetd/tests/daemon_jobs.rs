@@ -13,7 +13,7 @@ use fleet_proto::v1::fleet_worker_server::{FleetWorker, FleetWorkerServer};
 use fleet_proto::v1::{
     ClaimJobReply, ClaimJobRequest, Job, JobState, ReportJobReply, ReportJobRequest,
 };
-use fleetd::{Config, run_with_env};
+use fleetd::{Config, forward_hook, run_with_env};
 use tempfile::TempDir;
 use tokio::net::TcpListener;
 use tokio::sync::{mpsc, oneshot};
@@ -330,6 +330,75 @@ async fn a_failed_prepare_backs_the_poller_off() -> TestResult {
         tokio::time::timeout(Duration::from_secs(30), daemon).await???;
         server.abort();
         assert!(claims <= 8, "claims: {claims}");
+        Ok(())
+    }))
+    .await
+}
+
+#[tokio::test]
+async fn a_tool_hook_posted_to_the_daemon_socket_reaches_the_running_jobs_telemetry() -> TestResult
+{
+    common::bounded(Box::pin(async {
+        let dir = TempDir::new()?;
+        let marker = dir.path().join("hook-delivered");
+        let agent = format!(
+            "#!/bin/sh\necho '{{\"type\":\"assistant\",\"message\":{{\"id\":\"m1\",\"content\":[{{\"type\":\"tool_use\",\"id\":\"toolu_a\",\"name\":\"Bash\",\"input\":{{\"command\":\"false\"}}}}]}}}}'\nwhile [ ! -e {marker:?} ]; do sleep 0.05; done\necho '{{\"type\":\"user\",\"message\":{{\"content\":[{{\"type\":\"tool_result\",\"tool_use_id\":\"toolu_a\",\"content\":\"x\"}}]}}}}'\n"
+        );
+        let Launched {
+            mut inbox,
+            stop,
+            daemon,
+            server,
+            ..
+        } = launch(&dir, &agent).await?;
+
+        tokio::time::timeout(Duration::from_secs(60), async {
+            while let Some((_, report)) = inbox.recv().await {
+                if report.chunks.iter().any(|chunk| chunk.text.contains("tool_use")) {
+                    return Some(());
+                }
+            }
+            None
+        })
+        .await?
+        .ok_or("agent never started")?;
+
+        let file = format!(
+            "http_port = 1\nsocket_path = {:?}\n",
+            dir.path().join("fleetd.sock").to_string_lossy()
+        );
+        let config = Config::resolve(Some(&file), &|_| None)?;
+        let payload = serde_json::json!({
+            "tool_name": "Bash", "tool_use_id": "toolu_a", "duration_ms": 321,
+            "error": "Exit code 2\nboom", "is_interrupt": false
+        })
+        .to_string();
+        forward_hook(&config, "PostToolUseFailure", payload.as_bytes(), Some("job1")).await?;
+        std::fs::write(&marker, "")?;
+
+        let mut events = Vec::new();
+        let terminal = tokio::time::timeout(Duration::from_secs(60), async {
+            while let Some((_, report)) = inbox.recv().await {
+                events.extend(report.events.clone());
+                if report.terminal_state.is_some() {
+                    return Some(report);
+                }
+            }
+            None
+        })
+        .await?
+        .ok_or("no terminal report")?;
+        let event = events.first().ok_or("no event")?;
+        assert_eq!(event.tool_use_id.as_deref(), Some("toolu_a"));
+        assert_eq!(event.exit_code, Some(2));
+        assert_eq!(event.dur_ms, Some(321));
+        let summary = terminal.summary.ok_or("no summary")?;
+        assert_eq!(summary.bash_nonzero, Some(1));
+        assert!(!summary.missing.contains(&"exit_codes".to_owned()));
+
+        let _ = stop.send(());
+        tokio::time::timeout(Duration::from_secs(30), daemon).await???;
+        server.abort();
         Ok(())
     }))
     .await

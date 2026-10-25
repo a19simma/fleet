@@ -15,12 +15,14 @@ use fleet_proto::MAX_CHUNKS_PER_REPORT;
 use fleet_proto::v1::{
     Job, JobEvent, JobEventKind, JobState, ReportJobReply, ReportJobRequest, TranscriptChunk,
 };
+use fleetd::HookHub;
 use fleetd::agent_config::{Bundle, JOB_EMAIL, JOB_NAME};
 use fleetd::poller::{RunError, Shutdown};
 use fleetd::runner::{
     AGENT_PROTOCOL, AgentOutcome, AgentRunner, ChildWait, Interrupt, Reporter, RunConfig,
     STRIPPED_ENV,
 };
+use fleetd::toolhook::ToolReport;
 use serde_json::json;
 use tempfile::TempDir;
 use tokio::sync::{mpsc, oneshot};
@@ -1696,6 +1698,94 @@ async fn a_secret_at_the_command_cap_is_redacted_before_the_cut() -> TestResult 
         assert_eq!(cmd.len(), 512);
         assert!(cmd.ends_with(" [REDAC"));
         assert!(!cmd.contains("hunt"));
+        Ok(())
+    }))
+    .await
+}
+
+fn hook_report(exit: i32, dur: u64) -> ToolReport {
+    ToolReport {
+        tool_use_id: "a".into(),
+        tool_name: "Bash".into(),
+        exit_code: Some(exit),
+        dur_ms: Some(dur),
+    }
+}
+
+#[tokio::test]
+async fn a_tool_hook_fills_the_event_exit_code_and_the_summary_bash_nonzero() -> TestResult {
+    common::bounded(Box::pin(async {
+        let dir = TempDir::new()?;
+        fixture(dir.path(), "run.jsonl", &[bash_use("a", "false")])?;
+        let first = dir.path().join("run.jsonl");
+        fixture(dir.path(), "run.jsonl.second", &[tool_ok("a")])?;
+        let hub = HookHub::new();
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let fake = Fake {
+            tx,
+            fail_first: AtomicUsize::new(0),
+            switch: Arc::new(Switch::default()),
+        };
+        let agent =
+            AgentRunner::new(config(false), fake, Redactor::default()).with_hook_hub(hub.clone());
+        let (_trigger, shutdown) = Shutdown::channel();
+        let prompt = format!("sleepy:{}", first.display());
+        let job = job(&prompt);
+        let (outcome, delivered) = tokio::join!(agent.run(&job, dir.path(), shutdown), async {
+            assert!(!hub.deliver("other-job", hook_report(5, 5)));
+            for _ in 0..800 {
+                if hub.deliver("job1", hook_report(2, 123)) {
+                    assert!(hub.deliver("job1", hook_report(9, 999)));
+                    return true;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+            false
+        });
+        assert_eq!(outcome?, AgentOutcome::Succeeded);
+        assert!(delivered, "job never registered with the hub");
+        agent.fail_job(&job, "boom").await;
+        let requests = drain(&mut rx);
+        let sent = events(&requests);
+        assert_eq!(sent.len(), 1);
+        let event = sent.first().ok_or("no event")?;
+        assert_eq!(event.exit_code, Some(2));
+        assert_eq!(event.dur_ms, Some(123));
+        let summary = terminal(&requests)?.summary.clone().ok_or("no summary")?;
+        assert_eq!(summary.bash_nonzero, Some(1));
+        assert!(!summary.missing.contains(&"exit_codes".to_owned()));
+        assert!(hub.dropped() >= 1);
+        assert!(!hub.deliver("job1", hook_report(1, 1)));
+        Ok(())
+    }))
+    .await
+}
+
+#[tokio::test]
+async fn without_a_hook_the_summary_keeps_exit_codes_missing() -> TestResult {
+    common::bounded(Box::pin(async {
+        let dir = TempDir::new()?;
+        let file = fixture(
+            dir.path(),
+            "run.jsonl",
+            &[bash_use("a", "ls"), tool_ok("a")],
+        )?;
+        let hub = HookHub::new();
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let fake = Fake {
+            tx,
+            fail_first: AtomicUsize::new(0),
+            switch: Arc::new(Switch::default()),
+        };
+        let agent = AgentRunner::new(config(false), fake, Redactor::default()).with_hook_hub(hub);
+        let (_trigger, shutdown) = Shutdown::channel();
+        let prompt = format!("cat:{}", file.display());
+        agent.run(&job(&prompt), dir.path(), shutdown).await?;
+        agent.fail_job(&job(&prompt), "boom").await;
+        let requests = drain(&mut rx);
+        assert_eq!(events(&requests).first().map(|e| e.exit_code), Some(None));
+        let summary = terminal(&requests)?.summary.clone().ok_or("no summary")?;
+        assert!(summary.missing.contains(&"exit_codes".to_owned()));
         Ok(())
     }))
     .await

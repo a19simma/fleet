@@ -6,7 +6,7 @@ use std::time::{Duration, Instant};
 use axum::Router;
 use axum::body::Bytes;
 use axum::extract::{DefaultBodyLimit, Path, Request, State};
-use axum::http::{HeaderValue, StatusCode, header};
+use axum::http::{HeaderMap, HeaderValue, StatusCode, header};
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
@@ -16,6 +16,7 @@ use serde_json::{Value, json};
 use crate::events::Enqueued;
 use crate::store::Store;
 use crate::system::{fresh_id, now_ms};
+use crate::toolhook::{HookHub, ToolReport, is_tool_event};
 
 const MAX_RECENT: usize = 4096;
 const MAX_BODY_BYTES: usize = 1024 * 1024;
@@ -28,6 +29,7 @@ pub struct AppState {
     allow: HookAllowlist,
     redactor: Redactor,
     dedupe_window: Duration,
+    hub: Arc<HookHub>,
     recent: Mutex<HashMap<u64, Instant>>,
 }
 
@@ -47,12 +49,36 @@ impl AppState {
         redactor: Redactor,
         dedupe_window: Duration,
     ) -> Arc<Self> {
+        Self::with_hub(
+            store,
+            identity,
+            allow,
+            redactor,
+            dedupe_window,
+            HookHub::new(),
+        )
+    }
+
+    /// Builds state like [`AppState::new`], routing `PostToolUse` and `PostToolUseFailure`
+    /// hooks to the running jobs registered in `hub`.
+    ///
+    /// Those two events never enter the queue: they only reach a job's telemetry, and only
+    /// while the event name is on the allowlist.
+    pub fn with_hub(
+        store: Store,
+        identity: Identity,
+        allow: HookAllowlist,
+        redactor: Redactor,
+        dedupe_window: Duration,
+        hub: Arc<HookHub>,
+    ) -> Arc<Self> {
         Arc::new(Self {
             store,
             identity,
             allow,
             redactor,
             dedupe_window,
+            hub,
             recent: Mutex::new(HashMap::new()),
         })
     }
@@ -123,11 +149,39 @@ async fn healthz() -> &'static str {
     "ok"
 }
 
+const JOB_HEADER: &str = "x-fleet-job";
+const MAX_JOB_BYTES: usize = 128;
+
+fn tool_hook(state: &AppState, event: &str, headers: &HeaderMap, body: &[u8]) -> Response {
+    if !state.allow.contains(event) {
+        tracing::debug!(event, "hook event not recorded");
+        return json_response(StatusCode::OK, &json!({}));
+    }
+    let job = headers
+        .get(JOB_HEADER)
+        .and_then(|value| value.to_str().ok())
+        .map(str::trim)
+        .filter(|job| !job.is_empty() && job.len() <= MAX_JOB_BYTES);
+    if let (Some(job), Some(report)) = (job, ToolReport::from_reduced(body)) {
+        if !state.hub.deliver(job, report) {
+            tracing::debug!(event, "tool report dropped");
+        }
+    } else {
+        state.hub.note_dropped();
+        tracing::debug!(event, "tool hook payload unusable");
+    }
+    json_response(StatusCode::OK, &json!({}))
+}
+
 async fn hook(
     State(state): State<Arc<AppState>>,
     Path(event): Path<String>,
+    headers: HeaderMap,
     body: Bytes,
 ) -> Response {
+    if is_tool_event(&event) {
+        return tool_hook(&state, &event, &headers, &body);
+    }
     let Ok(parsed) = serde_json::from_slice::<Value>(&body) else {
         return bad_request("body is not valid JSON");
     };

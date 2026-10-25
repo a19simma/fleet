@@ -303,3 +303,107 @@ async fn omits_the_job_header_without_a_usable_job_id() {
     assert!(!captured_request(None).await.contains("X-Fleet-Job"));
     assert!(!captured_request(Some("\r\n")).await.contains("X-Fleet-Job"));
 }
+
+async fn captured_body(event: &str, input: Vec<u8>) -> (String, Vec<u8>) {
+    let dir = TempDir::new().unwrap();
+    let tcp = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let config = config(&dir, tcp.local_addr().unwrap().port());
+    let server = tokio::spawn(async move {
+        let (mut stream, _) = tcp.accept().await.unwrap();
+        let mut seen = Vec::new();
+        let mut buf = [0u8; 4096];
+        loop {
+            let n = stream.read(&mut buf).await.unwrap();
+            assert_ne!(n, 0);
+            seen.extend_from_slice(buf.get(..n).unwrap());
+            let Some(split) = seen.windows(4).position(|w| w == b"\r\n\r\n") else {
+                continue;
+            };
+            let head = String::from_utf8_lossy(seen.get(..split).unwrap()).into_owned();
+            let length: usize = head
+                .lines()
+                .find_map(|line| line.strip_prefix("Content-Length: "))
+                .unwrap()
+                .parse()
+                .unwrap();
+            if seen.len() >= split + 4 + length {
+                stream
+                    .write_all(b"HTTP/1.1 204 No Content\r\nContent-Length: 0\r\n\r\n")
+                    .await
+                    .unwrap();
+                return (head, seen.get(split + 4..).unwrap().to_vec());
+            }
+        }
+    });
+    let event = event.to_owned();
+    forward_hook(&config, &event, input.as_slice(), Some("job-7"))
+        .await
+        .unwrap();
+    server.await.unwrap()
+}
+
+fn big_write(content: &str) -> Vec<u8> {
+    serde_json::json!({
+        "tool_name": "Write", "tool_use_id": "toolu_w", "duration_ms": 9,
+        "hook_event_name": "PostToolUse", "cwd": "/work/job-7",
+        "tool_response": {"type": "create", "content": content, "originalFile": content}
+    })
+    .to_string()
+    .into_bytes()
+}
+
+#[tokio::test]
+async fn a_tool_hook_posts_only_the_reduced_fields() {
+    let content = "LEAKY-CONTENT-".repeat(5000);
+    let (head, body) = captured_body("PostToolUse", big_write(&content)).await;
+    assert!(head.starts_with("POST /hook/PostToolUse "));
+    assert!(head.contains("X-Fleet-Job: job-7"));
+    let text = String::from_utf8(body).unwrap();
+    assert!(!text.contains("LEAKY"));
+    assert!(text.len() < 200, "{text}");
+    let value: serde_json::Value = serde_json::from_str(&text).unwrap();
+    assert_eq!(value["tool_use_id"], "toolu_w");
+    assert_eq!(value["dur_ms"], 9);
+}
+
+#[tokio::test]
+async fn a_failure_hook_posts_the_exit_code_not_the_error_text() {
+    let payload = serde_json::json!({
+        "tool_name": "Bash", "tool_use_id": "toolu_b", "duration_ms": 5,
+        "error": "Exit code 137\nsecret stderr", "is_interrupt": false
+    })
+    .to_string()
+    .into_bytes();
+    let (_, body) = captured_body("PostToolUseFailure", payload).await;
+    let text = String::from_utf8(body).unwrap();
+    assert!(!text.contains("secret"));
+    let value: serde_json::Value = serde_json::from_str(&text).unwrap();
+    assert_eq!(value["exit_code"], 137);
+}
+
+#[tokio::test]
+async fn garbage_and_oversize_tool_input_post_an_empty_report() {
+    let (_, garbage) = captured_body("PostToolUse", b"not json".to_vec()).await;
+    assert_eq!(garbage, b"{}");
+    let oversize = vec![b'x'; 1024 * 1024 + 1];
+    let (_, body) = captured_body("PostToolUse", oversize).await;
+    assert_eq!(body, b"{}");
+}
+
+#[tokio::test]
+async fn other_events_still_forward_their_whole_body() {
+    let (_, body) = captured_body("SessionStart", PAYLOAD.as_bytes().to_vec()).await;
+    assert_eq!(body, PAYLOAD.as_bytes());
+}
+
+#[tokio::test]
+async fn an_oversize_body_for_another_event_still_fails() {
+    let dir = TempDir::new().unwrap();
+    let config = config(&dir, 1);
+    let oversize = vec![b'x'; 1024 * 1024 + 1];
+    assert!(
+        forward_hook(&config, "SessionStart", oversize.as_slice(), None)
+            .await
+            .is_err()
+    );
+}

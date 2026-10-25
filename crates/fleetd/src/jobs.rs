@@ -6,6 +6,7 @@
 )]
 
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use fleet_core::Redactor;
 use fleet_proto::v1::Job;
@@ -19,6 +20,7 @@ use crate::poller::{
     Token, channel,
 };
 use crate::runner::{AgentOutcome, AgentRunner, Interrupt, Reporter, RunConfig};
+use crate::toolhook::HookHub;
 use crate::workspace::{RepoPolicy, Workspace};
 
 const ERR_WORKSPACE: &str = "workspace could not be prepared";
@@ -128,6 +130,7 @@ pub(crate) fn build(
     env: &dyn Fn(&str) -> Option<String>,
     box_name: &str,
     redactor: Redactor,
+    hub: Arc<HookHub>,
 ) -> Result<Option<JobPoller>, Error> {
     let Some(url) = env(SERVER_URL_ENV).filter(|url| !url.is_empty()) else {
         return Ok(None);
@@ -153,7 +156,10 @@ pub(crate) fn build(
         })?;
     }
     let workspace = job_workspace(config, &mut run, env).with_redactor(redactor.clone());
-    let runner = DaemonRunner::new(workspace, AgentRunner::new(run, reporter, redactor));
+    let runner = DaemonRunner::new(
+        workspace,
+        AgentRunner::new(run, reporter, redactor).with_hook_hub(hub),
+    );
     Poller::with_channel(
         channel,
         &token,

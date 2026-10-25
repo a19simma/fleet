@@ -2,6 +2,7 @@ use std::future::Future;
 use std::net::{Ipv4Addr, SocketAddr};
 use std::os::unix::fs::{FileTypeExt, PermissionsExt};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::Duration;
 
 use fleet_core::{HookAllowlist, Identity, Redactor};
@@ -22,6 +23,7 @@ use crate::http1::{Failure, roundtrip};
 use crate::jobs::{self, JobPoller};
 use crate::store::Store;
 use crate::system::read_identity;
+use crate::toolhook::HookHub;
 
 const DEFAULT_WATCHDOG_PERIOD: Duration = Duration::from_secs(20);
 const MIN_WATCHDOG_PERIOD: Duration = Duration::from_millis(1);
@@ -324,14 +326,24 @@ pub async fn run_with_env(
             None
         }
     };
-    let jobs = match jobs::build(&config, env, &identity.box_name, redactor.clone()) {
+    let hub = HookHub::new();
+    let jobs = match jobs::build(
+        &config,
+        env,
+        &identity.box_name,
+        redactor.clone(),
+        hub.clone(),
+    ) {
         Ok(poller) => poller,
         Err(err) => {
             tracing::warn!(%err, "job poller disabled");
             None
         }
     };
-    run_with_store(config, store, identity, redactor, heartbeat, jobs, shutdown).await
+    run_with_hub(
+        config, store, identity, redactor, heartbeat, jobs, hub, shutdown,
+    )
+    .await
 }
 
 async fn bind_all(config: &Config) -> Result<(TcpListener, SocketAddr, UnixListener), Error> {
@@ -343,6 +355,7 @@ async fn bind_all(config: &Config) -> Result<(TcpListener, SocketAddr, UnixListe
     Ok((tcp, tcp_addr, socket))
 }
 
+#[cfg(test)]
 async fn run_with_store(
     config: Config,
     store: Store,
@@ -350,6 +363,33 @@ async fn run_with_store(
     redactor: Redactor,
     heartbeat: Option<Heartbeat>,
     jobs: Option<JobPoller>,
+    shutdown: impl Future<Output = ()>,
+) -> Result<(), Error> {
+    run_with_hub(
+        config,
+        store,
+        identity,
+        redactor,
+        heartbeat,
+        jobs,
+        HookHub::new(),
+        shutdown,
+    )
+    .await
+}
+
+#[expect(
+    clippy::too_many_arguments,
+    reason = "one call site wires the shared pieces together"
+)]
+async fn run_with_hub(
+    config: Config,
+    store: Store,
+    identity: Identity,
+    redactor: Redactor,
+    heartbeat: Option<Heartbeat>,
+    jobs: Option<JobPoller>,
+    hub: Arc<HookHub>,
     shutdown: impl Future<Output = ()>,
 ) -> Result<(), Error> {
     let (tcp, tcp_addr, socket) = match bind_all(&config).await {
@@ -362,12 +402,13 @@ async fn run_with_store(
         }
     };
     let heartbeat_identity = identity.clone();
-    let state = AppState::new(
+    let state = AppState::with_hub(
         store.clone(),
         identity,
         HookAllowlist::new(config.hook_events.iter().cloned()),
         redactor,
         config.dedupe_window,
+        hub,
     );
 
     tracing::info!(addr = %tcp_addr, socket = %config.socket_path.display(), "listening");

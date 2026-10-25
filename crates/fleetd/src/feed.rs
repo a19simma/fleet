@@ -12,7 +12,7 @@
     reason = "unreachable_pub forbids plain pub in a private module"
 )]
 
-use std::collections::VecDeque;
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::panic::{AssertUnwindSafe, catch_unwind};
 
 use fleet_core::Redactor;
@@ -21,10 +21,13 @@ use fleet_proto::v1 as pb;
 use tokio::time::Instant;
 
 use crate::telemetry::{EventKind, JobEvent, JobSummary, Limits, Telemetry, Terminal};
+use crate::toolhook::ToolReport;
 
 pub(crate) const MAX_LINE_BYTES: usize = 1 << 20;
 pub(crate) const MAX_FED_BYTES: u64 = 32 << 20;
 pub(crate) const MAX_PENDING_EVENTS: usize = 4096;
+pub(crate) const MAX_HOOKED_IDS: usize = 4096;
+pub(crate) const MAX_WAITING_HOOKS: usize = 256;
 const PARSER_MISSING: &str = "parser";
 
 type Parse = fn(&mut Telemetry, &str, u64, &dyn Fn(&str) -> String) -> Vec<JobEvent>;
@@ -36,6 +39,8 @@ pub(crate) struct Counters {
     pub(crate) over_budget: u64,
     pub(crate) panics: u64,
     pub(crate) dropped: u64,
+    pub(crate) hook_duplicates: u64,
+    pub(crate) hook_dropped: u64,
 }
 
 /// Per-job telemetry state: the parser, the clock origin and the events no report has delivered.
@@ -47,6 +52,8 @@ pub(crate) struct Feed {
     fed_bytes: u64,
     pending: VecDeque<pb::JobEvent>,
     counters: Counters,
+    hooked: HashSet<String>,
+    waiting: HashMap<String, ToolReport>,
 }
 
 impl Feed {
@@ -62,6 +69,8 @@ impl Feed {
             fed_bytes: 0,
             pending: VecDeque::new(),
             counters: Counters::default(),
+            hooked: HashSet::new(),
+            waiting: HashMap::new(),
         }
     }
 
@@ -96,6 +105,78 @@ impl Feed {
         } else {
             self.counters.panics += 1;
             self.parser = None;
+        }
+        self.retry_waiting();
+    }
+
+    /// Applies one tool hook report to the matching tool event.
+    ///
+    /// A `(job, tool_use_id)` pair applies once: a second report for an id already applied or
+    /// waiting is counted and ignored, which also covers the `PostToolUse` and
+    /// `PostToolUseFailure` pair a failing call fires. A report that arrives before its tool
+    /// event waits, at most 256 at a time, and applies when the event appears. An event
+    /// already acked keeps what it reported and only the summary changes.
+    pub(crate) fn hook(&mut self, report: ToolReport) {
+        if self.hooked.contains(&report.tool_use_id)
+            || self.waiting.contains_key(&report.tool_use_id)
+        {
+            self.counters.hook_duplicates += 1;
+            return;
+        }
+        if self.parser.is_none() {
+            self.counters.hook_dropped += 1;
+            return;
+        }
+        if self.apply(&report) {
+            self.mark_hooked(report.tool_use_id);
+        } else if self.waiting.len() >= MAX_WAITING_HOOKS {
+            self.counters.hook_dropped += 1;
+        } else {
+            self.waiting.insert(report.tool_use_id.clone(), report);
+        }
+    }
+
+    fn mark_hooked(&mut self, id: String) {
+        if self.hooked.len() < MAX_HOOKED_IDS {
+            self.hooked.insert(id);
+        }
+    }
+
+    fn apply(&mut self, report: &ToolReport) -> bool {
+        let Some(parser) = self.parser.as_mut() else {
+            return false;
+        };
+        if !parser.apply_hook(&report.tool_use_id, report.exit_code, report.dur_ms) {
+            return false;
+        }
+        let queued = self
+            .pending
+            .iter_mut()
+            .find(|event| event.tool_use_id.as_deref() == Some(report.tool_use_id.as_str()));
+        if let Some(event) = queued {
+            if report.exit_code.is_some() {
+                event.exit_code = report.exit_code;
+            }
+            if report.dur_ms.is_some() {
+                event.dur_ms = report.dur_ms;
+            }
+        }
+        true
+    }
+
+    fn retry_waiting(&mut self) {
+        if self.waiting.is_empty() {
+            return;
+        }
+        let ids: Vec<String> = self.waiting.keys().cloned().collect();
+        for id in ids {
+            let Some(report) = self.waiting.get(&id).cloned() else {
+                continue;
+            };
+            if self.apply(&report) {
+                self.waiting.remove(&id);
+                self.mark_hooked(id);
+            }
         }
     }
 
@@ -530,5 +611,120 @@ mod tests {
                 missing: vec!["exit_codes".into()],
             }
         );
+    }
+    fn report(id: &str, exit: Option<i32>, dur: Option<u64>) -> ToolReport {
+        ToolReport {
+            tool_use_id: id.to_owned(),
+            tool_name: "Bash".to_owned(),
+            exit_code: exit,
+            dur_ms: dur,
+        }
+    }
+
+    #[test]
+    fn the_hook_caps_are_pinned() {
+        assert_eq!(MAX_HOOKED_IDS, 4096);
+        assert_eq!(MAX_WAITING_HOOKS, 256);
+    }
+
+    #[test]
+    fn a_hook_after_its_event_fills_the_queued_event_and_the_summary() {
+        let (mut feed, start) = fresh();
+        feed.line(&redactor(), &bash("a", "ls"), start);
+        feed.line(&redactor(), &done("a"), start);
+        assert_eq!(feed.batch().first().map(|e| e.exit_code), Some(None));
+        feed.hook(report("a", Some(2), Some(50)));
+        let event = feed.batch().into_iter().next().unwrap();
+        assert_eq!((event.exit_code, event.dur_ms), (Some(2), Some(50)));
+        let summary = feed.finish(Terminal::Succeeded);
+        assert_eq!(summary.bash_nonzero, Some(1));
+        assert!(!summary.missing.contains(&"exit_codes".to_owned()));
+    }
+
+    #[test]
+    fn a_hook_for_an_acked_event_still_counts_in_the_summary() {
+        let (mut feed, start) = fresh();
+        feed.line(&redactor(), &bash("a", "ls"), start);
+        feed.line(&redactor(), &done("a"), start);
+        feed.ack(0);
+        feed.hook(report("a", Some(1), None));
+        assert!(feed.backlog_empty());
+        assert_eq!(feed.finish(Terminal::Succeeded).bash_nonzero, Some(1));
+    }
+
+    #[test]
+    fn a_hook_before_its_event_waits_and_applies_when_the_event_appears() {
+        let (mut feed, start) = fresh();
+        feed.hook(report("a", Some(3), Some(9)));
+        assert_eq!(feed.waiting.len(), 1);
+        feed.line(&redactor(), &bash("a", "ls"), start);
+        assert_eq!(feed.waiting.len(), 1);
+        feed.line(&redactor(), &done("a"), start);
+        assert_eq!(feed.waiting.len(), 0);
+        let event = feed.batch().into_iter().next().unwrap();
+        assert_eq!((event.exit_code, event.dur_ms), (Some(3), Some(9)));
+        assert_eq!(feed.finish(Terminal::Succeeded).bash_nonzero, Some(1));
+    }
+
+    #[test]
+    fn a_second_report_for_one_tool_use_applies_once() {
+        let (mut feed, start) = fresh();
+        feed.line(&redactor(), &bash("a", "ls"), start);
+        feed.line(&redactor(), &done("a"), start);
+        feed.hook(report("a", Some(2), Some(5)));
+        feed.hook(report("a", Some(7), Some(6)));
+        assert_eq!(feed.counters().hook_duplicates, 1);
+        let event = feed.batch().into_iter().next().unwrap();
+        assert_eq!((event.exit_code, event.dur_ms), (Some(2), Some(5)));
+        let (mut waiting, _) = fresh();
+        waiting.hook(report("w", Some(1), None));
+        waiting.hook(report("w", Some(9), None));
+        assert_eq!(waiting.counters().hook_duplicates, 1);
+        assert_eq!(waiting.waiting.get("w").map(|r| r.exit_code), Some(Some(1)));
+    }
+
+    #[test]
+    fn waiting_hooks_are_capped_and_the_overflow_is_counted() {
+        let (mut feed, _) = fresh();
+        for n in 0..MAX_WAITING_HOOKS {
+            feed.hook(report(&format!("t{n}"), Some(1), None));
+        }
+        assert_eq!(feed.counters().hook_dropped, 0);
+        feed.hook(report("extra", Some(1), None));
+        assert_eq!(feed.waiting.len(), MAX_WAITING_HOOKS);
+        assert_eq!(feed.counters().hook_dropped, 1);
+    }
+
+    #[test]
+    fn applied_ids_are_remembered_up_to_the_cap() {
+        let start = Instant::now();
+        let limits = Limits {
+            max_events: 100_000,
+            max_event_bytes: 1 << 30,
+            ..Limits::default()
+        };
+        let mut feed = Feed::with(start, limits, Telemetry::feed_line_with);
+        let (uses, results) = many(MAX_HOOKED_IDS + 1);
+        feed.line(&redactor(), &uses, start);
+        feed.line(&redactor(), &results, start);
+        for n in 0..=MAX_HOOKED_IDS {
+            feed.hook(report(&format!("t{n}"), Some(0), None));
+        }
+        assert_eq!(feed.hooked.len(), MAX_HOOKED_IDS);
+        assert_eq!(feed.counters().hook_duplicates, 0);
+        feed.hook(report("t0", Some(0), None));
+        assert_eq!(feed.counters().hook_duplicates, 1);
+        feed.hook(report(&format!("t{MAX_HOOKED_IDS}"), Some(0), None));
+        assert_eq!(feed.counters().hook_duplicates, 1);
+    }
+
+    #[test]
+    fn a_hook_after_the_parser_is_gone_is_counted_as_dropped() {
+        let (_, start) = fresh();
+        let mut feed = Feed::with(start, Limits::default(), boom);
+        feed.line(&redactor(), "a", start);
+        feed.hook(report("a", Some(1), None));
+        assert_eq!(feed.counters().hook_dropped, 1);
+        assert_eq!(feed.waiting.len(), 0);
     }
 }

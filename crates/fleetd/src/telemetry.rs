@@ -327,12 +327,18 @@ impl Telemetry {
 
     /// Fill the exit code and authoritative duration of an emitted tool event.
     ///
-    /// A `None` argument leaves the field as it is. An unknown id does nothing.
-    pub fn apply_hook(&mut self, tool_use_id: &str, exit_code: Option<i32>, dur_ms: Option<u64>) {
+    /// A `None` argument leaves the field as it is. An unknown id does nothing and returns
+    /// false, so a caller can retry once the tool event exists.
+    pub fn apply_hook(
+        &mut self,
+        tool_use_id: &str,
+        exit_code: Option<i32>,
+        dur_ms: Option<u64>,
+    ) -> bool {
         let Some(event) = self.events.iter_mut().find(|event| {
             event.kind == EventKind::Tool && event.tool_use_id.as_deref() == Some(tool_use_id)
         }) else {
-            return;
+            return false;
         };
         if let Some(code) = exit_code {
             if event.tool.as_deref() == Some("Bash") {
@@ -350,6 +356,7 @@ impl Telemetry {
         if dur_ms.is_some() {
             event.dur_ms = dur_ms;
         }
+        true
     }
 
     /// The summary so far.

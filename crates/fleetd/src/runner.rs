@@ -49,7 +49,7 @@ use std::io;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::process::{ExitStatus, Stdio};
-use std::sync::{Mutex, PoisonError};
+use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
 use fleet_core::Redactor;
@@ -69,6 +69,7 @@ use crate::now_ms;
 use crate::poller::{RunError, Shutdown};
 use crate::proc::{CAPTURE_BYTES, CaptureError, Captured, capture};
 use crate::telemetry::Terminal as Ending;
+use crate::toolhook::HookHub;
 use crate::workspace::{RepoPolicy, validate_job_id, validate_ref, validate_repo};
 
 /// Variables that never reach the agent's environment block, however it is configured.
@@ -356,6 +357,7 @@ pub struct AgentRunner<R> {
     reporter: R,
     redactor: Redactor,
     carries: Mutex<HashMap<String, Carry>>,
+    hub: Option<Arc<HookHub>>,
 }
 
 #[derive(Debug, Default)]
@@ -375,7 +377,18 @@ impl<R: Reporter> AgentRunner<R> {
             reporter,
             redactor,
             carries: Mutex::new(HashMap::new()),
+            hub: None,
         }
+    }
+
+    /// Takes tool hook reports for running jobs from `hub`.
+    ///
+    /// A job registers its id in the hub while its agent runs. Each report fills the exit code
+    /// and duration of the matching tool event, and the summary counts it once per tool use id.
+    #[must_use]
+    pub fn with_hook_hub(mut self, hub: Arc<HookHub>) -> Self {
+        self.hub = Some(hub);
+        self
     }
 
     fn carry_key(job: &Job) -> String {
@@ -401,6 +414,7 @@ impl<R: Reporter> AgentRunner<R> {
             job,
             self.config.terminal_report_timeout,
             carry,
+            self.hub.clone(),
         )
     }
 
@@ -509,6 +523,7 @@ impl<R: Reporter> AgentRunner<R> {
             job,
             self.config.terminal_report_timeout,
             Carry::default(),
+            self.hub.clone(),
         );
         let result = self.run_stream(job, cwd, shutdown, &mut stream, wrap).await;
         if matches!(result, Ok(AgentOutcome::Succeeded)) {
@@ -1286,10 +1301,28 @@ struct Stream<'a, R> {
     cancel: bool,
     lost: bool,
     failing: bool,
+    hub: Option<Arc<HookHub>>,
+}
+
+impl<R> Drop for Stream<'_, R> {
+    fn drop(&mut self) {
+        if let Some(hub) = &self.hub {
+            hub.unregister(&self.job.job_id);
+        }
+    }
 }
 
 impl<'a, R: Reporter> Stream<'a, R> {
-    fn new(reporter: &'a R, job: &'a Job, terminal_timeout: Duration, carry: Carry) -> Self {
+    fn new(
+        reporter: &'a R,
+        job: &'a Job,
+        terminal_timeout: Duration,
+        carry: Carry,
+        hub: Option<Arc<HookHub>>,
+    ) -> Self {
+        if let Some(hub) = &hub {
+            hub.register(&job.job_id);
+        }
         Self {
             reporter,
             job,
@@ -1304,6 +1337,14 @@ impl<'a, R: Reporter> Stream<'a, R> {
             cancel: false,
             lost: false,
             failing: false,
+            hub,
+        }
+    }
+
+    fn pull_hooks(&mut self) {
+        let Some(hub) = &self.hub else { return };
+        for report in hub.drain(&self.job.job_id) {
+            self.feed.hook(report);
         }
     }
 
@@ -1323,6 +1364,7 @@ impl<'a, R: Reporter> Stream<'a, R> {
         }
         let clean = redactor.redact_str(line);
         self.feed.line(redactor, &clean, Instant::now());
+        self.pull_hooks();
         if let Some(text) = assistant_text(&clean) {
             self.progress = text.chars().take(MAX_PROGRESS_CHARS).collect();
         }
@@ -1346,6 +1388,7 @@ impl<'a, R: Reporter> Stream<'a, R> {
     }
 
     fn beat(&mut self, report_interval: Duration) {
+        self.pull_hooks();
         if !self.pending.is_empty()
             || !self.feed.backlog_empty()
             || self.last_report.elapsed() >= report_interval
@@ -1524,6 +1567,7 @@ impl<'a, R: Reporter> Stream<'a, R> {
         request.exit_code = end.exit_code;
         request.branch = end.branch;
         request.pr_url = end.pr_url;
+        self.pull_hooks();
         request.summary = Some(self.feed.finish(ending(end.state, end.error)));
         match self.reporter.report(request).await {
             Err(status) if status.code() == Code::FailedPrecondition => {

@@ -8,6 +8,7 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite};
 use tokio::net::{TcpStream, UnixStream};
 
 use crate::http1::{Failure, roundtrip};
+use crate::toolhook::{is_tool_event, reduce};
 use crate::{Config, Error};
 
 const MAX_STDIN_BYTES: u64 = 1024 * 1024;
@@ -15,6 +16,7 @@ const TOTAL_TIMEOUT: Duration = Duration::from_secs(2);
 const UNIX_TIMEOUT: Duration = Duration::from_secs(1);
 const MAX_JOB_ID_BYTES: usize = 128;
 const JOB_ENV: &str = "FLEET_JOB_ID";
+const EMPTY_REPORT: &[u8] = b"{}";
 
 fn job_header_value(raw: &str) -> Option<String> {
     let clean: String = raw
@@ -58,7 +60,10 @@ pub async fn run_hook(
 /// Reads `input` up to 1 MiB, then POSTs it to `/hook/<event>`. It uses the unix
 /// socket in `config` when that path exists, else the loopback port. `job` is sent as
 /// `X-Fleet-Job` after it is sanitised to printable ASCII and capped at 128 bytes; an
-/// empty result sends no header. The call has no overall deadline: [`run_hook`] owns
+/// empty result sends no header. For `PostToolUse` and `PostToolUseFailure` the body is
+/// reduced to the tool use id, tool name, exit code and duration before it is sent, so no
+/// tool output or file content leaves the process; oversize or unusable input sends `{}`,
+/// which the daemon counts as dropped. The call has no overall deadline: [`run_hook`] owns
 /// the 2 second budget, and callers that must never block Claude Code should use it.
 ///
 /// The unix attempt gets a 1 second sub-budget. TCP is tried only when the unix
@@ -101,7 +106,14 @@ async fn forward(
         .take(MAX_STDIN_BYTES + 1)
         .read_to_end(&mut body)
         .await?;
-    if body.len() as u64 > MAX_STDIN_BYTES {
+    let oversize = body.len() as u64 > MAX_STDIN_BYTES;
+    if is_tool_event(event) {
+        body = if oversize {
+            EMPTY_REPORT.to_vec()
+        } else {
+            reduce(event, &body).map_or_else(|| EMPTY_REPORT.to_vec(), |report| report.to_body())
+        };
+    } else if oversize {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             "hook input exceeds 1 MiB",

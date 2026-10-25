@@ -31,6 +31,7 @@ mod runtime;
 mod store;
 mod system;
 pub mod telemetry;
+pub mod toolhook;
 pub mod transport;
 pub mod workspace;
 
@@ -43,3 +44,4 @@ pub use hook::{forward_hook, run_hook};
 pub use runtime::{Signals, bind_socket, run, run_with_env};
 pub use store::Store;
 pub use system::{fresh_id, now_ms, read_identity};
+pub use toolhook::{HookHub, ToolReport};
