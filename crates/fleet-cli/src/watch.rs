@@ -5,7 +5,9 @@ use std::time::Duration;
 
 use fleet_proto::v1::{GetJobRequest, Job, JobState};
 
-use super::{CliError, Config, connect, or_dash, sanitize, state_name};
+use super::{
+    CliError, Client, free_or_dash, or_dash, require_success, sanitize, sanitize_free, state_name,
+};
 
 /// Delay between polls of `GetJob`.
 const POLL_INTERVAL: Duration = Duration::from_secs(2);
@@ -27,7 +29,7 @@ fn write_change(out: &mut impl Write, job: &Job) -> std::io::Result<()> {
         "{}\t{}\t{}",
         state_name(job),
         sanitize(&job.phase),
-        sanitize(&job.progress)
+        sanitize_free(&job.progress)
     )
 }
 
@@ -39,8 +41,11 @@ fn write_change(out: &mut impl Write, job: &Job) -> std::io::Result<()> {
 /// # Errors
 /// Returns [`CliError::JobEnded`] unless the job succeeded, and [`CliError`] on connection
 /// failure, a server error status or an output failure.
-pub async fn watch(config: &Config, id: &str, out: &mut impl Write) -> Result<(), CliError> {
-    let mut client = connect(config).await?;
+pub(crate) async fn watch(
+    client: &mut Client,
+    id: &str,
+    out: &mut impl Write,
+) -> Result<(), CliError> {
     let mut last = None;
     loop {
         let job = client
@@ -56,13 +61,32 @@ pub async fn watch(config: &Config, id: &str, out: &mut impl Write) -> Result<()
         }
         if is_terminal(&job) {
             writeln!(out, "pr_url: {}", or_dash(job.pr_url.as_ref()))?;
-            writeln!(out, "error: {}", or_dash(job.error.as_ref()))?;
-            return if matches!(JobState::try_from(job.state), Ok(JobState::Succeeded)) {
-                Ok(())
-            } else {
-                Err(CliError::JobEnded(state_name(&job)))
-            };
+            writeln!(out, "error: {}", free_or_dash(job.error.as_ref()))?;
+            return require_success(&job);
         }
         tokio::time::sleep(POLL_INTERVAL).await;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn progress_is_cut_with_an_ellipsis_and_stripped() -> Result<(), std::io::Error> {
+        let job = Job {
+            phase: "run".into(),
+            progress: format!("{}\u{202E}", "x".repeat(300)),
+            ..Job::default()
+        };
+        let mut out = Vec::new();
+        write_change(&mut out, &job)?;
+        let text = String::from_utf8_lossy(&out).into_owned();
+        assert!(
+            text.ends_with(&format!("{}\u{2026}\n", "x".repeat(200))),
+            "{text}"
+        );
+        assert!(!text.contains('\u{202E}'), "{text:?}");
+        Ok(())
     }
 }

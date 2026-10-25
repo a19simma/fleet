@@ -55,6 +55,7 @@ pub struct Config {
     pub ca_cert: Option<PathBuf>,
     tls: bool,
     token: String,
+    token_warning: Option<String>,
 }
 
 fn non_empty(value: Option<String>) -> Option<String> {
@@ -70,9 +71,37 @@ pub fn token_path(lookup: &impl Fn(&str) -> Option<String>) -> Option<PathBuf> {
     Some(base.join("fleet").join("token"))
 }
 
-fn read_token_file(lookup: &impl Fn(&str) -> Option<String>) -> Option<String> {
-    let text = std::fs::read_to_string(token_path(lookup)?).ok()?;
-    non_empty(text.lines().next().map(|l| l.trim().to_owned()))
+struct TokenFile {
+    token: String,
+    warning: Option<String>,
+}
+
+#[cfg(unix)]
+fn permissive_mode_warning(path: &std::path::Path) -> Option<String> {
+    use std::os::unix::fs::PermissionsExt;
+    let mode = std::fs::metadata(path).ok()?.permissions().mode();
+    (mode & 0o077 != 0).then(|| {
+        format!(
+            "token file {} is accessible by group or other (mode {:03o}); run chmod 600 on it",
+            path.display(),
+            mode & 0o777
+        )
+    })
+}
+
+#[cfg(not(unix))]
+fn permissive_mode_warning(_: &std::path::Path) -> Option<String> {
+    None
+}
+
+fn read_token_file(lookup: &impl Fn(&str) -> Option<String>) -> Option<TokenFile> {
+    let path = token_path(lookup)?;
+    let text = std::fs::read_to_string(&path).ok()?;
+    let token = non_empty(text.lines().next().map(|l| l.trim().to_owned()))?;
+    Some(TokenFile {
+        token,
+        warning: permissive_mode_warning(&path),
+    })
 }
 
 fn is_loopback_host(host: &str) -> bool {
@@ -99,9 +128,12 @@ impl Config {
         let server = non_empty(server_flag)
             .or_else(|| non_empty(lookup(SERVER_VAR)))
             .ok_or(ConfigError::Missing(SERVER_VAR))?;
-        let token = non_empty(lookup(TOKEN_VAR))
-            .or_else(|| read_token_file(&lookup))
-            .ok_or(ConfigError::Missing(TOKEN_VAR))?;
+        let (token, token_warning) = if let Some(env_token) = non_empty(lookup(TOKEN_VAR)) {
+            (env_token.trim().to_owned(), None)
+        } else {
+            let file = read_token_file(&lookup).ok_or(ConfigError::Missing(TOKEN_VAR))?;
+            (file.token, file.warning)
+        };
         let ca_cert = non_empty(lookup(CA_VAR)).map(PathBuf::from);
         let insecure = insecure_flag || lookup(INSECURE_VAR).as_deref() == Some("1");
         let uri: Uri = server.parse().map_err(|_| ConfigError::InvalidServer)?;
@@ -122,12 +154,19 @@ impl Config {
             ca_cert,
             tls,
             token,
+            token_warning,
         })
     }
 
     /// Whether the server URL uses https.
     pub(crate) fn uses_tls(&self) -> bool {
         self.tls
+    }
+
+    /// A warning about the token file, set when the token came from a file that group or
+    /// other users can access.
+    pub fn token_warning(&self) -> Option<&str> {
+        self.token_warning.as_deref()
     }
 
     /// The `authorization` header value for requests.
@@ -143,6 +182,7 @@ impl fmt::Debug for Config {
             .field("ca_cert", &self.ca_cert)
             .field("tls", &self.tls)
             .field("token", &"[REDACTED]")
+            .field("token_warning", &self.token_warning)
             .finish()
     }
 }
@@ -253,6 +293,54 @@ mod tests {
             ]),
         )?;
         assert_eq!(config.bearer(), "Bearer env-token");
+        Ok(())
+    }
+
+    #[test]
+    fn env_token_is_trimmed_like_the_file() -> TestResult {
+        let config = Config::from_lookup(
+            None,
+            false,
+            env(&[(SERVER_VAR, "http://localhost:1"), (TOKEN_VAR, " tok\n")]),
+        )?;
+        assert_eq!(config.bearer(), "Bearer tok");
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    fn file_config(mode: u32, with_env: bool) -> Result<Config, Box<dyn std::error::Error>> {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir()?;
+        let path = dir.path().join("fleet");
+        std::fs::create_dir_all(&path)?;
+        std::fs::write(path.join("token"), "file-token\n")?;
+        std::fs::set_permissions(path.join("token"), std::fs::Permissions::from_mode(mode))?;
+        let base = dir.path().to_str().ok_or("utf8")?;
+        let mut pairs = vec![(SERVER_VAR, "http://localhost:1"), (XDG_VAR, base)];
+        if with_env {
+            pairs.push((TOKEN_VAR, "env-token"));
+        }
+        Ok(Config::from_lookup(None, false, env(&pairs))?)
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn token_file_with_group_or_other_bits_warns() -> TestResult {
+        for mode in [0o644, 0o640, 0o604, 0o660, 0o601] {
+            let warning = file_config(mode, false)?.token_warning().map(str::to_owned);
+            let text = warning.ok_or("expected a warning")?;
+            assert!(text.contains("chmod 600"), "{text}");
+            assert!(!text.contains("file-token"), "{text}");
+        }
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn private_token_file_and_env_token_do_not_warn() -> TestResult {
+        assert_eq!(file_config(0o600, false)?.token_warning(), None);
+        assert_eq!(file_config(0o400, false)?.token_warning(), None);
+        assert_eq!(file_config(0o644, true)?.token_warning(), None);
         Ok(())
     }
 
