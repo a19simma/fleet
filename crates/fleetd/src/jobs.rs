@@ -18,7 +18,7 @@ use crate::poller::{
     Token, channel,
 };
 use crate::runner::{AgentOutcome, AgentRunner, RunConfig};
-use crate::workspace::Workspace;
+use crate::workspace::{RepoPolicy, Workspace};
 
 const ERR_WORKSPACE: &str = "workspace could not be prepared";
 
@@ -91,8 +91,13 @@ pub(crate) fn build(
     let reporter = GrpcReporter::new(channel.clone(), &token)?;
     let mut run = RunConfig::new(&config.claude_bin, config.disposable);
     run.gh_bin.clone_from(&config.gh_bin);
+    let mut policy = RepoPolicy::new(config.repo_hosts.iter().cloned());
+    if config.allow_file_repos {
+        policy = policy.with_file_repos();
+    }
+    run.repo_policy = policy.clone();
     let runner = DaemonRunner {
-        workspace: Workspace::new(PathBuf::from(&config.jobs_dir)),
+        workspace: Workspace::new(PathBuf::from(&config.jobs_dir)).with_policy(policy),
         agent: AgentRunner::new(run, reporter, redactor),
     };
     Poller::with_channel(

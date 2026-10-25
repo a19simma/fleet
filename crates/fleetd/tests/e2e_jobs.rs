@@ -143,7 +143,9 @@ async fn a_submitted_job_runs_to_a_pushed_branch_and_a_pull_request(pool: PgPool
         dir.path().join("secrets.env"),
     );
     std::fs::write(dir.path().join("secrets.env"), "")?;
-    let config = Config::resolve(Some(&file), &|_| None)?;
+    let mut config = Config::resolve(Some(&file), &|_| None)?;
+    config.allow_file_repos = true;
+    config.repo_hosts.clear();
     let daemon_url = url.clone();
     let env = move |name: &str| match name {
         "FLEET_SERVER_URL" => Some(daemon_url.clone()),

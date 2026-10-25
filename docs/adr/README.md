@@ -17,6 +17,6 @@ ADRs for fleetd, the Fleet server and the `fleet` CLI. The plan is in `../plan.m
 | [0021](0021-job-protocol.md) | Job protocol | Accepted, built in the server and the daemon, supersedes the claim and lease sketch of 0016 where they differ |
 | [0022](0022-job-transcripts-on-the-server.md) | Job transcripts on the server | Accepted, built in the server, amends 0013 |
 | [0023](0023-two-bearer-token-scopes.md) | Two bearer token scopes | Accepted, built in the server, amends 0014 |
-| [0024](0024-job-git-credentials-and-permissions.md) | Job git credentials and permission policy | Accepted, runner, push and pull request step and reporter built and run by the daemon, amends 0011 |
+| [0024](0024-job-git-credentials-and-permissions.md) | Job git credentials and permission policy | Accepted, runner, push and pull request step and reporter built and run by the daemon, repo host allowlist and cleared workspace git added, amends 0011 |
 
 Each ADR has a "Decisions (2026-10-24)" section with the choices made when the docs moved into this repo: Apache-2.0 licence, repo github.com/a19simma/fleet, `fleet watch` as a client poll in v1, job cost deferred, Tailscale not a hard dependency.

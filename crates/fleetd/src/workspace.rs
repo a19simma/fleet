@@ -3,6 +3,7 @@
 //! Every input is validated before git runs. Error messages are fixed text and never carry
 //! the repo, ref, job id or git output.
 
+use std::ffi::OsString;
 use std::fmt;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
@@ -15,20 +16,86 @@ use crate::group::GroupGuard;
 const CACHE_DIR: &str = ".cache";
 const BRANCH_PREFIX: &str = "swarm/";
 const MAX_JOB_ID_LEN: usize = 64;
-const ALLOWED_PROTOCOLS: &str = "file:https:ssh:git";
+const HOME_DIR: &str = ".git-home";
+const DEFAULT_REPO_HOST: &str = "github.com";
+const PROTOCOLS: &str = "https";
+const PROTOCOLS_WITH_FILE: &str = "file:https";
 
 /// Longest a single git command may run before its process group is killed.
 pub const GIT_TIMEOUT: Duration = Duration::from_secs(300);
+
+/// Which repos a job may name: https on an allowed host.
+///
+/// [`RepoPolicy::with_file_repos`] also admits `file://` urls and absolute paths. Only code
+/// can turn it on: the config file and the environment have no key for it, so production
+/// runs never accept a local repo.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RepoPolicy {
+    hosts: Vec<String>,
+    allow_file: bool,
+}
+
+impl Default for RepoPolicy {
+    fn default() -> Self {
+        Self::new([DEFAULT_REPO_HOST])
+    }
+}
+
+impl RepoPolicy {
+    /// A policy that admits https repos on exactly `hosts`. No port is admitted.
+    #[must_use]
+    pub fn new<I, S>(hosts: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        Self {
+            hosts: hosts.into_iter().map(Into::into).collect(),
+            allow_file: false,
+        }
+    }
+
+    /// Also admits `file://` urls and absolute paths, and the `file` git transport. Meant
+    /// for tests that serve a local bare repo.
+    #[must_use]
+    pub fn with_file_repos(mut self) -> Self {
+        self.allow_file = true;
+        self
+    }
+
+    /// The allowed hosts.
+    #[must_use]
+    pub fn hosts(&self) -> &[String] {
+        &self.hosts
+    }
+
+    /// True when `host` equals an allowed host, ignoring ASCII case.
+    #[must_use]
+    pub fn allows_host(&self, host: &str) -> bool {
+        self.hosts.iter().any(|h| h.eq_ignore_ascii_case(host))
+    }
+
+    /// The value for `GIT_ALLOW_PROTOCOL` on a command that talks to the repo.
+    #[must_use]
+    pub fn protocols(&self) -> &'static str {
+        if self.allow_file {
+            PROTOCOLS_WITH_FILE
+        } else {
+            PROTOCOLS
+        }
+    }
+}
 
 /// Why a workspace could not be prepared.
 #[derive(Debug)]
 #[non_exhaustive]
 pub enum WorkspaceError {
-    /// The repo URL is empty, starts with `-`, carries userinfo or uses a disallowed form.
+    /// The repo is not https on an allowed host, is empty, starts with `-`, or uses a
+    /// disallowed form. A host mismatch covers userinfo, ports and look-alike hosts.
     InvalidRepo,
     /// The base ref is empty, starts with `-` or is not a plain ref name.
     InvalidRef,
-    /// The job id is not a short alphanumeric identifier.
+    /// The job id is not 1 to 64 bytes of ASCII letters, digits and `_`.
     InvalidJobId,
     /// A directory under the workspace root could not be created.
     Io(std::io::Error),
@@ -79,6 +146,8 @@ pub struct Workspace {
     root: PathBuf,
     git: PathBuf,
     timeout: Duration,
+    policy: RepoPolicy,
+    path_env: Option<OsString>,
 }
 
 impl Workspace {
@@ -89,7 +158,16 @@ impl Workspace {
             root: root.into(),
             git: PathBuf::from("git"),
             timeout: GIT_TIMEOUT,
+            policy: RepoPolicy::default(),
+            path_env: std::env::var_os("PATH"),
         }
+    }
+
+    /// Uses `policy` to judge repos instead of the default, https on `github.com`.
+    #[must_use]
+    pub fn with_policy(mut self, policy: RepoPolicy) -> Self {
+        self.policy = policy;
+        self
     }
 
     /// Uses `git` as the git binary and `timeout` as the per-command limit.
@@ -114,7 +192,7 @@ impl Workspace {
         base_ref: &str,
     ) -> Result<Checkout, WorkspaceError> {
         validate_job_id(job_id)?;
-        validate_repo(repo)?;
+        validate_repo(repo, &self.policy)?;
         validate_ref(base_ref)?;
 
         let cache = self.root.join(CACHE_DIR);
@@ -154,7 +232,7 @@ impl Workspace {
     /// Returns the first failure, with fixed text that carries no path or id.
     pub async fn remove(&self, job_id: &str, repo: &str) -> Result<(), WorkspaceError> {
         validate_job_id(job_id)?;
-        validate_repo(repo)?;
+        validate_repo(repo, &self.policy)?;
         let mut first = None;
         for path in [
             self.root.join(job_id),
@@ -194,12 +272,24 @@ impl Workspace {
                 "init",
             )
             .await?;
-            self.git(
+        }
+        match self
+            .git(
                 mirror,
-                &["remote", "add", "origin", "--", repo],
-                "remote add",
+                &["remote", "set-url", "origin", "--", repo],
+                "remote set-url",
             )
-            .await?;
+            .await
+        {
+            Err(WorkspaceError::Git(_)) => {
+                self.git(
+                    mirror,
+                    &["remote", "add", "origin", "--", repo],
+                    "remote add",
+                )
+                .await?;
+            }
+            other => other?,
         }
         self.git(
             mirror,
@@ -221,12 +311,33 @@ impl Workspace {
         args: &[&str],
         step: &'static str,
     ) -> Result<(), WorkspaceError> {
-        let mut child = Command::new(&self.git)
+        let home = self.root.join(HOME_DIR);
+        tokio::fs::create_dir_all(&home)
+            .await
+            .map_err(WorkspaceError::Io)?;
+        let mut command = Command::new(&self.git);
+        command.env_clear();
+        if let Some(path) = &self.path_env {
+            command.env("PATH", path);
+        }
+        let mut child = command
             .arg("-C")
             .arg(dir)
+            .args([
+                "-c",
+                "core.hooksPath=/dev/null",
+                "-c",
+                "core.fsmonitor=",
+                "-c",
+                "http.followRedirects=false",
+            ])
             .args(args)
+            .env("HOME", &home)
+            .env("XDG_CONFIG_HOME", home.join(".config"))
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_CONFIG_NOSYSTEM", "1")
             .env("GIT_TERMINAL_PROMPT", "0")
-            .env("GIT_ALLOW_PROTOCOL", ALLOWED_PROTOCOLS)
+            .env("GIT_ALLOW_PROTOCOL", self.policy.protocols())
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null())
@@ -265,7 +376,7 @@ pub(crate) fn validate_job_id(id: &str) -> Result<(), WorkspaceError> {
     }
 }
 
-pub(crate) fn validate_repo(repo: &str) -> Result<(), WorkspaceError> {
+pub(crate) fn validate_repo(repo: &str, policy: &RepoPolicy) -> Result<(), WorkspaceError> {
     let plain = !repo.is_empty()
         && !repo.starts_with('-')
         && !repo.contains("::")
@@ -273,12 +384,23 @@ pub(crate) fn validate_repo(repo: &str) -> Result<(), WorkspaceError> {
     if !plain {
         return Err(WorkspaceError::InvalidRepo);
     }
-    let after_scheme = repo.split_once("://").map_or(repo, |(_, rest)| rest);
-    let authority = after_scheme.split('/').next().unwrap_or_default();
-    if authority.contains('@') {
-        return Err(WorkspaceError::InvalidRepo);
+    if let Some(rest) = repo.strip_prefix("https://") {
+        let authority = rest.split(['/', '?', '#']).next().unwrap_or_default();
+        return if policy.allows_host(authority) {
+            Ok(())
+        } else {
+            Err(WorkspaceError::InvalidRepo)
+        };
     }
-    Ok(())
+    let local = repo.starts_with('/')
+        || repo
+            .strip_prefix("file://")
+            .is_some_and(|rest| rest.starts_with('/'));
+    if policy.allow_file && local {
+        Ok(())
+    } else {
+        Err(WorkspaceError::InvalidRepo)
+    }
 }
 
 pub(crate) fn validate_ref(name: &str) -> Result<(), WorkspaceError> {
@@ -301,5 +423,19 @@ pub(crate) fn validate_ref(name: &str) -> Result<(), WorkspaceError> {
         Ok(())
     } else {
         Err(WorkspaceError::InvalidRef)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use fleet_core::EventId;
+
+    use super::*;
+
+    #[test]
+    fn every_job_id_the_server_issues_passes_the_daemon_rule() {
+        for _ in 0..64 {
+            assert!(validate_job_id(&EventId::generate().to_string()).is_ok());
+        }
     }
 }

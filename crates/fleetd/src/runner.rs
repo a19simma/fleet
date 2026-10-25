@@ -14,7 +14,7 @@
 //! its own process group with an allowlisted environment and a scratch `HOME` and config
 //! dirs, so no agent-writable config is read. The push carries only `GIT_ASKPASS`, which
 //! names `fleetd askpass`, and the `GH_TOKEN` that helper prints, and `gh` only its own
-//! token. Push is limited to `file` and `https` remotes.
+//! token. Push is limited to `https` remotes on the [`RepoPolicy`] hosts.
 
 use std::collections::VecDeque;
 use std::ffi::OsString;
@@ -32,11 +32,12 @@ use tokio::process::{Child, ChildStdout, Command};
 use tokio::time::{Instant, MissedTickBehavior, Sleep};
 use tonic::{Code, Status};
 
+use crate::askpass;
 use crate::group::GroupGuard;
 use crate::now_ms;
 use crate::poller::{RunError, Shutdown};
 use crate::proc::{CaptureError, Captured, capture};
-use crate::workspace::{validate_job_id, validate_ref, validate_repo};
+use crate::workspace::{RepoPolicy, validate_job_id, validate_ref, validate_repo};
 
 /// Variables removed from the agent's own environment block.
 ///
@@ -132,6 +133,9 @@ pub struct RunConfig {
     /// The fleetd executable the push runs as `<path> askpass`, the current executable by
     /// default.
     pub askpass_bin: PathBuf,
+    /// Repos a job may push to. The push runs with only these hosts, and the askpass helper
+    /// answers only for them.
+    pub repo_policy: RepoPolicy,
     /// Git binary used to fetch, count, log and push commits, `git` by default.
     pub git_bin: PathBuf,
     /// Longest time for the finish step and for each helper command in it.
@@ -161,6 +165,7 @@ impl RunConfig {
             gh_bin: PathBuf::from("gh"),
             git_bin: PathBuf::from("git"),
             askpass_bin: std::env::current_exe().unwrap_or_else(|_| PathBuf::from("fleetd")),
+            repo_policy: RepoPolicy::default(),
             finish_timeout: DEFAULT_FINISH_TIMEOUT,
             disposable,
             timeout: DEFAULT_TIMEOUT,
@@ -319,10 +324,10 @@ impl<R: Reporter> AgentRunner<R> {
     /// global or system git config) and `gh` run from that repo with an allowlisted
     /// environment, a scratch `HOME` and scratch config dirs. The push holds only
     /// `GIT_ASKPASS` (`fleetd askpass`) and the `GH_TOKEN` it prints, and `gh` only its own
-    /// token, so config the agent planted cannot capture a token. The push allows `file` and
-    /// `https` remotes only. A failure sends a `FAILED` report with a fixed error and the
-    /// redacted, bounded tail of the helper's stderr as one transcript chunk. The raw output
-    /// goes nowhere else.
+    /// token, so config the agent planted cannot capture a token. The push allows `https`
+    /// remotes on the policy hosts only, and the helper answers only for those hosts. A
+    /// failure sends a `FAILED` report with a fixed error and the redacted, bounded tail of
+    /// the helper's stderr as one transcript chunk. The raw output goes nowhere else.
     ///
     /// # Errors
     ///
@@ -386,7 +391,7 @@ impl<R: Reporter> AgentRunner<R> {
 
     async fn publish(&self, job: &Job, cwd: &Path) -> Result<Published, Failure> {
         validate_job_id(&job.job_id).map_err(|_| Failure::bare(ERR_COMMITS))?;
-        validate_repo(&job.repo).map_err(|_| Failure::bare(ERR_PUSH))?;
+        validate_repo(&job.repo, &self.config.repo_policy).map_err(|_| Failure::bare(ERR_PUSH))?;
         validate_ref(&job.base_ref).map_err(|_| Failure::bare(ERR_COMMITS))?;
         let branch = format!("swarm/{}", job.job_id);
         let scratch = Scratch::create(cwd, &job.job_id).map_err(|()| Failure::bare(ERR_COMMITS))?;
@@ -407,6 +412,8 @@ impl<R: Reporter> AgentRunner<R> {
                     "core.hooksPath=/dev/null",
                     "-c",
                     "core.fsmonitor=",
+                    "-c",
+                    "http.followRedirects=false",
                     "-c",
                     "credential.helper=",
                     "push",
@@ -587,8 +594,12 @@ impl<R: Reporter> AgentRunner<R> {
         match scope {
             Scope::Clean => command.env("GIT_ALLOW_PROTOCOL", "file"),
             Scope::Push => command
-                .env("GIT_ALLOW_PROTOCOL", "file:https")
-                .env("GIT_ASKPASS", askpass_command(&self.config.askpass_bin)),
+                .env("GIT_ALLOW_PROTOCOL", self.config.repo_policy.protocols())
+                .env("GIT_ASKPASS", askpass_command(&self.config.askpass_bin))
+                .env(
+                    askpass::HOSTS_ENV,
+                    self.config.repo_policy.hosts().join(","),
+                ),
             Scope::Gh => command
                 .env("GH_CONFIG_DIR", dir.join(GH_CONFIG_DIR))
                 .env("GH_NO_UPDATE_NOTIFIER", "1")
