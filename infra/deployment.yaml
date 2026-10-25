@@ -1,0 +1,75 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: fleet-server
+  namespace: fleet-server
+  labels:
+    app: fleet-server
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: fleet-server
+  template:
+    metadata:
+      labels:
+        app: fleet-server
+    spec:
+      automountServiceAccountToken: false
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65532
+        runAsGroup: 65532
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: fleet-server
+          image: ghcr.io/a19simma/fleet-server:0.2.1
+          ports:
+            - name: grpc
+              containerPort: 7070
+            - name: health
+              containerPort: 7072
+          env:
+            - name: FLEET_LISTEN
+              value: "0.0.0.0:7070"
+            - name: FLEET_HEALTH_LISTEN
+              value: "0.0.0.0:7072"
+            - name: FLEET_DATABASE_URL
+              valueFrom:
+                secretKeyRef:
+                  name: fleet-server-secrets
+                  key: FLEET_DATABASE_URL
+            - name: FLEET_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: fleet-server-secrets
+                  key: FLEET_TOKEN
+            - name: FLEET_CLIENT_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: fleet-server-secrets
+                  key: FLEET_CLIENT_TOKEN
+                  optional: true
+          readinessProbe:
+            httpGet:
+              path: /healthz
+              port: health
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: health
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop:
+                - ALL
+          resources:
+            requests:
+              cpu: 50m
+              memory: 64Mi
+              ephemeral-storage: 64Mi
+            limits:
+              memory: 256Mi
+              ephemeral-storage: 128Mi
