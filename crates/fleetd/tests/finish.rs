@@ -46,7 +46,10 @@ root="$GIT_DIR/.."
 env > "$root/git-$sub.env"
 printf '%s\n' "$@" > "$root/git-$sub.args"
 if [ "$sub" = rev-list ] && [ -e "$root/emptycount" ]; then exit 0; fi
-if [ "$sub" = push ] && [ -e "$root/slow" ]; then sleep 1; fi
+if [ "$sub" = push ] && [ -e "$root/hold" ]; then
+  i=0
+  while [ ! -e "$root/release" ] && [ "$i" -lt 600 ]; do sleep 0.05; i=$((i + 1)); done
+fi
 exec git "$@"
 "#;
 
@@ -521,22 +524,30 @@ async fn the_lease_is_renewed_while_the_push_runs() -> TestResult {
     common::bounded(Box::pin(async {
         let rig = rig("ok").await?;
         commit(&rig)?;
-        std::fs::write(rig.dir.path().join("slow"), "")?;
+        std::fs::write(rig.dir.path().join("work").join("hold"), "")?;
         let (agent, mut rx) = agent_paced(
             &rig,
             PathBuf::from(env!("CARGO_BIN_EXE_fleetd")),
             Duration::from_millis(100),
         );
         let (_trigger, shutdown) = Shutdown::channel();
-        agent
-            .finish(&job(&rig, true), &rig.worktree, shutdown)
-            .await?;
-        let reports = drain(&mut rx);
-        let renewals = reports
-            .iter()
-            .filter(|r| r.chunks.is_empty() && r.terminal_state.is_none())
-            .count();
-        assert!(renewals >= 3, "renewals: {renewals}");
+        let release = rig.dir.path().join("work").join("release");
+        let releaser = async {
+            let mut renewals = 0;
+            while renewals < 3 {
+                let report = rx.recv().await.ok_or("reports ended")?;
+                if report.chunks.is_empty() && report.terminal_state.is_none() {
+                    renewals += 1;
+                }
+            }
+            std::fs::write(&release, "")?;
+            Ok::<_, Box<dyn std::error::Error>>(renewals)
+        };
+        let spec = job(&rig, true);
+        let (finished, renewals) =
+            tokio::join!(agent.finish(&spec, &rig.worktree, shutdown), releaser);
+        finished?;
+        assert!(renewals? >= 3);
         Ok(())
     }))
     .await
@@ -547,7 +558,7 @@ async fn a_lost_lease_skips_the_push_and_the_terminal_report() -> TestResult {
     common::bounded(Box::pin(async {
         let rig = rig("ok").await?;
         commit(&rig)?;
-        std::fs::write(rig.dir.path().join("slow"), "")?;
+        std::fs::write(rig.dir.path().join("work").join("hold"), "")?;
         let (agent, mut rx) = agent_replying(&rig, Reply::Stale);
         let (_trigger, shutdown) = Shutdown::channel();
         let outcome = agent
@@ -566,7 +577,7 @@ async fn a_cancel_reply_stops_the_push_and_reports_cancelled() -> TestResult {
     common::bounded(Box::pin(async {
         let rig = rig("ok").await?;
         commit(&rig)?;
-        std::fs::write(rig.dir.path().join("slow"), "")?;
+        std::fs::write(rig.dir.path().join("work").join("hold"), "")?;
         let (agent, mut rx) = agent_replying(&rig, Reply::Cancel);
         let (_trigger, shutdown) = Shutdown::channel();
         let outcome = agent
