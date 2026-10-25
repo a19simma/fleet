@@ -13,6 +13,7 @@ use fleet_proto::v1::{
 };
 use fleet_server::auth::BearerAuth;
 use fleet_server::config::Token;
+use fleet_server::jobs::MAX_CHUNKS_PER_REPORT;
 use fleet_server::service::{CLAIM_INTERVAL_S, router};
 use fleet_server::store::Store;
 use sqlx::PgPool;
@@ -249,16 +250,29 @@ async fn invalid_chunk_is_invalid_argument(pool: PgPool) {
         .into_inner()
         .job
         .unwrap();
-    let mut bad = report(&job.job_id, job.attempt, &name);
-    bad.chunks = vec![TranscriptChunk {
-        seq: 1,
+    let piece = |seq: u64, text: &str| TranscriptChunk {
+        seq,
         ts_ms: 1,
-        text: "bad\0text".to_owned(),
+        text: text.to_owned(),
         truncated: false,
-    }];
-    let status = worker.report_job(bad).await.unwrap_err();
-    assert_eq!(status.code(), Code::InvalidArgument);
-    assert_eq!(status.message(), "invalid transcript chunk");
+    };
+    let too_many = (1..=u64::try_from(MAX_CHUNKS_PER_REPORT).unwrap() + 1)
+        .map(|seq| piece(seq, "x"))
+        .collect();
+    let cases = [
+        vec![piece(1, "bad\0text")],
+        vec![piece(0, "x")],
+        vec![piece(2, "x"), piece(1, "y")],
+        vec![piece(1, "x"), piece(1, "y")],
+        too_many,
+    ];
+    for chunks in cases {
+        let mut bad = report(&job.job_id, job.attempt, &name);
+        bad.chunks = chunks;
+        let status = worker.report_job(bad).await.unwrap_err();
+        assert_eq!(status.code(), Code::InvalidArgument);
+        assert_eq!(status.message(), "invalid transcript chunk");
+    }
 }
 
 #[sqlx::test]

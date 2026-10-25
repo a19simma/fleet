@@ -12,6 +12,15 @@ pub const MAX_PROMPT_BYTES: usize = 64 * 1024;
 pub const MAX_REPO_BYTES: usize = 2048;
 /// Longest accepted base ref, in bytes.
 pub const MAX_BASE_REF_BYTES: usize = 255;
+/// Longest accepted terminal branch, in bytes.
+pub const MAX_BRANCH_BYTES: usize = 128;
+/// Longest accepted job id, in bytes.
+pub const MAX_JOB_ID_BYTES: usize = 64;
+pub use fleet_proto::MAX_CHUNKS_PER_REPORT;
+/// Transcript rows stored per job. The first chunk past this becomes the marker row.
+pub const MAX_TRANSCRIPT_ROWS: i64 = 50_000;
+/// Bytes charged against [`MAX_TRANSCRIPT_BYTES`] for any chunk, so empty text still costs.
+pub const MIN_CHUNK_COST_BYTES: usize = 64;
 
 /// Transcript bytes stored per job. Chunks past this are dropped after one marker row.
 pub const MAX_TRANSCRIPT_BYTES: usize = 4 * 1024 * 1024;
@@ -33,19 +42,20 @@ pub enum JobInvalid {
     Key,
     /// The prompt is empty, too long or contains a NUL character.
     Prompt,
-    /// The repository is not an `https://` URL of bounded length without whitespace or
-    /// credentials in the authority.
+    /// The repository is not an `https://` URL of bounded length without whitespace,
+    /// backslashes or credentials in the authority.
     Repo,
     /// The base ref is empty, too long, starts with `-` or has whitespace or control
     /// characters.
     BaseRef,
     /// The terminal state is not `SUCCEEDED`, `FAILED` or `CANCELLED`.
     TerminalState,
-    /// The pull request URL is not a bounded `https://` URL without whitespace.
+    /// The pull request URL fails the same rules as the repository URL.
     PrUrl,
     /// The error text contains a NUL character.
     Error,
-    /// The branch is empty, too long or has whitespace or control characters.
+    /// The branch does not start with `swarm/`, is too long or has whitespace or control
+    /// characters.
     Branch,
     /// The job id is empty, too long or has characters outside printable ASCII.
     JobId,
@@ -96,8 +106,13 @@ fn bare_token(text: &str, max: usize) -> bool {
     !text.is_empty() && text.len() <= max && text.bytes().all(|b| b.is_ascii_graphic())
 }
 
-/// Longest accepted job id, in bytes.
-pub const MAX_JOB_ID_BYTES: usize = 64;
+fn https_url(url: &str, max: usize) -> bool {
+    let Some(rest) = url.strip_prefix("https://") else {
+        return false;
+    };
+    let authority = rest.split(['/', '?', '#']).next().unwrap_or_default();
+    bare_token(url, max) && !authority.is_empty() && !authority.contains('@') && !url.contains('\\')
+}
 
 /// Validates a job id taken from a client request.
 ///
@@ -128,10 +143,7 @@ pub fn validate_submit(request: &SubmitJobRequest) -> Result<NewJob, JobInvalid>
     {
         return Err(JobInvalid::Prompt);
     }
-    let https = request.repo.strip_prefix("https://").unwrap_or_default();
-    let authority = https.split(['/', '?', '#']).next().unwrap_or_default();
-    if !bare_token(&request.repo, MAX_REPO_BYTES) || authority.is_empty() || authority.contains('@')
-    {
+    if !https_url(&request.repo, MAX_REPO_BYTES) {
         return Err(JobInvalid::Repo);
     }
     if !bare_token(&request.base_ref, MAX_BASE_REF_BYTES) || request.base_ref.starts_with('-') {
@@ -165,17 +177,16 @@ pub(crate) fn validate_terminal(
         Ok(JobState::Cancelled) => "CANCELLED",
         _ => return Err(JobInvalid::TerminalState),
     };
-    if let Some(url) = &request.pr_url {
-        let host = url.strip_prefix("https://").unwrap_or_default();
-        if !bare_token(url, MAX_PR_URL_BYTES) || host.is_empty() {
-            return Err(JobInvalid::PrUrl);
-        }
+    if let Some(url) = &request.pr_url
+        && !https_url(url, MAX_PR_URL_BYTES)
+    {
+        return Err(JobInvalid::PrUrl);
     }
     if request.error.as_deref().is_some_and(|e| e.contains('\0')) {
         return Err(JobInvalid::Error);
     }
     if let Some(branch) = &request.branch
-        && !bare_token(branch, MAX_BASE_REF_BYTES)
+        && !(bare_token(branch, MAX_BRANCH_BYTES) && branch.starts_with("swarm/"))
     {
         return Err(JobInvalid::Branch);
     }

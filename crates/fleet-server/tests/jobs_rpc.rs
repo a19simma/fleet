@@ -7,6 +7,7 @@
 use std::net::SocketAddr;
 use std::time::Duration;
 
+use fleet_core::BoxName;
 use fleet_proto::v1::fleet_jobs_client::FleetJobsClient;
 use fleet_proto::v1::{
     CancelJobRequest, GetJobRequest, JobState, ListJobsRequest, ReadTranscriptRequest,
@@ -28,6 +29,10 @@ const TOKEN: &str = "test-token-0123456789abcdef0123456789";
 const WAIT: Duration = Duration::from_secs(30);
 
 type Interceptor = fn(Request<()>) -> Result<Request<()>, Status>;
+
+fn boxed(n: u32) -> BoxName {
+    BoxName::new(&box_name(n)).unwrap()
+}
 
 fn box_name(n: u32) -> String {
     format!("box-{n}")
@@ -179,7 +184,7 @@ async fn submit_get_list(pool: PgPool) {
         .jobs;
     assert_eq!(limited.len(), 2);
 
-    store.claim_job(&box_name(1)).await.unwrap().unwrap();
+    store.claim_job(&boxed(1)).await.unwrap().unwrap();
     let running = jobs
         .list_jobs(ListJobsRequest {
             state: Some(JobState::Running as i32),
@@ -300,7 +305,7 @@ async fn cancel_queued_and_running(pool: PgPool) {
     assert_eq!(cancelled.state(), JobState::Cancelled);
     assert!(cancelled.finished_at_ms.is_some());
 
-    let claimed = store.claim_job(&box_name(1)).await.unwrap().unwrap();
+    let claimed = store.claim_job(&boxed(1)).await.unwrap().unwrap();
     assert_eq!(claimed.job_id, running.job_id);
     let flagged = jobs
         .cancel_job(cancel(&running.job_id))
@@ -330,7 +335,7 @@ async fn read_transcript_pages_and_done(pool: PgPool) {
         .await
         .unwrap()
         .into_inner();
-    store.claim_job(&box_name(1)).await.unwrap().unwrap();
+    store.claim_job(&boxed(1)).await.unwrap().unwrap();
 
     let empty = timeout(WAIT, jobs.read_transcript(read(&job.job_id, 0, 0)))
         .await
@@ -341,11 +346,10 @@ async fn read_transcript_pages_and_done(pool: PgPool) {
     assert!(!empty.done);
 
     store
-        .report_job(&report(
-            &job.job_id,
-            vec![chunk(1), chunk(2), chunk(3)],
-            false,
-        ))
+        .report_job(
+            &boxed(1),
+            &report(&job.job_id, vec![chunk(1), chunk(2), chunk(3)], false),
+        )
         .await
         .unwrap();
 
@@ -370,7 +374,7 @@ async fn read_transcript_pages_and_done(pool: PgPool) {
     assert!(!rest.done);
 
     store
-        .report_job(&report(&job.job_id, Vec::new(), true))
+        .report_job(&boxed(1), &report(&job.job_id, Vec::new(), true))
         .await
         .unwrap();
 

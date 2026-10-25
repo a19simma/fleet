@@ -11,6 +11,7 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::Duration;
 
 use fleet_core::Redactor;
+use fleet_proto::MAX_CHUNKS_PER_REPORT;
 use fleet_proto::v1::{Job, JobState, ReportJobReply, ReportJobRequest};
 use fleetd::poller::{RunError, Shutdown};
 use fleetd::runner::{AgentOutcome, AgentRunner, Reporter, RunConfig};
@@ -51,6 +52,7 @@ badutf8) printf 'a\377b\nnext\n'; exit 0 ;;
 stubborn) trap '' TERM; sleep 300 > "$path" & wait ;;
 term) trap 'echo t > "$path.marker"; exit 0' TERM; sleep 300 > "$path" & wait ;;
 closed) exec 1>&-; : > "$path.closed"; read x < "$path"; exit 0 ;;
+burst) i=0; while [ $i -lt 700 ]; do echo x; i=$((i+1)); done; exit 0 ;;
 huge) head -c 3000000 /dev/zero | tr '\0' a; echo; echo next; exit 0 ;;
 reap) echo $$ > "$path"; read x < "$path.go"; exit 0 ;;
 esac
@@ -355,6 +357,28 @@ async fn runner_resends_chunks_after_a_failed_report() -> TestResult {
         .flat_map(|r| r.chunks.iter().map(|c| c.seq))
         .collect();
     assert_eq!(chunks, vec![1, 2]);
+    Ok(())
+}
+
+#[tokio::test]
+async fn runner_caps_a_report_by_chunk_count() -> TestResult {
+    let dir = TempDir::new()?;
+    let mut cfg = config(false);
+    cfg.report_interval = Duration::from_millis(50);
+    let (agent, mut rx) = runner(cfg, 2);
+    let (_trigger, shutdown) = Shutdown::channel();
+    agent.run(&job("burst:"), dir.path(), shutdown).await?;
+    let requests = drain(&mut rx);
+    assert!(
+        requests
+            .iter()
+            .all(|r| r.chunks.len() <= MAX_CHUNKS_PER_REPORT)
+    );
+    let seqs: Vec<_> = requests
+        .iter()
+        .flat_map(|r| r.chunks.iter().map(|c| c.seq))
+        .collect();
+    assert_eq!(seqs, (1..=700).collect::<Vec<u64>>());
     Ok(())
 }
 

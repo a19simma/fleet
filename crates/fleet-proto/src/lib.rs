@@ -7,6 +7,9 @@ mod convert;
 
 pub use convert::{ConvertError, queued_event, validate_box};
 
+/// Most transcript chunks one report may carry. The server rejects more.
+pub const MAX_CHUNKS_PER_REPORT: usize = 256;
+
 /// Generated `fleet.v1` messages and services.
 #[expect(
     missing_docs,

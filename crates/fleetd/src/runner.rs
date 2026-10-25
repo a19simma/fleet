@@ -25,6 +25,7 @@ use std::process::{ExitStatus, Stdio};
 use std::time::Duration;
 
 use fleet_core::Redactor;
+use fleet_proto::MAX_CHUNKS_PER_REPORT;
 use fleet_proto::v1::{Job, JobState, ReportJobReply, ReportJobRequest, TranscriptChunk};
 use serde_json::Value;
 use tokio::io::{AsyncBufRead, AsyncBufReadExt, BufReader};
@@ -863,7 +864,9 @@ impl<'a, R: Reporter> Stream<'a, R> {
         let mut bytes = 0;
         let mut count = 0;
         for chunk in &self.pending {
-            if count > 0 && bytes + chunk.text.len() > MAX_REQUEST_BYTES {
+            if count >= MAX_CHUNKS_PER_REPORT
+                || (count > 0 && bytes + chunk.text.len() > MAX_REQUEST_BYTES)
+            {
                 break;
             }
             bytes += chunk.text.len();
