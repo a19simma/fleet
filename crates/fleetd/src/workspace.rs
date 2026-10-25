@@ -7,6 +7,8 @@ use std::ffi::OsString;
 use std::fmt;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use sha2::{Digest, Sha256};
@@ -26,6 +28,8 @@ const PROTOCOLS_WITH_FILE: &str = "file:https";
 const MIRROR_CONFIG: &str =
     "[core]\n\trepositoryformatversion = 0\n\tfilemode = true\n\tbare = true\n";
 const MIRROR_CONFIG_STAGING: &str = "config.fleetd-new";
+const REDIRECT_FILES: [&str; 2] = ["commondir", "config.worktree"];
+static STAGING_SEQ: AtomicU64 = AtomicU64::new(0);
 const PINNED_CONFIG: [&str; 14] = [
     "-c",
     "core.hooksPath=/dev/null",
@@ -198,6 +202,15 @@ impl fmt::Debug for Credential {
     }
 }
 
+#[derive(Clone)]
+struct BeforeFetch(Arc<dyn Fn(&Path) + Send + Sync>);
+
+impl fmt::Debug for BeforeFetch {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("BeforeFetch")
+    }
+}
+
 /// Creates job worktrees under a configurable root.
 #[derive(Debug, Clone)]
 pub struct Workspace {
@@ -207,6 +220,7 @@ pub struct Workspace {
     policy: RepoPolicy,
     path_env: Option<OsString>,
     credential: Option<Credential>,
+    before_fetch: Option<BeforeFetch>,
 }
 
 impl Workspace {
@@ -220,7 +234,17 @@ impl Workspace {
             policy: RepoPolicy::default(),
             path_env: std::env::var_os("PATH"),
             credential: None,
+            before_fetch: None,
         }
+    }
+
+    /// Test seam: runs `hook` with the mirror path after the mirror cleanup and config reset,
+    /// right before the fetch, to model an agent writing into the mirror in that window.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn with_before_fetch(mut self, hook: impl Fn(&Path) + Send + Sync + 'static) -> Self {
+        self.before_fetch = Some(BeforeFetch(Arc::new(hook)));
+        self
     }
 
     /// Lets the mirror fetch of a repo on the policy's token host authenticate through
@@ -251,7 +275,12 @@ impl Workspace {
     }
 
     /// Resets the bare mirror's config, fetches `repo` into it by explicit url, then runs
-    /// `git worktree add -b swarm/<job_id>` from `origin/<base_ref>`.
+    /// `git worktree add -B swarm/<job_id>` from `origin/<base_ref>`.
+    ///
+    /// A leftover worktree directory or branch of the same job id, from a prepare that was
+    /// killed or never removed, is replaced. Before the fetch, stale `*.lock` files in the
+    /// mirror are deleted. That is safe only when one daemon uses the jobs directory and runs
+    /// its jobs one at a time, so the jobs directory must belong to one daemon.
     ///
     /// # Errors
     ///
@@ -275,6 +304,13 @@ impl Workspace {
         self.sync_mirror(&mirror, repo).await?;
 
         let path = self.root.join(job_id);
+        match tokio::fs::remove_dir_all(&path).await {
+            Ok(()) => {}
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+            Err(err) => return Err(WorkspaceError::Io(err)),
+        }
+        self.git(&mirror, &["worktree", "prune"], "worktree prune")
+            .await?;
         let branch = format!("{BRANCH_PREFIX}{job_id}");
         let start = format!("origin/{base_ref}");
         self.git(
@@ -282,7 +318,7 @@ impl Workspace {
             &[
                 "worktree",
                 "add",
-                "-b",
+                "-B",
                 &branch,
                 path.to_str().ok_or(WorkspaceError::InvalidJobId)?,
                 &start,
@@ -296,8 +332,8 @@ impl Workspace {
 
 impl Workspace {
     /// Removes the job's worktree and its `.finish-<job_id>` scratch dir, then prunes the
-    /// mirror's worktree records. The bare mirror stays. Every step runs even when an
-    /// earlier one fails.
+    /// mirror's worktree records and deletes the job's branch. The bare mirror stays. Every
+    /// step runs even when an earlier one fails.
     ///
     /// # Errors
     ///
@@ -326,6 +362,15 @@ impl Workspace {
         {
             first.get_or_insert(err);
         }
+        if mirror.join("HEAD").exists() {
+            let reference = format!("refs/heads/{BRANCH_PREFIX}{job_id}");
+            if let Err(err) = self
+                .git(&mirror, &["update-ref", "-d", &reference], "branch delete")
+                .await
+            {
+                first.get_or_insert(err);
+            }
+        }
         first.map_or(Ok(()), Err)
     }
 
@@ -335,29 +380,69 @@ impl Workspace {
             .join(format!("{:x}.git", Sha256::digest(repo.as_bytes())))
     }
 
-    async fn reset_mirror_config(mirror: &Path) -> Result<(), WorkspaceError> {
+    async fn clear_redirects(mirror: &Path) -> Result<(), WorkspaceError> {
+        for name in REDIRECT_FILES {
+            match tokio::fs::remove_file(mirror.join(name)).await {
+                Ok(()) => {}
+                Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+                Err(err) => return Err(WorkspaceError::Io(err)),
+            }
+        }
+        Ok(())
+    }
+
+    async fn clear_stale_locks(mirror: &Path) -> Result<(), WorkspaceError> {
+        let mut pending = vec![mirror.to_path_buf()];
+        while let Some(dir) = pending.pop() {
+            let mut entries = tokio::fs::read_dir(&dir)
+                .await
+                .map_err(WorkspaceError::Io)?;
+            while let Some(entry) = entries.next_entry().await.map_err(WorkspaceError::Io)? {
+                let kind = entry.file_type().await.map_err(WorkspaceError::Io)?;
+                let name = entry.file_name();
+                if kind.is_dir() {
+                    if name != "objects" {
+                        pending.push(entry.path());
+                    }
+                } else if Path::new(&name)
+                    .extension()
+                    .is_some_and(|ext| ext.eq_ignore_ascii_case("lock"))
+                {
+                    match tokio::fs::remove_file(entry.path()).await {
+                        Ok(()) => {}
+                        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+                        Err(err) => return Err(WorkspaceError::Io(err)),
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    pub(crate) async fn reset_mirror_config(mirror: &Path) -> Result<(), WorkspaceError> {
         if !mirror.join("HEAD").exists() {
             return Ok(());
         }
-        let staging = mirror.join(MIRROR_CONFIG_STAGING);
-        match tokio::fs::remove_file(&staging).await {
-            Ok(()) => {}
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
-            Err(err) => return Err(WorkspaceError::Io(err)),
+        let staging = mirror.join(format!(
+            "{MIRROR_CONFIG_STAGING}-{}-{}",
+            std::process::id(),
+            STAGING_SEQ.fetch_add(1, Ordering::Relaxed)
+        ));
+        let written = async {
+            let mut file = tokio::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&staging)
+                .await?;
+            file.write_all(MIRROR_CONFIG.as_bytes()).await?;
+            drop(file);
+            tokio::fs::rename(&staging, mirror.join("config")).await
         }
-        let mut file = tokio::fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&staging)
-            .await
-            .map_err(WorkspaceError::Io)?;
-        file.write_all(MIRROR_CONFIG.as_bytes())
-            .await
-            .map_err(WorkspaceError::Io)?;
-        drop(file);
-        tokio::fs::rename(&staging, mirror.join("config"))
-            .await
-            .map_err(WorkspaceError::Io)
+        .await;
+        if written.is_err() {
+            let _ = tokio::fs::remove_file(&staging).await;
+        }
+        written.map_err(WorkspaceError::Io)
     }
 
     fn fetch_credential(&self, repo: &str) -> Option<(&Credential, &str)> {
@@ -382,7 +467,14 @@ impl Workspace {
             )
             .await?;
         }
+        if mirror.join("HEAD").exists() {
+            Self::clear_redirects(mirror).await?;
+            Self::clear_stale_locks(mirror).await?;
+        }
         Self::reset_mirror_config(mirror).await?;
+        if let Some(BeforeFetch(hook)) = &self.before_fetch {
+            hook(mirror);
+        }
         self.run_git(
             mirror,
             &[
@@ -429,6 +521,12 @@ impl Workspace {
                 .env("GIT_ASKPASS", askpass::command(&credential.askpass_bin))
                 .env(askpass::HOST_ENV, host)
                 .env("GH_TOKEN", &credential.token);
+        }
+        if args.first() != Some(&"init") {
+            let git_dir = std::path::absolute(dir).map_err(WorkspaceError::Io)?;
+            command
+                .env("GIT_DIR", &git_dir)
+                .env("GIT_COMMON_DIR", &git_dir);
         }
         let mut child = command
             .arg("-C")
@@ -528,6 +626,39 @@ mod tests {
     use fleet_core::EventId;
 
     use super::*;
+
+    #[tokio::test]
+    async fn concurrent_config_resets_on_one_mirror_all_succeed()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let dir = tempfile::TempDir::new()?;
+        std::fs::write(dir.path().join("HEAD"), "ref: refs/heads/main\n")?;
+        for _ in 0..20 {
+            let mut tasks = Vec::new();
+            for _ in 0..16 {
+                let mirror = dir.path().to_path_buf();
+                tasks.push(tokio::spawn(async move {
+                    Workspace::reset_mirror_config(&mirror).await.is_ok()
+                }));
+            }
+            for task in tasks {
+                assert!(task.await?);
+            }
+        }
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("config"))?,
+            MIRROR_CONFIG
+        );
+        let leftovers = std::fs::read_dir(dir.path())?
+            .filter_map(Result::ok)
+            .filter(|e| {
+                e.file_name()
+                    .to_string_lossy()
+                    .starts_with(MIRROR_CONFIG_STAGING)
+            })
+            .count();
+        assert_eq!(leftovers, 0);
+        Ok(())
+    }
 
     #[test]
     fn every_job_id_the_server_issues_passes_the_daemon_rule() {

@@ -99,11 +99,22 @@ const REPO: &str = "https://github.com/o/r.git";
 async fn every_call_runs_with_a_cleared_environment() -> TestResult {
     common::bounded(Box::pin(async {
         let (_dir, _root, all) = run(default_run(), REPO).await?;
-        assert_eq!(all.len(), 3);
+        assert_eq!(all.len(), 4);
         let expected = [
             "GIT_ALLOW_PROTOCOL",
             "GIT_CONFIG_GLOBAL",
             "GIT_CONFIG_NOSYSTEM",
+            "GIT_TERMINAL_PROMPT",
+            "HOME",
+            "PATH",
+            "XDG_CONFIG_HOME",
+        ];
+        let pinned = [
+            "GIT_ALLOW_PROTOCOL",
+            "GIT_COMMON_DIR",
+            "GIT_CONFIG_GLOBAL",
+            "GIT_CONFIG_NOSYSTEM",
+            "GIT_DIR",
             "GIT_TERMINAL_PROMPT",
             "HOME",
             "PATH",
@@ -116,8 +127,85 @@ async fn every_call_runs_with_a_cleared_environment() -> TestResult {
                 .map(String::as_str)
                 .filter(|n| !matches!(*n, "PWD" | "OLDPWD" | "SHLVL" | "_"))
                 .collect();
-            assert_eq!(names, expected, "{}", call.args);
+            let init = call.args.contains(" init ");
+            assert_eq!(
+                names,
+                if init { &expected[..] } else { &pinned[..] },
+                "{}",
+                call.args
+            );
         }
+        Ok(())
+    }))
+    .await
+}
+
+#[tokio::test]
+async fn the_git_dir_pins_equal_the_absolute_mirror_path() -> TestResult {
+    common::bounded(Box::pin(async {
+        let (_dir, root, all) = run(default_run(), REPO).await?;
+        let mirror = root
+            .join(".cache")
+            .join("bc3fbd4dd8dbadfc9793e2a816228cf8fa84d7954992c487a510aced135fecdf.git");
+        let mirror = mirror.to_str().ok_or("path")?;
+        assert!(Path::new(mirror).is_absolute());
+        let mut pinned = 0;
+        for call in all.iter().filter(|c| !c.args.contains(" init ")) {
+            assert_eq!(call.env.get("GIT_DIR").map(String::as_str), Some(mirror));
+            assert_eq!(
+                call.env.get("GIT_COMMON_DIR").map(String::as_str),
+                Some(mirror)
+            );
+            pinned += 1;
+        }
+        assert_eq!(pinned, 3);
+        Ok(())
+    }))
+    .await
+}
+
+#[tokio::test]
+async fn the_git_dir_pins_are_absolute_for_a_relative_root() -> TestResult {
+    common::bounded(Box::pin(async {
+        let dir = TempDir::new()?;
+        let log = dir.path().join("calls");
+        let script = dir.path().join("git");
+        let body = format!(
+            "#!/bin/sh\n{{\n  echo \"ARGS $*\"\n  env | sort\n  echo END\n}} >> '{}'\nexit 0\n",
+            log.to_str().ok_or("path")?
+        );
+        std::fs::write(&script, body)?;
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755))?;
+        let cwd = std::env::current_dir()?;
+        let mut relative = PathBuf::new();
+        for _ in cwd.components().skip(1) {
+            relative.push("..");
+        }
+        relative.push(dir.path().strip_prefix("/")?);
+        relative.push("jobs");
+        assert!(relative.is_relative());
+        Workspace::new(&relative)
+            .with_policy(default_run())
+            .with_git(&script, Duration::from_secs(60))
+            .prepare("job1", REPO, "main")
+            .await?;
+        std::fs::rename(&log, relative.join("calls"))?;
+        let all = calls(&relative)?;
+        let mirror = cwd
+            .join(&relative)
+            .join(".cache")
+            .join("bc3fbd4dd8dbadfc9793e2a816228cf8fa84d7954992c487a510aced135fecdf.git");
+        let mirror = mirror.to_str().ok_or("path")?;
+        let mut pinned = 0;
+        for call in all.iter().filter(|c| !c.args.contains(" init ")) {
+            for name in ["GIT_DIR", "GIT_COMMON_DIR"] {
+                let value = call.env.get(name).ok_or(name)?;
+                assert!(Path::new(value).is_absolute(), "{name}={value}");
+                assert_eq!(value, mirror, "{name}");
+            }
+            pinned += 1;
+        }
+        assert_eq!(pinned, 3);
         Ok(())
     }))
     .await
@@ -287,7 +375,7 @@ async fn the_mirror_fetches_by_explicit_url_and_configures_no_remote() -> TestRe
         .iter()
         .filter_map(|c| c.args.split(' ').nth(16))
         .collect();
-    assert_eq!(subs, ["init", "fetch", "worktree"]);
+    assert_eq!(subs, ["init", "fetch", "worktree", "worktree"]);
     assert!(
         all[1]
             .args
