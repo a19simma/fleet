@@ -32,6 +32,7 @@
 use std::collections::{HashMap, VecDeque};
 use std::ffi::OsString;
 use std::future::Future;
+use std::io;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::process::{ExitStatus, Stdio};
@@ -257,6 +258,20 @@ pub enum Interrupt {
     Cancelled,
 }
 
+/// Awaits the exit of a spawned agent process.
+///
+/// Production uses the [`Child`] itself. Tests inject a stand-in to force a wait error.
+pub trait ChildWait: Send {
+    /// Resolves with the exit status once the process has ended.
+    fn wait(&mut self) -> impl Future<Output = io::Result<ExitStatus>> + Send;
+}
+
+impl ChildWait for Child {
+    fn wait(&mut self) -> impl Future<Output = io::Result<ExitStatus>> + Send {
+        Self::wait(self)
+    }
+}
+
 /// Runs the agent for claimed jobs.
 #[derive(Debug)]
 pub struct AgentRunner<R> {
@@ -395,25 +410,42 @@ impl<R: Reporter> AgentRunner<R> {
         cwd: &Path,
         shutdown: Shutdown,
     ) -> Result<AgentOutcome, RunError> {
+        self.run_with(job, cwd, shutdown, |child| child).await
+    }
+
+    /// Like [`Self::run`], but `wrap` turns the spawned child into the value the runner
+    /// awaits for its exit.
+    ///
+    /// # Errors
+    ///
+    /// Same as [`Self::run`].
+    pub async fn run_with<W: ChildWait>(
+        &self,
+        job: &Job,
+        cwd: &Path,
+        shutdown: Shutdown,
+        wrap: impl FnOnce(Child) -> W + Send,
+    ) -> Result<AgentOutcome, RunError> {
         let mut stream = Stream::new(
             &self.reporter,
             job,
             self.config.terminal_report_timeout,
             Carry::default(),
         );
-        let result = self.run_stream(job, cwd, shutdown, &mut stream).await;
+        let result = self.run_stream(job, cwd, shutdown, &mut stream, wrap).await;
         if matches!(result, Ok(AgentOutcome::Succeeded)) {
             self.stash(job, stream.carry());
         }
         result
     }
 
-    async fn run_stream(
+    async fn run_stream<W: ChildWait>(
         &self,
         job: &Job,
         cwd: &Path,
         shutdown: Shutdown,
         stream: &mut Stream<'_, R>,
+        wrap: impl FnOnce(Child) -> W + Send,
     ) -> Result<AgentOutcome, RunError> {
         let Ok(mut child) = self.command(job, cwd).spawn() else {
             return Ok(stream.fail(None, ERR_START).await);
@@ -428,6 +460,7 @@ impl<R: Reporter> AgentRunner<R> {
             deadline: Box::pin(tokio::time::sleep(self.config.timeout)),
             shutdown,
         };
+        let mut child = wrap(child);
         let end = self
             .drive(&mut child, stdout, &mut guard, stream, &mut ctl)
             .await;
@@ -769,9 +802,9 @@ impl<R: Reporter> AgentRunner<R> {
         capture(command, self.config.finish_timeout).await
     }
 
-    async fn drive(
+    async fn drive<W: ChildWait>(
         &self,
-        child: &mut Child,
+        child: &mut W,
         stdout: ChildStdout,
         guard: &mut GroupGuard,
         stream: &mut Stream<'_, R>,
@@ -868,7 +901,7 @@ impl<R: AsyncBufRead + Unpin> LineReader<R> {
         }
     }
 
-    async fn next_line(&mut self) -> std::io::Result<bool> {
+    async fn next_line(&mut self) -> io::Result<bool> {
         loop {
             let available = self.reader.fill_buf().await?;
             if available.is_empty() {
