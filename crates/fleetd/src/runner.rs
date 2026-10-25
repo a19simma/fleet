@@ -786,7 +786,7 @@ impl<R: Reporter> AgentRunner<R> {
             Scope::Clean => command.env("GIT_ALLOW_PROTOCOL", "file"),
             Scope::Push => command
                 .env("GIT_ALLOW_PROTOCOL", self.config.repo_policy.protocols())
-                .env("GIT_ASKPASS", askpass::command(&self.config.askpass_bin))
+                .envs(askpass::env(&self.config.askpass_bin))
                 .env(
                     askpass::HOST_ENV,
                     self.config.repo_policy.token_host().unwrap_or_default(),

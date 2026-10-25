@@ -131,3 +131,84 @@ fn a_password_prompt_without_a_token_prints_nothing_and_fails() -> TestResult {
     assert_eq!(out.stdout, Vec::<u8>::new());
     Ok(())
 }
+
+fn credential_fill(askpass: &str, marker: bool) -> Result<Output, std::io::Error> {
+    use std::io::Write;
+    use std::process::Stdio;
+    let mut command = Command::new("git");
+    command
+        .args(["credential", "fill"])
+        .env_clear()
+        .env("PATH", std::env::var_os("PATH").unwrap_or_default())
+        .env("GIT_ASKPASS", askpass)
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env("FLEETD_ASKPASS_HOST", "github.com")
+        .env("GH_TOKEN", TOKEN)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    if marker {
+        command.env("FLEETD_ASKPASS", "1");
+    }
+    let mut child = command.spawn()?;
+    child
+        .stdin
+        .take()
+        .ok_or(std::io::ErrorKind::BrokenPipe)?
+        .write_all(b"protocol=https\nhost=github.com\n\n")?;
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = tx.send(child.wait_with_output());
+    });
+    rx.recv_timeout(std::time::Duration::from_secs(60))
+        .unwrap_or_else(|_| {
+            Err(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "git hung",
+            ))
+        })
+}
+
+#[test]
+fn git_gets_the_credentials_from_the_bare_binary_path_and_the_marker() -> TestResult {
+    let out = credential_fill(env!("CARGO_BIN_EXE_fleetd"), true)?;
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let text = String::from_utf8(out.stdout)?;
+    assert!(text.contains("username=x-access-token\n"), "{text}");
+    assert!(text.contains(&format!("password={TOKEN}\n")), "{text}");
+    Ok(())
+}
+
+#[test]
+fn the_binary_without_the_marker_still_needs_a_subcommand() -> TestResult {
+    let out = credential_fill(env!("CARGO_BIN_EXE_fleetd"), false)?;
+    assert!(!out.status.success());
+    Ok(())
+}
+
+#[test]
+fn the_quoted_command_string_is_not_an_executable_path() -> TestResult {
+    let quoted = format!("'{}' askpass", env!("CARGO_BIN_EXE_fleetd"));
+    let out = credential_fill(&quoted, true)?;
+    assert!(!out.status.success());
+    Ok(())
+}
+
+#[test]
+fn the_marker_with_a_second_argument_falls_through_to_the_subcommand() -> TestResult {
+    let out = Command::new(env!("CARGO_BIN_EXE_fleetd"))
+        .args(["askpass", "Username for 'https://github.com': "])
+        .env_clear()
+        .env("FLEETD_ASKPASS", "1")
+        .env("FLEETD_ASKPASS_HOST", "github.com")
+        .output()?;
+    assert!(out.status.success());
+    assert_eq!(String::from_utf8(out.stdout)?, "x-access-token\n");
+    Ok(())
+}

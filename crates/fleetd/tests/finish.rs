@@ -351,10 +351,8 @@ async fn only_the_push_gets_the_askpass_and_no_helper_runs_with_tokens_in_the_ag
             .finish(&job(&rig, true), &rig.worktree, shutdown)
             .await?;
         let push = recorded(&rig, "push")?;
-        assert!(push.contains(&format!(
-            "GIT_ASKPASS='{}' askpass\n",
-            env!("CARGO_BIN_EXE_fleetd")
-        )));
+        assert!(push.contains(&format!("GIT_ASKPASS={}\n", env!("CARGO_BIN_EXE_fleetd"))));
+        assert!(push.contains("FLEETD_ASKPASS=1\n"));
         assert!(!push.contains("/not/a/real/askpass"));
         assert!(push.contains("GH_TOKEN=not-a-real-gh-value\n"));
         let args = std::fs::read_to_string(rig.dir.path().join("work").join("git-push.args"))?;
@@ -688,6 +686,7 @@ async fn credentialed_children_get_only_their_credential_and_scratch_dirs() -> T
         ];
         let mut push = set(&common);
         push.insert("GIT_ASKPASS".into());
+        push.insert("FLEETD_ASKPASS".into());
         push.insert("GH_TOKEN".into());
         push.insert("FLEETD_ASKPASS_HOST".into());
         assert_eq!(keys(&recorded(&rig, "push")?), push);
@@ -785,7 +784,7 @@ async fn a_title_over_the_limit_is_cut_at_a_char_boundary() -> TestResult {
 }
 
 #[tokio::test]
-async fn an_askpass_path_with_quotes_and_substitutions_runs_as_one_file() -> TestResult {
+async fn an_askpass_path_with_quotes_and_substitutions_is_passed_verbatim() -> TestResult {
     common::bounded(Box::pin(async {
         let rig = rig("ok").await?;
         commit(&rig)?;
@@ -805,9 +804,9 @@ async fn an_askpass_path_with_quotes_and_substitutions_runs_as_one_file() -> Tes
             .find_map(|line| line.strip_prefix("GIT_ASKPASS="))
             .ok_or("no askpass")?;
         let probe = TempDir::new()?;
-        let out = Command::new("sh")
-            .arg("-c")
-            .arg(format!("{line} prompt"))
+        assert_eq!(line, odd.join("askpass").to_str().ok_or("path")?);
+        let out = Command::new(line)
+            .arg("prompt")
             .current_dir(probe.path())
             .output()?;
         assert!(out.status.success());

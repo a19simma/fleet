@@ -53,8 +53,12 @@ impl<R: Reporter> DaemonRunner<R> {
         };
         match guarded {
             Ok(Ok(Ok(checkout))) => Ok(checkout.path),
-            Ok(Ok(Err(_))) => {
-                tracing::warn!("job workspace could not be prepared");
+            Ok(Ok(Err(err))) => {
+                tracing::warn!(
+                    error = %err,
+                    detail = err.detail().unwrap_or_default(),
+                    "job workspace could not be prepared"
+                );
                 self.agent.fail_job(job, ERR_WORKSPACE).await;
                 Err(RunError)
             }
@@ -138,7 +142,7 @@ pub(crate) fn build(
     let reporter = GrpcReporter::new(channel.clone(), &token)?;
     let mut run = RunConfig::new(&config.claude_bin, config.disposable);
     run.gh_bin.clone_from(&config.gh_bin);
-    let workspace = job_workspace(config, &mut run, env);
+    let workspace = job_workspace(config, &mut run, env).with_redactor(redactor.clone());
     let runner = DaemonRunner::new(workspace, AgentRunner::new(run, reporter, redactor));
     Poller::with_channel(
         channel,

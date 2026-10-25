@@ -447,7 +447,8 @@ async fn only_the_fetch_child_carries_the_scoped_credential() -> TestResult {
             .ok_or("fetch")?;
         assert_eq!(fetch.env["GH_TOKEN"], "tok-for-fetch");
         assert_eq!(fetch.env["FLEETD_ASKPASS_HOST"], "github.com");
-        assert_eq!(fetch.env["GIT_ASKPASS"], "'/opt/fleetd bin/fleetd' askpass");
+        assert_eq!(fetch.env["GIT_ASKPASS"], "/opt/fleetd bin/fleetd");
+        assert_eq!(fetch.env["FLEETD_ASKPASS"], "1");
         Ok(())
     }))
     .await

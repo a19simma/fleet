@@ -70,17 +70,7 @@ async fn execute(cli: Cli) -> Result<ExitCode, Error> {
             }
             std::process::exit(0)
         }
-        Command::Askpass { prompt } => {
-            let token = std::env::var("GH_TOKEN").ok();
-            let host = std::env::var(askpass::HOST_ENV).unwrap_or_default();
-            let printed = askpass::answer(&prompt, token.as_deref(), &host)
-                .is_some_and(|text| writeln!(std::io::stdout(), "{text}").is_ok());
-            Ok(if printed {
-                ExitCode::SUCCESS
-            } else {
-                ExitCode::FAILURE
-            })
-        }
+        Command::Askpass { prompt } => Ok(askpass_reply(&prompt)),
         Command::PueueCallback { id, group } => {
             eprintln!("fleetd: pueue-callback is not implemented (task {id}, group {group})");
             Ok(ExitCode::from(2))
@@ -88,8 +78,34 @@ async fn execute(cli: Cli) -> Result<ExitCode, Error> {
     }
 }
 
+fn askpass_reply(prompt: &str) -> ExitCode {
+    let token = std::env::var("GH_TOKEN").ok();
+    let host = std::env::var(askpass::HOST_ENV).unwrap_or_default();
+    let printed = askpass::answer(prompt, token.as_deref(), &host)
+        .is_some_and(|text| writeln!(std::io::stdout(), "{text}").is_ok());
+    if printed {
+        ExitCode::SUCCESS
+    } else {
+        ExitCode::FAILURE
+    }
+}
+
+fn marked_askpass() -> Option<ExitCode> {
+    if std::env::var_os(askpass::MARKER_ENV).is_none_or(|marker| marker != "1") {
+        return None;
+    }
+    let mut args = std::env::args_os().skip(1);
+    let (Some(prompt), None) = (args.next(), args.next()) else {
+        return None;
+    };
+    Some(askpass_reply(&prompt.to_string_lossy()))
+}
+
 #[tokio::main]
 async fn main() -> ExitCode {
+    if let Some(code) = marked_askpass() {
+        return code;
+    }
     tracing_subscriber::fmt()
         .with_env_filter(
             EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),

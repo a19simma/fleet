@@ -5,15 +5,25 @@
 //! helper answers only when the prompt names the one token host, so a job that points git at
 //! another host, even one in `repo_hosts`, gets no token.
 
+use std::ffi::OsStr;
 use std::path::Path;
 
 /// Environment variable that carries the token host to the helper.
 pub const HOST_ENV: &str = "FLEETD_ASKPASS_HOST";
 
-/// The `GIT_ASKPASS` value that runs `<bin> askpass`, with `bin` shell-quoted.
+/// Environment variable that makes the fleetd binary answer as the askpass helper.
+pub const MARKER_ENV: &str = "FLEETD_ASKPASS";
+
+/// The variables that make git run `bin` as its askpass helper.
+///
+/// `GIT_ASKPASS` is the bare path, which git execs without a shell and so cannot carry a
+/// subcommand. [`MARKER_ENV`] tells the binary to treat its one argument as the prompt.
 #[must_use]
-pub fn command(bin: &Path) -> String {
-    format!("'{}' askpass", bin.to_string_lossy().replace('\'', "'\\''"))
+pub fn env(bin: &Path) -> [(&'static str, &OsStr); 2] {
+    [
+        ("GIT_ASKPASS", bin.as_os_str()),
+        (MARKER_ENV, OsStr::new("1")),
+    ]
 }
 
 /// The fixed username GitHub accepts for a token over https.
@@ -132,11 +142,14 @@ mod tests {
     }
 
     #[test]
-    fn the_command_quotes_the_binary_path() {
-        assert_eq!(command(Path::new("/a b/fleetd")), "'/a b/fleetd' askpass");
+    fn the_env_passes_the_binary_path_unquoted_with_the_marker() {
+        let bin = Path::new("/it's a/fleetd");
         assert_eq!(
-            command(Path::new("/it's/fleetd")),
-            "'/it'\\''s/fleetd' askpass"
+            env(bin),
+            [
+                ("GIT_ASKPASS", OsStr::new("/it's a/fleetd")),
+                (MARKER_ENV, OsStr::new("1"))
+            ]
         );
     }
 }

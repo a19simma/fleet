@@ -1,7 +1,8 @@
 //! Job workspaces: a bare mirror per repo and one git worktree per job.
 //!
-//! Every input is validated before git runs. Error messages are fixed text and never carry
-//! the repo, ref, job id or git output.
+//! Every input is validated before git runs. Error messages (`Display`) are fixed text and
+//! never carry the repo, ref, job id or git output. A failed git step keeps a redacted
+//! stderr tail, readable only through [`WorkspaceError::detail`], for logs.
 
 use std::ffi::OsString;
 use std::fmt;
@@ -11,13 +12,16 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
+use fleet_core::Redactor;
 use sha2::{Digest, Sha256};
-use tokio::io::AsyncWriteExt;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::process::Command;
 
 use crate::askpass;
 use crate::group::GroupGuard;
 
+const STDERR_KEEP: usize = 64 * 1024;
+const DETAIL_MAX: usize = 512;
 const CACHE_DIR: &str = ".cache";
 const BRANCH_PREFIX: &str = "swarm/";
 const MAX_JOB_ID_LEN: usize = 64;
@@ -49,6 +53,9 @@ const PINNED_CONFIG: [&str; 14] = [
 
 /// Longest a single git command may run before its process group is killed.
 pub const GIT_TIMEOUT: Duration = Duration::from_secs(300);
+
+/// Longest wait for git's stderr to reach EOF after git has exited.
+const STDERR_DRAIN: Duration = Duration::from_secs(1);
 
 /// Which repos a job may name: https on an allowed host.
 ///
@@ -147,8 +154,9 @@ pub enum WorkspaceError {
     InvalidJobId,
     /// A directory under the workspace root could not be created.
     Io(std::io::Error),
-    /// A git command could not start or exited with failure.
-    Git(&'static str),
+    /// A git command could not start or exited with failure. The second field is a redacted
+    /// tail of its stderr, for logs only, never for the server.
+    Git(&'static str, String),
     /// A git command ran past [`GIT_TIMEOUT`] and was killed.
     GitTimeout(&'static str),
 }
@@ -160,7 +168,7 @@ impl fmt::Display for WorkspaceError {
             Self::InvalidRef => write!(f, "base ref rejected"),
             Self::InvalidJobId => write!(f, "job id rejected"),
             Self::Io(_) => write!(f, "workspace directory error"),
-            Self::Git(step) => write!(f, "git {step} failed"),
+            Self::Git(step, _) => write!(f, "git {step} failed"),
             Self::GitTimeout(step) => write!(f, "git {step} timed out"),
         }
     }
@@ -173,8 +181,19 @@ impl std::error::Error for WorkspaceError {
             Self::InvalidRepo
             | Self::InvalidRef
             | Self::InvalidJobId
-            | Self::Git(_)
+            | Self::Git(..)
             | Self::GitTimeout(_) => None,
+        }
+    }
+}
+
+impl WorkspaceError {
+    /// The redacted tail of git's stderr for a failed git step, else `None`.
+    #[must_use]
+    pub fn detail(&self) -> Option<&str> {
+        match self {
+            Self::Git(_, detail) if !detail.is_empty() => Some(detail),
+            _ => None,
         }
     }
 }
@@ -221,6 +240,7 @@ pub struct Workspace {
     path_env: Option<OsString>,
     credential: Option<Credential>,
     before_fetch: Option<BeforeFetch>,
+    redactor: Redactor,
 }
 
 impl Workspace {
@@ -235,7 +255,15 @@ impl Workspace {
             path_env: std::env::var_os("PATH"),
             credential: None,
             before_fetch: None,
+            redactor: Redactor::default(),
         }
+    }
+
+    /// Scrubs `redactor`'s secrets from the git stderr kept in [`WorkspaceError::Git`].
+    #[must_use]
+    pub fn with_redactor(mut self, redactor: Redactor) -> Self {
+        self.redactor = redactor;
+        self
     }
 
     /// Test seam: runs `hook` with the mirror path after the mirror cleanup and config reset,
@@ -500,6 +528,12 @@ impl Workspace {
         self.run_git(dir, args, step, None).await
     }
 
+    fn detail(&self, raw: &[u8]) -> String {
+        let text = String::from_utf8_lossy(raw);
+        let scrubbed = self.redactor.redact_str(&text);
+        tail(&scrubbed, DETAIL_MAX).to_owned()
+    }
+
     async fn run_git(
         &self,
         dir: &Path,
@@ -518,7 +552,7 @@ impl Workspace {
         }
         if let Some((credential, host)) = credential {
             command
-                .env("GIT_ASKPASS", askpass::command(&credential.askpass_bin))
+                .envs(askpass::env(&credential.askpass_bin))
                 .env(askpass::HOST_ENV, host)
                 .env("GH_TOKEN", &credential.token);
         }
@@ -541,23 +575,73 @@ impl Workspace {
             .env("GIT_ALLOW_PROTOCOL", self.policy.protocols())
             .stdin(Stdio::null())
             .stdout(Stdio::null())
-            .stderr(Stdio::null())
+            .stderr(Stdio::piped())
             .process_group(0)
             .kill_on_drop(true)
             .spawn()
-            .map_err(|_| WorkspaceError::Git(step))?;
+            .map_err(|_| WorkspaceError::Git(step, String::new()))?;
         let mut guard = GroupGuard::new(child.id());
+        let stderr = child
+            .stderr
+            .take()
+            .map(|pipe| tokio::spawn(read_tail(pipe)));
         let waited = tokio::time::timeout(self.timeout, child.wait()).await;
         guard.kill();
         match waited {
-            Ok(Ok(status)) if status.success() => Ok(()),
-            Ok(_) => Err(WorkspaceError::Git(step)),
+            Ok(Ok(status)) if status.success() => {
+                if let Some(task) = stderr {
+                    task.abort();
+                }
+                Ok(())
+            }
+            Ok(_) => {
+                let raw = match stderr {
+                    Some(mut task) => {
+                        let drained = tokio::time::timeout(STDERR_DRAIN, &mut task).await;
+                        task.abort();
+                        drained.ok().and_then(Result::ok).unwrap_or_default()
+                    }
+                    None => Vec::new(),
+                };
+                Err(WorkspaceError::Git(step, self.detail(&raw)))
+            }
             Err(_) => {
+                if let Some(task) = stderr {
+                    task.abort();
+                }
                 let _ = child.wait().await;
                 Err(WorkspaceError::GitTimeout(step))
             }
         }
     }
+}
+
+fn push_tail(kept: &mut Vec<u8>, chunk: &[u8], keep: usize) {
+    kept.extend_from_slice(chunk);
+    if kept.len() > keep {
+        kept.drain(..kept.len() - keep);
+    }
+}
+
+fn tail(text: &str, max: usize) -> &str {
+    let mut start = text.len().saturating_sub(max);
+    while !text.is_char_boundary(start) {
+        start += 1;
+    }
+    text.get(start..).unwrap_or_default()
+}
+
+/// Reads `pipe` to the end, keeping only the last [`STDERR_KEEP`] bytes.
+async fn read_tail(mut pipe: tokio::process::ChildStderr) -> Vec<u8> {
+    let mut kept = Vec::new();
+    let mut chunk = [0_u8; 4096];
+    while let Ok(n) = pipe.read(&mut chunk).await {
+        if n == 0 {
+            break;
+        }
+        push_tail(&mut kept, chunk.get(..n).unwrap_or_default(), STDERR_KEEP);
+    }
+    kept
 }
 
 pub(crate) fn validate_job_id(id: &str) -> Result<(), WorkspaceError> {
@@ -665,5 +749,27 @@ mod tests {
         for _ in 0..64 {
             assert!(validate_job_id(&EventId::generate().to_string()).is_ok());
         }
+    }
+}
+
+#[cfg(test)]
+mod tail_tests {
+    use super::*;
+
+    #[test]
+    fn push_tail_keeps_only_the_last_bytes() {
+        let mut kept = b"abc".to_vec();
+        push_tail(&mut kept, b"def", 4);
+        assert_eq!(kept, b"cdef");
+        push_tail(&mut kept, b"g", 4);
+        assert_eq!(kept, b"defg");
+    }
+
+    #[test]
+    fn tail_never_splits_a_character() {
+        assert_eq!(tail("abcdef", 3), "def");
+        assert_eq!(tail("ab", 3), "ab");
+        assert_eq!(tail("a\u{e9}b", 2), "b");
+        assert_eq!(tail("a\u{e9}b", 3), "\u{e9}b");
     }
 }

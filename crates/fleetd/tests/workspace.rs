@@ -299,7 +299,7 @@ async fn a_pin_holds_against_a_commondir_planted_after_the_cleanup() -> TestResu
             let _ = std::fs::write(mirror.join("commondir"), evil_path.as_bytes());
         });
         let outcome = planting.prepare("job2", &repo, "main").await;
-        assert!(matches!(outcome, Err(WorkspaceError::Git("fetch"))));
+        assert!(matches!(outcome, Err(WorkspaceError::Git("fetch", _))));
         assert!(
             git(
                 &evil,
@@ -497,7 +497,7 @@ async fn errors_carry_no_input() -> TestResult {
             .await
             .err()
             .ok_or("expected error")?;
-        let text = format!("{err} {err:?}");
+        let text = err.to_string();
         assert!(!text.contains("missing-secret-name"));
         Ok(())
     }))
@@ -580,6 +580,109 @@ async fn a_background_descendant_of_a_clean_git_exit_is_killed() -> TestResult {
         driven?;
         result?;
         reader.wait_eof().await?;
+        Ok(())
+    }))
+    .await
+}
+
+fn noisy_git(dir: &Path, body: &str) -> Result<PathBuf, Box<dyn std::error::Error>> {
+    let path = dir.join("noisy-git");
+    std::fs::write(&path, format!("#!/bin/sh\n{body}\nexit 1\n"))?;
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755))?;
+    Ok(path)
+}
+
+#[tokio::test]
+async fn a_failed_git_step_carries_the_step_and_the_stderr_tail() -> TestResult {
+    common::bounded(Box::pin(async {
+        let dir = TempDir::new()?;
+        let missing = dir.path().join("nowhere.git");
+        let ws = workspace(dir.path().join("jobs"));
+        let err = ws
+            .prepare("job1", missing.to_str().ok_or("path")?, "main")
+            .await
+            .err()
+            .ok_or("fetch succeeded")?;
+        let WorkspaceError::Git(step, detail) = &err else {
+            return Err(format!("unexpected {err:?}").into());
+        };
+        assert_eq!(*step, "fetch");
+        assert!(detail.contains("fatal:"), "{detail}");
+        assert_eq!(err.to_string(), "git fetch failed");
+        assert_eq!(err.detail(), Some(detail.as_str()));
+        Ok(())
+    }))
+    .await
+}
+
+#[tokio::test]
+async fn a_detached_descendant_holding_stderr_cannot_stall_a_failed_git_step() -> TestResult {
+    common::bounded(Box::pin(async {
+        let dir = TempDir::new()?;
+        let git = noisy_git(
+            dir.path(),
+            "echo 'fatal: before detach' >&2\nready=\"$(dirname \"$0\")/detached\"\nperl -e 'use POSIX; POSIX::setsid(); open(F, \">\", shift); close(F); exec @ARGV' \"$ready\" sleep 60 &\nwhile [ ! -e \"$ready\" ]; do sleep 0.1; done",
+        )?;
+        let ws = workspace(dir.path().join("jobs")).with_git(git, Duration::from_secs(60));
+        let result = tokio::time::timeout(
+            Duration::from_secs(30),
+            ws.prepare("job1", "/nowhere.git", "main"),
+        )
+        .await?;
+        assert!(matches!(result, Err(WorkspaceError::Git("init", _))));
+        Ok(())
+    }))
+    .await
+}
+
+#[tokio::test]
+async fn git_stderr_is_redacted_before_it_is_kept() -> TestResult {
+    common::bounded(Box::pin(async {
+        let dir = TempDir::new()?;
+        let secret = "ghp_not-a-real-secret-value";
+        let git = noisy_git(
+            dir.path(),
+            &format!("echo 'fatal: auth {secret} rejected' >&2"),
+        )?;
+        let ws = workspace(dir.path().join("jobs"))
+            .with_git(git, GIT_BAND)
+            .with_redactor(fleet_core::Redactor::new([secret]));
+        let err = ws
+            .prepare("job1", "/nowhere.git", "main")
+            .await
+            .err()
+            .ok_or("succeeded")?;
+        let detail = err.detail().ok_or("no detail")?;
+        assert!(detail.contains("fatal: auth"), "{detail}");
+        assert!(!detail.contains(secret), "{detail}");
+        Ok(())
+    }))
+    .await
+}
+
+#[tokio::test]
+async fn git_stderr_is_cut_to_a_tail_and_a_split_secret_does_not_leak() -> TestResult {
+    common::bounded(Box::pin(async {
+        let dir = TempDir::new()?;
+        let secret = "ghp_not-a-real-secret-value";
+        let body = format!(
+            "head -c 100000 /dev/zero | tr '\\0' 'a' >&2\necho '{secret}' >&2\nhead -c 489 /dev/zero | tr '\\0' 'b' >&2\necho tail-marker >&2"
+        );
+        let git = noisy_git(dir.path(), &body)?;
+        let ws = workspace(dir.path().join("jobs"))
+            .with_git(git, GIT_BAND)
+            .with_redactor(fleet_core::Redactor::new([secret]));
+        let err = ws
+            .prepare("job1", "/nowhere.git", "main")
+            .await
+            .err()
+            .ok_or("succeeded")?;
+        let detail = err.detail().ok_or("no detail")?;
+        assert!(detail.len() <= 512, "{}", detail.len());
+        assert!(detail.ends_with("tail-marker\n"), "{detail}");
+        assert!(!detail.contains("ghp_"), "{detail}");
+        assert!(!detail.contains("value"), "{detail}");
+        assert!(!detail.contains(&"a".repeat(64)), "{detail}");
         Ok(())
     }))
     .await
