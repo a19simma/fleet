@@ -534,7 +534,7 @@ checksum = "1d674e81391d1e1ab681a28d99df07927c6d4aa5b027d7da16ba32d1d21ecd99"
 
 [[package]]
 name = "fleet-cli"
-version = "0.2.3"
+version = "0.2.4"
 dependencies = [
  "clap",
  "fleet-proto",
@@ -547,7 +547,7 @@ dependencies = [
 
 [[package]]
 name = "fleet-core"
-version = "0.2.3"
+version = "0.2.4"
 dependencies = [
  "serde",
  "serde_json",
@@ -555,7 +555,7 @@ dependencies = [
 
 [[package]]
 name = "fleet-proto"
-version = "0.2.3"
+version = "0.2.4"
 dependencies = [
  "fleet-core",
  "prost",
@@ -568,7 +568,7 @@ dependencies = [
 
 [[package]]
 name = "fleet-server"
-version = "0.2.3"
+version = "0.2.4"
 dependencies = [
  "axum",
  "fleet-core",
@@ -585,7 +585,7 @@ dependencies = [
 
 [[package]]
 name = "fleetd"
-version = "0.2.3"
+version = "0.2.4"
 dependencies = [
  "axum",
  "clap",
