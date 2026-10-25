@@ -39,6 +39,13 @@ jobs:
       - run: cargo build --workspace
       - run: cargo test --workspace
 
+  infra:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - run: infra/check-kinds.sh
+      - run: infra/test-check-kinds.sh
+
   scan:
     runs-on: ubuntu-latest
     steps:

@@ -1,6 +1,6 @@
 # Fleet server stack
 
-Status: Accepted. Service layout and the "No transcripts" bullet amended by ADR-0021 and ADR-0022 (built in the server). The monthly partitioning of `events` and its partition-drop retention are superseded by ADR-0019.
+Status: Accepted. Service layout and the "No transcripts" bullet amended by ADR-0021 and ADR-0022 (built in the server). The monthly partitioning of `events` and its partition-drop retention are superseded by ADR-0019. "The deploy target is not fixed" amended by ADR-0025: the manifests live in `infra/`.
 
 Fleet state must outlive the laptop's sleep and any single Box. The deployment stack is Rust with tonic, Kubernetes and Argo CD.
 
