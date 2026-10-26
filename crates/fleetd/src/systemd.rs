@@ -12,7 +12,7 @@ use std::fs;
 use std::io;
 use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
 use std::os::unix::process::ExitStatusExt;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::process::{Command, ExitStatus, Stdio};
 use std::sync::Arc;
@@ -39,6 +39,7 @@ const DEFAULT_START_DEADLINE: Duration = Duration::from_secs(60);
 const CALL_TIMEOUT: Duration = Duration::from_secs(30);
 const SHOW_CAP: usize = 4096;
 const DIR_MODE: u32 = 0o750;
+const HOOK_DIR: &str = "hook";
 const ENV_FILE: &str = "env";
 const STDOUT_FIFO: &str = "stdout";
 const JOB_ID_ENV: &str = "FLEET_JOB_ID";
@@ -54,6 +55,17 @@ pub fn select_launcher(config: &Config, job_gid: Option<u32>) -> Arc<dyn Launche
         AgentLauncher::Systemd => {
             Arc::new(SystemdLauncher::new(&config.systemctl_path).with_job_gid(job_gid))
         }
+    }
+}
+
+/// Removes the run dirs a crashed fleetd left under `run_dir` when the config selects the
+/// systemd launcher. The direct launcher leaves them alone. Never fails: each problem is logged.
+pub async fn sweep_stale_runs(config: &Config, run_dir: &Path) {
+    if config.agent_launcher == AgentLauncher::Systemd {
+        SystemdLauncher::new(&config.systemctl_path)
+            .with_run_dir(run_dir)
+            .sweep_stale()
+            .await;
     }
 }
 
@@ -100,6 +112,58 @@ impl SystemdLauncher {
     pub fn with_start_deadline(mut self, deadline: Duration) -> Self {
         self.start_deadline = deadline;
         self
+    }
+
+    /// Removes every run dir under the run root, which at startup belongs to no live job of
+    /// this process. Only real directories named like a job id are touched, never symlinks,
+    /// files, the `hook` dir or any other name. A unit still active for the id is stopped and
+    /// reset first. A failure is logged and the sweep goes on.
+    pub async fn sweep_stale(&self) {
+        if !self.ctl.systemctl.is_absolute() {
+            tracing::warn!("run dir sweep skipped: systemctl path is not absolute");
+            return;
+        }
+        let entries = match fs::read_dir(&self.run_dir) {
+            Ok(entries) => entries,
+            Err(err) if err.kind() == io::ErrorKind::NotFound => return,
+            Err(err) => {
+                tracing::warn!(%err, "run dir sweep skipped: cannot list the run root");
+                return;
+            }
+        };
+        for entry in entries {
+            let Ok(entry) = entry else { continue };
+            let Some(id) = entry.file_name().to_str().map(str::to_owned) else {
+                continue;
+            };
+            let is_dir = entry.file_type().is_ok_and(|kind| kind.is_dir());
+            if !is_dir || id == HOOK_DIR || validate_job_id(&id).is_err() {
+                continue;
+            }
+            self.sweep_one(&id, entry.path()).await;
+        }
+    }
+
+    async fn sweep_one(&self, id: &str, path: PathBuf) {
+        let unit = unit_name(id);
+        match self.ctl.show(&unit).await {
+            Ok(text) if is_live(&text) => {
+                tracing::warn!(job_id = %id, "stopping a unit left by a crash");
+                self.ctl.stop(&unit).await;
+                self.ctl.reset_failed(&unit).await;
+            }
+            Ok(_) => {}
+            Err(err) => {
+                tracing::warn!(job_id = %id, %err, "stale run dir kept: unit state unknown");
+                return;
+            }
+        }
+        drop(RunDir(path.clone()));
+        if path.exists() {
+            tracing::warn!(job_id = %id, "stale run dir could not be removed");
+        } else {
+            tracing::info!(job_id = %id, "removed a stale run dir");
+        }
     }
 
     /// Shares the run directory, the FIFO and the spec with `gid`, the job group.
@@ -171,6 +235,12 @@ impl Ctl {
         command.kill_on_drop(true);
         let _ = tokio::time::timeout(CALL_TIMEOUT, command.status()).await;
     }
+}
+
+fn is_live(show: &str) -> bool {
+    show.lines()
+        .filter_map(|line| line.strip_prefix("ActiveState="))
+        .any(|state| !matches!(state, "inactive" | "failed"))
 }
 
 fn unit_name(id: &str) -> String {

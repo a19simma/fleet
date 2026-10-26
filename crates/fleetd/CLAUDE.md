@@ -47,4 +47,5 @@
 ## Systemd launcher test
 
 - **Own test file.** `tests/systemd_launcher.rs` runs a fake `systemctl` script and the `fleetd agent-exec` binary, so it stays alone in its binary. The script is written once in a `OnceLock<TempDir>`, and its per-job state lives in a directory named after the job id, so every test uses a unique id.
+- **Startup sweep.** `sweep_stale_runs(config, run_dir)` takes the run root as a parameter and only acts for the systemd launcher. It removes real directories with a job-id name through `RunDir`, skips `hook`, symlinks and files, and stops then resets a still-active unit first. Tests plant dirs in a temp run root.
 - **The fake is injected as `systemctl_path`.** No env var selects it. `show.N` files give the Nth `show` reply and `show.last` the rest.

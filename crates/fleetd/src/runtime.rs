@@ -24,6 +24,7 @@ use crate::jobenv::group_id;
 use crate::jobs::{self, JobPoller};
 use crate::store::Store;
 use crate::system::read_identity;
+use crate::systemd;
 use crate::toolhook::HookHub;
 
 const DEFAULT_WATCHDOG_PERIOD: Duration = Duration::from_secs(20);
@@ -374,7 +375,15 @@ pub async fn run_with_env(
         }
     };
     run_with_hub(
-        config, store, identity, redactor, heartbeat, jobs, hub, shutdown,
+        config,
+        store,
+        identity,
+        redactor,
+        heartbeat,
+        jobs,
+        hub,
+        Path::new(systemd::DEFAULT_RUN_DIR),
+        shutdown,
     )
     .await
 }
@@ -419,6 +428,7 @@ async fn run_with_store(
         heartbeat,
         jobs,
         HookHub::new(),
+        Path::new(systemd::DEFAULT_RUN_DIR),
         shutdown,
     )
     .await
@@ -436,6 +446,7 @@ async fn run_with_hub(
     heartbeat: Option<Heartbeat>,
     jobs: Option<JobPoller>,
     hub: Arc<HookHub>,
+    run_root: &Path,
     shutdown: impl Future<Output = ()>,
 ) -> Result<(), Error> {
     let (tcp, tcp_addr, socket, hook_socket) = match bind_all(&config).await {
@@ -447,6 +458,7 @@ async fn run_with_hub(
             return Err(err);
         }
     };
+    systemd::sweep_stale_runs(&config, run_root).await;
     let heartbeat_identity = identity.clone();
     let state = AppState::with_hub(
         store.clone(),
@@ -851,6 +863,53 @@ mod tests {
         assert!(result.is_err());
         assert!(store.is_closed());
         assert!(!config.socket_path.exists());
+        Ok(())
+    }
+
+    const FAKE_SYSTEMCTL: &str = "#!/bin/sh\necho \"$@\" >> \"$(dirname \"$0\")/calls.log\"\nprintf 'ActiveState=inactive\\nSubState=dead\\nResult=success\\nExecMainCode=0\\nExecMainStatus=0\\n'\n";
+
+    fn fake_systemctl() -> &'static Path {
+        use std::os::unix::fs::PermissionsExt;
+        static DIR: std::sync::OnceLock<TempDir> = std::sync::OnceLock::new();
+        let dir = DIR.get_or_init(|| {
+            let dir = TempDir::new().unwrap();
+            let path = dir.path().join("systemctl");
+            std::fs::write(&path, FAKE_SYSTEMCTL).unwrap();
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+            dir
+        });
+        dir.path()
+    }
+
+    #[tokio::test]
+    async fn a_failed_bind_sweeps_no_run_dir_and_issues_no_systemctl_call()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let dir = TempDir::new()?;
+        let ctl = fake_systemctl();
+        let taken = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await?;
+        let port = taken.local_addr()?.port();
+        let run_root = dir.path().join("run");
+        let stale = run_root.join("job1");
+        std::fs::create_dir_all(&stale)?;
+        let mut config = test_config(&dir, port)?;
+        config.agent_launcher = crate::config::AgentLauncher::Systemd;
+        config.systemctl_path = ctl.join("systemctl");
+        let store = open_store(&dir).await?;
+        let result = run_with_hub(
+            config,
+            store,
+            test_identity(),
+            Redactor::default(),
+            None,
+            None,
+            HookHub::new(),
+            &run_root,
+            std::future::pending(),
+        )
+        .await;
+        assert!(matches!(result, Err(Error::Runtime(_))), "{result:?}");
+        assert!(stale.exists());
+        assert!(!ctl.join("calls.log").exists());
         Ok(())
     }
 

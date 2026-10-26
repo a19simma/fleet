@@ -12,7 +12,7 @@ use std::time::{Duration, Instant};
 
 use fleetd::agent_exec::write_spec;
 use fleetd::runner::{AgentProc, AgentSpec, Launched, Launcher};
-use fleetd::systemd::{SystemdLauncher, select_launcher};
+use fleetd::systemd::{SystemdLauncher, select_launcher, sweep_stale_runs};
 use fleetd::{AgentLauncher, Config, Error};
 use tempfile::TempDir;
 use tokio::io::AsyncReadExt;
@@ -749,5 +749,105 @@ fn agent_exec_exits_2_without_printing_env_values_on_bad_specs() -> TestResult {
     assert!(stderr.contains("different job"));
     let (_, _, stderr) = exec.run("ex_nospec")?;
     assert!(stderr.contains("missing"));
+    Ok(())
+}
+
+fn stale_dir(case: &Case) -> io::Result<()> {
+    fs::create_dir_all(case.dir())?;
+    fs::write(case.dir().join("env"), "SECRET=1\n")?;
+    fs::write(case.dir().join("spec.json"), "{}")
+}
+
+fn systemd_config() -> Result<Config, Error> {
+    Config::resolve(None, &|name| {
+        (name == "FLEETD_AGENT_LAUNCHER").then(|| String::from("systemd"))
+    })
+}
+
+#[tokio::test]
+async fn a_stale_run_dir_is_removed_and_a_live_unit_is_stopped_then_reset_first() -> TestResult {
+    let case = Case::new("t_sweep_live")?;
+    case.last(&show("active", "success", 0, 0))?;
+    stale_dir(&case)?;
+    case.launcher().sweep_stale().await;
+    let unit = case.unit();
+    assert_eq!(
+        case.log(),
+        vec![
+            format!(
+                "show {unit} -p ActiveState -p SubState -p Result -p ExecMainCode -p ExecMainStatus"
+            ),
+            format!("stop {unit}"),
+            format!("reset-failed {unit}"),
+        ]
+    );
+    assert!(!case.dir().exists());
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_stale_run_dir_of_an_inactive_unit_is_removed_without_stop() -> TestResult {
+    let case = Case::new("t_sweep_idle")?;
+    case.last(&show("inactive", "success", 0, 0))?;
+    stale_dir(&case)?;
+    case.launcher().sweep_stale().await;
+    assert!(!case.dir().exists());
+    assert!(case.log().iter().all(|line| line.starts_with("show ")));
+    Ok(())
+}
+
+#[tokio::test]
+async fn the_sweep_leaves_unsafe_names_symlinks_files_and_the_hook_dir() -> TestResult {
+    let case = Case::new("t_sweep_skip")?;
+    let outside = tempfile::tempdir()?;
+    fs::write(outside.path().join("keep"), "x")?;
+    let root = case.run.path();
+    fs::create_dir(root.join("bad name"))?;
+    fs::create_dir(root.join("a.b"))?;
+    fs::create_dir(root.join("hook"))?;
+    fs::write(root.join("plainfile"), "x")?;
+    std::os::unix::fs::symlink(outside.path(), root.join("linked"))?;
+    case.launcher().sweep_stale().await;
+    for name in ["bad name", "a.b", "hook", "plainfile", "linked"] {
+        assert!(root.join(name).symlink_metadata().is_ok(), "{name}");
+    }
+    assert!(outside.path().join("keep").exists());
+    assert!(!case.state.join("log").exists());
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_sweep_that_cannot_run_returns_quietly_and_keeps_the_dir() -> TestResult {
+    let case = Case::new("t_sweep_fail")?;
+    stale_dir(&case)?;
+    case.put("show.rc", "1")?;
+    case.last("")?;
+    case.launcher().sweep_stale().await;
+    assert!(case.dir().exists());
+    let file = case.run.path().join("not-a-dir");
+    fs::write(&file, "x")?;
+    SystemdLauncher::new(root().join("systemctl"))
+        .with_run_dir(&file)
+        .sweep_stale()
+        .await;
+    SystemdLauncher::new(root().join("systemctl"))
+        .with_run_dir(case.run.path().join("missing"))
+        .sweep_stale()
+        .await;
+    Ok(())
+}
+
+#[tokio::test]
+async fn startup_sweeps_only_for_the_systemd_launcher() -> TestResult {
+    let case = Case::new("t_sweep_cfg")?;
+    case.last(&show("inactive", "success", 0, 0))?;
+    stale_dir(&case)?;
+    let direct = Config::resolve(None, &|_| None)?;
+    sweep_stale_runs(&direct, case.run.path()).await;
+    assert!(case.dir().exists());
+    let mut config = systemd_config()?;
+    config.systemctl_path = root().join("systemctl");
+    sweep_stale_runs(&config, case.run.path()).await;
+    assert!(!case.dir().exists());
     Ok(())
 }
