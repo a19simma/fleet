@@ -36,13 +36,13 @@ pub mod toolhook;
 pub mod transport;
 pub mod workspace;
 
-pub use app::{AppState, hook_router, socket_router};
+pub use app::{AppState, hook_router, hook_socket_router, socket_router};
 pub use config::{Config, DEFAULT_CONFIG_PATH, DEFAULT_SECRETS_PATH, SecretsFile};
 pub use dump::dump;
 pub use error::Error;
 pub use events::{Enqueued, Limits, OVERFLOW_KIND, QueuedEvent};
 pub use hook::{forward_hook, run_hook};
-pub use runtime::{Signals, bind_socket, run, run_with_env};
+pub use runtime::{Signals, bind_hook_socket, bind_socket, run, run_with_env};
 pub use store::Store;
 pub use system::{fresh_id, now_ms, read_identity};
 pub use toolhook::{HookHub, ToolReport};

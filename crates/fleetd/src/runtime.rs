@@ -15,7 +15,7 @@ use tokio::task::{JoinError, JoinHandle, JoinSet};
 use tokio::time::{Interval, MissedTickBehavior};
 
 use crate::Error;
-use crate::app::{AppState, hook_router, socket_router};
+use crate::app::{AppState, hook_router, hook_socket_router, socket_router};
 use crate::config::Config;
 use crate::events::Limits;
 use crate::heartbeat::Heartbeat;
@@ -79,6 +79,22 @@ impl Signals {
 /// Fails when `path` holds anything but a stale socket, the old file cannot be removed,
 /// the bind fails or the mode cannot be set.
 pub fn bind_socket(path: &Path) -> Result<UnixListener, Error> {
+    bind_with(path, 0o600, None)
+}
+
+/// Binds the hook socket at `path` with mode 0660 and group `gid`, when one is given.
+///
+/// Stale-socket handling is that of [`bind_socket`]. The group is set before the mode, so
+/// the socket is never group-writable under the wrong group.
+///
+/// # Errors
+///
+/// Fails like [`bind_socket`], or when the group cannot be set.
+pub fn bind_hook_socket(path: &Path, gid: Option<u32>) -> Result<UnixListener, Error> {
+    bind_with(path, 0o660, gid)
+}
+
+fn bind_with(path: &Path, mode: u32, gid: Option<u32>) -> Result<UnixListener, Error> {
     let io = |source| Error::Io {
         path: path.to_owned(),
         source,
@@ -103,8 +119,35 @@ pub fn bind_socket(path: &Path) -> Result<UnixListener, Error> {
         Err(err) => return Err(io(err)),
     }
     let listener = UnixListener::bind(path).map_err(io)?;
-    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)).map_err(io)?;
+    if let Some(gid) = gid {
+        std::os::unix::fs::chown(path, None, Some(gid)).map_err(io)?;
+    }
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode)).map_err(io)?;
     Ok(listener)
+}
+
+fn group_id(spec: &str, groups: &str) -> Option<u32> {
+    spec.parse().ok().or_else(|| {
+        groups.lines().find_map(|line| {
+            let mut fields = line.split(':');
+            (fields.next() == Some(spec))
+                .then(|| fields.nth(1)?.parse().ok())
+                .flatten()
+        })
+    })
+}
+
+fn hook_group(config: &Config) -> Result<Option<u32>, Error> {
+    let Some(spec) = config.hook_socket_group.as_deref() else {
+        return Ok(None);
+    };
+    let groups = std::fs::read_to_string("/etc/group").unwrap_or_default();
+    group_id(spec, &groups)
+        .map(Some)
+        .ok_or(Error::InvalidValue {
+            name: "hook_socket_group",
+            value: spec.to_owned(),
+        })
 }
 
 fn load_redactor(config: &Config) -> Result<Redactor, Error> {
@@ -346,13 +389,26 @@ pub async fn run_with_env(
     .await
 }
 
-async fn bind_all(config: &Config) -> Result<(TcpListener, SocketAddr, UnixListener), Error> {
+type Bound = (TcpListener, SocketAddr, UnixListener, Option<UnixListener>);
+
+async fn bind_all(config: &Config) -> Result<Bound, Error> {
+    let gid = hook_group(config)?;
     let tcp = TcpListener::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, config.http_port)))
         .await
         .map_err(Error::Runtime)?;
     let tcp_addr = tcp.local_addr().map_err(Error::Runtime)?;
     let socket = bind_socket(&config.socket_path)?;
-    Ok((tcp, tcp_addr, socket))
+    let hook = match config.hook_socket.as_deref() {
+        Some(path) => match bind_hook_socket(path, gid) {
+            Ok(listener) => Some(listener),
+            Err(err) => {
+                let _ = std::fs::remove_file(&config.socket_path);
+                return Err(err);
+            }
+        },
+        None => None,
+    };
+    Ok((tcp, tcp_addr, socket, hook))
 }
 
 #[cfg(test)]
@@ -392,7 +448,7 @@ async fn run_with_hub(
     hub: Arc<HookHub>,
     shutdown: impl Future<Output = ()>,
 ) -> Result<(), Error> {
-    let (tcp, tcp_addr, socket) = match bind_all(&config).await {
+    let (tcp, tcp_addr, socket, hook_socket) = match bind_all(&config).await {
         Ok(bound) => bound,
         Err(err) => {
             if let Err(close_err) = store.clone().close().await {
@@ -425,24 +481,31 @@ async fn run_with_hub(
     serve(
         &mut tasks,
         "socket",
-        axum::serve(socket, socket_router(state))
+        axum::serve(socket, socket_router(state.clone()))
             .with_graceful_shutdown(wait_for(stop_rx.clone()))
             .into_future(),
     );
+    if let Some(listener) = hook_socket {
+        serve(
+            &mut tasks,
+            "hook socket",
+            axum::serve(listener, hook_socket_router(state))
+                .with_graceful_shutdown(wait_for(stop_rx.clone()))
+                .into_future(),
+        );
+    }
     let mut poller = jobs.map(|poller| tokio::spawn(poller.run(wait_for(stop_rx.clone()))));
     let mut heartbeat = heartbeat.map(|target| {
         tokio::spawn(target.run(heartbeat_identity, store.clone(), wait_for(stop_rx)))
     });
-    let dog = tokio::spawn(watchdog(
-        vec![
-            Listener::Tcp(tcp_addr),
-            Listener::Unix(config.socket_path.clone()),
-        ],
-        watchdog_period(),
-        || {
-            let _ = sd_notify::notify(&[NotifyState::Watchdog]);
-        },
-    ));
+    let mut probed = vec![
+        Listener::Tcp(tcp_addr),
+        Listener::Unix(config.socket_path.clone()),
+    ];
+    probed.extend(config.hook_socket.iter().cloned().map(Listener::Unix));
+    let dog = tokio::spawn(watchdog(probed, watchdog_period(), || {
+        let _ = sd_notify::notify(&[NotifyState::Watchdog]);
+    }));
     let _ = sd_notify::notify(&[NotifyState::Ready]);
 
     let outcome = first_exit(&mut tasks, &mut poller, &mut heartbeat, shutdown).await;
@@ -473,6 +536,9 @@ async fn run_with_hub(
         tasks.abort_all();
     }
     let _ = std::fs::remove_file(&config.socket_path);
+    if let Some(path) = &config.hook_socket {
+        let _ = std::fs::remove_file(path);
+    }
     let closed = store.close().await;
     let result = outcome.and(closed);
     if result.is_ok() {
@@ -723,6 +789,129 @@ mod tests {
         .await;
         assert!(result.is_err());
         assert!(store.is_closed());
+        Ok(())
+    }
+
+    const GROUPS: &str = "root:x:0:\nfleet-work:x:996:agent,fleet-job\nbroken:x:abc:\n";
+
+    #[test]
+    fn group_id_takes_a_number_or_a_name_from_the_group_file() {
+        assert_eq!(group_id("1234", GROUPS), Some(1234));
+        assert_eq!(group_id("fleet-work", GROUPS), Some(996));
+        assert_eq!(group_id("root", GROUPS), Some(0));
+        assert_eq!(group_id("fleet", GROUPS), None);
+        assert_eq!(group_id("broken", GROUPS), None);
+        assert_eq!(group_id("nobody", ""), None);
+    }
+
+    #[tokio::test]
+    async fn the_hook_socket_is_0660_and_takes_the_group() -> Result<(), Box<dyn std::error::Error>>
+    {
+        use std::os::unix::fs::MetadataExt;
+
+        let dir = TempDir::new()?;
+        let plain = dir.path().join("plain.sock");
+        let _plain = bind_hook_socket(&plain, None)?;
+        assert_eq!(std::fs::metadata(&plain)?.mode() & 0o777, 0o660);
+        let gid = rustix::process::getegid().as_raw();
+        let grouped = dir.path().join("grouped.sock");
+        let _grouped = bind_hook_socket(&grouped, Some(gid))?;
+        let meta = std::fs::metadata(&grouped)?;
+        assert_eq!((meta.mode() & 0o777, meta.gid()), (0o660, gid));
+        let main = dir.path().join("main.sock");
+        let _main = bind_socket(&main)?;
+        assert_eq!(std::fs::metadata(&main)?.mode() & 0o777, 0o600);
+        Ok(())
+    }
+
+    #[test]
+    fn an_unknown_hook_group_is_a_startup_error() -> Result<(), Box<dyn std::error::Error>> {
+        let dir = TempDir::new()?;
+        let mut config = test_config(&dir, 0)?;
+        config.hook_socket_group = Some("no-such-group-zz9".to_owned());
+        assert!(matches!(
+            hook_group(&config),
+            Err(Error::InvalidValue {
+                name: "hook_socket_group",
+                ..
+            })
+        ));
+        config.hook_socket_group = None;
+        assert!(matches!(hook_group(&config), Ok(None)));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_hook_socket_bind_failure_removes_the_main_socket_and_closes_the_store()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let dir = TempDir::new()?;
+        let store = open_store(&dir).await?;
+        let mut config = test_config(&dir, 0)?;
+        config.hook_socket = Some(dir.path().join("missing").join("hook.sock"));
+        let result = run_with_store(
+            config.clone(),
+            store.clone(),
+            test_identity(),
+            Redactor::default(),
+            None,
+            None,
+            std::future::pending(),
+        )
+        .await;
+        assert!(result.is_err());
+        assert!(store.is_closed());
+        assert!(!config.socket_path.exists());
+        Ok(())
+    }
+
+    async fn status_of(path: &Path, request: &str) -> Result<u16, Box<dyn std::error::Error>> {
+        let stream = UnixStream::connect(path).await?;
+        let response = roundtrip(stream, request.as_bytes())
+            .await
+            .map_err(|_| "no response")?;
+        Ok(response.status)
+    }
+
+    #[tokio::test]
+    async fn the_hook_socket_serves_only_hook_routes_and_is_removed_at_shutdown()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let dir = TempDir::new()?;
+        let store = open_store(&dir).await?;
+        let mut config = test_config(&dir, 0)?;
+        let hook = dir.path().join("hook.sock");
+        config.hook_socket = Some(hook.clone());
+        let main = config.socket_path.clone();
+        let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
+        let daemon = tokio::spawn(run_with_store(
+            config,
+            store,
+            test_identity(),
+            Redactor::default(),
+            None,
+            None,
+            async {
+                let _ = stopped.await;
+            },
+        ));
+        let mut waited = 0;
+        while !(hook.exists() && main.exists()) && waited < 500 {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+            waited += 1;
+        }
+        let post = |path: &str| {
+            format!(
+                "POST {path} HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{{}}"
+            )
+        };
+        let get = "GET /healthz HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n";
+        assert_eq!(status_of(&hook, &post("/event")).await?, 404);
+        assert_eq!(status_of(&hook, get).await?, 200);
+        assert_eq!(status_of(&hook, &post("/hook/PostToolUse")).await?, 200);
+        assert_eq!(status_of(&main, &post("/event")).await?, 400);
+        let _ = stop.send(());
+        daemon.await??;
+        assert!(!hook.exists());
+        assert!(!main.exists());
         Ok(())
     }
 

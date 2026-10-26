@@ -33,3 +33,8 @@
 
 - **Hostile repo.** The fallback runs git in an agent-written tree. Tests plant hooks, `filter.<name>` config and `core.fsmonitor` and assert none ran. Read `git config --list --name-only` before the first git call that touches the tree, or a clean filter runs during `status`.
 - **Fake `claude` modes.** The prompt carries `mode:path` as in the spawn tests; `write`, `commit`, `secret` and `trap` cover the fallback cases.
+
+## Config keys
+
+- **`Config::resolve` sits at the clippy `too_many_lines` cap.** Put a new key's env, file and validation logic in a helper fn and call it once, or clippy fails the build.
+- **Binding a `tokio::net::UnixListener` needs a runtime.** A plain `#[test]` that calls `bind_socket` or `bind_hook_socket` panics with "no reactor running"; use `#[tokio::test]`.

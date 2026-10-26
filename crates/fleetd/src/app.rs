@@ -290,6 +290,16 @@ pub fn hook_router(state: Arc<AppState>) -> Router {
         .layer(DefaultBodyLimit::max(MAX_BODY_BYTES))
 }
 
+/// Routes for the hook socket: the hook routes and nothing else.
+///
+/// `POST /event` is not routed, so a client on this socket gets 404 for it. Bodies are
+/// capped at 1 MiB. Access is gated by the socket's file mode and group.
+pub fn hook_socket_router(state: Arc<AppState>) -> Router {
+    hook_routes()
+        .with_state(state)
+        .layer(DefaultBodyLimit::max(MAX_BODY_BYTES))
+}
+
 /// Routes for the unix socket.
 ///
 /// Adds `POST /event`, which takes an envelope as JSON, to the hook routes. Bodies are capped at 1 MiB. Access is gated by the socket's file

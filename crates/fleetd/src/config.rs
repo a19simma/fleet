@@ -52,6 +52,9 @@ struct FileConfig {
     agent_env_passthrough: Option<Vec<String>>,
     max_turns: Option<i64>,
     max_budget_usd: Option<f64>,
+    hook_socket: Option<PathBuf>,
+    hook_socket_uid: Option<u32>,
+    hook_socket_group: Option<String>,
 }
 
 /// Where redaction secrets are read from.
@@ -116,6 +119,17 @@ pub struct Config {
     /// which has no file key or environment variable for it. Only code that builds a
     /// `Config` for a test sets it.
     pub allow_file_repos: bool,
+    /// Second unix socket that serves only the hook routes, mode 0660. Absolute path, unset
+    /// by default, which creates no second socket. Env `FLEETD_HOOK_SOCKET`. The hook client
+    /// connects here instead of `socket_path` when it is set.
+    pub hook_socket: Option<PathBuf>,
+    /// Uid that must own the socket the hook client connects to and must be the peer on that
+    /// connection. Unset means the client's own effective uid. Env `FLEETD_HOOK_SOCKET_UID`.
+    pub hook_socket_uid: Option<u32>,
+    /// Group that owns `hook_socket`, a numeric gid or a name from `/etc/group`. Needs
+    /// `hook_socket`. Unset leaves the group the process default. Env
+    /// `FLEETD_HOOK_SOCKET_GROUP`.
+    pub hook_socket_group: Option<String>,
 }
 
 impl Config {
@@ -136,7 +150,8 @@ impl Config {
     ///
     /// Precedence is environment, then file, then default. The overrides are
     /// `FLEETD_PORT`, `FLEET_BOX_NAME`, `FLEETD_DB`, `FLEETD_SOCKET` and
-    /// `FLEETD_SECRETS_FILE`. Without an override the db lives under `STATE_DIRECTORY`
+    /// `FLEETD_SECRETS_FILE`, plus `FLEETD_HOOK_SOCKET`, `FLEETD_HOOK_SOCKET_UID` and
+    /// `FLEETD_HOOK_SOCKET_GROUP` for the hook socket keys. Without an override the db lives under `STATE_DIRECTORY`
     /// and the socket under `RUNTIME_DIRECTORY`, else the working directory.
     ///
     /// # Errors
@@ -144,7 +159,9 @@ impl Config {
     /// Fails on invalid TOML, an unparsable `FLEETD_PORT`, a zero
     /// `queue_max_bytes` or `queue_max_age_secs`, a `max_turns` outside 1 to 1000, a
     /// `max_budget_usd` that is not finite, not above 0 or above 1000, a `repo_hosts` entry that is not a bare
-    /// host name, or a `token_host` that is not in `repo_hosts`. An empty environment value
+    /// host name, a `token_host` that is not in `repo_hosts`, a `hook_socket` that is relative
+    /// or equals `socket_path`, an unparsable `hook_socket_uid`, or a `hook_socket_group` that
+    /// is not a plain name or has no `hook_socket`. An empty environment value
     /// counts as unset.
     pub fn resolve(
         file: Option<&str>,
@@ -205,6 +222,15 @@ impl Config {
         let agent_env_passthrough = resolve_passthrough(file.agent_env_passthrough)?;
         let max_turns = resolve_max_turns(file.max_turns)?;
         let max_budget_usd = resolve_max_budget(file.max_budget_usd)?;
+        let (hook_socket, hook_socket_uid, hook_socket_group) = resolve_hook_socket(
+            &env,
+            (
+                file.hook_socket,
+                file.hook_socket_uid,
+                file.hook_socket_group,
+            ),
+            &socket_path,
+        )?;
         Ok(Self {
             http_port,
             socket_path,
@@ -229,15 +255,7 @@ impl Config {
                 .unwrap_or_else(|| PathBuf::from(DEFAULT_CLAUDE_BIN)),
             gh_bin: file.gh_bin.unwrap_or_else(|| PathBuf::from(DEFAULT_GH_BIN)),
             disposable: file.disposable.unwrap_or(false),
-            jobs_dir: env("FLEETD_JOBS_DIR")
-                .map(PathBuf::from)
-                .or(file.jobs_dir)
-                .unwrap_or_else(|| {
-                    env("STATE_DIRECTORY")
-                        .as_deref()
-                        .and_then(first_dir)
-                        .map_or_else(|| PathBuf::from("jobs"), |dir| dir.join("jobs"))
-                }),
+            jobs_dir: resolve_jobs_dir(&env, file.jobs_dir),
             repo_hosts,
             token_host,
             agent_config_dir: file.agent_config_dir,
@@ -245,6 +263,9 @@ impl Config {
             max_turns,
             max_budget_usd,
             allow_file_repos: false,
+            hook_socket,
+            hook_socket_uid,
+            hook_socket_group,
         })
     }
 }
@@ -256,6 +277,63 @@ fn nonzero(name: &'static str, raw: Option<u64>, default: u64) -> Result<u64, Er
             value: "0".to_owned(),
         }),
         value => Ok(value),
+    }
+}
+
+fn resolve_jobs_dir(env: &dyn Fn(&str) -> Option<String>, file: Option<PathBuf>) -> PathBuf {
+    env("FLEETD_JOBS_DIR")
+        .map(PathBuf::from)
+        .or(file)
+        .unwrap_or_else(|| {
+            env("STATE_DIRECTORY")
+                .as_deref()
+                .and_then(first_dir)
+                .map_or_else(|| PathBuf::from("jobs"), |dir| dir.join("jobs"))
+        })
+}
+
+type HookSocket = (Option<PathBuf>, Option<u32>, Option<String>);
+
+fn resolve_hook_socket(
+    env: &dyn Fn(&str) -> Option<String>,
+    file: HookSocket,
+    main_socket: &Path,
+) -> Result<HookSocket, Error> {
+    let socket = env("FLEETD_HOOK_SOCKET").map(PathBuf::from).or(file.0);
+    let uid = match env("FLEETD_HOOK_SOCKET_UID") {
+        Some(raw) => Some(raw.parse().map_err(|_| Error::InvalidValue {
+            name: "FLEETD_HOOK_SOCKET_UID",
+            value: raw,
+        })?),
+        None => file.1,
+    };
+    let group = env("FLEETD_HOOK_SOCKET_GROUP").or(file.2);
+    check_hook_socket(socket.as_deref(), group.as_deref(), main_socket)?;
+    Ok((socket, uid, group))
+}
+
+fn check_hook_socket(
+    socket: Option<&Path>,
+    group: Option<&str>,
+    main_socket: &Path,
+) -> Result<(), Error> {
+    let invalid = |name: &'static str, value: String| Error::InvalidValue { name, value };
+    if let Some(socket) = socket
+        && (!socket.is_absolute() || socket == main_socket)
+    {
+        return Err(invalid("hook_socket", socket.display().to_string()));
+    }
+    let name_ok = |name: &str| {
+        !name.is_empty()
+            && name
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-' | b'.'))
+    };
+    match group {
+        Some(group) if socket.is_none() || !name_ok(group) => {
+            Err(invalid("hook_socket_group", group.to_owned()))
+        }
+        _ => Ok(()),
     }
 }
 
@@ -433,6 +511,58 @@ mod tests {
         assert!(cfg.hook_events.iter().any(|e| e == "PostToolUse"));
         assert!(cfg.hook_events.iter().any(|e| e == "PostToolUseFailure"));
         assert!(!cfg.secrets_file.required);
+    }
+
+    #[test]
+    fn hook_socket_keys_default_to_unset() {
+        let cfg = Config::resolve(None, &env_of(&[])).unwrap();
+        assert_eq!(cfg.hook_socket, None);
+        assert_eq!(cfg.hook_socket_uid, None);
+        assert_eq!(cfg.hook_socket_group, None);
+    }
+
+    #[test]
+    fn hook_socket_keys_come_from_the_file_and_env_overrides_them() {
+        let file = "hook_socket = \"/run/a/hook.sock\"\nhook_socket_uid = 7\nhook_socket_group = \"fleet-work\"\n";
+        let cfg = Config::resolve(Some(file), &env_of(&[])).unwrap();
+        assert_eq!(cfg.hook_socket, Some(PathBuf::from("/run/a/hook.sock")));
+        assert_eq!(cfg.hook_socket_uid, Some(7));
+        assert_eq!(cfg.hook_socket_group.as_deref(), Some("fleet-work"));
+        let env = env_of(&[
+            ("FLEETD_HOOK_SOCKET", "/run/b/hook.sock"),
+            ("FLEETD_HOOK_SOCKET_UID", "8"),
+            ("FLEETD_HOOK_SOCKET_GROUP", "other"),
+        ]);
+        let cfg = Config::resolve(Some(file), &env).unwrap();
+        assert_eq!(cfg.hook_socket, Some(PathBuf::from("/run/b/hook.sock")));
+        assert_eq!(cfg.hook_socket_uid, Some(8));
+        assert_eq!(cfg.hook_socket_group.as_deref(), Some("other"));
+    }
+
+    #[test]
+    fn invalid_hook_socket_keys_fail_startup_naming_the_key() {
+        let named =
+            |file: &str, env: &[(&str, &str)]| match Config::resolve(Some(file), &env_of(env)) {
+                Err(Error::InvalidValue { name, .. }) => name,
+                other => panic!("{other:?}"),
+            };
+        assert_eq!(named("hook_socket = \"hook.sock\"", &[]), "hook_socket");
+        assert_eq!(
+            named("socket_path = \"/a/s\"\nhook_socket = \"/a/s\"", &[]),
+            "hook_socket"
+        );
+        assert_eq!(
+            named("hook_socket_group = \"fleet-work\"", &[]),
+            "hook_socket_group"
+        );
+        for bad in ["", "a b", "a/b", "a:b"] {
+            let file = format!("hook_socket = \"/a/h\"\nhook_socket_group = {bad:?}");
+            assert_eq!(named(&file, &[]), "hook_socket_group", "{bad:?}");
+        }
+        assert_eq!(
+            named("", &[("FLEETD_HOOK_SOCKET_UID", "-1")]),
+            "FLEETD_HOOK_SOCKET_UID"
+        );
     }
 
     #[test]

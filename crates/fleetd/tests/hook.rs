@@ -255,6 +255,73 @@ async fn a_unix_close_without_a_status_line_fails_without_replay() -> TestResult
     Ok(())
 }
 
+/// Runs the client against a hook socket whose peer answers 500, which is final when the
+/// socket is trusted. Returns whether the unix server was used and how many TCP requests came.
+async fn hook_socket_scenario(
+    dir_mode: u32,
+    uid: Option<u32>,
+) -> Result<(bool, usize), Box<dyn std::error::Error>> {
+    use std::os::unix::fs::PermissionsExt;
+
+    let dir = TempDir::new()?;
+    let sub = dir.path().join("hook");
+    std::fs::create_dir(&sub)?;
+    std::fs::set_permissions(&sub, std::fs::Permissions::from_mode(dir_mode))?;
+    let (port, count) =
+        counting_tcp("HTTP/1.1 204 No Content\r\nContent-Length: 0\r\n\r\n").await?;
+    let hook = sub.join("hook.sock");
+    let uid_line = uid.map_or_else(String::new, |uid| format!("hook_socket_uid = {uid}\n"));
+    let file = format!(
+        "http_port = {port}\nsocket_path = \"{}\"\nhook_socket = \"{}\"\n{uid_line}",
+        dir.path().join("fleetd.sock").display(),
+        hook.display()
+    );
+    let config = Config::resolve(Some(&file), &|_| None)?;
+    let sock = fleetd::bind_hook_socket(&hook, None)?;
+    tokio::spawn(async move {
+        while let Ok((mut stream, _)) = sock.accept().await {
+            let _ = answer(
+                &mut stream,
+                b"HTTP/1.1 500 Internal Server Error\r\nContent-Length: 0\r\n\r\n",
+            )
+            .await;
+        }
+    });
+    let result = forward_hook(&config, "SessionStart", PAYLOAD.as_bytes(), None).await;
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    Ok((result.is_err(), count.load(Ordering::SeqCst)))
+}
+
+fn own_uid() -> u32 {
+    rustix::process::geteuid().as_raw()
+}
+
+#[tokio::test]
+async fn a_trusted_hook_socket_is_used_in_place_of_the_main_socket() -> TestResult {
+    assert_eq!(hook_socket_scenario(0o700, None).await?, (true, 0));
+    assert_eq!(
+        hook_socket_scenario(0o750, Some(own_uid())).await?,
+        (true, 0)
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_hook_socket_owned_by_another_uid_is_refused() -> TestResult {
+    assert_eq!(
+        hook_socket_scenario(0o700, Some(own_uid() + 1)).await?,
+        (false, 1)
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_hook_socket_in_a_group_or_other_writable_directory_is_refused() -> TestResult {
+    assert_eq!(hook_socket_scenario(0o770, None).await?, (false, 1));
+    assert_eq!(hook_socket_scenario(0o707, None).await?, (false, 1));
+    Ok(())
+}
+
 async fn captured_request(job: Option<&str>) -> String {
     let dir = TempDir::new().unwrap();
     let tcp = TcpListener::bind("127.0.0.1:0").await.unwrap();

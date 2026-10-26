@@ -90,7 +90,7 @@ pub async fn forward_hook(
         });
     }
     let job = job.and_then(job_header_value);
-    forward(config, event, input, job.as_deref())
+    forward(config, event, input, job.as_deref(), &Trust::of(config))
         .await
         .map_err(Error::Runtime)
 }
@@ -100,6 +100,7 @@ async fn forward(
     event: &str,
     input: impl AsyncRead + Unpin,
     job: Option<&str>,
+    trust: &Trust,
 ) -> io::Result<()> {
     let mut body = Vec::new();
     input
@@ -120,11 +121,14 @@ async fn forward(
         ));
     }
     let request = request_bytes(event, &body, job);
-    if socket_usable(&config.socket_path) {
+    let socket = config.hook_socket.as_deref().unwrap_or(&config.socket_path);
+    if socket_usable(socket, trust.uid) {
         let attempt = tokio::time::timeout(UNIX_TIMEOUT, async {
-            match UnixStream::connect(&config.socket_path).await {
-                Ok(stream) => exchange(stream, &request).await,
-                Err(_) => Err(Attempt::NotDelivered),
+            match UnixStream::connect(socket).await {
+                Ok(stream) if (trust.peer_uid)(&stream).is_ok_and(|uid| uid == trust.uid) => {
+                    exchange(stream, &request).await
+                }
+                _ => Err(Attempt::NotDelivered),
             }
         })
         .await;
@@ -142,17 +146,54 @@ async fn forward(
     }
 }
 
-/// Decides whether a socket at `path` owned by `socket_uid` may be trusted.
+/// The uid a hook socket must belong to and how the peer uid is read.
 ///
-/// The path must be absolute and the owner must be `current_uid`, so a planted
-/// socket from another user is never sent a hook payload.
-fn socket_acceptable(path: &Path, socket_uid: u32, current_uid: u32) -> bool {
-    path.is_absolute() && socket_uid == current_uid
+/// `peer_uid` is a seam: production reads `SO_PEERCRED`, a test substitutes another uid.
+struct Trust {
+    uid: u32,
+    peer_uid: fn(&UnixStream) -> io::Result<u32>,
 }
 
-fn socket_usable(path: &Path) -> bool {
-    std::fs::metadata(path)
-        .is_ok_and(|meta| socket_acceptable(path, meta.uid(), rustix::process::geteuid().as_raw()))
+impl Trust {
+    fn of(config: &Config) -> Self {
+        Self {
+            uid: config
+                .hook_socket_uid
+                .unwrap_or_else(|| rustix::process::geteuid().as_raw()),
+            peer_uid: |stream| stream.peer_cred().map(|cred| cred.uid()),
+        }
+    }
+}
+
+/// Owner and parent-directory facts about a socket path.
+struct SocketFacts {
+    owner: u32,
+    parent_owner: u32,
+    parent_mode: u32,
+}
+
+/// Decides whether a socket at `path` may be trusted for `uid`.
+///
+/// The path must be absolute and the socket must be owned by `uid`, so a planted socket
+/// from another user is never sent a hook payload. Its parent directory must belong to
+/// root or `uid` and carry no group or other write bit, so nobody else can swap the socket.
+fn socket_acceptable(path: &Path, facts: &SocketFacts, uid: u32) -> bool {
+    path.is_absolute()
+        && facts.owner == uid
+        && (facts.parent_owner == 0 || facts.parent_owner == uid)
+        && facts.parent_mode & 0o022 == 0
+}
+
+fn socket_usable(path: &Path, uid: u32) -> bool {
+    let facts = std::fs::metadata(path).ok().and_then(|socket| {
+        let parent = std::fs::metadata(path.parent()?).ok()?;
+        Some(SocketFacts {
+            owner: socket.uid(),
+            parent_owner: parent.uid(),
+            parent_mode: parent.mode(),
+        })
+    });
+    facts.is_some_and(|facts| socket_acceptable(path, &facts, uid))
 }
 
 enum Attempt {
@@ -188,22 +229,116 @@ async fn exchange(
 
 #[cfg(test)]
 mod tests {
+    use std::io;
     use std::path::Path;
 
-    use super::socket_acceptable;
+    use tempfile::TempDir;
+    use tokio::io::AsyncReadExt;
+    use tokio::net::{UnixListener, UnixStream};
+
+    use super::{SocketFacts, Trust, forward, socket_acceptable};
+    use crate::Config;
+
+    fn facts(owner: u32, parent_owner: u32, parent_mode: u32) -> SocketFacts {
+        SocketFacts {
+            owner,
+            parent_owner,
+            parent_mode,
+        }
+    }
+
+    fn accepts(facts: &SocketFacts) -> bool {
+        socket_acceptable(Path::new("/run/fleetd/hook.sock"), facts, 1000)
+    }
 
     #[test]
-    fn accepts_an_absolute_path_owned_by_the_current_uid() {
-        assert!(socket_acceptable(Path::new("/run/fleetd.sock"), 1000, 1000));
+    fn accepts_an_absolute_path_owned_by_the_uid_in_a_private_directory() {
+        assert!(accepts(&facts(1000, 1000, 0o40700)));
+        assert!(accepts(&facts(1000, 0, 0o40755)));
+        assert!(accepts(&facts(1000, 1000, 0o40750)));
     }
 
     #[test]
     fn refuses_a_relative_path() {
-        assert!(!socket_acceptable(Path::new("fleetd.sock"), 1000, 1000));
+        assert!(!socket_acceptable(
+            Path::new("fleetd.sock"),
+            &facts(1000, 1000, 0o40700),
+            1000
+        ));
     }
 
     #[test]
     fn refuses_a_socket_owned_by_another_uid() {
-        assert!(!socket_acceptable(Path::new("/run/fleetd.sock"), 0, 1000));
+        assert!(!accepts(&facts(0, 1000, 0o40700)));
+        assert!(!accepts(&facts(1001, 1000, 0o40700)));
+    }
+
+    #[test]
+    fn refuses_a_parent_directory_owned_by_someone_else() {
+        assert!(!accepts(&facts(1000, 1001, 0o40700)));
+    }
+
+    #[test]
+    fn refuses_a_parent_directory_writable_by_group_or_other() {
+        assert!(!accepts(&facts(1000, 1000, 0o40770)));
+        assert!(!accepts(&facts(1000, 1000, 0o40707)));
+        assert!(!accepts(&facts(1000, 0, 0o41777)));
+        assert!(!accepts(&facts(1000, 1000, 0o40720)));
+        assert!(!accepts(&facts(1000, 1000, 0o40702)));
+    }
+
+    #[tokio::test]
+    async fn a_peer_that_is_not_the_trusted_uid_is_sent_nothing()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let dir = TempDir::new()?;
+        let path = dir.path().join("hook.sock");
+        let listener = UnixListener::bind(&path)?;
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await?;
+            let mut seen = Vec::new();
+            stream.read_to_end(&mut seen).await?;
+            io::Result::Ok(seen.len())
+        });
+        let file = format!(
+            "http_port = 1\nsocket_path = {:?}\nhook_socket = {:?}\n",
+            dir.path().join("main.sock"),
+            path
+        );
+        let config = Config::resolve(Some(&file), &|_| None)?;
+        let mut trust = Trust::of(&config);
+        trust.peer_uid = |_: &UnixStream| Ok(u32::MAX);
+        let sent = forward(&config, "SessionStart", &b"{}"[..], None, &trust).await;
+        assert!(sent.is_err());
+        assert_eq!(server.await??, 0);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_peer_that_is_the_trusted_uid_gets_the_request()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let dir = TempDir::new()?;
+        let path = dir.path().join("hook.sock");
+        let listener = UnixListener::bind(&path)?;
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await?;
+            let mut seen = vec![0; 16];
+            stream.read_exact(&mut seen).await?;
+            io::Result::Ok(seen)
+        });
+        let file = format!(
+            "http_port = 1\nsocket_path = {:?}\nhook_socket = {:?}\n",
+            dir.path().join("main.sock"),
+            path
+        );
+        let config = Config::resolve(Some(&file), &|_| None)?;
+        let mut trust = Trust::of(&config);
+        trust.peer_uid = |_: &UnixStream| Ok(trust_uid());
+        let _ = forward(&config, "SessionStart", &b"{}"[..], None, &trust).await;
+        assert_eq!(&server.await??, b"POST /hook/Sessi");
+        Ok(())
+    }
+
+    fn trust_uid() -> u32 {
+        rustix::process::geteuid().as_raw()
     }
 }
