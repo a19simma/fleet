@@ -667,6 +667,12 @@ fn select_launcher_follows_the_config() -> TestResult {
     let file = "agent_launcher = \"systemd\"\n";
     let systemd = Config::resolve(Some(file), &none)?;
     assert!(format!("{:?}", select_launcher(&systemd, None)).contains("SystemdLauncher"));
+    let timed = Config::resolve(
+        Some("agent_launcher = \"systemd\"\nagent_timeout_secs = 321\n"),
+        &none,
+    )?;
+    let shown = format!("{:?}", select_launcher(&timed, None));
+    assert!(shown.contains("321"), "{shown}");
     Ok(())
 }
 

@@ -26,7 +26,7 @@ use tokio::task::JoinHandle;
 use crate::agent_exec::{SPEC_FILE, write_spec};
 use crate::config::{AgentLauncher, Config};
 use crate::jobenv::{create_stdout_fifo, open_fifo_reader, render_env_file, write_env_file};
-use crate::runner::{AgentProc, AgentSpec, DEFAULT_TIMEOUT, DirectLauncher, Launched, Launcher};
+use crate::runner::{AgentProc, AgentSpec, DirectLauncher, Launched, Launcher};
 use crate::workspace::validate_job_id;
 
 /// Default parent of the per-job run directories.
@@ -55,7 +55,7 @@ pub fn select_launcher(config: &Config, job_gid: Option<u32>) -> Arc<dyn Launche
         AgentLauncher::Systemd => Arc::new(
             SystemdLauncher::new(&config.systemctl_path)
                 .with_job_gid(job_gid)
-                .with_run_timeout(DEFAULT_TIMEOUT),
+                .with_run_timeout(config.agent_timeout),
         ),
     }
 }

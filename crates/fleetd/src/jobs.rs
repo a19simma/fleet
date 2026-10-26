@@ -117,6 +117,12 @@ fn job_gid(config: &Config) -> Result<Option<u32>, Error> {
         })
 }
 
+fn apply_limits(run: &mut RunConfig, config: &Config) {
+    run.max_turns = config.max_turns;
+    run.max_budget_usd = config.max_budget_usd;
+    run.timeout = config.agent_timeout;
+}
+
 fn job_workspace(
     config: &Config,
     run: &mut RunConfig,
@@ -165,8 +171,7 @@ pub(crate) fn build(
     run.gh_bin.clone_from(&config.gh_bin);
     run.jobs_dir = Some(config.jobs_dir.clone());
     run.job_gid = job_gid(config)?;
-    run.max_turns = config.max_turns;
-    run.max_budget_usd = config.max_budget_usd;
+    apply_limits(&mut run, config);
     run.env_passthrough
         .clone_from(&config.agent_env_passthrough);
     if let Some(dir) = &config.agent_config_dir {
@@ -217,6 +222,15 @@ mod tests {
             let _ = self.0.send(request);
             std::future::ready(Ok(ReportJobReply::default()))
         }
+    }
+
+    #[test]
+    fn the_agent_timeout_reaches_the_run_config() -> TestResult {
+        let config = Config::resolve(Some("agent_timeout_secs = 77\n"), &|_| None)?;
+        let mut run = RunConfig::new("claude", false);
+        apply_limits(&mut run, &config);
+        assert_eq!(run.timeout, Duration::from_secs(77));
+        Ok(())
     }
 
     #[tokio::test]

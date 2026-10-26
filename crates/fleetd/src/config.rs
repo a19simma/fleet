@@ -4,13 +4,20 @@ use std::time::Duration;
 use serde::Deserialize;
 
 use crate::Error;
-use crate::runner::{DEFAULT_MAX_BUDGET_USD, DEFAULT_MAX_TURNS};
+use crate::runner::{DEFAULT_MAX_BUDGET_USD, DEFAULT_MAX_TURNS, DEFAULT_TIMEOUT};
 
 /// Config file read when `--config` is not given and the file exists.
 pub const DEFAULT_CONFIG_PATH: &str = "/etc/fleetd/config.toml";
 /// Default secrets env file. A missing file at this path is not an error.
 pub const DEFAULT_SECRETS_PATH: &str = "/etc/swarm/secrets.env";
 const MAX_TURNS_LIMIT: u32 = 1000;
+/// The `RuntimeMaxSec` of `deploy/fleet-agent@.service` in seconds, the unit's own backstop.
+const UNIT_RUNTIME_MAX_SECS: u64 = 2 * 60 * 60;
+/// Seconds the unit's `RuntimeMaxSec` must outlast `agent_timeout_secs`, so fleetd's own
+/// deadline fires first and the run reads as timed out, not as a unit kill.
+const RUNTIME_MAX_HEADROOM_SECS: u64 = 5 * 60;
+/// Largest `agent_timeout_secs`: [`UNIT_RUNTIME_MAX_SECS`] less [`RUNTIME_MAX_HEADROOM_SECS`].
+const MAX_AGENT_TIMEOUT_SECS: u64 = UNIT_RUNTIME_MAX_SECS - RUNTIME_MAX_HEADROOM_SECS;
 const MAX_BUDGET_USD_LIMIT: f64 = 1000.0;
 const DEFAULT_PORT: u16 = 7071;
 const DEFAULT_QUEUE_MAX_BYTES: u64 = 256 * 1024 * 1024;
@@ -52,6 +59,7 @@ struct FileConfig {
     agent_env_passthrough: Option<Vec<String>>,
     max_turns: Option<i64>,
     max_budget_usd: Option<f64>,
+    agent_timeout_secs: Option<i64>,
     hook_socket: Option<PathBuf>,
     hook_socket_uid: Option<u32>,
     hook_socket_group: Option<String>,
@@ -129,6 +137,11 @@ pub struct Config {
     /// Dollars one job may spend, above 0 and at most 1000, 5.0 by default. Always passed as
     /// `--max-budget-usd`. See [`crate::runner::DEFAULT_MAX_TURNS`].
     pub max_budget_usd: f64,
+    /// Longest one agent run may take, 1 to [`MAX_AGENT_TIMEOUT_SECS`] seconds, 1800 by
+    /// default, config file only. It sets `RunConfig::timeout` and, with the systemd launcher,
+    /// the deadline past which a unit kill reads as a timeout. The unit's `RuntimeMaxSec`
+    /// outlasts the maximum by [`RUNTIME_MAX_HEADROOM_SECS`].
+    pub agent_timeout: Duration,
     /// Admits `file://` and absolute-path repos. Always false from [`Config::resolve`],
     /// which has no file key or environment variable for it. Only code that builds a
     /// `Config` for a test sets it.
@@ -278,6 +291,7 @@ impl Config {
             agent_env_passthrough,
             max_turns: resolve_max_turns(file.max_turns)?,
             max_budget_usd,
+            agent_timeout: resolve_agent_timeout(file.agent_timeout_secs)?,
             allow_file_repos: false,
             hook_socket,
             hook_socket_uid,
@@ -423,6 +437,20 @@ fn resolve_max_turns(raw: Option<i64>) -> Result<u32, Error> {
         })
 }
 
+fn resolve_agent_timeout(raw: Option<i64>) -> Result<Duration, Error> {
+    let Some(raw) = raw else {
+        return Ok(DEFAULT_TIMEOUT);
+    };
+    u64::try_from(raw)
+        .ok()
+        .filter(|secs| (1..=MAX_AGENT_TIMEOUT_SECS).contains(secs))
+        .map(Duration::from_secs)
+        .ok_or_else(|| Error::InvalidValue {
+            name: "agent_timeout_secs",
+            value: raw.to_string(),
+        })
+}
+
 /// NaN fails both comparisons and infinity fails the upper bound, so the range alone keeps the
 /// value finite.
 fn resolve_max_budget(raw: Option<f64>) -> Result<f64, Error> {
@@ -538,6 +566,50 @@ mod tests {
             assert_eq!(got_turns, turns, "{text}");
             assert!((got_budget - budget).abs() < f64::EPSILON, "{text}");
         }
+    }
+
+    #[test]
+    fn agent_timeout_defaults_and_accepts_the_edges() {
+        let timeout =
+            |text: &str| Config::resolve(Some(text), &env_of(&[])).map(|c| c.agent_timeout);
+        assert_eq!(
+            Config::resolve(None, &env_of(&[])).unwrap().agent_timeout,
+            Duration::from_secs(1800)
+        );
+        assert_eq!(
+            timeout("agent_timeout_secs = 1").unwrap(),
+            Duration::from_secs(1)
+        );
+        assert_eq!(
+            timeout("agent_timeout_secs = 6900").unwrap(),
+            Duration::from_secs(MAX_AGENT_TIMEOUT_SECS)
+        );
+    }
+
+    #[test]
+    fn invalid_agent_timeouts_fail_startup_naming_the_key() {
+        for text in [
+            "agent_timeout_secs = 0",
+            "agent_timeout_secs = -1",
+            "agent_timeout_secs = 6901",
+            "agent_timeout_secs = 7200",
+        ] {
+            match Config::resolve(Some(text), &env_of(&[])) {
+                Err(Error::InvalidValue { name, .. }) => assert_eq!(name, "agent_timeout_secs"),
+                other => panic!("{text}: {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn the_unit_runtime_max_outlasts_the_largest_agent_timeout() {
+        let unit = include_str!("../../../deploy/fleet-agent@.service");
+        assert!(unit.contains("\nRuntimeMaxSec=2h\n"));
+        assert_eq!(UNIT_RUNTIME_MAX_SECS, 2 * 60 * 60);
+        assert_eq!(
+            MAX_AGENT_TIMEOUT_SECS + RUNTIME_MAX_HEADROOM_SECS,
+            UNIT_RUNTIME_MAX_SECS
+        );
     }
 
     #[test]
