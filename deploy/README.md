@@ -100,7 +100,7 @@ sqlite3 /var/lib/fleetd/queue.db 'select seq, kind, state from events order by s
 | `fleetd-systemd.service` | `/etc/systemd/system/fleetd.service`, replacing the legacy unit |
 | `fleet-agent@.service.d/allow-network.conf.example` | optional, see [Network](#network) |
 
-These files were written without `systemd-analyze verify`, which was not available where they were written. Run `systemd-analyze verify /etc/systemd/system/fleet-agent@.service /etc/systemd/system/fleetd.service` on the box before the first start.
+The units and `sysusers.d` file passed `systemd-analyze verify` and a live install on systemd 257. Run `systemd-analyze verify /etc/systemd/system/fleet-agent@.service /etc/systemd/system/fleetd.service` on the box before the first start anyway.
 
 ### Users and groups
 
@@ -163,6 +163,8 @@ For each job the launcher creates `/run/fleet/<job id>/` (the job id matches `[A
 The launcher runs `systemctl start --no-block fleet-agent@<job id>.service`, polls `systemctl show`, and removes the run dir and calls `reset-failed` when the unit ends. Cancel is `systemctl kill` and `stop`, which kill the whole cgroup. The unit runs at most `RuntimeMaxSec=2h`.
 
 The startup sweep of stale run dirs is not built. After a fleetd crash, remove old directories under `/run/fleet` by hand, or reboot (`/run` is a tmpfs).
+
+The unit sets `RemainAfterExit=yes` and no `CollectMode=`. systemd unloads a unit that exits cleanly, and with `CollectMode=inactive-or-failed` a failed one too, and `systemctl show` then reports `Result=success` and `ExecMainStatus=0` for every exit code, so the launcher would read a failure as no result. With `RemainAfterExit=yes` a clean exit stays `active (exited)` and a failed unit stays `failed`, both with the real status, until `systemctl stop` or `reset-failed`. The launcher must stop the unit after reading the status, because `reset-failed` leaves an `active (exited)` unit loaded. polkit allows `stop` for these units.
 
 The unit sets `ProtectProc=invisible`, `ProcSubset=pid`, `PrivateTmp=no`, `NoNewPrivileges=yes` and `MemoryMax=2300M` with `TasksMax=512`. `CPUQuota` is unset. `PrivateTmp=no` is deliberate: `PrivateTmp=yes` fails a `ReadWritePaths=` entry under `/var/tmp` with status 226/NAMESPACE, which is why the jobs dir lives outside `/var/tmp`. `RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6` stays open because `AF_UNIX` alone blocks loopback. `InaccessiblePaths=/etc/swarm` hides the secrets directory from the job.
 
