@@ -55,3 +55,16 @@ fn connection_failure_exits_one() -> TestResult {
     assert_eq!(out.status.code(), Some(1));
     Ok(())
 }
+
+#[test]
+fn bad_stats_window_exits_two_before_connecting() -> TestResult {
+    let out = fleet(
+        &[
+            ("FLEET_SERVER_URL", "http://127.0.0.1:1"),
+            ("FLEET_CLIENT_TOKEN", "t"),
+        ],
+        &["stats", "--since", "soon"],
+    )?;
+    assert_eq!(out.status.code(), Some(2));
+    Ok(())
+}

@@ -85,6 +85,13 @@ impl FleetJobs for Stub {
         Err(Status::unimplemented("not used"))
     }
 
+    async fn get_stats(
+        &self,
+        _: Request<fleet_proto::v1::GetStatsRequest>,
+    ) -> Result<Response<fleet_proto::v1::GetStatsReply>, Status> {
+        Err(Status::unimplemented("not used"))
+    }
+
     async fn read_job_events(
         &self,
         _: Request<fleet_proto::v1::ReadJobEventsRequest>,

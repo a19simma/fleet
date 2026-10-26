@@ -12,8 +12,8 @@ mod tests {
     use fleet_proto::v1::fleet_query_client::FleetQueryClient;
     use fleet_proto::v1::fleet_worker_client::FleetWorkerClient;
     use fleet_proto::v1::{
-        ClaimJobRequest, Envelope, HeartbeatRequest, ListFleetRequest, ListJobsRequest,
-        PushEventsRequest, QueuedEvent, ReadJobEventsRequest,
+        ClaimJobRequest, Envelope, GetStatsRequest, HeartbeatRequest, ListFleetRequest,
+        ListJobsRequest, PushEventsRequest, QueuedEvent, ReadJobEventsRequest,
     };
     use fleet_server::auth::BearerAuth;
     use fleet_server::config::Token;
@@ -186,6 +186,10 @@ mod tests {
                 })
                 .await
                 .map(|_| ()),
+            "stats" => FleetJobsClient::with_interceptor(chan, move |r| header.apply(r))
+                .get_stats(GetStatsRequest::default())
+                .await
+                .map(|_| ()),
             _ => FleetJobsClient::with_interceptor(chan, move |r| header.apply(r))
                 .list_jobs(ListJobsRequest::default())
                 .await
@@ -204,6 +208,7 @@ mod tests {
             ("worker", true, false),
             ("jobs", false, true),
             ("events", false, true),
+            ("stats", false, true),
         ] {
             for (name, token, ok) in [("box", TOKEN, box_ok), ("client", CLIENT, client_ok)] {
                 let code = code_of(addr, service, Some(token)).await;

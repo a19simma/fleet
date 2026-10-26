@@ -6,8 +6,9 @@ use std::time::Duration;
 
 use fleet_core::{BoxName, Envelope, EventId, SCHEMA_VERSION};
 use fleet_proto::v1::{
-    BoxStatus, BoxView, HeartbeatRequest, Job, JobState, ReadJobEventsReply, ReadTranscriptReply,
-    ReportJobReply, ReportJobRequest, SessionState, SessionView, SubmitJobRequest, TranscriptChunk,
+    BoxStatus, BoxView, GetStatsReply, GetStatsRequest, HeartbeatRequest, Job, JobState,
+    ReadJobEventsReply, ReadTranscriptReply, ReportJobReply, ReportJobRequest, SessionState,
+    SessionView, SubmitJobRequest, TranscriptChunk,
 };
 use serde_json::{Value, json};
 use sqlx::postgres::PgRow;
@@ -18,6 +19,7 @@ use crate::jobs::{
     MAX_TRANSCRIPT_ROWS, MIN_CHUNK_COST_BYTES, validate_job_id, validate_submit, validate_terminal,
 };
 use crate::projection::{Projection, State, project};
+use crate::stats;
 use crate::telemetry;
 
 const INSERT_EVENTS: &str = "\
@@ -218,6 +220,7 @@ const SET_TRANSCRIPT_BYTES: &str = "UPDATE jobs SET transcript_bytes = $2 WHERE 
 pub const DEFAULT_LEASE: Duration = Duration::from_secs(120);
 
 const NOW_MS: &str = "SELECT (EXTRACT(EPOCH FROM now()) * 1000)::bigint";
+pub(crate) const NOW_SECONDS: &str = "SELECT CEIL(EXTRACT(EPOCH FROM now()))::bigint";
 
 /// Jobs `list_jobs` returns when the request sets no limit.
 pub const DEFAULT_LIST_LIMIT: u32 = 50;
@@ -873,6 +876,16 @@ impl Store {
             .last()
             .map_or_else(|| after_seq.unwrap_or(0), |event| event.seq);
         Ok(ReadJobEventsReply { events, next_seq })
+    }
+
+    /// Aggregates job outcomes and telemetry over a time window.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StoreError::InvalidJob`] when the window, a filter or the grouping fails
+    /// validation, and [`StoreError::Database`] when the query fails.
+    pub async fn stats(&self, request: &GetStatsRequest) -> Result<GetStatsReply, StoreError> {
+        stats::stats(&self.pool, request).await
     }
 
     /// Cancels a job.

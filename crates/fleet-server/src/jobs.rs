@@ -61,6 +61,12 @@ pub enum JobInvalid {
     JobId,
     /// The state filter is not a known job state.
     State,
+    /// The stats window has a negative or out-of-range bound, or ends before it starts.
+    Window,
+    /// A stats filter is empty, too long or contains a NUL character.
+    Filter,
+    /// The stats grouping is not a known value.
+    GroupBy,
 }
 
 impl fmt::Display for JobInvalid {
@@ -76,6 +82,9 @@ impl fmt::Display for JobInvalid {
             Self::Branch => "invalid branch",
             Self::JobId => "invalid job id",
             Self::State => "invalid state filter",
+            Self::Window => "invalid stats window",
+            Self::Filter => "invalid stats filter",
+            Self::GroupBy => "invalid stats grouping",
         })
     }
 }

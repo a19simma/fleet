@@ -3,6 +3,7 @@
 pub mod config;
 pub mod list;
 pub mod logs;
+pub mod stats;
 pub mod telemetry;
 pub mod watch;
 
@@ -113,6 +114,34 @@ pub enum Command {
         /// Job id.
         id: String,
     },
+    /// Show job outcome and telemetry statistics.
+    Stats {
+        /// Window start: a duration such as `7d`, `24h` or `90m`, or a unix time in seconds.
+        #[arg(long, default_value = "7d")]
+        since: String,
+        /// Only jobs for this repository.
+        #[arg(long)]
+        repo: Option<String>,
+        /// Only jobs that ran on this box.
+        #[arg(long = "box")]
+        box_name: Option<String>,
+        /// Group rows by this column. Without it one row covers every job.
+        #[arg(long, value_enum)]
+        by: Option<StatsBy>,
+    },
+}
+
+/// A column `fleet stats` groups its rows by.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+pub enum StatsBy {
+    /// One row per repository.
+    Repo,
+    /// One row per box.
+    Box,
+    /// One row per job state.
+    State,
+    /// One row per UTC day.
+    Day,
 }
 
 /// A failure while running a command.
@@ -488,6 +517,16 @@ pub async fn run_with(
         Command::Logs { id, follow } => {
             let client = session(server, insecure, lookup, timeouts).await?.jobs;
             logs::logs(&client, id, follow, out).await?;
+        }
+        Command::Stats {
+            since,
+            repo,
+            box_name,
+            by,
+        } => {
+            let since = stats::parse_since(&since, stats::now_seconds())?;
+            let mut client = session(server, insecure, lookup, timeouts).await?.jobs;
+            stats::stats(&mut client, since, repo, box_name, by, out).await?;
         }
         Command::Cancel { id } => {
             let mut client = session(server, insecure, lookup, timeouts).await?.jobs;

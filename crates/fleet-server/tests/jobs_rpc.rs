@@ -10,9 +10,9 @@ use std::time::Duration;
 use fleet_core::BoxName;
 use fleet_proto::v1::fleet_jobs_client::FleetJobsClient;
 use fleet_proto::v1::{
-    CancelJobRequest, GetJobRequest, JobEvent, JobEventKind, JobState, JobSummary, ListJobsRequest,
-    ReadJobEventsRequest, ReadTranscriptRequest, ReportJobRequest, SubmitJobRequest,
-    TranscriptChunk,
+    CancelJobRequest, GetJobRequest, GetStatsRequest, JobEvent, JobEventKind, JobState, JobSummary,
+    ListJobsRequest, ReadJobEventsRequest, ReadTranscriptRequest, ReportJobRequest,
+    SubmitJobRequest, TranscriptChunk,
 };
 use fleet_server::auth::BearerAuth;
 use fleet_server::config::Token;
@@ -659,6 +659,41 @@ async fn read_job_events_rejects_unknown_and_invalid_jobs(pool: PgPool) {
     pool.close().await;
     let down = jobs
         .read_job_events(events_request(&id, None, 0))
+        .await
+        .unwrap_err();
+    assert_eq!(down.code(), Code::Unavailable);
+    assert_eq!(down.message(), "storage unavailable");
+}
+
+#[sqlx::test]
+async fn get_stats_over_the_wire_counts_jobs_and_maps_errors(pool: PgPool) {
+    let store = store(pool.clone()).await;
+    let mut jobs = spawn(&store);
+    running_job(&store, &mut jobs).await;
+
+    let reply = jobs
+        .get_stats(GetStatsRequest::default())
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(reply.groups.len(), 1);
+    assert_eq!(reply.groups[0].jobs, 1);
+    assert_eq!(reply.groups[0].other, 1);
+    assert!(reply.groups[0].duration_ms.is_none());
+
+    let bad = jobs
+        .get_stats(GetStatsRequest {
+            repo: Some("bad\u{0}repo".to_owned()),
+            ..GetStatsRequest::default()
+        })
+        .await
+        .unwrap_err();
+    assert_eq!(bad.code(), Code::InvalidArgument);
+    assert!(!bad.message().contains("bad"));
+
+    pool.close().await;
+    let down = jobs
+        .get_stats(GetStatsRequest::default())
         .await
         .unwrap_err();
     assert_eq!(down.code(), Code::Unavailable);

@@ -18,6 +18,7 @@ service FleetJobs {
   rpc CancelJob(CancelJobRequest) returns (Job);
   rpc ReadTranscript(ReadTranscriptRequest) returns (ReadTranscriptReply);
   rpc ReadJobEvents(ReadJobEventsRequest) returns (ReadJobEventsReply);
+  rpc GetStats(GetStatsRequest) returns (GetStatsReply);
 }
 
 service FleetWorker {
@@ -294,4 +295,73 @@ message ReportJobReply {
   bool cancel_requested = 2;
   uint64 acked_through_seq = 3;
   bool transcript_truncated = 4;
+}
+
+enum StatsGroupBy {
+  STATS_GROUP_BY_NONE = 0;
+  STATS_GROUP_BY_REPO = 1;
+  STATS_GROUP_BY_BOX = 2;
+  STATS_GROUP_BY_STATE = 3;
+  STATS_GROUP_BY_DAY = 4;
+}
+
+message GetStatsRequest {
+  optional int64 since = 1;
+  optional int64 until = 2;
+  optional string repo = 3;
+  optional string box = 4;
+  StatsGroupBy group_by = 5;
+}
+
+message Quantiles {
+  uint64 n = 1;
+  double p50 = 2;
+  double p95 = 3;
+}
+
+message Total {
+  uint64 n = 1;
+  uint64 sum = 2;
+}
+
+message CostStats {
+  uint64 n = 1;
+  double sum = 2;
+  double p50 = 3;
+  double p95 = 4;
+}
+
+message StatsGroup {
+  string key = 1;
+  uint64 jobs = 2;
+  uint64 succeeded = 3;
+  uint64 failed = 4;
+  uint64 timed_out = 5;
+  uint64 cancelled = 6;
+  uint64 lost = 7;
+  uint64 other = 8;
+  uint64 with_summary = 9;
+  uint64 complete = 10;
+  optional Quantiles duration_ms = 11;
+  optional Quantiles turns = 12;
+  optional CostStats cost_est_usd = 13;
+  optional Total tokens_in = 14;
+  optional Total tokens_out = 15;
+  optional Total tokens_cache_read = 16;
+  optional Total tokens_cache_write = 17;
+  optional Total tool_calls = 18;
+  optional Total tool_errors = 19;
+  optional Total bash_calls = 20;
+  optional Total bash_nonzero = 21;
+  optional Total denials = 22;
+  optional Total api_retries = 23;
+  optional Quantiles first_edit_ms = 24;
+}
+
+message GetStatsReply {
+  repeated StatsGroup groups = 1;
+  bool truncated = 2;
+  int64 since = 3;
+  int64 until = 4;
+  bool clamped = 5;
 }

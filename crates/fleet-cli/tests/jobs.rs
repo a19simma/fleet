@@ -120,6 +120,13 @@ impl FleetJobs for Stub {
         .ok_or_else(|| Status::not_found("no such job"))
     }
 
+    async fn get_stats(
+        &self,
+        _: Request<fleet_proto::v1::GetStatsRequest>,
+    ) -> Result<Response<fleet_proto::v1::GetStatsReply>, Status> {
+        Err(Status::unimplemented("not used"))
+    }
+
     async fn read_job_events(
         &self,
         _: Request<fleet_proto::v1::ReadJobEventsRequest>,
