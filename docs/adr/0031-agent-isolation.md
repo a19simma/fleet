@@ -1,6 +1,6 @@
 # Agent isolation
 
-Status: Proposed. P1 is built behind `agent_launcher = "systemd"` and is not cut over; P2 and P3 are not built. Supersedes the Known limit paragraph of ADR-0024. Amends the credential and mirror-hardening sections of ADR-0024.
+Status: Accepted 2026-10-26. P1 is built behind `agent_launcher = "systemd"` and cut over live on the first Box; P2 and P3 are not built. Supersedes the Known limit paragraph of ADR-0024. Amends the credential and mirror-hardening sections of ADR-0024.
 
 Supersedes: the "Known limit" paragraph of ADR-0024.
 Amends: the "Credential", "Who sees it", "Mirror hardening" and "Fetch credential" sections of ADR-0024, and the unit and hook sections of ADR-0011.
@@ -14,7 +14,7 @@ Isolate the agent in phases with systemd and a second uid. Each phase ships alon
 ### P1: uid split, no network change
 
 - **Users.** `fleetd` owns the daemon and `/etc/swarm/secrets.env` (mode 0600). `fleet-job` runs agents.
-- **Unit.** A template unit `fleet-agent@.service` with `User=fleet-job`, `NoNewPrivileges=yes`, `ProtectSystem=strict`, `ProtectHome=yes`, `PrivateTmp=no`, `ProtectProc=invisible`, `ProcSubset=pid`, an empty `CapabilityBoundingSet=`, `RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6` (plus `AF_NETLINK` only when a tool needs it), `MemoryMax`, `TasksMax` and `ReadWritePaths` set to the per-job directory. `HOME` and `CLAUDE_CONFIG_DIR` point inside the per-job directory.
+- **Unit.** A template unit `fleet-agent@.service` with `User=fleet-job`, `NoNewPrivileges=yes`, `ProtectSystem=strict`, `ProtectHome=yes`, `PrivateTmp=yes`, `ProtectProc=invisible`, `ProcSubset=pid`, an empty `CapabilityBoundingSet=`, `RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6` (plus `AF_NETLINK` only when a tool needs it), `MemoryMax`, `TasksMax` and `ReadWritePaths` set to the per-job directory. `HOME` and `CLAUDE_CONFIG_DIR` point inside the per-job directory.
 - **Launch.** A polkit rule lets user `fleetd` start and stop units matching `fleet-agent@*` and nothing else. fleetd writes a per-job `EnvironmentFile` under `/run/fleet/<id>/` and starts `fleet-agent@<id>.service`. The agent stdout goes to a file or FIFO that fleetd tails, and the redactor and reporter work on that stream as today.
 - **Cancel.** `systemctl stop fleet-agent@<id>.service`, which kills the whole cgroup. This replaces the process-group SIGTERM, 10 s wait and SIGKILL of ADR-0020.
 - **No `DynamicUser=`.** File ownership across fleetd restarts needs a stable uid.
