@@ -28,6 +28,26 @@ _Avoid_: config version
 Planned, not built: a proxy that would restrict the hosts a Job's agent can reach.
 _Avoid_: firewall
 
+**Agent unit**:
+The systemd unit `fleet-agent@<job id>.service` that runs one Job's agent under the **Job uid** when `agent_launcher` is `systemd`.
+_Avoid_: job service, runner unit
+
+**Job uid**:
+The user `fleet-job` that an **Agent unit** runs as, in the group `fleet-work`, apart from the `fleetd` uid that holds the secrets.
+_Avoid_: agent user, sandbox user
+
+**Launcher**:
+The seam in fleetd that starts an agent, either `direct` as a child process or `systemd` as an **Agent unit**.
+_Avoid_: spawner, executor
+
+**Hook socket**:
+The unix socket `hook_socket` that serves only `/healthz` and `/hook/<event>`, in its own directory so the **Job uid** can reach it.
+_Avoid_: main socket
+
+**Run dir**:
+The directory `/run/fleet/<job id>/` holding a Job's `env`, `spec.json` and `stdout` FIFO for an **Agent unit**.
+_Avoid_: job dir, workspace
+
 **Fixture**:
 Planned, not built: a recorded Job input with an expected outcome, meant to run through `fleet eval run`.
 _Avoid_: test case

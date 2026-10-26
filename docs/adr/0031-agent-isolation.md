@@ -1,6 +1,6 @@
 # Agent isolation
 
-Status: Proposed, not built. Supersedes the Known limit paragraph of ADR-0024. Amends the credential and mirror-hardening sections of ADR-0024.
+Status: Proposed. P1 is built behind `agent_launcher = "systemd"` and is not cut over; P2 and P3 are not built. Supersedes the Known limit paragraph of ADR-0024. Amends the credential and mirror-hardening sections of ADR-0024.
 
 Supersedes: the "Known limit" paragraph of ADR-0024.
 Amends: the "Credential", "Who sees it", "Mirror hardening" and "Fetch credential" sections of ADR-0024, and the unit and hook sections of ADR-0011.
@@ -14,7 +14,7 @@ Isolate the agent in phases with systemd and a second uid. Each phase ships alon
 ### P1: uid split, no network change
 
 - **Users.** `fleetd` owns the daemon and `/etc/swarm/secrets.env` (mode 0600). `fleet-job` runs agents.
-- **Unit.** A template unit `fleet-agent@.service` with `User=fleet-job`, `NoNewPrivileges=yes`, `ProtectSystem=strict`, `ProtectHome=yes`, `PrivateTmp=yes`, `ProtectProc=invisible`, `ProcSubset=pid`, an empty `CapabilityBoundingSet=`, `RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6` (plus `AF_NETLINK` only when a tool needs it), `MemoryMax`, `TasksMax` and `ReadWritePaths` set to the per-job directory. `HOME` and `CLAUDE_CONFIG_DIR` point inside the per-job directory.
+- **Unit.** A template unit `fleet-agent@.service` with `User=fleet-job`, `NoNewPrivileges=yes`, `ProtectSystem=strict`, `ProtectHome=yes`, `PrivateTmp=no`, `ProtectProc=invisible`, `ProcSubset=pid`, an empty `CapabilityBoundingSet=`, `RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6` (plus `AF_NETLINK` only when a tool needs it), `MemoryMax`, `TasksMax` and `ReadWritePaths` set to the per-job directory. `HOME` and `CLAUDE_CONFIG_DIR` point inside the per-job directory.
 - **Launch.** A polkit rule lets user `fleetd` start and stop units matching `fleet-agent@*` and nothing else. fleetd writes a per-job `EnvironmentFile` under `/run/fleet/<id>/` and starts `fleet-agent@<id>.service`. The agent stdout goes to a file or FIFO that fleetd tails, and the redactor and reporter work on that stream as today.
 - **Cancel.** `systemctl stop fleet-agent@<id>.service`, which kills the whole cgroup. This replaces the process-group SIGTERM, 10 s wait and SIGKILL of ADR-0020.
 - **No `DynamicUser=`.** File ownership across fleetd restarts needs a stable uid.
@@ -22,7 +22,7 @@ Isolate the agent in phases with systemd and a second uid. Each phase ships alon
   1. The job directory lives outside `/var/tmp`, for example `/var/lib/fleet/jobs` or `StateDirectory=`. `PrivateTmp=yes` makes a `ReadWritePaths=/var/tmp/...` entry fail with status 226/NAMESPACE.
   2. The template allows `AF_INET` and `AF_INET6`. `RestrictAddressFamilies=AF_UNIX` alone blocks every `socket()`, loopback included. In P2 the network namespace provides the isolation, so the family list stays open.
   3. P1 requires a system-wide Claude install that `fleet-job` can execute. Today the binary is a mise shim under `~agent` with mode 0700, so the job uid cannot run it.
-- **Hook client trust check.** `hook.rs` sends a payload over the unix socket only when the socket is owned by the caller's effective uid (`socket_acceptable`). Under `fleet-job` the socket belongs to `fleetd`, so the check rejects it and the client falls back to `127.0.0.1:7071`. P1 changes the check to accept the configured fleetd uid, and the socket directory must be reachable by `fleet-job`. The current `/run/fleetd` directory is mode 0700 (`RuntimeDirectoryMode=0700` in the unit), so it moves or relaxes. Verified against `hook.rs` and `deploy/fleetd.service`; the change itself is unbuilt.
+- **Hook client trust check.** Built in P1-2. The hook client uses `hook_socket` when set, and accepts the socket only when its owner is `hook_socket_uid` (default the caller's effective uid), the parent directory belongs to root or that uid with no group or other write bit, and the connected peer's `SO_PEERCRED` uid equals that uid. Otherwise it counts as a failed connect and falls back to `127.0.0.1:7071`. The socket directory must be reachable by `fleet-job`, and `/run/fleetd` is mode 0700, so the hook socket lives in `/run/fleet/hook`, mode 0750 `fleetd:fleet-work`, with `hook_socket_uid` set to the uid of `fleetd`.
 
 ### P2: network namespace and egress proxy
 
@@ -46,6 +46,15 @@ bwrap or Landlock inside the unit. bwrap is not installed on the test box and un
 ### MicroVM
 
 Option (iv), a microVM per Job, is adopted only if untrusted prompt sources appear (for example Jobs from a public issue tracker). `/dev/kvm` and AMD-V exist on the test box, so the path is open.
+
+## As built in P1
+
+- **Launcher seam.** `agent_launcher` is `direct` (default) or `systemd`. `systemd` selects `SystemdLauncher`, which calls `systemctl` by the absolute path in `systemctl_path` with an argv array and an empty environment.
+- **Run dir.** Per job, `/run/fleet/<job id>/`, mode 0750 with the group in `job_group`. It holds `env` (mode 0600, the `EnvironmentFile`), `spec.json` (`argv` and `cwd` only, mode 0640 with the job group) and `stdout` (a FIFO, mode 0660 with the job group). The environment never goes into `spec.json`.
+- **Unit contract.** `fleet-agent@<id>.service` loads `env`, writes stdout to the FIFO with `StandardOutput=file:/run/fleet/%i/stdout` and runs `fleetd agent-exec <id>`. `agent-exec` reads `spec.json`, checks the id, changes into `cwd` and execs the agent. It exits 2 on a missing, mismatched or empty spec. The launcher starts the unit with `--no-block`, polls `systemctl show`, then calls `reset-failed` and removes the run dir.
+- **Cancel.** `systemctl kill` and `stop` on the unit, which kill the control group. `RuntimeMaxSec=2h` bounds a unit the launcher loses track of.
+- **Files.** `deploy/fleet-agent@.service`, `deploy/fleetd-systemd.service`, `deploy/sysusers.d`, `deploy/tmpfiles.d` and `deploy/polkit/50-fleet-agent.rules` (user `fleetd`, verbs start, stop, kill and reset-failed on `^fleet-agent@[A-Za-z0-9_]{1,64}\.service$`, every other manage-units request from `fleetd` denied). `deploy/README.md` has the install order and the rollback.
+- **Not verified.** The unit files were not run through `systemd-analyze verify`, and the full launcher has not run a real agent on a box.
 
 ## Decisions (2026-10-26)
 
@@ -80,8 +89,16 @@ Three design corrections came out of the run and are binding constraints in P1: 
 - The egress proxy itself. It is not built, and its behaviour with the Claude client under `NODE_USE_ENV_PROXY=1` is untested.
 - Inferred, not part of the design: the hook client fix in P1 is the only repo change P1 needs besides the unit, the polkit rule and the launcher. Other code paths that assume one uid (the `.finish-<id>` scratch dir, askpass socket checks) were not audited.
 
+## Open items
+
+- Startup sweep of stale run dirs after a fleetd crash is not built.
+- On a `systemctl show` error the launcher runs `reset-failed` but not `kill`, so a still-running unit could outlive its removed run dir.
+- Egress and the credential proxy (P2) are not built. Until then the template has no route to the model API, and a box needs the `PrivateNetwork=no` drop-in (`deploy/fleet-agent@.service.d/allow-network.conf.example`) to run a real agent.
+- A Firecracker microVM per job stays the escalation path if third-party repos or public prompt sources are ever run.
+
 ## Consequences
 
+- Jobs share the host kernel. A kernel escape from a Job reaches the host and everything fleetd holds. The uid split, `NoNewPrivileges` and the unit sandbox do not change that. A microVM per Job is the answer if the prompt sources become untrusted.
 - A Job can no longer read `GH_TOKEN`, `FLEET_TOKEN` or `secrets.env` once P1 ships. The "Any claim here that the token stays secret holds against a process under a uid other than fleetd's" caveat of ADR-0024 then holds for the agent too.
 - The agent keeps the Claude token. A leak is bounded by the egress allowlist and by rotation.
 - P1 alone leaves the network open, so a Job can still reach any host and the host loopback services. P2 closes that.

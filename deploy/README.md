@@ -44,7 +44,7 @@ The default jobs dir is `/var/lib/fleetd/jobs`, inside `StateDirectory=fleetd`, 
 
 A missing secrets file disables redaction and fleetd logs a warning only. It does not refuse to start.
 
-`EnvironmentFile=-/etc/swarm/box.env` in the unit loads variables from that file. Put non-secret settings there: `FLEETD_PORT`, `FLEET_BOX_NAME`, `FLEETD_DB`, `FLEETD_SOCKET`, `FLEETD_SECRETS_FILE`, `FLEETD_JOBS_DIR` and `FLEET_SERVER_URL`. Put `FLEET_TOKEN` and `GH_TOKEN` in `secrets.env` only, mode 0600 and owned by `agent`, because fleetd scrubs that file's values from events. The `-` prefix makes the file optional: a missing file is not an error. The unit also loads `/etc/swarm/secrets.env` into the environment, so `FLEET_TOKEN` and `GH_TOKEN` reach fleetd, and fleetd reads the same file by path through `FLEETD_SECRETS_FILE` for the redaction list. The agent child environment block is stripped of `GH_TOKEN` and `FLEET_TOKEN`, but the agent runs as the same uid as fleetd and can read the fleetd process environment through `/proc/<pid>/environ` and any file fleetd reads, such as `/etc/swarm/secrets.env`. The git push child, the mirror fetch child for a repo on `token_host` and their askpass helper receive `GH_TOKEN`, and `gh` receives it too. The PAT is exposed to the agent on this box and hidden only from processes under another uid. Use a fine-grained PAT scoped to throwaway repos on disposable Boxes only. Per-job isolation (a separate uid or a credential broker) is not built. The unit sets `StateDirectory=fleetd` and `RuntimeDirectory=fleetd`, so systemd exports `STATE_DIRECTORY` and `RUNTIME_DIRECTORY` and the db and socket land in `/var/lib/fleetd` and `/run/fleetd`.
+`EnvironmentFile=-/etc/swarm/box.env` in the unit loads variables from that file. Put non-secret settings there: `FLEETD_PORT`, `FLEET_BOX_NAME`, `FLEETD_DB`, `FLEETD_SOCKET`, `FLEETD_SECRETS_FILE`, `FLEETD_JOBS_DIR` and `FLEET_SERVER_URL`. Put `FLEET_TOKEN` and `GH_TOKEN` in `secrets.env` only, mode 0600 and owned by `agent`, because fleetd scrubs that file's values from events. The `-` prefix makes the file optional: a missing file is not an error. The unit also loads `/etc/swarm/secrets.env` into the environment, so `FLEET_TOKEN` and `GH_TOKEN` reach fleetd, and fleetd reads the same file by path through `FLEETD_SECRETS_FILE` for the redaction list. The agent child environment block is stripped of `GH_TOKEN` and `FLEET_TOKEN`, but the agent runs as the same uid as fleetd and can read the fleetd process environment through `/proc/<pid>/environ` and any file fleetd reads, such as `/etc/swarm/secrets.env`. The git push child, the mirror fetch child for a repo on `token_host` and their askpass helper receive `GH_TOKEN`, and `gh` receives it too. The PAT is exposed to the agent on this box and hidden only from processes under another uid. Use a fine-grained PAT scoped to throwaway repos on disposable Boxes only. The [Systemd agent launcher](#systemd-agent-launcher) section builds the uid split. A credential broker is not built. The unit sets `StateDirectory=fleetd` and `RuntimeDirectory=fleetd`, so systemd exports `STATE_DIRECTORY` and `RUNTIME_DIRECTORY` and the db and socket land in `/var/lib/fleetd` and `/run/fleetd`.
 
 Config file keys: `http_port`, `socket_path`, `db_path`, `queue_max_bytes`, `queue_max_age_secs`, `hook_events`, `secrets_file`, `box_name`, `dedupe_window_secs`, `claude_bin`, `gh_bin`, `disposable`, `jobs_dir`, `repo_hosts`, `token_host`, `agent_config_dir`, `agent_env_passthrough`, `max_turns`, `max_budget_usd`. Unknown keys are an error. `max_turns` (1 to 1000, default 100) and `max_budget_usd` (above 0, at most 1000, default 5.0) bound every job: fleetd always passes them as `--max-turns` and `--max-budget-usd`, an agent config bundle cannot change them, and a missing or invalid value stops startup with an error naming the key. A job that hits either cap ends `FAILED` with the error `max turns reached` or `budget exceeded`, and fleetd publishes no branch or pull request for it, the same as for any failed agent run. `repo_hosts` lists the hosts a job repo may name, `["github.com"]` by default. A job repo must be `https://<host>/...` on one of them, with no port and no userinfo, and fleetd rejects every other scheme. An empty list rejects every job. Only `token_host` gets the PAT: `fleetd askpass` answers a git prompt only for that one host, for the push and for the mirror fetch of a private repo. `token_host` is a config-file key with no env override, defaults to `github.com` when `repo_hosts` lists it, else is unset and no host gets the PAT, and must be one of `repo_hosts` or fleetd fails to start. Adding `gitlab.com` to `repo_hosts` therefore never sends it the GitHub token. Local `file://` repos have no config key and are not accepted in production. `hook_events` lists the hook names to record. Add a name there and a matching hook in the managed settings to record more events.
 
@@ -84,3 +84,130 @@ sqlite3 /var/lib/fleetd/queue.db 'select seq, kind, state from events order by s
 ```
 
 `fleetd dump` prints one JSON object per queued event. The unit runs with `Type=notify` and a 60 second watchdog. Every half `WatchdogSec` fleetd makes a real `GET /healthz` round trip to the loopback listener and the unix socket. It sends the watchdog ping only when both answer 200 with body `ok` within 3 seconds, so a wedged or ended listener makes systemd restart it. The ping comes from its own task and does not wait on job progress, so a long running job does not trip `WatchdogSec`. Only a wedged runtime or listener does.
+
+## Systemd agent launcher
+
+`agent_launcher = "systemd"` runs each agent as a `fleet-agent@<job id>.service` unit under a second uid, so a job cannot read `/etc/swarm/secrets.env` or the fleetd environment. The design and the live findings are in [ADR-0031](../docs/adr/0031-agent-isolation.md). The default is `direct`, the legacy path above.
+
+### Files
+
+| File | Install to |
+| --- | --- |
+| `sysusers.d/fleet.conf` | `/etc/sysusers.d/fleet.conf` |
+| `tmpfiles.d/fleet.conf` | `/etc/tmpfiles.d/fleet.conf` |
+| `polkit/50-fleet-agent.rules` | `/etc/polkit-1/rules.d/50-fleet-agent.rules` |
+| `fleet-agent@.service` | `/etc/systemd/system/fleet-agent@.service` |
+| `fleetd-systemd.service` | `/etc/systemd/system/fleetd.service`, replacing the legacy unit |
+| `fleet-agent@.service.d/allow-network.conf.example` | optional, see [Network](#network) |
+
+These files were written without `systemd-analyze verify`, which was not available where they were written. Run `systemd-analyze verify /etc/systemd/system/fleet-agent@.service /etc/systemd/system/fleetd.service` on the box before the first start.
+
+### Users and groups
+
+- `fleetd` owns the daemon, its state under `/var/lib/fleetd` and `/etc/swarm/secrets.env`.
+- `fleet-job` runs agents. Its primary group is `fleet-work`.
+- `fleet-work` is the shared group. `fleetd` is a member, through `sysusers.d` and `SupplementaryGroups=fleet-work`. A non-root daemon can only chown to a group it belongs to.
+- `/var/lib/fleet/jobs` is mode 3770 `fleetd:fleet-work`: group-writable, setgid and sticky. Each job has its worktree there, plus `.agent/<job id>` (the per-job home) and the `.cache` mirror. The unit's `ReadWritePaths=` covers only this directory.
+- `/run/fleet` is mode 0750 `fleetd:fleet-work` and holds the per-job run dirs. `/run/fleet/hook` holds the hook socket, mode 0750 `fleetd:fleet-work`.
+
+`tmpfiles.d` creates `/run/fleet` and `/run/fleet/hook` instead of a second `RuntimeDirectory=` in the unit, because `RuntimeDirectoryMode=` applies to every name in the unit and `/run/fleetd` must stay 0700.
+
+### Install order
+
+1. Install a system-wide Claude (see [Claude install](#claude-install)).
+2. `sudo systemd-sysusers` and `sudo systemd-tmpfiles --create`.
+3. Install the polkit rule. polkit reloads rules on its own.
+4. Install `fleet-agent@.service` and `fleetd-systemd.service` (as `fleetd.service`), then `sudo systemctl daemon-reload`.
+5. Change the ownership of the secrets file: `sudo chown fleetd:fleetd /etc/swarm/secrets.env && sudo chmod 0600 /etc/swarm/secrets.env`. `/etc/swarm/box.env` stays root-owned and world-readable, with no secrets in it.
+6. Write `/etc/fleetd/config.toml` (below), then `sudo chown root:root /etc/fleetd/config.toml && sudo chmod 0644 /etc/fleetd/config.toml`. The file must be root-owned, mode 0644, not writable by `fleetd` or `fleet-job`, because the hook client trusts `hook_socket_uid` from this file. The hook process runs as the job uid and reads this file, so the job uid must be able to read it.
+7. `sudo systemctl restart fleetd`, then `curl http://127.0.0.1:7071/healthz`.
+8. Run the canary (below).
+
+### fleetd settings
+
+Set these in `/etc/fleetd/config.toml`, which must be root-owned, mode 0644, not writable by `fleetd` or `fleet-job`, because the hook client trusts `hook_socket_uid` from this file. The hook client reads only the config file, so `hook_socket_uid` and `hook_socket` must be there. The daemon also accepts the environment variable in the second column, and the variable wins.
+
+| Key | Variable | Value for this mode |
+| --- | --- | --- |
+| `agent_launcher` | `FLEETD_AGENT_LAUNCHER` | `"systemd"` (default `"direct"`) |
+| `systemctl_path` | `FLEETD_SYSTEMCTL_PATH` | absolute path, default `/usr/bin/systemctl` |
+| `hook_socket` | `FLEETD_HOOK_SOCKET` | `"/run/fleet/hook/hook.sock"` |
+| `hook_socket_uid` | `FLEETD_HOOK_SOCKET_UID` | the numeric uid of `fleetd` (`id -u fleetd`) |
+| `hook_socket_group` | `FLEETD_HOOK_SOCKET_GROUP` | `"fleet-work"` |
+| `job_group` | `FLEETD_JOB_GROUP` | `"fleet-work"` |
+| `jobs_dir` | `FLEETD_JOBS_DIR` | `"/var/lib/fleet/jobs"` |
+| `claude_bin` | none | `"/usr/local/bin/claude-real"` |
+
+```toml
+agent_launcher = "systemd"
+hook_socket = "/run/fleet/hook/hook.sock"
+hook_socket_uid = 996
+hook_socket_group = "fleet-work"
+job_group = "fleet-work"
+jobs_dir = "/var/lib/fleet/jobs"
+claude_bin = "/usr/local/bin/claude-real"
+```
+
+The `996` is an example. Use the uid `id -u fleetd` prints. Without `job_group`, the run dir keeps no job group and the job uid cannot read `spec.json`, so set it in this mode.
+
+A hook socket under `/run/fleetd` is unreachable by the job uid, because that directory is mode 0700. That is why `hook_socket` lives in `/run/fleet/hook`. The hook client accepts the socket when its owner and its `SO_PEERCRED` peer are `hook_socket_uid` and the parent directory has no group or other write bit. Mode 0750 satisfies that.
+
+### Run dir and unit contract
+
+For each job the launcher creates `/run/fleet/<job id>/` (the job id matches `[A-Za-z0-9_]{1,64}`), mode 0750 with the job group, holding:
+
+- `env`, mode 0600, the agent environment as an `EnvironmentFile`. systemd reads it as root, so the job uid never needs it.
+- `spec.json`, `argv` and `cwd` only, written by the launcher and read by `fleetd agent-exec <job id>` as the job uid. Mode 0640 with the job group. It never holds the environment.
+- `stdout`, a FIFO with mode 0660 and the job group. The unit's `StandardOutput=file:/run/fleet/%i/stdout` writes to it, and fleetd reads it.
+
+The launcher runs `systemctl start --no-block fleet-agent@<job id>.service`, polls `systemctl show`, and removes the run dir and calls `reset-failed` when the unit ends. Cancel is `systemctl kill` and `stop`, which kill the whole cgroup. The unit runs at most `RuntimeMaxSec=2h`.
+
+The startup sweep of stale run dirs is not built. After a fleetd crash, remove old directories under `/run/fleet` by hand, or reboot (`/run` is a tmpfs).
+
+The unit sets `ProtectProc=invisible`, `ProcSubset=pid`, `PrivateTmp=no`, `NoNewPrivileges=yes` and `MemoryMax=2300M` with `TasksMax=512`. `CPUQuota` is unset. `PrivateTmp=no` is deliberate: `PrivateTmp=yes` fails a `ReadWritePaths=` entry under `/var/tmp` with status 226/NAMESPACE, which is why the jobs dir lives outside `/var/tmp`. `RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6` stays open because `AF_UNIX` alone blocks loopback. `InaccessiblePaths=/etc/swarm` hides the secrets directory from the job.
+
+### Network
+
+The template sets `PrivateNetwork=yes`. The job reaches fleetd's hook socket over a unix socket, which a network namespace does not block. The model API is another matter: the egress proxy of ADR-0031 P2 is not built, so until it lands the unit has no route to the model API. `agent_launcher = "systemd"` therefore cannot run a real agent on a box without the P2 proxy, unless you accept a temporary override. The override is a drop-in:
+
+```sh
+sudo mkdir -p /etc/systemd/system/fleet-agent@.service.d
+sudo cp fleet-agent@.service.d/allow-network.conf.example /etc/systemd/system/fleet-agent@.service.d/allow-network.conf
+sudo systemctl daemon-reload
+```
+
+It sets `PrivateNetwork=no`. With it, a job reaches any host and any loopback service on the box, including the hook port 7071. The uid split and the secrets protection still hold. Remove the file once P2 ships.
+
+### Claude install
+
+The job uid cannot run `claude` from a per-user mise shim under a mode 0700 home. Install one system-wide copy:
+
+1. Put the binary at `/opt/claude/<version>/claude`, root-owned and world-executable.
+2. Symlink it: `sudo ln -sfn /opt/claude/<version>/claude /usr/local/bin/claude-real`.
+3. Set `claude_bin = "/usr/local/bin/claude-real"`.
+4. Set `DISABLE_UPDATES=1` in `/etc/swarm/box.env` and in the agent environment through `agent_env_passthrough`, so a job does not self-update. Update by installing a new version directory and moving the symlink.
+5. Record the version in `/opt/claude/VERSION` and check it in the canary, so a drifted version shows up.
+
+### Managed settings
+
+Install `managed-settings.json` as in the legacy steps, with two checks:
+
+- Validate before install: `python3 -m json.tool managed-settings.json`. An unparsable managed file stops the CLI from starting, for every job.
+- Managed sources are first-wins by default. A server-managed settings source would replace this file and drop the hooks unless `managedSourcesBehavior` is `"merge"`. Set it if the account uses server-managed settings.
+- The canary must check that the managed hooks fired under the job uid: run one job and confirm the hook events arrived for it. Whether they fire under the new uid is unverified until then.
+
+### Secrets
+
+After the ownership change in step 5, `/etc/swarm/secrets.env` is mode 0600 `fleetd:fleetd`. The legacy layout (mode 0640 `root:agent`) let any job running as `agent` read it.
+
+### Limits
+
+- Jobs share the host kernel. A kernel escape from a job reaches the host and every secret fleetd holds. If jobs from third-party repos or public prompt sources ever run, move to a Firecracker microVM per job (ADR-0031, MicroVM).
+- The Claude token stays visible to the agent, since the agent needs it to call the API.
+- The shared mirror is still writable by the job until P3.
+
+### Rollback
+
+Fast, with the units installed: set `agent_launcher = "direct"` (or remove the line) in `/etc/fleetd/config.toml`, then `sudo systemctl restart fleetd`. The new unit runs the agent as the daemon uid, as before.
+
+Full: stop fleetd, restore the legacy `fleetd.service`, run `sudo chown root:agent /etc/swarm/secrets.env && sudo chmod 0640 /etc/swarm/secrets.env`, remove `/etc/polkit-1/rules.d/50-fleet-agent.rules`, remove `/etc/systemd/system/fleet-agent@.service` and any drop-in, run `sudo systemctl daemon-reload`, and start fleetd. The users, groups and directories can stay.

@@ -1,0 +1,17 @@
+polkit.addRule(function(action, subject) {
+    if (action.id !== "org.freedesktop.systemd1.manage-units") {
+        return polkit.Result.NOT_HANDLED;
+    }
+    if (subject.user !== "fleetd") {
+        return polkit.Result.NOT_HANDLED;
+    }
+    var unit = action.lookup("unit");
+    var verb = action.lookup("verb");
+    var verbs = ["start", "stop", "kill", "reset-failed"];
+    if (unit && verb &&
+        /^fleet-agent@[A-Za-z0-9_]{1,64}\.service$/.test(unit) &&
+        verbs.indexOf(verb) !== -1) {
+        return polkit.Result.YES;
+    }
+    return polkit.Result.NO;
+});

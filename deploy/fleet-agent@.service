@@ -1,0 +1,33 @@
+[Unit]
+Description=Fleet agent job %i
+BindsTo=fleetd.service
+After=fleetd.service
+
+[Service]
+Type=exec
+User=fleet-job
+Group=fleet-work
+UMask=0007
+EnvironmentFile=/run/fleet/%i/env
+ExecStart=/usr/local/bin/fleetd agent-exec %i
+StandardOutput=file:/run/fleet/%i/stdout
+Restart=no
+RuntimeMaxSec=2h
+TimeoutStopSec=10
+KillMode=control-group
+CollectMode=inactive-or-failed
+MemoryMax=2300M
+TasksMax=512
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+ProtectProc=invisible
+ProcSubset=pid
+PrivateNetwork=yes
+PrivateTmp=no
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+RestrictSUIDSGID=yes
+LockPersonality=yes
+CapabilityBoundingSet=
+ReadWritePaths=/var/lib/fleet/jobs
+InaccessiblePaths=/etc/swarm
