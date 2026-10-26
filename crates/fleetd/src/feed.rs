@@ -206,6 +206,10 @@ impl Feed {
         }
     }
 
+    pub(crate) fn result_subtype(&self) -> Option<&str> {
+        self.parser.as_ref().and_then(Telemetry::result_subtype)
+    }
+
     pub(crate) fn finish(&mut self, terminal: Terminal) -> pb::JobSummary {
         let counters = self.counters;
         tracing::debug!(

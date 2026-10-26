@@ -124,6 +124,23 @@ pub const DEFAULT_PREPARE_TIMEOUT: Duration = Duration::from_secs(300);
 const TAIL_BYTES: usize = 2048;
 const MAX_PR_URL_BYTES: usize = 2048;
 
+/// Default for `max_turns`, passed to every job as `--max-turns`.
+///
+/// Read from `claude --help` and the option table of the installed binary, Claude Code
+/// 2.1.289: `--max-turns <turns>` is "Maximum number of agentic turns in non-interactive mode.
+/// This will early exit the conversation after the specified number of turns. (only works with
+/// --print)". At that version `claude --help` does not list it, but the binary registers it.
+/// `--max-budget-usd <amount>` is "Maximum dollar amount to spend on API calls (only works
+/// with --print)". When a limit hits, the binary ends the run with a stream-json `result` line
+/// whose `subtype` is `error_max_turns` or `error_max_budget_usd` (both strings are in the
+/// binary and its text-mode handler prints "Reached max turns" and "Exceeded USD budget").
+/// Not observed, so unverified: the process exit code on a cap hit and the `is_error` value
+/// of those lines, and whether the budget is checked before or after the call that crosses it.
+pub const DEFAULT_MAX_TURNS: u32 = 100;
+/// Default for `max_budget_usd`, passed to every job as `--max-budget-usd`. See
+/// [`DEFAULT_MAX_TURNS`] for what the flag does.
+pub const DEFAULT_MAX_BUDGET_USD: f64 = 5.0;
+
 /// Default hard limit on one agent run.
 pub const DEFAULT_TIMEOUT: Duration = Duration::from_secs(30 * 60);
 
@@ -167,6 +184,10 @@ const ERR_SIGNAL: &str = "agent was killed by a signal";
 const ERR_TIMEOUT: &str = "agent timed out";
 const ERR_SHUTDOWN: &str = "agent stopped by daemon shutdown";
 const ERR_WAIT: &str = "agent could not be awaited";
+const ERR_MAX_TURNS: &str = "max turns reached";
+const ERR_BUDGET: &str = "budget exceeded";
+const SUBTYPE_MAX_TURNS: &str = "error_max_turns";
+const SUBTYPE_BUDGET: &str = "error_max_budget_usd";
 const ERR_COMMITS: &str = "job commits could not be inspected";
 const ERR_PUSH: &str = "git push failed";
 const ERR_PR: &str = "pull request could not be opened";
@@ -236,6 +257,10 @@ pub struct RunConfig {
     pub disposable: bool,
     /// Hard limit on the run. The process group is killed when it passes.
     pub timeout: Duration,
+    /// Agentic turns one job may take, always passed as `--max-turns`.
+    pub max_turns: u32,
+    /// Dollars one job may spend, always passed as `--max-budget-usd`.
+    pub max_budget_usd: f64,
     /// Time between report attempts while chunks wait.
     pub flush_interval: Duration,
     /// Longest gap between reports.
@@ -272,6 +297,8 @@ impl RunConfig {
             prepare_timeout: DEFAULT_PREPARE_TIMEOUT,
             disposable,
             timeout: DEFAULT_TIMEOUT,
+            max_turns: DEFAULT_MAX_TURNS,
+            max_budget_usd: DEFAULT_MAX_BUDGET_USD,
             flush_interval: DEFAULT_FLUSH_INTERVAL,
             report_interval: DEFAULT_REPORT_INTERVAL,
             cancel_grace: DEFAULT_CANCEL_GRACE,
@@ -585,11 +612,16 @@ impl<R: Reporter> AgentRunner<R> {
         guard.kill();
         let _ = child.wait().await;
         match end {
-            Ok(status) => match status.code() {
-                Some(0) => Ok(AgentOutcome::Succeeded),
-                Some(code) => Ok(stream.fail(Some(code), ERR_EXIT).await),
-                None => Ok(stream.fail(None, ERR_SIGNAL).await),
-            },
+            Ok(status) => {
+                if let Some(error) = stream.feed.result_subtype().and_then(cap_error) {
+                    return Ok(stream.fail(status.code(), error).await);
+                }
+                match status.code() {
+                    Some(0) => Ok(AgentOutcome::Succeeded),
+                    Some(code) => Ok(stream.fail(Some(code), ERR_EXIT).await),
+                    None => Ok(stream.fail(None, ERR_SIGNAL).await),
+                }
+            }
             Err(End::Timeout) => Ok(stream.fail(None, ERR_TIMEOUT).await),
             Err(End::Cancel) => {
                 stream.cancelled().await;
@@ -1150,6 +1182,10 @@ impl<R: Reporter> AgentRunner<R> {
                 "user",
                 "--append-system-prompt",
                 AGENT_PROTOCOL,
+                "--max-turns",
+                &self.config.max_turns.to_string(),
+                "--max-budget-usd",
+                &self.config.max_budget_usd.to_string(),
             ])
             .current_dir(cwd)
             .env_clear()
@@ -1590,6 +1626,17 @@ fn report_request(job: &Job, progress: &str, chunks: Vec<TranscriptChunk>) -> Re
         progress: progress.to_owned(),
         chunks,
         ..ReportJobRequest::default()
+    }
+}
+
+/// Maps a final `result` subtype to the cap failure it means, if any. A cap hit is a failure
+/// whatever the exit status, so it takes precedence over the status. It ends as
+/// [`Ending::Failed`] and never reaches [`AgentRunner::finish`], so no branch is published.
+fn cap_error(subtype: &str) -> Option<&'static str> {
+    match subtype {
+        SUBTYPE_MAX_TURNS => Some(ERR_MAX_TURNS),
+        SUBTYPE_BUDGET => Some(ERR_BUDGET),
+        _ => None,
     }
 }
 

@@ -147,6 +147,8 @@ pub(crate) fn build(
     let mut run = RunConfig::new(&config.claude_bin, config.disposable);
     run.gh_bin.clone_from(&config.gh_bin);
     run.jobs_dir = Some(config.jobs_dir.clone());
+    run.max_turns = config.max_turns;
+    run.max_budget_usd = config.max_budget_usd;
     run.env_passthrough
         .clone_from(&config.agent_env_passthrough);
     if let Some(dir) = &config.agent_config_dir {

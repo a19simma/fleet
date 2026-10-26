@@ -4,11 +4,14 @@ use std::time::Duration;
 use serde::Deserialize;
 
 use crate::Error;
+use crate::runner::{DEFAULT_MAX_BUDGET_USD, DEFAULT_MAX_TURNS};
 
 /// Config file read when `--config` is not given and the file exists.
 pub const DEFAULT_CONFIG_PATH: &str = "/etc/fleetd/config.toml";
 /// Default secrets env file. A missing file at this path is not an error.
 pub const DEFAULT_SECRETS_PATH: &str = "/etc/swarm/secrets.env";
+const MAX_TURNS_LIMIT: u32 = 1000;
+const MAX_BUDGET_USD_LIMIT: f64 = 1000.0;
 const DEFAULT_PORT: u16 = 7071;
 const DEFAULT_QUEUE_MAX_BYTES: u64 = 256 * 1024 * 1024;
 const DEFAULT_QUEUE_MAX_AGE_SECS: u64 = 14 * 24 * 60 * 60;
@@ -47,6 +50,8 @@ struct FileConfig {
     token_host: Option<String>,
     agent_config_dir: Option<PathBuf>,
     agent_env_passthrough: Option<Vec<String>>,
+    max_turns: Option<i64>,
+    max_budget_usd: Option<f64>,
 }
 
 /// Where redaction secrets are read from.
@@ -59,7 +64,7 @@ pub struct SecretsFile {
 }
 
 /// Resolved fleetd settings.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct Config {
     /// Loopback TCP port for hooks.
     pub http_port: u16,
@@ -101,6 +106,12 @@ pub struct Config {
     /// Extra environment variable names the agent inherits from fleetd, config file only.
     /// Names that hold fleetd credentials or start with `FLEETD_` are rejected.
     pub agent_env_passthrough: Vec<String>,
+    /// Agentic turns one job may take, 1 to 1000, 100 by default. Always passed as
+    /// `--max-turns`. See [`crate::runner::DEFAULT_MAX_TURNS`].
+    pub max_turns: u32,
+    /// Dollars one job may spend, above 0 and at most 1000, 5.0 by default. Always passed as
+    /// `--max-budget-usd`. See [`crate::runner::DEFAULT_MAX_TURNS`].
+    pub max_budget_usd: f64,
     /// Admits `file://` and absolute-path repos. Always false from [`Config::resolve`],
     /// which has no file key or environment variable for it. Only code that builds a
     /// `Config` for a test sets it.
@@ -131,7 +142,8 @@ impl Config {
     /// # Errors
     ///
     /// Fails on invalid TOML, an unparsable `FLEETD_PORT`, a zero
-    /// `queue_max_bytes` or `queue_max_age_secs`, a `repo_hosts` entry that is not a bare
+    /// `queue_max_bytes` or `queue_max_age_secs`, a `max_turns` outside 1 to 1000, a
+    /// `max_budget_usd` that is not finite, not above 0 or above 1000, a `repo_hosts` entry that is not a bare
     /// host name, or a `token_host` that is not in `repo_hosts`. An empty environment value
     /// counts as unset.
     pub fn resolve(
@@ -178,25 +190,21 @@ impl Config {
             required: named.is_some(),
             path: named.unwrap_or_else(|| PathBuf::from(DEFAULT_SECRETS_PATH)),
         };
-        let queue_max_bytes = file.queue_max_bytes.unwrap_or(DEFAULT_QUEUE_MAX_BYTES);
-        if queue_max_bytes == 0 {
-            return Err(Error::InvalidValue {
-                name: "queue_max_bytes",
-                value: "0".to_owned(),
-            });
-        }
-        let queue_max_age_secs = file
-            .queue_max_age_secs
-            .unwrap_or(DEFAULT_QUEUE_MAX_AGE_SECS);
-        if queue_max_age_secs == 0 {
-            return Err(Error::InvalidValue {
-                name: "queue_max_age_secs",
-                value: "0".to_owned(),
-            });
-        }
+        let queue_max_bytes = nonzero(
+            "queue_max_bytes",
+            file.queue_max_bytes,
+            DEFAULT_QUEUE_MAX_BYTES,
+        )?;
+        let queue_max_age_secs = nonzero(
+            "queue_max_age_secs",
+            file.queue_max_age_secs,
+            DEFAULT_QUEUE_MAX_AGE_SECS,
+        )?;
         let repo_hosts = resolve_repo_hosts(file.repo_hosts)?;
         let token_host = resolve_token_host(file.token_host, &repo_hosts)?;
         let agent_env_passthrough = resolve_passthrough(file.agent_env_passthrough)?;
+        let max_turns = resolve_max_turns(file.max_turns)?;
+        let max_budget_usd = resolve_max_budget(file.max_budget_usd)?;
         Ok(Self {
             http_port,
             socket_path,
@@ -234,7 +242,48 @@ impl Config {
             token_host,
             agent_config_dir: file.agent_config_dir,
             agent_env_passthrough,
+            max_turns,
+            max_budget_usd,
             allow_file_repos: false,
+        })
+    }
+}
+
+fn nonzero(name: &'static str, raw: Option<u64>, default: u64) -> Result<u64, Error> {
+    match raw.unwrap_or(default) {
+        0 => Err(Error::InvalidValue {
+            name,
+            value: "0".to_owned(),
+        }),
+        value => Ok(value),
+    }
+}
+
+fn resolve_max_turns(raw: Option<i64>) -> Result<u32, Error> {
+    let Some(raw) = raw else {
+        return Ok(DEFAULT_MAX_TURNS);
+    };
+    u32::try_from(raw)
+        .ok()
+        .filter(|turns| (1..=MAX_TURNS_LIMIT).contains(turns))
+        .ok_or_else(|| Error::InvalidValue {
+            name: "max_turns",
+            value: raw.to_string(),
+        })
+}
+
+/// NaN fails both comparisons and infinity fails the upper bound, so the range alone keeps the
+/// value finite.
+fn resolve_max_budget(raw: Option<f64>) -> Result<f64, Error> {
+    let Some(raw) = raw else {
+        return Ok(DEFAULT_MAX_BUDGET_USD);
+    };
+    if raw > 0.0 && raw <= MAX_BUDGET_USD_LIMIT {
+        Ok(raw)
+    } else {
+        Err(Error::InvalidValue {
+            name: "max_budget_usd",
+            value: raw.to_string(),
         })
     }
 }
@@ -311,6 +360,57 @@ mod tests {
     use std::collections::HashMap;
 
     use super::*;
+
+    fn caps(text: &str) -> Result<(u32, f64), Error> {
+        Config::resolve(Some(text), &env_of(&[])).map(|cfg| (cfg.max_turns, cfg.max_budget_usd))
+    }
+
+    #[test]
+    fn caps_default_to_100_turns_and_5_dollars() {
+        let cfg = Config::resolve(None, &env_of(&[])).unwrap();
+        assert_eq!(cfg.max_turns, 100);
+        assert!((cfg.max_budget_usd - 5.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn valid_caps_are_accepted_including_the_edges() {
+        for (text, turns, budget) in [
+            ("max_turns = 1", 1, 5.0),
+            ("max_turns = 1000", 1000, 5.0),
+            ("max_turns = 37", 37, 5.0),
+            ("max_budget_usd = 1000.0", 100, 1000.0),
+            ("max_budget_usd = 1000", 100, 1000.0),
+            ("max_budget_usd = 0.01", 100, 0.01),
+            ("max_turns = 2\nmax_budget_usd = 2.5", 2, 2.5),
+        ] {
+            let (got_turns, got_budget) = caps(text).unwrap();
+            assert_eq!(got_turns, turns, "{text}");
+            assert!((got_budget - budget).abs() < f64::EPSILON, "{text}");
+        }
+    }
+
+    #[test]
+    fn invalid_caps_fail_startup_naming_the_key() {
+        for (text, name) in [
+            ("max_turns = 0", "max_turns"),
+            ("max_turns = 1001", "max_turns"),
+            ("max_turns = -1", "max_turns"),
+            ("max_turns = 4294967297", "max_turns"),
+            ("max_budget_usd = nan", "max_budget_usd"),
+            ("max_budget_usd = inf", "max_budget_usd"),
+            ("max_budget_usd = -inf", "max_budget_usd"),
+            ("max_budget_usd = 0", "max_budget_usd"),
+            ("max_budget_usd = 0.0", "max_budget_usd"),
+            ("max_budget_usd = -1.5", "max_budget_usd"),
+            ("max_budget_usd = 1000.01", "max_budget_usd"),
+            ("max_budget_usd = 1001", "max_budget_usd"),
+        ] {
+            match caps(text) {
+                Err(Error::InvalidValue { name: got, .. }) => assert_eq!(got, name, "{text}"),
+                other => panic!("{text}: {other:?}"),
+            }
+        }
+    }
 
     fn env_of(pairs: &[(&str, &str)]) -> impl Fn(&str) -> Option<String> {
         let map: HashMap<String, String> = pairs

@@ -437,6 +437,143 @@ async fn runner_skips_permissions_only_on_a_disposable_box() -> TestResult {
 }
 
 #[tokio::test]
+async fn every_job_gets_both_caps_with_the_configured_values() -> TestResult {
+    common::bounded(Box::pin(async {
+        let dir = TempDir::new()?;
+        let (_trigger, shutdown) = Shutdown::channel();
+        for disposable in [false, true] {
+            let mut cfg = config(disposable);
+            cfg.max_turns = 7;
+            cfg.max_budget_usd = 1.25;
+            let (agent, mut rx) = runner(cfg, 0);
+            agent
+                .run(&job("args:"), dir.path(), shutdown.clone())
+                .await?;
+            let all = text(&drain(&mut rx));
+            assert!(all.contains("arg=--max-turns\narg=7\n"));
+            assert!(all.contains("arg=--max-budget-usd\narg=1.25\n"));
+        }
+        let (agent, mut rx) = runner(config(false), 0);
+        agent.run(&job("args:"), dir.path(), shutdown).await?;
+        let all = text(&drain(&mut rx));
+        assert!(all.contains("arg=--max-turns\narg=100\n"));
+        assert!(all.contains("arg=--max-budget-usd\narg=5\n"));
+        assert_eq!(all.matches("--max-turns").count(), 1);
+        assert_eq!(all.matches("--max-budget-usd").count(), 1);
+        Ok(())
+    }))
+    .await
+}
+
+#[tokio::test]
+async fn a_bundle_cannot_override_or_remove_the_caps() -> TestResult {
+    common::bounded(Box::pin(async {
+        let dir = TempDir::new()?;
+        let hostile = TempDir::new()?;
+        std::fs::write(
+            hostile.path().join("settings.json"),
+            r#"{"maxTurns":100000,"max_turns":100000,"maxBudgetUsd":9999,"env":{"MAX_TURNS":"9"}}"#,
+        )?;
+        assert!(Bundle::from_dir(hostile.path()).is_err());
+        let bundle = TempDir::new()?;
+        std::fs::write(
+            bundle.path().join("settings.json"),
+            r#"{"model":"sonnet","permissions":{"allow":["Bash"]}}"#,
+        )?;
+        let (_trigger, shutdown) = Shutdown::channel();
+        let mut cfg = config(false);
+        cfg.max_turns = 9;
+        cfg.max_budget_usd = 2.0;
+        cfg.bundle = Bundle::from_dir(bundle.path())?;
+        let (agent, mut rx) = runner(cfg, 0);
+        agent.run(&job("args:"), dir.path(), shutdown).await?;
+        let all = text(&drain(&mut rx));
+        assert!(all.contains("arg=--max-turns\narg=9\n"));
+        assert!(all.contains("arg=--max-budget-usd\narg=2\n"));
+        Ok(())
+    }))
+    .await
+}
+
+fn capped_result(subtype: &str, is_error: bool) -> String {
+    json!({"type":"result","subtype":subtype,"is_error":is_error,"num_turns":30,
+        "duration_ms":10,"duration_api_ms":5,"stop_reason":"tool_use","total_cost_usd":1.5,
+        "usage":{"input_tokens":7,"output_tokens":8}})
+    .to_string()
+}
+
+#[tokio::test]
+async fn a_cap_hit_is_a_distinct_failure_and_other_endings_are_not() -> TestResult {
+    common::bounded(Box::pin(async {
+        let table: [(&str, bool, &str, Option<&str>); 7] = [
+            (
+                "error_max_turns",
+                true,
+                "catfail",
+                Some("max turns reached"),
+            ),
+            ("error_max_turns", true, "cat", Some("max turns reached")),
+            (
+                "error_max_budget_usd",
+                true,
+                "catfail",
+                Some("budget exceeded"),
+            ),
+            ("error_max_budget_usd", true, "cat", Some("budget exceeded")),
+            (
+                "error_during_execution",
+                true,
+                "catfail",
+                Some("agent exited with a failure status"),
+            ),
+            (
+                "success",
+                false,
+                "catfail",
+                Some("agent exited with a failure status"),
+            ),
+            ("success", false, "cat", None),
+        ];
+        for (subtype, is_error, mode, expected) in table {
+            let dir = TempDir::new()?;
+            let lines = [
+                json!({"type":"system","subtype":"init"}).to_string(),
+                capped_result(subtype, is_error),
+            ];
+            let file = fixture(dir.path(), "run.jsonl", &lines)?;
+            let (agent, mut rx) = runner(config(false), 0);
+            let (_trigger, shutdown) = Shutdown::channel();
+            let prompt = format!("{mode}:{}", file.display());
+            let outcome = agent.run(&job(&prompt), dir.path(), shutdown).await?;
+            let requests = drain(&mut rx);
+            let Some(error) = expected else {
+                assert_eq!(outcome, AgentOutcome::Succeeded, "{subtype} {mode}");
+                assert!(requests.iter().all(|r| r.terminal_state.is_none()));
+                continue;
+            };
+            let last = terminal(&requests)?;
+            let exit_code = if mode == "cat" { Some(0) } else { Some(3) };
+            assert_eq!(
+                outcome,
+                AgentOutcome::Failed { exit_code, error },
+                "{subtype} {mode}"
+            );
+            assert_eq!(last.terminal_state, Some(i32::from(JobState::Failed)));
+            assert_eq!(last.error.as_deref(), Some(error));
+            assert_eq!(last.exit_code, exit_code);
+            assert_eq!(
+                last.summary
+                    .as_ref()
+                    .and_then(|s| s.result_subtype.as_deref()),
+                Some(subtype)
+            );
+        }
+        Ok(())
+    }))
+    .await
+}
+
+#[tokio::test]
 async fn runner_reports_while_the_agent_is_quiet() -> TestResult {
     common::bounded(Box::pin(async {
         let dir = TempDir::new()?;

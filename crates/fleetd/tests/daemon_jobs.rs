@@ -35,6 +35,12 @@ git add hello.txt
 git -c user.name=t -c user.email=t@example.invalid commit -q -m "add hello.txt"
 "#;
 
+const ARGV_AGENT: &str = r#"#!/bin/sh
+printf '%s\n' "$@" > hello.txt
+git add hello.txt
+git -c user.name=t -c user.email=t@example.invalid commit -q -m "add hello.txt"
+"#;
+
 const BLOCKING_AGENT: &str = r#"#!/bin/sh
 mkdir ../.finish-job1
 echo '{"type":"assistant","message":{"content":[{"type":"text","text":"working"}]}}'
@@ -138,6 +144,15 @@ async fn launch_with(
     agent: &str,
     repo: Option<String>,
 ) -> Result<Launched, Box<dyn std::error::Error>> {
+    launch_cfg(dir, agent, repo, "").await
+}
+
+async fn launch_cfg(
+    dir: &TempDir,
+    agent: &str,
+    repo: Option<String>,
+    extra: &str,
+) -> Result<Launched, Box<dyn std::error::Error>> {
     let origin = dir.path().join("origin.git");
     let seed = dir.path().join("seed");
     std::fs::create_dir(&origin)?;
@@ -183,7 +198,7 @@ async fn launch_with(
 
     let box_name = format!("box-{}", 7);
     let file = format!(
-        "http_port = 0\nsocket_path = {:?}\ndb_path = {:?}\njobs_dir = {:?}\nbox_name = {box_name:?}\nclaude_bin = {:?}\ngh_bin = {:?}\nsecrets_file = {:?}\n",
+        "http_port = 0\nsocket_path = {:?}\ndb_path = {:?}\njobs_dir = {:?}\nbox_name = {box_name:?}\nclaude_bin = {:?}\ngh_bin = {:?}\nsecrets_file = {:?}\n{extra}",
         dir.path().join("fleetd.sock").to_string_lossy(),
         dir.path().join("queue.db").to_string_lossy(),
         dir.path().join("jobs").to_string_lossy(),
@@ -260,6 +275,45 @@ async fn the_daemon_runs_a_claimed_job_to_a_pushed_branch_and_a_pull_request() -
         assert!(!dir.path().join("jobs").join("job1").exists());
         assert!(!dir.path().join("jobs").join(".finish-job1").exists());
         assert!(dir.path().join("jobs").join(".cache").is_dir());
+        Ok(())
+    }))
+    .await
+}
+
+#[tokio::test]
+async fn the_configured_caps_reach_the_agent_argv() -> TestResult {
+    common::bounded(Box::pin(async {
+        let dir = TempDir::new()?;
+        let Launched {
+            mut inbox,
+            stop,
+            daemon,
+            server,
+            origin,
+            ..
+        } = launch_cfg(
+            &dir,
+            ARGV_AGENT,
+            None,
+            "max_turns = 7\nmax_budget_usd = 1.5\n",
+        )
+        .await?;
+        let terminal = tokio::time::timeout(Duration::from_secs(60), async {
+            while let Some((_, report)) = inbox.recv().await {
+                if report.terminal_state.is_some() {
+                    return Some(report);
+                }
+            }
+            None
+        })
+        .await?
+        .ok_or("no terminal report")?;
+        assert_eq!(terminal.terminal_state, Some(JobState::Succeeded.into()));
+        let argv = git(&origin, &["show", "swarm/job1:hello.txt"])?;
+        assert!(argv.contains("--max-turns\n7\n--max-budget-usd\n1.5\n"));
+        let _ = stop.send(());
+        tokio::time::timeout(Duration::from_secs(30), daemon).await???;
+        server.abort();
         Ok(())
     }))
     .await

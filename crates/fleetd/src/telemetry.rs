@@ -359,6 +359,12 @@ impl Telemetry {
         true
     }
 
+    /// The `subtype` of the final result line, once one was seen.
+    #[must_use]
+    pub fn result_subtype(&self) -> Option<&str> {
+        self.result_subtype.as_deref()
+    }
+
     /// The summary so far.
     #[must_use]
     pub fn summary(&self) -> JobSummary {
