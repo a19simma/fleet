@@ -15,13 +15,11 @@ These sent earlier work back for a retry. Check each before you commit.
 3. **Raw client input in errors.** Never echo a client-supplied value (box name, token, path) into a `Status` message, `Rejection.reason`, or a log line at a level clients can read. Use a fixed message.
 4. **Inferred claims written as fact.** In ADRs and docs, label anything not in the design as "Inferred, not part of the design:". No hedges (`should`, `probably`, `enough`), no em dashes, no "not X but Y".
 5. **Duplicate validation.** Validate each input once, at the boundary, and carry the validated type. A second check in a service handler gets flagged.
-6. **Drift in comments and docs.** When behaviour changes, rewrite the rustdoc that described the old behaviour, ADR status lines, and `docs/adr/README.md` rows in the same commit.
+6. **Drift in comments and docs.** When behaviour changes, rewrite the rustdoc that described the old behaviour, ADR status lines, and `docs/adr/README.md` rows in the same commit. On any claim or status change, grep `docs/`, `docs/plan.md`, READMEs and crate docs for the feature name and the old wording and fix every hit in one pass: scattered status lines cost A11 and A18 up to five gate rounds. An ADR says a feature is built only when a runtime path calls it; library-only code stays "built, not wired".
 7. **Lints.** CI clippy is newer than most local toolchains: no `unwrap` or `expect` in tests without `#[expect(lint, reason = "...")]`, keep the first doc paragraph short, and avoid `pub` items in private modules (`unreachable_pub` and `redundant_pub_crate` conflict: use `#[expect]`). A fake in a private trait's test impl that never awaits trips `unused_async_trait_impl`: return `std::future::ready(..)` from a plain `fn`.
 
 ## Style
 
-- No inline comments. The one exception is `// SAFETY:` above `unsafe`. Use rustdoc on public items.
-- Lint rules are obeyed or disabled in config. The only in-code escape is `#[expect(lint, reason = "...")]`.
 - Tracked files must not contain private hostnames, tailnet addresses and domains, home-directory paths, or box names with a digit suffix. CI greps for them and fails.
 
 ## Keep this file current
