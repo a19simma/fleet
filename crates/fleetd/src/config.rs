@@ -56,6 +56,19 @@ struct FileConfig {
     hook_socket_uid: Option<u32>,
     hook_socket_group: Option<String>,
     job_group: Option<String>,
+    agent_launcher: Option<String>,
+    systemctl_path: Option<PathBuf>,
+}
+
+/// How agents are started.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[non_exhaustive]
+pub enum AgentLauncher {
+    /// A child process of fleetd.
+    #[default]
+    Direct,
+    /// A `fleet-agent@<id>.service` unit started through `systemctl`.
+    Systemd,
 }
 
 /// Where redaction secrets are read from.
@@ -134,6 +147,12 @@ pub struct Config {
     /// Group the per-job directories are shared with, a numeric gid or a name from
     /// `/etc/group`. Unset keeps today's modes and sets no group. Env `FLEETD_JOB_GROUP`.
     pub job_group: Option<String>,
+    /// How agents start, `direct` or `systemd`, `direct` by default. Env
+    /// `FLEETD_AGENT_LAUNCHER`.
+    pub agent_launcher: AgentLauncher,
+    /// Absolute path of the `systemctl` binary the systemd launcher runs, `/usr/bin/systemctl`
+    /// by default. Env `FLEETD_SYSTEMCTL_PATH`.
+    pub systemctl_path: PathBuf,
 }
 
 impl Config {
@@ -211,16 +230,8 @@ impl Config {
             required: named.is_some(),
             path: named.unwrap_or_else(|| PathBuf::from(DEFAULT_SECRETS_PATH)),
         };
-        let queue_max_bytes = nonzero(
-            "queue_max_bytes",
-            file.queue_max_bytes,
-            DEFAULT_QUEUE_MAX_BYTES,
-        )?;
-        let queue_max_age_secs = nonzero(
-            "queue_max_age_secs",
-            file.queue_max_age_secs,
-            DEFAULT_QUEUE_MAX_AGE_SECS,
-        )?;
+        let (queue_max_bytes, queue_max_age) =
+            resolve_queue(file.queue_max_bytes, file.queue_max_age_secs)?;
         let repo_hosts = resolve_repo_hosts(file.repo_hosts)?;
         let token_host = resolve_token_host(file.token_host, &repo_hosts)?;
         let agent_env_passthrough = resolve_passthrough(file.agent_env_passthrough)?;
@@ -234,12 +245,14 @@ impl Config {
             ),
             &socket_path,
         )?;
+        let (agent_launcher, systemctl_path) =
+            resolve_launcher(&env, file.agent_launcher, file.systemctl_path)?;
         Ok(Self {
             http_port,
             socket_path,
             db_path,
             queue_max_bytes,
-            queue_max_age: Duration::from_secs(queue_max_age_secs),
+            queue_max_age,
             hook_events: file.hook_events.unwrap_or_else(|| {
                 DEFAULT_HOOK_EVENTS
                     .iter()
@@ -270,6 +283,37 @@ impl Config {
             hook_socket_uid,
             hook_socket_group,
             job_group: resolve_job_group(&env, file.job_group)?,
+            agent_launcher,
+            systemctl_path,
+        })
+    }
+}
+
+fn resolve_launcher(
+    env: &dyn Fn(&str) -> Option<String>,
+    launcher: Option<String>,
+    systemctl: Option<PathBuf>,
+) -> Result<(AgentLauncher, PathBuf), Error> {
+    let launcher = match env("FLEETD_AGENT_LAUNCHER").or(launcher).as_deref() {
+        None | Some("direct") => AgentLauncher::Direct,
+        Some("systemd") => AgentLauncher::Systemd,
+        Some(other) => {
+            return Err(Error::InvalidValue {
+                name: "agent_launcher",
+                value: other.to_owned(),
+            });
+        }
+    };
+    let systemctl = env("FLEETD_SYSTEMCTL_PATH")
+        .map(PathBuf::from)
+        .or(systemctl)
+        .unwrap_or_else(|| PathBuf::from(crate::systemd::DEFAULT_SYSTEMCTL));
+    if systemctl.is_absolute() {
+        Ok((launcher, systemctl))
+    } else {
+        Err(Error::InvalidValue {
+            name: "systemctl_path",
+            value: systemctl.display().to_string(),
         })
     }
 }
@@ -292,6 +336,17 @@ fn resolve_job_group(
         }),
         group => Ok(group),
     }
+}
+
+fn resolve_queue(bytes: Option<u64>, age_secs: Option<u64>) -> Result<(u64, Duration), Error> {
+    Ok((
+        nonzero("queue_max_bytes", bytes, DEFAULT_QUEUE_MAX_BYTES)?,
+        Duration::from_secs(nonzero(
+            "queue_max_age_secs",
+            age_secs,
+            DEFAULT_QUEUE_MAX_AGE_SECS,
+        )?),
+    ))
 }
 
 fn nonzero(name: &'static str, raw: Option<u64>, default: u64) -> Result<u64, Error> {

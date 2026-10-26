@@ -21,6 +21,7 @@ use crate::poller::{
     Token, channel,
 };
 use crate::runner::{AgentOutcome, AgentRunner, Interrupt, Reporter, RunConfig};
+use crate::systemd::select_launcher;
 use crate::toolhook::HookHub;
 use crate::workspace::{RepoPolicy, Workspace};
 
@@ -175,9 +176,12 @@ pub(crate) fn build(
         })?;
     }
     let workspace = job_workspace(config, &mut run, env).with_redactor(redactor.clone());
+    let launcher = select_launcher(config, run.job_gid);
     let runner = DaemonRunner::new(
         workspace,
-        AgentRunner::new(run, reporter, redactor).with_hook_hub(hub),
+        AgentRunner::new(run, reporter, redactor)
+            .with_hook_hub(hub)
+            .with_launcher(launcher),
     );
     Poller::with_channel(
         channel,

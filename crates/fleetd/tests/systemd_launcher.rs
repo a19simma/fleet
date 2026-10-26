@@ -1,0 +1,674 @@
+//! Runs the systemd launcher against a fake `systemctl` and the `fleetd agent-exec` binary.
+
+use std::ffi::OsString;
+use std::fs;
+use std::io;
+use std::os::unix::fs::{MetadataExt, PermissionsExt};
+use std::os::unix::process::ExitStatusExt;
+use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio};
+use std::sync::OnceLock;
+use std::time::{Duration, Instant};
+
+use fleetd::agent_exec::write_spec;
+use fleetd::runner::{AgentProc, AgentSpec, Launched, Launcher};
+use fleetd::systemd::{SystemdLauncher, select_launcher};
+use fleetd::{AgentLauncher, Config, Error};
+use tempfile::TempDir;
+use tokio::io::AsyncReadExt;
+
+type TestResult = Result<(), Box<dyn std::error::Error>>;
+
+const SCRIPT: &str = r#"#!/bin/sh
+root=$(dirname "$0")
+unit=
+for a in "$@"; do
+  case "$a" in fleet-agent@*) unit=$a;; esac
+done
+id=${unit#fleet-agent@}
+id=${id%.service}
+st=$root/$id
+mkdir -p "$st"
+echo "$*" >> "$st/log"
+case "$1" in
+  show)
+    n=$(cat "$st/n" 2>/dev/null || echo 0)
+    n=$((n+1))
+    echo "$n" > "$st/n"
+    if [ -f "$st/show.$n" ]; then cat "$st/show.$n"; else cat "$st/show.last"; fi
+    exit "$(cat "$st/show.rc" 2>/dev/null || echo 0)"
+    ;;
+  start)
+    exit "$(cat "$st/start.rc" 2>/dev/null || echo 0)"
+    ;;
+esac
+exit 0
+"#;
+
+const WIDE: Duration = Duration::from_secs(60);
+
+fn root() -> &'static Path {
+    static ROOT: OnceLock<TempDir> = OnceLock::new();
+    ROOT.get_or_init(|| {
+        let dir = tempfile::tempdir().unwrap_or_else(|_| std::process::abort());
+        let path = dir.path().join("systemctl");
+        fs::write(&path, SCRIPT).unwrap_or_else(|_| std::process::abort());
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o755))
+            .unwrap_or_else(|_| std::process::abort());
+        dir
+    })
+    .path()
+}
+
+fn show(state: &str, result: &str, code: u32, status: u32) -> String {
+    format!("ActiveState={state}\nResult={result}\nExecMainCode={code}\nExecMainStatus={status}\n")
+}
+
+struct Case {
+    id: String,
+    state: PathBuf,
+    run: TempDir,
+}
+
+impl Case {
+    fn new(id: &str) -> Result<Self, io::Error> {
+        let state = root().join(id);
+        fs::create_dir_all(&state)?;
+        Ok(Self {
+            id: id.to_owned(),
+            state,
+            run: tempfile::tempdir()?,
+        })
+    }
+
+    fn put(&self, name: &str, text: &str) -> io::Result<()> {
+        fs::write(self.state.join(name), text)
+    }
+
+    fn last(&self, text: &str) -> io::Result<()> {
+        self.put("show.last", text)
+    }
+
+    fn launcher(&self) -> SystemdLauncher {
+        SystemdLauncher::new(root().join("systemctl"))
+            .with_run_dir(self.run.path())
+            .with_poll_interval(Duration::from_millis(10))
+    }
+
+    fn spec(&self) -> AgentSpec {
+        let mut spec = AgentSpec {
+            argv: vec!["/bin/echo".into(), "hi".into()],
+            cwd: self.run.path().to_path_buf(),
+            ..AgentSpec::default()
+        };
+        spec.env
+            .insert("FLEET_JOB_ID".into(), OsString::from(&self.id));
+        spec.env
+            .insert("PROBE".into(), OsString::from("probe-value-1"));
+        spec
+    }
+
+    fn launch(&self) -> io::Result<Launched> {
+        self.launcher().launch(self.spec())
+    }
+
+    fn log(&self) -> Vec<String> {
+        fs::read_to_string(self.state.join("log"))
+            .unwrap_or_default()
+            .lines()
+            .map(str::to_owned)
+            .collect()
+    }
+
+    fn dir(&self) -> PathBuf {
+        self.run.path().join(&self.id)
+    }
+
+    fn unit(&self) -> String {
+        format!("fleet-agent@{}.service", self.id)
+    }
+}
+
+async fn waited(proc: &mut dyn AgentProc) -> io::Result<std::process::ExitStatus> {
+    tokio::time::timeout(WIDE, proc.wait())
+        .await
+        .map_err(|_| io::Error::from(io::ErrorKind::TimedOut))?
+}
+
+#[tokio::test]
+async fn bad_job_ids_are_rejected_before_anything_is_created() -> TestResult {
+    let long = "a".repeat(65);
+    for (n, bad) in ["", "a-b", "a b", "../x", "a/b", "a.b", long.as_str()]
+        .into_iter()
+        .enumerate()
+    {
+        let case = Case::new(&format!("t_badid_{n}"))?;
+        let mut spec = case.spec();
+        spec.env.insert("FLEET_JOB_ID".into(), bad.into());
+        let err = case.launcher().launch(spec).err().map(|e| e.kind());
+        assert_eq!(err, Some(io::ErrorKind::InvalidInput), "{bad:?}");
+        assert_eq!(fs::read_dir(case.run.path())?.count(), 0, "{bad:?}");
+        assert!(!case.state.join("log").exists(), "{bad:?}");
+    }
+    let case = Case::new("t_badid_missing")?;
+    let mut spec = case.spec();
+    spec.env.clear();
+    let err = case.launcher().launch(spec).err().map(|e| e.kind());
+    assert_eq!(err, Some(io::ErrorKind::InvalidInput));
+    let ok = Case::new(&"b".repeat(64))?;
+    ok.last(&show("active", "success", 0, 0))?;
+    assert!(ok.launch().is_ok());
+    Ok(())
+}
+
+#[tokio::test]
+async fn show_outputs_map_to_exit_outcomes() -> TestResult {
+    let cases: [(&str, String, Option<i32>, Option<i32>); 8] = [
+        ("t_map_ok", show("inactive", "success", 1, 0), Some(0), None),
+        (
+            "t_map_exit",
+            show("failed", "exit-code", 1, 3),
+            Some(3),
+            None,
+        ),
+        (
+            "t_map_signal",
+            show("failed", "signal", 2, 15),
+            None,
+            Some(15),
+        ),
+        (
+            "t_map_signal_odd",
+            show("failed", "signal", 2, 0),
+            None,
+            Some(9),
+        ),
+        (
+            "t_map_core",
+            show("failed", "core-dump", 3, 11),
+            None,
+            Some(11),
+        ),
+        (
+            "t_map_timeout",
+            show("failed", "timeout", 2, 15),
+            None,
+            Some(15),
+        ),
+        (
+            "t_map_watchdog",
+            show("failed", "watchdog", 2, 6),
+            None,
+            Some(15),
+        ),
+        ("t_map_oom", show("failed", "oom-kill", 2, 9), None, Some(9)),
+    ];
+    for (id, text, code, signal) in cases {
+        let case = Case::new(id)?;
+        case.last(&text)?;
+        let mut launched = case.launch()?;
+        let status = waited(launched.proc.as_mut()).await?;
+        assert_eq!((status.code(), status.signal()), (code, signal), "{id}");
+        assert!(!case.dir().exists(), "{id}");
+        assert_eq!(
+            case.log().last().map(String::as_str),
+            Some(format!("reset-failed {}", case.unit()).as_str()),
+            "{id}"
+        );
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn wait_polls_until_the_unit_has_run_and_ended() -> TestResult {
+    let case = Case::new("t_poll")?;
+    case.put("show.1", &show("inactive", "success", 0, 0))?;
+    case.put("show.2", &show("activating", "success", 0, 0))?;
+    case.put("show.3", &show("active", "success", 1, 0))?;
+    case.put("show.4", &show("deactivating", "success", 1, 0))?;
+    case.last(&show("inactive", "success", 1, 0))?;
+    let mut launched = case.launch()?;
+    let status = waited(launched.proc.as_mut()).await?;
+    assert_eq!(status.code(), Some(0));
+    let shows = case.log().iter().filter(|l| l.starts_with("show ")).count();
+    assert_eq!(shows, 5);
+    assert_eq!(
+        case.log().first().map(String::as_str),
+        Some(format!("start --no-block {}", case.unit()).as_str())
+    );
+    assert_eq!(
+        case.log().get(1).map(String::as_str),
+        Some(
+            format!(
+                "show {} -p ActiveState -p Result -p ExecMainCode -p ExecMainStatus",
+                case.unit()
+            )
+            .as_str()
+        )
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn unparsable_show_output_is_an_error_after_cleanup() -> TestResult {
+    let big = format!("ActiveState=inactive\n{}\n", "x".repeat(5000));
+    let bad: Vec<(&str, String)> = vec![
+        ("t_bad_empty", String::new()),
+        ("t_bad_garbage", "garbage\n".to_owned()),
+        (
+            "t_bad_nan",
+            show("inactive", "success", 1, 0).replace("ExecMainStatus=0", "ExecMainStatus=x"),
+        ),
+        ("t_bad_result", show("failed", "resources", 1, 1)),
+        ("t_bad_state", show("exploded", "success", 1, 0)),
+        (
+            "t_bad_dup",
+            format!("{}ActiveState=active\n", show("inactive", "success", 1, 0)),
+        ),
+        (
+            "t_bad_extra",
+            format!("{}Other=1\n", show("inactive", "success", 1, 0)),
+        ),
+        (
+            "t_bad_missing",
+            "ActiveState=inactive\nResult=success\n".to_owned(),
+        ),
+        ("t_bad_big", big),
+        ("t_bad_success_status", show("inactive", "success", 1, 3)),
+        ("t_bad_exit_zero", show("failed", "exit-code", 1, 0)),
+        ("t_bad_exit_wide", show("failed", "exit-code", 1, 256)),
+    ];
+    for (id, text) in bad {
+        let case = Case::new(id)?;
+        case.last(&text)?;
+        let mut launched = case.launch()?;
+        let err = waited(launched.proc.as_mut()).await.err().map(|e| e.kind());
+        assert_eq!(err, Some(io::ErrorKind::InvalidData), "{id}");
+        assert!(!case.dir().exists(), "{id}");
+        assert!(
+            case.log().iter().any(|l| l.starts_with("reset-failed ")),
+            "{id}"
+        );
+        let again = waited(launched.proc.as_mut()).await.err().map(|e| e.kind());
+        assert_eq!(again, Some(io::ErrorKind::InvalidData), "{id}");
+    }
+    let case = Case::new("t_bad_rc")?;
+    case.last(&show("inactive", "success", 1, 0))?;
+    case.put("show.rc", "1")?;
+    let mut launched = case.launch()?;
+    assert!(waited(launched.proc.as_mut()).await.is_err());
+    assert!(!case.dir().exists());
+    assert!(case.log().iter().any(|l| l.starts_with("reset-failed ")));
+    Ok(())
+}
+
+#[tokio::test]
+async fn terminate_and_kill_run_the_right_argv_and_drop_cleans_up() -> TestResult {
+    let case = Case::new("t_signals")?;
+    case.last(&show("active", "success", 1, 0))?;
+    let mut launched = case.launch()?;
+    launched.proc.terminate();
+    launched.proc.kill();
+    let unit = case.unit();
+    assert_eq!(
+        case.log(),
+        vec![
+            format!("start --no-block {unit}"),
+            format!("kill --kill-whom=all --signal=SIGTERM {unit}"),
+            format!("kill --kill-whom=all --signal=SIGKILL {unit}"),
+        ]
+    );
+    assert!(case.dir().exists());
+    drop(launched);
+    let log = case.log();
+    assert_eq!(
+        log.get(3).map(String::as_str),
+        Some(format!("kill --kill-whom=all --signal=SIGKILL {unit}").as_str())
+    );
+    assert_eq!(
+        log.get(4).map(String::as_str),
+        Some(format!("reset-failed {unit}").as_str())
+    );
+    assert!(!case.dir().exists());
+    Ok(())
+}
+
+#[tokio::test]
+async fn files_stdout_and_a_finished_wait_behave() -> TestResult {
+    let case = Case::new("t_files")?;
+    case.last(&show("active", "success", 1, 0))?;
+    let mut launched = case.launch()?;
+    let dir = case.dir();
+    let mode = |name: &str| fs::metadata(dir.join(name)).map(|m| m.mode() & 0o7777);
+    assert_eq!(mode("env")?, 0o600);
+    assert_eq!(mode("spec.json")?, 0o600);
+    assert_eq!(mode("stdout")?, 0o660);
+    assert_eq!(fs::metadata(&dir)?.mode() & 0o7777, 0o750);
+    assert_eq!(fs::read_to_string(dir.join("env"))?.lines().count(), 2);
+    assert!(fs::read_to_string(dir.join("env"))?.contains("PROBE=\"probe-value-1\""));
+    let spec = fs::read_to_string(dir.join("spec.json"))?;
+    assert!(!spec.contains("probe-value-1"));
+    assert!(spec.contains("\"/bin/echo\""));
+    {
+        use std::io::Write;
+        let mut writer = fs::OpenOptions::new()
+            .write(true)
+            .open(dir.join("stdout"))?;
+        writer.write_all(b"hi\n")?;
+    }
+    let mut first = [0_u8; 3];
+    tokio::time::timeout(WIDE, launched.stdout.read_exact(&mut first)).await??;
+    assert_eq!(&first, b"hi\n");
+    case.last(&show("inactive", "success", 1, 0))?;
+    assert_eq!(waited(launched.proc.as_mut()).await?.code(), Some(0));
+    let mut rest = Vec::new();
+    tokio::time::timeout(WIDE, launched.stdout.read_to_end(&mut rest)).await??;
+    assert_eq!(rest.len(), 0);
+    let before = case.log().len();
+    launched.proc.terminate();
+    launched.proc.kill();
+    assert_eq!(waited(launched.proc.as_mut()).await?.code(), Some(0));
+    drop(launched);
+    assert_eq!(case.log().len(), before);
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_failed_start_leaves_nothing_behind() -> TestResult {
+    let case = Case::new("t_startfail")?;
+    case.put("start.rc", "1")?;
+    assert!(case.launch().is_err());
+    assert_eq!(fs::read_dir(case.run.path())?.count(), 0);
+    let again = case.launch().err().map(|e| e.kind());
+    assert_ne!(again, Some(io::ErrorKind::AlreadyExists));
+    let rel = SystemdLauncher::new("systemctl").with_run_dir(case.run.path());
+    let err = rel.launch(case.spec()).err().map(|e| e.kind());
+    assert_eq!(err, Some(io::ErrorKind::InvalidInput));
+    assert_eq!(fs::read_dir(case.run.path())?.count(), 0);
+    Ok(())
+}
+
+const BOUND: Duration = Duration::from_secs(20);
+
+fn show_count(case: &Case) -> usize {
+    case.log().iter().filter(|l| l.starts_with("show ")).count()
+}
+
+fn reset_count(case: &Case) -> usize {
+    case.log()
+        .iter()
+        .filter(|l| l.starts_with("reset-failed "))
+        .count()
+}
+
+#[tokio::test]
+async fn kill_ends_a_unit_that_never_ran() -> TestResult {
+    for (id, signal) in [("t_never_kill", 9), ("t_never_term", 15)] {
+        let case = Case::new(id)?;
+        case.last(&show("inactive", "success", 0, 0))?;
+        let mut launched = case.launch()?;
+        if signal == 9 {
+            launched.proc.kill();
+        } else {
+            launched.proc.terminate();
+        }
+        let status = tokio::time::timeout(BOUND, launched.proc.wait())
+            .await
+            .map_err(|_| io::Error::from(io::ErrorKind::TimedOut))??;
+        assert_eq!(status.signal(), Some(signal), "{id}");
+        assert!(!case.dir().exists(), "{id}");
+        assert_eq!(reset_count(&case), 1, "{id}");
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_unit_that_never_runs_fails_at_the_start_deadline() -> TestResult {
+    let case = Case::new("t_never_deadline")?;
+    case.last(&show("inactive", "success", 0, 0))?;
+    let mut launched = case
+        .launcher()
+        .with_start_deadline(Duration::from_millis(300))
+        .launch(case.spec())?;
+    let err = tokio::time::timeout(BOUND, launched.proc.wait())
+        .await
+        .map_err(|_| io::Error::from(io::ErrorKind::TimedOut))?
+        .err()
+        .map(|e| e.kind());
+    assert_eq!(err, Some(io::ErrorKind::TimedOut));
+    assert!(!case.dir().exists());
+    assert_eq!(reset_count(&case), 1);
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_real_exit_zero_after_a_signal_still_maps_to_exit_zero() -> TestResult {
+    let case = Case::new("t_exit_zero_signalled")?;
+    case.last(&show("inactive", "success", 1, 0))?;
+    let mut launched = case.launch()?;
+    launched.proc.terminate();
+    launched.proc.kill();
+    let status = tokio::time::timeout(BOUND, launched.proc.wait())
+        .await
+        .map_err(|_| io::Error::from(io::ErrorKind::TimedOut))??;
+    assert_eq!((status.code(), status.signal()), (Some(0), None));
+    Ok(())
+}
+
+#[tokio::test]
+async fn recreating_wait_does_not_spawn_a_show_per_call() -> TestResult {
+    let case = Case::new("t_wait_churn")?;
+    case.last(&show("active", "success", 1, 0))?;
+    let poll = Duration::from_millis(100);
+    let mut launched = case
+        .launcher()
+        .with_poll_interval(poll)
+        .launch(case.spec())?;
+    let started = Instant::now();
+    let mut calls = 0_u32;
+    while calls < 150 {
+        let _ = tokio::time::timeout(Duration::from_millis(2), launched.proc.wait()).await;
+        calls += 1;
+    }
+    let elapsed = started.elapsed();
+    let shows = show_count(&case);
+    let allowed = usize::try_from(elapsed.as_millis() / poll.as_millis())? * 3 + 3;
+    assert!(
+        shows <= allowed,
+        "{shows} shows in {elapsed:?}, allowed {allowed}"
+    );
+    case.last(&show("inactive", "success", 1, 0))?;
+    let status = tokio::time::timeout(BOUND, launched.proc.wait())
+        .await
+        .map_err(|_| io::Error::from(io::ErrorKind::TimedOut))??;
+    assert_eq!(status.code(), Some(0));
+    Ok(())
+}
+
+#[tokio::test]
+async fn cleanup_runs_exactly_once() -> TestResult {
+    let case = Case::new("t_cleanup_once")?;
+    case.last(&show("inactive", "success", 1, 0))?;
+    let mut launched = case.launch()?;
+    for _ in 0..3 {
+        let status = tokio::time::timeout(BOUND, launched.proc.wait())
+            .await
+            .map_err(|_| io::Error::from(io::ErrorKind::TimedOut))??;
+        assert_eq!(status.code(), Some(0));
+    }
+    assert_eq!(reset_count(&case), 1);
+    drop(launched);
+    assert_eq!(reset_count(&case), 1);
+    assert!(!case.log().iter().any(|l| l.starts_with("kill ")));
+    assert!(!case.dir().exists());
+    Ok(())
+}
+
+#[test]
+fn config_defaults_to_direct_and_rejects_bad_values() -> TestResult {
+    let none = |_: &str| None;
+    let cfg = Config::resolve(None, &none)?;
+    assert_eq!(cfg.agent_launcher, AgentLauncher::Direct);
+    assert_eq!(cfg.systemctl_path, PathBuf::from("/usr/bin/systemctl"));
+    let file = "agent_launcher = \"systemd\"\nsystemctl_path = \"/opt/systemctl\"\n";
+    let cfg = Config::resolve(Some(file), &none)?;
+    assert_eq!(cfg.agent_launcher, AgentLauncher::Systemd);
+    assert_eq!(cfg.systemctl_path, PathBuf::from("/opt/systemctl"));
+    let env = |name: &str| (name == "FLEETD_AGENT_LAUNCHER").then(|| "direct".to_owned());
+    let cfg = Config::resolve(Some(file), &env)?;
+    assert_eq!(cfg.agent_launcher, AgentLauncher::Direct);
+    let env = |name: &str| (name == "FLEETD_SYSTEMCTL_PATH").then(|| "/env/ctl".to_owned());
+    let cfg = Config::resolve(Some(file), &env)?;
+    assert_eq!(cfg.systemctl_path, PathBuf::from("/env/ctl"));
+    for bad in ["\"Systemd\"", "\"\"", "\"docker\"", "\"direct \""] {
+        let file = format!("agent_launcher = {bad}\n");
+        assert!(
+            matches!(
+                Config::resolve(Some(&file), &none),
+                Err(Error::InvalidValue {
+                    name: "agent_launcher",
+                    ..
+                })
+            ),
+            "{bad}"
+        );
+    }
+    let env = |name: &str| (name == "FLEETD_AGENT_LAUNCHER").then(|| "nope".to_owned());
+    assert!(matches!(
+        Config::resolve(None, &env),
+        Err(Error::InvalidValue {
+            name: "agent_launcher",
+            ..
+        })
+    ));
+    let file = "systemctl_path = \"systemctl\"\n";
+    assert!(matches!(
+        Config::resolve(Some(file), &none),
+        Err(Error::InvalidValue {
+            name: "systemctl_path",
+            ..
+        })
+    ));
+    Ok(())
+}
+
+#[test]
+fn select_launcher_follows_the_config() -> TestResult {
+    let none = |_: &str| None;
+    let direct = Config::resolve(None, &none)?;
+    assert!(format!("{:?}", select_launcher(&direct, None)).contains("DirectLauncher"));
+    let file = "agent_launcher = \"systemd\"\n";
+    let systemd = Config::resolve(Some(file), &none)?;
+    assert!(format!("{:?}", select_launcher(&systemd, None)).contains("SystemdLauncher"));
+    Ok(())
+}
+
+struct Exec {
+    run: TempDir,
+    cwd: TempDir,
+}
+
+impl Exec {
+    fn new() -> Result<Self, io::Error> {
+        root();
+        Ok(Self {
+            run: tempfile::tempdir()?,
+            cwd: tempfile::tempdir()?,
+        })
+    }
+
+    fn spec(&self, argv: &[&str]) -> AgentSpec {
+        AgentSpec {
+            argv: argv.iter().map(OsString::from).collect(),
+            cwd: self.cwd.path().to_path_buf(),
+            ..AgentSpec::default()
+        }
+    }
+
+    fn put(&self, dir_id: &str, spec_id: &str, argv: &[&str]) -> TestResult {
+        fs::create_dir_all(self.run.path().join(dir_id))?;
+        let path = self.run.path().join(dir_id).join("spec.json");
+        write_spec(&path, spec_id, &self.spec(argv), None)?;
+        Ok(())
+    }
+
+    fn run(&self, id: &str) -> Result<(Option<i32>, String, String), io::Error> {
+        let mut child = Command::new(env!("CARGO_BIN_EXE_fleetd"))
+            .arg("agent-exec")
+            .arg(id)
+            .arg("--run-dir")
+            .arg(self.run.path())
+            .env("PROBE", "probe-value-2")
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()?;
+        let start = Instant::now();
+        while child.try_wait()?.is_none() {
+            if start.elapsed() > WIDE {
+                child.kill()?;
+                return Err(io::Error::from(io::ErrorKind::TimedOut));
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        let out = child.wait_with_output()?;
+        Ok((
+            out.status.code(),
+            String::from_utf8_lossy(&out.stdout).into_owned(),
+            String::from_utf8_lossy(&out.stderr).into_owned(),
+        ))
+    }
+}
+
+#[test]
+fn agent_exec_runs_the_argv_in_the_spec_cwd_with_the_inherited_env() -> TestResult {
+    let exec = Exec::new()?;
+    let out = exec.cwd.path().join("out.txt");
+    let script = format!("pwd -P > '{0}'; echo \"$PROBE\" >> '{0}'", out.display());
+    exec.put("ex_ok", "ex_ok", &["/bin/sh", "-c", &script])?;
+    let (code, stdout, stderr) = exec.run("ex_ok")?;
+    assert_eq!(code, Some(0), "{stderr}");
+    assert_eq!((stdout.as_str(), stderr.as_str()), ("", ""));
+    let want = fs::canonicalize(exec.cwd.path())?;
+    assert_eq!(
+        fs::read_to_string(&out)?,
+        format!("{}\nprobe-value-2\n", want.display())
+    );
+    let (code, ..) = exec.run("ex_ok")?;
+    assert_eq!(code, Some(0));
+    Ok(())
+}
+
+#[test]
+fn agent_exec_exits_2_without_printing_env_values_on_bad_specs() -> TestResult {
+    let exec = Exec::new()?;
+    exec.put("ex_empty", "ex_empty", &[])?;
+    exec.put("ex_a", "ex_other", &["/bin/true"])?;
+    exec.put("ex_nocmd", "ex_nocmd", &["/nonexistent/program"])?;
+    fs::create_dir_all(exec.run.path().join("ex_junk"))?;
+    fs::write(exec.run.path().join("ex_junk/spec.json"), "{not json")?;
+    fs::create_dir_all(exec.run.path().join("ex_nospec"))?;
+    for id in [
+        "ex_empty",
+        "ex_a",
+        "ex_nocmd",
+        "ex_junk",
+        "ex_nospec",
+        "ex_absent",
+        "bad-id",
+    ] {
+        let (code, stdout, stderr) = exec.run(id)?;
+        assert_eq!(code, Some(2), "{id}: {stderr}");
+        assert!(stderr.starts_with("fleetd agent-exec: "), "{id}: {stderr}");
+        assert!(!stderr.contains("probe-value-2"), "{id}");
+        assert!(!stdout.contains("probe-value-2"), "{id}");
+        assert_eq!(stdout, "", "{id}");
+    }
+    let (_, _, stderr) = exec.run("ex_empty")?;
+    assert!(stderr.contains("empty command line"));
+    let (_, _, stderr) = exec.run("ex_a")?;
+    assert!(stderr.contains("different job"));
+    let (_, _, stderr) = exec.run("ex_nospec")?;
+    assert!(stderr.contains("missing"));
+    Ok(())
+}

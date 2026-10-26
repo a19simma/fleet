@@ -1,10 +1,12 @@
-//! fleetd binary: `serve` (default), `dump`, `hook`, `askpass` and `pueue-callback`.
+//! fleetd binary: `serve` (default), `dump`, `hook`, `askpass`, `agent-exec` and `pueue-callback`.
 
 use std::io::Write;
 use std::path::PathBuf;
 use std::process::ExitCode;
 
 use clap::{Parser, Subcommand};
+use fleetd::agent_exec::exec_job;
+use fleetd::systemd::DEFAULT_RUN_DIR;
 use fleetd::{Config, Error, Signals, askpass, dump, run, run_hook};
 use tracing_subscriber::EnvFilter;
 
@@ -40,6 +42,15 @@ enum Command {
         /// The prompt git passes as its only argument.
         prompt: String,
     },
+    /// Run the agent for a job from its spec file, as the unit does. Replaces this process.
+    /// Exits 2 when the spec is missing, mismatched or empty.
+    AgentExec {
+        /// Job id.
+        id: String,
+        /// Parent of the per-job run directories.
+        #[arg(long, default_value = DEFAULT_RUN_DIR)]
+        run_dir: PathBuf,
+    },
     /// Report a finished pueue task. Not implemented yet.
     PueueCallback {
         /// pueue task id.
@@ -71,6 +82,10 @@ async fn execute(cli: Cli) -> Result<ExitCode, Error> {
             std::process::exit(0)
         }
         Command::Askpass { prompt } => Ok(askpass_reply(&prompt)),
+        Command::AgentExec { id, run_dir } => {
+            eprintln!("fleetd agent-exec: {}", exec_job(&run_dir, &id));
+            Ok(ExitCode::from(2))
+        }
         Command::PueueCallback { id, group } => {
             eprintln!("fleetd: pueue-callback is not implemented (task {id}, group {group})");
             Ok(ExitCode::from(2))

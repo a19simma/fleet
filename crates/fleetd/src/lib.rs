@@ -10,6 +10,7 @@
 //! `fleetd askpass` ([`askpass`]).
 
 pub mod agent_config;
+pub mod agent_exec;
 mod app;
 pub mod askpass;
 pub mod backoff;
@@ -32,13 +33,14 @@ mod runtime;
 mod store;
 pub mod stuck;
 mod system;
+pub mod systemd;
 pub mod telemetry;
 pub mod toolhook;
 pub mod transport;
 pub mod workspace;
 
 pub use app::{AppState, hook_router, hook_socket_router, socket_router};
-pub use config::{Config, DEFAULT_CONFIG_PATH, DEFAULT_SECRETS_PATH, SecretsFile};
+pub use config::{AgentLauncher, Config, DEFAULT_CONFIG_PATH, DEFAULT_SECRETS_PATH, SecretsFile};
 pub use dump::dump;
 pub use error::Error;
 pub use events::{Enqueued, Limits, OVERFLOW_KIND, QueuedEvent};

@@ -43,3 +43,8 @@
 
 - **No `mknodat` on macOS, no `unsafe` allowed.** `jobenv::create_stdout_fifo` runs the `mkfifo` program. A nonblocking FIFO reader reads 0 until a writer opens, then `WouldBlock`, so a test opens the writer before it asserts idle.
 - **Mode asserts need the umask in mind.** `create_dir_all` and git leave 0755 dirs, so assert group-write and setgid bits (`& 0o2020`), not group-read.
+
+## Systemd launcher test
+
+- **Own test file.** `tests/systemd_launcher.rs` runs a fake `systemctl` script and the `fleetd agent-exec` binary, so it stays alone in its binary. The script is written once in a `OnceLock<TempDir>`, and its per-job state lives in a directory named after the job id, so every test uses a unique id.
+- **The fake is injected as `systemctl_path`.** No env var selects it. `show.N` files give the Nth `show` reply and `show.last` the rest.
