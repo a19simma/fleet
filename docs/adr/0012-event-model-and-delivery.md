@@ -48,7 +48,7 @@ The reconciler adds a fifth `source`, `reconcile`, and three event types: `sessi
 ## Amendments
 
 - **SessionStart hook.** `SessionStart` is a command hook, `fleetd hook SessionStart`, because Claude Code accepts only `command` and `mcp_tool` hooks for that event. It forwards to the same route and always exits 0.
-- **Job header.** Only the `SessionStart` command hook sends `X-Fleet-Job`: `fleetd hook` reads `FLEET_JOB_ID` and sends it when set. The four http hooks send no job header, and the managed settings set no `allowedEnvVars`. The `allowedEnvVars` route was never built or tested.
+- **Job header.** Only the command hooks send `X-Fleet-Job` (`SessionStart`, `PostToolUse` and `PostToolUseFailure` in the shipped managed settings): `fleetd hook` reads `FLEET_JOB_ID` and sends it when set. The four http hooks send no job header, and the managed settings set no `allowedEnvVars`. The `allowedEnvVars` route was never built or tested.
 
 ## Considered and rejected
 

@@ -446,6 +446,10 @@ pub struct Launched {
 
 /// Starts the agent for [`AgentRunner`]. The seam lets a different sandbox replace the
 /// direct spawn.
+///
+/// [`DirectLauncher`] puts the agent in its own process group, so a signal reaches every
+/// descendant. Another launcher must give `terminate` and `kill` the same reach, for example
+/// the whole cgroup of a unit.
 pub trait Launcher: Send + Sync + std::fmt::Debug {
     /// Starts the agent described by `spec`.
     ///
