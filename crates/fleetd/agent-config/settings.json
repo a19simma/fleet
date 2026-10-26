@@ -1,7 +1,7 @@
 {
   "permissions": {
-    "allow": ["Read", "Edit", "Write", "Glob", "Grep", "Bash"],
-    "deny": ["Bash(git push *)", "Bash(gh *)", "Bash(curl *)"]
+    "allow": ["Read", "Glob", "Grep", "Bash"],
+    "deny": ["Bash(git push *)", "Bash(gh *)", "Bash(curl *)", "Edit", "Write", "NotebookEdit", "MultiEdit"]
   },
   "attribution": { "commit": "", "pr": "" }
 }

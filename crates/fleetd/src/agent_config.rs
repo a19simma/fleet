@@ -333,10 +333,13 @@ mod default_bundle_tests {
     }
 
     #[test]
-    fn allow_lets_a_job_edit_and_run_tools() {
+    fn allow_lets_a_job_read_and_run_tools_but_not_edit() {
         let allow = list(&settings(), "allow");
-        for tool in ["Read", "Edit", "Write", "Glob", "Grep", "Bash"] {
+        for tool in ["Read", "Glob", "Grep", "Bash"] {
             assert!(allow.iter().any(|a| a == tool), "missing {tool}");
+        }
+        for tool in ["Edit", "Write", "NotebookEdit", "MultiEdit"] {
+            assert!(!allow.iter().any(|a| a == tool), "allows {tool}");
         }
     }
 

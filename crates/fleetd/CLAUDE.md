@@ -27,7 +27,7 @@
 
 ## Agent config
 
-- **`agent_config_dir` replaces the default `settings.json` allow list entirely.** An operator bundle that omits `Edit`, `Write` or `Bash` leaves a `dontAsk` job unable to change files.
+- **`agent_config_dir` replaces the default `settings.json` allow list entirely.** An operator bundle that omits `Bash` leaves a `dontAsk` job unable to change files: `Edit`, `Write`, `NotebookEdit` and `MultiEdit` are denied by the argv floor, so edits go through Bash.
 
 ## Fallback commit tests
 

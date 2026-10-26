@@ -56,6 +56,10 @@ Option (iv), a microVM per Job, is adopted only if untrusted prompt sources appe
 - **Files.** `deploy/fleet-agent@.service`, `deploy/fleetd-systemd.service`, `deploy/sysusers.d`, `deploy/tmpfiles.d` and `deploy/polkit/50-fleet-agent.rules` (user `fleetd`, verbs start, stop, kill and reset-failed on `^fleet-agent@[A-Za-z0-9_]{1,64}\.service$`, every other manage-units request from `fleetd` denied). `deploy/README.md` has the install order and the rollback.
 - **Not verified.** The unit files were not run through `systemd-analyze verify`, and the full launcher has not run a real agent on a box.
 
+## Amendment (TEL-A11)
+
+Jobs run with `--disallowedTools Edit Write NotebookEdit MultiEdit`, and `deploy/managed-settings.json` denies the same tools. Edits go through Bash heredocs, so the stored command holds every edit. The live comparison of heredoc edits against Edit and Write (calls, output tokens, error rate) is outstanding.
+
 ## Decisions (2026-10-26)
 
 Recorded as the architect's recommendations.

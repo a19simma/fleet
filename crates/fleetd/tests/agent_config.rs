@@ -178,13 +178,18 @@ fn the_embedded_bundle_carries_the_commit_permissions_and_no_attribution() -> Te
             })
             .unwrap_or_default()
     };
-    assert_eq!(
-        list("allow"),
-        ["Read", "Edit", "Write", "Glob", "Grep", "Bash"]
-    );
+    assert_eq!(list("allow"), ["Read", "Glob", "Grep", "Bash"]);
     assert_eq!(
         list("deny"),
-        ["Bash(git push *)", "Bash(gh *)", "Bash(curl *)"]
+        [
+            "Bash(git push *)",
+            "Bash(gh *)",
+            "Bash(curl *)",
+            "Edit",
+            "Write",
+            "NotebookEdit",
+            "MultiEdit"
+        ]
     );
     assert_eq!(settings["attribution"]["commit"], "");
     assert_eq!(settings["attribution"]["pr"], "");

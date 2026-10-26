@@ -105,10 +105,17 @@ const AGENT_ENV: [&str; 12] = [
     "DISABLE_TELEMETRY",
 ];
 const AGENT_ENV_PREFIX: &str = "LC_";
-pub(crate) const DENIED_TOOLS: [&str; 2] = ["Bash(git push *)", "Bash(gh *)"];
+pub(crate) const DENIED_TOOLS: [&str; 6] = [
+    "Bash(git push *)",
+    "Bash(gh *)",
+    "Edit",
+    "Write",
+    "NotebookEdit",
+    "MultiEdit",
+];
 
 /// Appended to the agent's system prompt.
-pub const AGENT_PROTOCOL: &str = "You run as an unattended fleet job. Commit finished work on the current branch with a semantic message (type(scope): subject). Never push and never run gh: the daemon publishes the branch. Add no attribution lines to commits or pull requests.";
+pub const AGENT_PROTOCOL: &str = "You run as an unattended fleet job. Commit finished work on the current branch with a semantic message (type(scope): subject). Never push and never run gh: the daemon publishes the branch. Add no attribution lines to commits or pull requests. The Edit and Write tools are denied: change files with Bash, using a quoted python3 heredoc.";
 
 const CLEAN_ENV: [&str; 1] = ["PATH"];
 const PUSH_ENV: [&str; 2] = ["PATH", "GH_TOKEN"];
@@ -2181,6 +2188,39 @@ mod tests {
             [&blank.bundle_sha, &blank.claude_version, &blank.model],
             ["unknown"; 3]
         );
+    }
+
+    #[test]
+    fn agent_spec_denies_the_file_edit_tools_in_either_mode() {
+        for disposable in [false, true] {
+            let mut config = test_config(Path::new("/jobs"));
+            config.disposable = disposable;
+            let runner = AgentRunner::new(config, Replies { cancel: false }, Redactor::default());
+            let spec = runner.agent_spec(&test_job(), Path::new("/work"), Path::new("/h"));
+            let at = spec
+                .argv
+                .iter()
+                .position(|arg| arg == "--disallowedTools")
+                .unwrap_or(usize::MAX);
+            let denied: Vec<&OsString> = spec.argv.iter().skip(at.saturating_add(1)).collect();
+            for tool in ["Edit", "Write", "NotebookEdit", "MultiEdit"] {
+                assert!(denied.contains(&&OsString::from(tool)), "missing {tool}");
+            }
+        }
+    }
+
+    #[test]
+    fn managed_settings_deny_the_file_edit_tools() {
+        let value: serde_json::Value =
+            serde_json::from_str(include_str!("../../../deploy/managed-settings.json"))
+                .unwrap_or_default();
+        let deny: Vec<&str> = value["permissions"]["deny"]
+            .as_array()
+            .map(|list| list.iter().filter_map(|item| item.as_str()).collect())
+            .unwrap_or_default();
+        for tool in ["Edit", "Write", "NotebookEdit", "MultiEdit"] {
+            assert!(deny.contains(&tool), "missing {tool}");
+        }
     }
 
     #[test]
