@@ -32,7 +32,6 @@ ProtectKernelTunables=yes
 ProtectKernelModules=yes
 ProtectControlGroups=yes
 LockPersonality=yes
-RestrictSUIDSGID=yes
 
 [Install]
 WantedBy=multi-user.target

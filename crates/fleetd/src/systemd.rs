@@ -10,7 +10,7 @@
 
 use std::fs;
 use std::io;
-use std::os::unix::fs::DirBuilderExt;
+use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
 use std::os::unix::process::ExitStatusExt;
 use std::path::PathBuf;
 use std::pin::Pin;
@@ -208,6 +208,7 @@ impl Launcher for SystemdLauncher {
         let dir = self.run_dir.join(&id);
         fs::DirBuilder::new().mode(DIR_MODE).create(&dir)?;
         let guard = RunDir(dir.clone());
+        fs::set_permissions(&dir, fs::Permissions::from_mode(DIR_MODE))?;
         if let Some(gid) = self.gid {
             std::os::unix::fs::chown(&dir, None, Some(gid))?;
         }

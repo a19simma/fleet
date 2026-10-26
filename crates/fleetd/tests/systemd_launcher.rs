@@ -354,7 +354,10 @@ async fn terminate_and_kill_run_the_right_argv_and_drop_cleans_up() -> TestResul
 async fn files_stdout_and_a_finished_wait_behave() -> TestResult {
     let case = Case::new("t_files")?;
     case.last(&show("active", "success", 1, 0))?;
-    let mut launched = case.launch()?;
+    let previous = rustix::process::umask(rustix::fs::Mode::from_raw_mode(0o077));
+    let launched = case.launch();
+    rustix::process::umask(previous);
+    let mut launched = launched?;
     let dir = case.dir();
     let mode = |name: &str| fs::metadata(dir.join(name)).map(|m| m.mode() & 0o7777);
     assert_eq!(mode("env")?, 0o600);
