@@ -729,6 +729,9 @@ async fn get_job_carries_the_summary_only_when_stored(pool: PgPool) {
         first_edit_ms: Some(0),
         complete: true,
         missing: vec!["a".to_owned(), "b".to_owned()],
+        stuck_rule: Some("monologue".to_owned()),
+        stuck_at_seq: Some(14),
+        stuck_at_ms: Some(15),
     };
     let mut request = report(&id, Vec::new(), false);
     request.summary = Some(summary.clone());

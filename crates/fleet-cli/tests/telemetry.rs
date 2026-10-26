@@ -176,6 +176,9 @@ fn full_summary() -> JobSummary {
         first_edit_ms: Some(12_300),
         complete: true,
         missing: Vec::new(),
+        stuck_rule: None,
+        stuck_at_seq: None,
+        stuck_at_ms: None,
     }
 }
 
@@ -505,5 +508,79 @@ async fn unknown_job_and_bad_token_exit_one() -> TestResult {
         assert_eq!(err.exit_code(), 1);
         assert!(!err.to_string().contains("wrong-token"));
     }
+    Ok(())
+}
+
+#[tokio::test]
+async fn status_prints_the_shadow_stuck_line_after_stop_reason() -> TestResult {
+    let mut summary = full_summary();
+    summary.stuck_rule = Some("repeat_error".into());
+    summary.stuck_at_seq = Some(7);
+    summary.stuck_at_ms = Some(900);
+    let url = serve(Stub {
+        summary: Some(summary),
+        page: 10,
+        ..Stub::default()
+    })
+    .await?;
+    let (res, out) = cli(&url, TOKEN, &["status", "job-1"]).await;
+    res?;
+    assert!(
+        out.contains("  stop_reason: end_turn\n  stuck (shadow): repeat_error at event 7\n"),
+        "{out}"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn status_prints_no_stuck_line_when_absent() -> TestResult {
+    let url = serve(Stub {
+        summary: Some(full_summary()),
+        page: 10,
+        ..Stub::default()
+    })
+    .await?;
+    let (res, out) = cli(&url, TOKEN, &["status", "job-1"]).await;
+    res?;
+    assert!(!out.contains("stuck"), "{out}");
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_stuck_rule_without_a_position_prints_a_dash() -> TestResult {
+    let mut summary = full_summary();
+    summary.stuck_rule = Some("monologue".into());
+    let url = serve(Stub {
+        summary: Some(summary),
+        page: 10,
+        ..Stub::default()
+    })
+    .await?;
+    let (res, out) = cli(&url, TOKEN, &["status", "job-1"]).await;
+    res?;
+    assert!(
+        out.contains("  stuck (shadow): monologue at event -\n"),
+        "{out}"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn hostile_stuck_text_is_sanitized() -> TestResult {
+    let mut summary = full_summary();
+    summary.stuck_rule = Some("\u{1b}[2Jrepeat\u{7}_error\nforged: line".into());
+    summary.stuck_at_seq = Some(1);
+    let url = serve(Stub {
+        summary: Some(summary),
+        page: 10,
+        ..Stub::default()
+    })
+    .await?;
+    let (res, out) = cli(&url, TOKEN, &["status", "job-1"]).await;
+    res?;
+    assert!(!out.contains('\u{1b}'), "{out}");
+    assert!(!out.contains('\u{7}'), "{out}");
+    assert!(!out.contains("\nforged: line"), "{out}");
+    assert!(out.contains("  stuck (shadow): "), "{out}");
     Ok(())
 }

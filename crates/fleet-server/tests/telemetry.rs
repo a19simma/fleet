@@ -268,6 +268,9 @@ fn full_summary() -> JobSummary {
         first_edit_ms: Some(16),
         complete: true,
         missing: vec!["a".to_owned(), "b".to_owned()],
+        stuck_rule: Some("repeat_error".to_owned()),
+        stuck_at_seq: Some(17),
+        stuck_at_ms: Some(18),
     }
 }
 
@@ -295,7 +298,8 @@ async fn summary_upsert_keeps_unobserved_as_null(pool: PgPool) {
             "result_subtype": "success", "cost_est_usd": 0.25, "tokens_in": 6, "tokens_out": 7,
             "tokens_cache_read": 8, "tokens_cache_write": 9, "tool_calls": 10,
             "tool_errors": 11, "bash_calls": 12, "bash_nonzero": 13, "denials": 14,
-            "api_retries": 15, "first_edit_ms": 16, "complete": true, "missing": ["a", "b"]
+            "api_retries": 15, "first_edit_ms": 16, "complete": true, "missing": ["a", "b"],
+            "stuck_rule": "repeat_error", "stuck_at_seq": 17, "stuck_at_ms": 18
         })
     );
     let sparse = JobSummary {
@@ -313,7 +317,8 @@ async fn summary_upsert_keeps_unobserved_as_null(pool: PgPool) {
             "tokens_out": null, "tokens_cache_read": null, "tokens_cache_write": null,
             "tool_calls": null, "tool_errors": null, "bash_calls": null,
             "bash_nonzero": null, "denials": null, "api_retries": null,
-            "first_edit_ms": null, "complete": false, "missing": ["result"]
+            "first_edit_ms": null, "complete": false, "missing": ["result"],
+            "stuck_rule": null, "stuck_at_seq": null, "stuck_at_ms": null
         })
     );
 }
@@ -420,6 +425,56 @@ async fn invalid_telemetry_stores_nothing(pool: PgPool) {
             missing: vec!["m".to_owned(); 33],
             ..full_summary()
         },
+        JobSummary {
+            stuck_rule: Some("unknown_rule".to_owned()),
+            stuck_at_seq: None,
+            stuck_at_ms: None,
+            ..full_summary()
+        },
+        JobSummary {
+            stuck_rule: Some(String::new()),
+            ..full_summary()
+        },
+        JobSummary {
+            stuck_rule: Some("Repeat_Error".to_owned()),
+            stuck_at_seq: None,
+            stuck_at_ms: None,
+            ..full_summary()
+        },
+        JobSummary {
+            stuck_rule: None,
+            stuck_at_seq: Some(1),
+            stuck_at_ms: None,
+            ..full_summary()
+        },
+        JobSummary {
+            stuck_rule: None,
+            stuck_at_seq: None,
+            stuck_at_ms: Some(1),
+            ..full_summary()
+        },
+        JobSummary {
+            stuck_rule: Some("repeat_error".to_owned()),
+            stuck_at_seq: None,
+            stuck_at_ms: Some(1),
+            ..full_summary()
+        },
+        JobSummary {
+            stuck_rule: Some("repeat_error".to_owned()),
+            stuck_at_seq: Some(1),
+            stuck_at_ms: None,
+            ..full_summary()
+        },
+        JobSummary {
+            stuck_rule: Some("repeat_error".to_owned()),
+            stuck_at_seq: None,
+            stuck_at_ms: None,
+            ..full_summary()
+        },
+        JobSummary {
+            stuck_at_ms: Some(u64::MAX),
+            ..full_summary()
+        },
     ];
     for bad in summaries {
         let err = send(&store, &job, vec![event(0)], Some(bad))
@@ -505,4 +560,62 @@ fn wire_limits_are_pinned() {
     assert_eq!(MAX_EVENTS_PER_JOB, 2000);
     assert_eq!(MAX_EVENT_CMD_BYTES, 512);
     assert_eq!(MAX_EVENT_DETAIL_BYTES, 1024);
+}
+
+#[sqlx::test]
+async fn every_stable_stuck_rule_name_is_persisted(pool: PgPool) {
+    let store = store(pool.clone()).await;
+    let job = claimed(&store).await;
+    for name in [
+        "repeat_action_observation",
+        "repeat_error",
+        "alternating",
+        "monologue",
+    ] {
+        let summary = JobSummary {
+            stuck_rule: Some(name.to_owned()),
+            stuck_at_seq: Some(0),
+            stuck_at_ms: Some(0),
+            ..JobSummary::default()
+        };
+        send(&store, &job, Vec::new(), Some(summary)).await.unwrap();
+        let figures = figures(&pool).await;
+        assert_eq!(figures["stuck_rule"], name);
+        assert_eq!(figures["stuck_at_seq"], 0);
+        assert_eq!(figures["stuck_at_ms"], 0);
+    }
+}
+
+#[sqlx::test]
+async fn a_summary_without_a_stuck_rule_stores_nulls_and_clears_an_old_one(pool: PgPool) {
+    let store = store(pool.clone()).await;
+    let job = claimed(&store).await;
+    send(&store, &job, Vec::new(), Some(JobSummary::default()))
+        .await
+        .unwrap();
+    let before = figures(&pool).await;
+    assert_eq!(before["stuck_rule"], Value::Null);
+    assert_eq!(before["stuck_at_seq"], Value::Null);
+    assert_eq!(before["stuck_at_ms"], Value::Null);
+    send(&store, &job, Vec::new(), Some(full_summary()))
+        .await
+        .unwrap();
+    assert_eq!(figures(&pool).await["stuck_rule"], "repeat_error");
+    send(&store, &job, Vec::new(), Some(JobSummary::default()))
+        .await
+        .unwrap();
+    assert_eq!(figures(&pool).await["stuck_rule"], Value::Null);
+}
+
+#[sqlx::test]
+async fn the_database_rejects_a_stuck_rule_outside_the_stable_names(pool: PgPool) {
+    let store = store(pool.clone()).await;
+    let job = claimed(&store).await;
+    send(&store, &job, Vec::new(), Some(JobSummary::default()))
+        .await
+        .unwrap();
+    let outcome = sqlx::query("UPDATE job_summary SET stuck_rule = 'nope'")
+        .execute(&pool)
+        .await;
+    assert!(outcome.is_err());
 }

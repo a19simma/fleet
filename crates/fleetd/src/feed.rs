@@ -275,6 +275,9 @@ fn summary(summary: JobSummary) -> pb::JobSummary {
         first_edit_ms: summary.first_edit_ms,
         complete: summary.complete,
         missing: summary.missing,
+        stuck_rule: summary.stuck.map(|stuck| stuck.rule.name().to_owned()),
+        stuck_at_seq: summary.stuck.map(|stuck| stuck.seq),
+        stuck_at_ms: summary.stuck.map(|stuck| stuck.ts_ms),
     }
 }
 
@@ -285,6 +288,7 @@ mod tests {
     use serde_json::json;
 
     use super::*;
+    use crate::stuck::{Stuck, StuckRule};
 
     const SECRET: &str = "pa\"ss-word-xyz";
 
@@ -590,6 +594,11 @@ mod tests {
             complete: true,
             missing: vec!["exit_codes".into()],
             terminal: None,
+            stuck: Some(Stuck {
+                rule: StuckRule::Alternating,
+                seq: 15,
+                ts_ms: 16,
+            }),
         };
         assert_eq!(
             summary(source),
@@ -613,8 +622,19 @@ mod tests {
                 first_edit_ms: Some(14),
                 complete: true,
                 missing: vec!["exit_codes".into()],
+                stuck_rule: Some("alternating".into()),
+                stuck_at_seq: Some(15),
+                stuck_at_ms: Some(16),
             }
         );
+    }
+
+    #[test]
+    fn an_unset_stuck_rule_converts_to_unset_fields() {
+        let converted = summary(JobSummary::default());
+        assert_eq!(converted.stuck_rule, None);
+        assert_eq!(converted.stuck_at_seq, None);
+        assert_eq!(converted.stuck_at_ms, None);
     }
     fn report(id: &str, exit: Option<i32>, dur: Option<u64>) -> ToolReport {
         ToolReport {

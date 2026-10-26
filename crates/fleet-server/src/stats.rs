@@ -33,7 +33,7 @@ WITH scoped AS ( \
         j.state, j.error, s.job_id AS summarized, s.complete, s.turns, s.duration_ms, \
         s.cost_est_usd, s.tokens_in, s.tokens_out, s.tokens_cache_read, \
         s.tokens_cache_write, s.tool_calls, s.tool_errors, s.bash_calls, s.bash_nonzero, \
-        s.denials, s.api_retries, s.first_edit_ms \
+        s.denials, s.api_retries, s.first_edit_ms, s.stuck_rule \
     FROM jobs j LEFT JOIN job_summary s ON s.job_id = j.job_id \
     WHERE j.created_at >= to_timestamp($1::bigint::double precision) \
         AND j.created_at < to_timestamp($2::bigint::double precision) \
@@ -47,6 +47,7 @@ SELECT grp, count(*) AS jobs, \
     count(*) FILTER (WHERE state = 'LOST') AS lost, \
     count(*) FILTER (WHERE state NOT IN ('SUCCEEDED', 'FAILED', 'CANCELLED', 'LOST')) AS other, \
     count(summarized) AS with_summary, \
+    count(stuck_rule) AS stuck_jobs, \
     count(*) FILTER (WHERE complete) AS complete, \
     count(duration_ms) AS duration_ms_n, \
     percentile_cont(0.5) WITHIN GROUP (ORDER BY duration_ms::double precision) \
@@ -203,6 +204,7 @@ fn group(row: &PgRow) -> Result<StatsGroup, StoreError> {
         denials: total(row, "denials")?,
         api_retries: total(row, "api_retries")?,
         first_edit_ms: quantiles(row, "first_edit_ms")?,
+        stuck_jobs: n(row, "stuck_jobs")?,
     })
 }
 

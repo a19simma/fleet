@@ -115,6 +115,14 @@ pub(crate) fn write_summary(out: &mut impl Write, summary: &JobSummary) -> std::
             .as_ref()
             .map_or_else(|| "-".into(), |reason| sanitize_free(reason))
     )?;
+    if let Some(rule) = &summary.stuck_rule {
+        writeln!(
+            out,
+            "  stuck (shadow): {} at event {}",
+            sanitize_free(rule),
+            or_dash(summary.stuck_at_seq.as_ref())
+        )?;
+    }
     if !summary.complete {
         writeln!(out, "  INCOMPLETE (missing: {})", missing(&summary.missing))?;
     }

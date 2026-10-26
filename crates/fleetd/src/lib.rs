@@ -29,6 +29,7 @@ mod proc;
 pub mod runner;
 mod runtime;
 mod store;
+pub mod stuck;
 mod system;
 pub mod telemetry;
 pub mod toolhook;

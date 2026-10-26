@@ -277,6 +277,9 @@ message JobSummary {
   optional uint64 first_edit_ms = 17;
   bool complete = 18;
   repeated string missing = 19;
+  optional string stuck_rule = 20;
+  optional uint32 stuck_at_seq = 21;
+  optional uint64 stuck_at_ms = 22;
 }
 
 message ReadJobEventsRequest {
@@ -356,6 +359,7 @@ message StatsGroup {
   optional Total denials = 22;
   optional Total api_retries = 23;
   optional Quantiles first_edit_ms = 24;
+  uint64 stuck_jobs = 25;
 }
 
 message GetStatsReply {

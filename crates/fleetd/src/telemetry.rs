@@ -12,6 +12,8 @@ use std::collections::{BTreeMap, HashMap};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 
+use crate::stuck::{Detector, Stuck, StuckRules};
+
 const EVENT_OVERHEAD_BYTES: u64 = 48;
 const HASH_HEX_CHARS: usize = 16;
 const TRUNCATED: &str = "truncated";
@@ -161,6 +163,8 @@ pub struct JobSummary {
     pub missing: Vec<String>,
     /// How the job ended, set by [`Telemetry::finish`].
     pub terminal: Option<Terminal>,
+    /// First stuck rule that fired, recorded in shadow mode only.
+    pub stuck: Option<Stuck>,
 }
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -232,6 +236,7 @@ pub struct Telemetry {
     stop_reason: Option<String>,
     result_subtype: Option<String>,
     cost_est_usd: Option<f64>,
+    detector: Detector,
 }
 
 impl Telemetry {
@@ -265,7 +270,21 @@ impl Telemetry {
             stop_reason: None,
             result_subtype: None,
             cost_est_usd: None,
+            detector: Detector::new(StuckRules::default()),
         }
+    }
+
+    /// Replace the stuck thresholds. Call before the first line.
+    #[must_use]
+    pub fn with_stuck_rules(mut self, rules: StuckRules) -> Self {
+        self.detector = Detector::new(rules);
+        self
+    }
+
+    /// The stuck detector, for inspection.
+    #[must_use]
+    pub fn detector(&self) -> &Detector {
+        &self.detector
     }
 
     /// Lines that were not valid JSON, not an object of a known type, or matched no tool call.
@@ -319,7 +338,7 @@ impl Telemetry {
             }
             (Some("assistant"), _) => self.on_assistant(&value, ts_ms, redact),
             (Some("user"), _) => self.on_user(&value, ts_ms, &mut out),
-            (Some("result"), _) => self.on_result(&value),
+            (Some("result"), _) => self.on_result(&value, ts_ms),
             _ => self.ignored += 1,
         }
         out
@@ -410,6 +429,7 @@ impl Telemetry {
             complete: self.result_seen,
             missing,
             terminal: None,
+            stuck: self.detector.fired(),
         }
     }
 
@@ -439,6 +459,8 @@ impl Telemetry {
             };
         } else {
             self.event_bytes += size;
+            event.seq = u32::try_from(self.events.len()).unwrap_or(u32::MAX);
+            self.detector.tool(&event);
         }
         event.seq = u32::try_from(self.events.len()).unwrap_or(u32::MAX);
         self.events.push(event.clone());
@@ -501,11 +523,20 @@ impl Telemetry {
             .and_then(Value::as_array)
             .into_iter()
             .flatten();
+        let mut has_tool = false;
         for block in blocks {
             if block.get("type").and_then(Value::as_str) == Some("tool_use") {
+                has_tool = true;
                 self.on_tool_use(block, ts_ms, redact);
             }
         }
+        let seq = u32::try_from(self.events.len()).unwrap_or(u32::MAX);
+        self.detector.assistant(
+            message.get("id").and_then(Value::as_str),
+            has_tool,
+            seq,
+            ts_ms,
+        );
     }
 
     fn on_tool_use(&mut self, block: &Value, ts_ms: u64, redact: &dyn Fn(&str) -> String) {
@@ -591,8 +622,10 @@ impl Telemetry {
         self.emit(event, out);
     }
 
-    fn on_result(&mut self, value: &Value) {
+    fn on_result(&mut self, value: &Value, ts_ms: u64) {
         self.observed = true;
+        let seq = u32::try_from(self.events.len()).unwrap_or(u32::MAX);
+        self.detector.end_turn(seq, ts_ms);
         self.result_seen = true;
         let number = |name: &str| value.get(name).and_then(Value::as_u64);
         let text = |name: &str| value.get(name).and_then(Value::as_str).map(str::to_owned);

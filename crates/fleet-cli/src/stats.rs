@@ -9,7 +9,7 @@ use super::{CliError, Client, StatsBy, sanitize};
 
 const SINCE_USAGE: &str =
     "invalid --since: use a duration such as 45s, 90m, 24h or 7d, or a unix time in seconds";
-const HEADER: &str = "group\tjobs\tok%\tdur_p50\tdur_p95\tcost_usd\ttool_err%\tdenials\tn";
+const HEADER: &str = "group\tjobs\tok%\tdur_p50\tdur_p95\tcost_usd\ttool_err%\tdenials\tstuck\tn";
 const SECONDS_PER_MINUTE: f64 = 60.0;
 
 /// Seconds since the unix epoch, 0 when the clock is before it.
@@ -123,6 +123,13 @@ fn n_of(n: Option<u64>) -> String {
     n.map_or_else(|| "-".into(), |n| n.to_string())
 }
 
+fn stuck(group: &StatsGroup) -> String {
+    if group.with_summary == 0 {
+        return "-".into();
+    }
+    format!("{}/{}", group.stuck_jobs, group.with_summary)
+}
+
 fn write_row(out: &mut impl Write, group: &StatsGroup) -> std::io::Result<()> {
     let key = sanitize(&group.key);
     let key = if key.is_empty() { "all" } else { &key };
@@ -134,10 +141,11 @@ fn write_row(out: &mut impl Write, group: &StatsGroup) -> std::io::Result<()> {
     let (tool_rate, tools_n) = tool_errors(group.tool_calls.as_ref(), group.tool_errors.as_ref());
     writeln!(
         out,
-        "{key}\t{}\t{}\t{p50}\t{p95}\t{cost}\t{tool_rate}\t{}\tdur={} cost={} tools={tools_n} den={}",
+        "{key}\t{}\t{}\t{p50}\t{p95}\t{cost}\t{tool_rate}\t{}\t{}\tdur={} cost={} tools={tools_n} den={}",
         group.jobs,
         success(group),
         count(group.denials.as_ref()),
+        stuck(group),
         n_of(group.duration_ms.as_ref().map(|q| q.n)),
         n_of(group.cost_est_usd.as_ref().map(|c| c.n)),
         n_of(group.denials.as_ref().map(|t| t.n)),

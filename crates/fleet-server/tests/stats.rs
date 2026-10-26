@@ -763,3 +763,37 @@ async fn group_by_state_never_reads_request_text_as_sql(pool: PgPool) {
     };
     assert_eq!(run(&store, &hostile).await.groups.len(), 0);
 }
+
+async fn mark_stuck(pool: &PgPool, id: &str, rule: &str) {
+    sqlx::query("UPDATE job_summary SET stuck_rule = $2, stuck_at_seq = 3, stuck_at_ms = 40 WHERE job_id = $1")
+        .bind(id)
+        .bind(rule)
+        .execute(pool)
+        .await
+        .unwrap();
+}
+
+#[sqlx::test(migrations = false)]
+async fn stuck_jobs_count_summaries_with_a_rule_against_summarized_jobs(pool: PgPool) {
+    let store = store(pool.clone()).await;
+    for id in ["a", "b", "c", "d", "e"] {
+        insert(&pool, &seed(id, "SUCCEEDED")).await;
+    }
+    for id in ["a", "b", "c", "d"] {
+        with_duration(&pool, id, 100).await;
+    }
+    mark_stuck(&pool, "a", "repeat_error").await;
+    mark_stuck(&pool, "b", "monologue").await;
+    let group = one(&store).await;
+    assert_eq!(group.jobs, 5);
+    assert_eq!(group.with_summary, 4);
+    assert_eq!(group.stuck_jobs, 2);
+}
+
+#[sqlx::test(migrations = false)]
+async fn stuck_jobs_is_zero_when_no_summary_has_a_rule(pool: PgPool) {
+    let store = store(pool.clone()).await;
+    insert(&pool, &seed("a", "SUCCEEDED")).await;
+    with_duration(&pool, "a", 100).await;
+    assert_eq!(one(&store).await.stuck_jobs, 0);
+}

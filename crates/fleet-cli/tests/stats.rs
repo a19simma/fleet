@@ -152,6 +152,7 @@ fn full_group(key: &str) -> StatsGroup {
         tool_calls: total(5, 200).into(),
         tool_errors: total(5, 15).into(),
         denials: total(3, 7).into(),
+        stuck_jobs: 2,
         ..StatsGroup::default()
     }
 }
@@ -205,6 +206,7 @@ async fn renders_the_key_columns_with_denominators() -> TestResult {
             "cost_usd",
             "tool_err%",
             "denials",
+            "stuck",
             "n"
         ]
     );
@@ -220,6 +222,7 @@ async fn renders_the_key_columns_with_denominators() -> TestResult {
             "12.3456",
             "7.5%",
             "7",
+            "2/5",
             "dur=5 cost=5 tools=5 den=3"
         ]
     );
@@ -241,6 +244,7 @@ async fn absent_figures_print_a_dash_never_zero() -> TestResult {
             "bare",
             "3",
             "- (0/0)",
+            "-",
             "-",
             "-",
             "-",
@@ -274,9 +278,9 @@ async fn tool_error_rate_needs_both_figures_and_calls() -> TestResult {
     let out = stats(reply(vec![none, lone, thin]), &[]).await?;
     assert_eq!(row(&out, "zero")?[6], "-");
     assert_eq!(row(&out, "lone")?[6], "-");
-    assert_eq!(row(&out, "lone")?[8], "dur=- cost=- tools=- den=-");
+    assert_eq!(row(&out, "lone")?[9], "dur=- cost=- tools=- den=-");
     assert_eq!(row(&out, "thin")?[6], "10.0%");
-    assert_eq!(row(&out, "thin")?[8], "dur=- cost=- tools=1 den=-");
+    assert_eq!(row(&out, "thin")?[9], "dur=- cost=- tools=1 den=-");
     Ok(())
 }
 
@@ -495,5 +499,35 @@ async fn an_unknown_grouping_is_rejected_by_clap() -> TestResult {
     let url = serve(Stub::default()).await?;
     let (result, _) = cli(&url, TOKEN, &["stats", "--by", "colour"]).await;
     assert!(result.is_err());
+    Ok(())
+}
+
+#[tokio::test]
+async fn stuck_cell_is_the_count_over_summarized_jobs() -> TestResult {
+    let some = StatsGroup {
+        key: "some".into(),
+        jobs: 9,
+        with_summary: 4,
+        stuck_jobs: 0,
+        ..StatsGroup::default()
+    };
+    let many = StatsGroup {
+        key: "many".into(),
+        jobs: 9,
+        with_summary: 4,
+        stuck_jobs: 3,
+        ..StatsGroup::default()
+    };
+    let none = StatsGroup {
+        key: "none".into(),
+        jobs: 9,
+        with_summary: 0,
+        stuck_jobs: 0,
+        ..StatsGroup::default()
+    };
+    let out = stats(reply(vec![some, many, none]), &[]).await?;
+    assert_eq!(row(&out, "some")?[8], "0/4");
+    assert_eq!(row(&out, "many")?[8], "3/4");
+    assert_eq!(row(&out, "none")?[8], "-");
     Ok(())
 }

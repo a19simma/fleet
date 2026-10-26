@@ -32,9 +32,9 @@ const UPSERT_JOB_SUMMARY: &str = "\
 INSERT INTO job_summary (job_id, turns, duration_ms, duration_api_ms, stop_reason, \
     result_subtype, cost_est_usd, tokens_in, tokens_out, tokens_cache_read, \
     tokens_cache_write, tool_calls, tool_errors, bash_calls, bash_nonzero, denials, \
-    api_retries, first_edit_ms, complete, missing) \
+    api_retries, first_edit_ms, complete, missing, stuck_rule, stuck_at_seq, stuck_at_ms) \
 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, \
-    $19, $20) \
+    $19, $20, $21, $22, $23) \
 ON CONFLICT (job_id) DO UPDATE SET turns = EXCLUDED.turns, \
     duration_ms = EXCLUDED.duration_ms, duration_api_ms = EXCLUDED.duration_api_ms, \
     stop_reason = EXCLUDED.stop_reason, result_subtype = EXCLUDED.result_subtype, \
@@ -44,7 +44,9 @@ ON CONFLICT (job_id) DO UPDATE SET turns = EXCLUDED.turns, \
     tool_errors = EXCLUDED.tool_errors, bash_calls = EXCLUDED.bash_calls, \
     bash_nonzero = EXCLUDED.bash_nonzero, denials = EXCLUDED.denials, \
     api_retries = EXCLUDED.api_retries, first_edit_ms = EXCLUDED.first_edit_ms, \
-    complete = EXCLUDED.complete, missing = EXCLUDED.missing, updated_at = now()";
+    complete = EXCLUDED.complete, missing = EXCLUDED.missing, \
+    stuck_rule = EXCLUDED.stuck_rule, stuck_at_seq = EXCLUDED.stuck_at_seq, \
+    stuck_at_ms = EXCLUDED.stuck_at_ms, updated_at = now()";
 
 const READ_JOB_EVENTS: &str = "\
 SELECT seq, ts_ms, kind, tool_use_id, tool, ok, exit_code, dur_ms, out_bytes, out_hash, cmd, \
@@ -54,7 +56,8 @@ FROM job_event WHERE job_id = $1 AND seq > $2::bigint ORDER BY seq LIMIT $3";
 const READ_JOB_SUMMARY: &str = "\
 SELECT turns, duration_ms, duration_api_ms, stop_reason, result_subtype, cost_est_usd, \
     tokens_in, tokens_out, tokens_cache_read, tokens_cache_write, tool_calls, tool_errors, \
-    bash_calls, bash_nonzero, denials, api_retries, first_edit_ms, complete, missing \
+    bash_calls, bash_nonzero, denials, api_retries, first_edit_ms, complete, missing, \
+    stuck_rule, stuck_at_seq, stuck_at_ms \
 FROM job_summary WHERE job_id = $1";
 
 #[derive(Default)]
@@ -80,6 +83,9 @@ struct SummaryRow {
     cost_est_usd: Option<f64>,
     complete: bool,
     missing: Vec<String>,
+    stuck_rule: Option<&'static str>,
+    stuck_at_seq: Option<i64>,
+    stuck_at_ms: Option<i64>,
 }
 
 /// Telemetry of one report after validation and clamping.
@@ -112,6 +118,17 @@ fn figure(value: Option<u64>) -> Result<Option<i64>, StoreError> {
     value
         .map(|raw| i64::try_from(raw).map_err(|_| StoreError::InvalidTelemetry))
         .transpose()
+}
+
+fn stuck_rule_name(rule: Option<&String>) -> Result<Option<&'static str>, StoreError> {
+    match rule.map(String::as_str) {
+        None => Ok(None),
+        Some("repeat_action_observation") => Ok(Some("repeat_action_observation")),
+        Some("repeat_error") => Ok(Some("repeat_error")),
+        Some("alternating") => Ok(Some("alternating")),
+        Some("monologue") => Ok(Some("monologue")),
+        Some(_) => Err(StoreError::InvalidTelemetry),
+    }
 }
 
 fn kind_name(kind: i32) -> Result<&'static str, StoreError> {
@@ -161,6 +178,17 @@ fn check_summary(summary: &JobSummary) -> Result<SummaryRow, StoreError> {
     {
         return Err(StoreError::InvalidTelemetry);
     }
+    let stuck_rule = stuck_rule_name(summary.stuck_rule.as_ref())?;
+    let has_seq = summary.stuck_at_seq.is_some();
+    let has_ms = summary.stuck_at_ms.is_some();
+    let paired = if stuck_rule.is_some() {
+        has_seq && has_ms
+    } else {
+        !has_seq && !has_ms
+    };
+    if !paired {
+        return Err(StoreError::InvalidTelemetry);
+    }
     let missing = summary
         .missing
         .iter()
@@ -188,6 +216,9 @@ fn check_summary(summary: &JobSummary) -> Result<SummaryRow, StoreError> {
         cost_est_usd: summary.cost_est_usd,
         complete: summary.complete,
         missing,
+        stuck_rule,
+        stuck_at_seq: summary.stuck_at_seq.map(i64::from),
+        stuck_at_ms: figure(summary.stuck_at_ms)?,
     })
 }
 
@@ -202,7 +233,8 @@ fn check_summary(summary: &JobSummary) -> Result<SummaryRow, StoreError> {
 /// Returns [`StoreError::TelemetryTooLarge`] when the report carries more than
 /// [`MAX_EVENTS_PER_REPORT`] events, and [`StoreError::InvalidTelemetry`] for an unknown
 /// event kind, a NUL character in any text, a figure above `i64::MAX`, a non-finite cost or
-/// more than 32 missing-figure names.
+/// more than 32 missing-figure names, a stuck rule outside the four stable names, a stuck
+/// position without a rule, or a stuck rule missing either position.
 pub(crate) fn check(
     events: &[JobEvent],
     summary: Option<&JobSummary>,
@@ -287,6 +319,9 @@ pub(crate) async fn persist(
             .bind(edit)
             .bind(row.complete)
             .bind(&row.missing)
+            .bind(row.stuck_rule)
+            .bind(row.stuck_at_seq)
+            .bind(row.stuck_at_ms)
             .execute(&mut **tx)
             .await?;
     }
@@ -377,5 +412,11 @@ pub(crate) async fn read_summary(
         first_edit_ms: figure("first_edit_ms")?,
         complete: row.try_get("complete")?,
         missing: row.try_get("missing")?,
+        stuck_rule: row.try_get("stuck_rule")?,
+        stuck_at_seq: ms(row.try_get("stuck_at_seq")?, "stuck_at_seq")?
+            .map(u32::try_from)
+            .transpose()
+            .map_err(|_| StoreError::OutOfRange("stuck_at_seq"))?,
+        stuck_at_ms: figure("stuck_at_ms")?,
     }))
 }
