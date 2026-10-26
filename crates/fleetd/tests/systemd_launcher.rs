@@ -786,6 +786,26 @@ async fn a_stale_run_dir_is_removed_and_a_live_unit_is_stopped_then_reset_first(
 }
 
 #[tokio::test]
+async fn a_stale_run_dir_of_a_failed_unit_is_reset_without_stop_before_removal() -> TestResult {
+    let case = Case::new("t_sweep_failed")?;
+    case.last(&show("failed", "signal", 1, 9))?;
+    stale_dir(&case)?;
+    case.launcher().sweep_stale().await;
+    let unit = case.unit();
+    assert_eq!(
+        case.log(),
+        vec![
+            format!(
+                "show {unit} -p ActiveState -p SubState -p Result -p ExecMainCode -p ExecMainStatus"
+            ),
+            format!("reset-failed {unit}"),
+        ]
+    );
+    assert!(!case.dir().exists());
+    Ok(())
+}
+
+#[tokio::test]
 async fn a_stale_run_dir_of_an_inactive_unit_is_removed_without_stop() -> TestResult {
     let case = Case::new("t_sweep_idle")?;
     case.last(&show("inactive", "success", 0, 0))?;

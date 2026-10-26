@@ -91,7 +91,7 @@ Three design corrections came out of the run and are binding constraints in P1: 
 
 ## Open items
 
-- The startup sweep runs only after the daemon holds its sockets, so a second instance cannot sweep a running one. It removes stale run dirs only. The job worktree and `.agent/<id>` of a crashed job stay, because `Workspace::remove` needs the repo, which a crash no longer records.
+- The startup sweep runs only after the daemon holds its sockets, so a second instance cannot sweep a running one. It removes stale run dirs and resets their failed units only. The job worktree and `.agent/<id>` of a crashed job stay, because `Workspace::remove` needs the repo, which a crash no longer records.
 - On a `systemctl show` error the launcher runs `reset-failed` but not `kill`, so a still-running unit could outlive its removed run dir.
 - Egress and the credential proxy (P2) are not built. Until then the template has no route to the model API, and a box needs the `PrivateNetwork=no` drop-in (`deploy/fleet-agent@.service.d/allow-network.conf.example`) to run a real agent.
 - A Firecracker microVM per job stays the escalation path if third-party repos or public prompt sources are ever run.

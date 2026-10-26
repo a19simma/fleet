@@ -117,7 +117,7 @@ impl SystemdLauncher {
     /// Removes every run dir under the run root, which at startup belongs to no live job of
     /// this process. Only real directories named like a job id are touched, never symlinks,
     /// files, the `hook` dir or any other name. A unit still active for the id is stopped and
-    /// reset first. A failure is logged and the sweep goes on.
+    /// reset first, and a failed unit is reset. A failure is logged and the sweep goes on.
     pub async fn sweep_stale(&self) {
         if !self.ctl.systemctl.is_absolute() {
             tracing::warn!("run dir sweep skipped: systemctl path is not absolute");
@@ -150,6 +150,10 @@ impl SystemdLauncher {
             Ok(text) if is_live(&text) => {
                 tracing::warn!(job_id = %id, "stopping a unit left by a crash");
                 self.ctl.stop(&unit).await;
+                self.ctl.reset_failed(&unit).await;
+            }
+            Ok(text) if is_failed(&text) => {
+                tracing::warn!(job_id = %id, "resetting a failed unit left by a crash");
                 self.ctl.reset_failed(&unit).await;
             }
             Ok(_) => {}
@@ -241,6 +245,12 @@ fn is_live(show: &str) -> bool {
     show.lines()
         .filter_map(|line| line.strip_prefix("ActiveState="))
         .any(|state| !matches!(state, "inactive" | "failed"))
+}
+
+fn is_failed(show: &str) -> bool {
+    show.lines()
+        .filter_map(|line| line.strip_prefix("ActiveState="))
+        .any(|state| state == "failed")
 }
 
 fn unit_name(id: &str) -> String {
