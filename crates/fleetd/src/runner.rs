@@ -42,7 +42,7 @@
 //! worktree, unless the staged diff holds a value the redactor knows.
 
 use std::borrow::Cow;
-use std::collections::{BTreeSet, HashMap, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::ffi::OsString;
 use std::future::Future;
 use std::io;
@@ -56,8 +56,8 @@ use fleet_core::Redactor;
 use fleet_proto::MAX_CHUNKS_PER_REPORT;
 use fleet_proto::v1::{Job, JobState, ReportJobReply, ReportJobRequest, TranscriptChunk};
 use serde_json::Value;
-use tokio::io::{AsyncBufRead, AsyncBufReadExt, BufReader};
-use tokio::process::{Child, ChildStdout, Command};
+use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncRead, BufReader};
+use tokio::process::{Child, Command};
 use tokio::time::{Instant, MissedTickBehavior, Sleep};
 use tonic::{Code, Status};
 
@@ -377,10 +377,120 @@ impl ChildWait for Child {
     }
 }
 
+/// Everything a launcher needs to start the agent: the command line, the full environment
+/// block and the working directory.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AgentSpec {
+    /// The program followed by its arguments.
+    pub argv: Vec<OsString>,
+    /// The complete environment. Nothing else is inherited.
+    pub env: BTreeMap<OsString, OsString>,
+    /// The agent's working directory.
+    pub cwd: PathBuf,
+}
+
+/// A running agent process behind a [`Launcher`].
+///
+/// The runner awaits [`AgentProc::wait`] and sends [`AgentProc::terminate`] on a cancel and
+/// [`AgentProc::kill`] to end the run. Both are synchronous so the read loop never awaits
+/// them. Dropping the value must kill everything the agent started.
+pub trait AgentProc: Send {
+    /// Resolves with the exit status once the process has ended.
+    fn wait(&mut self) -> Pin<Box<dyn Future<Output = io::Result<ExitStatus>> + Send + '_>>;
+
+    /// Asks the agent and its descendants to stop, as `SIGTERM` to the process group does.
+    fn terminate(&mut self);
+
+    /// Ends the agent and its descendants at once. Safe to call more than once.
+    fn kill(&mut self);
+}
+
+/// A started agent: its stdout and the handle that ends it.
+pub struct Launched {
+    /// The agent's stdout, read line by line.
+    pub stdout: Box<dyn AsyncRead + Send + Unpin>,
+    /// The process handle.
+    pub proc: Box<dyn AgentProc>,
+}
+
+/// Starts the agent for [`AgentRunner`]. The seam lets a different sandbox replace the
+/// direct spawn.
+pub trait Launcher: Send + Sync + std::fmt::Debug {
+    /// Starts the agent described by `spec`.
+    ///
+    /// # Errors
+    ///
+    /// Returns the I/O error when the agent cannot be started.
+    fn launch(&self, spec: AgentSpec) -> io::Result<Launched>;
+}
+
+/// Spawns the agent as a child in its own process group, killed with the group on drop.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct DirectLauncher;
+
+impl Launcher for DirectLauncher {
+    fn launch(&self, spec: AgentSpec) -> io::Result<Launched> {
+        spawn_direct(&spec, |child| child)
+    }
+}
+
+struct Grouped<W> {
+    inner: W,
+    guard: GroupGuard,
+}
+
+impl<W: ChildWait> AgentProc for Grouped<W> {
+    fn wait(&mut self) -> Pin<Box<dyn Future<Output = io::Result<ExitStatus>> + Send + '_>> {
+        Box::pin(self.inner.wait())
+    }
+
+    fn terminate(&mut self) {
+        self.guard.terminate();
+    }
+
+    fn kill(&mut self) {
+        self.guard.kill();
+    }
+}
+
+fn spawn_direct<W: ChildWait + 'static>(
+    spec: &AgentSpec,
+    wrap: impl FnOnce(Child) -> W,
+) -> io::Result<Launched> {
+    let (program, args) = spec
+        .argv
+        .split_first()
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "empty agent argv"))?;
+    let mut child = Command::new(program)
+        .args(args)
+        .current_dir(&spec.cwd)
+        .env_clear()
+        .envs(&spec.env)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .process_group(0)
+        .kill_on_drop(true)
+        .spawn()?;
+    let guard = GroupGuard::new(child.id());
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| io::Error::other("agent stdout missing"))?;
+    Ok(Launched {
+        stdout: Box::new(stdout),
+        proc: Box::new(Grouped {
+            inner: wrap(child),
+            guard,
+        }),
+    })
+}
+
 /// Runs the agent for claimed jobs.
 #[derive(Debug)]
 pub struct AgentRunner<R> {
     config: RunConfig,
+    launcher: Arc<dyn Launcher>,
     reporter: R,
     redactor: Redactor,
     carries: Mutex<HashMap<String, Carry>>,
@@ -401,11 +511,19 @@ impl<R: Reporter> AgentRunner<R> {
     pub fn new(config: RunConfig, reporter: R, redactor: Redactor) -> Self {
         Self {
             config,
+            launcher: Arc::new(DirectLauncher),
             reporter,
             redactor,
             carries: Mutex::new(HashMap::new()),
             hub: None,
         }
+    }
+
+    /// Starts agents through `launcher` instead of [`DirectLauncher`].
+    #[must_use]
+    pub fn with_launcher(mut self, launcher: Arc<dyn Launcher>) -> Self {
+        self.launcher = launcher;
+        self
     }
 
     /// Takes tool hook reports for running jobs from `hub`.
@@ -529,7 +647,8 @@ impl<R: Reporter> AgentRunner<R> {
         cwd: &Path,
         shutdown: Shutdown,
     ) -> Result<AgentOutcome, RunError> {
-        self.run_with(job, cwd, shutdown, |child| child).await
+        self.run_launched(job, cwd, shutdown, |spec| self.launcher.launch(spec))
+            .await
     }
 
     /// Like [`Self::run`], but `wrap` turns the spawned child into the value the runner
@@ -538,12 +657,23 @@ impl<R: Reporter> AgentRunner<R> {
     /// # Errors
     ///
     /// Same as [`Self::run`].
-    pub async fn run_with<W: ChildWait>(
+    pub async fn run_with<W: ChildWait + 'static>(
         &self,
         job: &Job,
         cwd: &Path,
         shutdown: Shutdown,
         wrap: impl FnOnce(Child) -> W + Send,
+    ) -> Result<AgentOutcome, RunError> {
+        self.run_launched(job, cwd, shutdown, move |spec| spawn_direct(&spec, wrap))
+            .await
+    }
+
+    async fn run_launched(
+        &self,
+        job: &Job,
+        cwd: &Path,
+        shutdown: Shutdown,
+        launch: impl FnOnce(AgentSpec) -> io::Result<Launched> + Send,
     ) -> Result<AgentOutcome, RunError> {
         let mut stream = Stream::new(
             &self.reporter,
@@ -552,20 +682,22 @@ impl<R: Reporter> AgentRunner<R> {
             Carry::default(),
             self.hub.clone(),
         );
-        let result = self.run_stream(job, cwd, shutdown, &mut stream, wrap).await;
+        let result = self
+            .run_stream(job, cwd, shutdown, &mut stream, launch)
+            .await;
         if matches!(result, Ok(AgentOutcome::Succeeded)) {
             self.stash(job, stream.carry());
         }
         result
     }
 
-    async fn run_stream<W: ChildWait>(
+    async fn run_stream(
         &self,
         job: &Job,
         cwd: &Path,
         shutdown: Shutdown,
         stream: &mut Stream<'_, R>,
-        wrap: impl FnOnce(Child) -> W + Send,
+        launch: impl FnOnce(AgentSpec) -> io::Result<Launched> + Send,
     ) -> Result<AgentOutcome, RunError> {
         let root = self
             .config
@@ -580,8 +712,9 @@ impl<R: Reporter> AgentRunner<R> {
                 return Ok(stream.fail(None, ERR_START).await);
             }
         };
-        let mut child = match self.command(job, cwd, &job_dir.home()).spawn() {
-            Ok(child) => child,
+        let spec = self.agent_spec(job, cwd, &job_dir.home());
+        let Launched { stdout, mut proc } = match launch(spec) {
+            Ok(launched) => launched,
             Err(err) => {
                 tracing::warn!(
                     program = %self.config.claude_bin.display(),
@@ -591,26 +724,17 @@ impl<R: Reporter> AgentRunner<R> {
                 return Ok(stream.fail(None, ERR_START).await);
             }
         };
-        let mut guard = GroupGuard::new(child.id());
-        let Some(stdout) = child.stdout.take() else {
-            guard.kill();
-            let _ = child.wait().await;
-            return Ok(stream.fail(None, ERR_START).await);
-        };
         let mut ctl = Ctl {
             deadline: Box::pin(tokio::time::sleep(self.config.timeout)),
             shutdown,
         };
-        let mut child = wrap(child);
-        let end = self
-            .drive(&mut child, stdout, &mut guard, stream, &mut ctl)
-            .await;
+        let end = self.drive(proc.as_mut(), stdout, stream, &mut ctl).await;
         if matches!(end, Err(End::Cancel)) {
-            guard.terminate();
-            let _ = tokio::time::timeout(self.config.cancel_grace, child.wait()).await;
+            proc.terminate();
+            let _ = tokio::time::timeout(self.config.cancel_grace, proc.wait()).await;
         }
-        guard.kill();
-        let _ = child.wait().await;
+        proc.kill();
+        let _ = proc.wait().await;
         match end {
             Ok(status) => {
                 if let Some(error) = stream.feed.result_subtype().and_then(cap_error) {
@@ -1102,11 +1226,10 @@ impl<R: Reporter> AgentRunner<R> {
         capture(command, self.config.finish_timeout, limit).await
     }
 
-    async fn drive<W: ChildWait>(
+    async fn drive(
         &self,
-        child: &mut W,
-        stdout: ChildStdout,
-        guard: &mut GroupGuard,
+        child: &mut dyn AgentProc,
+        stdout: Box<dyn AsyncRead + Send + Unpin>,
         stream: &mut Stream<'_, R>,
         ctl: &mut Ctl,
     ) -> Result<ExitStatus, End> {
@@ -1138,7 +1261,7 @@ impl<R: Reporter> AgentRunner<R> {
                     }
                 }
                 waited = child.wait(), if status.is_none() => {
-                    guard.kill();
+                    child.kill();
                     status = Some(waited);
                     drain = Some(Box::pin(tokio::time::sleep(STDOUT_DRAIN)));
                 }
@@ -1168,13 +1291,18 @@ impl<R: Reporter> AgentRunner<R> {
                     .any(|extra| extra == name))
     }
 
-    fn command(&self, job: &Job, cwd: &Path, home: &Path) -> Command {
-        let claude = home.join(".claude");
-        let mut command = Command::new(&self.config.claude_bin);
-        command
-            .args([
+    /// The command line, environment and working directory for `job`'s agent.
+    ///
+    /// The environment is the allowlisted part of [`RunConfig::base_env`] plus the per-job
+    /// values, with `home` as `HOME` and `home/.claude` as `CLAUDE_CONFIG_DIR`.
+    pub fn agent_spec(&self, job: &Job, cwd: &Path, home: &Path) -> AgentSpec {
+        let turns = self.config.max_turns.to_string();
+        let budget = self.config.max_budget_usd.to_string();
+        let mut argv: Vec<OsString> = vec![self.config.claude_bin.clone().into_os_string()];
+        argv.extend(
+            [
                 "-p",
-                &job.prompt,
+                job.prompt.as_str(),
                 "--output-format",
                 "stream-json",
                 "--verbose",
@@ -1183,46 +1311,49 @@ impl<R: Reporter> AgentRunner<R> {
                 "--append-system-prompt",
                 AGENT_PROTOCOL,
                 "--max-turns",
-                &self.config.max_turns.to_string(),
+                turns.as_str(),
                 "--max-budget-usd",
-                &self.config.max_budget_usd.to_string(),
-            ])
-            .current_dir(cwd)
-            .env_clear()
-            .envs(
-                self.config
-                    .base_env
-                    .iter()
-                    .filter(|(name, _)| self.agent_env_kept(name))
-                    .map(|(name, value)| (name, value)),
-            )
-            .env("FLEET_JOB_ID", &job.job_id)
-            .env("SWARM_BOX", "1")
-            .env("HOME", home)
-            .env("CLAUDE_CONFIG_DIR", &claude)
-            .env("XDG_CONFIG_HOME", home.join(".config"))
-            .env("XDG_CACHE_HOME", home.join(".cache"))
-            .env("XDG_STATE_HOME", home.join(".local").join("state"))
-            .env("XDG_DATA_HOME", home.join(".local").join("share"))
-            .env("DISABLE_AUTOUPDATER", "1")
-            .env("GIT_CONFIG_GLOBAL", home.join(".gitconfig"))
-            .env("GIT_TERMINAL_PROMPT", "0")
-            .env("GIT_AUTHOR_NAME", JOB_NAME)
-            .env("GIT_AUTHOR_EMAIL", JOB_EMAIL)
-            .env("GIT_COMMITTER_NAME", JOB_NAME)
-            .env("GIT_COMMITTER_EMAIL", JOB_EMAIL)
-            .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::null())
-            .process_group(0)
-            .kill_on_drop(true);
+                budget.as_str(),
+            ]
+            .map(OsString::from),
+        );
         if self.config.disposable {
-            command.arg("--dangerously-skip-permissions");
+            argv.push("--dangerously-skip-permissions".into());
         } else {
-            command.args(["--permission-mode", "dontAsk"]);
+            argv.extend(["--permission-mode", "dontAsk"].map(OsString::from));
         }
-        command.arg("--disallowedTools").args(DENIED_TOOLS);
-        command
+        argv.push("--disallowedTools".into());
+        argv.extend(DENIED_TOOLS.map(OsString::from));
+        let mut env: BTreeMap<OsString, OsString> = self
+            .config
+            .base_env
+            .iter()
+            .filter(|(name, _)| self.agent_env_kept(name))
+            .cloned()
+            .collect();
+        let fixed: [(&str, OsString); 15] = [
+            ("FLEET_JOB_ID", job.job_id.clone().into()),
+            ("SWARM_BOX", "1".into()),
+            ("HOME", home.into()),
+            ("CLAUDE_CONFIG_DIR", home.join(".claude").into()),
+            ("XDG_CONFIG_HOME", home.join(".config").into()),
+            ("XDG_CACHE_HOME", home.join(".cache").into()),
+            ("XDG_STATE_HOME", home.join(".local").join("state").into()),
+            ("XDG_DATA_HOME", home.join(".local").join("share").into()),
+            ("DISABLE_AUTOUPDATER", "1".into()),
+            ("GIT_CONFIG_GLOBAL", home.join(".gitconfig").into()),
+            ("GIT_TERMINAL_PROMPT", "0".into()),
+            ("GIT_AUTHOR_NAME", JOB_NAME.into()),
+            ("GIT_AUTHOR_EMAIL", JOB_EMAIL.into()),
+            ("GIT_COMMITTER_NAME", JOB_NAME.into()),
+            ("GIT_COMMITTER_EMAIL", JOB_EMAIL.into()),
+        ];
+        env.extend(fixed.map(|(name, value)| (OsString::from(name), value)));
+        AgentSpec {
+            argv,
+            env,
+            cwd: cwd.to_path_buf(),
+        }
     }
 }
 
@@ -1799,8 +1930,264 @@ fn cut(text: &mut String, max: usize) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{ERR_FINISH_TIMEOUT, ERR_TIMEOUT, Ending, JobState, LineReader, ending};
+    use super::{
+        AgentOutcome, AgentProc, AgentRunner, AgentSpec, DirectLauncher, ERR_EXIT,
+        ERR_FINISH_TIMEOUT, ERR_TIMEOUT, Ending, Job, JobState, Launched, Launcher, LineReader,
+        Reporter, RunConfig, STRIPPED_ENV, ending,
+    };
+    use crate::poller::Shutdown;
+    use fleet_core::Redactor;
+    use fleet_proto::v1::{ReportJobReply, ReportJobRequest};
+    use std::ffi::OsString;
+    use std::future::Future;
+    use std::io;
+    use std::os::unix::process::ExitStatusExt;
+    use std::path::Path;
+    use std::pin::Pin;
+    use std::process::ExitStatus;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::{Arc, Mutex, PoisonError};
+    use std::time::Duration;
     use tokio::io::BufReader;
+    use tonic::Status;
+
+    struct Replies {
+        cancel: bool,
+    }
+
+    impl Reporter for Replies {
+        fn report(
+            &self,
+            _request: ReportJobRequest,
+        ) -> impl Future<Output = Result<ReportJobReply, Status>> + Send {
+            let reply = ReportJobReply {
+                cancel_requested: self.cancel,
+                ..ReportJobReply::default()
+            };
+            async move { Ok(reply) }
+        }
+    }
+
+    #[derive(Debug)]
+    struct FakeProc {
+        status: ExitStatus,
+        hold: bool,
+        stopped: Arc<AtomicBool>,
+        calls: Arc<Mutex<Vec<&'static str>>>,
+    }
+
+    impl AgentProc for FakeProc {
+        fn wait(&mut self) -> Pin<Box<dyn Future<Output = io::Result<ExitStatus>> + Send + '_>> {
+            Box::pin(async move {
+                while self.hold && !self.stopped.load(Ordering::SeqCst) {
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                }
+                Ok(self.status)
+            })
+        }
+
+        fn terminate(&mut self) {
+            self.calls
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .push("terminate");
+        }
+
+        fn kill(&mut self) {
+            self.calls
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .push("kill");
+            self.stopped.store(true, Ordering::SeqCst);
+        }
+    }
+
+    #[derive(Debug)]
+    struct FakeLauncher {
+        status: ExitStatus,
+        hold: bool,
+        specs: Arc<Mutex<Vec<AgentSpec>>>,
+        calls: Arc<Mutex<Vec<&'static str>>>,
+    }
+
+    impl FakeLauncher {
+        fn new(status: ExitStatus, hold: bool) -> Self {
+            Self {
+                status,
+                hold,
+                specs: Arc::default(),
+                calls: Arc::default(),
+            }
+        }
+    }
+
+    impl Launcher for FakeLauncher {
+        fn launch(&self, spec: AgentSpec) -> io::Result<Launched> {
+            self.specs
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .push(spec);
+            Ok(Launched {
+                stdout: Box::new(tokio::io::empty()),
+                proc: Box::new(FakeProc {
+                    status: self.status,
+                    hold: self.hold,
+                    stopped: Arc::default(),
+                    calls: Arc::clone(&self.calls),
+                }),
+            })
+        }
+    }
+
+    fn test_config(jobs: &Path) -> RunConfig {
+        let mut config = RunConfig::new("claude-fake", false);
+        config.jobs_dir = Some(jobs.to_path_buf());
+        config.max_turns = 7;
+        config.max_budget_usd = 1.5;
+        config.flush_interval = Duration::from_millis(10);
+        config.report_interval = Duration::from_millis(10);
+        config.cancel_grace = Duration::from_millis(20);
+        config.base_env = STRIPPED_ENV
+            .iter()
+            .map(|name| (OsString::from(name), OsString::from("secret")))
+            .chain([
+                (OsString::from("PATH"), OsString::from("/bin")),
+                (OsString::from("HTTPS_PROXY"), OsString::from("http://p:1")),
+                (OsString::from("HOME"), OsString::from("/real/operator")),
+            ])
+            .collect();
+        config.env_passthrough = STRIPPED_ENV.iter().map(|name| (*name).to_owned()).collect();
+        config
+    }
+
+    fn test_job() -> Job {
+        Job {
+            job_id: "job1".into(),
+            prompt: "do it".into(),
+            ..Job::default()
+        }
+    }
+
+    #[test]
+    fn agent_spec_holds_the_scrubbed_env_the_caps_and_the_cwd() {
+        let jobs = Path::new("/jobs");
+        let runner = AgentRunner::new(
+            test_config(jobs),
+            Replies { cancel: false },
+            Redactor::default(),
+        );
+        let home = Path::new("/jobs/home");
+        let spec = runner.agent_spec(&test_job(), Path::new("/work"), home);
+        for name in STRIPPED_ENV {
+            assert!(
+                !spec.env.contains_key(&OsString::from(name)),
+                "{name} leaked"
+            );
+        }
+        assert_eq!(spec.env.get(&OsString::from("HOME")), Some(&home.into()));
+        assert_eq!(
+            spec.env.get(&OsString::from("CLAUDE_CONFIG_DIR")),
+            Some(&home.join(".claude").into_os_string())
+        );
+        assert_eq!(
+            spec.env.get(&OsString::from("HTTPS_PROXY")),
+            Some(&OsString::from("http://p:1"))
+        );
+        assert_eq!(spec.cwd, Path::new("/work"));
+        assert_eq!(spec.argv.first(), Some(&OsString::from("claude-fake")));
+        let flag = |name: &str| {
+            let at = spec.argv.iter().position(|arg| arg == name)?;
+            spec.argv.get(at + 1).cloned()
+        };
+        assert_eq!(flag("--max-turns"), Some(OsString::from("7")));
+        assert_eq!(flag("--max-budget-usd"), Some(OsString::from("1.5")));
+        assert_eq!(flag("-p"), Some(OsString::from("do it")));
+        assert_eq!(flag("--permission-mode"), Some(OsString::from("dontAsk")));
+    }
+
+    #[test]
+    fn agent_spec_skips_permissions_only_on_a_disposable_box() {
+        let mut config = test_config(Path::new("/jobs"));
+        config.disposable = true;
+        let runner = AgentRunner::new(config, Replies { cancel: false }, Redactor::default());
+        let spec = runner.agent_spec(&test_job(), Path::new("/work"), Path::new("/h"));
+        assert!(
+            spec.argv
+                .contains(&OsString::from("--dangerously-skip-permissions"))
+        );
+        assert!(!spec.argv.contains(&OsString::from("--permission-mode")));
+    }
+
+    #[test]
+    fn the_direct_launcher_rejects_an_empty_argv() {
+        let spec = AgentSpec {
+            argv: Vec::new(),
+            env: std::collections::BTreeMap::new(),
+            cwd: "/".into(),
+        };
+        let err = DirectLauncher.launch(spec).err().map(|err| err.kind());
+        assert_eq!(err, Some(io::ErrorKind::InvalidInput));
+    }
+
+    #[tokio::test]
+    async fn the_runner_launches_once_and_maps_the_proc_status() {
+        let cases = [
+            (ExitStatus::from_raw(0), AgentOutcome::Succeeded),
+            (
+                ExitStatus::from_raw(3 << 8),
+                AgentOutcome::Failed {
+                    exit_code: Some(3),
+                    error: ERR_EXIT,
+                },
+            ),
+        ];
+        for (status, expected) in cases {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let launcher = Arc::new(FakeLauncher::new(status, false));
+            let runner = AgentRunner::new(
+                test_config(dir.path()),
+                Replies { cancel: false },
+                Redactor::default(),
+            )
+            .with_launcher(launcher.clone());
+            let (_trigger, shutdown) = Shutdown::channel();
+            let job = test_job();
+            let outcome = runner.run(&job, dir.path(), shutdown).await;
+            assert_eq!(outcome.ok(), Some(expected));
+            let specs = launcher
+                .specs
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner);
+            let home = dir.path().join(".agent").join("job1").join("home");
+            assert_eq!(*specs, vec![runner.agent_spec(&job, dir.path(), &home)]);
+        }
+    }
+
+    #[tokio::test]
+    async fn a_cancel_reply_terminates_then_kills_the_proc() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let launcher = Arc::new(FakeLauncher::new(ExitStatus::from_raw(0), true));
+        let runner = AgentRunner::new(
+            test_config(dir.path()),
+            Replies { cancel: true },
+            Redactor::default(),
+        )
+        .with_launcher(launcher.clone());
+        let (_trigger, shutdown) = Shutdown::channel();
+        let job = test_job();
+        let run = runner.run(&job, dir.path(), shutdown);
+        let outcome = tokio::time::timeout(Duration::from_secs(30), run)
+            .await
+            .expect("run bounded");
+        assert_eq!(outcome.ok(), Some(AgentOutcome::Cancelled));
+        let calls = launcher
+            .calls
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone();
+        assert_eq!(calls.first(), Some(&"terminate"));
+        assert!(calls.contains(&"kill"));
+    }
 
     #[test]
     fn the_terminal_state_and_error_pick_the_telemetry_ending() {
