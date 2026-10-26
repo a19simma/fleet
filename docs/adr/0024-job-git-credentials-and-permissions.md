@@ -1,6 +1,6 @@
 # Job git credentials and permission policy
 
-Status: Accepted. The runner, push and pull request step and reporter are built and run by the daemon, with a token host, a hardened mirror and a scoped fetch credential. Amends ADR-0011.
+Status: Accepted. The runner, push and pull request step and reporter are built and run by the daemon, with a token host, a hardened mirror and a scoped fetch credential. Amends ADR-0011. The Known limit paragraph is superseded and the mirror-hardening window is retired by the proposed ADR-0031 (not built).
 
 Pushing a branch and opening a pull request need write access to the repo, and ADR-0011 says fleetd holds no git credential. A headless `claude -p` run stalls on any permission prompt, and the agent can run arbitrary shell.
 
