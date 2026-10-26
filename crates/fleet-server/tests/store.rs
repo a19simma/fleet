@@ -499,26 +499,52 @@ async fn empty_heartbeat_version_keeps_stored_value(pool: PgPool) {
     assert_eq!(fleet(&store).await.unwrap().fleetd_version, "0.2.1");
 }
 
-#[sqlx::test]
-async fn pre_reboot_event_after_new_boot_heartbeat_keeps_boot_id(pool: PgPool) {
-    let store = Store::new(pool);
-    let name = BoxName::new(&box_name()).unwrap();
-    let before_ms = u64::try_from(
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_millis(),
-    )
-    .unwrap();
+async fn db_now_ms(pool: &PgPool) -> Result<u64, String> {
+    let ms: i64 =
+        sqlx::query_scalar("SELECT (extract(epoch FROM clock_timestamp()) * 1000)::bigint")
+            .fetch_one(pool)
+            .await
+            .map_err(|e| e.to_string())?;
+    u64::try_from(ms).map_err(|e| e.to_string())
+}
+
+async fn boot_after_late_pre_reboot_event(
+    pool: PgPool,
+    capture_skew_ms: u64,
+) -> Result<String, String> {
+    let store = Store::new(pool.clone());
+    let name = BoxName::new(&box_name()).map_err(|e| e.to_string())?;
+    let captured_ms = db_now_ms(&pool).await?;
     tokio::time::sleep(std::time::Duration::from_millis(20)).await;
     let fresh = HeartbeatRequest {
         boot_id: "boot-new".into(),
         ..heartbeat()
     };
-    store.heartbeat(&name, &fresh).await.unwrap();
-    let late = at(on_boot(prompt("a", "go"), "boot-old"), before_ms);
-    store.ingest(&[(1, late)]).await.unwrap();
-    assert_eq!(fleet(&store).await.unwrap().boot_id, "boot-new");
+    store
+        .heartbeat(&name, &fresh)
+        .await
+        .map_err(|e| e.to_string())?;
+    let late = at(
+        on_boot(prompt("a", "go"), "boot-old"),
+        captured_ms + capture_skew_ms,
+    );
+    store
+        .ingest(&[(1, late)])
+        .await
+        .map_err(|e| e.to_string())?;
+    Ok(fleet(&store).await?.boot_id)
+}
+
+#[sqlx::test]
+async fn pre_reboot_event_after_new_boot_heartbeat_keeps_boot_id(pool: PgPool) {
+    let boot = boot_after_late_pre_reboot_event(pool, 0).await.unwrap();
+    assert_eq!(boot, "boot-new");
+}
+
+#[sqlx::test]
+async fn pre_reboot_event_stamped_ahead_of_database_clock_replaces_boot_id(pool: PgPool) {
+    let boot = boot_after_late_pre_reboot_event(pool, 5_000).await.unwrap();
+    assert_eq!(boot, "boot-old");
 }
 
 fn heartbeat() -> HeartbeatRequest {
