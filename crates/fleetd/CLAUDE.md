@@ -38,3 +38,8 @@
 
 - **`Config::resolve` sits at the clippy `too_many_lines` cap.** Put a new key's env, file and validation logic in a helper fn and call it once, or clippy fails the build.
 - **Binding a `tokio::net::UnixListener` needs a runtime.** A plain `#[test]` that calls `bind_socket` or `bind_hook_socket` panics with "no reactor running"; use `#[tokio::test]`.
+
+## Named pipes and modes
+
+- **No `mknodat` on macOS, no `unsafe` allowed.** `jobenv::create_stdout_fifo` runs the `mkfifo` program. A nonblocking FIFO reader reads 0 until a writer opens, then `WouldBlock`, so a test opens the writer before it asserts idle.
+- **Mode asserts need the umask in mind.** `create_dir_all` and git leave 0755 dirs, so assert group-write and setgid bits (`& 0o2020`), not group-read.

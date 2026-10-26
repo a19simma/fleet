@@ -242,6 +242,7 @@ pub struct Workspace {
     credential: Option<Credential>,
     before_fetch: Option<BeforeFetch>,
     redactor: Redactor,
+    job_gid: Option<u32>,
 }
 
 impl Workspace {
@@ -257,7 +258,17 @@ impl Workspace {
             credential: None,
             before_fetch: None,
             redactor: Redactor::default(),
+            job_gid: None,
         }
+    }
+
+    /// Makes the cache dir and each job worktree group-writable for `gid` (2770). `None`, the
+    /// default, leaves the modes git and `create_dir_all` set. `.git-home` and
+    /// `.finish-<id>` stay private either way.
+    #[must_use]
+    pub fn with_job_group(mut self, gid: Option<u32>) -> Self {
+        self.job_gid = gid;
+        self
     }
 
     /// Scrubs `redactor`'s secrets from the git stderr kept in [`WorkspaceError::Git`].
@@ -329,6 +340,9 @@ impl Workspace {
         tokio::fs::create_dir_all(&cache)
             .await
             .map_err(WorkspaceError::Io)?;
+        if let Some(gid) = self.job_gid {
+            crate::jobenv::share_dir(&cache, gid).map_err(WorkspaceError::Io)?;
+        }
         let mirror = self.mirror_path(repo);
         self.sync_mirror(&mirror, repo).await?;
 
@@ -355,6 +369,13 @@ impl Workspace {
             "worktree add",
         )
         .await?;
+        if let Some(gid) = self.job_gid {
+            let shared = path.clone();
+            tokio::task::spawn_blocking(move || crate::jobenv::share_tree(&shared, gid))
+                .await
+                .map_err(|_| WorkspaceError::Io(std::io::Error::other("share task failed")))?
+                .map_err(WorkspaceError::Io)?;
+        }
         Ok(Checkout { path, branch })
     }
 }

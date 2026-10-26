@@ -15,6 +15,7 @@ use tonic::transport::Channel;
 use crate::Error;
 use crate::agent_config::Bundle;
 use crate::config::Config;
+use crate::jobenv::group_id;
 use crate::poller::{
     GrpcReporter, JobRunner, PollRandom, Poller, RunError, SERVER_URL_ENV, Shutdown, TOKEN_ENV,
     Token, channel,
@@ -102,6 +103,19 @@ impl<R: Reporter + 'static> JobRunner for DaemonRunner<R> {
     }
 }
 
+fn job_gid(config: &Config) -> Result<Option<u32>, Error> {
+    let Some(spec) = config.job_group.as_deref() else {
+        return Ok(None);
+    };
+    let groups = std::fs::read_to_string("/etc/group").unwrap_or_default();
+    group_id(spec, &groups)
+        .map(Some)
+        .ok_or(Error::InvalidValue {
+            name: "job_group",
+            value: spec.to_owned(),
+        })
+}
+
 fn job_workspace(
     config: &Config,
     run: &mut RunConfig,
@@ -113,7 +127,9 @@ fn job_workspace(
         policy = policy.with_file_repos();
     }
     run.repo_policy = policy.clone();
-    let mut workspace = Workspace::new(PathBuf::from(&config.jobs_dir)).with_policy(policy);
+    let mut workspace = Workspace::new(PathBuf::from(&config.jobs_dir))
+        .with_policy(policy)
+        .with_job_group(run.job_gid);
     if let Some(token) = env("GH_TOKEN") {
         workspace = workspace.with_credential(run.askpass_bin.clone(), token);
     }
@@ -147,6 +163,7 @@ pub(crate) fn build(
     let mut run = RunConfig::new(&config.claude_bin, config.disposable);
     run.gh_bin.clone_from(&config.gh_bin);
     run.jobs_dir = Some(config.jobs_dir.clone());
+    run.job_gid = job_gid(config)?;
     run.max_turns = config.max_turns;
     run.max_budget_usd = config.max_budget_usd;
     run.env_passthrough

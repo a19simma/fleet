@@ -282,6 +282,8 @@ pub struct RunConfig {
     pub bundle: Bundle,
     /// Directory that holds `.agent/<job id>`, the parent of the worktree when absent.
     pub jobs_dir: Option<PathBuf>,
+    /// Group that owns the per-job agent directory, group-writable. Unset keeps the 0700 modes.
+    pub job_gid: Option<u32>,
 }
 
 impl RunConfig {
@@ -307,6 +309,7 @@ impl RunConfig {
             env_passthrough: Vec::new(),
             bundle: Bundle::default(),
             jobs_dir: None,
+            job_gid: None,
         }
     }
 }
@@ -377,9 +380,35 @@ impl ChildWait for Child {
     }
 }
 
+/// The value of a [`VersionStamp`] field that is not known.
+pub const UNKNOWN_STAMP: &str = "unknown";
+
+/// What produced a job: the config bundle, the `claude` build and the model.
+///
+/// A field that is not known holds [`UNKNOWN_STAMP`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VersionStamp {
+    /// Hex SHA-256 of the agent config bundle, see [`Bundle::sha256`].
+    pub bundle_sha: String,
+    /// The `claude` version string.
+    pub claude_version: String,
+    /// The model name.
+    pub model: String,
+}
+
+impl Default for VersionStamp {
+    fn default() -> Self {
+        Self {
+            bundle_sha: UNKNOWN_STAMP.to_owned(),
+            claude_version: UNKNOWN_STAMP.to_owned(),
+            model: UNKNOWN_STAMP.to_owned(),
+        }
+    }
+}
+
 /// Everything a launcher needs to start the agent: the command line, the full environment
 /// block and the working directory.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct AgentSpec {
     /// The program followed by its arguments.
     pub argv: Vec<OsString>,
@@ -387,6 +416,8 @@ pub struct AgentSpec {
     pub env: BTreeMap<OsString, OsString>,
     /// The agent's working directory.
     pub cwd: PathBuf,
+    /// The version stamp every job carries.
+    pub stamp: VersionStamp,
 }
 
 /// A running agent process behind a [`Launcher`].
@@ -705,7 +736,12 @@ impl<R: Reporter> AgentRunner<R> {
             .as_deref()
             .or_else(|| cwd.parent())
             .unwrap_or(cwd);
-        let job_dir = match JobDir::create(root, &job.job_id, &self.config.bundle) {
+        let job_dir = match JobDir::create_shared(
+            root,
+            &job.job_id,
+            &self.config.bundle,
+            self.config.job_gid,
+        ) {
             Ok(dir) => dir,
             Err(err) => {
                 tracing::warn!(kind = ?err.kind(), "agent config dir could not be created");
@@ -1353,6 +1389,10 @@ impl<R: Reporter> AgentRunner<R> {
             argv,
             env,
             cwd: cwd.to_path_buf(),
+            stamp: VersionStamp {
+                bundle_sha: self.config.bundle.sha256(),
+                ..VersionStamp::default()
+            },
         }
     }
 }
@@ -1933,7 +1973,7 @@ mod tests {
     use super::{
         AgentOutcome, AgentProc, AgentRunner, AgentSpec, DirectLauncher, ERR_EXIT,
         ERR_FINISH_TIMEOUT, ERR_TIMEOUT, Ending, Job, JobState, Launched, Launcher, LineReader,
-        Reporter, RunConfig, STRIPPED_ENV, ending,
+        Reporter, RunConfig, STRIPPED_ENV, UNKNOWN_STAMP, VersionStamp, ending,
     };
     use crate::poller::Shutdown;
     use fleet_core::Redactor;
@@ -2106,6 +2146,25 @@ mod tests {
     }
 
     #[test]
+    fn every_agent_spec_carries_a_stamp_with_unknown_defaults() {
+        let runner = AgentRunner::new(
+            test_config(Path::new("/jobs")),
+            Replies { cancel: false },
+            Redactor::default(),
+        );
+        let spec = runner.agent_spec(&test_job(), Path::new("/w"), Path::new("/h"));
+        assert_eq!(spec.stamp.bundle_sha, runner.config.bundle.sha256());
+        assert_eq!(spec.stamp.bundle_sha.len(), 64);
+        assert_eq!(spec.stamp.claude_version, UNKNOWN_STAMP);
+        assert_eq!(spec.stamp.model, UNKNOWN_STAMP);
+        let blank = VersionStamp::default();
+        assert_eq!(
+            [&blank.bundle_sha, &blank.claude_version, &blank.model],
+            ["unknown"; 3]
+        );
+    }
+
+    #[test]
     fn agent_spec_skips_permissions_only_on_a_disposable_box() {
         let mut config = test_config(Path::new("/jobs"));
         config.disposable = true;
@@ -2124,6 +2183,7 @@ mod tests {
             argv: Vec::new(),
             env: std::collections::BTreeMap::new(),
             cwd: "/".into(),
+            stamp: VersionStamp::default(),
         };
         let err = DirectLauncher.launch(spec).err().map(|err| err.kind());
         assert_eq!(err, Some(io::ErrorKind::InvalidInput));

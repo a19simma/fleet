@@ -23,6 +23,7 @@ mod group;
 pub mod heartbeat;
 mod hook;
 pub mod http1;
+pub mod jobenv;
 mod jobs;
 pub mod poller;
 mod proc;

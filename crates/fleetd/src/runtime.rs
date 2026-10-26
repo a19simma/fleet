@@ -20,6 +20,7 @@ use crate::config::Config;
 use crate::events::Limits;
 use crate::heartbeat::Heartbeat;
 use crate::http1::{Failure, roundtrip};
+use crate::jobenv::group_id;
 use crate::jobs::{self, JobPoller};
 use crate::store::Store;
 use crate::system::read_identity;
@@ -124,17 +125,6 @@ fn bind_with(path: &Path, mode: u32, gid: Option<u32>) -> Result<UnixListener, E
     }
     std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode)).map_err(io)?;
     Ok(listener)
-}
-
-fn group_id(spec: &str, groups: &str) -> Option<u32> {
-    spec.parse().ok().or_else(|| {
-        groups.lines().find_map(|line| {
-            let mut fields = line.split(':');
-            (fields.next() == Some(spec))
-                .then(|| fields.nth(1)?.parse().ok())
-                .flatten()
-        })
-    })
 }
 
 fn hook_group(config: &Config) -> Result<Option<u32>, Error> {

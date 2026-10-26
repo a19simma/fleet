@@ -19,7 +19,9 @@ use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
 use std::path::{Component, Path, PathBuf};
 
 use serde_json::Value;
+use sha2::{Digest, Sha256};
 
+use crate::jobenv::{share_dir, share_tree};
 use crate::workspace::validate_job_id;
 
 /// Git author and committer name of a job.
@@ -94,6 +96,19 @@ impl Default for Bundle {
 }
 
 impl Bundle {
+    /// Hex SHA-256 over every file path and body, in path order.
+    #[must_use]
+    pub fn sha256(&self) -> String {
+        let mut hash = Sha256::new();
+        for (path, data) in &self.files {
+            hash.update(path.as_os_str().as_encoded_bytes());
+            hash.update([0]);
+            hash.update(data.len().to_be_bytes());
+            hash.update(data);
+        }
+        format!("{:x}", hash.finalize())
+    }
+
     /// Copies and checks the directory at `dir` over the embedded defaults.
     ///
     /// # Errors
@@ -197,6 +212,23 @@ impl JobDir {
     ///
     /// Returns the I/O error when the id is invalid or a file cannot be written.
     pub fn create(root: &Path, job_id: &str, bundle: &Bundle) -> io::Result<Self> {
+        Self::create_shared(root, job_id, bundle, None)
+    }
+
+    /// Like [`JobDir::create`]. With a `group`, `.agent` and the job directory become
+    /// group-writable for it (2770, files 0660 or 0770) before the rename. `None` leaves the
+    /// modes as [`JobDir::create`] sets them.
+    ///
+    /// # Errors
+    ///
+    /// Returns the I/O error when the id is invalid, a file cannot be written or the group
+    /// cannot be applied.
+    pub fn create_shared(
+        root: &Path,
+        job_id: &str,
+        bundle: &Bundle,
+        group: Option<u32>,
+    ) -> io::Result<Self> {
         validate_job_id(job_id).map_err(|_| io::Error::from(io::ErrorKind::InvalidInput))?;
         let parent = root.join(AGENT_DIR);
         let path = parent.join(job_id);
@@ -207,7 +239,13 @@ impl JobDir {
             .create(&parent)?;
         remove_if_present(&staging)?;
         remove_if_present(&path)?;
-        let built = Self::fill(&staging, bundle).and_then(|()| fs::rename(&staging, &path));
+        let built = Self::fill(&staging, bundle)
+            .and_then(|()| {
+                group.map_or(Ok(()), |gid| {
+                    share_dir(&parent, gid).and_then(|()| share_tree(&staging, gid))
+                })
+            })
+            .and_then(|()| fs::rename(&staging, &path));
         if let Err(err) = built {
             let _ = fs::remove_dir_all(&staging);
             return Err(err);
@@ -326,5 +364,55 @@ mod default_bundle_tests {
         for pattern in DENIED_TOOLS {
             assert!(deny.iter().any(|d| d == pattern), "bundle lacks {pattern}");
         }
+    }
+}
+
+#[cfg(test)]
+mod shared_mode_tests {
+    use super::{Bundle, JobDir};
+    use std::os::unix::fs::MetadataExt;
+
+    type TestResult = Result<(), Box<dyn std::error::Error>>;
+
+    fn modes(job: &JobDir) -> Result<[u32; 3], std::io::Error> {
+        let mode = |p: &std::path::Path| std::fs::metadata(p).map(|m| m.mode() & 0o7777);
+        let claude = job.home().join(".claude");
+        Ok([
+            mode(job.path())?,
+            mode(&claude)?,
+            mode(job.path().parent().ok_or(std::io::ErrorKind::NotFound)?)?,
+        ])
+    }
+
+    #[test]
+    fn without_a_group_the_modes_stay_private() -> TestResult {
+        let root = tempfile::tempdir()?;
+        let job = JobDir::create_shared(root.path(), "j1", &Bundle::default(), None)?;
+        assert_eq!(modes(&job)?, [0o700, 0o700, 0o700]);
+        let settings = job.home().join(".claude/settings.json");
+        assert_eq!(std::fs::metadata(settings)?.mode() & 0o7777, 0o600);
+        Ok(())
+    }
+
+    #[test]
+    fn with_a_group_the_job_dirs_are_group_writable() -> TestResult {
+        let root = tempfile::tempdir()?;
+        let gid = std::fs::metadata(root.path())?.gid();
+        let job = JobDir::create_shared(root.path(), "j1", &Bundle::default(), Some(gid))?;
+        assert_eq!(modes(&job)?, [0o2770, 0o2770, 0o2770]);
+        let settings = job.home().join(".claude/settings.json");
+        let meta = std::fs::metadata(settings)?;
+        assert_eq!((meta.mode() & 0o7777, meta.gid()), (0o660, gid));
+        Ok(())
+    }
+
+    #[test]
+    fn the_bundle_sha_is_stable_and_follows_the_content() {
+        let bundle = Bundle::default();
+        assert_eq!(bundle.sha256(), Bundle::default().sha256());
+        assert_eq!(bundle.sha256().len(), 64);
+        let mut other = bundle.clone();
+        other.files.insert("extra".into(), b"x".to_vec());
+        assert_ne!(bundle.sha256(), other.sha256());
     }
 }

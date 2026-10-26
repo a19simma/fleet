@@ -113,6 +113,32 @@ async fn a_job_id_of_the_longest_accepted_length_prepares() -> TestResult {
     .await
 }
 
+#[tokio::test]
+async fn a_job_group_shares_the_cache_and_worktree_and_unset_does_not() -> TestResult {
+    use std::os::unix::fs::MetadataExt;
+    common::bounded(Box::pin(async {
+        let dir = TempDir::new()?;
+        let repo = fixture(dir.path())?;
+        let gid = std::fs::metadata(dir.path())?.gid();
+        let mode = |p: &Path| std::fs::metadata(p).map(|m| m.mode() & 0o7777);
+        let plain = dir.path().join("plain");
+        let checkout = workspace(&plain).prepare("j1", &repo, "main").await?;
+        assert_eq!(mode(&plain.join(".cache"))? & 0o2020, 0);
+        assert_eq!(mode(&checkout.path)? & 0o2020, 0);
+        let shared = dir.path().join("shared");
+        let checkout = workspace(&shared)
+            .with_job_group(Some(gid))
+            .prepare("j1", &repo, "main")
+            .await?;
+        assert_eq!(mode(&shared.join(".cache"))?, 0o2770);
+        assert_eq!(mode(&checkout.path)?, 0o2770);
+        assert_eq!(mode(&checkout.path.join("a.txt"))? & 0o070, 0o060);
+        assert_eq!(mode(&shared.join(".git-home"))? & 0o2020, 0);
+        Ok(())
+    }))
+    .await
+}
+
 fn only_mirror(root: &Path) -> Result<PathBuf, Box<dyn std::error::Error>> {
     Ok(std::fs::read_dir(root.join(".cache"))?
         .next()

@@ -55,6 +55,7 @@ struct FileConfig {
     hook_socket: Option<PathBuf>,
     hook_socket_uid: Option<u32>,
     hook_socket_group: Option<String>,
+    job_group: Option<String>,
 }
 
 /// Where redaction secrets are read from.
@@ -130,6 +131,9 @@ pub struct Config {
     /// `hook_socket`. Unset leaves the group the process default. Env
     /// `FLEETD_HOOK_SOCKET_GROUP`.
     pub hook_socket_group: Option<String>,
+    /// Group the per-job directories are shared with, a numeric gid or a name from
+    /// `/etc/group`. Unset keeps today's modes and sets no group. Env `FLEETD_JOB_GROUP`.
+    pub job_group: Option<String>,
 }
 
 impl Config {
@@ -220,7 +224,6 @@ impl Config {
         let repo_hosts = resolve_repo_hosts(file.repo_hosts)?;
         let token_host = resolve_token_host(file.token_host, &repo_hosts)?;
         let agent_env_passthrough = resolve_passthrough(file.agent_env_passthrough)?;
-        let max_turns = resolve_max_turns(file.max_turns)?;
         let max_budget_usd = resolve_max_budget(file.max_budget_usd)?;
         let (hook_socket, hook_socket_uid, hook_socket_group) = resolve_hook_socket(
             &env,
@@ -260,13 +263,34 @@ impl Config {
             token_host,
             agent_config_dir: file.agent_config_dir,
             agent_env_passthrough,
-            max_turns,
+            max_turns: resolve_max_turns(file.max_turns)?,
             max_budget_usd,
             allow_file_repos: false,
             hook_socket,
             hook_socket_uid,
             hook_socket_group,
+            job_group: resolve_job_group(&env, file.job_group)?,
         })
+    }
+}
+
+fn group_name_ok(name: &str) -> bool {
+    !name.is_empty()
+        && name
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-' | b'.'))
+}
+
+fn resolve_job_group(
+    env: &dyn Fn(&str) -> Option<String>,
+    file: Option<String>,
+) -> Result<Option<String>, Error> {
+    match env("FLEETD_JOB_GROUP").or(file) {
+        Some(group) if !group_name_ok(&group) => Err(Error::InvalidValue {
+            name: "job_group",
+            value: group,
+        }),
+        group => Ok(group),
     }
 }
 
@@ -323,14 +347,8 @@ fn check_hook_socket(
     {
         return Err(invalid("hook_socket", socket.display().to_string()));
     }
-    let name_ok = |name: &str| {
-        !name.is_empty()
-            && name
-                .bytes()
-                .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-' | b'.'))
-    };
     match group {
-        Some(group) if socket.is_none() || !name_ok(group) => {
+        Some(group) if socket.is_none() || !group_name_ok(group) => {
             Err(invalid("hook_socket_group", group.to_owned()))
         }
         _ => Ok(()),
@@ -511,6 +529,29 @@ mod tests {
         assert!(cfg.hook_events.iter().any(|e| e == "PostToolUse"));
         assert!(cfg.hook_events.iter().any(|e| e == "PostToolUseFailure"));
         assert!(!cfg.secrets_file.required);
+    }
+
+    #[test]
+    fn job_group_defaults_to_unset_and_reads_file_then_env() {
+        let cfg = Config::resolve(None, &env_of(&[])).unwrap();
+        assert_eq!(cfg.job_group, None);
+        let file = "job_group = \"fleet-work\"\n";
+        let cfg = Config::resolve(Some(file), &env_of(&[])).unwrap();
+        assert_eq!(cfg.job_group.as_deref(), Some("fleet-work"));
+        let cfg = Config::resolve(Some(file), &env_of(&[("FLEETD_JOB_GROUP", "996")])).unwrap();
+        assert_eq!(cfg.job_group.as_deref(), Some("996"));
+    }
+
+    #[test]
+    fn a_bad_job_group_is_rejected_by_name() {
+        for bad in ["", "a b", "a:b", "x/y"] {
+            let file = format!("job_group = {bad:?}");
+            let name = match Config::resolve(Some(&file), &env_of(&[])) {
+                Err(Error::InvalidValue { name, .. }) => name,
+                other => panic!("{other:?}"),
+            };
+            assert_eq!(name, "job_group", "{bad:?}");
+        }
     }
 
     #[test]
