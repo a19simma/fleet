@@ -434,6 +434,12 @@ pub trait AgentProc: Send {
 
     /// Ends the agent and its descendants at once. Safe to call more than once.
     fn kill(&mut self);
+
+    /// Whether the process ended by a signal after the run deadline the launcher was given.
+    /// A launcher whose sandbox enforces its own timeout reports it here; the default is no.
+    fn timed_out(&self) -> bool {
+        false
+    }
 }
 
 /// A started agent: its stdout and the handle that ends it.
@@ -783,6 +789,7 @@ impl<R: Reporter> AgentRunner<R> {
                 match status.code() {
                     Some(0) => Ok(AgentOutcome::Succeeded),
                     Some(code) => Ok(stream.fail(Some(code), ERR_EXIT).await),
+                    None if proc.timed_out() => Ok(stream.fail(None, ERR_TIMEOUT).await),
                     None => Ok(stream.fail(None, ERR_SIGNAL).await),
                 }
             }
@@ -1976,8 +1983,8 @@ fn cut(text: &mut String, max: usize) -> bool {
 mod tests {
     use super::{
         AgentOutcome, AgentProc, AgentRunner, AgentSpec, DirectLauncher, ERR_EXIT,
-        ERR_FINISH_TIMEOUT, ERR_TIMEOUT, Ending, Job, JobState, Launched, Launcher, LineReader,
-        Reporter, RunConfig, STRIPPED_ENV, UNKNOWN_STAMP, VersionStamp, ending,
+        ERR_FINISH_TIMEOUT, ERR_SIGNAL, ERR_TIMEOUT, Ending, Job, JobState, Launched, Launcher,
+        LineReader, Reporter, RunConfig, STRIPPED_ENV, UNKNOWN_STAMP, VersionStamp, ending,
     };
     use crate::poller::Shutdown;
     use fleet_core::Redactor;
@@ -2018,9 +2025,14 @@ mod tests {
         hold: bool,
         stopped: Arc<AtomicBool>,
         calls: Arc<Mutex<Vec<&'static str>>>,
+        timed_out: bool,
     }
 
     impl AgentProc for FakeProc {
+        fn timed_out(&self) -> bool {
+            self.timed_out
+        }
+
         fn wait(&mut self) -> Pin<Box<dyn Future<Output = io::Result<ExitStatus>> + Send + '_>> {
             Box::pin(async move {
                 while self.hold && !self.stopped.load(Ordering::SeqCst) {
@@ -2052,6 +2064,7 @@ mod tests {
         hold: bool,
         specs: Arc<Mutex<Vec<AgentSpec>>>,
         calls: Arc<Mutex<Vec<&'static str>>>,
+        timed_out: bool,
     }
 
     impl FakeLauncher {
@@ -2061,6 +2074,7 @@ mod tests {
                 hold,
                 specs: Arc::default(),
                 calls: Arc::default(),
+                timed_out: false,
             }
         }
     }
@@ -2078,6 +2092,7 @@ mod tests {
                     hold: self.hold,
                     stopped: Arc::default(),
                     calls: Arc::clone(&self.calls),
+                    timed_out: self.timed_out,
                 }),
             })
         }
@@ -2224,6 +2239,30 @@ mod tests {
                 .unwrap_or_else(PoisonError::into_inner);
             let home = dir.path().join(".agent").join("job1").join("home");
             assert_eq!(*specs, vec![runner.agent_spec(&job, dir.path(), &home)]);
+        }
+    }
+
+    #[tokio::test]
+    async fn a_signal_end_past_the_launcher_deadline_reports_timed_out() {
+        for (timed_out, expected) in [(true, ERR_TIMEOUT), (false, ERR_SIGNAL)] {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let mut launcher = FakeLauncher::new(ExitStatus::from_raw(9), false);
+            launcher.timed_out = timed_out;
+            let runner = AgentRunner::new(
+                test_config(dir.path()),
+                Replies { cancel: false },
+                Redactor::default(),
+            )
+            .with_launcher(Arc::new(launcher));
+            let (_trigger, shutdown) = Shutdown::channel();
+            let outcome = runner.run(&test_job(), dir.path(), shutdown).await;
+            assert_eq!(
+                outcome.ok(),
+                Some(AgentOutcome::Failed {
+                    exit_code: None,
+                    error: expected,
+                })
+            );
         }
     }
 

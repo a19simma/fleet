@@ -26,7 +26,7 @@ use tokio::task::JoinHandle;
 use crate::agent_exec::{SPEC_FILE, write_spec};
 use crate::config::{AgentLauncher, Config};
 use crate::jobenv::{create_stdout_fifo, open_fifo_reader, render_env_file, write_env_file};
-use crate::runner::{AgentProc, AgentSpec, DirectLauncher, Launched, Launcher};
+use crate::runner::{AgentProc, AgentSpec, DEFAULT_TIMEOUT, DirectLauncher, Launched, Launcher};
 use crate::workspace::validate_job_id;
 
 /// Default parent of the per-job run directories.
@@ -52,9 +52,11 @@ const MAX_SIGNAL: i32 = 64;
 pub fn select_launcher(config: &Config, job_gid: Option<u32>) -> Arc<dyn Launcher> {
     match config.agent_launcher {
         AgentLauncher::Direct => Arc::new(DirectLauncher),
-        AgentLauncher::Systemd => {
-            Arc::new(SystemdLauncher::new(&config.systemctl_path).with_job_gid(job_gid))
-        }
+        AgentLauncher::Systemd => Arc::new(
+            SystemdLauncher::new(&config.systemctl_path)
+                .with_job_gid(job_gid)
+                .with_run_timeout(DEFAULT_TIMEOUT),
+        ),
     }
 }
 
@@ -76,6 +78,7 @@ pub struct SystemdLauncher {
     run_dir: PathBuf,
     poll: Duration,
     start_deadline: Duration,
+    run_timeout: Option<Duration>,
     gid: Option<u32>,
 }
 
@@ -89,6 +92,7 @@ impl SystemdLauncher {
             run_dir: PathBuf::from(DEFAULT_RUN_DIR),
             poll: DEFAULT_POLL,
             start_deadline: DEFAULT_START_DEADLINE,
+            run_timeout: None,
             gid: None,
         }
     }
@@ -111,6 +115,14 @@ impl SystemdLauncher {
     #[must_use]
     pub fn with_start_deadline(mut self, deadline: Duration) -> Self {
         self.start_deadline = deadline;
+        self
+    }
+
+    /// Sets the run deadline. A unit that ends by a signal after it has passed reads as
+    /// timed out through [`AgentProc::timed_out`], as the unit's own timeout does.
+    #[must_use]
+    pub fn with_run_timeout(mut self, timeout: Duration) -> Self {
+        self.run_timeout = Some(timeout);
         self
     }
 
@@ -309,6 +321,7 @@ impl Launcher for SystemdLauncher {
                 unit,
                 poll: self.poll,
                 start_deadline: self.start_deadline,
+                run_timeout: self.run_timeout,
                 launched: Instant::now(),
                 keepalive: Some(keepalive),
                 shared: Arc::new(Shared::default()),
@@ -326,6 +339,7 @@ type Outcome = Result<ExitStatus, io::ErrorKind>;
 struct Shared {
     sent: AtomicI32,
     cleaned: AtomicBool,
+    timed_out: AtomicBool,
 }
 
 struct SystemdProc {
@@ -333,6 +347,7 @@ struct SystemdProc {
     unit: String,
     poll: Duration,
     start_deadline: Duration,
+    run_timeout: Option<Duration>,
     launched: Instant,
     keepalive: Option<fs::File>,
     shared: Arc<Shared>,
@@ -346,6 +361,7 @@ struct Poller {
     unit: String,
     poll: Duration,
     deadline: Instant,
+    run_deadline: Option<Instant>,
     shared: Arc<Shared>,
 }
 
@@ -362,7 +378,13 @@ impl Poller {
                     break Err(io::ErrorKind::TimedOut);
                 }
                 Ok(Show::Running | Show::Idle) => tokio::time::sleep(self.poll).await,
-                Ok(Show::Ended(status)) => break Ok(status),
+                Ok(Show::Ended(status)) => {
+                    let late = self.run_deadline.is_some_and(|at| Instant::now() >= at);
+                    self.shared
+                        .timed_out
+                        .store(late && status.signal().is_some(), Ordering::SeqCst);
+                    break Ok(status);
+                }
                 Err(err) => break Err(err.kind()),
             }
         }
@@ -395,6 +417,7 @@ impl SystemdProc {
             unit: self.unit.clone(),
             poll: self.poll,
             deadline: self.launched + self.start_deadline,
+            run_deadline: self.run_timeout.map(|timeout| self.launched + timeout),
             shared: Arc::clone(&self.shared),
         };
         let keepalive = self.keepalive.take();
@@ -437,6 +460,10 @@ impl AgentProc for SystemdProc {
 
     fn kill(&mut self) {
         self.signal("SIGKILL", SIGKILL);
+    }
+
+    fn timed_out(&self) -> bool {
+        self.shared.timed_out.load(Ordering::SeqCst)
     }
 }
 

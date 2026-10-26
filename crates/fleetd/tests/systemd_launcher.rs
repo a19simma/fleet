@@ -521,6 +521,34 @@ async fn a_unit_that_never_runs_fails_at_the_start_deadline() -> TestResult {
 }
 
 #[tokio::test]
+async fn a_kill_after_the_run_deadline_reads_as_timed_out() -> TestResult {
+    let case = Case::new("t_run_deadline")?;
+    case.last(&show_sub("active", "exited", "success", 0, 0))?;
+    let mut launched = case
+        .launcher()
+        .with_run_timeout(Duration::from_millis(50))
+        .launch(case.spec())?;
+    tokio::time::sleep(Duration::from_millis(150)).await;
+    launched.proc.kill();
+    let status = waited(launched.proc.as_mut()).await?;
+    assert_eq!(status.signal(), Some(9));
+    assert!(launched.proc.timed_out());
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_kill_before_the_run_deadline_stays_a_plain_signal() -> TestResult {
+    let case = Case::new("t_before_deadline")?;
+    case.last(&show_sub("active", "exited", "success", 0, 0))?;
+    let mut launched = case.launcher().with_run_timeout(WIDE).launch(case.spec())?;
+    launched.proc.kill();
+    let status = waited(launched.proc.as_mut()).await?;
+    assert_eq!(status.signal(), Some(9));
+    assert!(!launched.proc.timed_out());
+    Ok(())
+}
+
+#[tokio::test]
 async fn a_real_exit_zero_after_a_signal_still_maps_to_exit_zero() -> TestResult {
     let case = Case::new("t_exit_zero_signalled")?;
     case.last(&show("inactive", "success", 1, 0))?;
