@@ -160,7 +160,7 @@ For each job the launcher creates `/run/fleet/<job id>/` (the job id matches `[A
 - `spec.json`, `argv` and `cwd` only, written by the launcher and read by `fleetd agent-exec <job id>` as the job uid. Mode 0640 with the job group. It never holds the environment.
 - `stdout`, a FIFO with mode 0660 and the job group. The unit's `StandardOutput=file:/run/fleet/%i/stdout` writes to it, and fleetd reads it.
 
-The launcher runs `systemctl start --no-block fleet-agent@<job id>.service`, polls `systemctl show`, and removes the run dir and calls `reset-failed` when the unit ends. Cancel is `systemctl kill` and `stop`, which kill the whole cgroup. The unit runs at most `RuntimeMaxSec=2h`.
+The launcher runs `systemctl start --no-block fleet-agent@<job id>.service`, polls `systemctl show`, and when the unit ends (`inactive`, `failed`, or `active (exited)`) calls `stop` and `reset-failed` and removes the run dir. Cancel is `systemctl kill` and `stop`, which kill the whole cgroup. The unit runs at most `RuntimeMaxSec=2h`.
 
 The startup sweep of stale run dirs is not built. After a fleetd crash, remove old directories under `/run/fleet` by hand, or reboot (`/run` is a tmpfs).
 

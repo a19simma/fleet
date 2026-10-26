@@ -31,6 +31,9 @@ st=$root/$id
 mkdir -p "$st"
 echo "$*" >> "$st/log"
 case "$1" in
+  stop)
+    if [ -f "$st/stop.to" ]; then cp "$st/stop.to" "$st/show.last"; rm -f "$st"/show.[0-9]*; fi
+    ;;
   show)
     n=$(cat "$st/n" 2>/dev/null || echo 0)
     n=$((n+1))
@@ -61,7 +64,18 @@ fn root() -> &'static Path {
 }
 
 fn show(state: &str, result: &str, code: u32, status: u32) -> String {
-    format!("ActiveState={state}\nResult={result}\nExecMainCode={code}\nExecMainStatus={status}\n")
+    let sub = match state {
+        "active" => "running",
+        "inactive" => "dead",
+        other => other,
+    };
+    show_sub(state, sub, result, code, status)
+}
+
+fn show_sub(state: &str, sub: &str, result: &str, code: u32, status: u32) -> String {
+    format!(
+        "ActiveState={state}\nSubState={sub}\nResult={result}\nExecMainCode={code}\nExecMainStatus={status}\n"
+    )
 }
 
 struct Case {
@@ -240,7 +254,7 @@ async fn wait_polls_until_the_unit_has_run_and_ended() -> TestResult {
         case.log().get(1).map(String::as_str),
         Some(
             format!(
-                "show {} -p ActiveState -p Result -p ExecMainCode -p ExecMainStatus",
+                "show {} -p ActiveState -p SubState -p Result -p ExecMainCode -p ExecMainStatus",
                 case.unit()
             )
             .as_str()
@@ -251,7 +265,10 @@ async fn wait_polls_until_the_unit_has_run_and_ended() -> TestResult {
 
 #[tokio::test]
 async fn unparsable_show_output_is_an_error_after_cleanup() -> TestResult {
-    let big = format!("ActiveState=inactive\n{}\n", "x".repeat(5000));
+    let big = format!(
+        "ActiveState=inactive\nSubState=dead\n{}\n",
+        "x".repeat(5000)
+    );
     let bad: Vec<(&str, String)> = vec![
         ("t_bad_empty", String::new()),
         ("t_bad_garbage", "garbage\n".to_owned()),
@@ -271,7 +288,7 @@ async fn unparsable_show_output_is_an_error_after_cleanup() -> TestResult {
         ),
         (
             "t_bad_missing",
-            "ActiveState=inactive\nResult=success\n".to_owned(),
+            "ActiveState=inactive\nSubState=dead\nResult=success\n".to_owned(),
         ),
         ("t_bad_big", big),
         ("t_bad_success_status", show("inactive", "success", 1, 3)),
@@ -399,6 +416,65 @@ fn reset_count(case: &Case) -> usize {
         .iter()
         .filter(|l| l.starts_with("reset-failed "))
         .count()
+}
+
+fn tail(case: &Case, n: usize) -> Vec<String> {
+    let log = case.log();
+    log.iter()
+        .skip(log.len().saturating_sub(n))
+        .cloned()
+        .collect()
+}
+
+#[tokio::test]
+async fn an_active_exited_unit_finishes_as_success_after_stop_and_reset_failed() -> TestResult {
+    let case = Case::new("t_remain_ok")?;
+    case.last(&show_sub("active", "exited", "success", 1, 0))?;
+    case.put("stop.to", &show("inactive", "success", 0, 0))?;
+    let mut launched = case.launch()?;
+    let status = tokio::time::timeout(BOUND, launched.proc.wait())
+        .await
+        .map_err(|_| io::Error::from(io::ErrorKind::TimedOut))??;
+    assert_eq!((status.code(), status.signal()), (Some(0), None));
+    let unit = case.unit();
+    assert_eq!(
+        tail(&case, 2),
+        vec![format!("stop {unit}"), format!("reset-failed {unit}")]
+    );
+    assert!(!case.dir().exists());
+    drop(launched);
+    assert_eq!(reset_count(&case), 1);
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_failed_unit_is_stopped_and_reset_after_its_status_is_read() -> TestResult {
+    let case = Case::new("t_remain_fail")?;
+    case.last(&show("failed", "exit-code", 1, 7))?;
+    let mut launched = case.launch()?;
+    let status = tokio::time::timeout(BOUND, launched.proc.wait())
+        .await
+        .map_err(|_| io::Error::from(io::ErrorKind::TimedOut))??;
+    assert_eq!(status.code(), Some(7));
+    let unit = case.unit();
+    assert_eq!(
+        tail(&case, 2),
+        vec![format!("stop {unit}"), format!("reset-failed {unit}")]
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn an_active_running_unit_keeps_waiting() -> TestResult {
+    let case = Case::new("t_remain_running")?;
+    case.last(&show_sub("active", "running", "success", 1, 0))?;
+    let mut launched = case.launch()?;
+    let waiting = tokio::time::timeout(Duration::from_millis(500), launched.proc.wait()).await;
+    assert!(waiting.is_err());
+    assert!(show_count(&case) >= 3);
+    assert!(!case.log().iter().any(|l| l.starts_with("stop ")));
+    assert!(case.dir().exists());
+    Ok(())
 }
 
 #[tokio::test]

@@ -4,6 +4,9 @@
 //! FIFO and `spec.json`, then starts the unit without waiting. The unit is delivered
 //! separately and runs `fleetd agent-exec <id>` as the job uid. Every `systemctl` call uses
 //! the configured absolute path with an argv array and an empty environment.
+//!
+//! The unit sets `RemainAfterExit=yes`, so a clean exit stays `active (exited)`. The launcher
+//! reads that as ended, then runs `stop` and `reset-failed` before it reports the result.
 
 use std::fs;
 use std::io;
@@ -139,6 +142,8 @@ impl Ctl {
             "-p",
             "ActiveState",
             "-p",
+            "SubState",
+            "-p",
             "Result",
             "-p",
             "ExecMainCode",
@@ -153,6 +158,12 @@ impl Ctl {
             return Err(io::Error::from(io::ErrorKind::InvalidData));
         }
         String::from_utf8(out.stdout).map_err(|_| io::Error::from(io::ErrorKind::InvalidData))
+    }
+
+    async fn stop(&self, unit: &str) {
+        let mut command = tokio::process::Command::from(self.command(&["stop", unit]));
+        command.kill_on_drop(true);
+        let _ = tokio::time::timeout(CALL_TIMEOUT, command.status()).await;
     }
 
     async fn reset_failed(&self, unit: &str) {
@@ -284,6 +295,7 @@ impl Poller {
     ) {
         let outcome = self.watch().await;
         drop(keepalive);
+        self.ctl.stop(&self.unit).await;
         self.ctl.reset_failed(&self.unit).await;
         let _ = fs::remove_dir_all(&dir);
         self.shared.cleaned.store(true, Ordering::SeqCst);
@@ -373,11 +385,12 @@ fn bad() -> io::Error {
 }
 
 fn parse_show(text: &str, sent: i32) -> io::Result<Show> {
-    let (mut state, mut result, mut code, mut status) = (None, None, None, None);
+    let (mut state, mut sub, mut result, mut code, mut status) = (None, None, None, None, None);
     for line in text.lines().filter(|line| !line.is_empty()) {
         let (key, value) = line.split_once('=').ok_or_else(bad)?;
         let slot = match key {
             "ActiveState" => &mut state,
+            "SubState" => &mut sub,
             "Result" => &mut result,
             "ExecMainCode" => &mut code,
             "ExecMainStatus" => &mut status,
@@ -387,12 +400,26 @@ fn parse_show(text: &str, sent: i32) -> io::Result<Show> {
             return Err(bad());
         }
     }
-    let (Some(state), Some(result), Some(code), Some(status)) = (state, result, code, status)
+    let (Some(state), Some(sub), Some(result), Some(code), Some(status)) =
+        (state, sub, result, code, status)
     else {
         return Err(bad());
     };
     let code: u32 = code.parse().map_err(|_| bad())?;
     let status: u32 = status.parse().map_err(|_| bad())?;
+    match (state, sub) {
+        ("active", "exited") => ended(result, code, status, sent),
+        _ => running_or_ended(state, result, code, status, sent),
+    }
+}
+
+fn running_or_ended(
+    state: &str,
+    result: &str,
+    code: u32,
+    status: u32,
+    sent: i32,
+) -> io::Result<Show> {
     match state {
         "active" | "reloading" | "refreshing" | "activating" | "deactivating" | "maintenance" => {
             Ok(Show::Running)
