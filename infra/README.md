@@ -22,6 +22,7 @@ The operator owns everything this directory leaves out.
 
 - Namespace `fleet-server` exists, with Pod Security `restricted`, a resource quota and a network policy. The quota requires cpu requests and memory and ephemeral-storage limits on every container, and does not require a cpu limit.
 - Secret `fleet-server-secrets` exists in that namespace with keys `FLEET_DATABASE_URL` and `FLEET_TOKEN`. The key `FLEET_CLIENT_TOKEN` is optional: the Deployment reads it with `optional: true`, and without it the server leaves `FleetQuery` and `FleetJobs` closed (ADR-0023).
+- Optional retention settings, set as plain `env` entries in the Deployment when the defaults do not fit: `FLEET_EVENTS_RETENTION_DAYS` (default 90), `FLEET_SUMMARIES_RETENTION_DAYS` (default 365, not below the events value) and `FLEET_RETENTION_INTERVAL_SECS` (default 3600, minimum 60). The server prunes job events and summaries of finished jobs on that schedule and keeps job rows and transcripts. An invalid value stops startup.
 - A Postgres 17 database and a role for the server exist, and `FLEET_DATABASE_URL` points at them.
 - The route and gateway that expose port 7070 belong to the operator. The route holds a private hostname, so it does not live in this repo.
 

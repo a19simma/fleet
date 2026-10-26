@@ -5,6 +5,7 @@ pub mod config;
 pub mod jobs;
 pub mod projection;
 pub mod reaper;
+pub mod retention;
 pub mod service;
 pub mod stats;
 pub mod store;

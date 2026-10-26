@@ -196,6 +196,22 @@ const REAP_EXPIRED: &str = "\
 UPDATE jobs SET state = 'LOST', finished_at = now(), error = 'lease expired' \
 WHERE state = 'RUNNING' AND lease_expires_at < now()";
 
+const PRUNE_EVENTS: &str = "\
+WITH doomed AS (\
+SELECT e.job_id, e.seq FROM job_event e JOIN jobs j ON j.job_id = e.job_id \
+WHERE j.state IN ('SUCCEEDED', 'FAILED', 'CANCELLED', 'LOST') \
+AND COALESCE(j.finished_at, j.created_at) < now() - make_interval(days => $1) \
+LIMIT $2 FOR UPDATE OF e SKIP LOCKED) \
+DELETE FROM job_event d USING doomed WHERE d.job_id = doomed.job_id AND d.seq = doomed.seq";
+
+const PRUNE_SUMMARIES: &str = "\
+WITH doomed AS (\
+SELECT s.job_id FROM job_summary s JOIN jobs j ON j.job_id = s.job_id \
+WHERE j.state IN ('SUCCEEDED', 'FAILED', 'CANCELLED', 'LOST') \
+AND COALESCE(j.finished_at, j.created_at) < now() - make_interval(days => $1) \
+LIMIT $2 FOR UPDATE OF s SKIP LOCKED) \
+DELETE FROM job_summary d USING doomed WHERE d.job_id = doomed.job_id";
+
 const TRANSCRIPT_STATE: &str = "\
 SELECT count(*), COALESCE(bool_or(truncated), false) FROM job_transcript WHERE job_id = $1";
 
@@ -1047,6 +1063,38 @@ impl Store {
     /// Returns [`StoreError::Database`] when the statement fails.
     pub async fn reap_expired(&self) -> Result<u64, StoreError> {
         let done = sqlx::query(REAP_EXPIRED).execute(&self.pool).await?;
+        Ok(done.rows_affected())
+    }
+
+    /// Deletes up to `limit` event rows of terminal jobs finished more than `days` days ago.
+    ///
+    /// The cutoff is `now()` in the database minus `days`, measured from `finished_at` and
+    /// from `created_at` when that is null. Rows another transaction holds are skipped.
+    /// Jobs in `QUEUED` or `RUNNING` are never touched. Returns the rows deleted.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StoreError::Database`] when the statement fails.
+    pub async fn prune_events(&self, days: i32, limit: i64) -> Result<u64, StoreError> {
+        let done = sqlx::query(PRUNE_EVENTS)
+            .bind(days)
+            .bind(limit)
+            .execute(&self.pool)
+            .await?;
+        Ok(done.rows_affected())
+    }
+
+    /// Deletes up to `limit` summary rows by the same rule as [`Store::prune_events`].
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StoreError::Database`] when the statement fails.
+    pub async fn prune_summaries(&self, days: i32, limit: i64) -> Result<u64, StoreError> {
+        let done = sqlx::query(PRUNE_SUMMARIES)
+            .bind(days)
+            .bind(limit)
+            .execute(&self.pool)
+            .await?;
         Ok(done.rows_affected())
     }
 

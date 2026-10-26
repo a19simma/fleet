@@ -2,6 +2,12 @@
 
 use std::fmt;
 use std::net::SocketAddr;
+use std::time::Duration;
+
+use crate::retention::{
+    DEFAULT_EVENTS_DAYS, DEFAULT_INTERVAL, DEFAULT_SUMMARIES_DAYS, MIN_INTERVAL, Policy,
+    PolicyError,
+};
 
 const DEFAULT_LISTEN: &str = "127.0.0.1:7070";
 const DEFAULT_HEALTH_LISTEN: &str = "0.0.0.0:7072";
@@ -118,6 +124,11 @@ pub struct Config {
     /// Client bearer token: `FleetQuery` and `FleetJobs`. `None` when
     /// `FLEET_CLIENT_TOKEN` is unset or empty; that closes `FleetQuery` and `FleetJobs`.
     pub client_token: Option<Token>,
+    /// How long telemetry rows are kept, from `FLEET_EVENTS_RETENTION_DAYS` and
+    /// `FLEET_SUMMARIES_RETENTION_DAYS`.
+    pub retention: Policy,
+    /// Pause between retention sweeps, from `FLEET_RETENTION_INTERVAL_SECS`.
+    pub retention_interval: Duration,
 }
 
 /// Lists the listeners bound to a non-loopback address, as `(variable, address)`.
@@ -148,14 +159,68 @@ fn address(
         })
 }
 
+fn whole(
+    lookup: &impl Fn(&str) -> Option<String>,
+    var: &'static str,
+    default: u64,
+) -> Result<u64, ConfigError> {
+    let Some(raw) = lookup(var).filter(|v| !v.is_empty()) else {
+        return Ok(default);
+    };
+    raw.parse().map_err(|_| ConfigError::Invalid {
+        var,
+        reason: "must be a whole number".to_owned(),
+    })
+}
+
+fn number(
+    lookup: &impl Fn(&str) -> Option<String>,
+    var: &'static str,
+    default: u64,
+    range: std::ops::RangeInclusive<u64>,
+) -> Result<u64, ConfigError> {
+    let value = whole(lookup, var, default)?;
+    if range.contains(&value) {
+        Ok(value)
+    } else {
+        Err(ConfigError::Invalid {
+            var,
+            reason: format!("must be between {} and {}", range.start(), range.end()),
+        })
+    }
+}
+
+fn retention(lookup: &impl Fn(&str) -> Option<String>) -> Result<Policy, ConfigError> {
+    let events = whole(
+        lookup,
+        "FLEET_EVENTS_RETENTION_DAYS",
+        u64::from(DEFAULT_EVENTS_DAYS),
+    )?;
+    let summaries = whole(
+        lookup,
+        "FLEET_SUMMARIES_RETENTION_DAYS",
+        u64::from(DEFAULT_SUMMARIES_DAYS),
+    )?;
+    let narrow = |value: u64| u32::try_from(value).unwrap_or(u32::MAX);
+    Policy::new(narrow(events), narrow(summaries)).map_err(|err| ConfigError::Invalid {
+        var: match err {
+            PolicyError::EventsDaysOutOfRange => "FLEET_EVENTS_RETENTION_DAYS",
+            _ => "FLEET_SUMMARIES_RETENTION_DAYS",
+        },
+        reason: err.to_string(),
+    })
+}
+
 impl Config {
     /// Reads the settings from the process environment.
     ///
     /// # Errors
     ///
     /// Returns [`ConfigError`] when `FLEET_DATABASE_URL` or `FLEET_TOKEN` is missing or
-    /// empty, `FLEET_CLIENT_TOKEN` is set but invalid or equal to `FLEET_TOKEN`, or an
-    /// address does not parse.
+    /// empty, `FLEET_CLIENT_TOKEN` is set but invalid or equal to `FLEET_TOKEN`, an
+    /// address does not parse, or a retention setting is out of range. Retention days run
+    /// from 1 to 3650, `FLEET_SUMMARIES_RETENTION_DAYS` must not be below
+    /// `FLEET_EVENTS_RETENTION_DAYS`, and `FLEET_RETENTION_INTERVAL_SECS` is at least 60.
     pub fn from_env() -> Result<Self, ConfigError> {
         Self::from_lookup(|var| std::env::var(var).ok())
     }
@@ -186,6 +251,13 @@ impl Config {
             database_url: Secret::new(database_url),
             token,
             client_token,
+            retention: retention(&lookup)?,
+            retention_interval: Duration::from_secs(number(
+                &lookup,
+                "FLEET_RETENTION_INTERVAL_SECS",
+                DEFAULT_INTERVAL.as_secs(),
+                MIN_INTERVAL.as_secs()..=u64::from(u32::MAX),
+            )?),
         })
     }
 }
@@ -349,6 +421,102 @@ mod tests {
                 "{token:?}"
             );
         }
+    }
+
+    fn base() -> Vec<(&'static str, &'static str)> {
+        vec![
+            ("FLEET_DATABASE_URL", "postgres://h/db"),
+            ("FLEET_TOKEN", TOKEN),
+        ]
+    }
+
+    fn with(extra: &[(&'static str, &'static str)]) -> Result<Config, ConfigError> {
+        let mut vars = base();
+        vars.extend_from_slice(extra);
+        Config::from_lookup(lookup(&vars))
+    }
+
+    #[test]
+    fn retention_defaults_apply() {
+        let config = with(&[]).unwrap();
+        assert_eq!(config.retention, Policy::default());
+        assert_eq!(config.retention_interval, Duration::from_secs(3600));
+        let empty = with(&[("FLEET_EVENTS_RETENTION_DAYS", "")]).unwrap();
+        assert_eq!(empty.retention.events_days(), 90);
+    }
+
+    #[test]
+    fn retention_overrides_apply() {
+        let config = with(&[
+            ("FLEET_EVENTS_RETENTION_DAYS", "7"),
+            ("FLEET_SUMMARIES_RETENTION_DAYS", "30"),
+            ("FLEET_RETENTION_INTERVAL_SECS", "60"),
+        ])
+        .unwrap();
+        assert_eq!(config.retention.events_days(), 7);
+        assert_eq!(config.retention.summaries_days(), 30);
+        assert_eq!(config.retention_interval, Duration::from_secs(60));
+    }
+
+    #[test]
+    fn retention_bounds_table() {
+        let cases: [(&str, &str, bool); 16] = [
+            ("FLEET_EVENTS_RETENTION_DAYS", "0", false),
+            ("FLEET_EVENTS_RETENTION_DAYS", "1", true),
+            ("FLEET_EVENTS_RETENTION_DAYS", "365", true),
+            ("FLEET_EVENTS_RETENTION_DAYS", "3651", false),
+            ("FLEET_EVENTS_RETENTION_DAYS", "abc", false),
+            ("FLEET_EVENTS_RETENTION_DAYS", "-1", false),
+            ("FLEET_EVENTS_RETENTION_DAYS", "99999999999", false),
+            ("FLEET_SUMMARIES_RETENTION_DAYS", "99999999999", false),
+            ("FLEET_SUMMARIES_RETENTION_DAYS", "0", false),
+            ("FLEET_SUMMARIES_RETENTION_DAYS", "3650", true),
+            ("FLEET_SUMMARIES_RETENTION_DAYS", "3651", false),
+            ("FLEET_SUMMARIES_RETENTION_DAYS", "90", true),
+            ("FLEET_SUMMARIES_RETENTION_DAYS", "89", false),
+            ("FLEET_RETENTION_INTERVAL_SECS", "59", false),
+            ("FLEET_RETENTION_INTERVAL_SECS", "60", true),
+            ("FLEET_RETENTION_INTERVAL_SECS", "x", false),
+        ];
+        for (var, value, ok) in cases {
+            let result = with(&[(var, value)]);
+            if ok {
+                assert!(result.is_ok(), "{var}={value}");
+            } else {
+                match result.unwrap_err() {
+                    ConfigError::Invalid { var: named, .. } => assert_eq!(named, var, "{value}"),
+                    other @ ConfigError::Missing(_) => panic!("{other}"),
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn summaries_below_events_name_the_summaries_key() {
+        let err = with(&[
+            ("FLEET_EVENTS_RETENTION_DAYS", "100"),
+            ("FLEET_SUMMARIES_RETENTION_DAYS", "99"),
+        ])
+        .unwrap_err();
+        assert!(err.to_string().contains("FLEET_SUMMARIES_RETENTION_DAYS"));
+        assert!(
+            err.to_string()
+                .contains("at least the events retention days")
+        );
+        assert!(
+            with(&[
+                ("FLEET_EVENTS_RETENTION_DAYS", "100"),
+                ("FLEET_SUMMARIES_RETENTION_DAYS", "100"),
+            ])
+            .is_ok()
+        );
+        assert!(
+            with(&[
+                ("FLEET_EVENTS_RETENTION_DAYS", "3650"),
+                ("FLEET_SUMMARIES_RETENTION_DAYS", "3650"),
+            ])
+            .is_ok()
+        );
     }
 
     #[test]

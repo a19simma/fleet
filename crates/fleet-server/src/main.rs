@@ -10,6 +10,7 @@ use axum::routing::get;
 use fleet_server::auth::BearerAuth;
 use fleet_server::config::{Config, exposed_binds, is_loopback};
 use fleet_server::reaper::{DEFAULT_REAP_PERIOD, run_reaper};
+use fleet_server::retention::run_retention;
 use fleet_server::service::router;
 use fleet_server::store::Store;
 use fleet_server::supervise::{BoxError, supervise};
@@ -102,6 +103,13 @@ async fn run() -> Result<(), BoxError> {
         stop_rx.clone(),
         None,
     ));
+    let retention = tokio::spawn(run_retention(
+        store.clone(),
+        config.retention,
+        config.retention_interval,
+        stop_rx.clone(),
+        None,
+    ));
     let auth = BearerAuth::new(&config.token, config.client_token.as_ref());
     let grpc_server = async {
         router(&store, &auth)
@@ -117,7 +125,11 @@ async fn run() -> Result<(), BoxError> {
             .map_err(BoxError::from)
     };
     let served = async { tokio::try_join!(grpc_server, health_server).map(|_| ()) };
-    supervise(served, reaper, &stop_tx).await?;
+    let result = supervise(served, reaper, &stop_tx).await;
+    if let Err(err) = retention.await {
+        tracing::error!(panicked = err.is_panic(), "retention task died");
+    }
+    result?;
     tracing::info!("fleet-server stopped");
     Ok(())
 }
