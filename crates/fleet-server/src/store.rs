@@ -8,12 +8,13 @@ use fleet_core::{BoxName, Envelope, EventId, SCHEMA_VERSION};
 use fleet_proto::v1::{
     BoxStatus, BoxView, GetStatsReply, GetStatsRequest, HeartbeatRequest, Job, JobState,
     ReadJobEventsReply, ReadTranscriptReply, ReportJobReply, ReportJobRequest, SessionState,
-    SessionView, SubmitJobRequest, TranscriptChunk,
+    SessionView, SubmitBatchReply, SubmitBatchRequest, SubmitJobRequest, TranscriptChunk,
 };
 use serde_json::{Value, json};
 use sqlx::postgres::PgRow;
 use sqlx::{PgPool, Postgres, Row, Transaction};
 
+use crate::batches::{self, BatchInvalid};
 use crate::jobs::{
     JobInvalid, MAX_CHUNKS_PER_REPORT, MAX_PHASE_CHARS, MAX_PROGRESS_CHARS, MAX_TRANSCRIPT_BYTES,
     MAX_TRANSCRIPT_ROWS, MIN_CHUNK_COST_BYTES, validate_job_id, validate_submit, validate_terminal,
@@ -286,6 +287,11 @@ pub enum StoreError {
     NotFound,
     /// A profile request failed validation. No input is kept.
     InvalidProfile(ProfileFault),
+    /// A batch request failed validation. No input is kept.
+    InvalidBatch(BatchInvalid),
+    /// A batch named a profile that has no version. The handler maps this to gRPC
+    /// `NOT_FOUND`. No input is kept.
+    UnknownProfile,
 }
 
 impl fmt::Display for StoreError {
@@ -302,6 +308,8 @@ impl fmt::Display for StoreError {
             Self::TelemetryTooLarge => f.write_str("too many telemetry events in one report"),
             Self::NotFound => f.write_str("job not found"),
             Self::InvalidProfile(reason) => reason.fmt(f),
+            Self::InvalidBatch(reason) => reason.fmt(f),
+            Self::UnknownProfile => f.write_str("profile not found"),
         }
     }
 }
@@ -313,13 +321,15 @@ impl std::error::Error for StoreError {
             Self::Migrate(err) => Some(err),
             Self::InvalidJob(err) => Some(err),
             Self::InvalidProfile(err) => Some(err),
+            Self::InvalidBatch(err) => Some(err),
             Self::OutOfRange(_)
             | Self::KeyConflict
             | Self::StaleReport
             | Self::InvalidChunk
             | Self::InvalidTelemetry
             | Self::TelemetryTooLarge
-            | Self::NotFound => None,
+            | Self::NotFound
+            | Self::UnknownProfile => None,
         }
     }
 }
@@ -963,6 +973,28 @@ impl Store {
         after_name: Option<&str>,
     ) -> Result<fleet_proto::v1::ListProfilesReply, StoreError> {
         profiles::list(&self.pool, limit, after_name).await
+    }
+
+    /// Queues one job per named profile as one batch, or returns the stored batch.
+    ///
+    /// The request is validated once, by [`batches::validate_batch`]. One transaction inserts
+    /// the batch row, takes the advisory lock of each profile name in sorted order, pins the
+    /// latest version and hash of each profile, and inserts one job per profile in list
+    /// order. Any failure rolls back the batch and every job. A repeat of the same key with
+    /// identical parameters returns the stored batch with `created` false.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StoreError::InvalidBatch`], [`StoreError::InvalidProfile`] or
+    /// [`StoreError::InvalidJob`] when the request fails validation,
+    /// [`StoreError::UnknownProfile`] when a profile has no version,
+    /// [`StoreError::KeyConflict`] when the key exists with other parameters and
+    /// [`StoreError::Database`] when a query fails.
+    pub async fn submit_batch(
+        &self,
+        request: &SubmitBatchRequest,
+    ) -> Result<SubmitBatchReply, StoreError> {
+        batches::submit(&self.pool, request).await
     }
 
     /// Cancels a job.

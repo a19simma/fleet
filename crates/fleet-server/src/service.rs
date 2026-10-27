@@ -1,9 +1,10 @@
-//! The `FleetIngest`, `FleetQuery`, `FleetWorker`, `FleetJobs` and `FleetProfiles` gRPC
-//! handlers.
+//! The `FleetIngest`, `FleetQuery`, `FleetWorker`, `FleetJobs`, `FleetProfiles` and
+//! `FleetBatches` gRPC handlers.
 
 use std::time::Duration;
 
 use fleet_core::Envelope;
+use fleet_proto::v1::fleet_batches_server::{FleetBatches, FleetBatchesServer};
 use fleet_proto::v1::fleet_ingest_server::{FleetIngest, FleetIngestServer};
 use fleet_proto::v1::fleet_jobs_server::{FleetJobs, FleetJobsServer};
 use fleet_proto::v1::fleet_profiles_server::{FleetProfiles, FleetProfilesServer};
@@ -15,7 +16,8 @@ use fleet_proto::v1::{
     ListFleetReply, ListFleetRequest, ListJobsReply, ListJobsRequest, ListProfilesReply,
     ListProfilesRequest, ProfileVersion, PushEventsReply, PushEventsRequest, QueuedEvent,
     ReadJobEventsReply, ReadJobEventsRequest, ReadTranscriptReply, ReadTranscriptRequest,
-    Rejection, ReportJobReply, ReportJobRequest, SubmitJobRequest,
+    Rejection, ReportJobReply, ReportJobRequest, SubmitBatchReply, SubmitBatchRequest,
+    SubmitJobRequest,
 };
 use fleet_proto::{ConvertError, validate_box};
 use tonic::transport::server::Router;
@@ -76,7 +78,8 @@ fn no_nul(field: &str, value: &str) -> Result<(), Status> {
     Ok(())
 }
 
-/// Handler for `FleetIngest`, `FleetQuery`, `FleetWorker`, `FleetJobs` and `FleetProfiles`.
+/// Handler for `FleetIngest`, `FleetQuery`, `FleetWorker`, `FleetJobs`, `FleetProfiles` and
+/// `FleetBatches`.
 #[derive(Debug, Clone)]
 pub struct FleetService {
     store: Store,
@@ -274,6 +277,34 @@ fn profiles_error(err: &StoreError) -> Status {
     }
 }
 
+fn batches_error(err: &StoreError) -> Status {
+    match err {
+        StoreError::KeyConflict => {
+            Status::already_exists("idempotency key already used with other parameters")
+        }
+        StoreError::UnknownProfile => Status::not_found("profile not found"),
+        StoreError::InvalidBatch(reason) => Status::invalid_argument(reason.to_string()),
+        StoreError::InvalidProfile(_) => Status::invalid_argument("invalid profile name"),
+        StoreError::InvalidJob(_) => Status::invalid_argument("invalid job request"),
+        other => storage_unavailable(other),
+    }
+}
+
+#[tonic::async_trait]
+impl FleetBatches for FleetService {
+    async fn submit_batch(
+        &self,
+        request: Request<SubmitBatchRequest>,
+    ) -> Result<Response<SubmitBatchReply>, Status> {
+        let reply = self
+            .store
+            .submit_batch(&request.into_inner())
+            .await
+            .map_err(|err| batches_error(&err))?;
+        Ok(Response::new(reply))
+    }
+}
+
 #[tonic::async_trait]
 impl FleetProfiles for FleetService {
     async fn create_profile(
@@ -416,6 +447,8 @@ pub fn router(store: &Store, auth: &BearerAuth) -> Router<Stack<BearerAuth, Iden
     let worker =
         FleetWorkerServer::new(service.clone()).max_decoding_message_size(MAX_MESSAGE_BYTES);
     let jobs = FleetJobsServer::new(service.clone()).max_decoding_message_size(MAX_MESSAGE_BYTES);
+    let batches =
+        FleetBatchesServer::new(service.clone()).max_decoding_message_size(MAX_MESSAGE_BYTES);
     let profiles =
         FleetProfilesServer::new(service).max_decoding_message_size(MAX_PROFILE_MESSAGE_BYTES);
     tonic::transport::Server::builder()
@@ -429,6 +462,7 @@ pub fn router(store: &Store, auth: &BearerAuth) -> Router<Stack<BearerAuth, Iden
         .add_service(worker)
         .add_service(jobs)
         .add_service(profiles)
+        .add_service(batches)
 }
 
 #[cfg(test)]

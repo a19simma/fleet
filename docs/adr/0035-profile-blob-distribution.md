@@ -1,6 +1,6 @@
 # Profile blob distribution
 
-Status: Accepted 2026-10-27. Migration 0011 and the `FleetProfiles` client RPCs are built; `GetProfileBlob` and fleetd materialisation are not built. Amends ADR-0021 and ADR-0023. Implements the storage and delivery of ADR-0034.
+Status: Accepted 2026-10-27. Migration 0011, migration 0012 and the `FleetProfiles` and `FleetBatches.SubmitBatch` client RPCs are built; `GetProfileBlob` and fleetd materialisation are not built. Amends ADR-0021 and ADR-0023. Implements the storage and delivery of ADR-0034.
 
 ADR-0034 defines the Profile. The server holds Profiles and fleetd applies them, so a Box needs the Profile content for a leased Job without holding a client credential.
 
@@ -11,7 +11,7 @@ ADR-0034 defines the Profile. The server holds Profiles and fleetd applies them,
 - Migration 0011 adds insert-only blobs and versions. Migration 0010 belongs to phase durations.
 - Migration 0011 stores the hash as `bytea`, so the stored content is the exact canonical bytes. A trigger on both tables rejects UPDATE, DELETE and TRUNCATE.
 - Inferred, not part of the design: a profile name is 1 to 64 bytes of `[A-Za-z0-9_-]`. `CreateProfile{name, content_json}` validates with `Profile::from_json` and `validate`, stores the canonical bytes and returns the existing version when the name already holds that content, so a name can never hold one hash under two versions. `GetProfile{name, version?}` returns the latest version when `version` is unset. `ListProfiles{limit, after_name}` returns each name with its latest version and hash, 50 by default and 200 at most.
-- Migration 0012 adds the batch table with `repeats` CHECK = 1, and adds `batch_id`, `profile_name`, `profile_version` and `profile_hash` to `jobs`.
+- Migration 0012 adds the batch table with `repeats` CHECK = 1, and adds `batch_id`, `repeat_idx`, `batch_pos`, `profile_name`, `profile_version` and `profile_hash` to `jobs`, with foreign keys that pin a Job to a stored version and hash.
 
 ### Protocol
 

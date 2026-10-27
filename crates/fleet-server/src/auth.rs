@@ -1,8 +1,8 @@
 //! Bearer token check, applied once as a tower layer around the whole gRPC router.
 //!
 //! Two tokens, scoped by gRPC path: the box token covers `FleetIngest` and `FleetWorker`,
-//! the client token covers `FleetQuery`, `FleetJobs` and `FleetProfiles`. Any other path is
-//! denied.
+//! the client token covers `FleetQuery`, `FleetJobs`, `FleetProfiles` and `FleetBatches`. Any other path
+//! is denied.
 
 use std::convert::Infallible;
 use std::future::{Future, ready};
@@ -23,6 +23,7 @@ const WORKER: &str = "/fleet.v1.FleetWorker/";
 const QUERY: &str = "/fleet.v1.FleetQuery/";
 const JOBS: &str = "/fleet.v1.FleetJobs/";
 const PROFILES: &str = "/fleet.v1.FleetProfiles/";
+const BATCHES: &str = "/fleet.v1.FleetBatches/";
 
 /// Which token a request carried.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -36,7 +37,7 @@ enum Scope {
 /// The whole header value is compared with [`constant_time_eq`], so a wrong scheme, a
 /// wrong token and a header with non-ASCII bytes all fail the same way. A valid token
 /// that does not cover the path gets `PERMISSION_DENIED`. Without a client token,
-/// `FleetJobs` and `FleetProfiles` are closed to everyone.
+/// `FleetJobs`, `FleetProfiles` and `FleetBatches` are closed to everyone.
 #[derive(Debug, Clone)]
 pub struct BearerAuth {
     box_token: Secret,
@@ -69,13 +70,16 @@ impl BearerAuth {
     }
 
     /// Allow-lists paths per scope: the box token takes `FleetIngest` and `FleetWorker`,
-    /// the client token takes `FleetQuery`, `FleetJobs` and `FleetProfiles`. Every other path is
-    /// denied.
+    /// the client token takes `FleetQuery`, `FleetJobs`, `FleetProfiles` and `FleetBatches`.
+    /// Every other path is denied.
     fn allows(scope: Scope, path: &str) -> bool {
         match scope {
             Scope::Box => path.starts_with(INGEST) || path.starts_with(WORKER),
             Scope::Client => {
-                path.starts_with(QUERY) || path.starts_with(JOBS) || path.starts_with(PROFILES)
+                path.starts_with(QUERY)
+                    || path.starts_with(JOBS)
+                    || path.starts_with(PROFILES)
+                    || path.starts_with(BATCHES)
             }
         }
     }

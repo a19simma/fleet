@@ -27,6 +27,10 @@ service FleetProfiles {
   rpc ListProfiles(ListProfilesRequest) returns (ListProfilesReply);
 }
 
+service FleetBatches {
+  rpc SubmitBatch(SubmitBatchRequest) returns (SubmitBatchReply);
+}
+
 service FleetWorker {
   rpc ClaimJob(ClaimJobRequest) returns (ClaimJobReply);
   rpc ReportJob(ReportJobRequest) returns (ReportJobReply);
@@ -176,6 +180,21 @@ message SubmitJobRequest {
   string repo = 3;
   string base_ref = 4;
   bool open_pr = 5;
+}
+
+message SubmitBatchRequest {
+  string idempotency_key = 1;
+  string prompt = 2;
+  string repo = 3;
+  string base_sha = 4;
+  uint32 repeats = 5;
+  repeated string profiles = 6;
+}
+
+message SubmitBatchReply {
+  string batch_id = 1;
+  repeated string job_ids = 2;
+  bool created = 3;
 }
 
 message GetJobRequest {

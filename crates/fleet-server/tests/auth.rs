@@ -7,6 +7,7 @@ mod tests {
     use std::net::SocketAddr;
     use std::time::Duration;
 
+    use fleet_proto::v1::fleet_batches_client::FleetBatchesClient;
     use fleet_proto::v1::fleet_ingest_client::FleetIngestClient;
     use fleet_proto::v1::fleet_jobs_client::FleetJobsClient;
     use fleet_proto::v1::fleet_profiles_client::FleetProfilesClient;
@@ -191,6 +192,10 @@ mod tests {
                 .list_profiles(ListProfilesRequest::default())
                 .await
                 .map(|_| ()),
+            "batches" => FleetBatchesClient::with_interceptor(chan, move |r| header.apply(r))
+                .submit_batch(fleet_proto::v1::SubmitBatchRequest::default())
+                .await
+                .map(|_| ()),
             "stats" => FleetJobsClient::with_interceptor(chan, move |r| header.apply(r))
                 .get_stats(GetStatsRequest::default())
                 .await
@@ -215,6 +220,7 @@ mod tests {
             ("events", false, true),
             ("stats", false, true),
             ("profiles", false, true),
+            ("batches", false, true),
         ] {
             for (name, token, ok) in [("box", TOKEN, box_ok), ("client", CLIENT, client_ok)] {
                 let code = code_of(addr, service, Some(token)).await;

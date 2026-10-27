@@ -1,6 +1,6 @@
 # Profiles and batches
 
-Status: Accepted 2026-10-27. Profile storage, the `FleetProfiles` client RPCs and `fleet profile create`, `list` and `show` are built; the rest is not built. Amends ADR-0021, ADR-0023, ADR-0029 and ADR-0030. ADR-0035 covers storage and distribution.
+Status: Accepted 2026-10-27. Profile storage, the `FleetProfiles` client RPCs, `fleet profile create`, `list` and `show`, migration 0012 and the `FleetBatches.SubmitBatch` client RPC are built; the rest is not built. Amends ADR-0021, ADR-0023, ADR-0029 and ADR-0030. ADR-0035 covers storage and distribution.
 
 A future UI will dispatch the same prompt with several named configurations and compare outcomes. No UI exists yet. This ADR records the structure that comparison needs: a Profile that fixes the agent config of one Job, a Batch that groups Jobs by Profile, and a per-profile view in the CLI.
 
@@ -73,7 +73,7 @@ Whether deny beats allow in the real claude is unverified: the probe on the dev 
 
 ### Batch
 
-A **Batch** is one prompt dispatched once per Profile. `repeats` is 1 for now, enforced by a CHECK. `fleet batch show` prints one column per Profile. A missing value prints `-`. The rows carry the command run breakdown and the time taken, both read from the existing telemetry (ADR-0029).
+A **Batch** is one prompt dispatched once per Profile. `repeats` is 1 for now, enforced by a CHECK; a request may send 0, which means 1, and 2 or more is refused. `SubmitBatch` takes a prompt, a repo, a `base_sha` of 40 lowercase hex characters, 1 to 16 distinct Profile names and an idempotency key. One transaction pins the latest version and hash of each Profile and inserts one Job per Profile, so a failure leaves no Batch and no Job. The same key with the same parameters returns the stored Batch; other parameters give `ALREADY_EXISTS`. Batch Jobs use `base_sha` as the base ref and do not open a pull request. `fleet batch show` prints one column per Profile. A missing value prints `-`. The rows carry the command run breakdown and the time taken, both read from the existing telemetry (ADR-0029).
 
 ### Scope
 

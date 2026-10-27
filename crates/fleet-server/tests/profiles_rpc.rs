@@ -352,7 +352,7 @@ async fn update_delete_and_truncate_are_rejected(pool: PgPool) {
         "DELETE FROM profile_blob",
         "DELETE FROM profile_version",
         "TRUNCATE profile_blob CASCADE",
-        "TRUNCATE profile_version",
+        "TRUNCATE profile_version CASCADE",
     ];
     for statement in statements {
         let err = sqlx::query(statement).execute(&pool).await.unwrap_err();
