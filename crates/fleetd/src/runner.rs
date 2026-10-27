@@ -389,10 +389,9 @@ impl ChildWait for Child {
 
 const VERSION_TIMEOUT: Duration = Duration::from_secs(5);
 const VERSION_BYTES: u64 = 1024;
-const VERSION_CHARS: usize = 64;
+const VERSION_CHARS: usize = fleet_proto::MAX_CLAUDE_VERSION_CHARS;
 
-/// The value of a [`VersionStamp`] field that is not known.
-pub const UNKNOWN_STAMP: &str = "unknown";
+pub use fleet_proto::UNKNOWN_STAMP;
 
 /// What produced a job: the config bundle, the `claude` build and the model.
 ///
@@ -786,6 +785,7 @@ impl<R: Reporter> AgentRunner<R> {
         if let Some(version) = self.claude_version(cwd, &job_dir.home()).await {
             spec.stamp.claude_version = version;
         }
+        stream.feed.set_stamp(spec.stamp.clone());
         let Launched { stdout, mut proc } = match launch(spec) {
             Ok(launched) => launched,
             Err(err) => {
@@ -1472,7 +1472,7 @@ impl<R: Reporter> AgentRunner<R> {
 
 fn parse_version(stdout: &str) -> Option<String> {
     let line = stdout.lines().next()?.trim();
-    if !crate::telemetry::is_plain_text(line) {
+    if !fleet_proto::is_plain_text(line) {
         return None;
     }
     Some(line.chars().take(VERSION_CHARS).collect())

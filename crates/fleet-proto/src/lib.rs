@@ -22,6 +22,30 @@ pub const MAX_EVENT_CMD_BYTES: usize = 512;
 /// Longest stored `detail` of a telemetry event, in bytes.
 pub const MAX_EVENT_DETAIL_BYTES: usize = 1024;
 
+/// Longest stored `bundle_sha` of a job summary, in characters.
+pub const MAX_BUNDLE_SHA_CHARS: usize = 64;
+
+/// Longest stored `claude_version` of a job summary, in characters.
+pub const MAX_CLAUDE_VERSION_CHARS: usize = 64;
+
+/// Longest stored `model` of a job summary, in bytes.
+pub const MAX_MODEL_BYTES: usize = 128;
+
+/// The in-memory value of a version stamp field that is not known.
+///
+/// It never crosses the wire and is never stored: an unknown field is unset on the wire and
+/// `NULL` in the database (ADR-0030).
+pub const UNKNOWN_STAMP: &str = "unknown";
+
+/// True when `text` is non-empty and holds no control character.
+///
+/// Agent and tool output is untrusted, so a value that reaches storage or a terminal must
+/// pass this, on the sending side and again on the receiving side.
+#[must_use]
+pub fn is_plain_text(text: &str) -> bool {
+    !text.is_empty() && !text.chars().any(char::is_control)
+}
+
 /// Generated `fleet.v1` messages and services.
 #[expect(
     missing_docs,

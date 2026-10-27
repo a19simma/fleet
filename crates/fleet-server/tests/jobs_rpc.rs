@@ -732,6 +732,9 @@ async fn get_job_carries_the_summary_only_when_stored(pool: PgPool) {
         stuck_rule: Some("monologue".to_owned()),
         stuck_at_seq: Some(14),
         stuck_at_ms: Some(15),
+        bundle_sha: Some("b".repeat(64)),
+        claude_version: Some("2.1.289 (Claude Code)".to_owned()),
+        model: None,
     };
     let mut request = report(&id, Vec::new(), false);
     request.summary = Some(summary.clone());

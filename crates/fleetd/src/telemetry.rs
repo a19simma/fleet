@@ -9,6 +9,7 @@
 
 use std::collections::{BTreeMap, HashMap};
 
+use fleet_proto::is_plain_text;
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 
@@ -17,7 +18,7 @@ use crate::stuck::{Detector, Stuck, StuckRules};
 const EVENT_OVERHEAD_BYTES: u64 = 48;
 const HASH_HEX_CHARS: usize = 16;
 const TRUNCATED: &str = "truncated";
-const MODEL_CAP: usize = 128;
+const MODEL_CAP: usize = fleet_proto::MAX_MODEL_BYTES;
 const EDIT_TOOLS: [&str; 3] = ["Edit", "Write", "MultiEdit"];
 
 /// Caps on stored events and their text.
@@ -675,13 +676,6 @@ fn content_text(content: Option<&Value>) -> String {
             .collect(),
         _ => String::new(),
     }
-}
-
-/// True when `text` is non-empty and holds no control character.
-///
-/// Agent and tool output is untrusted, so a value that reaches storage or a terminal must pass this.
-pub(crate) fn is_plain_text(text: &str) -> bool {
-    !text.is_empty() && !text.chars().any(char::is_control)
 }
 
 fn cap(text: &str, max: usize) -> String {

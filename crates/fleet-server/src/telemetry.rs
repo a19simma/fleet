@@ -2,7 +2,8 @@
 
 use fleet_proto::v1::{JobEvent, JobEventKind, JobSummary};
 use fleet_proto::{
-    MAX_EVENT_CMD_BYTES, MAX_EVENT_DETAIL_BYTES, MAX_EVENTS_PER_JOB, MAX_EVENTS_PER_REPORT,
+    MAX_BUNDLE_SHA_CHARS, MAX_CLAUDE_VERSION_CHARS, MAX_EVENT_CMD_BYTES, MAX_EVENT_DETAIL_BYTES,
+    MAX_EVENTS_PER_JOB, MAX_EVENTS_PER_REPORT, MAX_MODEL_BYTES, UNKNOWN_STAMP, is_plain_text,
 };
 use sqlx::{PgPool, Postgres, Row, Transaction};
 
@@ -32,9 +33,10 @@ const UPSERT_JOB_SUMMARY: &str = "\
 INSERT INTO job_summary (job_id, turns, duration_ms, duration_api_ms, stop_reason, \
     result_subtype, cost_est_usd, tokens_in, tokens_out, tokens_cache_read, \
     tokens_cache_write, tool_calls, tool_errors, bash_calls, bash_nonzero, denials, \
-    api_retries, first_edit_ms, complete, missing, stuck_rule, stuck_at_seq, stuck_at_ms) \
+    api_retries, first_edit_ms, complete, missing, stuck_rule, stuck_at_seq, stuck_at_ms, \
+    bundle_sha, claude_version, model) \
 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, \
-    $19, $20, $21, $22, $23) \
+    $19, $20, $21, $22, $23, $24, $25, $26) \
 ON CONFLICT (job_id) DO UPDATE SET turns = EXCLUDED.turns, \
     duration_ms = EXCLUDED.duration_ms, duration_api_ms = EXCLUDED.duration_api_ms, \
     stop_reason = EXCLUDED.stop_reason, result_subtype = EXCLUDED.result_subtype, \
@@ -46,7 +48,8 @@ ON CONFLICT (job_id) DO UPDATE SET turns = EXCLUDED.turns, \
     api_retries = EXCLUDED.api_retries, first_edit_ms = EXCLUDED.first_edit_ms, \
     complete = EXCLUDED.complete, missing = EXCLUDED.missing, \
     stuck_rule = EXCLUDED.stuck_rule, stuck_at_seq = EXCLUDED.stuck_at_seq, \
-    stuck_at_ms = EXCLUDED.stuck_at_ms, updated_at = now()";
+    stuck_at_ms = EXCLUDED.stuck_at_ms, bundle_sha = EXCLUDED.bundle_sha, \
+    claude_version = EXCLUDED.claude_version, model = EXCLUDED.model, updated_at = now()";
 
 const READ_JOB_EVENTS: &str = "\
 SELECT seq, ts_ms, kind, tool_use_id, tool, ok, exit_code, dur_ms, out_bytes, out_hash, cmd, \
@@ -57,7 +60,7 @@ const READ_JOB_SUMMARY: &str = "\
 SELECT turns, duration_ms, duration_api_ms, stop_reason, result_subtype, cost_est_usd, \
     tokens_in, tokens_out, tokens_cache_read, tokens_cache_write, tool_calls, tool_errors, \
     bash_calls, bash_nonzero, denials, api_retries, first_edit_ms, complete, missing, \
-    stuck_rule, stuck_at_seq, stuck_at_ms \
+    stuck_rule, stuck_at_seq, stuck_at_ms, bundle_sha, claude_version, model \
 FROM job_summary WHERE job_id = $1";
 
 #[derive(Default)]
@@ -86,6 +89,9 @@ struct SummaryRow {
     stuck_rule: Option<&'static str>,
     stuck_at_seq: Option<i64>,
     stuck_at_ms: Option<i64>,
+    bundle_sha: Option<String>,
+    claude_version: Option<String>,
+    model: Option<String>,
 }
 
 /// Telemetry of one report after validation and clamping.
@@ -118,6 +124,23 @@ fn figure(value: Option<u64>) -> Result<Option<i64>, StoreError> {
     value
         .map(|raw| i64::try_from(raw).map_err(|_| StoreError::InvalidTelemetry))
         .transpose()
+}
+
+fn stamp_field(
+    value: Option<&String>,
+    max: usize,
+    bytes: bool,
+) -> Result<Option<String>, StoreError> {
+    let Some(raw) = value else { return Ok(None) };
+    let size = if bytes {
+        raw.len()
+    } else {
+        raw.chars().count()
+    };
+    if raw == UNKNOWN_STAMP || !is_plain_text(raw) || size > max {
+        return Err(StoreError::InvalidTelemetry);
+    }
+    Ok(Some(raw.clone()))
 }
 
 fn stuck_rule_name(rule: Option<&String>) -> Result<Option<&'static str>, StoreError> {
@@ -219,6 +242,13 @@ fn check_summary(summary: &JobSummary) -> Result<SummaryRow, StoreError> {
         stuck_rule,
         stuck_at_seq: summary.stuck_at_seq.map(i64::from),
         stuck_at_ms: figure(summary.stuck_at_ms)?,
+        bundle_sha: stamp_field(summary.bundle_sha.as_ref(), MAX_BUNDLE_SHA_CHARS, false)?,
+        claude_version: stamp_field(
+            summary.claude_version.as_ref(),
+            MAX_CLAUDE_VERSION_CHARS,
+            false,
+        )?,
+        model: stamp_field(summary.model.as_ref(), MAX_MODEL_BYTES, true)?,
     })
 }
 
@@ -234,7 +264,9 @@ fn check_summary(summary: &JobSummary) -> Result<SummaryRow, StoreError> {
 /// [`MAX_EVENTS_PER_REPORT`] events, and [`StoreError::InvalidTelemetry`] for an unknown
 /// event kind, a NUL character in any text, a figure above `i64::MAX`, a non-finite cost or
 /// more than 32 missing-figure names, a stuck rule outside the four stable names, a stuck
-/// position without a rule, or a stuck rule missing either position.
+/// position without a rule, or a stuck rule missing either position, or a `bundle_sha`,
+/// `claude_version` or `model` that is empty, over its cap, holds a control character or is
+/// the string `unknown`.
 pub(crate) fn check(
     events: &[JobEvent],
     summary: Option<&JobSummary>,
@@ -322,6 +354,9 @@ pub(crate) async fn persist(
             .bind(row.stuck_rule)
             .bind(row.stuck_at_seq)
             .bind(row.stuck_at_ms)
+            .bind(&row.bundle_sha)
+            .bind(&row.claude_version)
+            .bind(&row.model)
             .execute(&mut **tx)
             .await?;
     }
@@ -418,5 +453,8 @@ pub(crate) async fn read_summary(
             .transpose()
             .map_err(|_| StoreError::OutOfRange("stuck_at_seq"))?,
         stuck_at_ms: figure("stuck_at_ms")?,
+        bundle_sha: row.try_get("bundle_sha")?,
+        claude_version: row.try_get("claude_version")?,
+        model: row.try_get("model")?,
     }))
 }

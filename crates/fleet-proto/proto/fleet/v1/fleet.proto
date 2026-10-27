@@ -280,6 +280,9 @@ message JobSummary {
   optional string stuck_rule = 20;
   optional uint32 stuck_at_seq = 21;
   optional uint64 stuck_at_ms = 22;
+  optional string bundle_sha = 23;
+  optional string claude_version = 24;
+  optional string model = 25;
 }
 
 message ReadJobEventsRequest {

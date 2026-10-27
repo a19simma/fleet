@@ -20,6 +20,7 @@ use fleet_proto::MAX_EVENTS_PER_REPORT;
 use fleet_proto::v1 as pb;
 use tokio::time::Instant;
 
+use crate::runner::{UNKNOWN_STAMP, VersionStamp};
 use crate::telemetry::{EventKind, JobEvent, JobSummary, Limits, Telemetry, Terminal};
 use crate::toolhook::ToolReport;
 
@@ -54,6 +55,7 @@ pub(crate) struct Feed {
     counters: Counters,
     hooked: HashSet<String>,
     waiting: HashMap<String, ToolReport>,
+    stamp: VersionStamp,
 }
 
 impl Feed {
@@ -71,7 +73,12 @@ impl Feed {
             counters: Counters::default(),
             hooked: HashSet::new(),
             waiting: HashMap::new(),
+            stamp: VersionStamp::default(),
         }
+    }
+
+    pub(crate) fn set_stamp(&mut self, stamp: VersionStamp) {
+        self.stamp = stamp;
     }
 
     #[cfg(test)]
@@ -219,14 +226,25 @@ impl Feed {
             dropped = counters.dropped,
             "job telemetry closed"
         );
-        self.parser.take().map_or_else(
-            || pb::JobSummary {
+        let stamp = self.stamp.clone();
+        let Some(parser) = self.parser.take() else {
+            let missing = pb::JobSummary {
                 missing: vec![PARSER_MISSING.to_owned()],
                 ..pb::JobSummary::default()
-            },
-            |parser| summary(parser.finish(terminal)),
-        )
+            };
+            return stamped(missing, &stamp);
+        };
+        let stamp = stamp.with_model(parser.model());
+        stamped(summary(parser.finish(terminal)), &stamp)
     }
+}
+
+fn stamped(mut summary: pb::JobSummary, stamp: &VersionStamp) -> pb::JobSummary {
+    let known = |value: &str| (value != UNKNOWN_STAMP).then(|| value.to_owned());
+    summary.bundle_sha = known(&stamp.bundle_sha);
+    summary.claude_version = known(&stamp.claude_version);
+    summary.model = known(&stamp.model);
+    summary
 }
 
 fn convert(redactor: &Redactor, event: JobEvent) -> pb::JobEvent {
@@ -278,6 +296,9 @@ fn summary(summary: JobSummary) -> pb::JobSummary {
         stuck_rule: summary.stuck.map(|stuck| stuck.rule.name().to_owned()),
         stuck_at_seq: summary.stuck.map(|stuck| stuck.seq),
         stuck_at_ms: summary.stuck.map(|stuck| stuck.ts_ms),
+        bundle_sha: None,
+        claude_version: None,
+        model: None,
     }
 }
 
@@ -625,6 +646,9 @@ mod tests {
                 stuck_rule: Some("alternating".into()),
                 stuck_at_seq: Some(15),
                 stuck_at_ms: Some(16),
+                bundle_sha: None,
+                claude_version: None,
+                model: None,
             }
         );
     }
@@ -643,6 +667,51 @@ mod tests {
             exit_code: exit,
             dur_ms: dur,
         }
+    }
+
+    fn stamp(model: &str) -> VersionStamp {
+        VersionStamp {
+            bundle_sha: "a".repeat(64),
+            claude_version: "2.1.289".to_owned(),
+            model: model.to_owned(),
+        }
+    }
+
+    fn init(model: &str) -> String {
+        json!({"type":"system","subtype":"init","model":model}).to_string()
+    }
+
+    #[test]
+    fn the_stamp_and_the_init_model_reach_the_summary() {
+        let (mut feed, start) = fresh();
+        feed.set_stamp(stamp(UNKNOWN_STAMP));
+        feed.line(&redactor(), &init("claude-opus-4"), start);
+        let summary = feed.finish(Terminal::Succeeded);
+        assert_eq!(summary.bundle_sha, Some("a".repeat(64)));
+        assert_eq!(summary.claude_version.as_deref(), Some("2.1.289"));
+        assert_eq!(summary.model.as_deref(), Some("claude-opus-4"));
+    }
+
+    #[test]
+    fn an_unknown_stamp_field_is_unset_never_the_word_unknown() {
+        let (mut feed, start) = fresh();
+        feed.line(&redactor(), &init("bad\u{7}model"), start);
+        let summary = feed.finish(Terminal::Succeeded);
+        assert_eq!(summary.bundle_sha, None);
+        assert_eq!(summary.claude_version, None);
+        assert_eq!(summary.model, None);
+    }
+
+    #[test]
+    fn a_dead_parser_still_sends_the_known_stamp_fields() {
+        let (_, start) = fresh();
+        let mut feed = Feed::with(start, Limits::default(), boom);
+        feed.set_stamp(stamp(UNKNOWN_STAMP));
+        feed.line(&redactor(), "a", start);
+        let summary = feed.finish(Terminal::Failed);
+        assert_eq!(summary.bundle_sha, Some("a".repeat(64)));
+        assert_eq!(summary.claude_version.as_deref(), Some("2.1.289"));
+        assert_eq!(summary.model, None);
     }
 
     #[test]

@@ -8,7 +8,8 @@ use fleet_proto::v1::{
     Job, JobEvent, JobEventKind, JobState, JobSummary, ReportJobRequest, SubmitJobRequest,
 };
 use fleet_proto::{
-    MAX_EVENT_CMD_BYTES, MAX_EVENT_DETAIL_BYTES, MAX_EVENTS_PER_JOB, MAX_EVENTS_PER_REPORT,
+    MAX_BUNDLE_SHA_CHARS, MAX_CLAUDE_VERSION_CHARS, MAX_EVENT_CMD_BYTES, MAX_EVENT_DETAIL_BYTES,
+    MAX_EVENTS_PER_JOB, MAX_EVENTS_PER_REPORT, MAX_MODEL_BYTES, UNKNOWN_STAMP,
 };
 use fleet_server::store::{MAX_TS_MS, Store, StoreError};
 use serde_json::{Value, json};
@@ -271,6 +272,9 @@ fn full_summary() -> JobSummary {
         stuck_rule: Some("repeat_error".to_owned()),
         stuck_at_seq: Some(17),
         stuck_at_ms: Some(18),
+        bundle_sha: Some("c".repeat(64)),
+        claude_version: Some("2.1.289".to_owned()),
+        model: Some("claude-opus-4".to_owned()),
     }
 }
 
@@ -299,7 +303,9 @@ async fn summary_upsert_keeps_unobserved_as_null(pool: PgPool) {
             "tokens_cache_read": 8, "tokens_cache_write": 9, "tool_calls": 10,
             "tool_errors": 11, "bash_calls": 12, "bash_nonzero": 13, "denials": 14,
             "api_retries": 15, "first_edit_ms": 16, "complete": true, "missing": ["a", "b"],
-            "stuck_rule": "repeat_error", "stuck_at_seq": 17, "stuck_at_ms": 18
+            "stuck_rule": "repeat_error", "stuck_at_seq": 17, "stuck_at_ms": 18,
+            "bundle_sha": "c".repeat(64), "claude_version": "2.1.289",
+            "model": "claude-opus-4"
         })
     );
     let sparse = JobSummary {
@@ -318,7 +324,8 @@ async fn summary_upsert_keeps_unobserved_as_null(pool: PgPool) {
             "tool_calls": null, "tool_errors": null, "bash_calls": null,
             "bash_nonzero": null, "denials": null, "api_retries": null,
             "first_edit_ms": null, "complete": false, "missing": ["result"],
-            "stuck_rule": null, "stuck_at_seq": null, "stuck_at_ms": null
+            "stuck_rule": null, "stuck_at_seq": null, "stuck_at_ms": null,
+            "bundle_sha": null, "claude_version": null, "model": null
         })
     );
 }
@@ -475,6 +482,42 @@ async fn invalid_telemetry_stores_nothing(pool: PgPool) {
             stuck_at_ms: Some(u64::MAX),
             ..full_summary()
         },
+        JobSummary {
+            bundle_sha: Some("unknown".to_owned()),
+            ..full_summary()
+        },
+        JobSummary {
+            claude_version: Some("unknown".to_owned()),
+            ..full_summary()
+        },
+        JobSummary {
+            model: Some("unknown".to_owned()),
+            ..full_summary()
+        },
+        JobSummary {
+            bundle_sha: Some(String::new()),
+            ..full_summary()
+        },
+        JobSummary {
+            claude_version: Some("2.1\u{7}".to_owned()),
+            ..full_summary()
+        },
+        JobSummary {
+            model: Some("a\nb".to_owned()),
+            ..full_summary()
+        },
+        JobSummary {
+            bundle_sha: Some("a".repeat(MAX_BUNDLE_SHA_CHARS + 1)),
+            ..full_summary()
+        },
+        JobSummary {
+            claude_version: Some("v".repeat(MAX_CLAUDE_VERSION_CHARS + 1)),
+            ..full_summary()
+        },
+        JobSummary {
+            model: Some("m".repeat(MAX_MODEL_BYTES + 1)),
+            ..full_summary()
+        },
     ];
     for bad in summaries {
         let err = send(&store, &job, vec![event(0)], Some(bad))
@@ -552,6 +595,63 @@ async fn ascii_text_is_cut_at_the_cap_and_32_missing_names_pass(pool: PgPool) {
     .await
     .unwrap();
     assert_eq!(lens, (64, 64, 64, 32));
+}
+
+#[sqlx::test]
+async fn stamp_fields_at_their_caps_round_trip_and_unset_ones_store_null(pool: PgPool) {
+    let store = store(pool.clone()).await;
+    let job = claimed(&store).await;
+    let edge = JobSummary {
+        bundle_sha: Some("a".repeat(MAX_BUNDLE_SHA_CHARS)),
+        claude_version: Some("\u{e9}".repeat(MAX_CLAUDE_VERSION_CHARS)),
+        model: Some("m".repeat(MAX_MODEL_BYTES)),
+        ..JobSummary::default()
+    };
+    send(&store, &job, Vec::new(), Some(edge)).await.unwrap();
+    let stored = figures(&pool).await;
+    assert_eq!(stored["bundle_sha"], "a".repeat(MAX_BUNDLE_SHA_CHARS));
+    assert_eq!(
+        stored["claude_version"],
+        "\u{e9}".repeat(MAX_CLAUDE_VERSION_CHARS)
+    );
+    assert_eq!(stored["model"], "m".repeat(MAX_MODEL_BYTES));
+    send(&store, &job, Vec::new(), Some(JobSummary::default()))
+        .await
+        .unwrap();
+    let cleared = figures(&pool).await;
+    assert_eq!(cleared["bundle_sha"], Value::Null);
+    assert_eq!(cleared["claude_version"], Value::Null);
+    assert_eq!(cleared["model"], Value::Null);
+}
+
+#[sqlx::test]
+async fn the_database_refuses_an_unknown_or_empty_stamp(pool: PgPool) {
+    let store = store(pool.clone()).await;
+    let job = claimed(&store).await;
+    send(&store, &job, Vec::new(), Some(JobSummary::default()))
+        .await
+        .unwrap();
+    for sql in [
+        "UPDATE job_summary SET bundle_sha = 'unknown'",
+        "UPDATE job_summary SET claude_version = 'unknown'",
+        "UPDATE job_summary SET model = 'unknown'",
+        "UPDATE job_summary SET bundle_sha = ''",
+        "UPDATE job_summary SET claude_version = ''",
+        "UPDATE job_summary SET model = ''",
+        "UPDATE job_summary SET bundle_sha = repeat('a', 65)",
+        "UPDATE job_summary SET claude_version = repeat('a', 65)",
+        "UPDATE job_summary SET model = repeat('a', 129)",
+    ] {
+        assert!(sqlx::query(sql).execute(&pool).await.is_err(), "{sql}");
+    }
+}
+
+#[test]
+fn stamp_limits_are_pinned() {
+    assert_eq!(MAX_BUNDLE_SHA_CHARS, 64);
+    assert_eq!(MAX_CLAUDE_VERSION_CHARS, 64);
+    assert_eq!(MAX_MODEL_BYTES, 128);
+    assert_eq!(UNKNOWN_STAMP, "unknown");
 }
 
 #[test]

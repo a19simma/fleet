@@ -179,6 +179,9 @@ fn full_summary() -> JobSummary {
         stuck_rule: None,
         stuck_at_seq: None,
         stuck_at_ms: None,
+        bundle_sha: None,
+        claude_version: None,
+        model: None,
     }
 }
 

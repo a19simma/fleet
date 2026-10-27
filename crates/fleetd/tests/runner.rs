@@ -55,6 +55,7 @@ type TestResult = Result<(), Box<dyn std::error::Error>>;
 const START_BAND: Duration = Duration::from_secs(5);
 
 const SCRIPT: &str = r#"#!/bin/sh
+if [ "$1" = "--version" ]; then echo '2.1.289 (Claude Code)'; exit 0; fi
 mode=${2%%:*}
 path=${2#*:}
 case "$mode" in
@@ -1489,12 +1490,39 @@ async fn telemetry_events_and_summary_reach_a_failed_run_redacted() -> TestResul
         assert_eq!(summary.turns, Some(3));
         assert_eq!(summary.tool_calls, Some(1));
         assert_eq!(summary.denials, Some(1));
+        assert_eq!(summary.model, None);
         assert!(
             requests
                 .iter()
                 .filter(|r| r.terminal_state.is_none())
                 .all(|r| r.summary.is_none())
         );
+        Ok(())
+    }))
+    .await
+}
+
+#[tokio::test]
+async fn the_version_stamp_reaches_the_terminal_summary() -> TestResult {
+    common::bounded(Box::pin(async {
+        let dir = TempDir::new()?;
+        let init = json!({"type":"system","subtype":"init","model":"claude-opus-4"}).to_string();
+        let file = fixture(dir.path(), "run.jsonl", &[init, result_line()])?;
+        let (agent, mut rx) = runner(config(false), 0);
+        let (_trigger, shutdown) = Shutdown::channel();
+        let prompt = format!("catfail:{}", file.display());
+        let outcome = agent.run(&job(&prompt), dir.path(), shutdown).await?;
+        assert!(matches!(outcome, AgentOutcome::Failed { .. }));
+        let requests = drain(&mut rx);
+        let summary = terminal(&requests)?.summary.clone().ok_or("no summary")?;
+        assert_eq!(summary.model.as_deref(), Some("claude-opus-4"));
+        assert_eq!(
+            summary.claude_version.as_deref(),
+            Some("2.1.289 (Claude Code)")
+        );
+        let sha = summary.bundle_sha.ok_or("no bundle sha")?;
+        assert_eq!(sha.len(), 64);
+        assert!(sha.chars().all(|c| c.is_ascii_hexdigit()));
         Ok(())
     }))
     .await
