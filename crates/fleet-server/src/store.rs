@@ -18,6 +18,7 @@ use crate::jobs::{
     JobInvalid, MAX_CHUNKS_PER_REPORT, MAX_PHASE_CHARS, MAX_PROGRESS_CHARS, MAX_TRANSCRIPT_BYTES,
     MAX_TRANSCRIPT_ROWS, MIN_CHUNK_COST_BYTES, validate_job_id, validate_submit, validate_terminal,
 };
+use crate::profiles::{self, ProfileFault};
 use crate::projection::{Projection, State, project};
 use crate::stats;
 use crate::telemetry;
@@ -283,6 +284,8 @@ pub enum StoreError {
     /// A get, cancel or transcript read named a job that does not exist. The handler maps
     /// this to gRPC `NOT_FOUND`. No input is kept.
     NotFound,
+    /// A profile request failed validation. No input is kept.
+    InvalidProfile(ProfileFault),
 }
 
 impl fmt::Display for StoreError {
@@ -298,6 +301,7 @@ impl fmt::Display for StoreError {
             Self::InvalidTelemetry => f.write_str("invalid job telemetry"),
             Self::TelemetryTooLarge => f.write_str("too many telemetry events in one report"),
             Self::NotFound => f.write_str("job not found"),
+            Self::InvalidProfile(reason) => reason.fmt(f),
         }
     }
 }
@@ -308,6 +312,7 @@ impl std::error::Error for StoreError {
             Self::Database(err) => Some(err),
             Self::Migrate(err) => Some(err),
             Self::InvalidJob(err) => Some(err),
+            Self::InvalidProfile(err) => Some(err),
             Self::OutOfRange(_)
             | Self::KeyConflict
             | Self::StaleReport
@@ -322,6 +327,12 @@ impl std::error::Error for StoreError {
 impl From<sqlx::Error> for StoreError {
     fn from(err: sqlx::Error) -> Self {
         Self::Database(err)
+    }
+}
+
+impl From<ProfileFault> for StoreError {
+    fn from(err: ProfileFault) -> Self {
+        Self::InvalidProfile(err)
     }
 }
 
@@ -902,6 +913,56 @@ impl Store {
     /// validation, and [`StoreError::Database`] when the query fails.
     pub async fn stats(&self, request: &GetStatsRequest) -> Result<GetStatsReply, StoreError> {
         stats::stats(&self.pool, request).await
+    }
+
+    /// Stores a profile under `name` and returns its version.
+    ///
+    /// The request is validated once, by [`profiles::validate_create`]. The canonical
+    /// content is inserted as a blob keyed by its hash, so one blob serves every name that
+    /// holds the same content. Under a per-name advisory lock, content already stored under
+    /// the name returns that version with `created` false, and new content gets the next
+    /// version.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StoreError::InvalidProfile`] when the name or content fails validation and
+    /// [`StoreError::Database`] when a query fails.
+    pub async fn create_profile(
+        &self,
+        name: &str,
+        content_json: &str,
+    ) -> Result<fleet_proto::v1::ProfileVersion, StoreError> {
+        profiles::create(&self.pool, name, content_json).await
+    }
+
+    /// Reads a profile version, or the latest one when `version` is `None`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StoreError::InvalidProfile`] for a bad name, [`StoreError::NotFound`] when
+    /// the name or version is missing and [`StoreError::Database`] when a query fails.
+    pub async fn get_profile(
+        &self,
+        name: &str,
+        version: Option<u32>,
+    ) -> Result<fleet_proto::v1::ProfileVersion, StoreError> {
+        profiles::get(&self.pool, name, version).await
+    }
+
+    /// Lists profile names in order with their latest version and hash.
+    ///
+    /// A `limit` of 0 means [`DEFAULT_LIST_LIMIT`] and any limit is capped at
+    /// [`MAX_LIST_LIMIT`]. `after_name` resumes after that name.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StoreError::Database`] when the query fails.
+    pub async fn list_profiles(
+        &self,
+        limit: u32,
+        after_name: Option<&str>,
+    ) -> Result<fleet_proto::v1::ListProfilesReply, StoreError> {
+        profiles::list(&self.pool, limit, after_name).await
     }
 
     /// Cancels a job.

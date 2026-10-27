@@ -21,6 +21,12 @@ service FleetJobs {
   rpc GetStats(GetStatsRequest) returns (GetStatsReply);
 }
 
+service FleetProfiles {
+  rpc CreateProfile(CreateProfileRequest) returns (ProfileVersion);
+  rpc GetProfile(GetProfileRequest) returns (ProfileVersion);
+  rpc ListProfiles(ListProfilesRequest) returns (ListProfilesReply);
+}
+
 service FleetWorker {
   rpc ClaimJob(ClaimJobRequest) returns (ClaimJobReply);
   rpc ReportJob(ReportJobRequest) returns (ReportJobReply);
@@ -389,6 +395,39 @@ message StatsGroup {
   optional Quantiles push_ms = 30;
   optional Quantiles pr_ms = 31;
   optional Quantiles queue_wait_ms = 32;
+}
+
+message CreateProfileRequest {
+  string name = 1;
+  string content_json = 2;
+}
+
+message GetProfileRequest {
+  string name = 1;
+  optional uint32 version = 2;
+}
+
+message ProfileVersion {
+  string name = 1;
+  uint32 version = 2;
+  string hash = 3;
+  string content_json = 4;
+  bool created = 5;
+}
+
+message ListProfilesRequest {
+  uint32 limit = 1;
+  optional string after_name = 2;
+}
+
+message ProfileSummary {
+  string name = 1;
+  uint32 latest_version = 2;
+  string hash = 3;
+}
+
+message ListProfilesReply {
+  repeated ProfileSummary profiles = 1;
 }
 
 message GetStatsReply {

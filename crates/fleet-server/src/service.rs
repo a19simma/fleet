@@ -1,16 +1,19 @@
-//! The `FleetIngest`, `FleetQuery`, `FleetWorker` and `FleetJobs` gRPC handlers.
+//! The `FleetIngest`, `FleetQuery`, `FleetWorker`, `FleetJobs` and `FleetProfiles` gRPC
+//! handlers.
 
 use std::time::Duration;
 
 use fleet_core::Envelope;
 use fleet_proto::v1::fleet_ingest_server::{FleetIngest, FleetIngestServer};
 use fleet_proto::v1::fleet_jobs_server::{FleetJobs, FleetJobsServer};
+use fleet_proto::v1::fleet_profiles_server::{FleetProfiles, FleetProfilesServer};
 use fleet_proto::v1::fleet_query_server::{FleetQuery, FleetQueryServer};
 use fleet_proto::v1::fleet_worker_server::{FleetWorker, FleetWorkerServer};
 use fleet_proto::v1::{
-    CancelJobRequest, ClaimJobReply, ClaimJobRequest, GetJobRequest, GetStatsReply,
-    GetStatsRequest, HeartbeatReply, HeartbeatRequest, Job, ListFleetReply, ListFleetRequest,
-    ListJobsReply, ListJobsRequest, PushEventsReply, PushEventsRequest, QueuedEvent,
+    CancelJobRequest, ClaimJobReply, ClaimJobRequest, CreateProfileRequest, GetJobRequest,
+    GetProfileRequest, GetStatsReply, GetStatsRequest, HeartbeatReply, HeartbeatRequest, Job,
+    ListFleetReply, ListFleetRequest, ListJobsReply, ListJobsRequest, ListProfilesReply,
+    ListProfilesRequest, ProfileVersion, PushEventsReply, PushEventsRequest, QueuedEvent,
     ReadJobEventsReply, ReadJobEventsRequest, ReadTranscriptReply, ReadTranscriptRequest,
     Rejection, ReportJobReply, ReportJobRequest, SubmitJobRequest,
 };
@@ -20,6 +23,7 @@ use tonic::{Request, Response, Status};
 use tower::layer::util::{Identity, Stack};
 
 use crate::auth::BearerAuth;
+use crate::profiles::MAX_PROFILE_JSON_BYTES;
 use crate::store::{Store, StoreError};
 
 /// Seconds a box should wait before its next heartbeat.
@@ -36,6 +40,9 @@ pub const CLAIM_INTERVAL_S: u32 = 5;
 
 /// Largest request message the server decodes, in bytes.
 pub const MAX_MESSAGE_BYTES: usize = 1024 * 1024;
+
+/// Largest `FleetProfiles` request message the server decodes, in bytes.
+pub const MAX_PROFILE_MESSAGE_BYTES: usize = MAX_PROFILE_JSON_BYTES + MAX_MESSAGE_BYTES;
 
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 const KEEPALIVE_INTERVAL: Duration = Duration::from_secs(30);
@@ -72,7 +79,7 @@ fn no_nul(field: &str, value: &str) -> Result<(), Status> {
     Ok(())
 }
 
-/// Handler for `FleetIngest`, `FleetQuery`, `FleetWorker` and `FleetJobs`.
+/// Handler for `FleetIngest`, `FleetQuery`, `FleetWorker`, `FleetJobs` and `FleetProfiles`.
 #[derive(Debug, Clone)]
 pub struct FleetService {
     store: Store,
@@ -262,6 +269,56 @@ fn jobs_error(err: &StoreError) -> Status {
     }
 }
 
+fn profiles_error(err: &StoreError) -> Status {
+    match err {
+        StoreError::InvalidProfile(fault) => Status::invalid_argument(fault.to_string()),
+        StoreError::NotFound => Status::not_found("profile not found"),
+        other => storage_unavailable(other),
+    }
+}
+
+#[tonic::async_trait]
+impl FleetProfiles for FleetService {
+    async fn create_profile(
+        &self,
+        request: Request<CreateProfileRequest>,
+    ) -> Result<Response<ProfileVersion>, Status> {
+        let request = request.into_inner();
+        let reply = self
+            .store
+            .create_profile(&request.name, &request.content_json)
+            .await
+            .map_err(|err| profiles_error(&err))?;
+        Ok(Response::new(reply))
+    }
+
+    async fn get_profile(
+        &self,
+        request: Request<GetProfileRequest>,
+    ) -> Result<Response<ProfileVersion>, Status> {
+        let request = request.into_inner();
+        let reply = self
+            .store
+            .get_profile(&request.name, request.version)
+            .await
+            .map_err(|err| profiles_error(&err))?;
+        Ok(Response::new(reply))
+    }
+
+    async fn list_profiles(
+        &self,
+        request: Request<ListProfilesRequest>,
+    ) -> Result<Response<ListProfilesReply>, Status> {
+        let request = request.into_inner();
+        let reply = self
+            .store
+            .list_profiles(request.limit, request.after_name.as_deref())
+            .await
+            .map_err(|err| profiles_error(&err))?;
+        Ok(Response::new(reply))
+    }
+}
+
 #[tonic::async_trait]
 impl FleetJobs for FleetService {
     async fn submit_job(
@@ -361,7 +418,9 @@ pub fn router(store: &Store, auth: &BearerAuth) -> Router<Stack<BearerAuth, Iden
     let query = FleetQueryServer::new(service.clone()).max_decoding_message_size(MAX_MESSAGE_BYTES);
     let worker =
         FleetWorkerServer::new(service.clone()).max_decoding_message_size(MAX_MESSAGE_BYTES);
-    let jobs = FleetJobsServer::new(service).max_decoding_message_size(MAX_MESSAGE_BYTES);
+    let jobs = FleetJobsServer::new(service.clone()).max_decoding_message_size(MAX_MESSAGE_BYTES);
+    let profiles =
+        FleetProfilesServer::new(service).max_decoding_message_size(MAX_PROFILE_MESSAGE_BYTES);
     tonic::transport::Server::builder()
         .timeout(REQUEST_TIMEOUT)
         .concurrency_limit_per_connection(CONCURRENCY_PER_CONNECTION)
@@ -372,6 +431,7 @@ pub fn router(store: &Store, auth: &BearerAuth) -> Router<Stack<BearerAuth, Iden
         .add_service(query)
         .add_service(worker)
         .add_service(jobs)
+        .add_service(profiles)
 }
 
 #[cfg(test)]

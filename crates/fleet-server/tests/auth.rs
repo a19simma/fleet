@@ -9,11 +9,12 @@ mod tests {
 
     use fleet_proto::v1::fleet_ingest_client::FleetIngestClient;
     use fleet_proto::v1::fleet_jobs_client::FleetJobsClient;
+    use fleet_proto::v1::fleet_profiles_client::FleetProfilesClient;
     use fleet_proto::v1::fleet_query_client::FleetQueryClient;
     use fleet_proto::v1::fleet_worker_client::FleetWorkerClient;
     use fleet_proto::v1::{
         ClaimJobRequest, Envelope, GetStatsRequest, HeartbeatRequest, ListFleetRequest,
-        ListJobsRequest, PushEventsRequest, QueuedEvent, ReadJobEventsRequest,
+        ListJobsRequest, ListProfilesRequest, PushEventsRequest, QueuedEvent, ReadJobEventsRequest,
     };
     use fleet_server::auth::BearerAuth;
     use fleet_server::config::Token;
@@ -186,6 +187,10 @@ mod tests {
                 })
                 .await
                 .map(|_| ()),
+            "profiles" => FleetProfilesClient::with_interceptor(chan, move |r| header.apply(r))
+                .list_profiles(ListProfilesRequest::default())
+                .await
+                .map(|_| ()),
             "stats" => FleetJobsClient::with_interceptor(chan, move |r| header.apply(r))
                 .get_stats(GetStatsRequest::default())
                 .await
@@ -209,6 +214,7 @@ mod tests {
             ("jobs", false, true),
             ("events", false, true),
             ("stats", false, true),
+            ("profiles", false, true),
         ] {
             for (name, token, ok) in [("box", TOKEN, box_ok), ("client", CLIENT, client_ok)] {
                 let code = code_of(addr, service, Some(token)).await;
