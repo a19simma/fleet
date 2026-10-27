@@ -35,3 +35,7 @@ ADR-0029 stores one summary per Job. Comparing a prompt, agent config or model c
 - **Enforce stuck rules at once.** Thresholds adapted from another project have no local data behind them.
 - **Return averages only.** A `NULL` figure would read as zero.
 - **A wall-clock limit as the only cap.** It does not bound spend.
+
+## Amendment (ADR-0034)
+
+`fleet batch show` compares Profiles from the existing telemetry under the same `NULL` and own-n rules as `GetStats`. Stats grouped by Profile stay deferred.

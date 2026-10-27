@@ -28,3 +28,7 @@ The server holds two static bearer tokens, each with a scope.
 - **Keep one token.** A leaked Box token would read prompts and submit Jobs.
 - **A token per Box.** Gives revocation, but needs an enrollment step with its own trust anchor. Kept as the upgrade path.
 - **VPN identity.** Hard-wires the server to one VPN (ADR-0014).
+
+## Amendment (ADR-0034, ADR-0035)
+
+`FleetProfiles` and `FleetBatches` are client scope. `FleetWorker.GetProfileBlob` is worker scope and is authorised against the lease.

@@ -36,3 +36,7 @@ fleetd records two tiers of telemetry per Job and reports them through `ReportJo
 - **Wrapping Bash to capture exit codes.** It changes what the agent runs and can break its commands.
 - **Pueue task state.** ADR-0020 removed pueue.
 - **Zero for unobserved figures.** It makes a missing result look like a free Job and corrupts every average.
+
+## Amendment (ADR-0034)
+
+A profile column and a batch comparison read from the existing summary and event data under the same `NULL` and own-n rules. No new metric is added.

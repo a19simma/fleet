@@ -1,6 +1,6 @@
 # Fleet
 
-Fleet runs coding-agent Jobs on Boxes and records what each Job did. This file defines the terms used by the telemetry and metrics ADRs (0029, 0030).
+Fleet runs coding-agent Jobs on Boxes and records what each Job did. This file defines the terms used by the telemetry and metrics ADRs (0029, 0030) and the profile ADRs (0034, 0035).
 
 ## Language
 
@@ -19,6 +19,30 @@ _Avoid_: partial, zero-filled
 **Stuck rule**:
 One of `repeat_action_observation`, `repeat_error`, `alternating` and `monologue`, checked by a detector that only records the first rule to fire and changes nothing about the Job (shadow mode).
 _Avoid_: loop detector, watchdog
+
+**Profile**:
+A named, versioned, immutable config that overlays a **Bundle** for one Job: `claude_md`, context files, prompt template, skills, allow and deny rules, model, caps and settings. It holds no MCP, hooks or secrets (ADR-0034).
+_Avoid_: preset, template
+
+**Profile version**:
+One numbered entry of a named **Profile**, pointing at one **Profile hash**.
+_Avoid_: revision
+
+**Profile hash**:
+The `sha256("fleet-profile-v1\0" + canonical JSON)` content hash of a **Profile**, recorded on each Job.
+_Avoid_: etag
+
+**Batch**:
+One prompt dispatched once per **Profile** so the outcomes can be compared.
+_Avoid_: run group, experiment
+
+**Floor**:
+The fixed deny set and permission mode (`dontAsk`) in fleetd that no **Profile** can loosen.
+_Avoid_: baseline, default policy
+
+**Bundle**:
+The on-disk files fleetd installs for the agent: CLAUDE.md, settings.json, skills and hooks. A **Profile** overlays it for one Job.
+_Avoid_: profile, config version
 
 **Bundle channel**:
 Planned, not built: a release channel for the agent config bundle a Box loads, meant for a canary rollout of config changes.
@@ -60,4 +84,5 @@ _Avoid_: test case
 
 ## Flagged ambiguities
 
-- "bundle", "egress" and "fixture" appear in planning notes only. No product code defines them, and ADR-0030 lists them as out of scope.
+- "egress" and "fixture" appear in planning notes only. No product code defines them, and ADR-0030 lists them as out of scope.
+- "bundle" and "profile" overlap. A **Bundle** is the on-disk files; a **Profile** is the named config overlaying it for one Job (ADR-0034, ADR-0035).

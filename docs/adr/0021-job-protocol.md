@@ -39,3 +39,7 @@ Jobs are rows in the server's Postgres, driven by two new gRPC services in packa
 - **Lease renewal through the heartbeat.** Inferred, not part of the design: couples Job liveness to the 30 s heartbeat and a separate rpc. `ReportJob` already carries the data.
 - **Streaming `ReportJob`.** ADR-0018 chose unary calls for the same reasons.
 - **Automatic retry of `LOST` Jobs.** A rerun repeats side effects such as pushes.
+
+## Amendment (ADR-0034, ADR-0035)
+
+A Job carries `Job.profile = 22` and `Job.batch_id = 23`, and the `jobs` table records `batch_id`, `profile_name`, `profile_version` and `profile_hash`. A Batch submits one Job per Profile.
