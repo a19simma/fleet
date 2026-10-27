@@ -387,6 +387,10 @@ impl ChildWait for Child {
     }
 }
 
+const VERSION_TIMEOUT: Duration = Duration::from_secs(5);
+const VERSION_BYTES: u64 = 1024;
+const VERSION_CHARS: usize = 64;
+
 /// The value of a [`VersionStamp`] field that is not known.
 pub const UNKNOWN_STAMP: &str = "unknown";
 
@@ -401,6 +405,17 @@ pub struct VersionStamp {
     pub claude_version: String,
     /// The model name.
     pub model: String,
+}
+
+impl VersionStamp {
+    /// This stamp with the model the agent reported, or [`UNKNOWN_STAMP`] when it reported none.
+    #[must_use]
+    pub fn with_model(mut self, model: Option<&str>) -> Self {
+        if let Some(model) = model {
+            model.clone_into(&mut self.model);
+        }
+        self
+    }
 }
 
 impl Default for VersionStamp {
@@ -543,6 +558,7 @@ pub struct AgentRunner<R> {
     redactor: Redactor,
     carries: Mutex<HashMap<String, Carry>>,
     hub: Option<Arc<HookHub>>,
+    claude_version: Mutex<Option<String>>,
 }
 
 #[derive(Debug, Default)]
@@ -564,6 +580,7 @@ impl<R: Reporter> AgentRunner<R> {
             redactor,
             carries: Mutex::new(HashMap::new()),
             hub: None,
+            claude_version: Mutex::new(None),
         }
     }
 
@@ -765,7 +782,10 @@ impl<R: Reporter> AgentRunner<R> {
                 return Ok(stream.fail(None, ERR_START).await);
             }
         };
-        let spec = self.agent_spec(job, cwd, &job_dir.home());
+        let mut spec = self.agent_spec(job, cwd, &job_dir.home());
+        if let Some(version) = self.claude_version(cwd, &job_dir.home()).await {
+            spec.stamp.claude_version = version;
+        }
         let Launched { stdout, mut proc } = match launch(spec) {
             Ok(launched) => launched,
             Err(err) => {
@@ -1345,6 +1365,41 @@ impl<R: Reporter> AgentRunner<R> {
                     .any(|extra| extra == name))
     }
 
+    async fn claude_version(&self, cwd: &Path, home: &Path) -> Option<String> {
+        let cached = self
+            .claude_version
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone();
+        if cached.is_some() {
+            return cached;
+        }
+        let mut command = Command::new(&self.config.claude_bin);
+        command
+            .arg("--version")
+            .current_dir(cwd)
+            .env_clear()
+            .env("HOME", home)
+            .env("CLAUDE_CONFIG_DIR", home.join(".claude"))
+            .env("DISABLE_AUTOUPDATER", "1");
+        command.envs(
+            self.config
+                .base_env
+                .iter()
+                .filter(|(name, _)| name == "PATH")
+                .map(|(name, value)| (name, value)),
+        );
+        let output = capture(command, VERSION_TIMEOUT, VERSION_BYTES)
+            .await
+            .ok()?;
+        let version = parse_version(&output.stdout).filter(|_| output.success)?;
+        *self
+            .claude_version
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = Some(version.clone());
+        Some(version)
+    }
+
     /// The command line, environment and working directory for `job`'s agent.
     ///
     /// The environment is the allowlisted part of [`RunConfig::base_env`] plus the per-job
@@ -1413,6 +1468,14 @@ impl<R: Reporter> AgentRunner<R> {
             },
         }
     }
+}
+
+fn parse_version(stdout: &str) -> Option<String> {
+    let line = stdout.lines().next()?.trim();
+    if !crate::telemetry::is_plain_text(line) {
+        return None;
+    }
+    Some(line.chars().take(VERSION_CHARS).collect())
 }
 
 struct LineReader<R> {
@@ -1991,7 +2054,8 @@ mod tests {
     use super::{
         AgentOutcome, AgentProc, AgentRunner, AgentSpec, DirectLauncher, ERR_EXIT,
         ERR_FINISH_TIMEOUT, ERR_SIGNAL, ERR_TIMEOUT, Ending, Job, JobState, Launched, Launcher,
-        LineReader, Reporter, RunConfig, STRIPPED_ENV, UNKNOWN_STAMP, VersionStamp, ending,
+        LineReader, Reporter, RunConfig, STRIPPED_ENV, UNKNOWN_STAMP, VERSION_CHARS, VersionStamp,
+        ending, parse_version,
     };
     use crate::poller::Shutdown;
     use fleet_core::Redactor;
@@ -2001,6 +2065,7 @@ mod tests {
     use std::io;
     use std::os::unix::process::ExitStatusExt;
     use std::path::Path;
+    use std::path::PathBuf;
     use std::pin::Pin;
     use std::process::ExitStatus;
     use std::sync::atomic::{AtomicBool, Ordering};
@@ -2280,6 +2345,78 @@ mod tests {
             let home = dir.path().join(".agent").join("job1").join("home");
             assert_eq!(*specs, vec![runner.agent_spec(&job, dir.path(), &home)]);
         }
+    }
+
+    fn version_script(mode: &str) -> PathBuf {
+        static DIR: std::sync::OnceLock<(tempfile::TempDir, PathBuf, PathBuf)> =
+            std::sync::OnceLock::new();
+        let (_, ok, bad) = DIR.get_or_init(|| {
+            use std::os::unix::fs::PermissionsExt;
+            let dir = tempfile::tempdir().unwrap_or_else(|_| std::process::abort());
+            let write = |name: &str, body: &str| {
+                let path = dir.path().join(name);
+                std::fs::write(&path, body).unwrap_or_else(|_| std::process::abort());
+                std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755))
+                    .unwrap_or_else(|_| std::process::abort());
+                path
+            };
+            let ok = write("ok", "#!/bin/sh\necho '2.3.4 (Claude Code)'\n");
+            let bad = write("bad", "#!/bin/sh\necho '9.9.9'\nexit 1\n");
+            (dir, ok, bad)
+        });
+        if mode == "ok" {
+            ok.clone()
+        } else {
+            bad.clone()
+        }
+    }
+
+    #[tokio::test]
+    async fn the_stamp_carries_the_version_claude_prints_and_unknown_when_it_cannot() {
+        for (bin, expected) in [
+            (version_script("ok"), "2.3.4 (Claude Code)"),
+            (version_script("bad"), UNKNOWN_STAMP),
+            (PathBuf::from("/nonexistent/claude"), UNKNOWN_STAMP),
+        ] {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let launcher = Arc::new(FakeLauncher::new(ExitStatus::from_raw(0), false));
+            let mut config = test_config(dir.path());
+            config.claude_bin = bin;
+            let runner = AgentRunner::new(config, Replies { cancel: false }, Redactor::default())
+                .with_launcher(launcher.clone());
+            let (_trigger, shutdown) = Shutdown::channel();
+            let outcome = runner.run(&test_job(), dir.path(), shutdown).await;
+            assert_eq!(outcome.ok(), Some(AgentOutcome::Succeeded));
+            let specs = launcher
+                .specs
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner);
+            assert_eq!(specs[0].stamp.claude_version, expected);
+            assert_eq!(specs[0].stamp.model, UNKNOWN_STAMP);
+        }
+    }
+
+    #[test]
+    fn a_version_line_is_the_first_clean_line_cut_at_the_cap() {
+        assert_eq!(parse_version("1.0 (x)\nmore"), Some("1.0 (x)".to_owned()));
+        assert_eq!(parse_version(""), None);
+        assert_eq!(parse_version("  \n"), None);
+        assert_eq!(parse_version("a\u{1b}[0m"), None);
+        assert_eq!(
+            parse_version(&"v".repeat(200)).map(|v| v.len()),
+            Some(VERSION_CHARS)
+        );
+    }
+
+    #[test]
+    fn a_stamp_takes_the_reported_model_and_keeps_unknown_without_one() {
+        let named = VersionStamp::default().with_model(Some("claude-opus-4"));
+        assert_eq!(named.model, "claude-opus-4");
+        assert_eq!(named.claude_version, UNKNOWN_STAMP);
+        assert_eq!(
+            VersionStamp::default().with_model(None).model,
+            UNKNOWN_STAMP
+        );
     }
 
     #[tokio::test]

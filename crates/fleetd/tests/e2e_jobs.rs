@@ -34,6 +34,7 @@ const SUBMIT_REPO: &str = "https://example.invalid/e2e/repo.git";
 const WAIT: Duration = Duration::from_secs(120);
 
 const AGENT: &str = r#"#!/bin/sh
+[ "$1" = --version ] && { echo '2.0.0 (Claude Code)'; exit 0; }
 echo '{"type":"assistant","message":{"content":[{"type":"text","text":"adding the file"}]}}'
 echo fake-agent-output > hello.txt
 git add hello.txt

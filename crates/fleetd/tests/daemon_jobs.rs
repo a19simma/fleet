@@ -29,6 +29,7 @@ const TOKEN: &str = "daemon-test-token-0123456789";
 const PR_URL: &str = "https://example.invalid/pr/9";
 
 const AGENT: &str = r#"#!/bin/sh
+[ "$1" = --version ] && { echo '2.0.0 (Claude Code)'; exit 0; }
 echo '{"type":"assistant","message":{"content":[{"type":"text","text":"adding the file"}]}}'
 echo fake-agent-output > hello.txt
 git add hello.txt
@@ -36,12 +37,14 @@ git -c user.name=t -c user.email=t@example.invalid commit -q -m "add hello.txt"
 "#;
 
 const ARGV_AGENT: &str = r#"#!/bin/sh
+[ "$1" = --version ] && { echo '2.0.0 (Claude Code)'; exit 0; }
 printf '%s\n' "$@" > hello.txt
 git add hello.txt
 git -c user.name=t -c user.email=t@example.invalid commit -q -m "add hello.txt"
 "#;
 
 const BLOCKING_AGENT: &str = r#"#!/bin/sh
+[ "$1" = --version ] && { echo '2.0.0 (Claude Code)'; exit 0; }
 mkdir ../.finish-job1
 echo '{"type":"assistant","message":{"content":[{"type":"text","text":"working"}]}}'
 exec tail -f /dev/null
@@ -396,7 +399,7 @@ async fn a_tool_hook_posted_to_the_daemon_socket_reaches_the_running_jobs_teleme
         let dir = TempDir::new()?;
         let marker = dir.path().join("hook-delivered");
         let agent = format!(
-            "#!/bin/sh\necho '{{\"type\":\"assistant\",\"message\":{{\"id\":\"m1\",\"content\":[{{\"type\":\"tool_use\",\"id\":\"toolu_a\",\"name\":\"Bash\",\"input\":{{\"command\":\"false\"}}}}]}}}}'\nwhile [ ! -e {marker:?} ]; do sleep 0.05; done\necho '{{\"type\":\"user\",\"message\":{{\"content\":[{{\"type\":\"tool_result\",\"tool_use_id\":\"toolu_a\",\"content\":\"x\"}}]}}}}'\n"
+            "#!/bin/sh\n[ \"$1\" = --version ] && {{ echo 2.0.0; exit 0; }}\necho '{{\"type\":\"assistant\",\"message\":{{\"id\":\"m1\",\"content\":[{{\"type\":\"tool_use\",\"id\":\"toolu_a\",\"name\":\"Bash\",\"input\":{{\"command\":\"false\"}}}}]}}}}'\nwhile [ ! -e {marker:?} ]; do sleep 0.05; done\necho '{{\"type\":\"user\",\"message\":{{\"content\":[{{\"type\":\"tool_result\",\"tool_use_id\":\"toolu_a\",\"content\":\"x\"}}]}}}}'\n"
         );
         let Launched {
             mut inbox,

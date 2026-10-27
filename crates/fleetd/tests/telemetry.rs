@@ -680,3 +680,76 @@ fn result_alone_marks_counters_as_observed() {
     assert_eq!(summary.tool_calls, Some(0));
     assert_eq!(summary.denials, Some(0));
 }
+
+#[test]
+fn the_init_line_gives_the_model_and_a_later_one_does_not_replace_it() {
+    let mut parser = Telemetry::new(Limits::default());
+    assert_eq!(parser.model(), None);
+    parser.feed_line(
+        r#"{"type":"system","subtype":"init","model":"claude-opus-4"}"#,
+        1,
+    );
+    assert_eq!(parser.model(), Some("claude-opus-4"));
+    parser.feed_line(r#"{"type":"system","subtype":"init","model":"other"}"#, 2);
+    assert_eq!(parser.model(), Some("claude-opus-4"));
+}
+
+#[test]
+fn an_init_line_without_a_usable_model_leaves_it_unset() {
+    for line in [
+        r#"{"type":"system","subtype":"init"}"#,
+        r#"{"type":"system","subtype":"init","model":"  "}"#,
+        r#"{"type":"system","subtype":"init","model":7}"#,
+    ] {
+        let mut parser = Telemetry::new(Limits::default());
+        parser.feed_line(line, 1);
+        assert_eq!(parser.model(), None, "{line}");
+    }
+    let mut parser = Telemetry::new(Limits::default());
+    let long = format!(
+        r#"{{"type":"system","subtype":"init","model":"{}"}}"#,
+        "m".repeat(500)
+    );
+    parser.feed_line(&long, 1);
+    assert_eq!(parser.model().map(str::len), Some(128));
+}
+
+#[test]
+fn a_model_with_a_control_character_is_treated_as_unset() {
+    for line in [
+        r#"{"type":"system","subtype":"init","model":"a\u001bb"}"#,
+        r#"{"type":"system","subtype":"init","model":"a\u001b[0mb"}"#,
+        r#"{"type":"system","subtype":"init","model":"a\nb"}"#,
+    ] {
+        let mut parser = Telemetry::new(Limits::default());
+        parser.feed_line(line, 1);
+        assert_eq!(parser.model(), None, "{line}");
+    }
+}
+
+#[test]
+fn a_clean_model_still_works_after_a_rejected_one() {
+    let mut parser = Telemetry::new(Limits::default());
+    parser.feed_line(
+        r#"{"type":"system","subtype":"init","model":"a\u001bb"}"#,
+        1,
+    );
+    parser.feed_line(
+        r#"{"type":"system","subtype":"init","model":"claude-opus-4"}"#,
+        2,
+    );
+    assert_eq!(parser.model(), Some("claude-opus-4"));
+}
+
+#[test]
+fn the_recorded_init_line_gives_the_model() {
+    let mut telemetry = Telemetry::new(Limits::default());
+    feed_all(&mut telemetry, SMOKE);
+    let model = SMOKE
+        .lines()
+        .next()
+        .and_then(|line| serde_json::from_str::<Value>(line).ok())
+        .and_then(|init| init["model"].as_str().map(str::to_owned));
+    assert!(model.is_some());
+    assert_eq!(telemetry.model(), model.as_deref());
+}

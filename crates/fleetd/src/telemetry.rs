@@ -17,6 +17,7 @@ use crate::stuck::{Detector, Stuck, StuckRules};
 const EVENT_OVERHEAD_BYTES: u64 = 48;
 const HASH_HEX_CHARS: usize = 16;
 const TRUNCATED: &str = "truncated";
+const MODEL_CAP: usize = 128;
 const EDIT_TOOLS: [&str; 3] = ["Edit", "Write", "MultiEdit"];
 
 /// Caps on stored events and their text.
@@ -236,6 +237,7 @@ pub struct Telemetry {
     stop_reason: Option<String>,
     result_subtype: Option<String>,
     cost_est_usd: Option<f64>,
+    model: Option<String>,
     detector: Detector,
 }
 
@@ -270,6 +272,7 @@ impl Telemetry {
             stop_reason: None,
             result_subtype: None,
             cost_est_usd: None,
+            model: None,
             detector: Detector::new(StuckRules::default()),
         }
     }
@@ -331,7 +334,7 @@ impl Telemetry {
         let kind = value.get("type").and_then(Value::as_str);
         let subtype = value.get("subtype").and_then(Value::as_str);
         match (kind, subtype) {
-            (Some("system"), Some("init")) => {}
+            (Some("system"), Some("init")) => self.on_init(&value),
             (Some("system"), Some("api_retry")) => self.on_retry(&value, ts_ms, &mut out),
             (Some("system"), Some("permission_denied")) => {
                 self.on_denied(&value, ts_ms, redact, &mut out);
@@ -376,6 +379,12 @@ impl Telemetry {
             event.dur_ms = dur_ms;
         }
         true
+    }
+
+    /// The model named by the `init` line, once one was seen and named one.
+    #[must_use]
+    pub fn model(&self) -> Option<&str> {
+        self.model.as_deref()
     }
 
     /// The `subtype` of the final result line, once one was seen.
@@ -465,6 +474,17 @@ impl Telemetry {
         event.seq = u32::try_from(self.events.len()).unwrap_or(u32::MAX);
         self.events.push(event.clone());
         out.push(event);
+    }
+
+    fn on_init(&mut self, value: &Value) {
+        let model = value
+            .get("model")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|model| is_plain_text(model));
+        if self.model.is_none() {
+            self.model = model.map(|model| cap(model, MODEL_CAP));
+        }
     }
 
     fn on_retry(&mut self, value: &Value, ts_ms: u64, out: &mut Vec<JobEvent>) {
@@ -655,6 +675,13 @@ fn content_text(content: Option<&Value>) -> String {
             .collect(),
         _ => String::new(),
     }
+}
+
+/// True when `text` is non-empty and holds no control character.
+///
+/// Agent and tool output is untrusted, so a value that reaches storage or a terminal must pass this.
+pub(crate) fn is_plain_text(text: &str) -> bool {
+    !text.is_empty() && !text.chars().any(char::is_control)
 }
 
 fn cap(text: &str, max: usize) -> String {
