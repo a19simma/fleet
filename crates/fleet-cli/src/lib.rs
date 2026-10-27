@@ -3,6 +3,7 @@
 pub mod config;
 pub mod list;
 pub mod logs;
+pub mod profile;
 pub mod stats;
 pub mod telemetry;
 pub mod watch;
@@ -12,7 +13,9 @@ use std::io::{Read, Write};
 use std::time::Duration;
 
 use clap::{Parser, Subcommand};
+use fleet_proto::MAX_PROFILE_MESSAGE_BYTES;
 use fleet_proto::v1::fleet_jobs_client::FleetJobsClient;
+use fleet_proto::v1::fleet_profiles_client::FleetProfilesClient;
 use fleet_proto::v1::fleet_query_client::FleetQueryClient;
 use fleet_proto::v1::{
     CancelJobRequest, GetJobRequest, Job, JobState, ListJobsRequest, SubmitJobRequest,
@@ -128,6 +131,32 @@ pub enum Command {
         /// Group rows by this column. Without it one row covers every job.
         #[arg(long, value_enum)]
         by: Option<StatsBy>,
+    },
+    /// Create, list and show named agent profiles.
+    Profile {
+        /// The profile action.
+        #[command(subcommand)]
+        action: ProfileAction,
+    },
+}
+
+/// A `fleet profile` action.
+#[derive(Debug, Subcommand)]
+pub enum ProfileAction {
+    /// Store a profile from a JSON file; the same content keeps its version.
+    Create {
+        /// Profile name: 1 to 64 characters of letters, digits, `_` and `-`.
+        name: String,
+        /// File holding the profile JSON, or `-` to read it from stdin.
+        #[arg(long)]
+        file: String,
+    },
+    /// List every profile with its latest version and hash.
+    List,
+    /// Show a profile: canonical content, version and hash.
+    Show {
+        /// Profile name, or `name@version` for a pinned version.
+        target: String,
     },
 }
 
@@ -286,6 +315,7 @@ type QueryClient = FleetQueryClient<InterceptedService<Channel, Bearer>>;
 struct Session {
     jobs: Client,
     query: QueryClient,
+    profiles: profile::ProfilesClient,
 }
 
 /// Adds the bearer token to every request.
@@ -414,9 +444,47 @@ async fn session(
     Ok(Session {
         jobs: FleetJobsClient::with_interceptor(channel.clone(), token.clone())
             .max_decoding_message_size(MAX_DECODE_BYTES),
-        query: FleetQueryClient::with_interceptor(channel, token)
+        query: FleetQueryClient::with_interceptor(channel.clone(), token.clone())
             .max_decoding_message_size(MAX_DECODE_BYTES),
+        profiles: FleetProfilesClient::with_interceptor(channel, token)
+            .max_decoding_message_size(MAX_PROFILE_MESSAGE_BYTES),
     })
+}
+
+async fn cancel(mut client: Client, id: String, out: &mut impl Write) -> Result<(), CliError> {
+    let job = client
+        .cancel_job(CancelJobRequest { job_id: id })
+        .await?
+        .into_inner();
+    writeln!(out, "{}\t{}", sanitize(&job.job_id), state_name(&job))?;
+    Ok(())
+}
+
+async fn run_profile(
+    action: ProfileAction,
+    server: Option<String>,
+    insecure: bool,
+    lookup: impl Fn(&str) -> Option<String>,
+    timeouts: bool,
+    stdin: &mut impl Read,
+    out: &mut impl Write,
+) -> Result<(), CliError> {
+    match action {
+        ProfileAction::Create { name, file } => {
+            let content = profile::read_source(&file, stdin)?;
+            let mut client = session(server, insecure, lookup, timeouts).await?.profiles;
+            profile::create(&mut client, name, content, out).await
+        }
+        ProfileAction::List => {
+            let mut client = session(server, insecure, lookup, timeouts).await?.profiles;
+            profile::list(&mut client, out).await
+        }
+        ProfileAction::Show { target } => {
+            let (name, version) = profile::split_target(&target)?;
+            let mut client = session(server, insecure, lookup, timeouts).await?.profiles;
+            profile::show(&mut client, name.to_owned(), version, out).await
+        }
+    }
 }
 
 /// Runs a parsed command, reading a `-` prompt from `stdin` and writing results to `out`.
@@ -534,13 +602,12 @@ pub async fn run_with(
             let mut client = session(server, insecure, lookup, timeouts).await?.jobs;
             stats::stats(&mut client, since, repo, box_name, by, out).await?;
         }
+        Command::Profile { action } => {
+            run_profile(action, server, insecure, lookup, timeouts, stdin, out).await?;
+        }
         Command::Cancel { id } => {
-            let mut client = session(server, insecure, lookup, timeouts).await?.jobs;
-            let job = client
-                .cancel_job(CancelJobRequest { job_id: id })
-                .await?
-                .into_inner();
-            writeln!(out, "{}\t{}", sanitize(&job.job_id), state_name(&job))?;
+            let client = session(server, insecure, lookup, timeouts).await?.jobs;
+            cancel(client, id, out).await?;
         }
     }
     Ok(())

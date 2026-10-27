@@ -27,7 +27,9 @@ tokio.workspace = true
 tonic.workspace = true
 
 [dev-dependencies]
+fleet-server = { path = "../fleet-server" }
 rcgen = { version = "0.14.10", default-features = false, features = ["pem", "ring"] }
+sqlx = { workspace = true, features = ["postgres", "migrate", "macros"] }
 tempfile.workspace = true
 tokio = { workspace = true, features = ["test-util"] }
 tokio-stream.workspace = true

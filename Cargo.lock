@@ -538,7 +538,9 @@ version = "0.2.5"
 dependencies = [
  "clap",
  "fleet-proto",
+ "fleet-server",
  "rcgen",
+ "sqlx",
  "tempfile",
  "tokio",
  "tokio-stream",

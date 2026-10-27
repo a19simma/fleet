@@ -23,8 +23,8 @@ use tonic::{Request, Response, Status};
 use tower::layer::util::{Identity, Stack};
 
 use crate::auth::BearerAuth;
-use crate::profiles::MAX_PROFILE_JSON_BYTES;
 use crate::store::{Store, StoreError};
+use fleet_proto::MAX_PROFILE_MESSAGE_BYTES;
 
 /// Seconds a box should wait before its next heartbeat.
 pub const HEARTBEAT_INTERVAL_S: u32 = 30;
@@ -40,9 +40,6 @@ pub const CLAIM_INTERVAL_S: u32 = 5;
 
 /// Largest request message the server decodes, in bytes.
 pub const MAX_MESSAGE_BYTES: usize = 1024 * 1024;
-
-/// Largest `FleetProfiles` request message the server decodes, in bytes.
-pub const MAX_PROFILE_MESSAGE_BYTES: usize = MAX_PROFILE_JSON_BYTES + MAX_MESSAGE_BYTES;
 
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 const KEEPALIVE_INTERVAL: Duration = Duration::from_secs(30);

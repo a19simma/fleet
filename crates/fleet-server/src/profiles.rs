@@ -3,6 +3,7 @@
 use std::fmt::{self, Write};
 
 use fleet_core::{Profile, ProfileError, ProfileHash, ProfileInvalid};
+use fleet_proto::MAX_PROFILE_JSON_BYTES;
 use fleet_proto::v1::{ListProfilesReply, ProfileSummary, ProfileVersion};
 use sqlx::{PgPool, Row};
 
@@ -10,9 +11,6 @@ use crate::store::{DEFAULT_LIST_LIMIT, MAX_LIST_LIMIT, StoreError};
 
 /// Longest accepted profile name, in bytes.
 pub const MAX_NAME_BYTES: usize = 64;
-/// Longest accepted profile JSON, in bytes. Escapes make the JSON longer than its text, so
-/// this sits above the 4 MiB text cap of the validator.
-pub const MAX_PROFILE_JSON_BYTES: usize = 8 * 1024 * 1024;
 
 const INSERT_BLOB: &str = "INSERT INTO profile_blob (hash, content, size) VALUES ($1, $2, $3) \
      ON CONFLICT (hash) DO NOTHING";

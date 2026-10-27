@@ -7,6 +7,14 @@ mod convert;
 
 pub use convert::{ConvertError, queued_event, validate_box};
 
+/// Longest accepted profile JSON, in bytes. Escapes make the JSON longer than its text, so
+/// this sits above the 4 MiB text cap of the validator.
+pub const MAX_PROFILE_JSON_BYTES: usize = 8 * 1024 * 1024;
+
+/// Largest `FleetProfiles` message either side decodes, in bytes: the profile JSON plus 1 MiB
+/// for the rest of the message.
+pub const MAX_PROFILE_MESSAGE_BYTES: usize = MAX_PROFILE_JSON_BYTES + 1024 * 1024;
+
 /// Most transcript chunks one report may carry. The server rejects more.
 pub const MAX_CHUNKS_PER_REPORT: usize = 256;
 
