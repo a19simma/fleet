@@ -54,7 +54,10 @@ use std::time::Duration;
 
 use fleet_core::Redactor;
 use fleet_proto::MAX_CHUNKS_PER_REPORT;
-use fleet_proto::v1::{Job, JobState, ReportJobReply, ReportJobRequest, TranscriptChunk};
+use fleet_proto::v1::{
+    GetProfileBlobReply, GetProfileBlobRequest, Job, JobState, ReportJobReply, ReportJobRequest,
+    TranscriptChunk,
+};
 use serde_json::Value;
 use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncRead, BufReader};
 use tokio::process::{Child, Command};
@@ -64,11 +67,13 @@ use tonic::{Code, Status};
 use crate::agent_config::{Bundle, JOB_EMAIL, JOB_NAME, JobDir};
 use crate::askpass;
 use crate::feed::Feed;
+use crate::floor::{BoxCeilings, PERMISSION_MODE};
 use crate::group::GroupGuard;
 use crate::now_ms;
 use crate::phase::{Clock, Phases, SystemClock, elapsed_ms};
 use crate::poller::{RunError, Shutdown};
 use crate::proc::{CAPTURE_BYTES, CaptureError, Captured, capture};
+use crate::profile_apply::{self, Applied, LoadError};
 use crate::telemetry::Terminal as Ending;
 use crate::toolhook::HookHub;
 use crate::workspace::{RepoPolicy, validate_job_id, validate_ref, validate_repo};
@@ -241,6 +246,21 @@ pub trait Reporter: Send + Sync {
         &self,
         request: ReportJobRequest,
     ) -> impl Future<Output = Result<ReportJobReply, Status>> + Send;
+
+    /// Fetches the Profile blob of the job in `request` over `GetProfileBlob`.
+    ///
+    /// The default refuses, so a reporter that cannot reach the server never yields a blob and
+    /// a Job that names a Profile fails closed.
+    ///
+    /// # Errors
+    ///
+    /// Returns the gRPC status when the call fails.
+    fn profile_blob(
+        &self,
+        _request: GetProfileBlobRequest,
+    ) -> impl Future<Output = Result<GetProfileBlobReply, Status>> + Send {
+        std::future::ready(Err(Status::unimplemented("profile blobs are not served")))
+    }
 }
 
 /// How the agent is started and paced.
@@ -261,7 +281,7 @@ pub struct RunConfig {
     pub git_bin: PathBuf,
     /// Longest time for the finish step and for each helper command in it.
     pub finish_timeout: Duration,
-    /// True when the box is disposable. Only then the agent runs with permission checks off.
+    /// True when the box is disposable. Only then a Job without a Profile runs with permission checks off.
     pub disposable: bool,
     /// Hard limit on the run. The process group is killed when it passes.
     pub timeout: Duration,
@@ -558,6 +578,7 @@ pub struct AgentRunner<R> {
     redactor: Redactor,
     carries: Mutex<HashMap<String, Carry>>,
     phases: Mutex<HashMap<String, Phases>>,
+    profiles: Mutex<HashMap<String, Arc<Applied>>>,
     clock: Arc<dyn Clock>,
     hub: Option<Arc<HookHub>>,
     claude_version: Mutex<Option<String>>,
@@ -582,6 +603,7 @@ impl<R: Reporter> AgentRunner<R> {
             redactor,
             carries: Mutex::new(HashMap::new()),
             phases: Mutex::new(HashMap::new()),
+            profiles: Mutex::new(HashMap::new()),
             clock: Arc::new(SystemClock::new()),
             hub: None,
             claude_version: Mutex::new(None),
@@ -618,6 +640,91 @@ impl<R: Reporter> AgentRunner<R> {
             .or_default()
             .merge(phases);
         out
+    }
+
+    fn ceilings(&self) -> BoxCeilings {
+        let cents = (self.config.max_budget_usd * 100.0).round().clamp(0.0, 1e9);
+        #[expect(
+            clippy::cast_possible_truncation,
+            clippy::cast_sign_loss,
+            reason = "clamped to 0 to 1e9 and rounded, and NaN saturates to 0"
+        )]
+        let cents = cents as u64;
+        BoxCeilings {
+            default_max_turns: self.config.max_turns,
+            max_turns: self.config.max_turns,
+            default_max_budget_cents: cents,
+            max_budget_cents: cents,
+        }
+    }
+
+    fn profile_for(&self, job: &Job) -> Option<Arc<Applied>> {
+        self.profiles
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .get(&Self::carry_key(job))
+            .cloned()
+    }
+
+    /// Fetches the Profile blob of `job` as box `box_name`, checks it against the job's
+    /// `ProfileRef`, applies the Floor and the box ceilings and keeps the result for
+    /// [`AgentRunner::run`]. A job without a Profile keeps the box bundle and gets `Ok`.
+    ///
+    /// The ceilings are [`RunConfig::max_turns`] and [`RunConfig::max_budget_usd`]. Call
+    /// [`AgentRunner::clear_profile`] when the job ends.
+    ///
+    /// # Errors
+    ///
+    /// Returns the [`LoadError`] of a failed fetch or check. The caller must end the job with
+    /// [`LoadError::reason`] and must not run the agent: nothing falls back to the box bundle.
+    pub async fn load_profile(&self, job: &Job, box_name: &str) -> Result<(), LoadError> {
+        let Some(reference) = job.profile.as_ref() else {
+            return Ok(());
+        };
+        let request = GetProfileBlobRequest {
+            job_id: job.job_id.clone(),
+            attempt: job.attempt,
+            r#box: box_name.to_owned(),
+        };
+        let reply = self
+            .reporter
+            .profile_blob(request)
+            .await
+            .map_err(|status| {
+                tracing::warn!(code = ?status.code(), "profile blob fetch failed");
+                LoadError::Fetch
+            })?;
+        let applied = profile_apply::load(
+            reference,
+            &reply,
+            &self.config.bundle,
+            &self.ceilings(),
+            &job.prompt,
+        )?;
+        if !applied.dropped_allows.is_empty() {
+            tracing::info!(
+                dropped = applied.dropped_allows.len(),
+                "profile allow rules dropped by the floor"
+            );
+        }
+        self.profiles
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .insert(Self::carry_key(job), Arc::new(applied));
+        Ok(())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn has_profile(&self, job: &Job) -> bool {
+        self.profile_for(job).is_some()
+    }
+
+    /// Forgets the Profile [`AgentRunner::load_profile`] kept for `job`.
+    pub fn clear_profile(&self, job: &Job) {
+        self.profiles
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .remove(&Self::carry_key(job));
     }
 
     fn take_phases(&self, job: &Job) -> Phases {
@@ -732,7 +839,7 @@ impl<R: Reporter> AgentRunner<R> {
     ///
     /// The child gets no stdin, its own process group, `FLEET_JOB_ID` and `SWARM_BOX=1`.
     /// It gets `--dangerously-skip-permissions` only when the config marks the box
-    /// disposable. Exit 0 is [`AgentOutcome::Succeeded`]. A nonzero exit, a signal, a
+    /// disposable and the Job has no Profile. Exit 0 is [`AgentOutcome::Succeeded`]. A nonzero exit, a signal, a
     /// start failure or the timeout sends a terminal `FAILED` report and returns
     /// [`AgentOutcome::Failed`]. A report reply with `cancel_requested` gives
     /// [`AgentOutcome::Cancelled`] after `SIGTERM`, the cancel grace and `SIGKILL`. A
@@ -810,12 +917,11 @@ impl<R: Reporter> AgentRunner<R> {
             .as_deref()
             .or_else(|| cwd.parent())
             .unwrap_or(cwd);
-        let job_dir = match JobDir::create_shared(
-            root,
-            &job.job_id,
-            &self.config.bundle,
-            self.config.job_gid,
-        ) {
+        let applied = self.profile_for(job);
+        let bundle = applied
+            .as_deref()
+            .map_or(&self.config.bundle, |applied| &applied.bundle);
+        let job_dir = match JobDir::create_shared(root, &job.job_id, bundle, self.config.job_gid) {
             Ok(dir) => dir,
             Err(err) => {
                 tracing::warn!(kind = ?err.kind(), "agent config dir could not be created");
@@ -1458,13 +1564,15 @@ impl<R: Reporter> AgentRunner<R> {
     /// The environment is the allowlisted part of [`RunConfig::base_env`] plus the per-job
     /// values, with `home` as `HOME` and `home/.claude` as `CLAUDE_CONFIG_DIR`.
     pub fn agent_spec(&self, job: &Job, cwd: &Path, home: &Path) -> AgentSpec {
-        let turns = self.config.max_turns.to_string();
-        let budget = self.config.max_budget_usd.to_string();
+        let applied = self.profile_for(job);
+        let prompt = applied
+            .as_deref()
+            .map_or(job.prompt.as_str(), |applied| applied.prompt.as_str());
         let mut argv: Vec<OsString> = vec![self.config.claude_bin.clone().into_os_string()];
         argv.extend(
             [
                 "-p",
-                job.prompt.as_str(),
+                prompt,
                 "--output-format",
                 "stream-json",
                 "--verbose",
@@ -1472,20 +1580,34 @@ impl<R: Reporter> AgentRunner<R> {
                 "user",
                 "--append-system-prompt",
                 AGENT_PROTOCOL,
-                "--max-turns",
-                turns.as_str(),
-                "--max-budget-usd",
-                budget.as_str(),
             ]
             .map(OsString::from),
         );
-        if self.config.disposable {
+        if let Some(applied) = applied.as_deref() {
+            argv.extend(["--permission-mode", applied.permission_mode].map(OsString::from));
+        } else if self.config.disposable {
             argv.push("--dangerously-skip-permissions".into());
         } else {
-            argv.extend(["--permission-mode", "dontAsk"].map(OsString::from));
+            argv.extend(["--permission-mode", PERMISSION_MODE].map(OsString::from));
         }
-        argv.push("--disallowedTools".into());
-        argv.extend(DENIED_TOOLS.map(OsString::from));
+        if let Some(applied) = applied.as_deref() {
+            argv.extend(applied.argv.iter().map(OsString::from));
+        } else {
+            argv.extend(
+                [
+                    "--max-turns",
+                    self.config.max_turns.to_string().as_str(),
+                    "--max-budget-usd",
+                    self.config.max_budget_usd.to_string().as_str(),
+                ]
+                .map(OsString::from),
+            );
+            argv.push("--disallowedTools".into());
+            argv.extend(DENIED_TOOLS.map(OsString::from));
+        }
+        let bundle = applied
+            .as_deref()
+            .map_or(&self.config.bundle, |applied| &applied.bundle);
         let mut env: BTreeMap<OsString, OsString> = self
             .config
             .base_env
@@ -1516,7 +1638,7 @@ impl<R: Reporter> AgentRunner<R> {
             env,
             cwd: cwd.to_path_buf(),
             stamp: VersionStamp {
-                bundle_sha: self.config.bundle.sha256(),
+                bundle_sha: bundle.sha256(),
                 ..VersionStamp::default()
             },
         }
@@ -2105,13 +2227,16 @@ fn cut(text: &mut String, max: usize) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        AgentOutcome, AgentProc, AgentRunner, AgentSpec, DirectLauncher, ERR_EXIT,
+        AgentOutcome, AgentProc, AgentRunner, AgentSpec, DENIED_TOOLS, DirectLauncher, ERR_EXIT,
         ERR_FINISH_TIMEOUT, ERR_SIGNAL, ERR_TIMEOUT, Ending, Job, JobState, Launched, Launcher,
         LineReader, Reporter, RunConfig, STRIPPED_ENV, UNKNOWN_STAMP, VERSION_CHARS, VersionStamp,
         ending, parse_version,
     };
     use crate::poller::Shutdown;
+    use crate::profile_apply::LoadError;
+    use fleet_core::Profile;
     use fleet_core::Redactor;
+    use fleet_proto::v1::{GetProfileBlobReply, GetProfileBlobRequest, ProfileRef};
     use fleet_proto::v1::{ReportJobReply, ReportJobRequest};
     use std::ffi::OsString;
     use std::future::Future;
@@ -2352,6 +2477,165 @@ mod tests {
                 .contains(&OsString::from("--dangerously-skip-permissions"))
         );
         assert!(!spec.argv.contains(&OsString::from("--permission-mode")));
+    }
+
+    struct Served(GetProfileBlobReply);
+
+    impl Reporter for Served {
+        fn report(
+            &self,
+            _request: ReportJobRequest,
+        ) -> impl Future<Output = Result<ReportJobReply, Status>> + Send {
+            std::future::ready(Ok(ReportJobReply::default()))
+        }
+
+        fn profile_blob(
+            &self,
+            _request: GetProfileBlobRequest,
+        ) -> impl Future<Output = Result<GetProfileBlobReply, Status>> + Send {
+            std::future::ready(Ok(self.0.clone()))
+        }
+    }
+
+    fn profile_job(profile: &Profile) -> (Job, GetProfileBlobReply) {
+        let reference = ProfileRef {
+            name: "p".into(),
+            version: 1,
+            hash: profile.hash().to_string(),
+        };
+        let job = Job {
+            profile: Some(reference.clone()),
+            ..test_job()
+        };
+        let reply = GetProfileBlobReply {
+            profile: Some(reference),
+            content: profile.canonical_json(),
+        };
+        (job, reply)
+    }
+
+    fn after<'a>(argv: &'a [OsString], flag: &str) -> Vec<&'a str> {
+        argv.iter()
+            .skip_while(|arg| *arg != flag)
+            .skip(1)
+            .take_while(|arg| !arg.to_string_lossy().starts_with("--"))
+            .filter_map(|arg| arg.to_str())
+            .collect()
+    }
+
+    fn wide_profile() -> Profile {
+        Profile {
+            prompt_prefix: Some("PRE ".to_owned()),
+            model: Some("opus".to_owned()),
+            allow: vec!["Read".to_owned(), "Edit".to_owned()],
+            deny: vec!["Bash(rm *)".to_owned()],
+            max_turns: Some(99),
+            max_budget_usd: Some(100_000),
+            ..Profile::default()
+        }
+    }
+
+    #[tokio::test]
+    async fn a_loaded_profile_drives_the_agent_argv_the_prompt_and_the_bundle()
+    -> Result<(), LoadError> {
+        let (job, reply) = profile_job(&wide_profile());
+        let runner = AgentRunner::new(
+            test_config(Path::new("/jobs")),
+            Served(reply),
+            Redactor::default(),
+        );
+        runner.load_profile(&job, "b").await?;
+        let spec = runner.agent_spec(&job, Path::new("/work"), Path::new("/h"));
+        let argv = &spec.argv;
+        assert_eq!(after(argv, "-p"), vec!["PRE do it"]);
+        assert_eq!(after(argv, "--model"), vec!["opus"]);
+        assert_eq!(after(argv, "--allowedTools"), vec!["Read"]);
+        assert_eq!(after(argv, "--max-turns"), vec!["7"]);
+        assert_eq!(after(argv, "--max-budget-usd"), vec!["1.50"]);
+        assert_eq!(after(argv, "--permission-mode"), vec!["dontAsk"]);
+        for flag in ["--max-turns", "--max-budget-usd", "--disallowedTools"] {
+            assert_eq!(argv.iter().filter(|arg| *arg == flag).count(), 1, "{flag}");
+        }
+        let denied = after(argv, "--disallowedTools");
+        for tool in DENIED_TOOLS.iter().chain(&["Bash(rm *)"]) {
+            assert!(denied.contains(tool), "missing {tool}");
+        }
+        assert_ne!(spec.stamp.bundle_sha, runner.config.bundle.sha256());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_disposable_box_keeps_dont_ask_with_a_profile() -> Result<(), LoadError> {
+        let (job, reply) = profile_job(&wide_profile());
+        let mut config = test_config(Path::new("/jobs"));
+        config.disposable = true;
+        let runner = AgentRunner::new(config, Served(reply), Redactor::default());
+        runner.load_profile(&job, "b").await?;
+        let spec = runner.agent_spec(&job, Path::new("/work"), Path::new("/h"));
+        assert!(
+            !spec
+                .argv
+                .contains(&OsString::from("--dangerously-skip-permissions"))
+        );
+        assert_eq!(after(&spec.argv, "--permission-mode"), vec!["dontAsk"]);
+        let denied = after(&spec.argv, "--disallowedTools");
+        for tool in DENIED_TOOLS {
+            assert!(denied.contains(&tool), "missing {tool}");
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_refused_blob_keeps_nothing_and_a_job_without_a_profile_loads_nothing() {
+        let profile = Profile::default();
+        let (job, mut reply) = profile_job(&profile);
+        reply.content = b"{}".to_vec();
+        reply.content.push(b' ');
+        let runner = AgentRunner::new(
+            test_config(Path::new("/jobs")),
+            Served(reply),
+            Redactor::default(),
+        );
+        assert_eq!(
+            runner.load_profile(&job, "b").await,
+            Err(LoadError::NotCanonical)
+        );
+        assert!(!runner.has_profile(&job));
+        assert_eq!(runner.load_profile(&test_job(), "b").await, Ok(()));
+        assert!(!runner.has_profile(&test_job()));
+    }
+
+    #[tokio::test]
+    async fn the_default_reporter_refuses_a_blob_so_a_profile_job_fails_closed() {
+        let (job, _) = profile_job(&Profile::default());
+        let runner = AgentRunner::new(
+            test_config(Path::new("/jobs")),
+            Replies { cancel: false },
+            Redactor::default(),
+        );
+        assert_eq!(runner.load_profile(&job, "b").await, Err(LoadError::Fetch));
+    }
+
+    #[tokio::test]
+    async fn clearing_forgets_the_loaded_profile() -> Result<(), LoadError> {
+        let (job, reply) = profile_job(&Profile::default());
+        let runner = AgentRunner::new(
+            test_config(Path::new("/jobs")),
+            Served(reply),
+            Redactor::default(),
+        );
+        runner.load_profile(&job, "b").await?;
+        assert!(runner.has_profile(&job));
+        runner.clear_profile(&job);
+        assert!(!runner.has_profile(&job));
+        Ok(())
+    }
+
+    #[test]
+    fn the_argv_floor_is_part_of_the_profile_floor() {
+        for tool in DENIED_TOOLS {
+            assert!(crate::floor::FLOOR_DENY.contains(&tool), "missing {tool}");
+        }
     }
 
     #[test]

@@ -36,11 +36,40 @@ pub(crate) type JobPoller = Poller<DaemonRunner<GrpcReporter>>;
 pub(crate) struct DaemonRunner<R> {
     workspace: Workspace,
     agent: AgentRunner<R>,
+    box_name: String,
 }
 
 impl<R: Reporter> DaemonRunner<R> {
-    fn new(workspace: Workspace, agent: AgentRunner<R>) -> Self {
-        Self { workspace, agent }
+    fn new(workspace: Workspace, agent: AgentRunner<R>, box_name: &str) -> Self {
+        Self {
+            workspace,
+            agent,
+            box_name: box_name.to_owned(),
+        }
+    }
+
+    async fn load_profile(&self, job: &Job, mut shutdown: Shutdown) -> Result<(), RunError> {
+        let work = self.agent.load_profile(job, &self.box_name);
+        let guarded = tokio::select! {
+            guarded = self.agent.keep_alive(job, work) => guarded,
+            () = shutdown.requested() => {
+                self.agent.fail_job(job, ERR_SHUTDOWN).await;
+                return Err(RunError);
+            }
+        };
+        match guarded {
+            Ok(Ok(())) => Ok(()),
+            Ok(Err(err)) => {
+                tracing::warn!(reason = err.reason(), "job profile refused");
+                self.agent.fail_job(job, err.reason()).await;
+                Err(RunError)
+            }
+            Err(Interrupt::Cancelled) => {
+                self.agent.cancel_job(job).await;
+                Err(RunError)
+            }
+            Err(_) => Err(RunError),
+        }
     }
 
     async fn prepare(&self, job: &Job, mut shutdown: Shutdown) -> Result<PathBuf, RunError> {
@@ -96,10 +125,15 @@ impl<R: Reporter> DaemonRunner<R> {
 
 impl<R: Reporter + 'static> JobRunner for DaemonRunner<R> {
     async fn run(&self, job: Job, shutdown: Shutdown) -> Result<(), RunError> {
+        if let Err(stop) = self.load_profile(&job, shutdown.clone()).await {
+            self.agent.clear_profile(&job);
+            return Err(stop);
+        }
         let result = match self.prepare(&job, shutdown.clone()).await {
             Ok(path) => self.execute(&job, &path, shutdown).await,
             Err(stop) => Err(stop),
         };
+        self.agent.clear_profile(&job);
         if self.workspace.remove(&job.job_id, &job.repo).await.is_err() {
             tracing::warn!("job workspace could not be removed");
         }
@@ -190,6 +224,7 @@ pub(crate) fn build(
         AgentRunner::new(run, reporter, redactor)
             .with_hook_hub(hub)
             .with_launcher(launcher),
+        box_name,
     );
     Poller::with_channel(
         channel,
@@ -207,7 +242,12 @@ mod tests {
     use std::path::{Path, PathBuf};
     use std::time::Duration;
 
-    use fleet_proto::v1::{ReportJobReply, ReportJobRequest};
+    use std::sync::{Arc, Mutex, PoisonError};
+
+    use fleet_core::Profile;
+    use fleet_proto::v1::{
+        GetProfileBlobReply, GetProfileBlobRequest, ProfileRef, ReportJobReply, ReportJobRequest,
+    };
     use tokio::sync::mpsc;
     use tonic::Status;
 
@@ -273,6 +313,7 @@ mod tests {
                 .with_policy(RepoPolicy::new(Vec::<String>::new()).with_file_repos())
                 .with_git(&git, Duration::from_secs(10)),
             AgentRunner::new(cfg, Recorder(tx), Redactor::default()),
+            "",
         );
         let job = Job {
             job_id: "job1".into(),
@@ -343,6 +384,7 @@ mod tests {
         let runner = DaemonRunner::new(
             workspace(dir.path(), &git),
             AgentRunner::new(cfg, Stale(tx), Redactor::default()),
+            "",
         );
         let (_trigger, shutdown) = Shutdown::channel();
         let ended =
@@ -365,6 +407,7 @@ mod tests {
         let runner = DaemonRunner::new(
             workspace(dir.path(), &git),
             AgentRunner::new(cfg, Recorder(tx), Redactor::default()),
+            "",
         );
         let (_trigger, shutdown) = Shutdown::channel();
         let ended =
@@ -393,10 +436,200 @@ mod tests {
                 Recorder(tx),
                 Redactor::default(),
             ),
+            "",
         );
         let (_trigger, shutdown) = Shutdown::channel();
         assert!(runner.run(sample_job(), shutdown).await.is_err());
         assert!(!leftover.exists());
+        Ok(())
+    }
+
+    struct Blob {
+        reports: mpsc::UnboundedSender<ReportJobRequest>,
+        reply: Result<GetProfileBlobReply, Status>,
+        asked: Arc<Mutex<Vec<GetProfileBlobRequest>>>,
+    }
+
+    impl Reporter for Blob {
+        fn report(
+            &self,
+            request: ReportJobRequest,
+        ) -> impl Future<Output = Result<ReportJobReply, Status>> + Send {
+            let _ = self.reports.send(request);
+            std::future::ready(Ok(ReportJobReply::default()))
+        }
+
+        fn profile_blob(
+            &self,
+            request: GetProfileBlobRequest,
+        ) -> impl Future<Output = Result<GetProfileBlobReply, Status>> + Send {
+            self.asked
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .push(request);
+            std::future::ready(self.reply.clone())
+        }
+    }
+
+    struct Fixture {
+        runner: DaemonRunner<Blob>,
+        reports: mpsc::UnboundedReceiver<ReportJobRequest>,
+        asked: Arc<Mutex<Vec<GetProfileBlobRequest>>>,
+        marker: PathBuf,
+        _dir: tempfile::TempDir,
+    }
+
+    fn fixture(reply: Result<GetProfileBlobReply, Status>) -> Result<Fixture, std::io::Error> {
+        let dir = tempfile::TempDir::new()?;
+        let marker = dir.path().join("git-ran");
+        let git = script(dir.path(), &format!("touch {}\nexit 1", marker.display()))?;
+        let (tx, reports) = mpsc::unbounded_channel();
+        let asked = Arc::new(Mutex::new(Vec::new()));
+        let blob = Blob {
+            reports: tx,
+            reply,
+            asked: Arc::clone(&asked),
+        };
+        let runner = DaemonRunner::new(
+            workspace(dir.path(), &git),
+            AgentRunner::new(RunConfig::new("claude", false), blob, Redactor::default()),
+            "the-box",
+        );
+        Ok(Fixture {
+            runner,
+            reports,
+            asked,
+            marker,
+            _dir: dir,
+        })
+    }
+
+    fn profile_job(profile: &Profile) -> Job {
+        Job {
+            profile: Some(ProfileRef {
+                name: "p".into(),
+                version: 3,
+                hash: profile.hash().to_string(),
+            }),
+            ..sample_job()
+        }
+    }
+
+    fn reply_for(job: &Job, content: Vec<u8>) -> GetProfileBlobReply {
+        GetProfileBlobReply {
+            profile: job.profile.clone(),
+            content,
+        }
+    }
+
+    fn errors(reports: &mut mpsc::UnboundedReceiver<ReportJobRequest>) -> Vec<String> {
+        let mut out = Vec::new();
+        while let Ok(report) = reports.try_recv() {
+            out.extend(report.error);
+        }
+        out
+    }
+
+    #[tokio::test]
+    async fn a_tampered_profile_fails_the_job_before_the_clone() -> TestResult {
+        let profile = Profile {
+            model: Some("opus".into()),
+            ..Profile::default()
+        };
+        let job = profile_job(&profile);
+        let tampered = Profile {
+            model: Some("haiku".into()),
+            ..Profile::default()
+        };
+        let mut fx = fixture(Ok(reply_for(&job, tampered.canonical_json())))?;
+        let (_trigger, shutdown) = Shutdown::channel();
+        assert!(fx.runner.run(job, shutdown).await.is_err());
+        assert_eq!(
+            errors(&mut fx.reports),
+            vec!["profile invalid: profile hash does not match the job".to_owned()]
+        );
+        assert!(!fx.marker.exists());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_failed_blob_fetch_fails_the_job_before_the_clone() -> TestResult {
+        let profile = Profile::default();
+        let mut fx = fixture(Err(Status::permission_denied("no")))?;
+        let (_trigger, shutdown) = Shutdown::channel();
+        assert!(
+            fx.runner
+                .run(profile_job(&profile), shutdown)
+                .await
+                .is_err()
+        );
+        assert_eq!(
+            errors(&mut fx.reports),
+            vec!["profile invalid: profile could not be fetched".to_owned()]
+        );
+        assert!(!fx.marker.exists());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn an_invalid_profile_fails_the_job_before_the_clone() -> TestResult {
+        let profile = Profile {
+            model: Some(String::new()),
+            ..Profile::default()
+        };
+        let job = profile_job(&profile);
+        let mut fx = fixture(Ok(reply_for(&job, profile.canonical_json())))?;
+        let (_trigger, shutdown) = Shutdown::channel();
+        assert!(fx.runner.run(job, shutdown).await.is_err());
+        assert_eq!(
+            errors(&mut fx.reports),
+            vec!["profile invalid: profile model name is not allowed".to_owned()]
+        );
+        assert!(!fx.marker.exists());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_verified_profile_is_fetched_with_the_lease_and_reaches_the_clone() -> TestResult {
+        let profile = Profile::default();
+        let job = profile_job(&profile);
+        let mut fx = fixture(Ok(reply_for(&job, profile.canonical_json())))?;
+        let (_trigger, shutdown) = Shutdown::channel();
+        assert!(fx.runner.run(job, shutdown).await.is_err());
+        assert!(fx.marker.exists());
+        assert_eq!(errors(&mut fx.reports), vec![ERR_WORKSPACE.to_owned()]);
+        let asked = fx.asked.lock().unwrap_or_else(PoisonError::into_inner);
+        assert_eq!(asked.len(), 1);
+        assert_eq!(asked[0].job_id, "job1");
+        assert_eq!(asked[0].attempt, 1);
+        assert_eq!(asked[0].r#box, "the-box");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_job_without_a_profile_fetches_nothing() -> TestResult {
+        let fx = fixture(Err(Status::internal("must not be called")))?;
+        let (_trigger, shutdown) = Shutdown::channel();
+        assert!(fx.runner.run(sample_job(), shutdown).await.is_err());
+        assert!(fx.marker.exists());
+        assert_eq!(
+            fx.asked
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .len(),
+            0
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn the_kept_profile_is_cleared_when_the_job_ends() -> TestResult {
+        let profile = Profile::default();
+        let job = profile_job(&profile);
+        let fx = fixture(Ok(reply_for(&job, profile.canonical_json())))?;
+        let (_trigger, shutdown) = Shutdown::channel();
+        assert!(fx.runner.run(job.clone(), shutdown).await.is_err());
+        assert!(!fx.runner.agent.has_profile(&job));
         Ok(())
     }
 }

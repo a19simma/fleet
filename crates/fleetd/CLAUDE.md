@@ -13,6 +13,11 @@
 - **List every exit arm of a loop with several, and test each one for the heartbeat and the group kill.** The arms are stdout EOF, child exit, deadline, shutdown and report error. A17 failed twice because each retry fixed the named arm and left a sibling: group disarmed after wait, report awaited inside `select`, no heartbeat arm after stdout EOF.
 - **A change to the spawn path needs every test binary that spawns the fake agent.** `grep -l claude_bin crates/fleetd/tests/*.rs` lists them, and `daemon_jobs` and `e2e_jobs` are among them. TEL-A3 ran only `telemetry` and `runner::` tests and went red on both in the independent verify.
 
+## Profile jobs
+
+- **`Reporter::profile_blob` defaults to `UNIMPLEMENTED`.** A test reporter that omits it makes any Job with a `profile` fail closed with `profile invalid: profile could not be fetched`. A test that needs a blob implements it, as `Served` in `runner.rs` and `Blob` in `jobs.rs` do.
+- **A new `FleetWorker` stub needs `get_profile_blob`.** `daemon_jobs` serves a real blob through `Worker::blob`; the other stubs return `unimplemented`.
+
 ## Askpass test
 
 - **Own test file.** `tests/askpass_process.rs` runs the `fleetd askpass` binary, so it stays alone in its binary.

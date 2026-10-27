@@ -1,13 +1,17 @@
 //! A validated Profile laid over the default [`Bundle`], as a pure function.
 //!
 //! No IO, clock or environment is read here. [`apply_profile`] returns the effective bundle,
-//! the argv pieces and the final prompt (ADR-0034). Nothing calls it yet.
+//! the argv pieces and the final prompt (ADR-0034). [`load`] first checks the blob the server
+//! sent against the Job's `ProfileRef` and fails closed (ADR-0035): the runner calls it before
+//! the clone and never falls back to the default bundle.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::path::PathBuf;
 
-use fleet_core::Profile;
+use fleet_core::{Profile, ProfileHash, ProfileInvalid};
+use fleet_proto::MAX_PROFILE_JSON_BYTES;
+use fleet_proto::v1::{GetProfileBlobReply, ProfileRef};
 use serde_json::{Map, Value, json};
 
 use crate::agent_config::{Bundle, BundleError};
@@ -62,6 +66,8 @@ pub struct Applied {
     pub prompt: String,
     /// The allow entries the Floor removed, without repeats.
     pub dropped_allows: Vec<String>,
+    /// The permission mode of the Effective settings, always [`floor::PERMISSION_MODE`].
+    pub permission_mode: &'static str,
 }
 
 fn dollars(cents: u64) -> String {
@@ -234,7 +240,126 @@ pub fn apply_profile(
         argv,
         prompt,
         dropped_allows: effective.dropped_allows,
+        permission_mode: effective.permission_mode,
     })
+}
+
+/// Why a Profile blob was refused. Every reason is a fixed message that starts with
+/// `profile invalid:` and never echoes the blob, the name or the hash.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum LoadError {
+    /// The blob could not be fetched from the server.
+    Fetch,
+    /// The reply names another Profile than the Job's `ProfileRef`.
+    Mismatch,
+    /// The hash in the Job's `ProfileRef` is not 64 lowercase hex characters.
+    RefHash,
+    /// The blob is longer than [`MAX_PROFILE_JSON_BYTES`].
+    TooLarge,
+    /// The blob is not Profile JSON.
+    Malformed,
+    /// The blob is not the canonical JSON of its Profile.
+    NotCanonical,
+    /// The Profile hash differs from the hash in the Job's `ProfileRef`.
+    HashMismatch,
+    /// The shared validator refused the Profile.
+    Invalid(ProfileInvalid),
+    /// The Profile could not be laid over the bundle.
+    Apply(ApplyError),
+}
+
+fn invalid_reason(err: ProfileInvalid) -> &'static str {
+    match err {
+        ProfileInvalid::TooManyEntries => "profile invalid: profile holds too many files",
+        ProfileInvalid::TotalTooLarge => "profile invalid: profile text is too large",
+        ProfileInvalid::FileTooLarge => "profile invalid: a profile file is too large",
+        ProfileInvalid::NulByte => "profile invalid: profile text holds a NUL byte",
+        ProfileInvalid::Model => "profile invalid: profile model name is not allowed",
+        ProfileInvalid::MaxTurns => "profile invalid: profile max_turns is out of range",
+        ProfileInvalid::Budget => "profile invalid: profile max_budget_usd is out of range",
+        ProfileInvalid::Path => "profile invalid: a profile path or skill name is not allowed",
+        ProfileInvalid::Duplicate => "profile invalid: a profile path or skill name is repeated",
+        ProfileInvalid::Template => "profile invalid: profile prompt_template is not allowed",
+        ProfileInvalid::Rule => "profile invalid: a profile permission rule is not allowed",
+        ProfileInvalid::McpRule => "profile invalid: a profile permission rule names an MCP tool",
+        ProfileInvalid::CredentialPath => {
+            "profile invalid: a profile path or rule references a credential location"
+        }
+        ProfileInvalid::EnvName => "profile invalid: a profile env flag name is not allowed",
+        ProfileInvalid::ModelMismatch => {
+            "profile invalid: profile settings.model differs from model"
+        }
+        ProfileInvalid::SecretLike => "profile invalid: profile text looks like a secret",
+        _ => "profile invalid: profile failed validation",
+    }
+}
+
+impl LoadError {
+    /// The fixed reason a failed Job reports.
+    #[must_use]
+    pub fn reason(&self) -> &'static str {
+        match self {
+            Self::Fetch => "profile invalid: profile could not be fetched",
+            Self::Mismatch => "profile invalid: server sent another profile than the job names",
+            Self::RefHash => "profile invalid: job profile hash is malformed",
+            Self::TooLarge => "profile invalid: profile blob is too large",
+            Self::Malformed => "profile invalid: profile blob is not profile JSON",
+            Self::NotCanonical => "profile invalid: profile blob is not canonical",
+            Self::HashMismatch => "profile invalid: profile hash does not match the job",
+            Self::Invalid(err) => invalid_reason(*err),
+            Self::Apply(ApplyError::Collision) => {
+                "profile invalid: profile paths collide when compared without case"
+            }
+            Self::Apply(ApplyError::ImportPath) => {
+                "profile invalid: profile context file path holds whitespace"
+            }
+            Self::Apply(_) => "profile invalid: profile could not be laid over the bundle",
+        }
+    }
+}
+
+impl fmt::Display for LoadError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.reason())
+    }
+}
+
+impl std::error::Error for LoadError {}
+
+/// Checks the blob `reply` against the Job's `expected` reference, then lays the Profile over
+/// `default` with [`apply_profile`].
+///
+/// The reply must name `expected` exactly. The blob must fit [`MAX_PROFILE_JSON_BYTES`], parse
+/// as a Profile, equal that Profile's canonical JSON and hash to the hash in `expected`. The
+/// shared validator runs last, before the overlay, so fleetd does not trust the server's check.
+///
+/// # Errors
+///
+/// Returns the [`LoadError`] of the first check that fails.
+pub fn load(
+    expected: &ProfileRef,
+    reply: &GetProfileBlobReply,
+    default: &Bundle,
+    ceilings: &BoxCeilings,
+    job_prompt: &str,
+) -> Result<Applied, LoadError> {
+    if reply.profile.as_ref() != Some(expected) {
+        return Err(LoadError::Mismatch);
+    }
+    let want = ProfileHash::from_hex(&expected.hash).map_err(|_| LoadError::RefHash)?;
+    if reply.content.len() > MAX_PROFILE_JSON_BYTES {
+        return Err(LoadError::TooLarge);
+    }
+    let profile = Profile::from_json(&reply.content).map_err(|_| LoadError::Malformed)?;
+    if profile.canonical_json() != reply.content {
+        return Err(LoadError::NotCanonical);
+    }
+    if profile.hash() != want {
+        return Err(LoadError::HashMismatch);
+    }
+    profile.validate().map_err(LoadError::Invalid)?;
+    apply_profile(&profile, default, ceilings, job_prompt).map_err(LoadError::Apply)
 }
 
 #[cfg(test)]
@@ -452,5 +577,173 @@ mod tests {
             ..Profile::default()
         };
         assert_eq!(run(&profile), Err(ApplyError::Bundle(BundleError::TooMany)));
+    }
+
+    fn blob(profile: &Profile) -> (ProfileRef, GetProfileBlobReply) {
+        let reference = ProfileRef {
+            name: "p".to_owned(),
+            version: 1,
+            hash: profile.hash().to_string(),
+        };
+        let reply = GetProfileBlobReply {
+            profile: Some(reference.clone()),
+            content: profile.canonical_json(),
+        };
+        (reference, reply)
+    }
+
+    fn loaded(reference: &ProfileRef, reply: &GetProfileBlobReply) -> Result<Applied, LoadError> {
+        load(reference, reply, &Bundle::default(), &ceilings(), "fix it")
+    }
+
+    #[test]
+    fn a_blob_that_matches_its_ref_is_applied_with_the_floor_last() -> Result<(), LoadError> {
+        let (reference, reply) = blob(&full());
+        let applied = loaded(&reference, &reply)?;
+        assert_eq!(applied.permission_mode, floor::PERMISSION_MODE);
+        assert_eq!(applied.prompt, "PRE do: fix it!");
+        assert_eq!(applied.dropped_allows, vec!["Bash(git push*)".to_owned()]);
+        assert!(applied.argv.windows(2).any(|w| w == ["--max-turns", "50"]));
+        Ok(())
+    }
+
+    #[test]
+    fn a_tampered_blob_fails_on_the_hash() {
+        let (reference, mut reply) = blob(&full());
+        let other = Profile {
+            model: Some("haiku".to_owned()),
+            ..full()
+        };
+        reply.content = other.canonical_json();
+        assert_eq!(loaded(&reference, &reply), Err(LoadError::HashMismatch));
+    }
+
+    #[test]
+    fn a_flipped_byte_never_applies() {
+        let (reference, reply) = blob(&full());
+        for at in 0..reply.content.len() {
+            let mut tampered = reply.clone();
+            tampered.content[at] ^= 1;
+            assert!(loaded(&reference, &tampered).is_err(), "byte {at}");
+        }
+    }
+
+    #[test]
+    fn a_blob_for_another_ref_is_refused() {
+        let (reference, reply) = blob(&full());
+        for change in [
+            |r: &mut ProfileRef| r.version = 2,
+            |r: &mut ProfileRef| r.name = "q".to_owned(),
+            |r: &mut ProfileRef| r.hash = "0".repeat(64),
+        ] {
+            let mut asked = reference.clone();
+            change(&mut asked);
+            assert_eq!(loaded(&asked, &reply), Err(LoadError::Mismatch));
+        }
+        let mut bare = reply;
+        bare.profile = None;
+        assert_eq!(loaded(&reference, &bare), Err(LoadError::Mismatch));
+    }
+
+    #[test]
+    fn a_malformed_hash_in_the_ref_is_refused() {
+        let (mut reference, mut reply) = blob(&full());
+        for hash in ["", "abc", &"A".repeat(64), &"g".repeat(64)] {
+            hash.clone_into(&mut reference.hash);
+            reply.profile = Some(reference.clone());
+            assert_eq!(loaded(&reference, &reply), Err(LoadError::RefHash));
+        }
+    }
+
+    #[test]
+    fn a_blob_over_the_cap_is_refused() {
+        let (reference, mut reply) = blob(&full());
+        reply.content = vec![b' '; MAX_PROFILE_JSON_BYTES + 1];
+        assert_eq!(loaded(&reference, &reply), Err(LoadError::TooLarge));
+    }
+
+    #[test]
+    fn a_blob_that_is_not_profile_json_is_refused() {
+        let (reference, mut reply) = blob(&full());
+        for text in ["", "[]", "{\"nope\":1}", "not json"] {
+            reply.content = text.as_bytes().to_vec();
+            assert_eq!(loaded(&reference, &reply), Err(LoadError::Malformed));
+        }
+    }
+
+    #[test]
+    fn a_non_canonical_blob_is_refused() {
+        let (reference, mut reply) = blob(&full());
+        reply.content = serde_json::to_vec_pretty(&full()).unwrap_or_default();
+        assert_eq!(loaded(&reference, &reply), Err(LoadError::NotCanonical));
+    }
+
+    #[test]
+    fn a_profile_the_validator_refuses_fails_even_with_a_matching_hash() {
+        let profile = Profile {
+            model: Some(String::new()),
+            ..Profile::default()
+        };
+        let (reference, reply) = blob(&profile);
+        assert_eq!(
+            loaded(&reference, &reply),
+            Err(LoadError::Invalid(ProfileInvalid::Model))
+        );
+    }
+
+    #[test]
+    fn a_profile_that_cannot_be_laid_over_the_bundle_fails() {
+        let profile = Profile {
+            context_files: vec![file("a b.md", "1")],
+            ..Profile::default()
+        };
+        let (reference, reply) = blob(&profile);
+        assert_eq!(
+            loaded(&reference, &reply),
+            Err(LoadError::Apply(ApplyError::ImportPath))
+        );
+    }
+
+    #[test]
+    fn every_reason_starts_with_profile_invalid_and_keeps_the_validator_text() {
+        let all = [
+            ProfileInvalid::TooManyEntries,
+            ProfileInvalid::TotalTooLarge,
+            ProfileInvalid::FileTooLarge,
+            ProfileInvalid::NulByte,
+            ProfileInvalid::Model,
+            ProfileInvalid::MaxTurns,
+            ProfileInvalid::Budget,
+            ProfileInvalid::Path,
+            ProfileInvalid::Duplicate,
+            ProfileInvalid::Template,
+            ProfileInvalid::Rule,
+            ProfileInvalid::McpRule,
+            ProfileInvalid::CredentialPath,
+            ProfileInvalid::EnvName,
+            ProfileInvalid::ModelMismatch,
+            ProfileInvalid::SecretLike,
+        ];
+        for err in all {
+            assert_eq!(
+                LoadError::Invalid(err).reason(),
+                format!("profile invalid: {err}")
+            );
+        }
+        for err in [
+            LoadError::Fetch,
+            LoadError::Mismatch,
+            LoadError::RefHash,
+            LoadError::TooLarge,
+            LoadError::Malformed,
+            LoadError::NotCanonical,
+            LoadError::HashMismatch,
+            LoadError::Apply(ApplyError::Collision),
+            LoadError::Apply(ApplyError::ImportPath),
+            LoadError::Apply(ApplyError::Bundle(BundleError::TooMany)),
+        ] {
+            assert!(err.reason().starts_with("profile invalid: "));
+            assert_eq!(err.to_string(), err.reason());
+        }
     }
 }

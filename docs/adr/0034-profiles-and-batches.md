@@ -62,7 +62,7 @@ Whether deny beats allow in the real claude is unverified: the probe on the dev 
 
 ### Overlay
 
-`fleetd::profile_apply::apply_profile` lays a validated Profile over the default bundle. It is built, not wired. Inferred, not part of the design: the rules below.
+`fleetd::profile_apply::apply_profile` lays a validated Profile over the box bundle. `fleetd::profile_apply::load` checks the blob against the Job's `ProfileRef` first, and the runner calls it before the clone (ADR-0035). Inferred, not part of the design: the rules below.
 
 - `CLAUDE.md` is replaced by the Profile `claude_md` when set. Each context file is written at `.claude/ctx/<path>` inside the bundle root and imported by an `@.claude/ctx/<path>` line appended to `CLAUDE.md`, so the import resolves from the file that holds it. A context path with whitespace is refused, because an import line cannot carry it.
 - Skill files are written at `skills/<name>/<path>`.

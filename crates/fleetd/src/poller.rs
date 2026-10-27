@@ -21,7 +21,10 @@ use std::time::Duration;
 
 use fleet_proto::MAX_PROFILE_MESSAGE_BYTES;
 use fleet_proto::v1::fleet_worker_client::FleetWorkerClient;
-use fleet_proto::v1::{ClaimJobRequest, Job, ReportJobReply, ReportJobRequest};
+use fleet_proto::v1::{
+    ClaimJobRequest, GetProfileBlobReply, GetProfileBlobRequest, Job, ReportJobReply,
+    ReportJobRequest,
+};
 use tokio::sync::watch;
 use tonic::codegen::http::Uri;
 use tonic::metadata::MetadataValue;
@@ -220,6 +223,16 @@ impl Reporter for GrpcReporter {
     async fn report(&self, request: ReportJobRequest) -> Result<ReportJobReply, Status> {
         let mut client = self.client.lock().await;
         backstop(client.report_job(request))
+            .await
+            .map(tonic::Response::into_inner)
+    }
+
+    async fn profile_blob(
+        &self,
+        request: GetProfileBlobRequest,
+    ) -> Result<GetProfileBlobReply, Status> {
+        let mut client = self.client.lock().await;
+        backstop(client.get_profile_blob(request))
             .await
             .map(tonic::Response::into_inner)
     }

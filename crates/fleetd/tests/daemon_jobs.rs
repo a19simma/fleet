@@ -9,10 +9,11 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
+use fleet_core::Profile;
 use fleet_proto::v1::fleet_worker_server::{FleetWorker, FleetWorkerServer};
 use fleet_proto::v1::{
     ClaimJobReply, ClaimJobRequest, GetProfileBlobReply, GetProfileBlobRequest, Job, JobState,
-    ReportJobReply, ReportJobRequest,
+    ProfileRef, ReportJobReply, ReportJobRequest,
 };
 use fleetd::{Config, forward_hook, run_with_env};
 use tempfile::TempDir;
@@ -60,6 +61,24 @@ struct Worker {
     repeat: bool,
     claims: AtomicUsize,
     reports: mpsc::UnboundedSender<(String, ReportJobRequest)>,
+    blob: Option<GetProfileBlobReply>,
+    blob_requests: Mutex<Vec<(String, GetProfileBlobRequest)>>,
+}
+
+struct Served {
+    reference: ProfileRef,
+    content: Vec<u8>,
+}
+
+fn served(profile: &Profile, content: Vec<u8>) -> Served {
+    Served {
+        reference: ProfileRef {
+            name: "p".into(),
+            version: 1,
+            hash: profile.hash().to_string(),
+        },
+        content,
+    }
 }
 
 fn bearer(metadata: &tonic::metadata::MetadataMap) -> String {
@@ -100,9 +119,19 @@ impl FleetWorker for Stub {
 
     async fn get_profile_blob(
         &self,
-        _request: Request<GetProfileBlobRequest>,
+        request: Request<GetProfileBlobRequest>,
     ) -> Result<Response<GetProfileBlobReply>, Status> {
-        Err(Status::unimplemented("unused"))
+        let auth = bearer(request.metadata());
+        self.0
+            .blob_requests
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .push((auth, request.into_inner()));
+        self.0
+            .blob
+            .clone()
+            .map(Response::new)
+            .ok_or_else(|| Status::unimplemented("unused"))
     }
 
     async fn report_job(
@@ -164,6 +193,16 @@ async fn launch_cfg(
     repo: Option<String>,
     extra: &str,
 ) -> Result<Launched, Box<dyn std::error::Error>> {
+    launch_full(dir, agent, repo, extra, None).await
+}
+
+async fn launch_full(
+    dir: &TempDir,
+    agent: &str,
+    repo: Option<String>,
+    extra: &str,
+    profile: Option<Served>,
+) -> Result<Launched, Box<dyn std::error::Error>> {
     let origin = dir.path().join("origin.git");
     let seed = dir.path().join("seed");
     std::fs::create_dir(&origin)?;
@@ -193,11 +232,17 @@ async fn launch_cfg(
             base_ref: "main".into(),
             open_pr: true,
             attempt: 1,
+            profile: profile.as_ref().map(|served| served.reference.clone()),
             ..Job::default()
         })),
         reports,
         repeat: repo.is_some(),
         claims: AtomicUsize::new(0),
+        blob: profile.map(|served| GetProfileBlobReply {
+            profile: Some(served.reference),
+            content: served.content,
+        }),
+        blob_requests: Mutex::new(Vec::new()),
     });
     let listener = TcpListener::bind(("127.0.0.1", 0)).await?;
     let url = format!("http://{}", listener.local_addr()?);
@@ -325,6 +370,115 @@ async fn the_configured_caps_reach_the_agent_argv() -> TestResult {
         let _ = stop.send(());
         tokio::time::timeout(Duration::from_secs(30), daemon).await???;
         server.abort();
+        Ok(())
+    }))
+    .await
+}
+
+async fn terminal_of(
+    inbox: &mut mpsc::UnboundedReceiver<(String, ReportJobRequest)>,
+) -> Result<ReportJobRequest, Box<dyn std::error::Error>> {
+    tokio::time::timeout(Duration::from_secs(60), async {
+        while let Some((_, report)) = inbox.recv().await {
+            if report.terminal_state.is_some() {
+                return Some(report);
+            }
+        }
+        None
+    })
+    .await?
+    .ok_or_else(|| "no terminal report".into())
+}
+
+#[tokio::test]
+async fn a_profile_job_runs_with_the_fetched_profile_over_the_wire() -> TestResult {
+    common::bounded(Box::pin(async {
+        let dir = TempDir::new()?;
+        let profile = Profile {
+            prompt_prefix: Some("PRE ".into()),
+            model: Some("opus".into()),
+            max_turns: Some(3),
+            ..Profile::default()
+        };
+        let Launched {
+            mut inbox,
+            stop,
+            daemon,
+            server,
+            origin,
+            box_name,
+            worker,
+        } = launch_full(
+            &dir,
+            ARGV_AGENT,
+            None,
+            "max_turns = 7\n",
+            Some(served(&profile, profile.canonical_json())),
+        )
+        .await?;
+        let terminal = terminal_of(&mut inbox).await?;
+        assert_eq!(terminal.terminal_state, Some(JobState::Succeeded.into()));
+        let argv = git(&origin, &["show", "swarm/job1:hello.txt"])?;
+        assert!(argv.contains("PRE add hello.txt\n"), "{argv}");
+        assert!(argv.contains("--model\nopus\n"), "{argv}");
+        assert!(argv.contains("--permission-mode\ndontAsk\n"), "{argv}");
+        assert!(argv.contains("--max-turns\n3\n"), "{argv}");
+        let asked = worker
+            .blob_requests
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone();
+        assert_eq!(asked.len(), 1);
+        assert_eq!(asked[0].0, format!("Bearer {TOKEN}"));
+        assert_eq!(asked[0].1.job_id, "job1");
+        assert_eq!(asked[0].1.attempt, 1);
+        assert_eq!(asked[0].1.r#box, box_name);
+        let _ = stop.send(());
+        tokio::time::timeout(Duration::from_secs(30), daemon).await???;
+        server.abort();
+        Ok(())
+    }))
+    .await
+}
+
+#[tokio::test]
+async fn a_tampered_profile_blob_fails_the_job_and_the_agent_never_runs() -> TestResult {
+    common::bounded(Box::pin(async {
+        let dir = TempDir::new()?;
+        let profile = Profile {
+            model: Some("opus".into()),
+            ..Profile::default()
+        };
+        let tampered = Profile {
+            model: Some("haiku".into()),
+            ..Profile::default()
+        };
+        let Launched {
+            mut inbox,
+            stop,
+            daemon,
+            server,
+            origin,
+            ..
+        } = launch_full(
+            &dir,
+            AGENT,
+            None,
+            "",
+            Some(served(&profile, tampered.canonical_json())),
+        )
+        .await?;
+        let terminal = terminal_of(&mut inbox).await?;
+        assert_eq!(terminal.terminal_state, Some(JobState::Failed.into()));
+        assert_eq!(
+            terminal.error.as_deref(),
+            Some("profile invalid: profile hash does not match the job")
+        );
+        let _ = stop.send(());
+        tokio::time::timeout(Duration::from_secs(30), daemon).await???;
+        server.abort();
+        let branches = git(&origin, &["branch", "--list", "swarm/*"])?;
+        assert_eq!(branches.trim(), "");
         Ok(())
     }))
     .await
