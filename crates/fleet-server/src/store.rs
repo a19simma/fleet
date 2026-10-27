@@ -1026,6 +1026,30 @@ impl Store {
         batches::submit(&self.pool, request).await
     }
 
+    /// Returns a batch with its jobs in profile order, each with its profile and telemetry
+    /// summary.
+    ///
+    /// A job's prompt is cleared because the batch carries it once. The batch holds at most
+    /// 16 jobs.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StoreError::InvalidBatch`] when `batch_id` is not a job-shaped id,
+    /// [`StoreError::NotFound`] when no batch has it and [`StoreError::Database`] when a
+    /// query fails.
+    pub async fn get_batch(
+        &self,
+        batch_id: &str,
+    ) -> Result<fleet_proto::v1::GetBatchReply, StoreError> {
+        let (mut reply, ids) = batches::get_head(&self.pool, batch_id).await?;
+        for id in &ids {
+            let mut job = self.get_job_with_summary(id).await?;
+            job.prompt.clear();
+            reply.jobs.push(job);
+        }
+        Ok(reply)
+    }
+
     /// Reads the profile blob a running job pins, authorised against its lease.
     ///
     /// The job must be `RUNNING` at `attempt` on `box_name` with an unexpired lease. A job

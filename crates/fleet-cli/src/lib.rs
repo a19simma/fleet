@@ -1,5 +1,6 @@
 //! The `fleet` command line client: job submission and inspection over gRPC.
 
+pub mod batch;
 pub mod config;
 pub mod list;
 pub mod logs;
@@ -14,6 +15,7 @@ use std::time::Duration;
 
 use clap::{Parser, Subcommand};
 use fleet_proto::MAX_PROFILE_MESSAGE_BYTES;
+use fleet_proto::v1::fleet_batches_client::FleetBatchesClient;
 use fleet_proto::v1::fleet_jobs_client::FleetJobsClient;
 use fleet_proto::v1::fleet_profiles_client::FleetProfilesClient;
 use fleet_proto::v1::fleet_query_client::FleetQueryClient;
@@ -132,11 +134,27 @@ pub enum Command {
         #[arg(long, value_enum)]
         by: Option<StatsBy>,
     },
+    /// Compare the jobs of a batch, one column per profile.
+    Batch {
+        /// The batch action.
+        #[command(subcommand)]
+        action: BatchAction,
+    },
     /// Create, list and show named agent profiles.
     Profile {
         /// The profile action.
         #[command(subcommand)]
         action: ProfileAction,
+    },
+}
+
+/// A `fleet batch` action.
+#[derive(Debug, Subcommand)]
+pub enum BatchAction {
+    /// Show one column per profile: outcome, cost, turns, times, tool figures and commands.
+    Show {
+        /// Batch id.
+        id: String,
     },
 }
 
@@ -316,6 +334,7 @@ struct Session {
     jobs: Client,
     query: QueryClient,
     profiles: profile::ProfilesClient,
+    batches: batch::BatchesClient,
 }
 
 /// Adds the bearer token to every request.
@@ -446,8 +465,10 @@ async fn session(
             .max_decoding_message_size(MAX_DECODE_BYTES),
         query: FleetQueryClient::with_interceptor(channel.clone(), token.clone())
             .max_decoding_message_size(MAX_DECODE_BYTES),
-        profiles: FleetProfilesClient::with_interceptor(channel, token)
+        profiles: FleetProfilesClient::with_interceptor(channel.clone(), token.clone())
             .max_decoding_message_size(MAX_PROFILE_MESSAGE_BYTES),
+        batches: FleetBatchesClient::with_interceptor(channel, token)
+            .max_decoding_message_size(MAX_DECODE_BYTES),
     })
 }
 
@@ -458,6 +479,54 @@ async fn cancel(mut client: Client, id: String, out: &mut impl Write) -> Result<
         .into_inner();
     writeln!(out, "{}\t{}", sanitize(&job.job_id), state_name(&job))?;
     Ok(())
+}
+
+async fn list_jobs(
+    client: &mut Client,
+    state: Option<JobState>,
+    limit: u32,
+    out: &mut impl Write,
+) -> Result<(), CliError> {
+    let reply = client
+        .list_jobs(ListJobsRequest {
+            state: state.map(|s| s as i32),
+            limit,
+        })
+        .await?
+        .into_inner();
+    for job in &reply.jobs {
+        writeln!(
+            out,
+            "{}\t{}\t{}\t{}",
+            sanitize(&job.job_id),
+            state_name(job),
+            sanitize(&job.repo),
+            sanitize(&job.phase)
+        )?;
+    }
+    if usize::try_from(limit).is_ok_and(|n| n == reply.jobs.len()) {
+        writeln!(
+            out,
+            "-- showing {limit} jobs, the limit; raise --limit to see more --"
+        )?;
+    }
+    Ok(())
+}
+
+async fn run_batch(
+    action: BatchAction,
+    server: Option<String>,
+    insecure: bool,
+    lookup: impl Fn(&str) -> Option<String>,
+    timeouts: bool,
+    out: &mut impl Write,
+) -> Result<(), CliError> {
+    match action {
+        BatchAction::Show { id } => {
+            let mut session = session(server, insecure, lookup, timeouts).await?;
+            batch::show(&mut session.batches, &mut session.jobs, id, out).await
+        }
+    }
 }
 
 async fn run_profile(
@@ -553,29 +622,7 @@ pub async fn run_with(
         Command::Jobs { state, limit } => {
             let state = state.as_deref().map(parse_state).transpose()?;
             let mut client = session(server, insecure, lookup, timeouts).await?.jobs;
-            let reply = client
-                .list_jobs(ListJobsRequest {
-                    state: state.map(|s| s as i32),
-                    limit,
-                })
-                .await?
-                .into_inner();
-            for job in &reply.jobs {
-                writeln!(
-                    out,
-                    "{}\t{}\t{}\t{}",
-                    sanitize(&job.job_id),
-                    state_name(job),
-                    sanitize(&job.repo),
-                    sanitize(&job.phase)
-                )?;
-            }
-            if usize::try_from(limit).is_ok_and(|n| n == reply.jobs.len()) {
-                writeln!(
-                    out,
-                    "-- showing {limit} jobs, the limit; raise --limit to see more --"
-                )?;
-            }
+            list_jobs(&mut client, state, limit, out).await?;
         }
         Command::Status { id, tools } => {
             let mut client = session(server, insecure, lookup, timeouts).await?.jobs;
@@ -601,6 +648,9 @@ pub async fn run_with(
             let since = stats::parse_since(&since, stats::now_seconds())?;
             let mut client = session(server, insecure, lookup, timeouts).await?.jobs;
             stats::stats(&mut client, since, repo, box_name, by, out).await?;
+        }
+        Command::Batch { action } => {
+            run_batch(action, server, insecure, lookup, timeouts, out).await?;
         }
         Command::Profile { action } => {
             run_profile(action, server, insecure, lookup, timeouts, stdin, out).await?;

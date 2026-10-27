@@ -29,6 +29,7 @@ service FleetProfiles {
 
 service FleetBatches {
   rpc SubmitBatch(SubmitBatchRequest) returns (SubmitBatchReply);
+  rpc GetBatch(GetBatchRequest) returns (GetBatchReply);
 }
 
 service FleetWorker {
@@ -215,6 +216,20 @@ message SubmitBatchReply {
   string batch_id = 1;
   repeated string job_ids = 2;
   bool created = 3;
+}
+
+message GetBatchRequest {
+  string batch_id = 1;
+}
+
+message GetBatchReply {
+  string batch_id = 1;
+  string prompt = 2;
+  string repo = 3;
+  string base_sha = 4;
+  uint32 repeats = 5;
+  uint64 created_at_ms = 6;
+  repeated Job jobs = 7;
 }
 
 message GetJobRequest {

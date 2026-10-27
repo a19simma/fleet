@@ -8,7 +8,7 @@ use std::net::SocketAddr;
 
 use fleet_proto::v1::fleet_batches_client::FleetBatchesClient;
 use fleet_proto::v1::fleet_jobs_client::FleetJobsClient;
-use fleet_proto::v1::{ListJobsRequest, SubmitBatchRequest};
+use fleet_proto::v1::{GetBatchRequest, ListJobsRequest, SubmitBatchRequest};
 use fleet_server::auth::BearerAuth;
 use fleet_server::config::Token;
 use fleet_server::service::router;
@@ -540,4 +540,94 @@ async fn concurrent_submits_with_one_key_make_one_batch(pool: PgPool) {
     assert_eq!(replies.iter().filter(|r| r.created).count(), 1);
     assert_eq!(count(&pool, "batch").await, 1);
     assert_eq!(count(&pool, "jobs").await, 2);
+}
+
+fn get(batch_id: &str) -> GetBatchRequest {
+    GetBatchRequest {
+        batch_id: batch_id.to_owned(),
+    }
+}
+
+#[sqlx::test]
+async fn get_batch_returns_jobs_in_profile_order_with_summary_and_no_prompt(pool: PgPool) {
+    let store = store(pool.clone()).await;
+    two_profiles(&store).await;
+    let addr = serve(&store);
+    let mut client = batches(addr, as_client);
+    let made = client
+        .submit_batch(request("k1", &["beta", "alpha"]))
+        .await
+        .unwrap()
+        .into_inner();
+    sqlx::query(
+        "INSERT INTO job_summary (job_id, turns, cost_est_usd, complete, missing) \
+         VALUES ($1, 7, 0.25, false, ARRAY['hooks'])",
+    )
+    .bind(&made.job_ids[1])
+    .execute(&pool)
+    .await
+    .unwrap();
+    let got = client
+        .get_batch(get(&made.batch_id))
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(got.batch_id, made.batch_id);
+    assert_eq!(got.prompt, "fix the bug");
+    assert_eq!(got.repo, REPO);
+    assert_eq!(got.base_sha, SHA);
+    assert_eq!(got.repeats, 1);
+    assert!(got.created_at_ms > 0);
+    let ids: Vec<&str> = got.jobs.iter().map(|j| j.job_id.as_str()).collect();
+    assert_eq!(
+        ids,
+        made.job_ids.iter().map(String::as_str).collect::<Vec<_>>()
+    );
+    let names: Vec<&str> = got
+        .jobs
+        .iter()
+        .map(|j| j.profile.as_ref().unwrap().name.as_str())
+        .collect();
+    assert_eq!(names, ["beta", "alpha"]);
+    assert!(got.jobs.iter().all(|j| j.prompt.is_empty()));
+    assert!(got.jobs[0].summary.is_none());
+    let summary = got.jobs[1].summary.as_ref().unwrap();
+    assert_eq!(summary.turns, Some(7));
+    assert_eq!(summary.tool_calls, None);
+    assert!(!summary.complete);
+    assert_eq!(summary.missing, ["hooks"]);
+}
+
+#[sqlx::test]
+async fn get_batch_refuses_unknown_bad_and_wrong_scope_without_echo(pool: PgPool) {
+    let store = store(pool.clone()).await;
+    two_profiles(&store).await;
+    let addr = serve(&store);
+    let made = batches(addr, as_client)
+        .submit_batch(request("k1", &["alpha"]))
+        .await
+        .unwrap()
+        .into_inner();
+    let unknown = batches(addr, as_client)
+        .get_batch(get("01ARZ3NDEKTSV4RRFFQ69G5FAV"))
+        .await
+        .unwrap_err();
+    assert_eq!(unknown.code(), Code::NotFound);
+    assert_eq!(unknown.message(), "batch not found");
+    let bad = batches(addr, as_client)
+        .get_batch(get("zzz private input"))
+        .await
+        .unwrap_err();
+    assert_eq!(bad.code(), Code::InvalidArgument);
+    assert_eq!(bad.message(), "invalid batch id");
+    let boxed = batches(addr, as_box)
+        .get_batch(get(&made.batch_id))
+        .await
+        .unwrap_err();
+    assert_eq!(boxed.code(), Code::PermissionDenied);
+    let anon = batches(addr, anonymous)
+        .get_batch(get(&made.batch_id))
+        .await
+        .unwrap_err();
+    assert_eq!(anon.code(), Code::Unauthenticated);
 }
