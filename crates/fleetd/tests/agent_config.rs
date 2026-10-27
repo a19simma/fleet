@@ -233,3 +233,165 @@ fn an_invalid_job_id_is_rejected_before_any_path_is_built() -> TestResult {
     assert!(!jobs.path().join(".agent").exists());
     Ok(())
 }
+
+fn logical() -> Vec<(&'static str, &'static [u8])> {
+    vec![
+        ("CLAUDE.md", b"persona"),
+        ("skills/a.md", b"skill"),
+        (".hidden", b"h"),
+        (
+            "settings.json",
+            br#"{"permissions":{"defaultMode":"dontAsk"},"model":"m"}"#,
+        ),
+    ]
+}
+
+fn write_tree(dir: &Path, files: &[(&str, &[u8])]) -> TestResult {
+    for (path, data) in files {
+        let target = dir.join(path);
+        if let Some(parent) = target.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        std::fs::write(target, data)?;
+    }
+    Ok(())
+}
+
+fn files_of(files: &[(&str, &[u8])]) -> Vec<(String, Vec<u8>)> {
+    files
+        .iter()
+        .map(|(path, data)| ((*path).to_owned(), data.to_vec()))
+        .collect()
+}
+
+type Pair = (Result<Bundle, BundleError>, Result<Bundle, BundleError>);
+
+fn one() -> &'static [u8] {
+    b"x"
+}
+
+fn both(files: &[(&str, &[u8])]) -> Result<Pair, Box<dyn std::error::Error>> {
+    let dir = TempDir::new()?;
+    write_tree(dir.path(), files)?;
+    Ok((
+        Bundle::from_dir(dir.path()),
+        Bundle::from_files(files_of(files)),
+    ))
+}
+
+#[test]
+fn from_files_matches_from_dir_for_the_same_logical_bundle() -> TestResult {
+    let (dir, files) = both(&logical())?;
+    assert_eq!(dir, files);
+    let reversed: Vec<_> = files_of(&logical()).into_iter().rev().collect();
+    assert_eq!(Bundle::from_files(reversed), dir);
+    assert_eq!(dir?.sha256(), files?.sha256());
+    Ok(())
+}
+
+#[test]
+fn from_files_overrides_the_defaults_like_from_dir() -> TestResult {
+    let (dir, files) = both(&[("CLAUDE.md", b"mine")])?;
+    assert_eq!(dir, files);
+    assert_ne!(files?, Bundle::default());
+    Ok(())
+}
+
+#[test]
+fn an_empty_file_set_is_the_default_bundle() -> TestResult {
+    let none: Vec<(String, Vec<u8>)> = Vec::new();
+    assert_eq!(Bundle::from_files(none), Ok(Bundle::default()));
+    let (dir, files) = both(&[])?;
+    assert_eq!(dir, files);
+    Ok(())
+}
+
+#[test]
+fn from_files_entry_cap_matches_from_dir() -> TestResult {
+    let names: Vec<String> = (0..=MAX_ENTRIES).map(|n| format!("f{n}.md")).collect();
+    let at_cap: Vec<(&str, &[u8])> = names[..MAX_ENTRIES]
+        .iter()
+        .map(|n| (n.as_str(), one()))
+        .collect();
+    let (dir, files) = both(&at_cap)?;
+    assert_eq!(dir, files);
+    assert!(files.is_ok());
+    let over: Vec<(&str, &[u8])> = names.iter().map(|n| (n.as_str(), one())).collect();
+    let (dir, files) = both(&over)?;
+    assert_eq!(dir, Err(BundleError::TooMany));
+    assert_eq!(files, Err(BundleError::TooMany));
+    Ok(())
+}
+
+#[test]
+fn from_files_counts_implied_directories_like_from_dir() -> TestResult {
+    let names: Vec<String> = (0..MAX_ENTRIES / 2).map(|n| format!("d{n}/f")).collect();
+    let tree: Vec<(&str, &[u8])> = names.iter().map(|n| (n.as_str(), one())).collect();
+    let (dir, files) = both(&tree)?;
+    assert_eq!(dir, files);
+    assert!(files.is_ok());
+    let mut over = tree.clone();
+    over.push(("one/more", b"x"));
+    let (dir, files) = both(&over)?;
+    assert_eq!(dir, Err(BundleError::TooMany));
+    assert_eq!(files, Err(BundleError::TooMany));
+    Ok(())
+}
+
+#[test]
+fn from_files_byte_cap_matches_from_dir() -> TestResult {
+    let cap = usize::try_from(MAX_BYTES)?;
+    let big = vec![b'a'; cap];
+    let (dir, files) = both(&[("big.bin", &big)])?;
+    assert_eq!(dir, files);
+    assert!(files.is_ok());
+    let (dir, files) = both(&[("big.bin", &big), ("extra.bin", b"x")])?;
+    assert_eq!(dir, Err(BundleError::TooLarge));
+    assert_eq!(files, Err(BundleError::TooLarge));
+    Ok(())
+}
+
+#[test]
+fn from_files_settings_rules_match_from_dir() -> TestResult {
+    for json in [
+        r#"{"hooks":{}}"#,
+        r#"{"env":{"A":"b"}}"#,
+        r#"{"permissions":{},"apiKeyHelper":"x"}"#,
+        r#"{"enabledPlugins":{}}"#,
+        r#"{"permissions":{"defaultMode":"bypassPermissions"}}"#,
+        r#"{"permissions":{"defaultMode":"BypassPermissions"}}"#,
+        "[]",
+        "not json",
+        "\"x\"",
+    ] {
+        let (dir, files) = both(&[("settings.json", json.as_bytes())])?;
+        assert_eq!(dir, Err(BundleError::Settings), "{json}");
+        assert_eq!(files, Err(BundleError::Settings), "{json}");
+    }
+    Ok(())
+}
+
+#[test]
+fn from_files_rejects_a_duplicate_path() {
+    let files = vec![("CLAUDE.md", b"a".to_vec()), ("CLAUDE.md", b"b".to_vec())];
+    assert_eq!(Bundle::from_files(files), Err(BundleError::Path));
+}
+
+#[test]
+fn from_files_rejects_unusable_paths() {
+    for path in [
+        "../x", "a/../b", "/abs", "a\\b", "a\0b", "", ".", "./a", "a//b", "a/",
+    ] {
+        assert_eq!(
+            Bundle::from_files([(path, b"x".to_vec())]),
+            Err(BundleError::Path),
+            "{path:?}"
+        );
+    }
+}
+
+#[test]
+fn from_files_rejects_a_file_that_is_also_a_directory() {
+    let files = vec![("a", b"x".to_vec()), ("a/b", b"y".to_vec())];
+    assert_eq!(Bundle::from_files(files), Err(BundleError::Entry));
+}

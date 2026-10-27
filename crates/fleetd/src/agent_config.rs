@@ -11,7 +11,7 @@
 //! may hold the top-level keys `permissions`, `model` and `attribution` and never a
 //! `bypassPermissions` default mode.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::fs;
 use std::io;
@@ -129,6 +129,63 @@ impl Bundle {
             return Err(BundleError::Entry);
         }
         walk.collect(dir, Path::new(""), &mut files)?;
+        Self::assemble(files)
+    }
+
+    /// Builds the bundle from relative paths and bodies, with no filesystem access.
+    ///
+    /// Applies the same entry and byte caps, the same `settings.json` checks and the same
+    /// error variants as [`Bundle::from_dir`], and yields an equal [`Bundle`] for the same
+    /// files. Each distinct parent directory counts as an entry, as on disk. A path must be
+    /// relative, hold only plain components and no backslash or NUL byte, and appear once; a
+    /// bad or repeated path is [`BundleError::Path`], and a path that is both a file and a
+    /// directory is [`BundleError::Entry`].
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BundleError`] when a path, the entry count, the size or `settings.json` is
+    /// rejected.
+    pub fn from_files<I, P, B>(files: I) -> Result<Self, BundleError>
+    where
+        I: IntoIterator<Item = (P, B)>,
+        P: AsRef<Path>,
+        B: Into<Vec<u8>>,
+    {
+        let mut walk = Walk {
+            entries: 0,
+            bytes: 0,
+        };
+        let mut dirs = BTreeSet::new();
+        let mut out = BTreeMap::new();
+        for (path, data) in files {
+            let rel = checked_path(path.as_ref())?;
+            let data = data.into();
+            let mut parent = rel.parent();
+            let mut fresh = Vec::new();
+            while let Some(dir) = parent.filter(|dir| !dir.as_os_str().is_empty()) {
+                if dirs.contains(dir) {
+                    break;
+                }
+                fresh.push(dir.to_path_buf());
+                parent = dir.parent();
+            }
+            for dir in fresh {
+                walk.enter()?;
+                dirs.insert(dir);
+            }
+            walk.enter()?;
+            walk.file(data.len() as u64)?;
+            if out.insert(rel, data).is_some() {
+                return Err(BundleError::Path);
+            }
+        }
+        if out.keys().any(|path| dirs.contains(path)) {
+            return Err(BundleError::Entry);
+        }
+        Self::assemble(out)
+    }
+
+    fn assemble(files: BTreeMap<PathBuf, Vec<u8>>) -> Result<Self, BundleError> {
         let mut bundle = Self::default();
         bundle.files.extend(files);
         bundle.check_settings()?;
@@ -165,6 +222,22 @@ struct Walk {
 }
 
 impl Walk {
+    fn enter(&mut self) -> Result<(), BundleError> {
+        self.entries += 1;
+        if self.entries > MAX_ENTRIES {
+            return Err(BundleError::TooMany);
+        }
+        Ok(())
+    }
+
+    fn file(&mut self, len: u64) -> Result<(), BundleError> {
+        self.bytes += len;
+        if self.bytes > MAX_BYTES {
+            return Err(BundleError::TooLarge);
+        }
+        Ok(())
+    }
+
     fn collect(
         &mut self,
         base: &Path,
@@ -174,20 +247,14 @@ impl Walk {
         let listing = fs::read_dir(base.join(rel)).map_err(|_| BundleError::Path)?;
         for entry in listing {
             let entry = entry.map_err(|_| BundleError::Path)?;
-            self.entries += 1;
-            if self.entries > MAX_ENTRIES {
-                return Err(BundleError::TooMany);
-            }
+            self.enter()?;
             let name = PathBuf::from(entry.file_name());
             let rel = rel.join(&name);
             let meta = fs::symlink_metadata(entry.path()).map_err(|_| BundleError::Path)?;
             if meta.is_dir() {
                 self.collect(base, &rel, files)?;
             } else if meta.is_file() {
-                self.bytes += meta.len();
-                if self.bytes > MAX_BYTES {
-                    return Err(BundleError::TooLarge);
-                }
+                self.file(meta.len())?;
                 let data = fs::read(entry.path()).map_err(|_| BundleError::Path)?;
                 files.insert(rel, data);
             } else {
@@ -196,6 +263,24 @@ impl Walk {
         }
         Ok(())
     }
+}
+
+fn checked_path(path: &Path) -> Result<PathBuf, BundleError> {
+    let raw = path.as_os_str().as_encoded_bytes();
+    if raw.contains(&0) || raw.contains(&b'\\') {
+        return Err(BundleError::Path);
+    }
+    let mut rel = PathBuf::new();
+    for part in path.components() {
+        match part {
+            Component::Normal(name) => rel.push(name),
+            _ => return Err(BundleError::Path),
+        }
+    }
+    if rel.as_os_str().is_empty() || rel.as_os_str() != path.as_os_str() {
+        return Err(BundleError::Path);
+    }
+    Ok(rel)
 }
 
 /// One job's agent directory. Dropping it removes the directory.
