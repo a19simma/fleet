@@ -143,7 +143,7 @@ fn stamp_field(
     Ok(Some(raw.clone()))
 }
 
-fn stuck_rule_name(rule: Option<&String>) -> Result<Option<&'static str>, StoreError> {
+pub(crate) fn stuck_rule_name(rule: Option<&String>) -> Result<Option<&'static str>, StoreError> {
     match rule.map(String::as_str) {
         None => Ok(None),
         Some("repeat_action_observation") => Ok(Some("repeat_action_observation")),

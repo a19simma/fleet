@@ -1,13 +1,15 @@
 //! Fleet stats: one aggregate query over jobs and their telemetry summaries.
 
 use fleet_proto::v1::{
-    CostStats, GetStatsReply, GetStatsRequest, Quantiles, StatsGroup, StatsGroupBy, Total,
+    CostStats, GetStatsReply, GetStatsRequest, Quantiles, StatsGroup, StatsGroupBy, StuckOutcomes,
+    StuckRuleStats, Total,
 };
 use sqlx::postgres::PgRow;
 use sqlx::{PgPool, Row};
 
 use crate::jobs::{JobInvalid, MAX_REPO_BYTES};
 use crate::store::{MAX_TS_MS, NOW_SECONDS, StoreError, count};
+use crate::telemetry::stuck_rule_name;
 
 /// Seconds in a day.
 const DAY_S: i64 = 86_400;
@@ -21,7 +23,9 @@ pub const MAX_GROUPS: usize = 200;
 /// sends, and splits `FAILED` jobs into failed and timed out.
 pub const TIMED_OUT_ERROR: &str = "agent timed out";
 
-const STATS: &str = "\
+macro_rules! scoped {
+    () => {
+        "\
 WITH scoped AS ( \
     SELECT CASE $5::text \
             WHEN 'repo' THEN j.repo \
@@ -42,6 +46,13 @@ WITH scoped AS ( \
         AND j.created_at < to_timestamp($2::bigint::double precision) \
         AND ($3::text IS NULL OR j.repo = $3) \
         AND ($4::text IS NULL OR j.box = $4)) \
+"
+    };
+}
+
+const STATS: &str = concat!(
+    scoped!(),
+    "\
 SELECT grp, grp IS NULL AS unknown, count(*) AS jobs, \
     count(*) FILTER (WHERE state = 'SUCCEEDED') AS succeeded, \
     count(*) FILTER (WHERE state = 'FAILED' AND error IS DISTINCT FROM $6) AS failed, \
@@ -87,7 +98,20 @@ SELECT grp, grp IS NULL AS unknown, count(*) AS jobs, \
     count(api_retries) AS api_retries_n, sum(api_retries)::bigint AS api_retries_sum \
 FROM scoped GROUP BY grp \
 ORDER BY CASE WHEN $5::text = 'day' THEN 0 ELSE -count(*) END, grp \
-LIMIT $7";
+LIMIT $7"
+);
+
+const STUCK_STATS: &str = concat!(
+    scoped!(),
+    "\
+SELECT grp, grp IS NULL AS unknown, stuck_rule, count(*) AS jobs, \
+    count(*) FILTER (WHERE state = 'SUCCEEDED') AS succeeded, \
+    count(*) FILTER (WHERE state = 'FAILED') AS failed, \
+    count(*) FILTER (WHERE state IN ('CANCELLED', 'LOST')) AS other_terminal \
+FROM scoped WHERE summarized IS NOT NULL \
+GROUP BY grp, stuck_rule \
+ORDER BY grp, stuck_rule"
+);
 
 /// A validated stats request: the effective window, the filters and the grouping column.
 #[derive(Debug, PartialEq, Eq)]
@@ -184,6 +208,38 @@ fn cost(row: &PgRow) -> Result<Option<CostStats>, StoreError> {
     }))
 }
 
+fn outcomes(row: &PgRow) -> Result<StuckOutcomes, StoreError> {
+    Ok(StuckOutcomes {
+        jobs: n(row, "jobs")?,
+        succeeded: n(row, "succeeded")?,
+        failed: n(row, "failed")?,
+        other_terminal: n(row, "other_terminal")?,
+    })
+}
+
+fn attach_stuck(groups: &mut [StatsGroup], rows: &[PgRow]) -> Result<(), StoreError> {
+    for row in rows {
+        let key: Option<String> = row.try_get("grp")?;
+        let unknown: bool = row.try_get("unknown")?;
+        let Some(group) = groups
+            .iter_mut()
+            .find(|g| g.unknown == unknown && (unknown || Some(&g.key) == key.as_ref()))
+        else {
+            continue;
+        };
+        let outcomes = outcomes(row)?;
+        let rule: Option<String> = row.try_get("stuck_rule")?;
+        match stuck_rule_name(rule.as_ref())? {
+            Some(rule) => group.stuck_rules.push(StuckRuleStats {
+                rule: rule.to_owned(),
+                outcomes: Some(outcomes),
+            }),
+            None => group.clean = Some(outcomes),
+        }
+    }
+    Ok(())
+}
+
 fn group(row: &PgRow) -> Result<StatsGroup, StoreError> {
     Ok(StatsGroup {
         key: row.try_get::<Option<String>, _>("grp")?.unwrap_or_default(),
@@ -212,10 +268,17 @@ fn group(row: &PgRow) -> Result<StatsGroup, StoreError> {
         api_retries: total(row, "api_retries")?,
         first_edit_ms: quantiles(row, "first_edit_ms")?,
         stuck_jobs: n(row, "stuck_jobs")?,
+        stuck_rules: Vec::new(),
+        clean: None,
     })
 }
 
 /// Validates `request` and runs the aggregate.
+///
+/// A second query over the same scope splits the jobs with a summary by stuck rule. Each
+/// rule's jobs carry their outcome split, and jobs with a summary and no rule form `clean`.
+/// Jobs without a summary are in neither, because a missing summary is not a clean run. A
+/// rule name is read back through the stored-name validation before it reaches the reply.
 ///
 /// The window is half open on `jobs.created_at`: `since` is included, `until` is not. A
 /// missing `until` is the database clock rounded up to a whole second, so a job created in
@@ -244,11 +307,20 @@ pub(crate) async fn stats(
         .fetch_all(pool)
         .await?;
     let truncated = rows.len() > MAX_GROUPS;
-    let groups = rows
+    let mut groups = rows
         .iter()
         .take(MAX_GROUPS)
         .map(group)
         .collect::<Result<Vec<_>, _>>()?;
+    let stuck_rows = sqlx::query(STUCK_STATS)
+        .bind(plan.since)
+        .bind(plan.until)
+        .bind(plan.repo)
+        .bind(plan.box_name)
+        .bind(plan.group)
+        .fetch_all(pool)
+        .await?;
+    attach_stuck(&mut groups, &stuck_rows)?;
     Ok(GetStatsReply {
         groups,
         truncated,

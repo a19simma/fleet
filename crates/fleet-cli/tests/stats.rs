@@ -9,7 +9,8 @@ use fleet_proto::v1::fleet_jobs_server::{FleetJobs, FleetJobsServer};
 use fleet_proto::v1::{
     CancelJobRequest, CostStats, GetJobRequest, GetStatsReply, GetStatsRequest, Job, ListJobsReply,
     ListJobsRequest, Quantiles, ReadJobEventsReply, ReadJobEventsRequest, ReadTranscriptReply,
-    ReadTranscriptRequest, StatsGroup, StatsGroupBy, SubmitJobRequest, Total,
+    ReadTranscriptRequest, StatsGroup, StatsGroupBy, StuckOutcomes, StuckRuleStats,
+    SubmitJobRequest, Total,
 };
 use tokio::net::TcpListener;
 use tokio_stream::wrappers::TcpListenerStream;
@@ -550,5 +551,73 @@ async fn stuck_cell_is_the_count_over_summarized_jobs() -> TestResult {
     assert_eq!(row(&out, "some")?[8], "0/4");
     assert_eq!(row(&out, "many")?[8], "3/4");
     assert_eq!(row(&out, "none")?[8], "-");
+    Ok(())
+}
+
+fn outcomes(jobs: u64, succeeded: u64, failed: u64, other_terminal: u64) -> StuckOutcomes {
+    StuckOutcomes {
+        jobs,
+        succeeded,
+        failed,
+        other_terminal,
+    }
+}
+
+#[tokio::test]
+async fn stuck_rules_table_lists_each_rule_beside_clean_jobs() -> TestResult {
+    let group = StatsGroup {
+        key: "alpha".into(),
+        jobs: 9,
+        with_summary: 9,
+        stuck_jobs: 5,
+        stuck_rules: vec![
+            StuckRuleStats {
+                rule: "repeat_error".into(),
+                outcomes: Some(outcomes(3, 2, 1, 0)),
+            },
+            StuckRuleStats {
+                rule: "monologue".into(),
+                outcomes: Some(outcomes(2, 0, 0, 0)),
+            },
+        ],
+        clean: Some(outcomes(4, 3, 0, 1)),
+        ..StatsGroup::default()
+    };
+    let unknown = StatsGroup {
+        unknown: true,
+        clean: Some(outcomes(1, 1, 0, 0)),
+        ..StatsGroup::default()
+    };
+    let out = stats(reply(vec![group, unknown]), &[]).await?;
+    let lines: Vec<Vec<&str>> = out
+        .lines()
+        .skip_while(|l| !l.starts_with("group\tstuck_rule"))
+        .map(|l| l.split('\t').collect())
+        .collect();
+    assert_eq!(
+        lines,
+        [
+            vec![
+                "group",
+                "stuck_rule",
+                "flagged",
+                "succeeded",
+                "failed",
+                "other",
+                "ok%"
+            ],
+            vec!["alpha", "repeat_error", "3", "2", "1", "0", "66.7% (2/3)"],
+            vec!["alpha", "monologue", "2", "0", "0", "0", "- (0/0)"],
+            vec!["alpha", "(clean)", "4", "3", "0", "1", "75.0% (3/4)"],
+            vec!["unknown", "(clean)", "1", "1", "0", "0", "100.0% (1/1)"],
+        ]
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn no_stuck_data_prints_no_stuck_table() -> TestResult {
+    let out = stats(reply(vec![full_group("all")]), &[]).await?;
+    assert!(!out.contains("stuck_rule"), "{out}");
     Ok(())
 }

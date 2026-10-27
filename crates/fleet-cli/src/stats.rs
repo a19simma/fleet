@@ -3,13 +3,17 @@
 use std::io::Write;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use fleet_proto::v1::{GetStatsReply, GetStatsRequest, Quantiles, StatsGroup, StatsGroupBy, Total};
+use fleet_proto::v1::{
+    GetStatsReply, GetStatsRequest, Quantiles, StatsGroup, StatsGroupBy, StuckOutcomes, Total,
+};
 
 use super::{CliError, Client, StatsBy, sanitize};
 
 const SINCE_USAGE: &str =
     "invalid --since: use a duration such as 45s, 90m, 24h or 7d, or a unix time in seconds";
 const HEADER: &str = "group\tjobs\tok%\tdur_p50\tdur_p95\tcost_usd\ttool_err%\tdenials\tstuck\tn";
+const STUCK_HEADER: &str = "group\tstuck_rule\tflagged\tsucceeded\tfailed\tother\tok%";
+const CLEAN_LABEL: &str = "(clean)";
 const SECONDS_PER_MINUTE: f64 = 60.0;
 
 /// Seconds since the unix epoch, 0 when the clock is before it.
@@ -133,15 +137,63 @@ fn stuck(group: &StatsGroup) -> String {
     format!("{}/{}", group.stuck_jobs, group.with_summary)
 }
 
-fn write_row(out: &mut impl Write, group: &StatsGroup) -> std::io::Result<()> {
+fn group_label(group: &StatsGroup) -> String {
     let key = sanitize(&group.key);
-    let key = if group.unknown {
-        "unknown"
+    if group.unknown {
+        "unknown".into()
     } else if key.is_empty() {
-        "all"
+        "all".into()
     } else {
-        &key
-    };
+        key
+    }
+}
+
+fn write_stuck_row(
+    out: &mut impl Write,
+    key: &str,
+    rule: &str,
+    outcomes: &StuckOutcomes,
+) -> std::io::Result<()> {
+    let finished = outcomes.succeeded + outcomes.failed + outcomes.other_terminal;
+    let ok = permille(outcomes.succeeded, finished).map_or_else(
+        || "- (0/0)".into(),
+        |rate| format!("{} ({}/{finished})", percent(rate), outcomes.succeeded),
+    );
+    writeln!(
+        out,
+        "{key}\t{}\t{}\t{}\t{}\t{}\t{ok}",
+        sanitize(rule),
+        outcomes.jobs,
+        outcomes.succeeded,
+        outcomes.failed,
+        outcomes.other_terminal,
+    )
+}
+
+fn write_stuck_rules(out: &mut impl Write, groups: &[StatsGroup]) -> std::io::Result<()> {
+    if groups
+        .iter()
+        .all(|g| g.stuck_rules.is_empty() && g.clean.is_none())
+    {
+        return Ok(());
+    }
+    writeln!(out, "{STUCK_HEADER}")?;
+    for group in groups {
+        let key = group_label(group);
+        for rule in &group.stuck_rules {
+            if let Some(outcomes) = &rule.outcomes {
+                write_stuck_row(out, &key, &rule.rule, outcomes)?;
+            }
+        }
+        if let Some(clean) = &group.clean {
+            write_stuck_row(out, &key, CLEAN_LABEL, clean)?;
+        }
+    }
+    Ok(())
+}
+
+fn write_row(out: &mut impl Write, group: &StatsGroup) -> std::io::Result<()> {
+    let key = group_label(group);
     let (p50, p95) = median_and_tail(group.duration_ms.as_ref());
     let cost = group
         .cost_est_usd
@@ -164,7 +216,9 @@ fn write_row(out: &mut impl Write, group: &StatsGroup) -> std::io::Result<()> {
 /// Writes the window line, the group table and any truncation or clamp notice.
 ///
 /// A figure no job observed prints as `-`. The `ok%` cell shows its finished-job
-/// denominator. The `n` cell lists how many jobs contributed to each figure.
+/// denominator. The `n` cell lists how many jobs contributed to each figure. A second
+/// table lists, per group and stuck rule, the flagged jobs with their outcome split and the
+/// `(clean)` jobs no rule flagged, so a rule's false-positive rate reads off its `ok%`.
 ///
 /// # Errors
 /// Returns the output error.
@@ -184,6 +238,7 @@ pub(crate) fn write_stats(out: &mut impl Write, reply: &GetStatsReply) -> std::i
         for group in &reply.groups {
             write_row(out, group)?;
         }
+        write_stuck_rules(out, &reply.groups)?;
     }
     if reply.truncated {
         writeln!(

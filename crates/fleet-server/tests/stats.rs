@@ -5,7 +5,7 @@
 
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use fleet_proto::v1::{GetStatsReply, GetStatsRequest, StatsGroup, StatsGroupBy};
+use fleet_proto::v1::{GetStatsReply, GetStatsRequest, StatsGroup, StatsGroupBy, StuckOutcomes};
 use fleet_server::store::{Store, StoreError};
 use sqlx::PgPool;
 use sqlx::postgres::PgPoolOptions;
@@ -841,4 +841,87 @@ async fn stuck_jobs_is_zero_when_no_summary_has_a_rule(pool: PgPool) {
     insert(&pool, &seed("a", "SUCCEEDED")).await;
     with_duration(&pool, "a", 100).await;
     assert_eq!(one(&store).await.stuck_jobs, 0);
+}
+
+fn outcome(outcomes: &StuckOutcomes) -> (u64, u64, u64, u64) {
+    (
+        outcomes.jobs,
+        outcomes.succeeded,
+        outcomes.failed,
+        outcomes.other_terminal,
+    )
+}
+
+fn rule_split(group: &StatsGroup, rule: &str) -> Option<(u64, u64, u64, u64)> {
+    group
+        .stuck_rules
+        .iter()
+        .find(|r| r.rule == rule)
+        .and_then(|r| r.outcomes.as_ref())
+        .map(outcome)
+}
+
+async fn summarized(pool: &PgPool, id: &str, state: &str, rule: Option<&str>) {
+    insert(pool, &seed(id, state)).await;
+    with_duration(pool, id, 100).await;
+    if let Some(rule) = rule {
+        mark_stuck(pool, id, rule).await;
+    }
+}
+
+#[sqlx::test(migrations = false)]
+async fn stuck_rules_split_outcomes_per_rule_beside_clean_jobs(pool: PgPool) {
+    let store = store(pool.clone()).await;
+    for (id, state) in [("s1", "SUCCEEDED"), ("s2", "SUCCEEDED"), ("f1", "FAILED")] {
+        summarized(&pool, id, state, Some("repeat_error")).await;
+    }
+    for (id, state) in [
+        ("c1", "CANCELLED"),
+        ("l1", "LOST"),
+        ("f2", "FAILED"),
+        ("r1", "RUNNING"),
+    ] {
+        summarized(&pool, id, state, Some("monologue")).await;
+    }
+    for (id, state) in [("s3", "SUCCEEDED"), ("f3", "FAILED"), ("f4", "FAILED")] {
+        summarized(&pool, id, state, None).await;
+    }
+    insert(&pool, &seed("bare", "SUCCEEDED")).await;
+    let group = one(&store).await;
+    assert_eq!(group.stuck_jobs, 7);
+    assert_eq!(group.stuck_rules.len(), 2);
+    assert_eq!(rule_split(&group, "repeat_error"), Some((3, 2, 1, 0)));
+    assert_eq!(rule_split(&group, "monologue"), Some((4, 0, 1, 2)));
+    assert_eq!(rule_split(&group, "alternating"), None);
+    assert_eq!(outcome(&group.clean.unwrap()), (3, 1, 2, 0));
+}
+
+#[sqlx::test(migrations = false)]
+async fn stuck_rules_without_summaries_leave_clean_absent(pool: PgPool) {
+    let store = store(pool.clone()).await;
+    insert(&pool, &seed("bare", "SUCCEEDED")).await;
+    let group = one(&store).await;
+    assert_eq!(group.stuck_rules.len(), 0);
+    assert!(group.clean.is_none());
+}
+
+#[sqlx::test(migrations = false)]
+async fn stuck_rules_follow_their_group_and_unknown_stays_apart(pool: PgPool) {
+    let store = store(pool.clone()).await;
+    summarized(&pool, "a", "SUCCEEDED", Some("alternating")).await;
+    summarized(&pool, "b", "FAILED", Some("alternating")).await;
+    summarized(&pool, "c", "SUCCEEDED", None).await;
+    sqlx::query("UPDATE job_summary SET model = 'm1' WHERE job_id IN ('a', 'c')")
+        .execute(&pool)
+        .await
+        .unwrap();
+    let reply = run(&store, &request(StatsGroupBy::Model)).await;
+    assert_eq!(reply.groups.len(), 2);
+    let known = reply.groups.iter().find(|g| !g.unknown).unwrap();
+    let unknown = reply.groups.iter().find(|g| g.unknown).unwrap();
+    assert_eq!(known.key, "m1");
+    assert_eq!(rule_split(known, "alternating"), Some((1, 1, 0, 0)));
+    assert_eq!(outcome(&known.clean.unwrap()), (1, 1, 0, 0));
+    assert_eq!(rule_split(unknown, "alternating"), Some((1, 0, 1, 0)));
+    assert!(unknown.clean.is_none());
 }

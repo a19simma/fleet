@@ -340,6 +340,18 @@ message CostStats {
   double p95 = 4;
 }
 
+message StuckOutcomes {
+  uint64 jobs = 1;
+  uint64 succeeded = 2;
+  uint64 failed = 3;
+  uint64 other_terminal = 4;
+}
+
+message StuckRuleStats {
+  string rule = 1;
+  StuckOutcomes outcomes = 2;
+}
+
 message StatsGroup {
   string key = 1;
   uint64 jobs = 2;
@@ -367,6 +379,8 @@ message StatsGroup {
   optional Quantiles first_edit_ms = 24;
   uint64 stuck_jobs = 25;
   bool unknown = 26;
+  repeated StuckRuleStats stuck_rules = 27;
+  optional StuckOutcomes clean = 28;
 }
 
 message GetStatsReply {
