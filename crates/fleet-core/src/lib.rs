@@ -8,6 +8,7 @@ mod envelope;
 mod error;
 mod id;
 mod normalize;
+mod profile;
 mod redact;
 
 pub use box_name::BoxName;
@@ -16,4 +17,8 @@ pub use envelope::{Envelope, Identity, Priority, SCHEMA_VERSION, Source, kind};
 pub use error::Error;
 pub use id::EventId;
 pub use normalize::{HookAllowlist, normalize_hook};
+pub use profile::{
+    Attribution, ContextFile, EnvFlag, PROFILE_HASH_DOMAIN, Profile, ProfileError, ProfileHash,
+    Settings, SettingsPermissions, Skill,
+};
 pub use redact::{MIN_SECRET_LEN, PLACEHOLDER, Redactor};
