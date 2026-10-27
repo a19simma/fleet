@@ -231,6 +231,7 @@ pub struct Telemetry {
     result_denials: u64,
     exit_known: u64,
     exit_nonzero: u64,
+    hooks_joined: u64,
     first_edit_ms: Option<u64>,
     turns: Option<u64>,
     duration_ms: Option<u64>,
@@ -266,6 +267,7 @@ impl Telemetry {
             result_denials: 0,
             exit_known: 0,
             exit_nonzero: 0,
+            hooks_joined: 0,
             first_edit_ms: None,
             turns: None,
             duration_ms: None,
@@ -363,6 +365,7 @@ impl Telemetry {
         }) else {
             return false;
         };
+        self.hooks_joined += 1;
         if let Some(code) = exit_code {
             if event.tool.as_deref() == Some("Bash") {
                 match event.exit_code {
@@ -411,6 +414,9 @@ impl Telemetry {
         }
         if self.exit_known == 0 {
             missing.push("exit_codes".to_owned());
+        }
+        if self.tool_calls > 0 && self.hooks_joined == 0 {
+            missing.push("hooks".to_owned());
         }
         if self.truncated {
             missing.push("events_truncated".to_owned());

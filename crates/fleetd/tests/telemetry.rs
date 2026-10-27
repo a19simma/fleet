@@ -93,7 +93,10 @@ fn smoke_fixture_yields_one_tool_event_and_complete_summary() {
     assert_eq!(summary.denials, Some(0));
     assert_eq!(summary.api_retries, Some(0));
     assert_eq!(summary.first_edit_ms, None);
-    assert_eq!(summary.missing, vec!["exit_codes".to_owned()]);
+    assert_eq!(
+        summary.missing,
+        vec!["exit_codes".to_owned(), "hooks".to_owned()]
+    );
     assert_eq!(summary.terminal, Some(Terminal::Succeeded));
 }
 
@@ -752,4 +755,37 @@ fn the_recorded_init_line_gives_the_model() {
         .and_then(|init| init["model"].as_str().map(str::to_owned));
     assert!(model.is_some());
     assert_eq!(telemetry.model(), model.as_deref());
+}
+
+fn has_hooks_missing(telemetry: &Telemetry) -> bool {
+    telemetry.summary().missing.contains(&"hooks".to_owned())
+}
+
+#[test]
+fn tool_calls_without_a_joined_hook_report_miss_hooks() {
+    let mut telemetry = Telemetry::new(Limits::default());
+    telemetry.feed_line(&tool_use("a", "Read", &json!({"file_path":"a"})), 0);
+    assert_eq!(telemetry.summary().tool_calls, Some(1));
+    assert!(has_hooks_missing(&telemetry));
+    assert!(!telemetry.apply_hook("nope", Some(0), None));
+    assert!(has_hooks_missing(&telemetry));
+}
+
+#[test]
+fn a_joined_hook_report_clears_hooks_from_missing() {
+    let mut telemetry = Telemetry::new(Limits::default());
+    pair(&mut telemetry, "a", "ls", 0);
+    assert!(telemetry.apply_hook("a", None, Some(3)));
+    assert!(!has_hooks_missing(&telemetry));
+    assert_eq!(telemetry.summary().tool_calls, Some(1));
+}
+
+#[test]
+fn zero_tool_calls_never_miss_hooks() {
+    let telemetry = Telemetry::new(Limits::default());
+    assert_eq!(telemetry.summary().tool_calls, None);
+    assert!(!has_hooks_missing(&telemetry));
+    let mut with_result = Telemetry::new(Limits::default());
+    feed_all(&mut with_result, SMOKE.lines().last().unwrap_or(""));
+    assert!(!has_hooks_missing(&with_result));
 }
