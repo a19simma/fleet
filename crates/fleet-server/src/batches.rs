@@ -4,10 +4,10 @@ use std::collections::HashSet;
 use std::fmt;
 
 use fleet_core::EventId;
-use fleet_proto::v1::{SubmitBatchReply, SubmitBatchRequest, SubmitJobRequest};
+use fleet_proto::v1::{GetBatchReply, SubmitBatchReply, SubmitBatchRequest, SubmitJobRequest};
 use sqlx::{PgPool, Row};
 
-use crate::jobs::validate_submit;
+use crate::jobs::{validate_job_id, validate_submit};
 use crate::profiles::validate_name;
 use crate::store::StoreError;
 
@@ -20,6 +20,10 @@ const SELECT_BATCH_BY_KEY: &str =
     "SELECT batch_id, prompt, repo, base_sha FROM batch WHERE idempotency_key = $1";
 const SELECT_BATCH_JOBS: &str =
     "SELECT job_id, profile_name FROM jobs WHERE batch_id = $1 ORDER BY batch_pos LIMIT $2";
+const SELECT_BATCH_BY_ID: &str = "SELECT prompt, repo, base_sha, repeats, \
+     (EXTRACT(EPOCH FROM created_at) * 1000)::bigint AS created_at_ms FROM batch WHERE batch_id = $1";
+const SELECT_BATCH_JOB_IDS: &str =
+    "SELECT job_id FROM jobs WHERE batch_id = $1 ORDER BY batch_pos LIMIT $2";
 const LOCK_NAME: &str = "SELECT pg_advisory_xact_lock(hashtextextended($1, 0))";
 const SELECT_LATEST: &str =
     "SELECT version, hash FROM profile_version WHERE name = $1 ORDER BY version DESC LIMIT 1";
@@ -41,6 +45,8 @@ pub enum BatchInvalid {
     ProfileName,
     /// The profile list names one profile twice.
     DuplicateProfile,
+    /// A batch id is not a job-shaped id.
+    BatchId,
 }
 
 impl fmt::Display for BatchInvalid {
@@ -51,6 +57,7 @@ impl fmt::Display for BatchInvalid {
             Self::ProfileCount => "a batch needs 1 to 16 profiles",
             Self::ProfileName => "invalid profile name",
             Self::DuplicateProfile => "duplicate profile in batch",
+            Self::BatchId => "invalid batch id",
         })
     }
 }
@@ -109,6 +116,44 @@ pub fn validate_batch(request: &SubmitBatchRequest) -> Result<NewBatch, StoreErr
         base_sha: job.base_ref,
         profiles: request.profiles.clone(),
     })
+}
+
+/// Reads a batch row and the ids of its jobs in profile order.
+///
+/// The reply carries no jobs; the caller fills them in. The id is checked once here and an
+/// unknown id is [`StoreError::NotFound`]. At most [`MAX_BATCH_PROFILES`] ids come back.
+pub(crate) async fn get_head(
+    pool: &PgPool,
+    batch_id: &str,
+) -> Result<(GetBatchReply, Vec<String>), StoreError> {
+    validate_job_id(batch_id).map_err(|_| StoreError::InvalidBatch(BatchInvalid::BatchId))?;
+    let row = sqlx::query(SELECT_BATCH_BY_ID)
+        .bind(batch_id)
+        .fetch_optional(pool)
+        .await?
+        .ok_or(StoreError::NotFound)?;
+    let ids = sqlx::query(SELECT_BATCH_JOB_IDS)
+        .bind(batch_id)
+        .bind(i64::try_from(MAX_BATCH_PROFILES).unwrap_or(i64::MAX))
+        .fetch_all(pool)
+        .await?
+        .iter()
+        .map(|row| row.try_get::<String, _>("job_id"))
+        .collect::<Result<Vec<_>, _>>()?;
+    let repeats = u32::try_from(row.try_get::<i32, _>("repeats")?)
+        .map_err(|_| StoreError::OutOfRange("batch repeats"))?;
+    let created_at_ms = u64::try_from(row.try_get::<i64, _>("created_at_ms")?)
+        .map_err(|_| StoreError::OutOfRange("batch created_at"))?;
+    let reply = GetBatchReply {
+        batch_id: batch_id.to_owned(),
+        prompt: row.try_get("prompt")?,
+        repo: row.try_get("repo")?,
+        base_sha: row.try_get("base_sha")?,
+        repeats,
+        created_at_ms,
+        jobs: Vec::new(),
+    };
+    Ok((reply, ids))
 }
 
 pub(crate) async fn submit(

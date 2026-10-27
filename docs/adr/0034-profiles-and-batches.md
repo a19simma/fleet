@@ -1,6 +1,6 @@
 # Profiles and batches
 
-Status: Accepted 2026-10-27. Profile storage, the `FleetProfiles` client RPCs, `fleet profile create`, `list` and `show`, migration 0012, the `FleetBatches.SubmitBatch` client RPC and `Job.profile` and `Job.batch_id` are built; the rest is not built. Amends ADR-0021, ADR-0023, ADR-0029 and ADR-0030. ADR-0035 covers storage and distribution.
+Status: Accepted 2026-10-27. Profile storage, the `FleetProfiles` client RPCs, `fleet profile create`, `list` and `show`, migration 0012, the `FleetBatches.SubmitBatch` and `GetBatch` client RPCs, `fleet batch show` and `Job.profile` and `Job.batch_id` are built; the rest is not built. Amends ADR-0021, ADR-0023, ADR-0029 and ADR-0030. ADR-0035 covers storage and distribution.
 
 A future UI will dispatch the same prompt with several named configurations and compare outcomes. No UI exists yet. This ADR records the structure that comparison needs: a Profile that fixes the agent config of one Job, a Batch that groups Jobs by Profile, and a per-profile view in the CLI.
 
@@ -74,6 +74,8 @@ Whether deny beats allow in the real claude is unverified: the probe on the dev 
 ### Batch
 
 A **Batch** is one prompt dispatched once per Profile. `repeats` is 1 for now, enforced by a CHECK; a request may send 0, which means 1, and 2 or more is refused. `SubmitBatch` takes a prompt, a repo, a `base_sha` of 40 lowercase hex characters, 1 to 16 distinct Profile names and an idempotency key. One transaction pins the latest version and hash of each Profile and inserts one Job per Profile, so a failure leaves no Batch and no Job. The same key with the same parameters returns the stored Batch; other parameters give `ALREADY_EXISTS`. Batch Jobs use `base_sha` as the base ref and do not open a pull request. `fleet batch show` prints one column per Profile. A missing value prints `-`. The rows carry the command run breakdown and the time taken, both read from the existing telemetry (ADR-0029).
+
+`FleetBatches.GetBatch{batch_id}` returns the batch row and its Jobs in Profile order, each with `Job.profile` and `Job.summary`. Inferred, not part of the design: the reply clears each Job's prompt, since the batch carries it once. A malformed id is `INVALID_ARGUMENT` and an unknown one `NOT_FOUND`, both with fixed messages. `fleet batch show` then reads each Job's events with `ReadJobEvents` to list its Bash commands with their durations. A Job with no summary prints `-` in every figure row, `unknown` in the stamp rows and `no summary` in `missing`. A stamp field the Job did not report prints `unknown`. `fleet batch list` and `ListBatches` are not built.
 
 ### Scope
 

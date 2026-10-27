@@ -11,13 +11,13 @@ use fleet_proto::v1::fleet_profiles_server::{FleetProfiles, FleetProfilesServer}
 use fleet_proto::v1::fleet_query_server::{FleetQuery, FleetQueryServer};
 use fleet_proto::v1::fleet_worker_server::{FleetWorker, FleetWorkerServer};
 use fleet_proto::v1::{
-    CancelJobRequest, ClaimJobReply, ClaimJobRequest, CreateProfileRequest, GetJobRequest,
-    GetProfileBlobReply, GetProfileBlobRequest, GetProfileRequest, GetStatsReply, GetStatsRequest,
-    HeartbeatReply, HeartbeatRequest, Job, ListFleetReply, ListFleetRequest, ListJobsReply,
-    ListJobsRequest, ListProfilesReply, ListProfilesRequest, ProfileVersion, PushEventsReply,
-    PushEventsRequest, QueuedEvent, ReadJobEventsReply, ReadJobEventsRequest, ReadTranscriptReply,
-    ReadTranscriptRequest, Rejection, ReportJobReply, ReportJobRequest, SubmitBatchReply,
-    SubmitBatchRequest, SubmitJobRequest,
+    CancelJobRequest, ClaimJobReply, ClaimJobRequest, CreateProfileRequest, GetBatchReply,
+    GetBatchRequest, GetJobRequest, GetProfileBlobReply, GetProfileBlobRequest, GetProfileRequest,
+    GetStatsReply, GetStatsRequest, HeartbeatReply, HeartbeatRequest, Job, ListFleetReply,
+    ListFleetRequest, ListJobsReply, ListJobsRequest, ListProfilesReply, ListProfilesRequest,
+    ProfileVersion, PushEventsReply, PushEventsRequest, QueuedEvent, ReadJobEventsReply,
+    ReadJobEventsRequest, ReadTranscriptReply, ReadTranscriptRequest, Rejection, ReportJobReply,
+    ReportJobRequest, SubmitBatchReply, SubmitBatchRequest, SubmitJobRequest,
 };
 use fleet_proto::{ConvertError, validate_box};
 use tonic::transport::server::Router;
@@ -300,6 +300,7 @@ fn batches_error(err: &StoreError) -> Status {
             Status::already_exists("idempotency key already used with other parameters")
         }
         StoreError::UnknownProfile => Status::not_found("profile not found"),
+        StoreError::NotFound => Status::not_found("batch not found"),
         StoreError::InvalidBatch(reason) => Status::invalid_argument(reason.to_string()),
         StoreError::InvalidProfile(_) => Status::invalid_argument("invalid profile name"),
         StoreError::InvalidJob(_) => Status::invalid_argument("invalid job request"),
@@ -316,6 +317,18 @@ impl FleetBatches for FleetService {
         let reply = self
             .store
             .submit_batch(&request.into_inner())
+            .await
+            .map_err(|err| batches_error(&err))?;
+        Ok(Response::new(reply))
+    }
+
+    async fn get_batch(
+        &self,
+        request: Request<GetBatchRequest>,
+    ) -> Result<Response<GetBatchReply>, Status> {
+        let reply = self
+            .store
+            .get_batch(&request.into_inner().batch_id)
             .await
             .map_err(|err| batches_error(&err))?;
         Ok(Response::new(reply))
