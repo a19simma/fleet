@@ -19,6 +19,7 @@ ADRs for fleetd, the Fleet server and the `fleet` CLI. The plan is in `../plan.m
 | [0023](0023-two-bearer-token-scopes.md) | Two bearer token scopes | Accepted, built in the server, amends 0014 |
 | [0024](0024-job-git-credentials-and-permissions.md) | Job git credentials and permission policy | Accepted, runner, push and pull request step and reporter built and run by the daemon, repo host allowlist, cleared workspace git, token host, hardened mirror and scoped fetch credential added, amends 0011, Known limit superseded by 0031 |
 | [0025](0025-fleet-infra-directory-and-scoped-deploy.md) | Fleet infra directory and scoped deploy | Accepted, built, amends 0013 |
+| [0028](0028-eval-judge-and-ci-follow-up.md) | Eval, judge and CI follow-up | Accepted 2026-10-27, not built, builds on 0029 and 0030, amends 0021 and 0023 |
 | [0029](0029-job-telemetry.md) | Job telemetry | Accepted, built in the daemon and the server, amends 0021, beside 0022 |
 | [0030](0030-metrics-and-improvement-loop.md) | Metrics and the improvement loop | Accepted, `GetStats`, caps and shadow stuck detector built, enforcement not built, builds on 0029 |
 | [0031](0031-agent-isolation.md) | Agent isolation | Accepted 2026-10-26, P1 built behind `agent_launcher = "systemd"` and cut over on the first Box, P2 and P3 not built, supersedes the Known limit paragraph of 0024 and amends its credential and mirror-hardening sections |
