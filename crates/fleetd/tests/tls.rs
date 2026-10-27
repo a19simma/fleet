@@ -9,8 +9,8 @@ use fleet_proto::v1::fleet_ingest_server::{FleetIngest, FleetIngestServer};
 use fleet_proto::v1::fleet_worker_client::FleetWorkerClient;
 use fleet_proto::v1::fleet_worker_server::{FleetWorker, FleetWorkerServer};
 use fleet_proto::v1::{
-    ClaimJobReply, ClaimJobRequest, HeartbeatReply, HeartbeatRequest, PushEventsReply,
-    PushEventsRequest, ReportJobReply, ReportJobRequest,
+    ClaimJobReply, ClaimJobRequest, GetProfileBlobReply, GetProfileBlobRequest, HeartbeatReply,
+    HeartbeatRequest, PushEventsReply, PushEventsRequest, ReportJobReply, ReportJobRequest,
 };
 use fleetd::heartbeat::{Heartbeat, QueueSnapshot, QueueSource};
 use fleetd::poller::{CALL_BACKSTOP, GrpcReporter, Token, channel, channel_with_ca};
@@ -65,6 +65,13 @@ impl FleetWorker for Stub {
             lease_s: 0,
             next_in_s: 1,
         }))
+    }
+
+    async fn get_profile_blob(
+        &self,
+        _request: Request<GetProfileBlobRequest>,
+    ) -> Result<Response<GetProfileBlobReply>, Status> {
+        Err(Status::unimplemented("unused"))
     }
 
     async fn report_job(

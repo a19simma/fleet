@@ -12,12 +12,12 @@ use fleet_proto::v1::fleet_query_server::{FleetQuery, FleetQueryServer};
 use fleet_proto::v1::fleet_worker_server::{FleetWorker, FleetWorkerServer};
 use fleet_proto::v1::{
     CancelJobRequest, ClaimJobReply, ClaimJobRequest, CreateProfileRequest, GetJobRequest,
-    GetProfileRequest, GetStatsReply, GetStatsRequest, HeartbeatReply, HeartbeatRequest, Job,
-    ListFleetReply, ListFleetRequest, ListJobsReply, ListJobsRequest, ListProfilesReply,
-    ListProfilesRequest, ProfileVersion, PushEventsReply, PushEventsRequest, QueuedEvent,
-    ReadJobEventsReply, ReadJobEventsRequest, ReadTranscriptReply, ReadTranscriptRequest,
-    Rejection, ReportJobReply, ReportJobRequest, SubmitBatchReply, SubmitBatchRequest,
-    SubmitJobRequest,
+    GetProfileBlobReply, GetProfileBlobRequest, GetProfileRequest, GetStatsReply, GetStatsRequest,
+    HeartbeatReply, HeartbeatRequest, Job, ListFleetReply, ListFleetRequest, ListJobsReply,
+    ListJobsRequest, ListProfilesReply, ListProfilesRequest, ProfileVersion, PushEventsReply,
+    PushEventsRequest, QueuedEvent, ReadJobEventsReply, ReadJobEventsRequest, ReadTranscriptReply,
+    ReadTranscriptRequest, Rejection, ReportJobReply, ReportJobRequest, SubmitBatchReply,
+    SubmitBatchRequest, SubmitJobRequest,
 };
 use fleet_proto::{ConvertError, validate_box};
 use tonic::transport::server::Router;
@@ -211,6 +211,8 @@ fn worker_error(err: &StoreError) -> Status {
             Status::invalid_argument("too many telemetry events in one report")
         }
         StoreError::NotFound => Status::not_found("job not found"),
+        StoreError::LeaseDenied => Status::permission_denied("lease does not match"),
+        StoreError::UnknownProfile => Status::not_found("profile not found"),
         other => storage_unavailable(other),
     }
 }
@@ -238,6 +240,21 @@ impl FleetWorker for FleetService {
             lease_s,
             next_in_s: CLAIM_INTERVAL_S,
         }))
+    }
+
+    async fn get_profile_blob(
+        &self,
+        request: Request<GetProfileBlobRequest>,
+    ) -> Result<Response<GetProfileBlobReply>, Status> {
+        let request = request.into_inner();
+        let name = validate_box(&request.r#box)
+            .map_err(|err| Status::invalid_argument(err.to_string()))?;
+        let reply = self
+            .store
+            .get_profile_blob(&request.job_id, request.attempt, &name)
+            .await
+            .map_err(|err| worker_error(&err))?;
+        Ok(Response::new(reply))
     }
 
     async fn report_job(
@@ -444,8 +461,9 @@ pub fn router(store: &Store, auth: &BearerAuth) -> Router<Stack<BearerAuth, Iden
     let ingest =
         FleetIngestServer::new(service.clone()).max_decoding_message_size(MAX_MESSAGE_BYTES);
     let query = FleetQueryServer::new(service.clone()).max_decoding_message_size(MAX_MESSAGE_BYTES);
-    let worker =
-        FleetWorkerServer::new(service.clone()).max_decoding_message_size(MAX_MESSAGE_BYTES);
+    let worker = FleetWorkerServer::new(service.clone())
+        .max_decoding_message_size(MAX_MESSAGE_BYTES)
+        .max_encoding_message_size(MAX_PROFILE_MESSAGE_BYTES);
     let jobs = FleetJobsServer::new(service.clone()).max_decoding_message_size(MAX_MESSAGE_BYTES);
     let batches =
         FleetBatchesServer::new(service.clone()).max_decoding_message_size(MAX_MESSAGE_BYTES);

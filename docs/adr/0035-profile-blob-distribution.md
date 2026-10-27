@@ -1,6 +1,6 @@
 # Profile blob distribution
 
-Status: Accepted 2026-10-27. Migration 0011, migration 0012 and the `FleetProfiles` and `FleetBatches.SubmitBatch` client RPCs are built; `GetProfileBlob` and fleetd materialisation are not built. Amends ADR-0021 and ADR-0023. Implements the storage and delivery of ADR-0034.
+Status: Accepted 2026-10-27. Migration 0011, migration 0012 and the `FleetProfiles` and `FleetBatches.SubmitBatch` client RPCs and the server side of `FleetWorker.GetProfileBlob` are built; fleetd materialisation is not built. Amends ADR-0021 and ADR-0023. Implements the storage and delivery of ADR-0034.
 
 ADR-0034 defines the Profile. The server holds Profiles and fleetd applies them, so a Box needs the Profile content for a leased Job without holding a client credential.
 
@@ -18,6 +18,8 @@ ADR-0034 defines the Profile. The server holds Profiles and fleetd applies them,
 - `Job.profile = 22` and `Job.batch_id = 23`.
 - Client scope gains `FleetProfiles` and `FleetBatches`.
 - Worker scope gains `FleetWorker.GetProfileBlob{job_id, attempt, box}`, authorised against the lease like the other worker calls.
+- Inferred, not part of the design: `GetProfileBlob` returns `PERMISSION_DENIED` with a fixed message for a wrong box, a wrong attempt, a job that is not `RUNNING`, an expired lease and a job that does not exist, so a Box learns nothing about other jobs. A leased job with no Profile gets `NOT_FOUND`. The server checks that the job's hash column equals the hash of its version row and of the canonical bytes before it replies, and fails closed otherwise. There is no lookup by hash or by name.
+- Inferred, not part of the design: the reply carries up to `MAX_PROFILE_MESSAGE_BYTES` (`fleet-proto`). The `FleetWorker` server sets its encode limit to it and fleetd's `FleetWorker` client sets its decode limit to it, because the tonic client default is 4 MiB.
 
 ### Materialisation
 

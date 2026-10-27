@@ -11,7 +11,8 @@ use std::time::Duration;
 
 use fleet_proto::v1::fleet_worker_server::{FleetWorker, FleetWorkerServer};
 use fleet_proto::v1::{
-    ClaimJobReply, ClaimJobRequest, Job, JobState, ReportJobReply, ReportJobRequest,
+    ClaimJobReply, ClaimJobRequest, GetProfileBlobReply, GetProfileBlobRequest, Job, JobState,
+    ReportJobReply, ReportJobRequest,
 };
 use fleetd::{Config, forward_hook, run_with_env};
 use tempfile::TempDir;
@@ -95,6 +96,13 @@ impl FleetWorker for Stub {
             next_in_s: if job.is_some() { 0 } else { 60 },
             job,
         }))
+    }
+
+    async fn get_profile_blob(
+        &self,
+        _request: Request<GetProfileBlobRequest>,
+    ) -> Result<Response<GetProfileBlobReply>, Status> {
+        Err(Status::unimplemented("unused"))
     }
 
     async fn report_job(

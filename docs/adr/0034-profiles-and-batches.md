@@ -1,6 +1,6 @@
 # Profiles and batches
 
-Status: Accepted 2026-10-27. Profile storage, the `FleetProfiles` client RPCs, `fleet profile create`, `list` and `show`, migration 0012 and the `FleetBatches.SubmitBatch` client RPC are built; the rest is not built. Amends ADR-0021, ADR-0023, ADR-0029 and ADR-0030. ADR-0035 covers storage and distribution.
+Status: Accepted 2026-10-27. Profile storage, the `FleetProfiles` client RPCs, `fleet profile create`, `list` and `show`, migration 0012, the `FleetBatches.SubmitBatch` client RPC and `Job.profile` and `Job.batch_id` are built; the rest is not built. Amends ADR-0021, ADR-0023, ADR-0029 and ADR-0030. ADR-0035 covers storage and distribution.
 
 A future UI will dispatch the same prompt with several named configurations and compare outcomes. No UI exists yet. This ADR records the structure that comparison needs: a Profile that fixes the agent config of one Job, a Batch that groups Jobs by Profile, and a per-profile view in the CLI.
 

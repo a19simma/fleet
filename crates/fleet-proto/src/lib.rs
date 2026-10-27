@@ -11,8 +11,12 @@ pub use convert::{ConvertError, queued_event, validate_box};
 /// this sits above the 4 MiB text cap of the validator.
 pub const MAX_PROFILE_JSON_BYTES: usize = 8 * 1024 * 1024;
 
-/// Largest `FleetProfiles` message either side decodes, in bytes: the profile JSON plus 1 MiB
-/// for the rest of the message.
+/// Largest profile-carrying message either side encodes or decodes, in bytes: the profile
+/// JSON plus 1 MiB for the rest of the message.
+///
+/// It applies to `FleetProfiles` on the server, to the `FleetWorker` reply of
+/// `GetProfileBlob` on the server (encode) and on every `FleetWorker` client (decode), and to
+/// the `FleetProfiles` client. The tonic client default of 4 MiB is below the largest profile.
 pub const MAX_PROFILE_MESSAGE_BYTES: usize = MAX_PROFILE_JSON_BYTES + 1024 * 1024;
 
 /// Most transcript chunks one report may carry. The server rejects more.

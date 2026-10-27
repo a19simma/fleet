@@ -34,6 +34,7 @@ service FleetBatches {
 service FleetWorker {
   rpc ClaimJob(ClaimJobRequest) returns (ClaimJobReply);
   rpc ReportJob(ReportJobRequest) returns (ReportJobReply);
+  rpc GetProfileBlob(GetProfileBlobRequest) returns (GetProfileBlobReply);
 }
 
 message Envelope {
@@ -172,6 +173,25 @@ message Job {
   optional uint64 finished_at_ms = 19;
   string phase = 20;
   optional JobSummary summary = 21;
+  optional ProfileRef profile = 22;
+  optional string batch_id = 23;
+}
+
+message ProfileRef {
+  string name = 1;
+  uint32 version = 2;
+  string hash = 3;
+}
+
+message GetProfileBlobRequest {
+  string job_id = 1;
+  uint32 attempt = 2;
+  string box = 3;
+}
+
+message GetProfileBlobReply {
+  ProfileRef profile = 1;
+  bytes content = 2;
 }
 
 message SubmitJobRequest {

@@ -19,6 +19,7 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Duration;
 
+use fleet_proto::MAX_PROFILE_MESSAGE_BYTES;
 use fleet_proto::v1::fleet_worker_client::FleetWorkerClient;
 use fleet_proto::v1::{ClaimJobRequest, Job, ReportJobReply, ReportJobRequest};
 use tokio::sync::watch;
@@ -187,6 +188,7 @@ fn attach_client(channel: Channel, header: MetadataValue<tonic::metadata::Ascii>
         Ok(request)
     });
     FleetWorkerClient::with_interceptor(channel, attach)
+        .max_decoding_message_size(MAX_PROFILE_MESSAGE_BYTES)
 }
 
 /// Sends job reports to the Fleet server over `ReportJob` with the bearer token attached.

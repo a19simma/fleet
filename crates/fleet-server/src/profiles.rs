@@ -4,7 +4,9 @@ use std::fmt::{self, Write};
 
 use fleet_core::{Profile, ProfileError, ProfileHash, ProfileInvalid};
 use fleet_proto::MAX_PROFILE_JSON_BYTES;
-use fleet_proto::v1::{ListProfilesReply, ProfileSummary, ProfileVersion};
+use fleet_proto::v1::{
+    GetProfileBlobReply, ListProfilesReply, ProfileRef, ProfileSummary, ProfileVersion,
+};
 use sqlx::{PgPool, Row};
 
 use crate::store::{DEFAULT_LIST_LIMIT, MAX_LIST_LIMIT, StoreError};
@@ -25,6 +27,12 @@ const SELECT_LATEST: &str = "SELECT v.version, v.hash, b.content FROM profile_ve
      ORDER BY v.version DESC LIMIT 1";
 const SELECT_EXACT: &str = "SELECT v.version, v.hash, b.content FROM profile_version v \
      JOIN profile_blob b ON b.hash = v.hash WHERE v.name = $1 AND v.version = $2";
+const SELECT_LEASED_BLOB: &str = "SELECT j.profile_name, j.profile_version, j.profile_hash, \
+     v.hash AS version_hash, b.content FROM jobs j \
+     LEFT JOIN profile_version v ON v.name = j.profile_name AND v.version = j.profile_version \
+     LEFT JOIN profile_blob b ON b.hash = j.profile_hash \
+     WHERE j.job_id = $1 AND j.attempt = $2 AND j.box = $3 AND j.state = 'RUNNING' \
+     AND j.lease_expires_at > now()";
 const LIST: &str = "SELECT DISTINCT ON (name) name, version, hash FROM profile_version \
      WHERE ($1::text IS NULL OR name > $1) ORDER BY name, version DESC LIMIT $2";
 
@@ -189,6 +197,55 @@ pub(crate) async fn get(
         hash: hex(&row.try_get::<Vec<u8>, _>("hash")?),
         content_json: text_of(row.try_get("content")?)?,
         created: false,
+    })
+}
+
+pub(crate) async fn blob_for_lease(
+    pool: &PgPool,
+    job_id: &str,
+    attempt: u32,
+    box_name: &str,
+) -> Result<GetProfileBlobReply, StoreError> {
+    let attempt = i32::try_from(attempt).map_err(|_| StoreError::LeaseDenied)?;
+    let row = sqlx::query(SELECT_LEASED_BLOB)
+        .bind(job_id)
+        .bind(attempt)
+        .bind(box_name)
+        .fetch_optional(pool)
+        .await?
+        .ok_or(StoreError::LeaseDenied)?;
+    let Some(name) = row.try_get::<Option<String>, _>("profile_name")? else {
+        return Err(StoreError::UnknownProfile);
+    };
+    let corrupt = || StoreError::OutOfRange("profile blob");
+    let version = row
+        .try_get::<Option<i32>, _>("profile_version")?
+        .ok_or_else(corrupt)?;
+    let pinned = row
+        .try_get::<Option<Vec<u8>>, _>("profile_hash")?
+        .ok_or_else(corrupt)?;
+    let version_hash = row
+        .try_get::<Option<Vec<u8>>, _>("version_hash")?
+        .ok_or_else(corrupt)?;
+    let content = row
+        .try_get::<Option<Vec<u8>>, _>("content")?
+        .ok_or_else(corrupt)?;
+    if version_hash != pinned {
+        return Err(corrupt());
+    }
+    let profile = Profile::from_json(&content).map_err(|_| corrupt())?;
+    if profile.hash().as_bytes().as_slice() != pinned.as_slice()
+        || profile.canonical_json() != content
+    {
+        return Err(corrupt());
+    }
+    Ok(GetProfileBlobReply {
+        profile: Some(ProfileRef {
+            name,
+            version: version_of(version)?,
+            hash: hex(&pinned),
+        }),
+        content,
     })
 }
 

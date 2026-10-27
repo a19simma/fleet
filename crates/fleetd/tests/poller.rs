@@ -12,7 +12,10 @@ use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
 use fleet_proto::v1::fleet_worker_server::{FleetWorker, FleetWorkerServer};
-use fleet_proto::v1::{ClaimJobReply, ClaimJobRequest, Job, ReportJobReply, ReportJobRequest};
+use fleet_proto::v1::{
+    ClaimJobReply, ClaimJobRequest, GetProfileBlobReply, GetProfileBlobRequest, Job,
+    ReportJobReply, ReportJobRequest,
+};
 use fleetd::backoff::Random;
 use fleetd::poller::{
     CLAIM_GRACE, Claimed, GrpcReporter, JobRunner, MAX_IDLE_WAIT, PollRandom, Poller,
@@ -123,6 +126,13 @@ impl FleetWorker for Stub {
                 next_in_s: 0,
             })),
         }
+    }
+
+    async fn get_profile_blob(
+        &self,
+        _request: Request<GetProfileBlobRequest>,
+    ) -> Result<Response<GetProfileBlobReply>, Status> {
+        Err(Status::unimplemented("unused"))
     }
 
     async fn report_job(

@@ -6,9 +6,10 @@ use std::time::Duration;
 
 use fleet_core::{BoxName, Envelope, EventId, SCHEMA_VERSION};
 use fleet_proto::v1::{
-    BoxStatus, BoxView, GetStatsReply, GetStatsRequest, HeartbeatRequest, Job, JobState,
-    ReadJobEventsReply, ReadTranscriptReply, ReportJobReply, ReportJobRequest, SessionState,
-    SessionView, SubmitBatchReply, SubmitBatchRequest, SubmitJobRequest, TranscriptChunk,
+    BoxStatus, BoxView, GetProfileBlobReply, GetStatsReply, GetStatsRequest, HeartbeatRequest, Job,
+    JobState, ProfileRef, ReadJobEventsReply, ReadTranscriptReply, ReportJobReply,
+    ReportJobRequest, SessionState, SessionView, SubmitBatchReply, SubmitBatchRequest,
+    SubmitJobRequest, TranscriptChunk,
 };
 use serde_json::{Value, json};
 use sqlx::postgres::PgRow;
@@ -118,7 +119,8 @@ ORDER BY box, last_event_at DESC, session_id";
 
 const SELECT_JOB_BY_KEY: &str = "\
 SELECT job_id, idempotency_key, prompt, repo, base_ref, open_pr, state, box, attempt, \
-progress, phase, branch, pr_url, error, exit_code, cancel_requested, \
+progress, phase, branch, pr_url, error, exit_code, cancel_requested, batch_id, \
+profile_name, profile_version, encode(profile_hash, 'hex') AS profile_hash, \
 (EXTRACT(EPOCH FROM lease_expires_at) * 1000)::bigint AS lease_ms, \
 (EXTRACT(EPOCH FROM created_at) * 1000)::bigint AS created_ms, \
 (EXTRACT(EPOCH FROM claimed_at) * 1000)::bigint AS claimed_ms, \
@@ -133,7 +135,8 @@ RETURNING job_id";
 
 const SELECT_JOB_BY_ID: &str = "\
 SELECT job_id, idempotency_key, prompt, repo, base_ref, open_pr, state, box, attempt, \
-progress, phase, branch, pr_url, error, exit_code, cancel_requested, \
+progress, phase, branch, pr_url, error, exit_code, cancel_requested, batch_id, \
+profile_name, profile_version, encode(profile_hash, 'hex') AS profile_hash, \
 (EXTRACT(EPOCH FROM lease_expires_at) * 1000)::bigint AS lease_ms, \
 (EXTRACT(EPOCH FROM created_at) * 1000)::bigint AS created_ms, \
 (EXTRACT(EPOCH FROM claimed_at) * 1000)::bigint AS claimed_ms, \
@@ -142,7 +145,8 @@ FROM jobs WHERE job_id = $1";
 
 const LIST_JOBS: &str = "\
 SELECT job_id, idempotency_key, prompt, repo, base_ref, open_pr, state, box, attempt, \
-progress, phase, branch, pr_url, error, exit_code, cancel_requested, \
+progress, phase, branch, pr_url, error, exit_code, cancel_requested, batch_id, \
+profile_name, profile_version, encode(profile_hash, 'hex') AS profile_hash, \
 (EXTRACT(EPOCH FROM lease_expires_at) * 1000)::bigint AS lease_ms, \
 (EXTRACT(EPOCH FROM created_at) * 1000)::bigint AS created_ms, \
 (EXTRACT(EPOCH FROM claimed_at) * 1000)::bigint AS claimed_ms, \
@@ -161,7 +165,8 @@ WHERE job_id = ( \
 SELECT job_id FROM jobs WHERE state = 'QUEUED' \
 ORDER BY created_at, job_id LIMIT 1 FOR UPDATE SKIP LOCKED) \
 RETURNING job_id, idempotency_key, prompt, repo, base_ref, open_pr, state, box, attempt, \
-progress, phase, branch, pr_url, error, exit_code, cancel_requested, \
+progress, phase, branch, pr_url, error, exit_code, cancel_requested, batch_id, \
+profile_name, profile_version, encode(profile_hash, 'hex') AS profile_hash, \
 (EXTRACT(EPOCH FROM lease_expires_at) * 1000)::bigint AS lease_ms, \
 (EXTRACT(EPOCH FROM created_at) * 1000)::bigint AS created_ms, \
 (EXTRACT(EPOCH FROM claimed_at) * 1000)::bigint AS claimed_ms, \
@@ -174,7 +179,8 @@ finished_at = CASE WHEN state = 'QUEUED' THEN now() ELSE finished_at END, \
 cancel_requested = cancel_requested OR state = 'RUNNING' \
 WHERE job_id = $1 \
 RETURNING job_id, idempotency_key, prompt, repo, base_ref, open_pr, state, box, attempt, \
-progress, phase, branch, pr_url, error, exit_code, cancel_requested, \
+progress, phase, branch, pr_url, error, exit_code, cancel_requested, batch_id, \
+profile_name, profile_version, encode(profile_hash, 'hex') AS profile_hash, \
 (EXTRACT(EPOCH FROM lease_expires_at) * 1000)::bigint AS lease_ms, \
 (EXTRACT(EPOCH FROM created_at) * 1000)::bigint AS created_ms, \
 (EXTRACT(EPOCH FROM claimed_at) * 1000)::bigint AS claimed_ms, \
@@ -292,6 +298,9 @@ pub enum StoreError {
     /// A batch named a profile that has no version. The handler maps this to gRPC
     /// `NOT_FOUND`. No input is kept.
     UnknownProfile,
+    /// A profile blob read did not match a live lease, or no such job exists. The handler
+    /// maps this to gRPC `PERMISSION_DENIED`. No input is kept.
+    LeaseDenied,
 }
 
 impl fmt::Display for StoreError {
@@ -310,6 +319,7 @@ impl fmt::Display for StoreError {
             Self::InvalidProfile(reason) => reason.fmt(f),
             Self::InvalidBatch(reason) => reason.fmt(f),
             Self::UnknownProfile => f.write_str("profile not found"),
+            Self::LeaseDenied => f.write_str("lease does not match"),
         }
     }
 }
@@ -329,7 +339,8 @@ impl std::error::Error for StoreError {
             | Self::InvalidTelemetry
             | Self::TelemetryTooLarge
             | Self::NotFound
-            | Self::UnknownProfile => None,
+            | Self::UnknownProfile
+            | Self::LeaseDenied => None,
         }
     }
 }
@@ -445,6 +456,22 @@ pub(crate) fn ms(value: Option<i64>, field: &'static str) -> Result<Option<u64>,
     value.map(|v| count(v, field)).transpose()
 }
 
+fn profile_ref(row: &PgRow) -> Result<Option<ProfileRef>, StoreError> {
+    let Some(name) = row.try_get::<Option<String>, _>("profile_name")? else {
+        return Ok(None);
+    };
+    let version: Option<i32> = row.try_get("profile_version")?;
+    let hash: Option<String> = row.try_get("profile_hash")?;
+    let (Some(version), Some(hash)) = (version, hash) else {
+        return Err(StoreError::OutOfRange("job profile"));
+    };
+    Ok(Some(ProfileRef {
+        name,
+        version: u32::try_from(version).map_err(|_| StoreError::OutOfRange("profile version"))?,
+        hash,
+    }))
+}
+
 fn job_from_row(row: &PgRow) -> Result<Job, StoreError> {
     let state: String = row.try_get("state")?;
     let attempt: i32 = row.try_get("attempt")?;
@@ -472,6 +499,8 @@ fn job_from_row(row: &PgRow) -> Result<Job, StoreError> {
         finished_at_ms: ms(row.try_get("finished_ms")?, "finished_at")?,
         phase: row.try_get("phase")?,
         summary: None,
+        profile: profile_ref(row)?,
+        batch_id: row.try_get("batch_id")?,
     })
 }
 
@@ -995,6 +1024,28 @@ impl Store {
         request: &SubmitBatchRequest,
     ) -> Result<SubmitBatchReply, StoreError> {
         batches::submit(&self.pool, request).await
+    }
+
+    /// Reads the profile blob a running job pins, authorised against its lease.
+    ///
+    /// The job must be `RUNNING` at `attempt` on `box_name` with an unexpired lease. A job
+    /// that does not exist gives the same error as a lease mismatch.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StoreError::InvalidJob`] when `job_id` fails validation,
+    /// [`StoreError::LeaseDenied`] when no job matches the lease,
+    /// [`StoreError::UnknownProfile`] when the leased job pins no profile,
+    /// [`StoreError::OutOfRange`] when the stored blob fails the hash check and
+    /// [`StoreError::Database`] when the query fails.
+    pub async fn get_profile_blob(
+        &self,
+        job_id: &str,
+        attempt: u32,
+        box_name: &BoxName,
+    ) -> Result<GetProfileBlobReply, StoreError> {
+        validate_job_id(job_id)?;
+        profiles::blob_for_lease(&self.pool, job_id, attempt, box_name.as_str()).await
     }
 
     /// Cancels a job.
