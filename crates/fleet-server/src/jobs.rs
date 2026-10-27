@@ -2,7 +2,10 @@
 
 use std::fmt;
 
-use fleet_proto::v1::{JobState, ReportJobRequest, SubmitJobRequest};
+use fleet_proto::v1::{
+    JobState, JobVerdict, ReportJobRequest, SubmitJobRequest, SubmitJudgeRequest,
+};
+use fleet_proto::{MAX_MODEL_BYTES, MAX_VERDICT_REASON_BYTES, MAX_VERDICT_SCORE, is_plain_text};
 
 /// Longest accepted idempotency key, in bytes.
 pub const MAX_KEY_BYTES: usize = 128;
@@ -22,8 +25,7 @@ pub const MAX_TRANSCRIPT_ROWS: i64 = 50_000;
 /// Bytes charged against [`MAX_TRANSCRIPT_BYTES`] for any chunk, so empty text still costs.
 pub const MIN_CHUNK_COST_BYTES: usize = 64;
 
-/// Transcript bytes stored per job. Chunks past this are dropped after one marker row.
-pub const MAX_TRANSCRIPT_BYTES: usize = 4 * 1024 * 1024;
+pub use fleet_proto::MAX_TRANSCRIPT_BYTES;
 /// Longest stored progress text, in characters. Longer text is cut.
 pub const MAX_PROGRESS_CHARS: usize = 200;
 /// Longest stored phase, in characters. Longer text is cut.
@@ -67,6 +69,11 @@ pub enum JobInvalid {
     Filter,
     /// The stats grouping is not a known value.
     GroupBy,
+    /// A judge job names no valid, finished agent job as its target.
+    Target,
+    /// The verdict score, reason or model is out of range, or the report is not a
+    /// successful judge ending.
+    Verdict,
 }
 
 impl fmt::Display for JobInvalid {
@@ -85,6 +92,8 @@ impl fmt::Display for JobInvalid {
             Self::Window => "invalid stats window",
             Self::Filter => "invalid stats filter",
             Self::GroupBy => "invalid stats grouping",
+            Self::Target => "invalid target job",
+            Self::Verdict => "invalid verdict",
         })
     }
 }
@@ -99,6 +108,7 @@ pub struct NewJob {
     pub(crate) repo: String,
     pub(crate) base_ref: String,
     pub(crate) open_pr: bool,
+    pub(crate) target_job_id: Option<String>,
 }
 
 /// A validated final report: the state a box ends its job in and the result fields.
@@ -164,7 +174,54 @@ pub fn validate_submit(request: &SubmitJobRequest) -> Result<NewJob, JobInvalid>
         repo: request.repo.clone(),
         base_ref: request.base_ref.clone(),
         open_pr: request.open_pr,
+        target_job_id: None,
     })
+}
+
+/// Validates a judge submit request: the key, the rubric prompt and the target job id.
+///
+/// # Errors
+///
+/// Returns [`JobInvalid::Key`], [`JobInvalid::Prompt`] or [`JobInvalid::Target`] for the first
+/// field that fails, never carrying its value.
+pub fn validate_judge(request: &SubmitJudgeRequest) -> Result<NewJob, JobInvalid> {
+    if !bare_token(&request.idempotency_key, MAX_KEY_BYTES) {
+        return Err(JobInvalid::Key);
+    }
+    if request.prompt.trim().is_empty()
+        || request.prompt.len() > MAX_PROMPT_BYTES
+        || request.prompt.contains('\0')
+    {
+        return Err(JobInvalid::Prompt);
+    }
+    validate_job_id(&request.target_job_id).map_err(|_| JobInvalid::Target)?;
+    Ok(NewJob {
+        key: request.idempotency_key.clone(),
+        prompt: request.prompt.clone(),
+        repo: String::new(),
+        base_ref: String::new(),
+        open_pr: false,
+        target_job_id: Some(request.target_job_id.clone()),
+    })
+}
+
+/// Validates the verdict a judge job reports with its terminal state.
+///
+/// # Errors
+///
+/// Returns [`JobInvalid::Verdict`] when the score passes [`MAX_VERDICT_SCORE`], the reason is
+/// empty, over [`MAX_VERDICT_REASON_BYTES`] or has a control character, or the model is
+/// empty, over [`MAX_MODEL_BYTES`] or has a control character.
+pub(crate) fn validate_verdict(verdict: &JobVerdict) -> Result<(), JobInvalid> {
+    if verdict.score > MAX_VERDICT_SCORE
+        || verdict.reason.len() > MAX_VERDICT_REASON_BYTES
+        || verdict.judge_model.len() > MAX_MODEL_BYTES
+        || !is_plain_text(&verdict.reason)
+        || !is_plain_text(&verdict.judge_model)
+    {
+        return Err(JobInvalid::Verdict);
+    }
+    Ok(())
 }
 
 /// Validates the terminal part of a report. A report without `terminal_state` is a

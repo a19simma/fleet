@@ -1,5 +1,5 @@
-//! The `FleetIngest`, `FleetQuery`, `FleetWorker`, `FleetJobs`, `FleetProfiles` and
-//! `FleetBatches` gRPC handlers.
+//! The `FleetIngest`, `FleetQuery`, `FleetWorker`, `FleetJobs`, `FleetJudge`, `FleetProfiles`
+//! and `FleetBatches` gRPC handlers.
 
 use std::time::Duration;
 
@@ -7,17 +7,19 @@ use fleet_core::Envelope;
 use fleet_proto::v1::fleet_batches_server::{FleetBatches, FleetBatchesServer};
 use fleet_proto::v1::fleet_ingest_server::{FleetIngest, FleetIngestServer};
 use fleet_proto::v1::fleet_jobs_server::{FleetJobs, FleetJobsServer};
+use fleet_proto::v1::fleet_judge_server::{FleetJudge, FleetJudgeServer};
 use fleet_proto::v1::fleet_profiles_server::{FleetProfiles, FleetProfilesServer};
 use fleet_proto::v1::fleet_query_server::{FleetQuery, FleetQueryServer};
 use fleet_proto::v1::fleet_worker_server::{FleetWorker, FleetWorkerServer};
 use fleet_proto::v1::{
     CancelJobRequest, ClaimJobReply, ClaimJobRequest, CreateProfileRequest, GetBatchReply,
-    GetBatchRequest, GetJobRequest, GetProfileBlobReply, GetProfileBlobRequest, GetProfileRequest,
-    GetStatsReply, GetStatsRequest, HeartbeatReply, HeartbeatRequest, Job, ListFleetReply,
-    ListFleetRequest, ListJobsReply, ListJobsRequest, ListProfilesReply, ListProfilesRequest,
-    ProfileVersion, PushEventsReply, PushEventsRequest, QueuedEvent, ReadJobEventsReply,
-    ReadJobEventsRequest, ReadTranscriptReply, ReadTranscriptRequest, Rejection, ReportJobReply,
-    ReportJobRequest, SubmitBatchReply, SubmitBatchRequest, SubmitJobRequest,
+    GetBatchRequest, GetJobRequest, GetJobTranscriptReply, GetJobTranscriptRequest,
+    GetProfileBlobReply, GetProfileBlobRequest, GetProfileRequest, GetStatsReply, GetStatsRequest,
+    HeartbeatReply, HeartbeatRequest, Job, ListFleetReply, ListFleetRequest, ListJobsReply,
+    ListJobsRequest, ListProfilesReply, ListProfilesRequest, ProfileVersion, PushEventsReply,
+    PushEventsRequest, QueuedEvent, ReadJobEventsReply, ReadJobEventsRequest, ReadTranscriptReply,
+    ReadTranscriptRequest, Rejection, ReportJobReply, ReportJobRequest, SubmitBatchReply,
+    SubmitBatchRequest, SubmitJobRequest, SubmitJudgeRequest,
 };
 use fleet_proto::{ConvertError, validate_box};
 use tonic::transport::server::Router;
@@ -257,6 +259,21 @@ impl FleetWorker for FleetService {
         Ok(Response::new(reply))
     }
 
+    async fn get_job_transcript(
+        &self,
+        request: Request<GetJobTranscriptRequest>,
+    ) -> Result<Response<GetJobTranscriptReply>, Status> {
+        let request = request.into_inner();
+        let name = validate_box(&request.r#box)
+            .map_err(|err| Status::invalid_argument(err.to_string()))?;
+        let reply = self
+            .store
+            .get_job_transcript(&request.job_id, request.attempt, &name)
+            .await
+            .map_err(|err| worker_error(&err))?;
+        Ok(Response::new(reply))
+    }
+
     async fn report_job(
         &self,
         request: Request<ReportJobRequest>,
@@ -378,6 +395,21 @@ impl FleetProfiles for FleetService {
 }
 
 #[tonic::async_trait]
+impl FleetJudge for FleetService {
+    async fn submit_judge(
+        &self,
+        request: Request<SubmitJudgeRequest>,
+    ) -> Result<Response<Job>, Status> {
+        let job = self
+            .store
+            .submit_judge(&request.into_inner())
+            .await
+            .map_err(|err| jobs_error(&err))?;
+        Ok(Response::new(job))
+    }
+}
+
+#[tonic::async_trait]
 impl FleetJobs for FleetService {
     async fn submit_job(
         &self,
@@ -478,6 +510,7 @@ pub fn router(store: &Store, auth: &BearerAuth) -> Router<Stack<BearerAuth, Iden
         .max_decoding_message_size(MAX_MESSAGE_BYTES)
         .max_encoding_message_size(MAX_PROFILE_MESSAGE_BYTES);
     let jobs = FleetJobsServer::new(service.clone()).max_decoding_message_size(MAX_MESSAGE_BYTES);
+    let judge = FleetJudgeServer::new(service.clone()).max_decoding_message_size(MAX_MESSAGE_BYTES);
     let batches =
         FleetBatchesServer::new(service.clone()).max_decoding_message_size(MAX_MESSAGE_BYTES);
     let profiles =
@@ -492,6 +525,7 @@ pub fn router(store: &Store, auth: &BearerAuth) -> Router<Stack<BearerAuth, Iden
         .add_service(query)
         .add_service(worker)
         .add_service(jobs)
+        .add_service(judge)
         .add_service(profiles)
         .add_service(batches)
 }

@@ -22,6 +22,7 @@ const INGEST: &str = "/fleet.v1.FleetIngest/";
 const WORKER: &str = "/fleet.v1.FleetWorker/";
 const QUERY: &str = "/fleet.v1.FleetQuery/";
 const JOBS: &str = "/fleet.v1.FleetJobs/";
+const JUDGE: &str = "/fleet.v1.FleetJudge/";
 const PROFILES: &str = "/fleet.v1.FleetProfiles/";
 const BATCHES: &str = "/fleet.v1.FleetBatches/";
 
@@ -70,7 +71,8 @@ impl BearerAuth {
     }
 
     /// Allow-lists paths per scope: the box token takes `FleetIngest` and `FleetWorker`,
-    /// the client token takes `FleetQuery`, `FleetJobs`, `FleetProfiles` and `FleetBatches`.
+    /// the client token takes `FleetQuery`, `FleetJobs`, `FleetJudge`, `FleetProfiles` and
+    /// `FleetBatches`.
     /// Every other path is denied.
     fn allows(scope: Scope, path: &str) -> bool {
         match scope {
@@ -78,6 +80,7 @@ impl BearerAuth {
             Scope::Client => {
                 path.starts_with(QUERY)
                     || path.starts_with(JOBS)
+                    || path.starts_with(JUDGE)
                     || path.starts_with(PROFILES)
                     || path.starts_with(BATCHES)
             }

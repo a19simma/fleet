@@ -2,7 +2,7 @@
 
 use fleet_proto::v1::{
     CostStats, GetStatsReply, GetStatsRequest, Quantiles, StatsGroup, StatsGroupBy, StuckOutcomes,
-    StuckRuleStats, Total,
+    StuckRuleStats, Total, VerdictStats,
 };
 use sqlx::postgres::PgRow;
 use sqlx::{PgPool, Row};
@@ -41,9 +41,11 @@ WITH scoped AS ( \
         s.cost_est_usd, s.tokens_in, s.tokens_out, s.tokens_cache_read, \
         s.tokens_cache_write, s.tool_calls, s.tool_errors, s.bash_calls, s.bash_nonzero, \
         s.denials, s.api_retries, s.first_edit_ms, s.clone_ms, s.push_ms, s.pr_ms, \
-        s.queue_wait_ms, s.stuck_rule \
+        s.queue_wait_ms, s.stuck_rule, v.score AS verdict_score \
     FROM jobs j LEFT JOIN job_summary s ON s.job_id = j.job_id \
-    WHERE j.created_at >= to_timestamp($1::bigint::double precision) \
+    LEFT JOIN LATERAL (SELECT avg(score)::double precision AS score FROM job_verdict \
+        WHERE target_job_id = j.job_id) v ON true \
+    WHERE j.kind = 'agent' AND j.created_at >= to_timestamp($1::bigint::double precision) \
         AND j.created_at < to_timestamp($2::bigint::double precision) \
         AND ($3::text IS NULL OR j.repo = $3) \
         AND ($4::text IS NULL OR j.box = $4)) \
@@ -99,6 +101,11 @@ SELECT grp, grp IS NULL AS unknown, count(*) AS jobs, \
         FILTER (WHERE queue_wait_ms IS NOT NULL) AS queue_wait_ms_p50, \
     percentile_cont(0.95) WITHIN GROUP (ORDER BY queue_wait_ms::double precision) \
         FILTER (WHERE queue_wait_ms IS NOT NULL) AS queue_wait_ms_p95, \
+    count(verdict_score) AS verdict_n, avg(verdict_score) AS verdict_mean, \
+    percentile_cont(0.5) WITHIN GROUP (ORDER BY verdict_score) \
+        FILTER (WHERE verdict_score IS NOT NULL) AS verdict_p50, \
+    percentile_cont(0.95) WITHIN GROUP (ORDER BY verdict_score) \
+        FILTER (WHERE verdict_score IS NOT NULL) AS verdict_p95, \
     count(cost_est_usd) AS cost_n, \
     sum(cost_est_usd) AS cost_sum, \
     percentile_cont(0.5) WITHIN GROUP (ORDER BY cost_est_usd) \
@@ -229,6 +236,20 @@ fn cost(row: &PgRow) -> Result<Option<CostStats>, StoreError> {
     }))
 }
 
+fn verdict(row: &PgRow) -> Result<Option<VerdictStats>, StoreError> {
+    let n = n(row, "verdict_n")?;
+    if n == 0 {
+        return Ok(None);
+    }
+    Ok(Some(VerdictStats {
+        n,
+        mean: row.try_get("verdict_mean")?,
+        p50: row.try_get("verdict_p50")?,
+        p95: row.try_get("verdict_p95")?,
+        model_graded: true,
+    }))
+}
+
 fn outcomes(row: &PgRow) -> Result<StuckOutcomes, StoreError> {
     Ok(StuckOutcomes {
         jobs: n(row, "jobs")?,
@@ -292,6 +313,7 @@ fn group(row: &PgRow) -> Result<StatsGroup, StoreError> {
         push_ms: quantiles(row, "push_ms")?,
         pr_ms: quantiles(row, "pr_ms")?,
         queue_wait_ms: quantiles(row, "queue_wait_ms")?,
+        verdict: verdict(row)?,
         stuck_jobs: n(row, "stuck_jobs")?,
         stuck_rules: Vec::new(),
         clean: None,

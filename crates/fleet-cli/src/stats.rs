@@ -11,6 +11,7 @@ use super::{CliError, Client, StatsBy, sanitize};
 
 const SINCE_USAGE: &str =
     "invalid --since: use a duration such as 45s, 90m, 24h or 7d, or a unix time in seconds";
+const VERDICT_HEADER: &str = "group\tscore_mean\tscore_p50\tscore_p95\tn\tgrading";
 const HEADER: &str = "group\tjobs\tok%\tdur_p50\tdur_p95\tcost_usd\ttool_err%\tdenials\tstuck\tn";
 const STUCK_HEADER: &str = "group\tstuck_rule\tflagged\tsucceeded\tfailed\tother\tok%";
 const PHASE_HEADER: &str =
@@ -231,6 +232,31 @@ fn write_phases(out: &mut impl Write, groups: &[StatsGroup]) -> std::io::Result<
     Ok(())
 }
 
+/// Writes the verdict table: per group the judge score mean, p50 and p95, its own `n` and
+/// the `model_graded` label. Absent when no group has a verdict figure.
+fn write_verdicts(out: &mut impl Write, groups: &[StatsGroup]) -> std::io::Result<()> {
+    if groups.iter().all(|g| g.verdict.is_none()) {
+        return Ok(());
+    }
+    writeln!(out, "{VERDICT_HEADER}")?;
+    for group in groups {
+        let label = group_label(group);
+        match group.verdict.as_ref() {
+            Some(v) => writeln!(
+                out,
+                "{label}\t{:.1}\t{:.0}\t{:.0}\t{}\t{}",
+                v.mean,
+                v.p50,
+                v.p95,
+                v.n,
+                if v.model_graded { "model-graded" } else { "-" },
+            )?,
+            None => writeln!(out, "{label}\t-\t-\t-\t-\t-")?,
+        }
+    }
+    Ok(())
+}
+
 fn write_row(out: &mut impl Write, group: &StatsGroup) -> std::io::Result<()> {
     let key = group_label(group);
     let (p50, p95) = median_and_tail(group.duration_ms.as_ref());
@@ -280,6 +306,7 @@ pub(crate) fn write_stats(out: &mut impl Write, reply: &GetStatsReply) -> std::i
             write_row(out, group)?;
         }
         write_phases(out, &reply.groups)?;
+        write_verdicts(out, &reply.groups)?;
         write_stuck_rules(out, &reply.groups)?;
     }
     if reply.truncated {

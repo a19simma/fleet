@@ -27,6 +27,10 @@ service FleetProfiles {
   rpc ListProfiles(ListProfilesRequest) returns (ListProfilesReply);
 }
 
+service FleetJudge {
+  rpc SubmitJudge(SubmitJudgeRequest) returns (Job);
+}
+
 service FleetBatches {
   rpc SubmitBatch(SubmitBatchRequest) returns (SubmitBatchReply);
   rpc GetBatch(GetBatchRequest) returns (GetBatchReply);
@@ -36,6 +40,7 @@ service FleetWorker {
   rpc ClaimJob(ClaimJobRequest) returns (ClaimJobReply);
   rpc ReportJob(ReportJobRequest) returns (ReportJobReply);
   rpc GetProfileBlob(GetProfileBlobRequest) returns (GetProfileBlobReply);
+  rpc GetJobTranscript(GetJobTranscriptRequest) returns (GetJobTranscriptReply);
 }
 
 message Envelope {
@@ -152,6 +157,12 @@ enum JobState {
   JOB_STATE_LOST = 6;
 }
 
+enum JobKind {
+  JOB_KIND_UNSPECIFIED = 0;
+  JOB_KIND_AGENT = 1;
+  JOB_KIND_JUDGE = 2;
+}
+
 message Job {
   string job_id = 1;
   string idempotency_key = 2;
@@ -176,6 +187,25 @@ message Job {
   optional JobSummary summary = 21;
   optional ProfileRef profile = 22;
   optional string batch_id = 23;
+  JobKind kind = 24;
+  optional string target_job_id = 25;
+}
+
+message JobVerdict {
+  uint32 score = 1;
+  string reason = 2;
+  string judge_model = 3;
+}
+
+message GetJobTranscriptRequest {
+  string job_id = 1;
+  uint32 attempt = 2;
+  string box = 3;
+}
+
+message GetJobTranscriptReply {
+  string target_job_id = 1;
+  repeated TranscriptChunk chunks = 2;
 }
 
 message ProfileRef {
@@ -201,6 +231,12 @@ message SubmitJobRequest {
   string repo = 3;
   string base_ref = 4;
   bool open_pr = 5;
+}
+
+message SubmitJudgeRequest {
+  string idempotency_key = 1;
+  string prompt = 2;
+  string target_job_id = 3;
 }
 
 message SubmitBatchRequest {
@@ -291,6 +327,7 @@ message ReportJobRequest {
   optional string branch = 11;
   repeated JobEvent events = 12;
   optional JobSummary summary = 13;
+  optional JobVerdict verdict = 14;
 }
 
 enum JobEventKind {
@@ -449,6 +486,15 @@ message StatsGroup {
   optional Quantiles push_ms = 30;
   optional Quantiles pr_ms = 31;
   optional Quantiles queue_wait_ms = 32;
+  optional VerdictStats verdict = 33;
+}
+
+message VerdictStats {
+  uint64 n = 1;
+  double mean = 2;
+  double p50 = 3;
+  double p95 = 4;
+  bool model_graded = 5;
 }
 
 message CreateProfileRequest {

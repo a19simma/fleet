@@ -292,6 +292,50 @@ async fn phase_table_shows_each_phase_with_its_own_n_and_dashes_for_none() -> Te
 }
 
 #[tokio::test]
+async fn verdict_table_is_model_graded_with_its_own_n_and_dashes_for_none() -> TestResult {
+    let graded = StatsGroup {
+        verdict: Some(fleet_proto::v1::VerdictStats {
+            n: 3,
+            mean: 71.5,
+            p50: 70.0,
+            p95: 90.0,
+            model_graded: true,
+        }),
+        ..full_group("graded")
+    };
+    let out = stats(reply(vec![graded, full_group("plain")]), &[]).await?;
+    let table: Vec<Vec<&str>> = out
+        .lines()
+        .skip_while(|l| !l.starts_with("group\tscore_mean"))
+        .map(|l| l.split('\t').collect())
+        .collect();
+    assert_eq!(
+        table[0],
+        [
+            "group",
+            "score_mean",
+            "score_p50",
+            "score_p95",
+            "n",
+            "grading"
+        ]
+    );
+    assert_eq!(
+        table[1],
+        ["graded", "71.5", "70", "90", "3", "model-graded"]
+    );
+    assert_eq!(table[2], ["plain", "-", "-", "-", "-", "-"]);
+    Ok(())
+}
+
+#[tokio::test]
+async fn no_verdict_table_when_no_group_has_a_verdict() -> TestResult {
+    let out = stats(reply(vec![full_group("all")]), &[]).await?;
+    assert!(!out.contains("score_mean"), "{out}");
+    Ok(())
+}
+
+#[tokio::test]
 async fn no_phase_table_when_no_group_has_a_phase_figure() -> TestResult {
     let out = stats(reply(vec![full_group("all")]), &[]).await?;
     assert!(!out.contains("clone_p50"), "{out}");

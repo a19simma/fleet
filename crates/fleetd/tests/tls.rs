@@ -74,6 +74,13 @@ impl FleetWorker for Stub {
         Err(Status::unimplemented("unused"))
     }
 
+    async fn get_job_transcript(
+        &self,
+        _request: Request<fleet_proto::v1::GetJobTranscriptRequest>,
+    ) -> Result<Response<fleet_proto::v1::GetJobTranscriptReply>, Status> {
+        Err(Status::unimplemented("unused"))
+    }
+
     async fn report_job(
         &self,
         _request: Request<ReportJobRequest>,

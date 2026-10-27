@@ -9,7 +9,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use fleet_core::Redactor;
-use fleet_proto::v1::Job;
+use fleet_proto::v1::{Job, JobKind};
 use tonic::transport::Channel;
 
 use crate::Error;
@@ -72,6 +72,54 @@ impl<R: Reporter> DaemonRunner<R> {
         }
     }
 
+    async fn load_judge(&self, job: &Job, mut shutdown: Shutdown) -> Result<PathBuf, RunError> {
+        let work = self.agent.load_judge(job, &self.box_name);
+        let guarded = tokio::select! {
+            guarded = self.agent.keep_alive(job, work) => guarded,
+            () = shutdown.requested() => {
+                self.agent.fail_job(job, ERR_SHUTDOWN).await;
+                return Err(RunError);
+            }
+        };
+        match guarded {
+            Ok(Ok(dir)) => Ok(dir),
+            Ok(Err(err)) => {
+                tracing::warn!(reason = err.reason(), "judge transcript refused");
+                self.agent.fail_job(job, err.reason()).await;
+                Err(RunError)
+            }
+            Err(Interrupt::Cancelled) => {
+                self.agent.cancel_job(job).await;
+                Err(RunError)
+            }
+            Err(_) => Err(RunError),
+        }
+    }
+
+    async fn run_judge(&self, job: &Job, shutdown: Shutdown) -> Result<(), RunError> {
+        let dir = match self.load_judge(job, shutdown.clone()).await {
+            Ok(dir) => dir,
+            Err(stop) => {
+                self.agent.clear_judge(job);
+                return Err(stop);
+            }
+        };
+        let outcome = self.agent.run(job, &dir, shutdown).await;
+        let result = match outcome {
+            Ok(AgentOutcome::Succeeded) => {
+                self.agent.finish_judge(job).await;
+                Ok(())
+            }
+            Ok(other) => {
+                tracing::info!(outcome = ?other, "judge ended without a verdict");
+                Ok(())
+            }
+            Err(stop) => Err(stop),
+        };
+        self.agent.clear_judge(job);
+        result
+    }
+
     async fn prepare(&self, job: &Job, mut shutdown: Shutdown) -> Result<PathBuf, RunError> {
         let work = self.agent.timed_clone(
             job,
@@ -125,6 +173,9 @@ impl<R: Reporter> DaemonRunner<R> {
 
 impl<R: Reporter + 'static> JobRunner for DaemonRunner<R> {
     async fn run(&self, job: Job, shutdown: Shutdown) -> Result<(), RunError> {
+        if job.kind() == JobKind::Judge {
+            return self.run_judge(&job, shutdown).await;
+        }
         if let Err(stop) = self.load_profile(&job, shutdown.clone()).await {
             self.agent.clear_profile(&job);
             return Err(stop);
@@ -476,10 +527,17 @@ mod tests {
         reports: mpsc::UnboundedReceiver<ReportJobRequest>,
         asked: Arc<Mutex<Vec<GetProfileBlobRequest>>>,
         marker: PathBuf,
-        _dir: tempfile::TempDir,
+        dir: tempfile::TempDir,
     }
 
     fn fixture(reply: Result<GetProfileBlobReply, Status>) -> Result<Fixture, std::io::Error> {
+        fixture_with(reply, false)
+    }
+
+    fn fixture_with(
+        reply: Result<GetProfileBlobReply, Status>,
+        jobs_dir: bool,
+    ) -> Result<Fixture, std::io::Error> {
         let dir = tempfile::TempDir::new()?;
         let marker = dir.path().join("git-ran");
         let git = script(dir.path(), &format!("touch {}\nexit 1", marker.display()))?;
@@ -490,9 +548,13 @@ mod tests {
             reply,
             asked: Arc::clone(&asked),
         };
+        let mut config = RunConfig::new("claude", false);
+        if jobs_dir {
+            config.jobs_dir = Some(dir.path().join("agent-jobs"));
+        }
         let runner = DaemonRunner::new(
             workspace(dir.path(), &git),
-            AgentRunner::new(RunConfig::new("claude", false), blob, Redactor::default()),
+            AgentRunner::new(config, blob, Redactor::default()),
             "the-box",
         );
         Ok(Fixture {
@@ -500,7 +562,7 @@ mod tests {
             reports,
             asked,
             marker,
-            _dir: dir,
+            dir,
         })
     }
 
@@ -528,6 +590,46 @@ mod tests {
             out.extend(report.error);
         }
         out
+    }
+
+    #[tokio::test]
+    async fn a_judge_job_never_clones_and_fails_with_a_fixed_reason() -> TestResult {
+        let mut fx = fixture(Err(Status::unavailable("down")))?;
+        let job = Job {
+            kind: JobKind::Judge.into(),
+            target_job_id: Some("target1".into()),
+            ..sample_job()
+        };
+        let (_trigger, shutdown) = Shutdown::channel();
+        assert!(fx.runner.run(job, shutdown).await.is_err());
+        assert_eq!(
+            errors(&mut fx.reports),
+            vec!["judge workspace could not be prepared".to_owned()]
+        );
+        assert!(!fx.marker.exists());
+        assert!(fx.asked.lock().is_ok_and(|asked| asked.is_empty()));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_refused_judge_job_leaves_no_transcript_on_disk() -> TestResult {
+        let mut fx = fixture_with(Err(Status::unavailable("down")), true)?;
+        let stale = fx.dir.path().join("agent-jobs").join("job1");
+        std::fs::create_dir_all(&stale)?;
+        std::fs::write(stale.join("transcript.jsonl"), "secret")?;
+        let job = Job {
+            kind: JobKind::Judge.into(),
+            target_job_id: Some("target1".into()),
+            ..sample_job()
+        };
+        let (_trigger, shutdown) = Shutdown::channel();
+        assert!(fx.runner.run(job, shutdown).await.is_err());
+        assert_eq!(
+            errors(&mut fx.reports),
+            vec!["judge transcript could not be fetched".to_owned()]
+        );
+        assert!(!stale.exists());
+        Ok(())
     }
 
     #[tokio::test]

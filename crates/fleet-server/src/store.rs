@@ -6,10 +6,10 @@ use std::time::Duration;
 
 use fleet_core::{BoxName, Envelope, EventId, SCHEMA_VERSION};
 use fleet_proto::v1::{
-    BoxStatus, BoxView, GetProfileBlobReply, GetStatsReply, GetStatsRequest, HeartbeatRequest, Job,
-    JobState, ProfileRef, ReadJobEventsReply, ReadTranscriptReply, ReportJobReply,
-    ReportJobRequest, SessionState, SessionView, SubmitBatchReply, SubmitBatchRequest,
-    SubmitJobRequest, TranscriptChunk,
+    BoxStatus, BoxView, GetJobTranscriptReply, GetProfileBlobReply, GetStatsReply, GetStatsRequest,
+    HeartbeatRequest, Job, JobKind, JobState, JobVerdict, ProfileRef, ReadJobEventsReply,
+    ReadTranscriptReply, ReportJobReply, ReportJobRequest, SessionState, SessionView,
+    SubmitBatchReply, SubmitBatchRequest, SubmitJobRequest, SubmitJudgeRequest, TranscriptChunk,
 };
 use serde_json::{Value, json};
 use sqlx::postgres::PgRow;
@@ -18,7 +18,8 @@ use sqlx::{PgPool, Postgres, Row, Transaction};
 use crate::batches::{self, BatchInvalid};
 use crate::jobs::{
     JobInvalid, MAX_CHUNKS_PER_REPORT, MAX_PHASE_CHARS, MAX_PROGRESS_CHARS, MAX_TRANSCRIPT_BYTES,
-    MAX_TRANSCRIPT_ROWS, MIN_CHUNK_COST_BYTES, validate_job_id, validate_submit, validate_terminal,
+    MAX_TRANSCRIPT_ROWS, MIN_CHUNK_COST_BYTES, NewJob, validate_job_id, validate_judge,
+    validate_submit, validate_terminal, validate_verdict,
 };
 use crate::profiles::{self, ProfileFault};
 use crate::projection::{Projection, State, project};
@@ -120,7 +121,7 @@ ORDER BY box, last_event_at DESC, session_id";
 const SELECT_JOB_BY_KEY: &str = "\
 SELECT job_id, idempotency_key, prompt, repo, base_ref, open_pr, state, box, attempt, \
 progress, phase, branch, pr_url, error, exit_code, cancel_requested, batch_id, \
-profile_name, profile_version, encode(profile_hash, 'hex') AS profile_hash, \
+kind, target_job_id, profile_name, profile_version, encode(profile_hash, 'hex') AS profile_hash, \
 (EXTRACT(EPOCH FROM lease_expires_at) * 1000)::bigint AS lease_ms, \
 (EXTRACT(EPOCH FROM created_at) * 1000)::bigint AS created_ms, \
 (EXTRACT(EPOCH FROM claimed_at) * 1000)::bigint AS claimed_ms, \
@@ -133,10 +134,40 @@ VALUES ($1, $2, $3, $4, $5, 'swarm/' || $1, $6) \
 ON CONFLICT (idempotency_key) DO NOTHING \
 RETURNING job_id";
 
+const INSERT_JUDGE: &str = "\
+INSERT INTO jobs (job_id, idempotency_key, prompt, repo, base_ref, branch, open_pr, kind, target_job_id) \
+SELECT $1, $2, $3, '', '', '', false, 'judge', t.job_id FROM jobs t \
+WHERE t.job_id = $4 AND t.kind = 'agent' \
+AND t.state IN ('SUCCEEDED', 'FAILED', 'CANCELLED', 'LOST') \
+AND NOT EXISTS (\
+SELECT 1 FROM jobs d WHERE d.target_job_id = t.job_id AND d.kind = 'judge' \
+AND (d.state IN ('QUEUED', 'RUNNING') \
+OR EXISTS (SELECT 1 FROM job_verdict v WHERE v.job_id = d.job_id))) \
+ON CONFLICT (idempotency_key) DO NOTHING \
+RETURNING job_id";
+
+const LOCK_JUDGE_TARGET: &str = "SELECT 1 FROM jobs WHERE job_id = $1 FOR NO KEY UPDATE";
+
+const SELECT_KIND: &str = "SELECT kind FROM jobs WHERE job_id = $1";
+
+const INSERT_VERDICT: &str = "\
+INSERT INTO job_verdict (job_id, target_job_id, score, reason, judge_model) \
+SELECT job_id, target_job_id, $2, $3, $4 FROM jobs WHERE job_id = $1 \
+ON CONFLICT DO NOTHING";
+
+const SELECT_JUDGE_TARGET: &str = "\
+SELECT j.target_job_id FROM jobs j \
+WHERE j.job_id = $1 AND j.attempt = $2 AND j.box = $3 AND j.kind = 'judge' \
+AND j.state = 'RUNNING' AND j.lease_expires_at > now()";
+
+const READ_ALL_TRANSCRIPT: &str = "\
+SELECT seq, ts_ms, chunk, truncated FROM job_transcript \
+WHERE job_id = $1 ORDER BY seq LIMIT $2";
+
 const SELECT_JOB_BY_ID: &str = "\
 SELECT job_id, idempotency_key, prompt, repo, base_ref, open_pr, state, box, attempt, \
 progress, phase, branch, pr_url, error, exit_code, cancel_requested, batch_id, \
-profile_name, profile_version, encode(profile_hash, 'hex') AS profile_hash, \
+kind, target_job_id, profile_name, profile_version, encode(profile_hash, 'hex') AS profile_hash, \
 (EXTRACT(EPOCH FROM lease_expires_at) * 1000)::bigint AS lease_ms, \
 (EXTRACT(EPOCH FROM created_at) * 1000)::bigint AS created_ms, \
 (EXTRACT(EPOCH FROM claimed_at) * 1000)::bigint AS claimed_ms, \
@@ -146,7 +177,7 @@ FROM jobs WHERE job_id = $1";
 const LIST_JOBS: &str = "\
 SELECT job_id, idempotency_key, prompt, repo, base_ref, open_pr, state, box, attempt, \
 progress, phase, branch, pr_url, error, exit_code, cancel_requested, batch_id, \
-profile_name, profile_version, encode(profile_hash, 'hex') AS profile_hash, \
+kind, target_job_id, profile_name, profile_version, encode(profile_hash, 'hex') AS profile_hash, \
 (EXTRACT(EPOCH FROM lease_expires_at) * 1000)::bigint AS lease_ms, \
 (EXTRACT(EPOCH FROM created_at) * 1000)::bigint AS created_ms, \
 (EXTRACT(EPOCH FROM claimed_at) * 1000)::bigint AS claimed_ms, \
@@ -166,7 +197,7 @@ SELECT job_id FROM jobs WHERE state = 'QUEUED' \
 ORDER BY created_at, job_id LIMIT 1 FOR UPDATE SKIP LOCKED) \
 RETURNING job_id, idempotency_key, prompt, repo, base_ref, open_pr, state, box, attempt, \
 progress, phase, branch, pr_url, error, exit_code, cancel_requested, batch_id, \
-profile_name, profile_version, encode(profile_hash, 'hex') AS profile_hash, \
+kind, target_job_id, profile_name, profile_version, encode(profile_hash, 'hex') AS profile_hash, \
 (EXTRACT(EPOCH FROM lease_expires_at) * 1000)::bigint AS lease_ms, \
 (EXTRACT(EPOCH FROM created_at) * 1000)::bigint AS created_ms, \
 (EXTRACT(EPOCH FROM claimed_at) * 1000)::bigint AS claimed_ms, \
@@ -180,7 +211,7 @@ cancel_requested = cancel_requested OR state = 'RUNNING' \
 WHERE job_id = $1 \
 RETURNING job_id, idempotency_key, prompt, repo, base_ref, open_pr, state, box, attempt, \
 progress, phase, branch, pr_url, error, exit_code, cancel_requested, batch_id, \
-profile_name, profile_version, encode(profile_hash, 'hex') AS profile_hash, \
+kind, target_job_id, profile_name, profile_version, encode(profile_hash, 'hex') AS profile_hash, \
 (EXTRACT(EPOCH FROM lease_expires_at) * 1000)::bigint AS lease_ms, \
 (EXTRACT(EPOCH FROM created_at) * 1000)::bigint AS created_ms, \
 (EXTRACT(EPOCH FROM claimed_at) * 1000)::bigint AS claimed_ms, \
@@ -501,7 +532,17 @@ fn job_from_row(row: &PgRow) -> Result<Job, StoreError> {
         summary: None,
         profile: profile_ref(row)?,
         batch_id: row.try_get("batch_id")?,
+        kind: job_kind(&row.try_get::<String, _>("kind")?)?.into(),
+        target_job_id: row.try_get("target_job_id")?,
     })
+}
+
+fn job_kind(text: &str) -> Result<JobKind, StoreError> {
+    match text {
+        "agent" => Ok(JobKind::Agent),
+        "judge" => Ok(JobKind::Judge),
+        _ => Err(StoreError::OutOfRange("job kind")),
+    }
 }
 
 impl From<sqlx::migrate::MigrateError> for StoreError {
@@ -765,24 +806,66 @@ impl Store {
     /// [`StoreError::Database`] when a query fails.
     pub async fn submit_job(&self, request: &SubmitJobRequest) -> Result<Job, StoreError> {
         let job = validate_submit(request)?;
-        sqlx::query(INSERT_JOB)
-            .bind(EventId::generate().to_string())
-            .bind(&job.key)
-            .bind(&job.prompt)
-            .bind(&job.repo)
-            .bind(&job.base_ref)
-            .bind(job.open_pr)
-            .fetch_optional(&self.pool)
-            .await?;
+        self.insert_job(job).await
+    }
+
+    /// Submits a judge job over the stored transcript of a finished agent job, idempotent by
+    /// key like [`Store::submit_job`].
+    ///
+    /// The job has an empty repo and base ref, no branch and no pull request. The target must
+    /// be an agent job in a terminal state. A target has at most one live judge: a request
+    /// under a new key is refused while another judge Job of the target is `QUEUED` or
+    /// `RUNNING` or already holds a verdict. A target whose judges all failed may be judged
+    /// again.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StoreError::InvalidJob`] when the request fails validation or the target is
+    /// not a finished agent job, [`StoreError::KeyConflict`] when the key exists with
+    /// different parameters, and [`StoreError::Database`] when a query fails.
+    pub async fn submit_judge(&self, request: &SubmitJudgeRequest) -> Result<Job, StoreError> {
+        let job = validate_judge(request)?;
+        self.insert_job(job).await
+    }
+
+    async fn insert_job(&self, job: NewJob) -> Result<Job, StoreError> {
+        let id = EventId::generate().to_string();
+        if let Some(target) = &job.target_job_id {
+            let mut tx = self.pool.begin().await?;
+            sqlx::query(LOCK_JUDGE_TARGET)
+                .bind(target)
+                .fetch_optional(&mut *tx)
+                .await?;
+            sqlx::query(INSERT_JUDGE)
+                .bind(id)
+                .bind(&job.key)
+                .bind(&job.prompt)
+                .bind(target)
+                .fetch_optional(&mut *tx)
+                .await?;
+            tx.commit().await?;
+        } else {
+            sqlx::query(INSERT_JOB)
+                .bind(id)
+                .bind(&job.key)
+                .bind(&job.prompt)
+                .bind(&job.repo)
+                .bind(&job.base_ref)
+                .bind(job.open_pr)
+                .fetch_optional(&self.pool)
+                .await?;
+        }
         let row = sqlx::query(SELECT_JOB_BY_KEY)
             .bind(&job.key)
-            .fetch_one(&self.pool)
-            .await?;
+            .fetch_optional(&self.pool)
+            .await?
+            .ok_or(JobInvalid::Target)?;
         let stored = job_from_row(&row)?;
         if stored.prompt != job.prompt
             || stored.repo != job.repo
             || stored.base_ref != job.base_ref
             || stored.open_pr != job.open_pr
+            || stored.target_job_id != job.target_job_id
         {
             return Err(StoreError::KeyConflict);
         }
@@ -1072,6 +1155,64 @@ impl Store {
         profiles::blob_for_lease(&self.pool, job_id, attempt, box_name.as_str()).await
     }
 
+    /// Reads the whole transcript of the job a running judge job targets, authorised against
+    /// the judge's lease.
+    ///
+    /// The judge must be a `RUNNING` judge job at `attempt` on `box_name` with an unexpired
+    /// lease. The target comes from the judge row, never from the request. Any mismatch,
+    /// including a job that does not exist, gives the same [`StoreError::LeaseDenied`].
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StoreError::InvalidJob`] when `job_id` fails validation,
+    /// [`StoreError::LeaseDenied`] when no judge job matches the lease,
+    /// [`StoreError::OutOfRange`] when the stored transcript passes [`MAX_TRANSCRIPT_ROWS`]
+    /// rows or [`MAX_TRANSCRIPT_BYTES`] bytes of text and [`StoreError::Database`] when a
+    /// query fails.
+    pub async fn get_job_transcript(
+        &self,
+        job_id: &str,
+        attempt: u32,
+        box_name: &BoxName,
+    ) -> Result<GetJobTranscriptReply, StoreError> {
+        validate_job_id(job_id)?;
+        let attempt = i32::try_from(attempt).map_err(|_| StoreError::LeaseDenied)?;
+        let target: String = sqlx::query_scalar(SELECT_JUDGE_TARGET)
+            .bind(job_id)
+            .bind(attempt)
+            .bind(box_name.as_str())
+            .fetch_optional(&self.pool)
+            .await?
+            .ok_or(StoreError::LeaseDenied)?;
+        let rows = sqlx::query(READ_ALL_TRANSCRIPT)
+            .bind(&target)
+            .bind(MAX_TRANSCRIPT_ROWS + 1)
+            .fetch_all(&self.pool)
+            .await?;
+        if i64::try_from(rows.len()).map_or(true, |len| len > MAX_TRANSCRIPT_ROWS) {
+            return Err(StoreError::OutOfRange("transcript"));
+        }
+        let chunks = rows
+            .iter()
+            .map(|row| {
+                Ok(TranscriptChunk {
+                    seq: count(row.try_get("seq")?, "seq")?,
+                    ts_ms: count(row.try_get("ts_ms")?, "ts_ms")?,
+                    text: row.try_get("chunk")?,
+                    truncated: row.try_get("truncated")?,
+                })
+            })
+            .collect::<Result<Vec<_>, StoreError>>()?;
+        let bytes: usize = chunks.iter().map(|chunk| chunk.text.len()).sum();
+        if bytes > MAX_TRANSCRIPT_BYTES {
+            return Err(StoreError::OutOfRange("transcript"));
+        }
+        Ok(GetJobTranscriptReply {
+            target_job_id: target,
+            chunks,
+        })
+    }
+
     /// Cancels a job.
     ///
     /// One statement decides by the stored state. A `QUEUED` job becomes `CANCELLED` at
@@ -1203,6 +1344,10 @@ impl Store {
             }
         }
         telemetry::persist(&mut tx, job_id, &telemetry).await?;
+        if terminal.is_some() || request.verdict.is_some() {
+            let succeeded = terminal.as_ref().is_some_and(|t| t.state == "SUCCEEDED");
+            store_verdict(&mut tx, job_id, succeeded, request.verdict.as_ref()).await?;
+        }
         let mut acked: i64 = sqlx::query_scalar(TRANSCRIPT_PREFIX)
             .bind(job_id)
             .fetch_one(&mut *tx)
@@ -1335,6 +1480,40 @@ impl Store {
         }
         Ok((as_of_ms, boxes))
     }
+}
+
+async fn store_verdict(
+    tx: &mut Transaction<'_, Postgres>,
+    job_id: &str,
+    succeeded: bool,
+    verdict: Option<&JobVerdict>,
+) -> Result<(), StoreError> {
+    let kind: String = sqlx::query_scalar(SELECT_KIND)
+        .bind(job_id)
+        .fetch_one(&mut **tx)
+        .await?;
+    let judge = kind == "judge";
+    let Some(verdict) = verdict else {
+        return if succeeded && judge {
+            Err(StoreError::InvalidTelemetry)
+        } else {
+            Ok(())
+        };
+    };
+    if !succeeded || !judge || validate_verdict(verdict).is_err() {
+        return Err(StoreError::InvalidTelemetry);
+    }
+    let stored = sqlx::query(INSERT_VERDICT)
+        .bind(job_id)
+        .bind(i16::try_from(verdict.score).map_err(|_| StoreError::InvalidTelemetry)?)
+        .bind(&verdict.reason)
+        .bind(&verdict.judge_model)
+        .execute(&mut **tx)
+        .await?;
+    if stored.rows_affected() == 0 {
+        return Err(StoreError::InvalidTelemetry);
+    }
+    Ok(())
 }
 
 async fn insert_events(
