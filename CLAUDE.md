@@ -20,7 +20,7 @@ These sent earlier work back for a retry. Check each before you commit.
 
 ## Style
 
-- Tracked files must not contain private hostnames, tailnet addresses and domains, home-directory paths, or box names with a digit suffix. CI greps for them and fails.
+- Tracked files must not contain private hostnames, tailnet addresses and domains, home-directory paths, or box names with a digit suffix. CI greps for them and fails. Run the private-pattern grep over the diff before committing, and write "the dev box" in docs, never a box name (PF-5 failed verify on a box name in an ADR note).
 
 ## Keep this file current
 
