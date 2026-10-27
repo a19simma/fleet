@@ -8,6 +8,11 @@
 - **Escaped descendants.** A `setsid` descendant must finish `setsid` before the agent script exits, because the exit kills the process group. The script waits for the pid file the descendant writes, and the test kills that pid.
 - **Surviving descendants hang the test binary.** A red kill test leaves `sleep 300` holding the runner fifo, and the runtime drop blocks on the fifo `open` in `tokio::fs`.
 
+## Runner loop
+
+- **List every exit arm of a loop with several, and test each one for the heartbeat and the group kill.** The arms are stdout EOF, child exit, deadline, shutdown and report error. A17 failed twice because each retry fixed the named arm and left a sibling: group disarmed after wait, report awaited inside `select`, no heartbeat arm after stdout EOF.
+- **A change to the spawn path needs every test binary that spawns the fake agent.** `grep -l claude_bin crates/fleetd/tests/*.rs` lists them, and `daemon_jobs` and `e2e_jobs` are among them. TEL-A3 ran only `telemetry` and `runner::` tests and went red on both in the independent verify.
+
 ## Askpass test
 
 - **Own test file.** `tests/askpass_process.rs` runs the `fleetd askpass` binary, so it stays alone in its binary.
