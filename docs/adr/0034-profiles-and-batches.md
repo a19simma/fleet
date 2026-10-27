@@ -35,6 +35,19 @@ The **Floor** is fixed in fleetd. It sets the permission mode to `dontAsk` and c
 
 The Box ceilings for max turns, budget and timeout win over the Profile values (clamp). fleetd applies the Floor and the ceilings last.
 
+### Floor
+
+`fleetd::floor::FLOOR_DENY` holds the Floor deny set:
+
+- `Bash(git push *)`, `Bash(git push*)`, `Bash(gh *)`: the daemon publishes the branch (ADR-0024).
+- `Bash(curl *)`: denied in the default agent settings.
+- `WebFetch`: fetches go through the egress proxy (ADR-0031), not the tool. This is a documented choice.
+- `Edit`, `Write`, `NotebookEdit`, `MultiEdit`: edits go through Bash (ADR-0024).
+
+An `allow` entry matches a Floor deny, and is dropped, when `covers(deny, allow)` holds. Identical strings cover. A bare tool name covers that name and that name followed by `(`. `Tool(prefix*)` covers `Tool(arg)` when `arg` starts with `prefix`, and `Tool(prefix2*)` when `prefix2` starts with `prefix`. Tool names are matched exactly, with case and whitespace significant. `Bash(git push*)` therefore also covers `Bash(git pushd*)`: when in doubt the allow is dropped. fleetd reports each dropped allow. The effective deny list is the Floor set, then the Profile extras in sorted order, with no repeats. Max turns and budget use the Box default when the Profile sets none, then the lower of that value and the Box ceiling.
+
+Whether deny beats allow in the real claude is unverified: the probe on the dev box (claude 2.1.289) stopped at "Not logged in", so neither the allow-and-deny run nor the allow-only control ran. Dropping the allow is correct either way.
+
 ### Validation
 
 `fleet-core` checks these rules on every Floor. Each failure is a fixed error that never echoes the input.

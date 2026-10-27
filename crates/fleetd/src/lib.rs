@@ -19,6 +19,7 @@ mod dump;
 mod error;
 pub mod events;
 mod feed;
+pub mod floor;
 pub mod forwarder;
 mod group;
 pub mod heartbeat;
