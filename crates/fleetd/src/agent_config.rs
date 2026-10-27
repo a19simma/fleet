@@ -109,6 +109,10 @@ impl Bundle {
         format!("{:x}", hash.finalize())
     }
 
+    pub(crate) fn files(&self) -> &BTreeMap<PathBuf, Vec<u8>> {
+        &self.files
+    }
+
     /// Copies and checks the directory at `dir` over the embedded defaults.
     ///
     /// # Errors

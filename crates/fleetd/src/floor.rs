@@ -114,6 +114,11 @@ pub fn apply(profile: &Profile, ceilings: &BoxCeilings) -> Effective {
         .iter()
         .cloned()
         .partition(|entry| FLOOR_DENY.iter().any(|deny| covers(deny, entry)));
+    let mut seen = BTreeSet::new();
+    let dropped_allows = dropped_allows
+        .into_iter()
+        .filter(|entry| seen.insert(entry.clone()))
+        .collect();
     Effective {
         deny,
         allow,
@@ -170,6 +175,15 @@ mod tests {
     fn allow_of_a_concrete_push_is_dropped() {
         assert!(dropped("Bash(git push origin main)"));
         assert!(dropped("Bash(git push *)"));
+    }
+
+    #[test]
+    fn repeated_dropped_allows_are_listed_once() {
+        let eff = apply(&profile(&["Edit", "Edit", "WebFetch"], &[]), &ceilings());
+        assert_eq!(
+            eff.dropped_allows,
+            vec!["Edit".to_owned(), "WebFetch".to_owned()]
+        );
     }
 
     #[test]

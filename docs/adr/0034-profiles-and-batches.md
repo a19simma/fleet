@@ -60,6 +60,17 @@ Whether deny beats allow in the real claude is unverified: the probe on the dev 
 - Paths and allow rules naming credential locations are rejected, and text that looks like a secret is rejected. Both checks are best-effort lints.
 - `max_budget_usd` is whole US cents.
 
+### Overlay
+
+`fleetd::profile_apply::apply_profile` lays a validated Profile over the default bundle. It is built, not wired. Inferred, not part of the design: the rules below.
+
+- `CLAUDE.md` is replaced by the Profile `claude_md` when set. Each context file is written at `.claude/ctx/<path>` inside the bundle root and imported by an `@.claude/ctx/<path>` line appended to `CLAUDE.md`, so the import resolves from the file that holds it. A context path with whitespace is refused, because an import line cannot carry it.
+- Skill files are written at `skills/<name>/<path>`.
+- `settings.json` is generated: permissions from the Floor, the Profile model and attribution. Rules in `settings.permissions` join `allow` and `deny` before the Floor. A Profile with no allow rules keeps the default allow list; any allow rule replaces that list.
+- Overlay paths that collide when compared without case are refused, because the box may hold a case-insensitive filesystem.
+- The argv pieces are `--model`, `--allowedTools`, `--disallowedTools`, `--max-turns` and `--max-budget-usd` (cents written as dollars with two decimals). The prompt is the prefix followed by the template with `{prompt}` replaced once.
+- Unverified: whether claude discovers `skills/<name>/` under `CLAUDE_CONFIG_DIR` and resolves the import. The probe on the dev box stopped at "Not logged in".
+
 ### Batch
 
 A **Batch** is one prompt dispatched once per Profile. `repeats` is 1 for now, enforced by a CHECK. `fleet batch show` prints one column per Profile. A missing value prints `-`. The rows carry the command run breakdown and the time taken, both read from the existing telemetry (ADR-0029).
