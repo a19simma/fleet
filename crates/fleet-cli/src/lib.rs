@@ -156,6 +156,25 @@ pub enum BatchAction {
         /// Batch id.
         id: String,
     },
+    /// Submit one job per profile at a pinned commit and print the batch and job ids.
+    Submit {
+        /// Task prompt, or `-` to read it from stdin.
+        #[arg(long)]
+        prompt: String,
+        /// Repository the jobs work in.
+        #[arg(long)]
+        repo: String,
+        /// Commit the jobs start from: 40 lowercase hex characters.
+        #[arg(long)]
+        base: String,
+        /// Profile names, comma separated: 1 to 16 distinct names.
+        #[arg(long)]
+        profiles: String,
+        /// Key that makes a repeated submit return the same batch. A fresh key is used
+        /// when it is absent.
+        #[arg(long)]
+        idempotency_key: Option<String>,
+    },
 }
 
 /// A `fleet profile` action.
@@ -519,9 +538,30 @@ async fn run_batch(
     insecure: bool,
     lookup: impl Fn(&str) -> Option<String>,
     timeouts: bool,
+    stdin: &mut impl Read,
     out: &mut impl Write,
 ) -> Result<(), CliError> {
     match action {
+        BatchAction::Submit {
+            prompt,
+            repo,
+            base,
+            profiles,
+            idempotency_key,
+        } => {
+            let request = batch::prepare(
+                batch::Submit {
+                    prompt,
+                    repo,
+                    base,
+                    profiles,
+                    idempotency_key,
+                },
+                stdin,
+            )?;
+            let mut client = session(server, insecure, lookup, timeouts).await?.batches;
+            batch::submit(&mut client, request, out).await
+        }
         BatchAction::Show { id } => {
             let mut session = session(server, insecure, lookup, timeouts).await?;
             batch::show(&mut session.batches, &mut session.jobs, id, out).await
@@ -650,7 +690,7 @@ pub async fn run_with(
             stats::stats(&mut client, since, repo, box_name, by, out).await?;
         }
         Command::Batch { action } => {
-            run_batch(action, server, insecure, lookup, timeouts, out).await?;
+            run_batch(action, server, insecure, lookup, timeouts, stdin, out).await?;
         }
         Command::Profile { action } => {
             run_profile(action, server, insecure, lookup, timeouts, stdin, out).await?;

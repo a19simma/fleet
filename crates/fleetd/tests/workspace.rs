@@ -719,3 +719,72 @@ async fn git_stderr_is_cut_to_a_tail_and_a_split_secret_does_not_leak() -> TestR
     }))
     .await
 }
+
+#[tokio::test]
+async fn a_sha_base_clones_that_commit_and_not_the_branch_tip() -> TestResult {
+    common::bounded(Box::pin(async {
+        let dir = TempDir::new()?;
+        let repo = fixture(dir.path())?;
+        let seed = dir.path().join("seed");
+        let pinned = git(&seed, &["rev-parse", "HEAD"])?;
+        std::fs::write(seed.join("b.txt"), "two")?;
+        git(&seed, &["add", "."])?;
+        git(&seed, &["commit", "--quiet", "-m", "two"])?;
+        git(&seed, &["push", "--quiet", &repo, "main"])?;
+        let tip = git(&seed, &["rev-parse", "HEAD"])?;
+        assert_ne!(pinned, tip);
+
+        let ws = workspace(dir.path().join("jobs"));
+        let checkout = ws.prepare("job1", &repo, &pinned).await?;
+        assert_eq!(checkout.branch, "swarm/job1");
+        assert_eq!(git(&checkout.path, &["rev-parse", "HEAD"])?, pinned);
+        assert_eq!(
+            git(&checkout.path, &["rev-parse", "--abbrev-ref", "HEAD"])?,
+            "swarm/job1"
+        );
+        assert!(checkout.path.join("a.txt").exists());
+        assert!(!checkout.path.join("b.txt").exists());
+
+        let branch = ws.prepare("job2", &repo, "main").await?;
+        assert_eq!(git(&branch.path, &["rev-parse", "HEAD"])?, tip);
+        Ok(())
+    }))
+    .await
+}
+
+#[tokio::test]
+async fn a_sha_the_repo_does_not_hold_fails_with_a_fixed_error() -> TestResult {
+    common::bounded(Box::pin(async {
+        let dir = TempDir::new()?;
+        let repo = fixture(dir.path())?;
+        let ws = workspace(dir.path().join("jobs"));
+        let missing = "0123456789abcdef0123456789abcdef01234567";
+        let err = ws
+            .prepare("job1", &repo, missing)
+            .await
+            .err()
+            .ok_or("expected an error")?;
+        assert!(matches!(err, WorkspaceError::Git(_, _)), "{err:?}");
+        assert!(!dir.path().join("jobs").join("job1").exists());
+        Ok(())
+    }))
+    .await
+}
+
+#[tokio::test]
+async fn a_branch_named_like_a_short_hex_is_still_a_branch() -> TestResult {
+    common::bounded(Box::pin(async {
+        let dir = TempDir::new()?;
+        let repo = fixture(dir.path())?;
+        let seed = dir.path().join("seed");
+        git(
+            &seed,
+            &["push", "--quiet", &repo, "main:refs/heads/abcdef0"],
+        )?;
+        let ws = workspace(dir.path().join("jobs"));
+        let checkout = ws.prepare("job1", &repo, "abcdef0").await?;
+        assert!(checkout.path.join("a.txt").exists());
+        Ok(())
+    }))
+    .await
+}

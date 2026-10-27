@@ -1,10 +1,11 @@
 //! `fleet batch show`: one column per profile, one row per figure.
 
-use std::io::Write;
+use std::io::{Read, Write};
 
 use fleet_proto::v1::fleet_batches_client::FleetBatchesClient;
 use fleet_proto::v1::{
     GetBatchReply, GetBatchRequest, Job, JobEvent, JobEventKind, JobSummary, ReadJobEventsRequest,
+    SubmitBatchRequest,
 };
 use tonic::service::interceptor::InterceptedService;
 use tonic::transport::Channel;
@@ -14,6 +15,13 @@ use super::{Bearer, CliError, Client, ELLIPSIS, or_dash, sanitize, sanitize_free
 /// A `FleetBatches` client carrying the bearer token.
 pub(crate) type BatchesClient = FleetBatchesClient<InterceptedService<Channel, Bearer>>;
 
+/// Most profiles one batch holds. The server enforces the same figure; a test pins the two
+/// together.
+pub const MAX_BATCH_PROFILES: usize = 16;
+/// Longest prompt in bytes. The server enforces the same figure; a test pins the two together.
+pub const MAX_PROMPT_BYTES: usize = 64 * 1024;
+/// Length of a full commit id in hex characters.
+const SHA_LEN: usize = 40;
 /// Events asked for per page. The server cuts a larger request to its own maximum.
 const EVENTS_PAGE: u32 = 1000;
 /// Most event pages read per job. A job holds at most 2000 events, so this only stops a
@@ -244,6 +252,110 @@ pub(crate) async fn show(
         events.push(read_events(jobs, &job.job_id).await?);
     }
     write_batch(out, &reply, &events)?;
+    Ok(())
+}
+
+fn read_prompt(prompt: String, stdin: &mut impl Read) -> Result<String, CliError> {
+    let too_large = || CliError::Usage("prompt is too large".into());
+    let text = if prompt == "-" {
+        let mut raw = Vec::new();
+        stdin
+            .take(MAX_PROMPT_BYTES as u64 + 1)
+            .read_to_end(&mut raw)?;
+        String::from_utf8(raw).map_err(|_| CliError::Usage("prompt is not valid UTF-8".into()))?
+    } else {
+        prompt
+    };
+    if text.len() > MAX_PROMPT_BYTES {
+        return Err(too_large());
+    }
+    if text.trim().is_empty() {
+        return Err(CliError::Usage("prompt is empty".into()));
+    }
+    Ok(text)
+}
+
+fn parse_sha(base: &str) -> Result<(), CliError> {
+    if base.len() == SHA_LEN && base.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f')) {
+        Ok(())
+    } else {
+        Err(CliError::Usage(
+            "--base must be a full commit id of 40 lowercase hex characters".into(),
+        ))
+    }
+}
+
+fn parse_profiles(list: &str) -> Result<Vec<String>, CliError> {
+    let names: Vec<String> = list.split(',').map(str::to_owned).collect();
+    if names.iter().any(String::is_empty) {
+        return Err(CliError::Usage(
+            "--profiles must be comma-separated names with no empty entry".into(),
+        ));
+    }
+    if names.len() > MAX_BATCH_PROFILES {
+        return Err(CliError::Usage(format!(
+            "--profiles takes at most {MAX_BATCH_PROFILES} names"
+        )));
+    }
+    let mut seen = std::collections::HashSet::with_capacity(names.len());
+    if !names.iter().all(|name| seen.insert(name.as_str())) {
+        return Err(CliError::Usage("--profiles names must be distinct".into()));
+    }
+    Ok(names)
+}
+
+fn fresh_key() -> String {
+    use std::hash::{BuildHasher, Hasher};
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |d| d.as_nanos());
+    let half = || {
+        let mut hasher = std::collections::hash_map::RandomState::new().build_hasher();
+        hasher.write_u128(nanos);
+        hasher.finish()
+    };
+    format!("cli-{:016x}{:016x}", half(), half())
+}
+
+/// The arguments of `fleet batch submit` after the fields were checked.
+pub(crate) struct Submit {
+    pub(crate) prompt: String,
+    pub(crate) repo: String,
+    pub(crate) base: String,
+    pub(crate) profiles: String,
+    pub(crate) idempotency_key: Option<String>,
+}
+
+/// Checks the flags of `fleet batch submit` before any connection is opened.
+pub(crate) fn prepare(args: Submit, stdin: &mut impl Read) -> Result<SubmitBatchRequest, CliError> {
+    let prompt = read_prompt(args.prompt, stdin)?;
+    parse_sha(&args.base)?;
+    let profiles = parse_profiles(&args.profiles)?;
+    Ok(SubmitBatchRequest {
+        idempotency_key: args.idempotency_key.unwrap_or_else(fresh_key),
+        prompt,
+        repo: args.repo,
+        base_sha: args.base,
+        repeats: 0,
+        profiles,
+    })
+}
+
+/// `fleet batch submit`: creates one job per profile and prints the batch and job ids.
+pub(crate) async fn submit(
+    client: &mut BatchesClient,
+    request: SubmitBatchRequest,
+    out: &mut impl Write,
+) -> Result<(), CliError> {
+    let names = request.profiles.clone();
+    let reply = client.submit_batch(request).await?.into_inner();
+    writeln!(out, "batch: {}", sanitize(&reply.batch_id))?;
+    writeln!(out, "created: {}", if reply.created { "yes" } else { "no" })?;
+    for (name, id) in names.iter().zip(&reply.job_ids) {
+        writeln!(out, "job: {}\t{}", sanitize(name), sanitize(id))?;
+    }
     Ok(())
 }
 

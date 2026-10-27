@@ -317,6 +317,11 @@ impl Workspace {
     /// Resets the bare mirror's config, fetches `repo` into it by explicit url, then runs
     /// `git worktree add -B swarm/<job_id>` from `origin/<base_ref>`.
     ///
+    /// A `base_ref` of 40 lowercase hex characters (see [`is_commit_sha`]) names a commit and
+    /// the worktree starts at that commit. The commit must be reachable from a branch of
+    /// `repo`, because the mirror fetches branches only. Otherwise the call fails at the
+    /// worktree step.
+    ///
     /// A leftover worktree directory or branch of the same job id, from a prepare that was
     /// killed or never removed, is replaced. Before the fetch, stale `*.lock` files in the
     /// mirror are deleted. That is safe only when one daemon uses the jobs directory and runs
@@ -355,7 +360,11 @@ impl Workspace {
         self.git(&mirror, &["worktree", "prune"], "worktree prune")
             .await?;
         let branch = format!("{BRANCH_PREFIX}{job_id}");
-        let start = format!("origin/{base_ref}");
+        let start = if is_commit_sha(base_ref) {
+            base_ref.to_owned()
+        } else {
+            format!("origin/{base_ref}")
+        };
         self.git(
             &mirror,
             &[
@@ -705,6 +714,13 @@ pub(crate) fn validate_repo(repo: &str, policy: &RepoPolicy) -> Result<(), Works
     } else {
         Err(WorkspaceError::InvalidRepo)
     }
+}
+
+/// Whether `text` is 40 lowercase hex characters, the form of a full commit id. A base ref
+/// of this form is a commit, never a branch name.
+#[must_use]
+pub fn is_commit_sha(text: &str) -> bool {
+    text.len() == 40 && text.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
 }
 
 pub(crate) fn validate_ref(name: &str) -> Result<(), WorkspaceError> {

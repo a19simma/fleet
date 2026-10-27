@@ -76,7 +76,7 @@ use crate::proc::{CAPTURE_BYTES, CaptureError, Captured, capture};
 use crate::profile_apply::{self, Applied, LoadError};
 use crate::telemetry::Terminal as Ending;
 use crate::toolhook::HookHub;
-use crate::workspace::{RepoPolicy, validate_job_id, validate_ref, validate_repo};
+use crate::workspace::{RepoPolicy, is_commit_sha, validate_job_id, validate_ref, validate_repo};
 
 /// Variables that never reach the agent's environment block, however it is configured.
 ///
@@ -1287,40 +1287,45 @@ impl<R: Reporter> AgentRunner<R> {
         .map_err(|e| e.failure(ERR_COMMITS))?;
         let worktree = cwd.to_str().ok_or_else(|| Failure::bare(ERR_COMMITS))?;
         let head = format!("+refs/heads/{branch}:refs/heads/{branch}");
+        let pinned = is_commit_sha(&job.base_ref);
         let base = format!(
             "+refs/remotes/origin/{base}:refs/remotes/origin/{base}",
             base = job.base_ref
         );
+        let mut specs = vec![head.as_str()];
+        if !pinned {
+            specs.push(base.as_str());
+        }
+        let mut fetch_args = vec![
+            "-c",
+            "core.hooksPath=/dev/null",
+            "-c",
+            "core.fsmonitor=",
+            "-c",
+            "core.sshCommand=",
+            "-c",
+            "credential.helper=",
+            "fetch",
+            "--quiet",
+            "--no-tags",
+            "--no-recurse-submodules",
+            "--",
+            worktree,
+        ];
+        fetch_args.extend(specs);
         let fetched = self
-            .helper(
-                &self.config.git_bin,
-                dir,
-                &[
-                    "-c",
-                    "core.hooksPath=/dev/null",
-                    "-c",
-                    "core.fsmonitor=",
-                    "-c",
-                    "core.sshCommand=",
-                    "-c",
-                    "credential.helper=",
-                    "fetch",
-                    "--quiet",
-                    "--no-tags",
-                    "--no-recurse-submodules",
-                    "--",
-                    worktree,
-                    &head,
-                    &base,
-                ],
-                Scope::Clean,
-            )
+            .helper(&self.config.git_bin, dir, &fetch_args, Scope::Clean)
             .await
             .map_err(|e| e.failure(ERR_COMMITS))?;
         if !fetched.success {
             return Err(Failure::bare(ERR_COMMITS));
         }
-        let range = format!("refs/remotes/origin/{}..refs/heads/{branch}", job.base_ref);
+        let floor = if pinned {
+            job.base_ref.clone()
+        } else {
+            format!("refs/remotes/origin/{}", job.base_ref)
+        };
+        let range = format!("{floor}..refs/heads/{branch}");
         let counted = self
             .helper(
                 &self.config.git_bin,

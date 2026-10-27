@@ -1395,3 +1395,54 @@ async fn the_clone_time_reaches_the_summary_of_a_failed_prepare_and_of_finish() 
     }))
     .await
 }
+
+#[tokio::test]
+async fn a_sha_base_job_pushes_its_commits_and_opens_no_pr() -> TestResult {
+    common::bounded(Box::pin(async {
+        let rig = rig("fail").await?;
+        let sha = git(&rig.worktree, &["rev-parse", "HEAD"])?
+            .trim()
+            .to_owned();
+        commit(&rig)?;
+        let (agent, _rx) = agent(&rig);
+        let (_trigger, shutdown) = Shutdown::channel();
+        let mut pinned = job(&rig, false);
+        pinned.base_ref = sha;
+        let outcome = agent.finish(&pinned, &rig.worktree, shutdown).await?;
+        assert_eq!(
+            outcome,
+            FinishOutcome::Succeeded {
+                branch: Some("swarm/job1".into()),
+                pr_url: None,
+            }
+        );
+        assert!(pushed(&rig)?);
+        Ok(())
+    }))
+    .await
+}
+
+#[tokio::test]
+async fn a_sha_base_job_with_no_commits_succeeds_without_a_push() -> TestResult {
+    common::bounded(Box::pin(async {
+        let rig = rig("fail").await?;
+        let sha = git(&rig.worktree, &["rev-parse", "HEAD"])?
+            .trim()
+            .to_owned();
+        let (agent, _rx) = agent(&rig);
+        let (_trigger, shutdown) = Shutdown::channel();
+        let mut pinned = job(&rig, false);
+        pinned.base_ref = sha;
+        let outcome = agent.finish(&pinned, &rig.worktree, shutdown).await?;
+        assert_eq!(
+            outcome,
+            FinishOutcome::Succeeded {
+                branch: None,
+                pr_url: None,
+            }
+        );
+        assert!(!pushed(&rig)?);
+        Ok(())
+    }))
+    .await
+}

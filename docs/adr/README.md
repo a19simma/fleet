@@ -23,7 +23,7 @@ ADRs for fleetd, the Fleet server and the `fleet` CLI. The plan is in `../plan.m
 | [0029](0029-job-telemetry.md) | Job telemetry | Accepted, built in the daemon and the server, amends 0021, beside 0022 |
 | [0030](0030-metrics-and-improvement-loop.md) | Metrics and the improvement loop | Accepted, `GetStats`, caps and shadow stuck detector built, enforcement not built, builds on 0029 |
 | [0031](0031-agent-isolation.md) | Agent isolation | Accepted 2026-10-26, P1 built behind `agent_launcher = "systemd"` and cut over on the first Box, P2 and P3 not built, supersedes the Known limit paragraph of 0024 and amends its credential and mirror-hardening sections |
-| [0034](0034-profiles-and-batches.md) | Profiles and batches | Accepted 2026-10-27, storage, profile and batch RPCs and `fleet batch show` built, fleetd wiring not built, amends 0021, 0023, 0029 and 0030 |
+| [0034](0034-profiles-and-batches.md) | Profiles and batches | Accepted 2026-10-27, storage, profile and batch RPCs and `fleet batch show` and `fleet batch submit` built, fleetd profile apply and clone by commit id built, live probe not run, amends 0021, 0023, 0029 and 0030 |
 | [0035](0035-profile-blob-distribution.md) | Profile blob distribution | Accepted 2026-10-27, server side and fleetd materialisation built, amends 0021 and 0023, implements 0034 |
 
 Each ADR has a "Decisions (2026-10-24)" section with the choices made when the docs moved into this repo: Apache-2.0 licence, repo github.com/a19simma/fleet, `fleet watch` as a client poll in v1, job cost deferred, Tailscale not a hard dependency.
