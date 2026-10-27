@@ -10,6 +10,7 @@ mod id;
 mod normalize;
 mod profile;
 mod redact;
+mod validate;
 
 pub use box_name::BoxName;
 pub use ct::constant_time_eq;
@@ -22,3 +23,8 @@ pub use profile::{
     Settings, SettingsPermissions, Skill,
 };
 pub use redact::{MIN_SECRET_LEN, PLACEHOLDER, Redactor};
+pub use validate::{
+    ENV_FLAG_ALLOWLIST, MAX_BUDGET_CENTS, MAX_COMPONENT_BYTES, MAX_ENTRIES, MAX_FILE_BYTES,
+    MAX_MODEL_BYTES, MAX_PATH_BYTES, MAX_RULE_BYTES, MAX_RULES, MAX_SKILL_NAME_LEN,
+    MAX_TOTAL_BYTES, MAX_TURNS, ProfileInvalid,
+};

@@ -35,6 +35,18 @@ The **Floor** is fixed in fleetd. It sets the permission mode to `dontAsk` and c
 
 The Box ceilings for max turns, budget and timeout win over the Profile values (clamp). fleetd applies the Floor and the ceilings last.
 
+### Validation
+
+`fleet-core` checks these rules on every Floor. Each failure is a fixed error that never echoes the input.
+
+- Caps: at most 64 files (context files plus skill files), 4 MiB of text in total, 256 KiB per file.
+- Paths: relative, `/` separated, no empty, `.` or `..` component, no component starting with `.`, at most 256 bytes. Skill names are one component of `[A-Za-z0-9_-]`. No duplicate paths or skill names. Symlinks are refused when fleetd writes the files.
+- `prompt_template` holds `{prompt}` once and no other brace.
+- `settings.model` equals `model` when set. Settings hold no `defaultMode`, hooks or MCP, and permission rules name no MCP tool.
+- `env_flags` names come from a fixed allowlist in `fleet-core`.
+- Paths and allow rules naming credential locations are rejected, and text that looks like a secret is rejected. Both checks are best-effort lints.
+- `max_budget_usd` is whole US cents.
+
 ### Batch
 
 A **Batch** is one prompt dispatched once per Profile. `repeats` is 1 for now, enforced by a CHECK. `fleet batch show` prints one column per Profile. A missing value prints `-`. The rows carry the command run breakdown and the time taken, both read from the existing telemetry (ADR-0029).
