@@ -179,9 +179,9 @@ fn full_summary() -> JobSummary {
         stuck_rule: None,
         stuck_at_seq: None,
         stuck_at_ms: None,
-        bundle_sha: None,
-        claude_version: None,
-        model: None,
+        bundle_sha: Some("abc123".into()),
+        claude_version: Some("2.1.289".into()),
+        model: Some("opus-x".into()),
     }
 }
 
@@ -236,6 +236,9 @@ telemetry:
   api_retries: 6
   first_edit: 12.3s
   stop_reason: end_turn
+  bundle_sha: abc123
+  claude_version: 2.1.289
+  model: opus-x
 ";
     assert!(out.contains(expected), "{out}");
     assert!(!out.contains("INCOMPLETE"), "{out}");
@@ -281,6 +284,9 @@ telemetry:
   api_retries: -
   first_edit: 0ms
   stop_reason: -
+  bundle_sha: -
+  claude_version: -
+  model: -
   INCOMPLETE (missing: cost_est_usd, tokens_out)
 ";
     assert!(out.contains(expected), "{out}");

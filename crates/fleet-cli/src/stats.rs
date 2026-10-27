@@ -65,6 +65,9 @@ fn by_group(by: Option<StatsBy>) -> StatsGroupBy {
         Some(StatsBy::Box) => StatsGroupBy::Box,
         Some(StatsBy::State) => StatsGroupBy::State,
         Some(StatsBy::Day) => StatsGroupBy::Day,
+        Some(StatsBy::BundleSha) => StatsGroupBy::BundleSha,
+        Some(StatsBy::ClaudeVersion) => StatsGroupBy::ClaudeVersion,
+        Some(StatsBy::Model) => StatsGroupBy::Model,
     }
 }
 
@@ -132,7 +135,13 @@ fn stuck(group: &StatsGroup) -> String {
 
 fn write_row(out: &mut impl Write, group: &StatsGroup) -> std::io::Result<()> {
     let key = sanitize(&group.key);
-    let key = if key.is_empty() { "all" } else { &key };
+    let key = if group.unknown {
+        "unknown"
+    } else if key.is_empty() {
+        "all"
+    } else {
+        &key
+    };
     let (p50, p95) = median_and_tail(group.duration_ms.as_ref());
     let cost = group
         .cost_est_usd

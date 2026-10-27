@@ -754,6 +754,51 @@ async fn groups_are_capped_at_two_hundred_and_truncation_is_flagged(pool: PgPool
 }
 
 #[sqlx::test(migrations = false)]
+async fn stamp_groups_keep_null_apart_and_report_their_own_n(pool: PgPool) {
+    let store = store(pool.clone()).await;
+    let stamps = [
+        ("a", Some("m1"), 10),
+        ("b", Some("m1"), 30),
+        ("c", Some("m2"), 20),
+        ("d", None, 40),
+    ];
+    for (id, model, ms) in stamps {
+        insert(&pool, &seed(id, "SUCCEEDED")).await;
+        with_duration(&pool, id, ms).await;
+        sqlx::query(
+            "UPDATE job_summary SET model = $2, bundle_sha = $2, claude_version = $2 \
+             WHERE job_id = $1",
+        )
+        .bind(id)
+        .bind(model)
+        .execute(&pool)
+        .await
+        .unwrap();
+    }
+    insert(&pool, &seed("e", "RUNNING")).await;
+    for by in [
+        StatsGroupBy::Model,
+        StatsGroupBy::BundleSha,
+        StatsGroupBy::ClaudeVersion,
+    ] {
+        let reply = run(&store, &request(by)).await;
+        assert_eq!(keys(&reply), ["m1", "", "m2"], "{by:?}");
+        let flags: Vec<bool> = reply.groups.iter().map(|g| g.unknown).collect();
+        assert_eq!(flags, [false, true, false], "{by:?}");
+        let jobs: Vec<u64> = reply.groups.iter().map(|g| g.jobs).collect();
+        assert_eq!(jobs, [2, 2, 1], "{by:?}");
+        let n: Vec<u64> = reply
+            .groups
+            .iter()
+            .map(|g| g.duration_ms.as_ref().map_or(0, |q| q.n))
+            .collect();
+        assert_eq!(n, [2, 1, 1], "{by:?}");
+    }
+    let plain = run(&store, &request(StatsGroupBy::State)).await;
+    assert!(plain.groups.iter().all(|g| !g.unknown));
+}
+
+#[sqlx::test(migrations = false)]
 async fn group_by_state_never_reads_request_text_as_sql(pool: PgPool) {
     let store = store(pool.clone()).await;
     insert(&pool, &seed("a", "SUCCEEDED")).await;

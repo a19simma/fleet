@@ -142,6 +142,12 @@ pub enum StatsBy {
     State,
     /// One row per UTC day.
     Day,
+    /// One row per agent config bundle hash.
+    BundleSha,
+    /// One row per Claude Code version.
+    ClaudeVersion,
+    /// One row per model.
+    Model,
 }
 
 /// A failure while running a command.

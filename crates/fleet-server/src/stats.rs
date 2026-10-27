@@ -28,6 +28,9 @@ WITH scoped AS ( \
             WHEN 'box' THEN j.box \
             WHEN 'state' THEN j.state \
             WHEN 'day' THEN to_char(j.created_at AT TIME ZONE 'UTC', 'YYYY-MM-DD') \
+            WHEN 'bundle_sha' THEN s.bundle_sha \
+            WHEN 'claude_version' THEN s.claude_version \
+            WHEN 'model' THEN s.model \
             ELSE '' \
         END AS grp, \
         j.state, j.error, s.job_id AS summarized, s.complete, s.turns, s.duration_ms, \
@@ -39,7 +42,7 @@ WITH scoped AS ( \
         AND j.created_at < to_timestamp($2::bigint::double precision) \
         AND ($3::text IS NULL OR j.repo = $3) \
         AND ($4::text IS NULL OR j.box = $4)) \
-SELECT grp, count(*) AS jobs, \
+SELECT grp, grp IS NULL AS unknown, count(*) AS jobs, \
     count(*) FILTER (WHERE state = 'SUCCEEDED') AS succeeded, \
     count(*) FILTER (WHERE state = 'FAILED' AND error IS DISTINCT FROM $6) AS failed, \
     count(*) FILTER (WHERE state = 'FAILED' AND error = $6) AS timed_out, \
@@ -104,6 +107,9 @@ fn group_column(raw: i32) -> Result<&'static str, JobInvalid> {
         Ok(StatsGroupBy::Box) => Ok("box"),
         Ok(StatsGroupBy::State) => Ok("state"),
         Ok(StatsGroupBy::Day) => Ok("day"),
+        Ok(StatsGroupBy::BundleSha) => Ok("bundle_sha"),
+        Ok(StatsGroupBy::ClaudeVersion) => Ok("claude_version"),
+        Ok(StatsGroupBy::Model) => Ok("model"),
         Err(_) => Err(JobInvalid::GroupBy),
     }
 }
@@ -180,7 +186,8 @@ fn cost(row: &PgRow) -> Result<Option<CostStats>, StoreError> {
 
 fn group(row: &PgRow) -> Result<StatsGroup, StoreError> {
     Ok(StatsGroup {
-        key: row.try_get("grp")?,
+        key: row.try_get::<Option<String>, _>("grp")?.unwrap_or_default(),
+        unknown: row.try_get("unknown")?,
         jobs: n(row, "jobs")?,
         succeeded: n(row, "succeeded")?,
         failed: n(row, "failed")?,

@@ -309,6 +309,9 @@ enum StatsGroupBy {
   STATS_GROUP_BY_BOX = 2;
   STATS_GROUP_BY_STATE = 3;
   STATS_GROUP_BY_DAY = 4;
+  STATS_GROUP_BY_BUNDLE_SHA = 5;
+  STATS_GROUP_BY_CLAUDE_VERSION = 6;
+  STATS_GROUP_BY_MODEL = 7;
 }
 
 message GetStatsRequest {
@@ -363,6 +366,7 @@ message StatsGroup {
   optional Total api_retries = 23;
   optional Quantiles first_edit_ms = 24;
   uint64 stuck_jobs = 25;
+  bool unknown = 26;
 }
 
 message GetStatsReply {

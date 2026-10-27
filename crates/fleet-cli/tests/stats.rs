@@ -373,6 +373,24 @@ async fn an_empty_key_is_shown_as_all() -> TestResult {
     Ok(())
 }
 
+#[tokio::test]
+async fn an_unknown_group_is_labelled_unknown_and_a_real_value_stays_itself() -> TestResult {
+    let unknown = StatsGroup {
+        unknown: true,
+        ..full_group("")
+    };
+    let literal = full_group("unknown");
+    let out = stats(reply(vec![unknown, literal]), &["--by", "model"]).await?;
+    let labels = out
+        .lines()
+        .filter_map(|line| line.split('\t').next())
+        .filter(|cell| *cell == "unknown")
+        .count();
+    assert_eq!(labels, 2, "{out}");
+    assert!(!out.contains("\nall\t"), "{out}");
+    Ok(())
+}
+
 async fn requests_for(args: &[&str]) -> Result<Vec<GetStatsRequest>, Box<dyn std::error::Error>> {
     let stub = Stub::default();
     let seen = stub.requests.clone();
@@ -398,6 +416,9 @@ async fn flags_map_onto_the_request() -> TestResult {
         ("box", StatsGroupBy::Box),
         ("state", StatsGroupBy::State),
         ("day", StatsGroupBy::Day),
+        ("bundle-sha", StatsGroupBy::BundleSha),
+        ("claude-version", StatsGroupBy::ClaudeVersion),
+        ("model", StatsGroupBy::Model),
     ] {
         let seen = requests_for(&["--by", flag]).await?;
         assert_eq!(seen[0].group_by, expected as i32, "{flag}");
