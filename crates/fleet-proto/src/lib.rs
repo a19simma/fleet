@@ -31,6 +31,9 @@ pub const MAX_CLAUDE_VERSION_CHARS: usize = 64;
 /// Longest stored `model` of a job summary, in bytes.
 pub const MAX_MODEL_BYTES: usize = 128;
 
+/// Largest stored phase or queue duration of a job summary: seven days, in milliseconds.
+pub const MAX_PHASE_MS: u64 = 7 * 24 * 60 * 60 * 1000;
+
 /// The in-memory value of a version stamp field that is not known.
 ///
 /// It never crosses the wire and is never stored: an unknown field is unset on the wire and

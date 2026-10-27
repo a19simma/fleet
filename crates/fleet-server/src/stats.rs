@@ -40,7 +40,8 @@ WITH scoped AS ( \
         j.state, j.error, s.job_id AS summarized, s.complete, s.turns, s.duration_ms, \
         s.cost_est_usd, s.tokens_in, s.tokens_out, s.tokens_cache_read, \
         s.tokens_cache_write, s.tool_calls, s.tool_errors, s.bash_calls, s.bash_nonzero, \
-        s.denials, s.api_retries, s.first_edit_ms, s.stuck_rule \
+        s.denials, s.api_retries, s.first_edit_ms, s.clone_ms, s.push_ms, s.pr_ms, \
+        s.queue_wait_ms, s.stuck_rule \
     FROM jobs j LEFT JOIN job_summary s ON s.job_id = j.job_id \
     WHERE j.created_at >= to_timestamp($1::bigint::double precision) \
         AND j.created_at < to_timestamp($2::bigint::double precision) \
@@ -78,6 +79,26 @@ SELECT grp, grp IS NULL AS unknown, count(*) AS jobs, \
         FILTER (WHERE first_edit_ms IS NOT NULL) AS first_edit_ms_p50, \
     percentile_cont(0.95) WITHIN GROUP (ORDER BY first_edit_ms::double precision) \
         FILTER (WHERE first_edit_ms IS NOT NULL) AS first_edit_ms_p95, \
+    count(clone_ms) AS clone_ms_n, \
+    percentile_cont(0.5) WITHIN GROUP (ORDER BY clone_ms::double precision) \
+        FILTER (WHERE clone_ms IS NOT NULL) AS clone_ms_p50, \
+    percentile_cont(0.95) WITHIN GROUP (ORDER BY clone_ms::double precision) \
+        FILTER (WHERE clone_ms IS NOT NULL) AS clone_ms_p95, \
+    count(push_ms) AS push_ms_n, \
+    percentile_cont(0.5) WITHIN GROUP (ORDER BY push_ms::double precision) \
+        FILTER (WHERE push_ms IS NOT NULL) AS push_ms_p50, \
+    percentile_cont(0.95) WITHIN GROUP (ORDER BY push_ms::double precision) \
+        FILTER (WHERE push_ms IS NOT NULL) AS push_ms_p95, \
+    count(pr_ms) AS pr_ms_n, \
+    percentile_cont(0.5) WITHIN GROUP (ORDER BY pr_ms::double precision) \
+        FILTER (WHERE pr_ms IS NOT NULL) AS pr_ms_p50, \
+    percentile_cont(0.95) WITHIN GROUP (ORDER BY pr_ms::double precision) \
+        FILTER (WHERE pr_ms IS NOT NULL) AS pr_ms_p95, \
+    count(queue_wait_ms) AS queue_wait_ms_n, \
+    percentile_cont(0.5) WITHIN GROUP (ORDER BY queue_wait_ms::double precision) \
+        FILTER (WHERE queue_wait_ms IS NOT NULL) AS queue_wait_ms_p50, \
+    percentile_cont(0.95) WITHIN GROUP (ORDER BY queue_wait_ms::double precision) \
+        FILTER (WHERE queue_wait_ms IS NOT NULL) AS queue_wait_ms_p95, \
     count(cost_est_usd) AS cost_n, \
     sum(cost_est_usd) AS cost_sum, \
     percentile_cont(0.5) WITHIN GROUP (ORDER BY cost_est_usd) \
@@ -267,6 +288,10 @@ fn group(row: &PgRow) -> Result<StatsGroup, StoreError> {
         denials: total(row, "denials")?,
         api_retries: total(row, "api_retries")?,
         first_edit_ms: quantiles(row, "first_edit_ms")?,
+        clone_ms: quantiles(row, "clone_ms")?,
+        push_ms: quantiles(row, "push_ms")?,
+        pr_ms: quantiles(row, "pr_ms")?,
+        queue_wait_ms: quantiles(row, "queue_wait_ms")?,
         stuck_jobs: n(row, "stuck_jobs")?,
         stuck_rules: Vec::new(),
         clean: None,

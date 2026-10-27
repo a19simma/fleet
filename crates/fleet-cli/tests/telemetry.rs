@@ -182,6 +182,10 @@ fn full_summary() -> JobSummary {
         bundle_sha: Some("abc123".into()),
         claude_version: Some("2.1.289".into()),
         model: Some("opus-x".into()),
+        clone_ms: Some(4_200),
+        push_ms: Some(850),
+        pr_ms: Some(1_100),
+        queue_wait_ms: Some(62_000),
     }
 }
 
@@ -235,6 +239,10 @@ telemetry:
   denials: 3
   api_retries: 6
   first_edit: 12.3s
+  clone: 4.2s
+  push: 850ms
+  pr: 1.1s
+  queue_wait: 62.0s
   stop_reason: end_turn
   bundle_sha: abc123
   claude_version: 2.1.289
@@ -253,6 +261,7 @@ async fn unobserved_figures_print_dash_and_zero_stays_zero() -> TestResult {
         duration_ms: Some(250),
         tokens_in: Some(0),
         first_edit_ms: Some(0),
+        push_ms: Some(0),
         denials: Some(0),
         complete: false,
         missing: vec!["cost_est_usd".into(), "tokens_out".into()],
@@ -283,6 +292,10 @@ telemetry:
   denials: 0
   api_retries: -
   first_edit: 0ms
+  clone: -
+  push: 0ms
+  pr: -
+  queue_wait: -
   stop_reason: -
   bundle_sha: -
   claude_version: -

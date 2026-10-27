@@ -1,16 +1,18 @@
 //! Push and pull request step against a local bare origin and a fake `gh`. Own test binary
 //! because it spawns children.
 
+use std::collections::VecDeque;
 use std::ffi::OsString;
 use std::future::{Future, ready};
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::sync::OnceLock;
+use std::sync::{Arc, Mutex, OnceLock, PoisonError};
 use std::time::Duration;
 
 use fleet_core::Redactor;
 use fleet_proto::v1::{Job, JobState, ReportJobReply, ReportJobRequest};
+use fleetd::phase::Clock;
 use fleetd::poller::Shutdown;
 use fleetd::runner::{AgentOutcome, AgentRunner, FinishOutcome, Reporter, RunConfig};
 use fleetd::workspace::{RepoPolicy, Workspace};
@@ -1253,6 +1255,142 @@ async fn every_terminal_report_from_finish_carries_a_summary() -> TestResult {
         let last = reports.last().ok_or("no report")?;
         assert_eq!(last.terminal_state, Some(JobState::Cancelled.into()));
         assert!(last.summary.is_some());
+        Ok(())
+    }))
+    .await
+}
+
+#[derive(Debug)]
+struct ScriptClock(Mutex<VecDeque<u64>>);
+
+impl ScriptClock {
+    fn new(millis: &[u64]) -> Arc<Self> {
+        Arc::new(Self(Mutex::new(millis.iter().copied().collect())))
+    }
+}
+
+impl Clock for ScriptClock {
+    fn now(&self) -> Duration {
+        let mut queue = self.0.lock().unwrap_or_else(PoisonError::into_inner);
+        let next = if queue.len() > 1 {
+            queue.pop_front()
+        } else {
+            queue.front().copied()
+        };
+        Duration::from_millis(next.unwrap_or_default())
+    }
+}
+
+async fn timed_finish(
+    mode: &str,
+    open_pr: bool,
+    changed: bool,
+    clock: &[u64],
+) -> Result<fleet_proto::v1::JobSummary, Box<dyn std::error::Error>> {
+    let rig = rig(mode).await?;
+    if changed {
+        commit(&rig)?;
+    }
+    let (agent, mut rx) = agent(&rig);
+    let agent = agent.with_clock(ScriptClock::new(clock));
+    let (_trigger, shutdown) = Shutdown::channel();
+    agent
+        .finish(&job(&rig, open_pr), &rig.worktree, shutdown)
+        .await?;
+    let reports = drain(&mut rx);
+    let last = reports.last().ok_or("no report")?;
+    Ok(last.summary.clone().ok_or("no summary")?)
+}
+
+#[tokio::test]
+async fn the_push_and_pr_phases_are_timed_by_the_injected_clock() -> TestResult {
+    common::bounded(Box::pin(async {
+        let summary = timed_finish("ok", true, true, &[0, 40, 50, 150]).await?;
+        assert_eq!(summary.push_ms, Some(40));
+        assert_eq!(summary.pr_ms, Some(100));
+        assert_eq!(summary.clone_ms, None);
+        assert_eq!(summary.queue_wait_ms, None);
+        Ok(())
+    }))
+    .await
+}
+
+#[tokio::test]
+async fn a_job_without_a_pr_has_a_push_time_and_no_pr_time() -> TestResult {
+    common::bounded(Box::pin(async {
+        let summary = timed_finish("fail", false, true, &[5, 12]).await?;
+        assert_eq!(summary.push_ms, Some(7));
+        assert_eq!(summary.pr_ms, None);
+        Ok(())
+    }))
+    .await
+}
+
+#[tokio::test]
+async fn a_job_with_no_changes_runs_neither_phase() -> TestResult {
+    common::bounded(Box::pin(async {
+        let summary = timed_finish("fail", true, false, &[5, 12, 20, 90]).await?;
+        assert_eq!(summary.push_ms, None);
+        assert_eq!(summary.pr_ms, None);
+        Ok(())
+    }))
+    .await
+}
+
+#[tokio::test]
+async fn a_failed_pr_step_still_reports_the_time_both_phases_took() -> TestResult {
+    common::bounded(Box::pin(async {
+        let summary = timed_finish("fail", true, true, &[0, 3, 3, 33]).await?;
+        assert_eq!(summary.push_ms, Some(3));
+        assert_eq!(summary.pr_ms, Some(30));
+        Ok(())
+    }))
+    .await
+}
+
+#[tokio::test]
+async fn a_phase_time_is_capped_at_the_server_maximum() -> TestResult {
+    common::bounded(Box::pin(async {
+        let over = fleet_proto::MAX_PHASE_MS * 3;
+        let summary = timed_finish("ok", false, true, &[0, over]).await?;
+        assert_eq!(summary.push_ms, Some(fleet_proto::MAX_PHASE_MS));
+        Ok(())
+    }))
+    .await
+}
+
+#[tokio::test]
+async fn the_clone_time_reaches_the_summary_of_a_failed_prepare_and_of_finish() -> TestResult {
+    common::bounded(Box::pin(async {
+        let rig = rig("ok").await?;
+        let (agent, mut rx) = agent(&rig);
+        let agent = agent.with_clock(ScriptClock::new(&[10, 35]));
+        let work = job(&rig, true);
+        agent.timed_clone(&work, async {}).await;
+        agent
+            .fail_job(&work, "workspace could not be prepared")
+            .await;
+        let reports = drain(&mut rx);
+        let summary = reports
+            .last()
+            .and_then(|r| r.summary.as_ref())
+            .ok_or("no summary")?;
+        assert_eq!(summary.clone_ms, Some(25));
+        assert_eq!(summary.push_ms, None);
+        assert_eq!(summary.pr_ms, None);
+
+        let (agent, mut rx) = self::agent(&rig);
+        let agent = agent.with_clock(ScriptClock::new(&[100, 160]));
+        agent.timed_clone(&work, async {}).await;
+        let (_trigger, shutdown) = Shutdown::channel();
+        agent.finish(&work, &rig.worktree, shutdown).await?;
+        let reports = drain(&mut rx);
+        let summary = reports
+            .last()
+            .and_then(|r| r.summary.as_ref())
+            .ok_or("no summary")?;
+        assert_eq!(summary.clone_ms, Some(60));
+        assert_eq!(summary.push_ms, None);
         Ok(())
     }))
     .await

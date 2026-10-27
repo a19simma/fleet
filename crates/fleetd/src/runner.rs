@@ -66,6 +66,7 @@ use crate::askpass;
 use crate::feed::Feed;
 use crate::group::GroupGuard;
 use crate::now_ms;
+use crate::phase::{Clock, Phases, SystemClock, elapsed_ms};
 use crate::poller::{RunError, Shutdown};
 use crate::proc::{CAPTURE_BYTES, CaptureError, Captured, capture};
 use crate::telemetry::Terminal as Ending;
@@ -556,6 +557,8 @@ pub struct AgentRunner<R> {
     reporter: R,
     redactor: Redactor,
     carries: Mutex<HashMap<String, Carry>>,
+    phases: Mutex<HashMap<String, Phases>>,
+    clock: Arc<dyn Clock>,
     hub: Option<Arc<HookHub>>,
     claude_version: Mutex<Option<String>>,
 }
@@ -578,6 +581,8 @@ impl<R: Reporter> AgentRunner<R> {
             reporter,
             redactor,
             carries: Mutex::new(HashMap::new()),
+            phases: Mutex::new(HashMap::new()),
+            clock: Arc::new(SystemClock::new()),
             hub: None,
             claude_version: Mutex::new(None),
         }
@@ -588,6 +593,39 @@ impl<R: Reporter> AgentRunner<R> {
     pub fn with_launcher(mut self, launcher: Arc<dyn Launcher>) -> Self {
         self.launcher = launcher;
         self
+    }
+
+    /// Times the clone, push and pull request phases with `clock` instead of [`SystemClock`].
+    #[must_use]
+    pub fn with_clock(mut self, clock: Arc<dyn Clock>) -> Self {
+        self.clock = clock;
+        self
+    }
+
+    /// Runs the workspace step `work` and keeps its duration for the job's summary as
+    /// `clone_ms`. A `work` dropped before it completes records nothing.
+    pub async fn timed_clone<T>(&self, job: &Job, work: impl Future<Output = T>) -> T {
+        let start = self.clock.now();
+        let out = work.await;
+        let phases = Phases {
+            checkout: Some(elapsed_ms(&*self.clock, start)),
+            ..Phases::default()
+        };
+        self.phases
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .entry(Self::carry_key(job))
+            .or_default()
+            .merge(phases);
+        out
+    }
+
+    fn take_phases(&self, job: &Job) -> Phases {
+        self.phases
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .remove(&Self::carry_key(job))
+            .unwrap_or_default()
     }
 
     /// Takes tool hook reports for running jobs from `hub`.
@@ -618,13 +656,15 @@ impl<R: Reporter> AgentRunner<R> {
             .unwrap_or_else(PoisonError::into_inner)
             .remove(&Self::carry_key(job))
             .unwrap_or_default();
-        Stream::new(
+        let mut stream = Stream::new(
             &self.reporter,
             job,
             self.config.terminal_report_timeout,
             carry,
             self.hub.clone(),
-        )
+        );
+        stream.feed.record(self.take_phases(job));
+        stream
     }
 
     /// The longest time the caller should let the workspace step run.
@@ -746,6 +786,7 @@ impl<R: Reporter> AgentRunner<R> {
             Carry::default(),
             self.hub.clone(),
         );
+        stream.feed.record(self.take_phases(job));
         let result = self
             .run_stream(job, cwd, shutdown, &mut stream, launch)
             .await;
@@ -871,10 +912,12 @@ impl<R: Reporter> AgentRunner<R> {
             shutdown,
         };
         let progress = stream.progress.clone();
-        match ctl
-            .race(self.alive(job, &progress, self.publish(job, cwd)))
-            .await
-        {
+        let mut phases = Phases::default();
+        let raced = ctl
+            .race(self.alive(job, &progress, self.publish(job, cwd, &mut phases)))
+            .await;
+        stream.feed.record(phases);
+        match raced {
             Ok(Err(Interrupt::Lost)) => Ok(FinishOutcome::Lost),
             Ok(Err(Interrupt::Cancelled)) => {
                 stream.cancelled().await;
@@ -933,7 +976,12 @@ impl<R: Reporter> AgentRunner<R> {
         stream.fail(None, error).await;
     }
 
-    async fn publish(&self, job: &Job, cwd: &Path) -> Result<Published, Failure> {
+    async fn publish(
+        &self,
+        job: &Job,
+        cwd: &Path,
+        phases: &mut Phases,
+    ) -> Result<Published, Failure> {
         validate_job_id(&job.job_id).map_err(|_| Failure::bare(ERR_COMMITS))?;
         validate_repo(&job.repo, &self.config.repo_policy).map_err(|_| Failure::bare(ERR_PUSH))?;
         validate_ref(&job.base_ref).map_err(|_| Failure::bare(ERR_COMMITS))?;
@@ -948,6 +996,7 @@ impl<R: Reporter> AgentRunner<R> {
             });
         }
         let refspec = format!("refs/heads/{branch}:refs/heads/{branch}");
+        let push_start = self.clock.now();
         let pushed = self
             .helper(
                 &self.config.git_bin,
@@ -970,8 +1019,9 @@ impl<R: Reporter> AgentRunner<R> {
                 ],
                 Scope::Push,
             )
-            .await
-            .map_err(|e| e.failure(ERR_PUSH))?;
+            .await;
+        phases.push = Some(elapsed_ms(&*self.clock, push_start));
+        let pushed = pushed.map_err(|e| e.failure(ERR_PUSH))?;
         if !pushed.success {
             return Err(Failure::tail(ERR_PUSH, &pushed.stderr));
         }
@@ -981,7 +1031,10 @@ impl<R: Reporter> AgentRunner<R> {
                 pr_url: None,
             });
         }
-        let pr_url = self.open_pr(job, &branch, dir).await?;
+        let pr_start = self.clock.now();
+        let opened = self.open_pr(job, &branch, dir).await;
+        phases.pr = Some(elapsed_ms(&*self.clock, pr_start));
+        let pr_url = opened?;
         Ok(Published {
             branch: Some(branch),
             pr_url: Some(pr_url),

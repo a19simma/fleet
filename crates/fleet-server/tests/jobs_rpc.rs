@@ -735,13 +735,25 @@ async fn get_job_carries_the_summary_only_when_stored(pool: PgPool) {
         bundle_sha: Some("b".repeat(64)),
         claude_version: Some("2.1.289 (Claude Code)".to_owned()),
         model: None,
+        clone_ms: Some(16),
+        push_ms: Some(17),
+        pr_ms: None,
+        queue_wait_ms: None,
     };
     let mut request = report(&id, Vec::new(), false);
     request.summary = Some(summary.clone());
     store.report_job(&boxed(1), &request).await.unwrap();
 
     let after = jobs.get_job(get(&id)).await.unwrap().into_inner();
-    assert_eq!(after.summary, Some(summary));
+    let stored = after.summary.unwrap();
+    assert!(stored.queue_wait_ms.is_some());
+    assert_eq!(
+        stored,
+        JobSummary {
+            queue_wait_ms: stored.queue_wait_ms,
+            ..summary
+        }
+    );
 
     let sparse = JobSummary {
         turns: Some(2),
@@ -753,7 +765,15 @@ async fn get_job_carries_the_summary_only_when_stored(pool: PgPool) {
     request.summary = Some(sparse.clone());
     store.report_job(&boxed(1), &request).await.unwrap();
     let replaced = jobs.get_job(get(&id)).await.unwrap().into_inner();
-    assert_eq!(replaced.summary, Some(sparse));
+    let replaced = replaced.summary.unwrap();
+    assert!(replaced.queue_wait_ms.is_some());
+    assert_eq!(
+        replaced,
+        JobSummary {
+            queue_wait_ms: replaced.queue_wait_ms,
+            ..sparse
+        }
+    );
     let listed = jobs
         .list_jobs(ListJobsRequest::default())
         .await

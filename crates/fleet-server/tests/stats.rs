@@ -283,6 +283,48 @@ async fn every_metric_is_summed_from_its_own_column(pool: PgPool) {
 }
 
 #[sqlx::test(migrations = false)]
+async fn phase_metrics_count_their_own_jobs_and_a_null_phase_has_no_group_figure(pool: PgPool) {
+    let store = store(pool.clone()).await;
+    for id in ["a", "b", "c", "d"] {
+        insert(&pool, &seed(id, "SUCCEEDED")).await;
+    }
+    for id in ["a", "b", "c"] {
+        summarize(&pool, id, &Fig::default()).await;
+    }
+    let sets = [
+        ("a", 100_i64, Some(50_i64), Some(2_000_i64)),
+        ("b", 300, None, Some(4_000)),
+        ("c", 0, None, None),
+    ];
+    for (id, clone, push, queue) in sets {
+        sqlx::query(
+            "UPDATE job_summary SET clone_ms = $2, push_ms = $3, queue_wait_ms = $4 \
+             WHERE job_id = $1",
+        )
+        .bind(id)
+        .bind(clone)
+        .bind(push)
+        .bind(queue)
+        .execute(&pool)
+        .await
+        .unwrap();
+    }
+    let g = one(&store).await;
+    let clone = g.clone_ms.unwrap();
+    assert_eq!(clone.n, 3);
+    close(clone.p50, 100.0);
+    close(clone.p95, 280.0);
+    let push = g.push_ms.unwrap();
+    assert_eq!(push.n, 1);
+    close(push.p50, 50.0);
+    let queue = g.queue_wait_ms.unwrap();
+    assert_eq!(queue.n, 2);
+    close(queue.p50, 3_000.0);
+    close(queue.p95, 3_900.0);
+    assert!(g.pr_ms.is_none());
+}
+
+#[sqlx::test(migrations = false)]
 async fn terminal_states_are_split_and_unfinished_jobs_are_other(pool: PgPool) {
     let store = store(pool.clone()).await;
     let timed_out = Seed {

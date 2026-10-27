@@ -231,6 +231,74 @@ async fn renders_the_key_columns_with_denominators() -> TestResult {
 }
 
 #[tokio::test]
+async fn phase_table_shows_each_phase_with_its_own_n_and_dashes_for_none() -> TestResult {
+    let timed = StatsGroup {
+        clone_ms: quantiles(3, 400.0, 2_500.0).into(),
+        queue_wait_ms: quantiles(5, 90_000.0, 130_000.0).into(),
+        ..full_group("timed")
+    };
+    let out = stats(reply(vec![timed, full_group("plain")]), &[]).await?;
+    let table: Vec<Vec<&str>> = out
+        .lines()
+        .skip_while(|l| !l.starts_with("group\tclone_p50"))
+        .map(|l| l.split('\t').collect())
+        .collect();
+    assert_eq!(
+        table[0],
+        [
+            "group",
+            "clone_p50",
+            "clone_p95",
+            "push_p50",
+            "push_p95",
+            "pr_p50",
+            "pr_p95",
+            "queue_p50",
+            "queue_p95",
+            "n"
+        ]
+    );
+    assert_eq!(
+        table[1],
+        [
+            "timed",
+            "400ms",
+            "2.5s",
+            "-",
+            "-",
+            "-",
+            "-",
+            "1m30s",
+            "2m10s",
+            "clone=3 push=- pr=- queue=5"
+        ]
+    );
+    assert_eq!(
+        table[2],
+        [
+            "plain",
+            "-",
+            "-",
+            "-",
+            "-",
+            "-",
+            "-",
+            "-",
+            "-",
+            "clone=- push=- pr=- queue=-"
+        ]
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn no_phase_table_when_no_group_has_a_phase_figure() -> TestResult {
+    let out = stats(reply(vec![full_group("all")]), &[]).await?;
+    assert!(!out.contains("clone_p50"), "{out}");
+    Ok(())
+}
+
+#[tokio::test]
 async fn absent_figures_print_a_dash_never_zero() -> TestResult {
     let group = StatsGroup {
         key: "bare".into(),

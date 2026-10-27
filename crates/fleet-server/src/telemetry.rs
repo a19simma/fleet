@@ -3,7 +3,8 @@
 use fleet_proto::v1::{JobEvent, JobEventKind, JobSummary};
 use fleet_proto::{
     MAX_BUNDLE_SHA_CHARS, MAX_CLAUDE_VERSION_CHARS, MAX_EVENT_CMD_BYTES, MAX_EVENT_DETAIL_BYTES,
-    MAX_EVENTS_PER_JOB, MAX_EVENTS_PER_REPORT, MAX_MODEL_BYTES, UNKNOWN_STAMP, is_plain_text,
+    MAX_EVENTS_PER_JOB, MAX_EVENTS_PER_REPORT, MAX_MODEL_BYTES, MAX_PHASE_MS, UNKNOWN_STAMP,
+    is_plain_text,
 };
 use sqlx::{PgPool, Postgres, Row, Transaction};
 
@@ -34,9 +35,12 @@ INSERT INTO job_summary (job_id, turns, duration_ms, duration_api_ms, stop_reaso
     result_subtype, cost_est_usd, tokens_in, tokens_out, tokens_cache_read, \
     tokens_cache_write, tool_calls, tool_errors, bash_calls, bash_nonzero, denials, \
     api_retries, first_edit_ms, complete, missing, stuck_rule, stuck_at_seq, stuck_at_ms, \
-    bundle_sha, claude_version, model) \
+    bundle_sha, claude_version, model, clone_ms, push_ms, pr_ms, queue_wait_ms) \
 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, \
-    $19, $20, $21, $22, $23, $24, $25, $26) \
+    $19, $20, $21, $22, $23, $24, $25, $26, $27, $28, $29, \
+    (SELECT CASE WHEN claimed_at IS NULL THEN NULL \
+        ELSE GREATEST(EXTRACT(EPOCH FROM (claimed_at - created_at)) * 1000, 0)::bigint END \
+        FROM jobs WHERE job_id = $1)) \
 ON CONFLICT (job_id) DO UPDATE SET turns = EXCLUDED.turns, \
     duration_ms = EXCLUDED.duration_ms, duration_api_ms = EXCLUDED.duration_api_ms, \
     stop_reason = EXCLUDED.stop_reason, result_subtype = EXCLUDED.result_subtype, \
@@ -49,7 +53,9 @@ ON CONFLICT (job_id) DO UPDATE SET turns = EXCLUDED.turns, \
     complete = EXCLUDED.complete, missing = EXCLUDED.missing, \
     stuck_rule = EXCLUDED.stuck_rule, stuck_at_seq = EXCLUDED.stuck_at_seq, \
     stuck_at_ms = EXCLUDED.stuck_at_ms, bundle_sha = EXCLUDED.bundle_sha, \
-    claude_version = EXCLUDED.claude_version, model = EXCLUDED.model, updated_at = now()";
+    claude_version = EXCLUDED.claude_version, model = EXCLUDED.model, \
+    clone_ms = EXCLUDED.clone_ms, push_ms = EXCLUDED.push_ms, pr_ms = EXCLUDED.pr_ms, \
+    queue_wait_ms = EXCLUDED.queue_wait_ms, updated_at = now()";
 
 const READ_JOB_EVENTS: &str = "\
 SELECT seq, ts_ms, kind, tool_use_id, tool, ok, exit_code, dur_ms, out_bytes, out_hash, cmd, \
@@ -60,7 +66,8 @@ const READ_JOB_SUMMARY: &str = "\
 SELECT turns, duration_ms, duration_api_ms, stop_reason, result_subtype, cost_est_usd, \
     tokens_in, tokens_out, tokens_cache_read, tokens_cache_write, tool_calls, tool_errors, \
     bash_calls, bash_nonzero, denials, api_retries, first_edit_ms, complete, missing, \
-    stuck_rule, stuck_at_seq, stuck_at_ms, bundle_sha, claude_version, model \
+    stuck_rule, stuck_at_seq, stuck_at_ms, bundle_sha, claude_version, model, \
+    clone_ms, push_ms, pr_ms, queue_wait_ms \
 FROM job_summary WHERE job_id = $1";
 
 #[derive(Default)]
@@ -92,6 +99,9 @@ struct SummaryRow {
     bundle_sha: Option<String>,
     claude_version: Option<String>,
     model: Option<String>,
+    clone_ms: Option<i64>,
+    push_ms: Option<i64>,
+    pr_ms: Option<i64>,
 }
 
 /// Telemetry of one report after validation and clamping.
@@ -124,6 +134,13 @@ fn figure(value: Option<u64>) -> Result<Option<i64>, StoreError> {
     value
         .map(|raw| i64::try_from(raw).map_err(|_| StoreError::InvalidTelemetry))
         .transpose()
+}
+
+fn phase_ms(value: Option<u64>) -> Result<Option<i64>, StoreError> {
+    if value.is_some_and(|raw| raw > MAX_PHASE_MS) {
+        return Err(StoreError::InvalidTelemetry);
+    }
+    figure(value)
 }
 
 fn stamp_field(
@@ -249,6 +266,9 @@ fn check_summary(summary: &JobSummary) -> Result<SummaryRow, StoreError> {
             false,
         )?,
         model: stamp_field(summary.model.as_ref(), MAX_MODEL_BYTES, true)?,
+        clone_ms: phase_ms(summary.clone_ms)?,
+        push_ms: phase_ms(summary.push_ms)?,
+        pr_ms: phase_ms(summary.pr_ms)?,
     })
 }
 
@@ -266,7 +286,7 @@ fn check_summary(summary: &JobSummary) -> Result<SummaryRow, StoreError> {
 /// more than 32 missing-figure names, a stuck rule outside the four stable names, a stuck
 /// position without a rule, or a stuck rule missing either position, or a `bundle_sha`,
 /// `claude_version` or `model` that is empty, over its cap, holds a control character or is
-/// the string `unknown`.
+/// the string `unknown`, or a `clone_ms`, `push_ms` or `pr_ms` above [`MAX_PHASE_MS`].
 pub(crate) fn check(
     events: &[JobEvent],
     summary: Option<&JobSummary>,
@@ -289,6 +309,10 @@ pub(crate) fn check(
 /// Events insert with `ON CONFLICT DO NOTHING`, so a replayed batch changes nothing. The
 /// summary is a full snapshot: it replaces the stored row, and a figure it leaves unset
 /// becomes NULL.
+///
+/// `queue_wait_ms` is never read from the report. The row derives it from the job: the time
+/// from `created_at` to `claimed_at`, which is the latest claim and equals the first lease
+/// for a job on its first attempt. It is NULL while `claimed_at` is unset.
 pub(crate) async fn persist(
     tx: &mut Transaction<'_, Postgres>,
     job_id: &str,
@@ -357,6 +381,9 @@ pub(crate) async fn persist(
             .bind(&row.bundle_sha)
             .bind(&row.claude_version)
             .bind(&row.model)
+            .bind(row.clone_ms)
+            .bind(row.push_ms)
+            .bind(row.pr_ms)
             .execute(&mut **tx)
             .await?;
     }
@@ -456,5 +483,9 @@ pub(crate) async fn read_summary(
         bundle_sha: row.try_get("bundle_sha")?,
         claude_version: row.try_get("claude_version")?,
         model: row.try_get("model")?,
+        clone_ms: figure("clone_ms")?,
+        push_ms: figure("push_ms")?,
+        pr_ms: figure("pr_ms")?,
+        queue_wait_ms: figure("queue_wait_ms")?,
     }))
 }

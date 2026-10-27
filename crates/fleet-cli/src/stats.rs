@@ -13,6 +13,8 @@ const SINCE_USAGE: &str =
     "invalid --since: use a duration such as 45s, 90m, 24h or 7d, or a unix time in seconds";
 const HEADER: &str = "group\tjobs\tok%\tdur_p50\tdur_p95\tcost_usd\ttool_err%\tdenials\tstuck\tn";
 const STUCK_HEADER: &str = "group\tstuck_rule\tflagged\tsucceeded\tfailed\tother\tok%";
+const PHASE_HEADER: &str =
+    "group\tclone_p50\tclone_p95\tpush_p50\tpush_p95\tpr_p50\tpr_p95\tqueue_p50\tqueue_p95\tn";
 const CLEAN_LABEL: &str = "(clean)";
 const SECONDS_PER_MINUTE: f64 = 60.0;
 
@@ -192,6 +194,43 @@ fn write_stuck_rules(out: &mut impl Write, groups: &[StatsGroup]) -> std::io::Re
     Ok(())
 }
 
+fn phase_figures(group: &StatsGroup) -> [Option<&Quantiles>; 4] {
+    [
+        group.clone_ms.as_ref(),
+        group.push_ms.as_ref(),
+        group.pr_ms.as_ref(),
+        group.queue_wait_ms.as_ref(),
+    ]
+}
+
+fn write_phases(out: &mut impl Write, groups: &[StatsGroup]) -> std::io::Result<()> {
+    if groups
+        .iter()
+        .all(|g| phase_figures(g).iter().all(Option::is_none))
+    {
+        return Ok(());
+    }
+    writeln!(out, "{PHASE_HEADER}")?;
+    for group in groups {
+        let figures = phase_figures(group);
+        let cells: Vec<String> = figures
+            .iter()
+            .map(|q| {
+                let (p50, p95) = median_and_tail(*q);
+                format!("{p50}\t{p95}")
+            })
+            .collect();
+        let [clone_n, push_n, pr_n, queue_n] = figures.map(|q| n_of(q.map(|q| q.n)));
+        writeln!(
+            out,
+            "{}\t{}\tclone={clone_n} push={push_n} pr={pr_n} queue={queue_n}",
+            group_label(group),
+            cells.join("\t"),
+        )?;
+    }
+    Ok(())
+}
+
 fn write_row(out: &mut impl Write, group: &StatsGroup) -> std::io::Result<()> {
     let key = group_label(group);
     let (p50, p95) = median_and_tail(group.duration_ms.as_ref());
@@ -217,8 +256,10 @@ fn write_row(out: &mut impl Write, group: &StatsGroup) -> std::io::Result<()> {
 ///
 /// A figure no job observed prints as `-`. The `ok%` cell shows its finished-job
 /// denominator. The `n` cell lists how many jobs contributed to each figure. A second
-/// table lists, per group and stuck rule, the flagged jobs with their outcome split and the
-/// `(clean)` jobs no rule flagged, so a rule's false-positive rate reads off its `ok%`.
+/// table lists, per group, the p50 and p95 of the clone, push, pull request and queue wait
+/// times with the count of jobs behind each, and appears only when some group has one. A
+/// further table lists, per group and stuck rule, the flagged jobs with their outcome split
+/// and the `(clean)` jobs no rule flagged, so a rule's false-positive rate reads off its `ok%`.
 ///
 /// # Errors
 /// Returns the output error.
@@ -238,6 +279,7 @@ pub(crate) fn write_stats(out: &mut impl Write, reply: &GetStatsReply) -> std::i
         for group in &reply.groups {
             write_row(out, group)?;
         }
+        write_phases(out, &reply.groups)?;
         write_stuck_rules(out, &reply.groups)?;
     }
     if reply.truncated {

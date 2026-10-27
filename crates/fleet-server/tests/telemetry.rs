@@ -9,7 +9,7 @@ use fleet_proto::v1::{
 };
 use fleet_proto::{
     MAX_BUNDLE_SHA_CHARS, MAX_CLAUDE_VERSION_CHARS, MAX_EVENT_CMD_BYTES, MAX_EVENT_DETAIL_BYTES,
-    MAX_EVENTS_PER_JOB, MAX_EVENTS_PER_REPORT, MAX_MODEL_BYTES, UNKNOWN_STAMP,
+    MAX_EVENTS_PER_JOB, MAX_EVENTS_PER_REPORT, MAX_MODEL_BYTES, MAX_PHASE_MS, UNKNOWN_STAMP,
 };
 use fleet_server::store::{MAX_TS_MS, Store, StoreError};
 use serde_json::{Value, json};
@@ -275,7 +275,19 @@ fn full_summary() -> JobSummary {
         bundle_sha: Some("c".repeat(64)),
         claude_version: Some("2.1.289".to_owned()),
         model: Some("claude-opus-4".to_owned()),
+        clone_ms: Some(19),
+        push_ms: Some(20),
+        pr_ms: Some(21),
+        queue_wait_ms: None,
     }
+}
+
+async fn pin_queue_wait(pool: &PgPool, millis: i32) {
+    sqlx::query("UPDATE jobs SET created_at = claimed_at - make_interval(secs => $1)")
+        .bind(f64::from(millis) / 1000.0)
+        .execute(pool)
+        .await
+        .unwrap();
 }
 
 async fn figures(pool: &PgPool) -> Value {
@@ -292,6 +304,7 @@ async fn figures(pool: &PgPool) -> Value {
 async fn summary_upsert_keeps_unobserved_as_null(pool: PgPool) {
     let store = store(pool.clone()).await;
     let job = claimed(&store).await;
+    pin_queue_wait(&pool, 2_500).await;
     send(&store, &job, Vec::new(), Some(full_summary()))
         .await
         .unwrap();
@@ -305,7 +318,8 @@ async fn summary_upsert_keeps_unobserved_as_null(pool: PgPool) {
             "api_retries": 15, "first_edit_ms": 16, "complete": true, "missing": ["a", "b"],
             "stuck_rule": "repeat_error", "stuck_at_seq": 17, "stuck_at_ms": 18,
             "bundle_sha": "c".repeat(64), "claude_version": "2.1.289",
-            "model": "claude-opus-4"
+            "model": "claude-opus-4", "clone_ms": 19, "push_ms": 20, "pr_ms": 21,
+            "queue_wait_ms": 2500
         })
     );
     let sparse = JobSummary {
@@ -325,9 +339,63 @@ async fn summary_upsert_keeps_unobserved_as_null(pool: PgPool) {
             "bash_nonzero": null, "denials": null, "api_retries": null,
             "first_edit_ms": null, "complete": false, "missing": ["result"],
             "stuck_rule": null, "stuck_at_seq": null, "stuck_at_ms": null,
-            "bundle_sha": null, "claude_version": null, "model": null
+            "bundle_sha": null, "claude_version": null, "model": null, "clone_ms": null,
+            "push_ms": null, "pr_ms": null, "queue_wait_ms": 2500
         })
     );
+}
+
+#[sqlx::test]
+async fn phase_figures_are_capped_and_queue_wait_comes_from_the_job(pool: PgPool) {
+    let store = store(pool.clone()).await;
+    let job = claimed(&store).await;
+    pin_queue_wait(&pool, 3_000).await;
+    let over = MAX_PHASE_MS + 1;
+    let bad = [
+        JobSummary {
+            clone_ms: Some(over),
+            ..JobSummary::default()
+        },
+        JobSummary {
+            push_ms: Some(u64::MAX),
+            ..JobSummary::default()
+        },
+        JobSummary {
+            pr_ms: Some(over),
+            ..JobSummary::default()
+        },
+    ];
+    for summary in bad {
+        let err = send(&store, &job, Vec::new(), Some(summary))
+            .await
+            .unwrap_err();
+        assert!(matches!(err, StoreError::InvalidTelemetry));
+    }
+    assert_eq!(count(&pool, "job_summary").await, 0);
+
+    let edge = JobSummary {
+        clone_ms: Some(MAX_PHASE_MS),
+        push_ms: Some(0),
+        queue_wait_ms: Some(1),
+        ..JobSummary::default()
+    };
+    send(&store, &job, Vec::new(), Some(edge)).await.unwrap();
+    let stored = figures(&pool).await;
+    assert_eq!(stored["clone_ms"], json!(MAX_PHASE_MS));
+    assert_eq!(stored["push_ms"], 0);
+    assert_eq!(stored["pr_ms"], Value::Null);
+    assert_eq!(stored["queue_wait_ms"], 3_000);
+
+    sqlx::query("UPDATE jobs SET claimed_at = NULL")
+        .execute(&pool)
+        .await
+        .unwrap();
+    send(&store, &job, Vec::new(), Some(JobSummary::default()))
+        .await
+        .unwrap();
+    let stored = figures(&pool).await;
+    assert_eq!(stored["clone_ms"], Value::Null);
+    assert_eq!(stored["queue_wait_ms"], Value::Null);
 }
 
 #[sqlx::test]

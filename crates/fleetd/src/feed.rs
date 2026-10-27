@@ -20,6 +20,7 @@ use fleet_proto::MAX_EVENTS_PER_REPORT;
 use fleet_proto::v1 as pb;
 use tokio::time::Instant;
 
+use crate::phase::Phases;
 use crate::runner::{UNKNOWN_STAMP, VersionStamp};
 use crate::telemetry::{EventKind, JobEvent, JobSummary, Limits, Telemetry, Terminal};
 use crate::toolhook::ToolReport;
@@ -56,6 +57,7 @@ pub(crate) struct Feed {
     hooked: HashSet<String>,
     waiting: HashMap<String, ToolReport>,
     stamp: VersionStamp,
+    phases: Phases,
 }
 
 impl Feed {
@@ -74,7 +76,12 @@ impl Feed {
             hooked: HashSet::new(),
             waiting: HashMap::new(),
             stamp: VersionStamp::default(),
+            phases: Phases::default(),
         }
+    }
+
+    pub(crate) fn record(&mut self, phases: Phases) {
+        self.phases.merge(phases);
     }
 
     pub(crate) fn set_stamp(&mut self, stamp: VersionStamp) {
@@ -227,16 +234,24 @@ impl Feed {
             "job telemetry closed"
         );
         let stamp = self.stamp.clone();
+        let phases = self.phases;
         let Some(parser) = self.parser.take() else {
             let missing = pb::JobSummary {
                 missing: vec![PARSER_MISSING.to_owned()],
                 ..pb::JobSummary::default()
             };
-            return stamped(missing, &stamp);
+            return phased(stamped(missing, &stamp), phases);
         };
         let stamp = stamp.with_model(parser.model());
-        stamped(summary(parser.finish(terminal)), &stamp)
+        phased(stamped(summary(parser.finish(terminal)), &stamp), phases)
     }
+}
+
+fn phased(mut summary: pb::JobSummary, phases: Phases) -> pb::JobSummary {
+    summary.clone_ms = phases.checkout;
+    summary.push_ms = phases.push;
+    summary.pr_ms = phases.pr;
+    summary
 }
 
 fn stamped(mut summary: pb::JobSummary, stamp: &VersionStamp) -> pb::JobSummary {
@@ -299,6 +314,10 @@ fn summary(summary: JobSummary) -> pb::JobSummary {
         bundle_sha: None,
         claude_version: None,
         model: None,
+        clone_ms: None,
+        push_ms: None,
+        pr_ms: None,
+        queue_wait_ms: None,
     }
 }
 
@@ -649,6 +668,10 @@ mod tests {
                 bundle_sha: None,
                 claude_version: None,
                 model: None,
+                clone_ms: None,
+                push_ms: None,
+                pr_ms: None,
+                queue_wait_ms: None,
             }
         );
     }

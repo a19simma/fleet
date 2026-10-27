@@ -44,10 +44,13 @@ impl<R: Reporter> DaemonRunner<R> {
     }
 
     async fn prepare(&self, job: &Job, mut shutdown: Shutdown) -> Result<PathBuf, RunError> {
-        let work = tokio::time::timeout(
-            self.agent.prepare_timeout(),
-            self.workspace
-                .prepare(&job.job_id, &job.repo, &job.base_ref),
+        let work = self.agent.timed_clone(
+            job,
+            tokio::time::timeout(
+                self.agent.prepare_timeout(),
+                self.workspace
+                    .prepare(&job.job_id, &job.repo, &job.base_ref),
+            ),
         );
         let guarded = tokio::select! {
             guarded = self.agent.keep_alive(job, work) => guarded,

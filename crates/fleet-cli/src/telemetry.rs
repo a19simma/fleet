@@ -107,6 +107,10 @@ pub(crate) fn write_summary(out: &mut impl Write, summary: &JobSummary) -> std::
         or_dash(summary.api_retries.as_ref())
     )?;
     writeln!(out, "  first_edit: {}", duration(summary.first_edit_ms))?;
+    writeln!(out, "  clone: {}", duration(summary.clone_ms))?;
+    writeln!(out, "  push: {}", duration(summary.push_ms))?;
+    writeln!(out, "  pr: {}", duration(summary.pr_ms))?;
+    writeln!(out, "  queue_wait: {}", duration(summary.queue_wait_ms))?;
     writeln!(
         out,
         "  stop_reason: {}",
