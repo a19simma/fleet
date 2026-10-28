@@ -1,6 +1,9 @@
 //! Telemetry parser over recorded and hand-written stream-json lines.
 
-use fleetd::telemetry::{EventKind, JobEvent, Limits, Telemetry, Terminal};
+use fleetd::telemetry::{
+    EventKind, FetchPhase, FetchRecordError, JobEvent, Limits, MAX_FETCH_URL_BYTES, Telemetry,
+    Terminal,
+};
 use serde_json::{Value, json};
 
 const SMOKE: &str = include_str!("fixtures/smoke-success.jsonl");
@@ -788,4 +791,60 @@ fn zero_tool_calls_never_miss_hooks() {
     let mut with_result = Telemetry::new(Limits::default());
     feed_all(&mut with_result, SMOKE.lines().last().unwrap_or(""));
     assert!(!has_hooks_missing(&with_result));
+}
+
+#[test]
+fn a_fetch_record_stores_the_whole_url_and_counts_toward_the_cap() {
+    let mut telemetry = Telemetry::new(limits(2, 1 << 20, 512, 1024));
+    let url = format!("https://h.example/{}", "p".repeat(MAX_FETCH_URL_BYTES - 18));
+    let mut out = Vec::new();
+    telemetry
+        .record_fetch(&url, FetchPhase::Intent, 7, &str::to_owned, &mut out)
+        .unwrap();
+    telemetry
+        .record_fetch(
+            &url,
+            FetchPhase::Failed { status: Some(502) },
+            8,
+            &str::to_owned,
+            &mut out,
+        )
+        .unwrap();
+    assert_eq!(out.len(), 2);
+    assert_eq!(out[0].kind, EventKind::Fetch);
+    assert_eq!(out[0].cmd.as_deref(), Some(url.as_str()));
+    assert_eq!(out[1].ok, Some(false));
+    assert_eq!(out[1].exit_code, Some(502));
+    assert_eq!(out[1].out_bytes, None);
+    assert_eq!(out[0].exit_code, None);
+    let mut marker = Vec::new();
+    assert_eq!(
+        telemetry.record_fetch(&url, FetchPhase::Intent, 9, &str::to_owned, &mut marker),
+        Err(FetchRecordError::Truncated)
+    );
+    assert_eq!(marker.len(), 1);
+    assert_eq!(marker[0].kind, EventKind::Phase);
+    assert!(
+        telemetry
+            .summary()
+            .missing
+            .iter()
+            .any(|m| m == "events_truncated")
+    );
+}
+
+#[test]
+fn a_succeeded_fetch_stores_status_and_bytes_on_the_event() {
+    let mut telemetry = Telemetry::new(limits(8, 1 << 20, 512, 1024));
+    let mut out = Vec::new();
+    let phase = FetchPhase::Succeeded {
+        status: 200,
+        bytes: 123_456,
+    };
+    telemetry
+        .record_fetch("https://h.example/", phase, 3, &str::to_owned, &mut out)
+        .unwrap();
+    assert_eq!(out[0].exit_code, Some(200));
+    assert_eq!(out[0].out_bytes, Some(123_456));
+    assert_eq!(out[0].ok, Some(true));
 }
