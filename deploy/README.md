@@ -38,7 +38,7 @@ fleetd reads `/etc/fleetd/config.toml` when it exists, then these environment va
 | `FLEETD_JOBS_DIR` | job worktrees and git mirrors (the mirror cache lives under it) | `$STATE_DIRECTORY/jobs`, else `./jobs` |
 | `FLEET_SERVER_URL` | server URL, `http://` or `https://`. While set, fleetd heartbeats and polls for jobs. `https://` uses TLS with the bundled webpki roots and sends the token encrypted to the gateway. A bad or untrusted certificate fails the call within 11 seconds and the error never holds the token. The gateway-to-pod hop depends on the cluster: plaintext h2c unless a `BackendTLSPolicy` or mesh is configured | unset, no server link |
 | `FLEET_TOKEN` | box bearer token for the server. Required when `FLEET_SERVER_URL` is set | unset |
-| `GH_TOKEN` | GitHub PAT for the job push, the private repo mirror fetch and `gh pr create`, passed to `fleetd askpass` and `gh` only | unset |
+| `GH_TOKEN` | GitHub PAT for the job push, the private repo mirror fetch and `gh pr create`, passed to `fleetd askpass` and `gh` only, and only while a token host is set. `gh` gets `GH_HOST` set to the token host, and `GH_ENTERPRISE_TOKEN` only when that host is not `github.com` | unset |
 
 The default jobs dir is `/var/lib/fleetd/jobs`, inside `StateDirectory=fleetd`, so the unit needs no extra path for it. fleetd removes a job's worktree after the job ends, and keeps the mirror cache. A failed workspace prepare, a shutdown during prepare and a killed fleetd leave a worktree behind, and nothing removes it, so clear old directories from the jobs dir by hand. If you set `FLEETD_JOBS_DIR` or `jobs_dir` elsewhere, add that path to `ReadWritePaths=` with a drop-in (`systemctl edit fleetd`), or the worktree and mirror writes fail under `ProtectSystem=strict`. `claude_bin` and `gh_bin` are config-file keys only, with no env variable. They default to `claude` and `gh`, resolved through `PATH`. Set absolute paths in `/etc/fleetd/config.toml` when the unit's `PATH` does not include them.
 
@@ -86,7 +86,7 @@ sqlite3 /var/lib/fleetd/queue.db 'select seq, kind, state from events order by s
 
 ## Systemd agent launcher
 
-`agent_launcher = "systemd"` runs each agent as a `fleet-agent@<job id>.service` unit under a second uid, so a job cannot read `/etc/swarm/secrets.env` or the fleetd environment. The design and the live findings are in [ADR-0031](../docs/adr/0031-agent-isolation.md). The default is `direct`, the legacy path above.
+`agent_launcher = "systemd"` runs each agent as a `fleet-agent@<job id>.service` unit under a second uid, so a job under the second uid cannot read `/etc/swarm/secrets.env` or `/proc/<fleetd pid>/environ`. Under this launcher the agent asks fleetd for `push`, `pr_create`, `pr_checks` and `fetch` through `fleetd broker` on its per-job socket (ADR-0037), and holds no GitHub token. The direct launcher serves no job socket, so no broker runs there and the agent shares fleetd's uid and can read both. These claims come from the code and its tests. The live probe in [Credential isolation probe](#credential-isolation-probe) has not run yet, so none of them is proven on a box. The design and the live findings are in [ADR-0031](../docs/adr/0031-agent-isolation.md). The default is `direct`, the legacy path above.
 
 ### Files
 
@@ -214,7 +214,65 @@ Install `managed-settings.json` as in the legacy steps, with two checks:
 
 ### Secrets
 
-After the ownership change in step 5, `/etc/swarm/secrets.env` is mode 0600 `fleetd:fleetd`. The legacy layout (mode 0640 `root:agent`) let any job running as `agent` read it.
+After the ownership change in step 5, `/etc/swarm/secrets.env` is mode 0600 `fleetd:fleetd`. The legacy layout (mode 0640 `root:agent`) let any job running as `agent` read it. Whether the job uid is refused on a live box is the first check of the probe below.
+
+### Credential isolation probe
+
+Status: not run. Set `BOX` to the test box host name and `SERVER` to the fleet server URL. Run the steps as the operator over `ssh agent@$BOX`. Every command prints a status or a count, never a value. `JOBUID` is `fleet-job` and `FPID` is the fleetd main pid.
+
+1. Job uid cannot read fleetd secrets. Expect `denied` twice.
+
+   ```sh
+   ssh agent@$BOX 'FPID=$(systemctl show -p MainPID --value fleetd); for f in /proc/$FPID/environ /etc/swarm/secrets.env; do sudo -u fleet-job sh -c "head -c1 $f >/dev/null 2>&1 && echo readable || echo denied"; done'
+   ```
+
+2. Job env and argv hold no token. A job must be running. The loop runs under `sudo` so every `/proc/<pid>/environ` is readable, and errors stay visible. Expect `sampled` of at least 1 and `tokens=0`. `sampled=0` or any read error fails the step, so `tokens=0` means the environ files were read and were clean.
+
+   ```sh
+   ssh agent@$BOX sudo sh -s <<'EOF'
+   n=0; t=0
+   for p in $(pgrep -u fleet-job); do
+     e=$(tr "\0" "\n" < /proc/$p/environ) || { echo "unreadable environ for pid $p"; exit 1; }
+     [ -n "$e" ] || { echo "empty environ for pid $p"; exit 1; }
+     c=$(printf "%s\n" "$e" | grep -c -E "^(GH_TOKEN|GITHUB_TOKEN|GH_ENTERPRISE_TOKEN|GIT_ASKPASS|FLEET_TOKEN|FLEETD_ASKPASS)=") || true
+     n=$((n+1)); t=$((t+c))
+   done
+   echo "sampled=$n tokens=$t"
+   [ "$n" -ge 1 ] || { echo "no fleet-job process sampled"; exit 1; }
+   EOF
+   ```
+
+3. Broker push and `pr_checks` work. Submit a job whose prompt makes one commit, then runs `fleetd broker push`, `fleetd broker pr_create "t" "b"` and `fleetd broker pr_checks`. Expect each to print its reply, and the job to finish `SUCCEEDED` with a `pr_url`.
+
+   ```sh
+   fleet submit --server $SERVER --repo <test repo url> --prompt 'commit one file, then run: fleetd broker push; fleetd broker pr_create "probe" "probe"; fleetd broker pr_checks'
+   fleet status --server $SERVER <job id>
+   ```
+
+4. Plain `git push` and `gh` fail with no credential. Submit a job that runs `git push origin HEAD`, `gh auth status` and `gh pr list`. Expect a refusal or an authentication failure for each, and no token in the transcript.
+
+   ```sh
+   fleet submit --server $SERVER --repo <test repo url> --prompt 'run each of: git push origin HEAD; gh auth status; gh pr list; report only exit codes'
+   fleet logs --server $SERVER <job id>
+   ```
+
+5. Another job's socket is refused. Start two jobs together. In job A, connect to job B's socket path and print only the outcome. Expect `refused`.
+
+   ```sh
+   fleet submit --server $SERVER --repo <test repo url> --prompt 'sleep 120'
+   fleet submit --server $SERVER --repo <test repo url> --prompt 'python3 -c "import socket,sys; s=socket.socket(socket.AF_UNIX); s.connect(\"/run/fleet/<job B id>/job.sock\")" 2>&1 | tail -1; echo done'
+   ```
+
+6. A push to another branch is impossible. `fleetd broker push` takes no branch argument, and the target is the bound `swarm/<job id>` branch. Expect the extra argument refused and the branch list unchanged.
+
+   ```sh
+   fleet submit --server $SERVER --repo <test repo url> --prompt 'run: fleetd broker push refs/heads/main; fleetd broker push --branch main'
+   ssh agent@$BOX 'git ls-remote --heads <test repo url> | grep -c " refs/heads/main$"'
+   ```
+
+   Compare the `main` count before and after the job. Expect no change.
+
+Record each outcome in `.ralph/progress.md`. Do not mark A28 passed until all six hold on the box.
 
 ### Limits
 

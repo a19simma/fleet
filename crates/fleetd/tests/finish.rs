@@ -300,7 +300,7 @@ fn agent(rig: &Rig) -> (AgentRunner<Fake>, mpsc::UnboundedReceiver<ReportJobRequ
 }
 
 fn test_policy() -> RepoPolicy {
-    RepoPolicy::new(Vec::<String>::new()).with_file_repos()
+    RepoPolicy::new(["github.com"]).with_file_repos()
 }
 
 fn agent_with(
@@ -419,6 +419,7 @@ fn agent_final(
         ("GIT_ASKPASS".into(), "/not/a/real/askpass".into()),
         ("FLEET_TOKEN".into(), "not-a-real-fleet-value".into()),
         ("KEPT_VALUE".into(), "kept".into()),
+        ("GH_HOST".into(), "evil.invalid".into()),
     ];
     env.extend(std::env::var_os("PATH").map(|path| ("PATH".into(), path)));
     config.base_env = env;
@@ -908,7 +909,7 @@ async fn credentialed_children_get_only_their_credential_and_scratch_dirs() -> T
         gh.extend(
             [
                 "GH_TOKEN",
-                "GH_ENTERPRISE_TOKEN",
+                "GH_HOST",
                 "GH_CONFIG_DIR",
                 "GH_NO_UPDATE_NOTIFIER",
                 "GH_BROWSER",
@@ -1144,7 +1145,7 @@ async fn the_test_policy_adds_the_file_transport_to_the_push() -> TestResult {
             .await?;
         let push = recorded(&rig, "push")?;
         assert!(push.contains("GIT_ALLOW_PROTOCOL=file:https\n"), "{push}");
-        assert!(push.contains("FLEETD_ASKPASS_HOST=\n"), "{push}");
+        assert!(push.contains("FLEETD_ASKPASS_HOST=github.com\n"), "{push}");
         Ok(())
     }))
     .await
@@ -2019,6 +2020,64 @@ async fn a_shutdown_during_the_wait_fails_the_job_with_no_ci_state() -> TestResu
         assert!(last.ci.is_none());
         assert_eq!(last.pr_url.as_deref(), Some(CI_PR));
         assert_eq!(last.branch.as_deref(), Some("swarm/job1"));
+        Ok(())
+    }))
+    .await
+}
+
+async fn finish_env(policy: RepoPolicy) -> Result<(String, String), Box<dyn std::error::Error>> {
+    let rig = rig("ok").await?;
+    commit(&rig)?;
+    let (agent, _rx) = agent_with_policy(&rig, PathBuf::from(env!("CARGO_BIN_EXE_fleetd")), policy);
+    let (_trigger, shutdown) = Shutdown::channel();
+    agent
+        .finish(&job(&rig, true), &rig.worktree, shutdown)
+        .await?;
+    let gh = std::fs::read_to_string(rig.dir.path().join("gh.env"))?;
+    Ok((recorded(&rig, "push")?, gh))
+}
+
+#[tokio::test]
+async fn gh_host_is_the_token_host_and_never_the_inherited_one() -> TestResult {
+    common::bounded(Box::pin(async {
+        let (_, gh) = finish_env(test_policy()).await?;
+        assert!(gh.contains("GH_HOST=github.com\n"), "{gh}");
+        assert!(!gh.contains("evil.invalid"), "{gh}");
+        assert!(!gh.contains("GH_ENTERPRISE_TOKEN"), "{gh}");
+        Ok(())
+    }))
+    .await
+}
+
+#[tokio::test]
+async fn an_enterprise_token_host_gets_the_enterprise_token_and_its_own_host() -> TestResult {
+    common::bounded(Box::pin(async {
+        let policy = RepoPolicy::new(["github.com", "ghe.example"])
+            .with_token_host(Some("ghe.example".into()))
+            .with_file_repos();
+        let (push, gh) = finish_env(policy).await?;
+        assert!(gh.contains("GH_HOST=ghe.example\n"), "{gh}");
+        assert!(
+            gh.contains("GH_ENTERPRISE_TOKEN=not-a-real-ent-value\n"),
+            "{gh}"
+        );
+        assert!(!gh.contains("evil.invalid"), "{gh}");
+        assert!(push.contains("GH_TOKEN=not-a-real-gh-value\n"), "{push}");
+        Ok(())
+    }))
+    .await
+}
+
+#[tokio::test]
+async fn with_no_token_host_no_helper_holds_a_token_or_a_gh_host() -> TestResult {
+    common::bounded(Box::pin(async {
+        let policy = RepoPolicy::new(["ghe.example"]).with_file_repos();
+        let (push, gh) = finish_env(policy).await?;
+        for (name, env) in [("push", push), ("gh", gh)] {
+            for key in ["GH_TOKEN", "GH_ENTERPRISE_TOKEN", "GH_HOST", "evil.invalid"] {
+                assert!(!env.contains(key), "{name} {key}");
+            }
+        }
         Ok(())
     }))
     .await

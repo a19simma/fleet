@@ -88,10 +88,10 @@ use crate::workspace::{RepoPolicy, validate_job_id};
 /// Variables that never reach the agent's environment block, however it is configured.
 ///
 /// The agent environment is an allowlist, so this list is the test oracle and the check for
-/// `agent_env_passthrough`. The agent runs as fleetd's uid and can still read the fleetd
-/// environment through `/proc` (ADR-0024 Known limit). The push child keeps `GH_TOKEN` and
-/// `GIT_ASKPASS`.
-pub const STRIPPED_ENV: [&str; 9] = [
+/// `agent_env_passthrough`. It limits the block only. An agent under fleetd's uid can still
+/// read the fleetd environment through `/proc` (ADR-0024 Known limit); with the job uid
+/// split in place that read fails. The push child keeps `GH_TOKEN` and `GIT_ASKPASS`.
+pub const STRIPPED_ENV: [&str; 11] = [
     "GH_TOKEN",
     "GITHUB_TOKEN",
     "GH_ENTERPRISE_TOKEN",
@@ -101,6 +101,8 @@ pub const STRIPPED_ENV: [&str; 9] = [
     "SSH_AUTH_SOCK",
     "FLEET_TOKEN",
     "FLEET_CLIENT_TOKEN",
+    "FLEETD_ASKPASS",
+    "FLEETD_ASKPASS_HOST",
 ];
 
 const AGENT_ENV: [&str; 13] = [
@@ -130,7 +132,7 @@ pub(crate) const DENIED_TOOLS: [&str; 6] = [
 
 const CLEAN_ENV: [&str; 1] = ["PATH"];
 const PUSH_ENV: [&str; 2] = ["PATH", "GH_TOKEN"];
-const GH_ENV: [&str; 4] = ["PATH", "GH_TOKEN", "GH_HOST", "GH_ENTERPRISE_TOKEN"];
+const GH_ENV: [&str; 3] = ["PATH", "GH_TOKEN", "GH_ENTERPRISE_TOKEN"];
 
 /// Default longest time for the whole finish step, and for each helper in it.
 pub const DEFAULT_FINISH_TIMEOUT: Duration = Duration::from_secs(300);
@@ -1518,7 +1520,17 @@ impl<R: Reporter> AgentRunner<R> {
             Scope::Push => &PUSH_ENV,
             Scope::Gh => &GH_ENV,
         };
-        let kept = |name: &OsString| allowed.iter().any(|keep| name == keep);
+        let token_host = self.config.repo_policy.token_host();
+        let kept = |name: &OsString| {
+            allowed.iter().any(|keep| name == keep)
+                && match name.to_str() {
+                    Some("GH_TOKEN") => token_host.is_some(),
+                    Some("GH_ENTERPRISE_TOKEN") => {
+                        token_host.is_some_and(|host| !host.eq_ignore_ascii_case("github.com"))
+                    }
+                    _ => true,
+                }
+        };
         command.envs(
             self.config
                 .base_env
@@ -1536,6 +1548,7 @@ impl<R: Reporter> AgentRunner<R> {
                     self.config.repo_policy.token_host().unwrap_or_default(),
                 ),
             Scope::Gh => command
+                .envs(token_host.map(|host| ("GH_HOST", host)))
                 .env("GH_CONFIG_DIR", dir.join(GH_CONFIG_DIR))
                 .env("GH_NO_UPDATE_NOTIFIER", "1")
                 .env("GH_BROWSER", "true")
@@ -3120,6 +3133,13 @@ mod tests {
             spec.env.get(&OsString::from("GIT_TERMINAL_PROMPT")),
             Some(&OsString::from("0"))
         );
+    }
+
+    #[test]
+    fn the_askpass_marker_and_host_are_stripped_names() {
+        for name in ["FLEETD_ASKPASS", "FLEETD_ASKPASS_HOST"] {
+            assert!(STRIPPED_ENV.contains(&name), "{name}");
+        }
     }
 
     #[test]
