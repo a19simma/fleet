@@ -1320,7 +1320,8 @@ impl<R: Reporter> AgentRunner<R> {
         validate_repo(&job.repo, &self.config.repo_policy).map_err(|_| Failure::bare(ERR_PUSH))?;
         validate_ref(&job.base_ref).map_err(|_| Failure::bare(ERR_COMMITS))?;
         let local = format!("swarm/{}", job.job_id);
-        let branch = push_branch(job, &local)?;
+        let target = PushTarget::from_job(job)?;
+        let branch = target.remote_branch();
         let scratch = Scratch::create(cwd, &job.job_id).map_err(|()| Failure::bare(ERR_COMMITS))?;
         let dir = scratch.path();
         self.commit_leftovers(job, cwd, dir).await?;
@@ -1360,25 +1361,19 @@ impl<R: Reporter> AgentRunner<R> {
         if !pushed.success {
             return Err(Failure::tail(ERR_PUSH, &pushed.stderr));
         }
-        if job.parent_job_id.is_some() {
-            return Ok(Published {
-                pr_url: job.pr_url.clone().filter(|url| is_ci_url(url)),
-                branch: Some(branch),
-            });
-        }
-        if !job.open_pr {
-            return Ok(Published {
-                branch: Some(branch),
-                pr_url: None,
-            });
-        }
-        let pr_start = self.clock.now();
-        let opened = self.open_pr(job, &branch, dir).await;
-        phases.pr = Some(elapsed_ms(&*self.clock, pr_start));
-        let pr_url = opened?;
+        let pr_url = match target {
+            PushTarget::Chain(_) => job.pr_url.clone().filter(|url| is_ci_url(url)),
+            PushTarget::Own(_) if !job.open_pr => None,
+            PushTarget::Own(_) => {
+                let pr_start = self.clock.now();
+                let opened = self.open_pr(job, &branch, dir).await;
+                phases.pr = Some(elapsed_ms(&*self.clock, pr_start));
+                Some(opened?)
+            }
+        };
         Ok(Published {
             branch: Some(branch),
-            pr_url: Some(pr_url),
+            pr_url,
         })
     }
 
@@ -2513,16 +2508,33 @@ struct Terminal {
     ci: Option<JobCi>,
 }
 
-/// The remote branch the job pushes to: its own `swarm/<job_id>` branch, or for a fix Job the
-/// existing branch of its `base_ref`, which must be a `swarm/` branch.
-fn push_branch(job: &Job, local: &str) -> Result<String, Failure> {
-    if job.parent_job_id.is_none() {
-        return Ok(local.to_owned());
+/// The remote branch a job pushes to, built once from the claimed Job.
+///
+/// A normal job pushes to its own `swarm/<job_id>` branch. A fix Job (`parent_job_id` set,
+/// ADR-0028) pushes to the existing chain-root branch named by its `base_ref`, which passed
+/// [`is_swarm_branch`] when the target was built. `git push` receives no branch name except
+/// through [`PushTarget::remote_branch`].
+enum PushTarget {
+    Own(String),
+    Chain(String),
+}
+
+impl PushTarget {
+    fn from_job(job: &Job) -> Result<Self, Failure> {
+        if job.parent_job_id.is_none() {
+            Ok(Self::Own(job.job_id.clone()))
+        } else if is_swarm_branch(&job.base_ref) {
+            Ok(Self::Chain(job.base_ref.clone()))
+        } else {
+            Err(Failure::bare(ERR_PUSH))
+        }
     }
-    if is_swarm_branch(&job.base_ref) {
-        Ok(job.base_ref.clone())
-    } else {
-        Err(Failure::bare(ERR_PUSH))
+
+    fn remote_branch(&self) -> String {
+        match self {
+            Self::Own(job_id) => format!("swarm/{job_id}"),
+            Self::Chain(branch) => branch.clone(),
+        }
     }
 }
 
@@ -2674,6 +2686,7 @@ mod tests {
         LineReader, Reporter, RunConfig, STRIPPED_ENV, UNKNOWN_STAMP, VERSION_CHARS, VersionStamp,
         ending, parse_version,
     };
+    use super::{ERR_PUSH, PushTarget};
     use crate::poller::Shutdown;
     use crate::profile_apply::LoadError;
     use fleet_core::Profile;
@@ -2817,6 +2830,60 @@ mod tests {
             prompt: "do it".into(),
             ..Job::default()
         }
+    }
+
+    fn fix_job(base_ref: &str) -> Job {
+        Job {
+            parent_job_id: Some("root1".into()),
+            base_ref: base_ref.into(),
+            ..test_job()
+        }
+    }
+
+    #[test]
+    fn a_normal_job_targets_its_own_swarm_branch() {
+        let target = PushTarget::from_job(&test_job()).ok();
+        assert!(matches!(target, Some(PushTarget::Own(_))));
+        assert_eq!(
+            target.map(|t| t.remote_branch()),
+            Some("swarm/job1".to_owned())
+        );
+    }
+
+    #[test]
+    fn a_fix_job_targets_the_chain_branch_of_its_base_ref() {
+        let target = PushTarget::from_job(&fix_job("swarm/root1")).ok();
+        assert!(matches!(target, Some(PushTarget::Chain(_))));
+        assert_eq!(
+            target.map(|t| t.remote_branch()),
+            Some("swarm/root1".to_owned())
+        );
+    }
+
+    #[test]
+    fn a_fix_job_with_a_base_ref_that_is_no_swarm_branch_is_refused() {
+        for base_ref in ["main", "swarm/", "swarm/a/b", "swarm/a-b", ""] {
+            let refused = PushTarget::from_job(&fix_job(base_ref)).err();
+            assert_eq!(
+                refused.map(|f| f.error),
+                Some(ERR_PUSH),
+                "{base_ref:?} accepted"
+            );
+        }
+        let long = format!("swarm/{}", "a".repeat(65));
+        assert!(PushTarget::from_job(&fix_job(&long)).is_err());
+    }
+
+    #[test]
+    fn a_normal_job_ignores_a_base_ref_that_is_no_swarm_branch() {
+        let job = Job {
+            base_ref: "main".into(),
+            ..test_job()
+        };
+        assert_eq!(
+            PushTarget::from_job(&job).ok().map(|t| t.remote_branch()),
+            Some("swarm/job1".to_owned())
+        );
     }
 
     #[test]
