@@ -669,9 +669,8 @@ mod tests {
 
     use super::{
         AGENT_SLICE, JobContext, JobSocket, Limits, MAX_FRAME_BYTES, Peer, PeerId, PerJob,
-        RegisterError, ServeFuture,
-        Service, ServiceName, Services, SocketFacts, cgroup_unit, connect, connect_with,
-        read_frame, socket_acceptable, socket_path, write_frame,
+        RegisterError, ServeFuture, Service, ServiceName, Services, SocketFacts, cgroup_unit,
+        connect, connect_with, read_frame, socket_acceptable, socket_path, write_frame,
     };
 
     type TestResult = Result<(), Box<dyn std::error::Error>>;
@@ -1392,8 +1391,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn unregister_takes_effect_on_the_next_connection_and_spares_the_open_one()
-    -> TestResult {
+    async fn unregister_takes_effect_on_the_next_connection_and_spares_the_open_one() -> TestResult
+    {
         let dir = TempDir::new()?;
         let (tx, mut seen) = mpsc::unbounded_channel();
         let registry = PerJob::new();
