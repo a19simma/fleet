@@ -107,7 +107,7 @@ The units and `sysusers.d` file were installed live on systemd 257. `systemd-ana
 - `fleetd` owns the daemon, its state under `/var/lib/fleetd` and `/etc/swarm/secrets.env`.
 - `fleet-job` runs agents. Its primary group is `fleet-work`.
 - `fleet-work` is the shared group. `fleetd` is a member, through `sysusers.d` and `SupplementaryGroups=fleet-work`. A non-root daemon can only chown to a group it belongs to.
-- `/var/lib/fleet/jobs` is mode 3770 `fleetd:fleet-work`: group-writable, setgid and sticky. Each job has its worktree there, plus `.agent/<job id>` (the per-job home) and the `.cache` mirror. The unit's `ReadWritePaths=` covers only this directory.
+- `/var/lib/fleet/jobs` is mode 3770 `fleetd:fleet-work`: group-writable, setgid and sticky. Each job has its clone there, plus `.agent/<job id>` (the per-job home) and the `.cache` mirror, which `fleetd` owns and the job group reads but never writes. The daemon unit's `ReadWritePaths=` covers only this directory. The agent unit reopens it too, then `ReadOnlyPaths=-/var/lib/fleet/jobs/.cache` makes the mirror read-only inside the agent's mount namespace, on top of the file modes.
 - `/run/fleet` is mode 0750 `fleetd:fleet-work` and holds the per-job run dirs. `/run/fleet/hook` holds the hook socket, mode 0750 `fleetd:fleet-work`.
 
 The agent unit mounts an empty read-only tmpfs over `/run/fleet` (`TemporaryFileSystem=/run/fleet:ro`) and bind-mounts back only `/run/fleet/%i` (`BindPaths=`, its own run dir with the per-job socket) and `/run/fleet/hook` (`BindReadOnlyPaths=`). Other jobs' run dirs and sockets are absent from the agent's mount namespace (ADR-0036). This is the first isolation layer; the cgroup check in `jobsock.rs` is the second.
@@ -219,7 +219,7 @@ After the ownership change in step 5, `/etc/swarm/secrets.env` is mode 0600 `fle
 
 - Jobs share the host kernel. A kernel escape from a job reaches the host and every secret fleetd holds. If jobs from third-party repos or public prompt sources ever run, move to a Firecracker microVM per job (ADR-0031, MicroVM).
 - The Claude token stays visible to the agent, since the agent needs it to call the API.
-- The shared mirror is still writable by the job until P3.
+- The mirror is read-only to the job (P3), so `fleetd` no longer rewrites its config. Before each fetch `fleetd` checks the mirror (owner, modes, symlinks, alternates, config content) and deletes and rebuilds one that fails, so a mirror created before P3 that may hold agent-written config is replaced on the next job. Deleting `/var/lib/fleet/jobs/.cache` once at cutover is optional. `fleetd` still clears stale `*.lock` files in the mirror before each fetch.
 
 ### Rollback
 

@@ -1,6 +1,6 @@
 # Agent isolation
 
-Status: Accepted 2026-10-26. P1 is built behind `agent_launcher = "systemd"` and cut over live on the first Box; P2 and P3 are not built. Supersedes the Known limit paragraph of ADR-0024. Amends the credential and mirror-hardening sections of ADR-0024.
+Status: Accepted 2026-10-26. P1 is built behind `agent_launcher = "systemd"` and cut over live on the first Box; P2 is not built. P3 clone and publish are built, the rest of P3 is not. Supersedes the Known limit paragraph of ADR-0024. Amends the credential and mirror-hardening sections of ADR-0024.
 
 Supersedes: the "Known limit" paragraph of ADR-0024.
 Amends: the "Credential", "Who sees it", "Mirror hardening" and "Fetch credential" sections of ADR-0024, and the unit and hook sections of ADR-0011.
@@ -35,8 +35,8 @@ Isolate the agent in phases with systemd and a second uid. Each phase ships alon
 ### P3: workspace and limits
 
 - **Clone.** Replace the shared worktree with `git clone --reference <mirror>` (alternates) into a directory owned by the job uid. The mirror is read-only to the job uid.
-- **Publish.** fleetd fetches `swarm/<job_id>` from the job directory under its own uid, with hooks and fsmonitor off and `GIT_ALLOW_PROTOCOL=file`, then pushes from the mirror. The push and `gh pr create` steps of ADR-0020 and ADR-0024 are unchanged in what they publish.
-- **Retires** the mirror-hardening window of ADR-0024: the agent no longer writes the mirror, so the `commondir` and `config.worktree` deletion, the config rewrite and the lock cleanup stop being needed once P3 ships. The pins on the workspace git calls stay as defense in depth.
+- **Publish.** fleetd fetches `swarm/<job_id>` from the job directory under its own uid, with hooks and fsmonitor off and `GIT_ALLOW_PROTOCOL=file`, then pushes from a scratch bare repo that borrows the mirror's objects through alternates. Inferred, not part of the design: the scratch repo keeps the push's `GIT_DIR` and scratch `HOME` apart from the mirror, so the push runs in no directory the job group can read for config. The push and `gh pr create` steps of ADR-0020 and ADR-0024 are unchanged in what they publish.
+- **Retires** the mirror-hardening window of ADR-0024: the agent no longer writes the mirror, so the `commondir` and `config.worktree` deletion and the config rewrite are removed. The mirror is built in a sibling directory with its gc settings and renamed into place. Before each fetch fleetd checks an existing mirror structurally (owner uid, no group or other write bit, no symlinks, no alternates, `commondir` or `config.worktree`, a `config` holding only the init keys and the gc settings) and deletes and rebuilds one that fails, so a mirror made before P3 needs no manual delete. The lock cleanup stays, because a killed fleetd fetch leaves `*.lock` files in the mirror. The pins on the workspace git calls stay as defense in depth.
 - **Limits.** `MemoryMax`, `TasksMax`, `CPUQuota` and a job-directory quota.
 
 ### P4: optional inner sandbox
@@ -110,7 +110,7 @@ Three design corrections came out of the run and are binding constraints in P1: 
 - A Job can no longer read `GH_TOKEN`, `FLEET_TOKEN` or `secrets.env` once P1 ships. The "Any claim here that the token stays secret holds against a process under a uid other than fleetd's" caveat of ADR-0024 then holds for the agent too.
 - The agent keeps the Claude token. A leak is bounded by the egress allowlist and by rotation.
 - P1 alone leaves the network open, so a Job can still reach any host and the host loopback services. P2 closes that.
-- P1 and P2 leave the shared mirror writable by the agent until P3.
+- P1 and P2 leave the shared mirror writable by the agent until P3. The agent unit also marks `.cache` read-only with `ReadOnlyPaths=`.
 - fleetd gains a polkit rule, a second uid, a template unit and a launcher subcommand, and loses the process-group cancel path. A Box needs a system-wide Claude install, which changes the Template.
 - Per-job state moves out of `StateDirectory=fleetd` or needs a second state directory owned by `fleet-job`.
 - The allowlist is a new thing to maintain per Box. A missing host fails a Job at the first request.

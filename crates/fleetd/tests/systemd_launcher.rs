@@ -1126,6 +1126,8 @@ fn agent_unit_exposes_only_own_run_dir_and_hook_dir() {
     assert!(has("TemporaryFileSystem=/run/fleet:ro"));
     assert!(has("BindPaths=/run/fleet/%i"));
     assert!(has("BindReadOnlyPaths=/run/fleet/hook"));
+    assert!(has("ReadWritePaths=/var/lib/fleet/jobs"));
+    assert!(has("ReadOnlyPaths=-/var/lib/fleet/jobs/.cache"));
     let binds = lines
         .iter()
         .filter(|l| l.starts_with("BindPaths=") || l.starts_with("BindReadOnlyPaths="))
