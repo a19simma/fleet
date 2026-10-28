@@ -22,7 +22,9 @@ use tokio::time::Instant;
 
 use crate::phase::Phases;
 use crate::runner::{UNKNOWN_STAMP, VersionStamp};
-use crate::telemetry::{EventKind, JobEvent, JobSummary, Limits, Telemetry, Terminal};
+use crate::telemetry::{
+    EventKind, FetchPhase, FetchRecordError, JobEvent, JobSummary, Limits, Telemetry, Terminal,
+};
 use crate::toolhook::ToolReport;
 
 pub(crate) const MAX_LINE_BYTES: usize = 1 << 20;
@@ -31,6 +33,7 @@ pub(crate) const MAX_PENDING_EVENTS: usize = 4096;
 pub(crate) const MAX_HOOKED_IDS: usize = 4096;
 pub(crate) const MAX_WAITING_HOOKS: usize = 256;
 const PARSER_MISSING: &str = "parser";
+const FETCH_OUTCOME_MISSING: &str = "fetch_outcome";
 
 type Parse = fn(&mut Telemetry, &str, u64, &dyn Fn(&str) -> String) -> Vec<JobEvent>;
 
@@ -58,6 +61,7 @@ pub(crate) struct Feed {
     waiting: HashMap<String, ToolReport>,
     stamp: VersionStamp,
     phases: Phases,
+    fetch_outcome_lost: bool,
 }
 
 impl Feed {
@@ -77,6 +81,7 @@ impl Feed {
             waiting: HashMap::new(),
             stamp: VersionStamp::default(),
             phases: Phases::default(),
+            fetch_outcome_lost: false,
         }
     }
 
@@ -121,6 +126,64 @@ impl Feed {
             self.parser = None;
         }
         self.retry_waiting();
+    }
+
+    /// Records one fetch event, failing when the feed would not keep it.
+    ///
+    /// The feed refuses when it is closed, when the byte budget is spent (a line already skipped
+    /// over budget counts, and so does a feed with no room left), when the event cap is already
+    /// full (the event after the last stored one, the 2001st by default, becomes the truncation
+    /// marker and fails; the one that reaches the cap is kept), and when the URL is over
+    /// [`MAX_FETCH_URL_BYTES`] after redaction. An outcome phase carries the HTTP status into
+    /// `exit_code` and the body length into `out_bytes`; an intent carries neither. A refused outcome record adds
+    /// `fetch_outcome` to the summary `missing` list. The caller refuses the fetch when an
+    /// intent record fails. "Recorded" means this feed accepted the event, not that the server
+    /// confirmed it.
+    #[cfg_attr(
+        not(test),
+        expect(dead_code, reason = "the fetch handler lands in the next task")
+    )]
+    pub(crate) fn record_fetch(
+        &mut self,
+        redactor: &Redactor,
+        url: &str,
+        phase: FetchPhase,
+        now: Instant,
+    ) -> Result<(), FetchRecordError> {
+        let result = self.try_record_fetch(redactor, url, phase, now);
+        if result.is_err() && !matches!(phase, FetchPhase::Intent) {
+            self.fetch_outcome_lost = true;
+        }
+        result
+    }
+
+    #[cfg_attr(
+        not(test),
+        expect(dead_code, reason = "the fetch handler lands in the next task")
+    )]
+    fn try_record_fetch(
+        &mut self,
+        redactor: &Redactor,
+        url: &str,
+        phase: FetchPhase,
+        now: Instant,
+    ) -> Result<(), FetchRecordError> {
+        if self.parser.is_none() {
+            return Err(FetchRecordError::Closed);
+        }
+        if self.counters.over_budget > 0 || self.fed_bytes >= MAX_FED_BYTES {
+            return Err(FetchRecordError::OverBudget);
+        }
+        let ts_ms = u64::try_from(now.saturating_duration_since(self.started).as_millis())
+            .unwrap_or(u64::MAX);
+        let redact = |text: &str| redactor.redact_str(text).into_owned();
+        let mut stored = Vec::new();
+        let parser = self.parser.as_mut().ok_or(FetchRecordError::Closed)?;
+        let result = parser.record_fetch(url, phase, ts_ms, &redact, &mut stored);
+        for event in stored {
+            self.queue(convert(redactor, event));
+        }
+        result
     }
 
     /// Applies one tool hook report to the matching tool event.
@@ -236,14 +299,21 @@ impl Feed {
         let stamp = self.stamp.clone();
         let phases = self.phases;
         let Some(parser) = self.parser.take() else {
-            let missing = pb::JobSummary {
+            let mut missing = pb::JobSummary {
                 missing: vec![PARSER_MISSING.to_owned()],
                 ..pb::JobSummary::default()
             };
+            if self.fetch_outcome_lost {
+                missing.missing.push(FETCH_OUTCOME_MISSING.to_owned());
+            }
             return phased(stamped(missing, &stamp), phases);
         };
         let stamp = stamp.with_model(parser.model());
-        phased(stamped(summary(parser.finish(terminal)), &stamp), phases)
+        let mut summary = summary(parser.finish(terminal));
+        if self.fetch_outcome_lost {
+            summary.missing.push(FETCH_OUTCOME_MISSING.to_owned());
+        }
+        phased(stamped(summary, &stamp), phases)
     }
 }
 
@@ -270,6 +340,7 @@ fn convert(redactor: &Redactor, event: JobEvent) -> pb::JobEvent {
         EventKind::ApiRetry => pb::JobEventKind::ApiRetry,
         EventKind::Phase => pb::JobEventKind::Phase,
         EventKind::Stuck => pb::JobEventKind::Stuck,
+        EventKind::Fetch => pb::JobEventKind::Fetch,
     };
     pb::JobEvent {
         seq: event.seq,
@@ -282,7 +353,11 @@ fn convert(redactor: &Redactor, event: JobEvent) -> pb::JobEvent {
         dur_ms: event.dur_ms,
         out_bytes: event.out_bytes,
         out_hash: event.out_hash,
-        cmd: clean(event.cmd),
+        cmd: if event.kind == EventKind::Fetch {
+            event.cmd
+        } else {
+            clean(event.cmd)
+        },
         detail: clean(event.detail),
     }
 }
@@ -329,6 +404,7 @@ mod tests {
 
     use super::*;
     use crate::stuck::{Stuck, StuckRule};
+    use crate::telemetry::MAX_FETCH_URL_BYTES;
 
     const SECRET: &str = "pa\"ss-word-xyz";
 
@@ -601,6 +677,7 @@ mod tests {
             (EventKind::ApiRetry, pb::JobEventKind::ApiRetry),
             (EventKind::Phase, pb::JobEventKind::Phase),
             (EventKind::Stuck, pb::JobEventKind::Stuck),
+            (EventKind::Fetch, pb::JobEventKind::Fetch),
         ];
         for (kind, expected) in kinds {
             let event = JobEvent {
@@ -842,5 +919,248 @@ mod tests {
         feed.hook(report("a", Some(1), None));
         assert_eq!(feed.counters().hook_dropped, 1);
         assert_eq!(feed.waiting.len(), 0);
+    }
+
+    const URL: &str = "https://docs.example.org/a?q=1";
+
+    fn fetch_feed(max_events: usize) -> (Feed, Instant) {
+        let start = Instant::now();
+        let limits = Limits {
+            max_events,
+            ..Limits::default()
+        };
+        (Feed::with(start, limits, Telemetry::feed_line_with), start)
+    }
+
+    #[test]
+    fn an_intent_and_an_outcome_queue_as_fetch_events_in_order() {
+        let (mut feed, start) = fresh();
+        let at = start + Duration::from_millis(40);
+        feed.record_fetch(&redactor(), URL, FetchPhase::Intent, at)
+            .unwrap();
+        feed.record_fetch(
+            &redactor(),
+            URL,
+            FetchPhase::Succeeded {
+                status: 200,
+                bytes: 1,
+            },
+            at,
+        )
+        .unwrap();
+        feed.record_fetch(&redactor(), URL, FetchPhase::Failed { status: None }, at)
+            .unwrap();
+        let events = feed.batch();
+        assert_eq!(seqs(&events), [0, 1, 2]);
+        for event in &events {
+            assert_eq!(event.kind, i32::from(pb::JobEventKind::Fetch));
+            assert_eq!(event.cmd.as_deref(), Some(URL));
+            assert_eq!(event.ts_ms, 40);
+        }
+        assert_eq!(events[0].detail.as_deref(), Some("intent"));
+        assert_eq!(events[0].ok, None);
+        assert_eq!(events[1].ok, Some(true));
+        assert_eq!(events[2].ok, Some(false));
+        let summary = feed.finish(Terminal::Succeeded);
+        assert!(!summary.missing.iter().any(|m| m == "fetch_outcome"));
+    }
+
+    #[test]
+    fn a_secret_in_the_url_is_redacted() {
+        let (mut feed, start) = fresh();
+        let url = format!("https://docs.example.org/?k={SECRET}");
+        feed.record_fetch(&redactor(), &url, FetchPhase::Intent, start)
+            .unwrap();
+        let event = &feed.batch()[0];
+        assert_eq!(
+            event.cmd.as_deref(),
+            Some("https://docs.example.org/?k=[REDACTED]")
+        );
+    }
+
+    #[test]
+    fn a_url_over_the_cap_is_refused_and_one_at_the_cap_is_kept_whole() {
+        let (mut feed, start) = fresh();
+        let long = format!("https://h.example/{}", "a".repeat(MAX_FETCH_URL_BYTES));
+        assert!(long.len() > MAX_FETCH_URL_BYTES);
+        assert_eq!(
+            feed.record_fetch(&redactor(), &long, FetchPhase::Intent, start),
+            Err(FetchRecordError::UrlTooLong)
+        );
+        assert!(feed.backlog_empty());
+        let exact = format!("https://h.example/{}", "a".repeat(MAX_FETCH_URL_BYTES - 18));
+        assert_eq!(exact.len(), MAX_FETCH_URL_BYTES);
+        feed.record_fetch(&redactor(), &exact, FetchPhase::Intent, start)
+            .unwrap();
+        assert_eq!(feed.batch()[0].cmd.as_deref(), Some(exact.as_str()));
+    }
+
+    #[test]
+    fn a_closed_feed_refuses_and_a_lost_outcome_is_named_in_missing() {
+        let (_, start) = fresh();
+        let mut feed = Feed::with(start, Limits::default(), boom);
+        feed.line(&redactor(), "a", start);
+        assert_eq!(
+            feed.record_fetch(&redactor(), URL, FetchPhase::Intent, start),
+            Err(FetchRecordError::Closed)
+        );
+        assert_eq!(
+            feed.record_fetch(
+                &redactor(),
+                URL,
+                FetchPhase::Succeeded {
+                    status: 200,
+                    bytes: 1
+                },
+                start
+            ),
+            Err(FetchRecordError::Closed)
+        );
+        let summary = feed.finish(Terminal::Failed);
+        assert_eq!(summary.missing, ["parser", "fetch_outcome"]);
+    }
+
+    #[test]
+    fn a_refused_intent_alone_leaves_fetch_outcome_out_of_missing() {
+        let (mut feed, start) = fetch_feed(1);
+        feed.record_fetch(&redactor(), URL, FetchPhase::Intent, start)
+            .unwrap();
+        assert_eq!(
+            feed.record_fetch(&redactor(), URL, FetchPhase::Intent, start),
+            Err(FetchRecordError::Truncated)
+        );
+        let summary = feed.finish(Terminal::Failed);
+        assert!(summary.missing.iter().any(|m| m == "events_truncated"));
+        assert!(!summary.missing.iter().any(|m| m == "fetch_outcome"));
+    }
+
+    #[test]
+    fn fetch_events_count_toward_the_cap_and_a_truncated_feed_refuses() {
+        let (mut feed, start) = fetch_feed(2);
+        feed.record_fetch(&redactor(), URL, FetchPhase::Intent, start)
+            .unwrap();
+        feed.record_fetch(
+            &redactor(),
+            URL,
+            FetchPhase::Succeeded {
+                status: 200,
+                bytes: 1,
+            },
+            start,
+        )
+        .unwrap();
+        assert_eq!(
+            feed.record_fetch(&redactor(), URL, FetchPhase::Intent, start),
+            Err(FetchRecordError::Truncated)
+        );
+        assert_eq!(
+            feed.record_fetch(&redactor(), URL, FetchPhase::Intent, start),
+            Err(FetchRecordError::Truncated)
+        );
+        let events = feed.batch();
+        assert_eq!(events.len(), 3);
+        assert_eq!(events[2].kind, i32::from(pb::JobEventKind::Phase));
+        assert_eq!(events[2].detail.as_deref(), Some("truncated"));
+    }
+
+    #[test]
+    fn a_failed_outcome_record_adds_fetch_outcome_to_missing() {
+        let (mut feed, start) = fetch_feed(1);
+        feed.record_fetch(&redactor(), URL, FetchPhase::Intent, start)
+            .unwrap();
+        assert_eq!(
+            feed.record_fetch(&redactor(), URL, FetchPhase::Failed { status: None }, start),
+            Err(FetchRecordError::Truncated)
+        );
+        let summary = feed.finish(Terminal::Failed);
+        assert!(summary.missing.iter().any(|m| m == "fetch_outcome"));
+        assert!(summary.missing.iter().any(|m| m == "events_truncated"));
+    }
+
+    #[test]
+    fn outcome_events_carry_status_and_bytes_and_intents_carry_neither() {
+        let (mut feed, start) = fresh();
+        feed.record_fetch(&redactor(), URL, FetchPhase::Intent, start)
+            .unwrap();
+        feed.record_fetch(
+            &redactor(),
+            URL,
+            FetchPhase::Succeeded {
+                status: 200,
+                bytes: 4096,
+            },
+            start,
+        )
+        .unwrap();
+        feed.record_fetch(
+            &redactor(),
+            URL,
+            FetchPhase::Failed { status: Some(503) },
+            start,
+        )
+        .unwrap();
+        feed.record_fetch(&redactor(), URL, FetchPhase::Failed { status: None }, start)
+            .unwrap();
+        let events = feed.batch();
+        let pairs: Vec<_> = events.iter().map(|e| (e.exit_code, e.out_bytes)).collect();
+        assert_eq!(
+            pairs,
+            [
+                (None, None),
+                (Some(200), Some(4096)),
+                (Some(503), None),
+                (None, None)
+            ]
+        );
+    }
+
+    #[test]
+    fn the_url_cap_holds_on_the_wire_form_after_the_final_redaction() {
+        let (mut feed, start) = fresh();
+        let redactor = Redactor::new(["REDACTED"]);
+        let tail = "a".repeat(MAX_FETCH_URL_BYTES - 28);
+        let url = format!("https://h.example/REDACTED{tail}");
+        assert_eq!(url.len(), MAX_FETCH_URL_BYTES - 2);
+        feed.record_fetch(&redactor, &url, FetchPhase::Intent, start)
+            .unwrap();
+        let cmd = feed.batch()[0].cmd.clone().unwrap();
+        assert_eq!(cmd, format!("https://h.example/[REDACTED]{tail}"));
+        assert!(cmd.len() <= MAX_FETCH_URL_BYTES);
+    }
+
+    #[test]
+    fn a_spent_byte_budget_refuses_the_record() {
+        let (mut feed, start) = fresh();
+        let line = "x".repeat(MAX_LINE_BYTES);
+        for _ in 0..32 {
+            feed.line(&redactor(), &line, start);
+        }
+        assert_eq!(
+            feed.record_fetch(&redactor(), URL, FetchPhase::Intent, start),
+            Err(FetchRecordError::OverBudget)
+        );
+        assert!(feed.backlog_empty());
+        let (mut feed, start) = fresh();
+        for _ in 0..31 {
+            feed.line(&redactor(), &line, start);
+        }
+        feed.record_fetch(&redactor(), URL, FetchPhase::Intent, start)
+            .unwrap();
+    }
+
+    #[test]
+    fn a_skipped_line_over_budget_also_refuses_the_record() {
+        let (mut feed, start) = fresh();
+        let line = "x".repeat(MAX_LINE_BYTES);
+        for _ in 0..31 {
+            feed.line(&redactor(), &line, start);
+        }
+        feed.line(&redactor(), &"y".repeat(MAX_LINE_BYTES - 1), start);
+        feed.line(&redactor(), "zz", start);
+        assert_eq!(feed.counters().over_budget, 1);
+        assert_eq!(
+            feed.record_fetch(&redactor(), URL, FetchPhase::Intent, start),
+            Err(FetchRecordError::OverBudget)
+        );
     }
 }
