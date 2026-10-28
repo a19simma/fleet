@@ -17,7 +17,11 @@ axum.workspace = true
 clap.workspace = true
 fleet-core.workspace = true
 fleet-proto.workspace = true
+http-body-util = "0.1.5"
+hyper = { version = "1.12.0", default-features = false, features = ["client", "http1"] }
+hyper-util = { version = "0.1.21", features = ["tokio"] }
 prost.workspace = true
+rustls = { version = "0.23.45", default-features = false, features = ["ring", "std", "tls12"] }
 rustix.workspace = true
 sd-notify.workspace = true
 serde.workspace = true
@@ -25,17 +29,19 @@ serde_json.workspace = true
 sha2.workspace = true
 sqlx = { workspace = true, features = ["migrate", "macros"] }
 tokio = { workspace = true, features = ["fs", "process"] }
+tokio-rustls = { version = "0.26.5", default-features = false, features = ["ring", "tls12"] }
 toml.workspace = true
 tonic.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
+webpki-roots = "1.0.9"
 
 [dev-dependencies]
 rcgen = { version = "0.14.10", default-features = false, features = ["pem", "ring"] }
 fleet-cli = { path = "../fleet-cli" }
 fleet-server = { path = "../fleet-server" }
-hyper-util = { version = "0.1.21", features = ["tokio"] }
 tempfile.workspace = true
+unicode-general-category = "1.1.0"
 tokio = { workspace = true, features = ["test-util"] }
 tokio-stream = "0.1.19"
 tower.workspace = true

@@ -20,6 +20,7 @@ mod dump;
 mod error;
 pub mod events;
 mod feed;
+pub mod fetch;
 pub mod fetch_policy;
 pub mod floor;
 pub mod forwarder;
