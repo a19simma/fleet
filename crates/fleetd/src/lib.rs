@@ -56,6 +56,8 @@ pub use dump::dump;
 pub use error::Error;
 pub use events::{Enqueued, Limits, OVERFLOW_KIND, QueuedEvent};
 pub use hook::{forward_hook, run_hook};
+#[doc(hidden)]
+pub use jobs::{BrokerWiring, DaemonRunner, DynBroker, JobServices, job_services_with};
 pub use runtime::{Signals, bind_hook_socket, bind_socket, run, run_with_env};
 pub use store::Store;
 pub use system::{fresh_id, now_ms, read_identity};

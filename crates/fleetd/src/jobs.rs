@@ -10,6 +10,7 @@ use std::sync::Arc;
 
 use fleet_core::Redactor;
 use fleet_proto::v1::{Job, JobKind};
+use rustls::ClientConfig;
 use tokio::net::UnixStream;
 use tonic::transport::Channel;
 
@@ -19,7 +20,7 @@ use crate::agent_config::Bundle;
 use crate::broker::{Broker, GhCli, MirrorGit};
 use crate::config::Config;
 use crate::connect_proxy::{ConnectProxy, ProxyLimits};
-use crate::fetch::{Fetcher, SystemResolver, TcpDialer};
+use crate::fetch::{Dialer, Fetcher, Resolver, SystemResolver, TcpDialer, webpki_tls_config};
 use crate::fetch_service::{FeedBook, FetchRecorder, FetchService, MAX_CONCURRENT_FETCHES};
 use crate::jobenv::group_id;
 use crate::jobsock::{JobContext, PerJob, ServeFuture, Service, ServiceName, Services};
@@ -43,7 +44,7 @@ const ERR_BROKER: &str = "job broker could not be set up";
 pub(crate) type JobPoller = Poller<DaemonRunner<GrpcReporter>>;
 
 /// Runs one claimed job from checkout to terminal report.
-pub(crate) struct DaemonRunner<R> {
+pub struct DaemonRunner<R> {
     workspace: Workspace,
     agent: Arc<AgentRunner<R>>,
     box_name: String,
@@ -51,7 +52,7 @@ pub(crate) struct DaemonRunner<R> {
 }
 
 /// A [`Broker`] with its executor types erased, so one [`PerJob`] registry holds them all.
-pub(crate) struct DynBroker(Box<dyn Service>);
+pub struct DynBroker(Box<dyn Service>);
 
 impl Service for DynBroker {
     fn serve(&self, ctx: JobContext, stream: UnixStream) -> ServeFuture<'_> {
@@ -60,7 +61,7 @@ impl Service for DynBroker {
 }
 
 /// What the runner needs to build and register the broker of a claimed job.
-pub(crate) struct BrokerWiring {
+pub struct BrokerWiring {
     registry: PerJob<DynBroker>,
     launcher: AgentLauncher,
     gh_bin: PathBuf,
@@ -69,8 +70,33 @@ pub(crate) struct BrokerWiring {
     redactor: Redactor,
 }
 
+impl BrokerWiring {
+    /// The broker settings of a daemon: the registry the job socket reads, the launcher kind,
+    /// the absolute `gh` path, the token host, its token and the redactor.
+    #[must_use]
+    pub const fn new(
+        registry: PerJob<DynBroker>,
+        launcher: AgentLauncher,
+        gh_bin: PathBuf,
+        host: String,
+        token: String,
+        redactor: Redactor,
+    ) -> Self {
+        Self {
+            registry,
+            launcher,
+            gh_bin,
+            host,
+            token,
+            redactor,
+        }
+    }
+}
+
 impl<R: Reporter> DaemonRunner<R> {
-    fn new(workspace: Workspace, agent: AgentRunner<R>, box_name: &str) -> Self {
+    /// A runner over `workspace` and `agent`, for the box named `box_name`.
+    #[must_use]
+    pub fn new(workspace: Workspace, agent: AgentRunner<R>, box_name: &str) -> Self {
         Self {
             workspace,
             agent: Arc::new(agent),
@@ -79,7 +105,9 @@ impl<R: Reporter> DaemonRunner<R> {
         }
     }
 
-    fn with_broker(mut self, wiring: BrokerWiring) -> Self {
+    /// Registers the broker of each job in `wiring` before its agent launches.
+    #[must_use]
+    pub fn with_broker(mut self, wiring: BrokerWiring) -> Self {
         self.broker = Some(wiring);
         self
     }
@@ -338,12 +366,15 @@ impl FetchRecorder for BookRecorder {
 }
 
 /// What [`job_services`] builds: the services and the hook that clears their per-job state.
-pub(crate) struct JobServices {
-    pub(crate) services: Services,
-    pub(crate) end: JobEnd,
-    pub(crate) broker: PerJob<DynBroker>,
-    #[cfg(test)]
-    pub(crate) proxy: Arc<ConnectProxy<SystemResolver, TcpDialer>>,
+pub struct JobServices<R = SystemResolver, D = TcpDialer> {
+    /// The services by handshake name.
+    pub services: Services,
+    /// The hook the runner fires when a job ends.
+    pub end: JobEnd,
+    /// The registry behind the `Broker` service, filled at claim time.
+    pub broker: PerJob<DynBroker>,
+    /// The egress proxy behind the `EgressProxy` service.
+    pub proxy: Arc<ConnectProxy<R, D>>,
 }
 
 /// The services every Job socket of this daemon offers, built once and shared by all sockets.
@@ -361,7 +392,40 @@ pub(crate) struct JobServices {
 /// drops these in [`select_launcher`].
 #[must_use]
 pub(crate) fn job_services(config: &Config, feeds: &Arc<FeedBook>) -> JobServices {
-    let fetcher = Fetcher::system(config.fetch_policy.clone(), config.fetch_caps);
+    job_services_with(
+        config,
+        feeds,
+        SystemResolver,
+        TcpDialer,
+        webpki_tls_config(),
+    )
+}
+
+/// [`job_services`] over an injected resolver, dialer and TLS client config.
+///
+/// The fetch and egress guards stay in force: every address the resolver returns still has to
+/// pass `netguard::is_public_address`, so a test fakes the lookup and the connect, never the
+/// guard. Exposed for the integration test of the live wiring.
+#[doc(hidden)]
+#[must_use]
+pub fn job_services_with<R, D>(
+    config: &Config,
+    feeds: &Arc<FeedBook>,
+    resolver: R,
+    dialer: D,
+    tls: Arc<ClientConfig>,
+) -> JobServices<R, D>
+where
+    R: Resolver + Clone + 'static,
+    D: Dialer + Clone + 'static,
+{
+    let fetcher = Fetcher::new(
+        config.fetch_policy.clone(),
+        config.fetch_caps,
+        resolver.clone(),
+        dialer.clone(),
+        tls,
+    );
     let fetch = Arc::new(FetchService::new(
         config.fetch_policy.clone(),
         config.fetch_caps,
@@ -372,8 +436,8 @@ pub(crate) fn job_services(config: &Config, feeds: &Arc<FeedBook>) -> JobService
     let proxy = Arc::new(ConnectProxy::new(
         config.egress_allow.clone(),
         ProxyLimits::default(),
-        SystemResolver,
-        TcpDialer,
+        resolver,
+        dialer,
     ));
     let mut services = Services::new();
     let end = JobEnd::new()
@@ -399,7 +463,6 @@ pub(crate) fn job_services(config: &Config, feeds: &Arc<FeedBook>) -> JobService
         services,
         end,
         broker,
-        #[cfg(test)]
         proxy,
     }
 }
