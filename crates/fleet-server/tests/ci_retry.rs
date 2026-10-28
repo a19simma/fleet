@@ -73,6 +73,17 @@ async fn fail_ci(
     store.report_job(&boxed(), &report).await
 }
 
+fn aimed(job: &Job, branch: &str) -> ReportJobRequest {
+    ReportJobRequest {
+        branch: Some(branch.to_owned()),
+        ..ending(
+            job,
+            JobState::Succeeded,
+            Some((CiState::Failure, Some(LOG))),
+        )
+    }
+}
+
 async fn children(pool: &PgPool, parent: &str) -> i64 {
     sqlx::query_scalar("SELECT count(*) FROM jobs WHERE parent_job_id = $1")
         .bind(parent)
@@ -142,6 +153,137 @@ async fn attempt_n_of_n_submits_nothing_and_attempt_n_minus_1_submits_one(pool: 
     assert_eq!(last.state, JobState::Succeeded as i32);
     assert_eq!(last.ci_state, Some(CiState::Failure as i32));
     assert!(store.claim_job(&boxed()).await.unwrap().is_none());
+}
+
+#[sqlx::test]
+async fn a_chain_of_three_keeps_every_report_on_the_root_branch(pool: PgPool) {
+    let store = store(pool.clone(), 2).await;
+    let root = running(&store, "do it").await;
+    let branch = format!("swarm/{}", root.job_id);
+    store
+        .report_job(&boxed(), &aimed(&root, &branch))
+        .await
+        .unwrap();
+    let first = claim(&store).await;
+    assert_eq!(first.branch.as_deref(), Some(branch.as_str()));
+    store
+        .report_job(&boxed(), &aimed(&first, &branch))
+        .await
+        .unwrap();
+    let second = claim(&store).await;
+    assert_eq!(second.branch.as_deref(), Some(branch.as_str()));
+    store
+        .report_job(&boxed(), &aimed(&second, &branch))
+        .await
+        .unwrap();
+    assert_eq!(total(&pool).await, 3);
+    assert_eq!(outcome(&store, &second).await, Some(CiRetry::Exhausted));
+}
+
+#[sqlx::test]
+async fn a_worker_aiming_a_fix_job_at_another_branch_is_refused_at_every_attempt(pool: PgPool) {
+    let store = store(pool.clone(), 3).await;
+    let other = running(&store, "other").await;
+    let root = {
+        store.submit_job(&submit("second", "do it")).await.unwrap();
+        claim(&store).await
+    };
+    let first_attempt = aimed(&root, &format!("swarm/{}", other.job_id));
+    let err = store
+        .report_job(&boxed(), &first_attempt)
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(err, StoreError::InvalidJob(JobInvalid::Branch)),
+        "{err}"
+    );
+    assert_eq!(total(&pool).await, 2);
+    let root_branch = format!("swarm/{}", root.job_id);
+    store
+        .report_job(&boxed(), &aimed(&root, &root_branch))
+        .await
+        .unwrap();
+    let fix = claim(&store).await;
+    for branch in [
+        format!("swarm/{}", other.job_id),
+        format!("swarm/{}", fix.job_id),
+    ] {
+        let err = store
+            .report_job(&boxed(), &aimed(&fix, &branch))
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, StoreError::InvalidJob(JobInvalid::Branch)),
+            "{err}"
+        );
+    }
+    assert_eq!(children(&pool, &fix.job_id).await, 0);
+    assert_eq!(total(&pool).await, 3);
+    store
+        .report_job(&boxed(), &aimed(&fix, &root_branch))
+        .await
+        .unwrap();
+    assert_eq!(children(&pool, &fix.job_id).await, 1);
+}
+
+#[sqlx::test]
+async fn a_parent_branch_other_than_the_chain_root_gets_no_fix_job(pool: PgPool) {
+    let store = store(pool.clone(), 3).await;
+    let other = running(&store, "other").await;
+    store.submit_job(&submit("second", "do it")).await.unwrap();
+    let root = claim(&store).await;
+    sqlx::query("UPDATE jobs SET branch = $2 WHERE job_id = $1")
+        .bind(&root.job_id)
+        .bind(format!("swarm/{}", other.job_id))
+        .execute(&pool)
+        .await
+        .unwrap();
+    let mut report = ending(
+        &root,
+        JobState::Succeeded,
+        Some((CiState::Failure, Some(LOG))),
+    );
+    report.branch = None;
+    store.report_job(&boxed(), &report).await.unwrap();
+    assert_eq!(children(&pool, &root.job_id).await, 0);
+    assert_eq!(outcome(&store, &root).await, Some(CiRetry::Ineligible));
+}
+
+#[sqlx::test]
+async fn a_parent_branch_outside_the_branch_pattern_gets_no_fix_job(pool: PgPool) {
+    let store = store(pool.clone(), 3).await;
+    let root = running(&store, "do it").await;
+    sqlx::query("UPDATE jobs SET job_id = 'a-b', branch = 'swarm/a-b' WHERE job_id = $1")
+        .bind(&root.job_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+    let mut report = ending(
+        &root,
+        JobState::Succeeded,
+        Some((CiState::Failure, Some(LOG))),
+    );
+    report.job_id = "a-b".to_owned();
+    report.branch = Some("swarm/a-b".to_owned());
+    let err = store.report_job(&boxed(), &report).await.unwrap_err();
+    assert!(
+        matches!(err, StoreError::InvalidJob(JobInvalid::Branch)),
+        "{err}"
+    );
+    report.branch = None;
+    store.report_job(&boxed(), &report).await.unwrap();
+    assert_eq!(children(&pool, "a-b").await, 0);
+    assert_eq!(
+        outcome(
+            &store,
+            &Job {
+                job_id: "a-b".to_owned(),
+                ..root
+            }
+        )
+        .await,
+        Some(CiRetry::Ineligible)
+    );
 }
 
 #[sqlx::test]

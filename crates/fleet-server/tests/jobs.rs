@@ -10,9 +10,9 @@ use fleet_proto::v1::{
     JobState, ReportJobReply, ReportJobRequest, SubmitJobRequest, TranscriptChunk,
 };
 use fleet_server::jobs::{
-    MAX_BASE_REF_BYTES, MAX_BRANCH_BYTES, MAX_CHUNKS_PER_REPORT, MAX_ERROR_CHARS, MAX_KEY_BYTES,
-    MAX_PHASE_CHARS, MAX_PR_URL_BYTES, MAX_PROGRESS_CHARS, MAX_PROMPT_BYTES, MAX_REPO_BYTES,
-    MAX_TRANSCRIPT_BYTES, MAX_TRANSCRIPT_ROWS, MIN_CHUNK_COST_BYTES,
+    JobInvalid, MAX_BASE_REF_BYTES, MAX_BRANCH_BYTES, MAX_CHUNKS_PER_REPORT, MAX_ERROR_CHARS,
+    MAX_KEY_BYTES, MAX_PHASE_CHARS, MAX_PR_URL_BYTES, MAX_PROGRESS_CHARS, MAX_PROMPT_BYTES,
+    MAX_REPO_BYTES, MAX_TRANSCRIPT_BYTES, MAX_TRANSCRIPT_ROWS, MIN_CHUNK_COST_BYTES,
 };
 use fleet_server::reaper::{MAX_BACKOFF, backoff_after, error_kind, run_reaper};
 use fleet_server::store::{Store, StoreError};
@@ -774,6 +774,27 @@ async fn terminal_branch_with_swarm_prefix_is_stored(pool: PgPool) {
         .await
         .unwrap();
     assert_eq!(branch, report.branch);
+}
+
+#[sqlx::test]
+async fn terminal_branch_of_another_job_is_refused(pool: PgPool) {
+    let store = store(pool.clone()).await;
+    let job = claimed(&store, &claimer(1)).await;
+    for branch in [
+        "swarm/01J8ZOTHERJOB".to_owned(),
+        "swarm/".to_owned(),
+        format!("swarm/{}x", job.job_id),
+        format!("swarm/{}/y", job.job_id),
+    ] {
+        let mut report = terminal(&job, JobState::Succeeded);
+        report.branch = Some(branch);
+        let err = store.report_job(&boxed(1), &report).await.unwrap_err();
+        assert!(
+            matches!(err, StoreError::InvalidJob(JobInvalid::Branch)),
+            "{err}"
+        );
+    }
+    assert_eq!(row_state(&pool).await, ("RUNNING".to_owned(), false, false));
 }
 
 async fn stored_rows(pool: &PgPool) -> Vec<(i64, String, bool)> {

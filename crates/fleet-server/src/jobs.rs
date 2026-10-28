@@ -7,7 +7,7 @@ use fleet_proto::v1::{
 };
 use fleet_proto::{
     CI_RETRY_KEY_PREFIX, MAX_MODEL_BYTES, MAX_VERDICT_REASON_BYTES, MAX_VERDICT_SCORE, is_ci_log,
-    is_ci_url, is_plain_text,
+    is_ci_url, is_plain_text, is_swarm_branch,
 };
 
 /// Longest accepted idempotency key, in bytes.
@@ -60,8 +60,8 @@ pub enum JobInvalid {
     PrUrl,
     /// The error text contains a NUL character.
     Error,
-    /// The branch does not start with `swarm/`, is too long or has whitespace or control
-    /// characters.
+    /// The branch is not the one the server expects for the job: `swarm/` and the id of the
+    /// chain root.
     Branch,
     /// The job id is empty, too long or has characters outside printable ASCII.
     JobId,
@@ -123,6 +123,15 @@ pub(crate) struct Terminal {
     pub(crate) error: Option<String>,
     pub(crate) exit_code: Option<i32>,
     pub(crate) branch: Option<String>,
+}
+
+/// The only branch a job of the chain rooted at `root_id` may report or push to.
+///
+/// A job with no parent is its own root, so its branch is `swarm/<its id>`. A fix Job shares
+/// the branch of the root it descends from.
+#[must_use]
+pub(crate) fn expected_branch(root_id: &str) -> String {
+    format!("swarm/{root_id}")
 }
 
 fn bare_token(text: &str, max: usize) -> bool {
@@ -308,9 +317,10 @@ pub(crate) fn validate_ci(request: &ReportJobRequest, ci: &JobCi) -> Option<CiSt
 /// # Errors
 ///
 /// Returns the [`JobInvalid`] variant of the first field that fails. It never carries
-/// the offending value.
+/// the offending value. A reported branch must equal [`expected_branch`] of `root_id`.
 pub(crate) fn validate_terminal(
     request: &ReportJobRequest,
+    root_id: &str,
 ) -> Result<Option<Terminal>, JobInvalid> {
     let Some(raw) = request.terminal_state else {
         return Ok(None);
@@ -330,7 +340,9 @@ pub(crate) fn validate_terminal(
         return Err(JobInvalid::Error);
     }
     if let Some(branch) = &request.branch
-        && !(bare_token(branch, MAX_BRANCH_BYTES) && branch.starts_with("swarm/"))
+        && !(bare_token(branch, MAX_BRANCH_BYTES)
+            && is_swarm_branch(branch)
+            && *branch == expected_branch(root_id))
     {
         return Err(JobInvalid::Branch);
     }

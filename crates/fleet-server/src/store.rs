@@ -20,8 +20,8 @@ use sqlx::{PgPool, Postgres, Row, Transaction};
 use crate::batches::{self, BatchInvalid};
 use crate::jobs::{
     JobInvalid, MAX_CHUNKS_PER_REPORT, MAX_PHASE_CHARS, MAX_PROGRESS_CHARS, MAX_TRANSCRIPT_BYTES,
-    MAX_TRANSCRIPT_ROWS, MIN_CHUNK_COST_BYTES, NewJob, fix_prompt, validate_ci, validate_job_id,
-    validate_judge, validate_submit, validate_terminal, validate_verdict,
+    MAX_TRANSCRIPT_ROWS, MIN_CHUNK_COST_BYTES, NewJob, expected_branch, fix_prompt, validate_ci,
+    validate_job_id, validate_judge, validate_submit, validate_terminal, validate_verdict,
 };
 use crate::profiles::{self, ProfileFault};
 use crate::projection::{Projection, State, project};
@@ -250,6 +250,14 @@ const SELECT_CI_LOG: &str = "SELECT log FROM job_ci_log WHERE job_id = $1";
 
 const SELECT_RETRY_ATTEMPT: &str = "SELECT ci_retry_attempt FROM jobs WHERE job_id = $1";
 
+const ROOT_ID: &str = "\
+WITH RECURSIVE up AS (\
+SELECT job_id, parent_job_id, 0 AS depth FROM jobs WHERE job_id = $1 \
+UNION ALL \
+SELECT p.job_id, p.parent_job_id, up.depth + 1 FROM jobs p \
+JOIN up ON p.job_id = up.parent_job_id WHERE up.depth < 16) \
+SELECT job_id FROM up WHERE parent_job_id IS NULL";
+
 const ROOT_PROMPT: &str = "\
 WITH RECURSIVE up AS (\
 SELECT job_id, parent_job_id, prompt, 0 AS depth FROM jobs WHERE job_id = $1 \
@@ -265,7 +273,7 @@ SELECT $1, $2, $3, p.repo, p.branch, p.branch, true, p.pr_url, p.job_id, p.ci_re
 FROM jobs p \
 WHERE p.job_id = $4 AND p.kind = 'agent' AND p.state = 'SUCCEEDED' AND p.open_pr \
 AND p.pr_url IS NOT NULL AND p.ci_state = 'failure' AND p.batch_id IS NULL \
-AND p.profile_name IS NULL AND p.branch LIKE 'swarm/%' \
+AND p.profile_name IS NULL AND p.branch = $5 AND p.branch ~ '^swarm/[A-Za-z0-9]{1,64}$' \
 ON CONFLICT DO NOTHING \
 RETURNING job_id";
 
@@ -1407,7 +1415,8 @@ impl Store {
     /// # Errors
     ///
     /// Returns [`StoreError::InvalidJob`] when the terminal state, `pr_url`, `error` or
-    /// `branch` is invalid, [`StoreError::InvalidChunk`] when a report has too many chunks,
+    /// `branch` is invalid (a reported `branch` must be `swarm/` and the id of the chain
+    /// root), [`StoreError::InvalidChunk`] when a report has too many chunks,
     /// a `seq` is 0, out of the database range or not increasing, or a chunk text holds a
     /// NUL character, [`StoreError::TelemetryTooLarge`] when a report carries too many
     /// events, [`StoreError::InvalidTelemetry`] when an event or the summary holds a value
@@ -1422,7 +1431,8 @@ impl Store {
     ) -> Result<ReportJobReply, StoreError> {
         let job_id = request.job_id.as_str();
         let attempt = i32::try_from(request.attempt).map_err(|_| StoreError::StaleReport)?;
-        let terminal = validate_terminal(request)?;
+        let root_id = self.report_root(request).await?;
+        let terminal = validate_terminal(request, &root_id)?;
         let rows = check_chunks(&request.chunks)?;
         let telemetry = telemetry::check(&request.events, request.summary.as_ref())?;
         let ci = request
@@ -1698,6 +1708,19 @@ async fn record_ci(
     Ok(())
 }
 
+impl Store {
+    async fn report_root(&self, request: &ReportJobRequest) -> Result<String, StoreError> {
+        if request.terminal_state.is_none() || request.branch.is_none() {
+            return Ok(String::new());
+        }
+        sqlx::query_scalar(ROOT_ID)
+            .bind(request.job_id.as_str())
+            .fetch_optional(&self.pool)
+            .await?
+            .ok_or(StoreError::StaleReport)
+    }
+}
+
 async fn decide_ci_retry(
     tx: &mut Transaction<'_, Postgres>,
     job_id: &str,
@@ -1738,11 +1761,19 @@ async fn submit_fix(
     let Some(prompt) = log.and_then(|log| fix_prompt(&original, log, &id)) else {
         return Ok(CiRetry::NoLog);
     };
+    let root_id: Option<String> = sqlx::query_scalar(ROOT_ID)
+        .bind(parent)
+        .fetch_optional(&mut **tx)
+        .await?;
+    let Some(root_id) = root_id else {
+        return Ok(CiRetry::Ineligible);
+    };
     let inserted = sqlx::query(INSERT_FIX)
         .bind(id)
         .bind(ci_retry_key(parent, attempt))
         .bind(prompt)
         .bind(parent)
+        .bind(expected_branch(&root_id))
         .fetch_optional(&mut **tx)
         .await?;
     if inserted.is_some() {
