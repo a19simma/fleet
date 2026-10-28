@@ -61,7 +61,7 @@ async fn run() -> Result<(), BoxError> {
         .acquire_timeout(ACQUIRE_TIMEOUT)
         .connect_with(options)
         .await?;
-    let store = Store::new(pool);
+    let store = Store::new(pool).with_max_ci_retries(config.max_ci_retries);
     store.migrate().await?;
 
     if !is_loopback(&config.listen) {

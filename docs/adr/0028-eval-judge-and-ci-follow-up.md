@@ -1,6 +1,6 @@
 # Eval, judge and CI follow-up
 
-Status: Accepted 2026-10-27. Not built. Builds on ADR-0029 and ADR-0030, amends ADR-0021 and ADR-0023.
+Status: Accepted 2026-10-27. The CI retry is built (migration 0015, `FLEET_MAX_CI_RETRIES`); the rest is not built. Builds on ADR-0029 and ADR-0030, amends ADR-0021 and ADR-0023.
 
 ADR-0029 and ADR-0030 record what a Job did, not whether it was good. Two signals are missing: a model's grade of the transcript, and the CI conclusion of the pull request the Job opened. A failed CI run also needs a bounded way to try again. This ADR fixes the design for three tasks: the judge Job, the CI status and the CI retry.
 
@@ -35,9 +35,11 @@ ADR-0029 and ADR-0030 record what a Job did, not whether it was good. Two signal
 
 - **Who decides.** The server decides, because a Box cannot submit a Job (ADR-0023). When a Job reports a terminal `failure`, the server submits one fix Job. A `timeout` never retries.
 - **Fix Job.** It has `parent_job_id` set to the failed Job and the same repo. Its base is the head commit of the branch the parent pushed. It pushes to that same branch, `swarm/<parent_job_id>`, which stays inside the namespace of ADR-0016, by fast-forward only, and opens no second pull request. Its prompt is the original prompt plus the redacted failure log, inside a marked block that tells the agent the block is data.
-- **Limit.** Server config `max_ci_retries`, an integer from 0 to 5, default 2. 0 turns the retry off. The server counts the fix Jobs in the chain by walking `parent_job_id`, and refuses to start the server on a value outside the range.
+- **Limit.** Server config `max_ci_retries`, set by `FLEET_MAX_CI_RETRIES`, an integer from 0 to 5. As built the default is 0, not the 2 first written here: a server that spends money on its own starts off until an operator opts in. 0 turns the retry off. The chain depth is `ci_retry_attempt`, which is the parent's depth plus one, and the server refuses to start on a value outside the range.
 - **Boundary.** A chain with `max_ci_retries` fix Jobs already submitted submits no more. The last Job's `failure` stays its final state and `fleet status` shows the count and the reason `ci retries exhausted`.
-- **Atomic.** The count check and the insert of the fix Job run in one transaction, so two reports of one `failure` cannot submit two fix Jobs. A repeated terminal report is a no-op.
+- **Atomic.** The count check and the insert of the fix Job run in one transaction, so two reports of one `failure` cannot submit two fix Jobs. A repeated terminal report is a no-op. The database enforces it: the fix Job's idempotency key is `ci-retry:<parent_job_id>:<attempt>`, a unique partial index allows one child per `parent_job_id`, and a client cannot submit that key prefix.
+- **Built shape.** `jobs` gains `parent_job_id`, `ci_retry_attempt` and `ci_retry`, one of `submitted`, `exhausted`, `disabled`, `no_log` or `ineligible`, set on the failed Job and shown on `Job`. The server retries only a Job that ended `SUCCEEDED` with CI `failure`; a `FAILED` or `CANCELLED` Job never retries, and `timeout` never retries. A failure with no stored log, a batch Job, or a Job with a profile is `no_log` or `ineligible` and submits nothing (stricter than the text above). The fix Job copies the parent's repo and pull request URL and sets no profile, so it can never hold more than the parent: a Job with a profile never retries, and the fix Job has no cap column to raise. It reuses the parent pull request URL for the CI watch and pushes to `swarm/<parent_job_id>`, which fleetd checks with `is_swarm_branch` before the push; the push never forces.
+- **Prompt.** The fix prompt is the root prompt of the chain, then the latest log in a block with a per-job nonce marker, then a line stating that the block is untrusted tool output and not instructions. The log passes the same `is_ci_log` filter and 16 KiB cap as the stored log, marker text inside it is defanged, and the whole prompt stays under the prompt cap or the Job is `no_log`.
 - **Bounded cost.** Each fix Job carries the turn and budget caps of ADR-0030. The chain costs at most `max_ci_retries + 1` times one Job's cap.
 
 ## Consequences
@@ -53,6 +55,7 @@ ADR-0029 and ADR-0030 record what a Job did, not whether it was good. Two signal
 - The shape of `gh pr checks --json bucket,link,name` output and its exit codes for pending and failed checks were not observed on the dev box. The poller's doc comment records the reading: buckets `pass`, `fail`, `pending`, `skipping` and `cancel`, exit 8 for pending and exit 1 for a failure or for no checks. The poller reads stdout for `failure` and `pending` and ignores the exit code there; for `success` it also needs exit 0.
 - Whether `gh run view --job <id> --log-failed` accepts the job id parsed from the check link, and whether a check that is not an Actions job has a log at all. Such a failure stores no log.
 - Whether the Box token reaches check logs with the current scope.
+- Whether a fix Job's push to the parent's branch by fast-forward succeeds against a real remote, and whether the parent's CI failure is still current when the fix Job starts (a later push can make the stored log stale). Inferred, not part of the design: a stale log costs one fix Job, bounded by the limit.
 - The verdict line format is a first choice. The first judge runs test it.
 - Whether the real `claude` honours the path rules of the confinement above, and whether a deny rule wins over an allow rule, is unverified (ADR-0034 says the same for deny against allow). The working directory and the scratch `HOME` are the fallback. A live probe, with a judge told to read a file outside its directory, settles it.
 

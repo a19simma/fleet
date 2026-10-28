@@ -6,12 +6,13 @@ use std::time::Duration;
 
 use fleet_core::{BoxName, Envelope, EventId, SCHEMA_VERSION};
 use fleet_proto::v1::{
-    BoxStatus, BoxView, CiState, GetJobTranscriptReply, GetProfileBlobReply, GetStatsReply,
-    GetStatsRequest, HeartbeatRequest, Job, JobCi, JobKind, JobState, JobVerdict, ProfileRef,
-    ReadJobEventsReply, ReadTranscriptReply, ReportJobReply, ReportJobRequest, SessionState,
-    SessionView, SubmitBatchReply, SubmitBatchRequest, SubmitJobRequest, SubmitJudgeRequest,
-    TranscriptChunk,
+    BoxStatus, BoxView, CiRetry, CiState, GetJobTranscriptReply, GetProfileBlobReply,
+    GetStatsReply, GetStatsRequest, HeartbeatRequest, Job, JobCi, JobKind, JobState, JobVerdict,
+    ProfileRef, ReadJobEventsReply, ReadTranscriptReply, ReportJobReply, ReportJobRequest,
+    SessionState, SessionView, SubmitBatchReply, SubmitBatchRequest, SubmitJobRequest,
+    SubmitJudgeRequest, TranscriptChunk,
 };
+use fleet_proto::{DEFAULT_CI_RETRIES, MAX_CI_RETRIES, ci_retry_key};
 use serde_json::{Value, json};
 use sqlx::postgres::PgRow;
 use sqlx::{PgPool, Postgres, Row, Transaction};
@@ -19,7 +20,7 @@ use sqlx::{PgPool, Postgres, Row, Transaction};
 use crate::batches::{self, BatchInvalid};
 use crate::jobs::{
     JobInvalid, MAX_CHUNKS_PER_REPORT, MAX_PHASE_CHARS, MAX_PROGRESS_CHARS, MAX_TRANSCRIPT_BYTES,
-    MAX_TRANSCRIPT_ROWS, MIN_CHUNK_COST_BYTES, NewJob, validate_ci, validate_job_id,
+    MAX_TRANSCRIPT_ROWS, MIN_CHUNK_COST_BYTES, NewJob, fix_prompt, validate_ci, validate_job_id,
     validate_judge, validate_submit, validate_terminal, validate_verdict,
 };
 use crate::profiles::{self, ProfileFault};
@@ -122,7 +123,7 @@ ORDER BY box, last_event_at DESC, session_id";
 const SELECT_JOB_BY_KEY: &str = "\
 SELECT job_id, idempotency_key, prompt, repo, base_ref, open_pr, state, box, attempt, \
 progress, phase, branch, pr_url, error, exit_code, cancel_requested, batch_id, \
-kind, target_job_id, ci_state, ci_url, profile_name, profile_version, encode(profile_hash, 'hex') AS profile_hash, \
+kind, target_job_id, parent_job_id, ci_retry_attempt, ci_retry, ci_state, ci_url, profile_name, profile_version, encode(profile_hash, 'hex') AS profile_hash, \
 (EXTRACT(EPOCH FROM lease_expires_at) * 1000)::bigint AS lease_ms, \
 (EXTRACT(EPOCH FROM created_at) * 1000)::bigint AS created_ms, \
 (EXTRACT(EPOCH FROM claimed_at) * 1000)::bigint AS claimed_ms, \
@@ -169,7 +170,7 @@ WHERE job_id = $1 ORDER BY seq LIMIT $2";
 const SELECT_JOB_BY_ID: &str = "\
 SELECT job_id, idempotency_key, prompt, repo, base_ref, open_pr, state, box, attempt, \
 progress, phase, branch, pr_url, error, exit_code, cancel_requested, batch_id, \
-kind, target_job_id, ci_state, ci_url, profile_name, profile_version, encode(profile_hash, 'hex') AS profile_hash, \
+kind, target_job_id, parent_job_id, ci_retry_attempt, ci_retry, ci_state, ci_url, profile_name, profile_version, encode(profile_hash, 'hex') AS profile_hash, \
 (EXTRACT(EPOCH FROM lease_expires_at) * 1000)::bigint AS lease_ms, \
 (EXTRACT(EPOCH FROM created_at) * 1000)::bigint AS created_ms, \
 (EXTRACT(EPOCH FROM claimed_at) * 1000)::bigint AS claimed_ms, \
@@ -180,7 +181,7 @@ FROM jobs WHERE job_id = $1";
 const LIST_JOBS: &str = "\
 SELECT job_id, idempotency_key, prompt, repo, base_ref, open_pr, state, box, attempt, \
 progress, phase, branch, pr_url, error, exit_code, cancel_requested, batch_id, \
-kind, target_job_id, ci_state, ci_url, profile_name, profile_version, encode(profile_hash, 'hex') AS profile_hash, \
+kind, target_job_id, parent_job_id, ci_retry_attempt, ci_retry, ci_state, ci_url, profile_name, profile_version, encode(profile_hash, 'hex') AS profile_hash, \
 (EXTRACT(EPOCH FROM lease_expires_at) * 1000)::bigint AS lease_ms, \
 (EXTRACT(EPOCH FROM created_at) * 1000)::bigint AS created_ms, \
 (EXTRACT(EPOCH FROM claimed_at) * 1000)::bigint AS claimed_ms, \
@@ -201,7 +202,7 @@ SELECT job_id FROM jobs WHERE state = 'QUEUED' \
 ORDER BY created_at, job_id LIMIT 1 FOR UPDATE SKIP LOCKED) \
 RETURNING job_id, idempotency_key, prompt, repo, base_ref, open_pr, state, box, attempt, \
 progress, phase, branch, pr_url, error, exit_code, cancel_requested, batch_id, \
-kind, target_job_id, ci_state, ci_url, profile_name, profile_version, encode(profile_hash, 'hex') AS profile_hash, \
+kind, target_job_id, parent_job_id, ci_retry_attempt, ci_retry, ci_state, ci_url, profile_name, profile_version, encode(profile_hash, 'hex') AS profile_hash, \
 (EXTRACT(EPOCH FROM lease_expires_at) * 1000)::bigint AS lease_ms, \
 (EXTRACT(EPOCH FROM created_at) * 1000)::bigint AS created_ms, \
 (EXTRACT(EPOCH FROM claimed_at) * 1000)::bigint AS claimed_ms, \
@@ -216,7 +217,7 @@ cancel_requested = cancel_requested OR state = 'RUNNING' \
 WHERE job_id = $1 \
 RETURNING job_id, idempotency_key, prompt, repo, base_ref, open_pr, state, box, attempt, \
 progress, phase, branch, pr_url, error, exit_code, cancel_requested, batch_id, \
-kind, target_job_id, ci_state, ci_url, profile_name, profile_version, encode(profile_hash, 'hex') AS profile_hash, \
+kind, target_job_id, parent_job_id, ci_retry_attempt, ci_retry, ci_state, ci_url, profile_name, profile_version, encode(profile_hash, 'hex') AS profile_hash, \
 (EXTRACT(EPOCH FROM lease_expires_at) * 1000)::bigint AS lease_ms, \
 (EXTRACT(EPOCH FROM created_at) * 1000)::bigint AS created_ms, \
 (EXTRACT(EPOCH FROM claimed_at) * 1000)::bigint AS claimed_ms, \
@@ -246,6 +247,31 @@ const INSERT_CI_LOG: &str = "\
 INSERT INTO job_ci_log (job_id, log) VALUES ($1, $2) ON CONFLICT DO NOTHING";
 
 const SELECT_CI_LOG: &str = "SELECT log FROM job_ci_log WHERE job_id = $1";
+
+const SELECT_RETRY_ATTEMPT: &str = "SELECT ci_retry_attempt FROM jobs WHERE job_id = $1";
+
+const ROOT_PROMPT: &str = "\
+WITH RECURSIVE up AS (\
+SELECT job_id, parent_job_id, prompt, 0 AS depth FROM jobs WHERE job_id = $1 \
+UNION ALL \
+SELECT p.job_id, p.parent_job_id, p.prompt, up.depth + 1 FROM jobs p \
+JOIN up ON p.job_id = up.parent_job_id WHERE up.depth < 16) \
+SELECT prompt FROM up WHERE parent_job_id IS NULL";
+
+const INSERT_FIX: &str = "\
+INSERT INTO jobs (job_id, idempotency_key, prompt, repo, base_ref, branch, open_pr, pr_url, \
+parent_job_id, ci_retry_attempt) \
+SELECT $1, $2, $3, p.repo, p.branch, p.branch, true, p.pr_url, p.job_id, p.ci_retry_attempt + 1 \
+FROM jobs p \
+WHERE p.job_id = $4 AND p.kind = 'agent' AND p.state = 'SUCCEEDED' AND p.open_pr \
+AND p.pr_url IS NOT NULL AND p.ci_state = 'failure' AND p.batch_id IS NULL \
+AND p.profile_name IS NULL AND p.branch LIKE 'swarm/%' \
+ON CONFLICT DO NOTHING \
+RETURNING job_id";
+
+const SELECT_FIX_CHILD: &str = "SELECT 1 FROM jobs WHERE parent_job_id = $1";
+
+const SET_RETRY: &str = "UPDATE jobs SET ci_retry = $2 WHERE job_id = $1 AND ci_retry IS NULL";
 
 const END_CI: &str = "\
 UPDATE jobs SET ci_state = 'timeout', ci_checked_at = now() \
@@ -570,7 +596,37 @@ fn job_from_row(row: &PgRow) -> Result<Job, StoreError> {
             .map(Into::into),
         ci_checked_at_ms: ms(row.try_get("ci_checked_ms")?, "ci_checked_at")?,
         ci_url: row.try_get("ci_url")?,
+        parent_job_id: row.try_get("parent_job_id")?,
+        ci_retry_attempt: u32::try_from(row.try_get::<i32, _>("ci_retry_attempt")?)
+            .map_err(|_| StoreError::OutOfRange("ci retry attempt"))?,
+        ci_retry: row
+            .try_get::<Option<String>, _>("ci_retry")?
+            .as_deref()
+            .map(ci_retry_state)
+            .transpose()?
+            .map(Into::into),
     })
+}
+
+fn ci_retry_state(text: &str) -> Result<CiRetry, StoreError> {
+    match text {
+        "submitted" => Ok(CiRetry::Submitted),
+        "exhausted" => Ok(CiRetry::Exhausted),
+        "disabled" => Ok(CiRetry::Disabled),
+        "no_log" => Ok(CiRetry::NoLog),
+        "ineligible" => Ok(CiRetry::Ineligible),
+        _ => Err(StoreError::OutOfRange("ci retry")),
+    }
+}
+
+const fn ci_retry_name(outcome: CiRetry) -> &'static str {
+    match outcome {
+        CiRetry::Submitted => "submitted",
+        CiRetry::Exhausted => "exhausted",
+        CiRetry::Disabled => "disabled",
+        CiRetry::NoLog => "no_log",
+        CiRetry::Ineligible | CiRetry::Unspecified => "ineligible",
+    }
 }
 
 fn ci_state(text: &str) -> Result<CiState, StoreError> {
@@ -703,6 +759,7 @@ fn parse_count(value: Option<String>, bad: &mut u32) -> u64 {
 pub struct Store {
     pool: PgPool,
     lease: Duration,
+    max_ci_retries: u32,
     #[cfg(test)]
     snapshot_gate: Option<std::sync::Arc<SnapshotGate>>,
 }
@@ -720,6 +777,7 @@ impl Store {
         Self {
             pool,
             lease: DEFAULT_LEASE,
+            max_ci_retries: DEFAULT_CI_RETRIES,
             #[cfg(test)]
             snapshot_gate: None,
         }
@@ -734,6 +792,15 @@ impl Store {
     #[must_use]
     pub fn with_lease(mut self, lease: Duration) -> Self {
         self.lease = lease;
+        self
+    }
+
+    /// Sets how many fix Jobs a failed pull request may start, [`DEFAULT_CI_RETRIES`]
+    /// otherwise. A value above [`MAX_CI_RETRIES`] is lowered to it, so no caller can exceed
+    /// the documented maximum. 0 turns the retry off.
+    #[must_use]
+    pub fn with_max_ci_retries(mut self, max: u32) -> Self {
+        self.max_ci_retries = max.min(MAX_CI_RETRIES);
         self
     }
 
@@ -1330,6 +1397,13 @@ impl Store {
     /// still pending. A bad status, or one for a job without a pull request, gives
     /// [`StoreError::InvalidTelemetry`] and stores nothing.
     ///
+    /// A `failure` that this report stores, on a `SUCCEEDED` report, ends in the retry decision
+    /// of the same transaction: with `max_ci_retries` above 0, fewer fix Jobs in the chain than
+    /// that and a failure log, one fix Job is inserted for the same repo and branch, and
+    /// `ci_retry` on the failed job records the outcome. The unique key and the unique parent
+    /// make a second insert impossible. A report of any other ending, a `timeout`, or a
+    /// repeated `failure` decides nothing.
+    ///
     /// # Errors
     ///
     /// Returns [`StoreError::InvalidJob`] when the terminal state, `pr_url`, `error` or
@@ -1416,7 +1490,9 @@ impl Store {
             store_verdict(&mut tx, job_id, succeeded, request.verdict.as_ref()).await?;
         }
         if let (Some(state), Some(report)) = (ci, request.ci.as_ref()) {
-            store_ci(&mut tx, job_id, state, report).await?;
+            let succeeded = terminal.as_ref().is_some_and(|t| t.state == "SUCCEEDED");
+            let retry = succeeded.then_some(self.max_ci_retries);
+            record_ci(&mut tx, job_id, state, report, retry).await?;
         }
         if terminal.is_some() {
             sqlx::query(END_CI).bind(job_id).execute(&mut *tx).await?;
@@ -1576,7 +1652,7 @@ async fn store_ci(
     job_id: &str,
     state: CiState,
     report: &JobCi,
-) -> Result<(), StoreError> {
+) -> Result<bool, StoreError> {
     let (open_pr, kind, stored): (bool, String, Option<String>) = sqlx::query_as(SELECT_CI)
         .bind(job_id)
         .fetch_one(&mut **tx)
@@ -1590,7 +1666,7 @@ async fn store_ci(
         .transpose()?
         .is_some_and(CiState::is_terminal)
     {
-        return Ok(());
+        return Ok(false);
     }
     sqlx::query(SET_CI)
         .bind(job_id)
@@ -1605,7 +1681,82 @@ async fn store_ci(
             .execute(&mut **tx)
             .await?;
     }
+    Ok(state == CiState::Failure)
+}
+
+async fn record_ci(
+    tx: &mut Transaction<'_, Postgres>,
+    job_id: &str,
+    state: CiState,
+    report: &JobCi,
+    retry: Option<u32>,
+) -> Result<(), StoreError> {
+    let failed = store_ci(tx, job_id, state, report).await?;
+    if let (true, Some(max)) = (failed, retry) {
+        decide_ci_retry(tx, job_id, report.failure_log.as_deref(), max).await?;
+    }
     Ok(())
+}
+
+async fn decide_ci_retry(
+    tx: &mut Transaction<'_, Postgres>,
+    job_id: &str,
+    log: Option<&str>,
+    max: u32,
+) -> Result<(), StoreError> {
+    let stored: i32 = sqlx::query_scalar(SELECT_RETRY_ATTEMPT)
+        .bind(job_id)
+        .fetch_one(&mut **tx)
+        .await?;
+    let attempt = u32::try_from(stored).map_err(|_| StoreError::OutOfRange("ci retry attempt"))?;
+    let outcome = if max == 0 {
+        CiRetry::Disabled
+    } else if attempt >= max {
+        CiRetry::Exhausted
+    } else {
+        submit_fix(tx, job_id, attempt + 1, log).await?
+    };
+    sqlx::query(SET_RETRY)
+        .bind(job_id)
+        .bind(ci_retry_name(outcome))
+        .execute(&mut **tx)
+        .await?;
+    Ok(())
+}
+
+async fn submit_fix(
+    tx: &mut Transaction<'_, Postgres>,
+    parent: &str,
+    attempt: u32,
+    log: Option<&str>,
+) -> Result<CiRetry, StoreError> {
+    let id = EventId::generate().to_string();
+    let original: String = sqlx::query_scalar(ROOT_PROMPT)
+        .bind(parent)
+        .fetch_one(&mut **tx)
+        .await?;
+    let Some(prompt) = log.and_then(|log| fix_prompt(&original, log, &id)) else {
+        return Ok(CiRetry::NoLog);
+    };
+    let inserted = sqlx::query(INSERT_FIX)
+        .bind(id)
+        .bind(ci_retry_key(parent, attempt))
+        .bind(prompt)
+        .bind(parent)
+        .fetch_optional(&mut **tx)
+        .await?;
+    if inserted.is_some() {
+        return Ok(CiRetry::Submitted);
+    }
+    let child = sqlx::query(SELECT_FIX_CHILD)
+        .bind(parent)
+        .fetch_optional(&mut **tx)
+        .await?;
+    Ok(if child.is_some() {
+        CiRetry::Submitted
+    } else {
+        CiRetry::Ineligible
+    })
 }
 
 async fn store_verdict(

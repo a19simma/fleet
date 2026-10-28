@@ -59,7 +59,7 @@ use fleet_proto::v1::{
 };
 use fleet_proto::{
     MAX_CHUNKS_PER_REPORT, MAX_MODEL_BYTES, MAX_TRANSCRIPT_BYTES, MAX_VERDICT_REASON_BYTES,
-    MAX_VERDICT_SCORE, is_plain_text,
+    MAX_VERDICT_SCORE, is_ci_url, is_plain_text, is_swarm_branch,
 };
 use serde_json::Value;
 use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncRead, BufReader};
@@ -1187,6 +1187,13 @@ impl<R: Reporter> AgentRunner<R> {
     /// unless the job has `open_pr` off, `gh pr create` runs and the last stdout line that
     /// is an `https` url becomes `pr_url`.
     ///
+    /// A fix Job (`parent_job_id` set, ADR-0028) pushes `swarm/<job_id>` to the existing branch
+    /// named by its `base_ref`, which must pass [`fleet_proto::is_swarm_branch`] or the job
+    /// fails with the push error before any process starts. The refspec has no `+`, so a
+    /// branch that moved ahead of the job is refused, never rewritten. No pull request is
+    /// created: the `pr_url` the server stored with the Job is the one the CI watch follows,
+    /// when it passes [`fleet_proto::is_ci_url`].
+    ///
     /// No credentialed command runs in the agent's repo. A throwaway bare repo under the
     /// jobs directory fetches the branch from the worktree with no tokens in the
     /// environment. The push (`--no-verify`, no hooks path, no stored credential helper, no
@@ -1312,17 +1319,18 @@ impl<R: Reporter> AgentRunner<R> {
         validate_job_id(&job.job_id).map_err(|_| Failure::bare(ERR_COMMITS))?;
         validate_repo(&job.repo, &self.config.repo_policy).map_err(|_| Failure::bare(ERR_PUSH))?;
         validate_ref(&job.base_ref).map_err(|_| Failure::bare(ERR_COMMITS))?;
-        let branch = format!("swarm/{}", job.job_id);
+        let local = format!("swarm/{}", job.job_id);
+        let branch = push_branch(job, &local)?;
         let scratch = Scratch::create(cwd, &job.job_id).map_err(|()| Failure::bare(ERR_COMMITS))?;
         let dir = scratch.path();
         self.commit_leftovers(job, cwd, dir).await?;
-        if !self.ahead(job, &branch, cwd, dir).await? {
+        if !self.ahead(job, &local, cwd, dir).await? {
             return Ok(Published {
                 branch: None,
                 pr_url: None,
             });
         }
-        let refspec = format!("refs/heads/{branch}:refs/heads/{branch}");
+        let refspec = format!("refs/heads/{local}:refs/heads/{branch}");
         let push_start = self.clock.now();
         let pushed = self
             .helper(
@@ -1351,6 +1359,12 @@ impl<R: Reporter> AgentRunner<R> {
         let pushed = pushed.map_err(|e| e.failure(ERR_PUSH))?;
         if !pushed.success {
             return Err(Failure::tail(ERR_PUSH, &pushed.stderr));
+        }
+        if job.parent_job_id.is_some() {
+            return Ok(Published {
+                pr_url: job.pr_url.clone().filter(|url| is_ci_url(url)),
+                branch: Some(branch),
+            });
         }
         if !job.open_pr {
             return Ok(Published {
@@ -2497,6 +2511,19 @@ struct Terminal {
     pr_url: Option<String>,
     verdict: Option<JobVerdict>,
     ci: Option<JobCi>,
+}
+
+/// The remote branch the job pushes to: its own `swarm/<job_id>` branch, or for a fix Job the
+/// existing branch of its `base_ref`, which must be a `swarm/` branch.
+fn push_branch(job: &Job, local: &str) -> Result<String, Failure> {
+    if job.parent_job_id.is_none() {
+        return Ok(local.to_owned());
+    }
+    if is_swarm_branch(&job.base_ref) {
+        Ok(job.base_ref.clone())
+    } else {
+        Err(Failure::bare(ERR_PUSH))
+    }
 }
 
 struct Published {

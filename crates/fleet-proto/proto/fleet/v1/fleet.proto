@@ -192,6 +192,18 @@ message Job {
   optional CiState ci_state = 26;
   optional uint64 ci_checked_at_ms = 27;
   optional string ci_url = 28;
+  optional string parent_job_id = 29;
+  uint32 ci_retry_attempt = 30;
+  optional CiRetry ci_retry = 31;
+}
+
+enum CiRetry {
+  CI_RETRY_UNSPECIFIED = 0;
+  CI_RETRY_SUBMITTED = 1;
+  CI_RETRY_EXHAUSTED = 2;
+  CI_RETRY_DISABLED = 3;
+  CI_RETRY_NO_LOG = 4;
+  CI_RETRY_INELIGIBLE = 5;
 }
 
 enum CiState {

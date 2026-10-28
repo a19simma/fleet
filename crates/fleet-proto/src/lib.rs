@@ -42,6 +42,35 @@ pub const MAX_CI_LOG_BYTES: usize = 16 * 1024;
 /// Longest CI url, in bytes.
 pub const MAX_CI_URL_BYTES: usize = 2048;
 
+/// Highest accepted `max_ci_retries`, the most fix Jobs one failed pull request may start.
+pub const MAX_CI_RETRIES: u32 = 5;
+
+/// Default `max_ci_retries`: 0, so the server starts no fix Job until an operator opts in.
+pub const DEFAULT_CI_RETRIES: u32 = 0;
+
+/// Idempotency key prefix the server reserves for the fix Jobs it submits. A client submit
+/// with a key that starts with it is refused, so a client cannot occupy a fix Job's key.
+pub const CI_RETRY_KEY_PREFIX: &str = "ci-retry:";
+
+/// The idempotency key of the fix Job that follows attempt `attempt` of `parent_job_id`.
+///
+/// One value per `(parent, attempt)`, so a repeated decision for one failure maps to one key.
+#[must_use]
+pub fn ci_retry_key(parent_job_id: &str, attempt: u32) -> String {
+    format!("{CI_RETRY_KEY_PREFIX}{parent_job_id}:{attempt}")
+}
+
+/// True when `text` is `swarm/` and a job id of 1 to 64 ASCII letters or digits.
+///
+/// fleetd checks it before a fix Job pushes to a branch it did not create, so no fix Job can
+/// push outside the `swarm/` namespace.
+#[must_use]
+pub fn is_swarm_branch(text: &str) -> bool {
+    text.strip_prefix("swarm/").is_some_and(|id| {
+        (1..=64).contains(&id.len()) && id.bytes().all(|b| b.is_ascii_alphanumeric())
+    })
+}
+
 /// Most transcript chunks one report may carry. The server rejects more.
 pub const MAX_CHUNKS_PER_REPORT: usize = 256;
 

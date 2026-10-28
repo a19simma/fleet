@@ -4,6 +4,8 @@ use std::fmt;
 use std::net::SocketAddr;
 use std::time::Duration;
 
+use fleet_proto::{DEFAULT_CI_RETRIES, MAX_CI_RETRIES};
+
 use crate::retention::{
     DEFAULT_EVENTS_DAYS, DEFAULT_INTERVAL, DEFAULT_SUMMARIES_DAYS, MIN_INTERVAL, Policy,
     PolicyError,
@@ -129,6 +131,9 @@ pub struct Config {
     pub retention: Policy,
     /// Pause between retention sweeps, from `FLEET_RETENTION_INTERVAL_SECS`.
     pub retention_interval: Duration,
+    /// Most fix Jobs one failed pull request may start, from `FLEET_MAX_CI_RETRIES`: 0 to
+    /// [`MAX_CI_RETRIES`], default [`DEFAULT_CI_RETRIES`]. 0 turns the retry off.
+    pub max_ci_retries: u32,
 }
 
 /// Lists the listeners bound to a non-loopback address, as `(variable, address)`.
@@ -190,6 +195,19 @@ fn number(
     }
 }
 
+fn ci_retries(lookup: &impl Fn(&str) -> Option<String>) -> Result<u32, ConfigError> {
+    let value = number(
+        lookup,
+        "FLEET_MAX_CI_RETRIES",
+        u64::from(DEFAULT_CI_RETRIES),
+        0..=u64::from(MAX_CI_RETRIES),
+    )?;
+    u32::try_from(value).map_err(|_| ConfigError::Invalid {
+        var: "FLEET_MAX_CI_RETRIES",
+        reason: "out of range".to_owned(),
+    })
+}
+
 fn retention(lookup: &impl Fn(&str) -> Option<String>) -> Result<Policy, ConfigError> {
     let events = whole(
         lookup,
@@ -221,6 +239,7 @@ impl Config {
     /// address does not parse, or a retention setting is out of range. Retention days run
     /// from 1 to 3650, `FLEET_SUMMARIES_RETENTION_DAYS` must not be below
     /// `FLEET_EVENTS_RETENTION_DAYS`, and `FLEET_RETENTION_INTERVAL_SECS` is at least 60.
+    /// `FLEET_MAX_CI_RETRIES` runs from 0 to 5 and defaults to 0.
     pub fn from_env() -> Result<Self, ConfigError> {
         Self::from_lookup(|var| std::env::var(var).ok())
     }
@@ -252,6 +271,7 @@ impl Config {
             token,
             client_token,
             retention: retention(&lookup)?,
+            max_ci_retries: ci_retries(&lookup)?,
             retention_interval: Duration::from_secs(number(
                 &lookup,
                 "FLEET_RETENTION_INTERVAL_SECS",
@@ -434,6 +454,28 @@ mod tests {
         let mut vars = base();
         vars.extend_from_slice(extra);
         Config::from_lookup(lookup(&vars))
+    }
+
+    #[test]
+    fn ci_retries_default_to_off_and_stop_at_the_maximum() {
+        assert_eq!(with(&[]).unwrap().max_ci_retries, 0);
+        assert_eq!(
+            with(&[("FLEET_MAX_CI_RETRIES", "")])
+                .unwrap()
+                .max_ci_retries,
+            0
+        );
+        for (text, value) in [("0", 0), ("1", 1), ("2", 2), ("3", 3), ("4", 4), ("5", 5)] {
+            let config = with(&[("FLEET_MAX_CI_RETRIES", text)]).unwrap();
+            assert_eq!(config.max_ci_retries, value);
+        }
+        assert_eq!(MAX_CI_RETRIES, 5);
+        for bad in ["6", "-1", "x", "99999999999"] {
+            match with(&[("FLEET_MAX_CI_RETRIES", bad)]).unwrap_err() {
+                ConfigError::Invalid { var, .. } => assert_eq!(var, "FLEET_MAX_CI_RETRIES"),
+                other @ ConfigError::Missing(_) => panic!("{other}"),
+            }
+        }
     }
 
     #[test]

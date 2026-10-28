@@ -2220,3 +2220,184 @@ async fn passing_polls_must_be_consecutive() -> TestResult {
     }))
     .await
 }
+
+async fn fix_rig() -> Result<Rig, Box<dyn std::error::Error>> {
+    let mut rig = rig("ok").await?;
+    git(&rig.origin, &["branch", "swarm/root1", "main"])?;
+    let checkout = Workspace::new(rig.dir.path().join("work"))
+        .with_policy(test_policy())
+        .prepare("job1", &rig.origin.to_string_lossy(), "swarm/root1")
+        .await?;
+    rig.worktree = checkout.path;
+    Ok(rig)
+}
+
+fn fix_job(rig: &Rig) -> Job {
+    Job {
+        parent_job_id: Some("root1".into()),
+        ci_retry_attempt: 1,
+        base_ref: "swarm/root1".into(),
+        pr_url: Some(CI_PR.into()),
+        open_pr: true,
+        ..job(rig, true)
+    }
+}
+
+fn origin_has(rig: &Rig, branch: &str) -> Result<bool, Box<dyn std::error::Error>> {
+    Ok(!git(&rig.origin, &["branch", "--list", branch])?
+        .trim()
+        .is_empty())
+}
+
+#[tokio::test]
+async fn a_fix_job_pushes_to_the_parent_branch_and_follows_the_existing_pull_request() -> TestResult
+{
+    common::bounded(Box::pin(async {
+        let rig = fix_rig().await?;
+        commit(&rig)?;
+        let before = git(&rig.origin, &["rev-parse", "main"])?;
+        let (agent, mut rx) = agent_waiting(
+            &rig,
+            Duration::from_millis(100),
+            Reply::Ok,
+            Duration::from_secs(30),
+        );
+        let (_trigger, shutdown) = Shutdown::channel();
+        let outcome = agent
+            .finish(&fix_job(&rig), &rig.worktree, shutdown)
+            .await?;
+        assert_eq!(
+            outcome,
+            FinishOutcome::Succeeded {
+                branch: Some("swarm/root1".into()),
+                pr_url: Some(CI_PR.into()),
+            }
+        );
+        assert!(!origin_has(&rig, "swarm/job1")?);
+        let log = git(&rig.origin, &["log", "--format=%s", "swarm/root1"])?;
+        assert_eq!(log.lines().collect::<Vec<_>>(), ["work", "seed"]);
+        assert_eq!(git(&rig.origin, &["rev-parse", "main"])?, before);
+        assert!(!rig.dir.path().join("gh.args").exists());
+        let args = std::fs::read_to_string(rig.dir.path().join("checks.args"))?;
+        assert_eq!(
+            args.lines().collect::<Vec<_>>(),
+            ["pr", "checks", CI_PR, "--json", "bucket,link"]
+        );
+        let reports = drain(&mut rx);
+        let last = terminal(&reports)?;
+        assert_eq!(last.branch.as_deref(), Some("swarm/root1"));
+        assert_eq!(last.pr_url.as_deref(), Some(CI_PR));
+        assert_eq!(
+            last.ci.as_ref().map(|ci| ci.state),
+            Some(CiState::Success as i32)
+        );
+        Ok(())
+    }))
+    .await
+}
+
+#[tokio::test]
+async fn a_fix_job_that_made_no_commit_pushes_nothing_and_has_no_ci() -> TestResult {
+    common::bounded(Box::pin(async {
+        let rig = fix_rig().await?;
+        let (agent, mut rx) = agent(&rig);
+        let (_trigger, shutdown) = Shutdown::channel();
+        let outcome = agent
+            .finish(&fix_job(&rig), &rig.worktree, shutdown)
+            .await?;
+        assert_eq!(
+            outcome,
+            FinishOutcome::Succeeded {
+                branch: None,
+                pr_url: None,
+            }
+        );
+        assert!(!rig.dir.path().join("checks.args").exists());
+        assert!(terminal(&drain(&mut rx))?.ci.is_none());
+        Ok(())
+    }))
+    .await
+}
+
+#[tokio::test]
+async fn a_fix_job_never_pushes_outside_the_swarm_namespace() -> TestResult {
+    common::bounded(Box::pin(async {
+        for target in ["main", "swarm/a/b", "swarm/", "swarm/../main", "-main"] {
+            let rig = fix_rig().await?;
+            commit(&rig)?;
+            let before = git(&rig.origin, &["rev-parse", "main"])?;
+            let (agent, _rx) = agent(&rig);
+            let (_trigger, shutdown) = Shutdown::channel();
+            let mut aimed = fix_job(&rig);
+            aimed.base_ref = target.into();
+            let outcome = agent.finish(&aimed, &rig.worktree, shutdown).await?;
+            assert!(
+                matches!(outcome, FinishOutcome::Failed { .. }),
+                "{target}: {outcome:?}"
+            );
+            assert_eq!(git(&rig.origin, &["rev-parse", "main"])?, before);
+            assert!(!origin_has(&rig, "swarm/job1")?);
+        }
+        Ok(())
+    }))
+    .await
+}
+
+#[tokio::test]
+async fn a_fix_job_never_rewrites_a_branch_that_moved_ahead() -> TestResult {
+    common::bounded(Box::pin(async {
+        let rig = fix_rig().await?;
+        commit(&rig)?;
+        let seed = rig.dir.path().join("seed");
+        std::fs::write(seed.join("c.txt"), "c")?;
+        git(&seed, &["add", "."])?;
+        git(&seed, &["commit", "--quiet", "-m", "someone else"])?;
+        git(
+            &seed,
+            &[
+                "push",
+                "--quiet",
+                &rig.origin.to_string_lossy(),
+                "HEAD:refs/heads/swarm/root1",
+            ],
+        )?;
+        let moved = git(&rig.origin, &["rev-parse", "swarm/root1"])?;
+        let (agent, _rx) = agent(&rig);
+        let (_trigger, shutdown) = Shutdown::channel();
+        let outcome = agent
+            .finish(&fix_job(&rig), &rig.worktree, shutdown)
+            .await?;
+        assert_eq!(
+            outcome,
+            FinishOutcome::Failed {
+                error: "git push failed"
+            }
+        );
+        assert_eq!(git(&rig.origin, &["rev-parse", "swarm/root1"])?, moved);
+        Ok(())
+    }))
+    .await
+}
+
+#[tokio::test]
+async fn a_fix_job_with_a_bad_pull_request_url_pushes_and_skips_the_ci_watch() -> TestResult {
+    common::bounded(Box::pin(async {
+        let rig = fix_rig().await?;
+        commit(&rig)?;
+        let (agent, _rx) = agent(&rig);
+        let (_trigger, shutdown) = Shutdown::channel();
+        let mut odd = fix_job(&rig);
+        odd.pr_url = Some("http://example.invalid/pr/7".into());
+        let outcome = agent.finish(&odd, &rig.worktree, shutdown).await?;
+        assert_eq!(
+            outcome,
+            FinishOutcome::Succeeded {
+                branch: Some("swarm/root1".into()),
+                pr_url: None,
+            }
+        );
+        assert!(!rig.dir.path().join("checks.args").exists());
+        Ok(())
+    }))
+    .await
+}
