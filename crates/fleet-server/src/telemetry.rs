@@ -178,6 +178,7 @@ fn kind_name(kind: i32) -> Result<&'static str, StoreError> {
         Ok(JobEventKind::ApiRetry) => Ok("api_retry"),
         Ok(JobEventKind::Phase) => Ok("phase"),
         Ok(JobEventKind::Stuck) => Ok("stuck"),
+        Ok(JobEventKind::Fetch) => Ok("fetch"),
         Ok(JobEventKind::Unspecified) | Err(_) => Err(StoreError::InvalidTelemetry),
     }
 }
@@ -397,6 +398,7 @@ fn kind_from_name(name: &str) -> Result<JobEventKind, StoreError> {
         "api_retry" => Ok(JobEventKind::ApiRetry),
         "phase" => Ok(JobEventKind::Phase),
         "stuck" => Ok(JobEventKind::Stuck),
+        "fetch" => Ok(JobEventKind::Fetch),
         _ => Err(StoreError::OutOfRange("kind")),
     }
 }
