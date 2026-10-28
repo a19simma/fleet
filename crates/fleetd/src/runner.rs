@@ -55,7 +55,7 @@ use std::time::Duration;
 use fleet_core::Redactor;
 use fleet_proto::v1::{
     GetJobTranscriptReply, GetJobTranscriptRequest, GetProfileBlobReply, GetProfileBlobRequest,
-    Job, JobKind, JobState, JobVerdict, ReportJobReply, ReportJobRequest, TranscriptChunk,
+    Job, JobCi, JobKind, JobState, JobVerdict, ReportJobReply, ReportJobRequest, TranscriptChunk,
 };
 use fleet_proto::{
     MAX_CHUNKS_PER_REPORT, MAX_MODEL_BYTES, MAX_TRANSCRIPT_BYTES, MAX_VERDICT_REASON_BYTES,
@@ -75,10 +75,12 @@ use crate::group::GroupGuard;
 use crate::now_ms;
 use crate::phase::{Clock, Phases, SystemClock, elapsed_ms};
 use crate::poller::{RunError, Shutdown};
-use crate::proc::{CAPTURE_BYTES, CaptureError, Captured, capture};
+use crate::proc::{CAPTURE_BYTES, CaptureError, Captured, Keep, capture, capture_keeping};
 use crate::profile_apply::{self, Applied, LoadError};
 use crate::telemetry::Terminal as Ending;
 use crate::toolhook::HookHub;
+mod ci;
+
 use crate::workspace::{RepoPolicy, is_commit_sha, validate_job_id, validate_ref, validate_repo};
 
 /// Variables that never reach the agent's environment block, however it is configured.
@@ -139,6 +141,19 @@ pub const DEFAULT_FINISH_TIMEOUT: Duration = Duration::from_secs(300);
 
 /// Default longest time for preparing the workspace.
 pub const DEFAULT_PREPARE_TIMEOUT: Duration = Duration::from_secs(300);
+
+/// Default longest time to wait for the checks of the pull request, counted from the push.
+pub const DEFAULT_CI_DEADLINE: Duration = Duration::from_secs(900);
+
+/// Default wait before the second check poll. The wait doubles up to
+/// [`DEFAULT_CI_POLL_CAP`].
+pub const DEFAULT_CI_POLL_INITIAL: Duration = Duration::from_secs(5);
+
+/// Default longest wait between check polls.
+pub const DEFAULT_CI_POLL_CAP: Duration = Duration::from_secs(30);
+
+/// Default longest time to fetch the log of a failed check.
+pub const DEFAULT_CI_LOG_BUDGET: Duration = Duration::from_secs(30);
 
 const TAIL_BYTES: usize = 2048;
 const MAX_PR_URL_BYTES: usize = 2048;
@@ -325,6 +340,16 @@ pub struct RunConfig {
     pub git_bin: PathBuf,
     /// Longest time for the finish step and for each helper command in it.
     pub finish_timeout: Duration,
+    /// Longest time to wait for the pull request checks to settle. Lease renewals continue
+    /// through [`RunConfig::report_interval`] the whole wait, so this may exceed the lease.
+    pub ci_deadline: Duration,
+    /// Longest time to fetch the log of a failed check once the failure is seen, counted from
+    /// the failure and apart from [`RunConfig::ci_deadline`].
+    pub ci_log_budget: Duration,
+    /// Wait before the second check poll, doubled after each poll.
+    pub ci_poll_initial: Duration,
+    /// Longest wait between check polls.
+    pub ci_poll_cap: Duration,
     /// True when the box is disposable. Only then a Job without a Profile runs with permission checks off.
     pub disposable: bool,
     /// Hard limit on the run. The process group is killed when it passes.
@@ -369,6 +394,10 @@ impl RunConfig {
             repo_policy: RepoPolicy::default(),
             finish_timeout: DEFAULT_FINISH_TIMEOUT,
             prepare_timeout: DEFAULT_PREPARE_TIMEOUT,
+            ci_deadline: DEFAULT_CI_DEADLINE,
+            ci_poll_initial: DEFAULT_CI_POLL_INITIAL,
+            ci_poll_cap: DEFAULT_CI_POLL_CAP,
+            ci_log_budget: DEFAULT_CI_LOG_BUDGET,
             disposable,
             timeout: DEFAULT_TIMEOUT,
             max_turns: DEFAULT_MAX_TURNS,
@@ -870,6 +899,7 @@ impl<R: Reporter> AgentRunner<R> {
                         branch: None,
                         pr_url: None,
                         verdict: Some(verdict),
+                        ci: None,
                     })
                     .await;
             }
@@ -1196,6 +1226,29 @@ impl<R: Reporter> AgentRunner<R> {
                 Ok(FinishOutcome::Cancelled)
             }
             Ok(Ok(Ok(published))) => {
+                let ci = match published.pr_url.as_deref() {
+                    Some(url) => {
+                        match Box::pin(self.watch_ci(job, cwd, url, &progress, &mut ctl)).await {
+                            ci::Watched::Done(ci) => Some(ci),
+                            ci::Watched::Lost => return Ok(FinishOutcome::Lost),
+                            stopped => {
+                                let cancelled = matches!(stopped, ci::Watched::Cancelled);
+                                let (state, error) = if cancelled {
+                                    (JobState::Cancelled, None)
+                                } else {
+                                    (JobState::Failed, Some(ERR_SHUTDOWN))
+                                };
+                                stream.end_published(state, error, &published).await;
+                                return if cancelled {
+                                    Ok(FinishOutcome::Cancelled)
+                                } else {
+                                    Err(RunError)
+                                };
+                            }
+                        }
+                    }
+                    None => None,
+                };
                 if published.branch.is_none() {
                     tracing::info!("job ended with no changes");
                     stream.push(&self.redactor, NO_CHANGES_NOTE);
@@ -1208,6 +1261,7 @@ impl<R: Reporter> AgentRunner<R> {
                         branch: published.branch.clone(),
                         pr_url: published.pr_url.clone(),
                         verdict: None,
+                        ci,
                     })
                     .await;
                 Ok(FinishOutcome::Succeeded {
@@ -1573,6 +1627,30 @@ impl<R: Reporter> AgentRunner<R> {
         scope: Scope<'_>,
         limit: u64,
     ) -> Result<Captured, CaptureError> {
+        self.helper_keeping(bin, dir, args, scope, limit, false)
+            .await
+    }
+
+    async fn helper_tail(
+        &self,
+        bin: &Path,
+        dir: &Path,
+        args: &[&str],
+        scope: Scope<'_>,
+    ) -> Result<Captured, CaptureError> {
+        self.helper_keeping(bin, dir, args, scope, CAPTURE_BYTES, true)
+            .await
+    }
+
+    async fn helper_keeping(
+        &self,
+        bin: &Path,
+        dir: &Path,
+        args: &[&str],
+        scope: Scope<'_>,
+        limit: u64,
+        tail: bool,
+    ) -> Result<Captured, CaptureError> {
         let home = dir.join(HOME_DIR);
         let mut command = Command::new(bin);
         command
@@ -1628,7 +1706,8 @@ impl<R: Reporter> AgentRunner<R> {
                 .env("GIT_COMMITTER_NAME", JOB_NAME)
                 .env("GIT_COMMITTER_EMAIL", JOB_EMAIL);
         }
-        capture(command, self.config.finish_timeout, limit).await
+        let keep = if tail { Keep::Tail } else { Keep::Head };
+        capture_keeping(command, self.config.finish_timeout, limit, keep).await
     }
 
     async fn drive(
@@ -2281,9 +2360,45 @@ impl<'a, R: Reporter> Stream<'a, R> {
             branch: None,
             pr_url: None,
             verdict: None,
+            ci: None,
         })
         .await;
         AgentOutcome::Failed { exit_code, error }
+    }
+
+    async fn end_published(
+        &mut self,
+        state: JobState,
+        error: Option<&'static str>,
+        published: &Published,
+    ) {
+        self.terminal(Terminal {
+            state,
+            exit_code: None,
+            error,
+            branch: published.branch.clone(),
+            pr_url: published.pr_url.clone(),
+            verdict: None,
+            ci: None,
+        })
+        .await;
+    }
+
+    async fn report_terminal(
+        reporter: &R,
+        request: ReportJobRequest,
+    ) -> Result<ReportJobReply, Status> {
+        let bare = request.ci.is_some().then(|| ReportJobRequest {
+            ci: None,
+            ..request.clone()
+        });
+        match (reporter.report(request).await, bare) {
+            (Err(status), Some(bare)) if status.code() == Code::InvalidArgument => {
+                tracing::warn!("job terminal report rejected, resending without the ci status");
+                reporter.report(bare).await
+            }
+            (sent, _) => sent,
+        }
     }
 
     async fn terminal(&mut self, end: Terminal) {
@@ -2304,6 +2419,7 @@ impl<'a, R: Reporter> Stream<'a, R> {
             branch: None,
             pr_url: None,
             verdict: None,
+            ci: None,
         })
         .await;
     }
@@ -2326,9 +2442,10 @@ impl<'a, R: Reporter> Stream<'a, R> {
         request.branch = end.branch;
         request.pr_url = end.pr_url;
         request.verdict = end.verdict;
+        request.ci = end.ci;
         self.pull_hooks();
         request.summary = Some(self.feed.finish(ending(end.state, end.error)));
-        match self.reporter.report(request).await {
+        match Box::pin(Self::report_terminal(self.reporter, request)).await {
             Err(status) if status.code() == Code::FailedPrecondition => {
                 tracing::info!("job already ended");
             }
@@ -2379,6 +2496,7 @@ struct Terminal {
     branch: Option<String>,
     pr_url: Option<String>,
     verdict: Option<JobVerdict>,
+    ci: Option<JobCi>,
 }
 
 struct Published {

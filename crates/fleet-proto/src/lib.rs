@@ -35,6 +35,13 @@ pub const MAX_VERDICT_REASON_BYTES: usize = 1024;
 /// Highest judge verdict score.
 pub const MAX_VERDICT_SCORE: u32 = 100;
 
+/// Longest stored CI failure log, in bytes. fleetd keeps the last bytes of the redacted log of
+/// the failed checks and the server rejects more.
+pub const MAX_CI_LOG_BYTES: usize = 16 * 1024;
+
+/// Longest CI url, in bytes.
+pub const MAX_CI_URL_BYTES: usize = 2048;
+
 /// Most transcript chunks one report may carry. The server rejects more.
 pub const MAX_CHUNKS_PER_REPORT: usize = 256;
 
@@ -108,6 +115,44 @@ fn is_format(c: char) -> bool {
             | '\u{e0001}'
             | '\u{e0020}'..='\u{e007f}'
     )
+}
+
+/// True when `text` is a CI failure log the server may store: within [`MAX_CI_LOG_BYTES`],
+/// non-empty and holding no control or format character except newline and tab.
+#[must_use]
+pub fn is_ci_log(text: &str) -> bool {
+    !text.is_empty()
+        && text.len() <= MAX_CI_LOG_BYTES
+        && text
+            .chars()
+            .all(|c| matches!(c, '\n' | '\t') || is_plain_text(c.encode_utf8(&mut [0; 4])))
+}
+
+/// True when `url` is a CI check link the server may store.
+///
+/// It must be `https` with a host and no userinfo or backslash, hold only ASCII graphic
+/// characters and be at most [`MAX_CI_URL_BYTES`] bytes. fleetd and the server both call it,
+/// so a link one side keeps the other accepts.
+#[must_use]
+pub fn is_ci_url(url: &str) -> bool {
+    let Some(rest) = url.strip_prefix("https://") else {
+        return false;
+    };
+    let authority = rest.split(['/', '?', '#']).next().unwrap_or_default();
+    url.len() <= MAX_CI_URL_BYTES
+        && url.bytes().all(|b| b.is_ascii_graphic())
+        && !authority.is_empty()
+        && !authority.contains('@')
+        && !url.contains('\\')
+}
+
+impl v1::CiState {
+    /// True for the states that end a CI check: `success`, `failure` and `timeout`. `pending`
+    /// and the unspecified value are not final.
+    #[must_use]
+    pub const fn is_terminal(self) -> bool {
+        matches!(self, Self::Success | Self::Failure | Self::Timeout)
+    }
 }
 
 /// Generated `fleet.v1` messages and services.

@@ -3,9 +3,12 @@
 use std::fmt;
 
 use fleet_proto::v1::{
-    JobState, JobVerdict, ReportJobRequest, SubmitJobRequest, SubmitJudgeRequest,
+    CiState, JobCi, JobState, JobVerdict, ReportJobRequest, SubmitJobRequest, SubmitJudgeRequest,
 };
-use fleet_proto::{MAX_MODEL_BYTES, MAX_VERDICT_REASON_BYTES, MAX_VERDICT_SCORE, is_plain_text};
+use fleet_proto::{
+    MAX_MODEL_BYTES, MAX_VERDICT_REASON_BYTES, MAX_VERDICT_SCORE, is_ci_log, is_ci_url,
+    is_plain_text,
+};
 
 /// Longest accepted idempotency key, in bytes.
 pub const MAX_KEY_BYTES: usize = 128;
@@ -222,6 +225,31 @@ pub(crate) fn validate_verdict(verdict: &JobVerdict) -> Result<(), JobInvalid> {
         return Err(JobInvalid::Verdict);
     }
     Ok(())
+}
+
+/// Validates the CI status a report carries and gives its state, or `None` when it is not
+/// valid.
+///
+/// It is not valid when the state is unspecified or unknown, the url is not a plain `https`
+/// url within [`MAX_CI_URL_BYTES`], the failure log is not a plain log within the shared cap
+/// or comes with a state other than `failure`, or the report ends the job in any state but
+/// `SUCCEEDED` or without a pull request url. A progress report may carry only `pending`: a
+/// final state arrives on the `SUCCEEDED` report that carries the pull request url.
+pub(crate) fn validate_ci(request: &ReportJobRequest, ci: &JobCi) -> Option<CiState> {
+    let state = CiState::try_from(ci.state)
+        .ok()
+        .filter(|state| *state != CiState::Unspecified)?;
+    let url_ok = ci.url.as_deref().is_none_or(is_ci_url);
+    let log_ok = ci
+        .failure_log
+        .as_deref()
+        .is_none_or(|log| state == CiState::Failure && is_ci_log(log));
+    let end_ok = request
+        .terminal_state
+        .map_or(state == CiState::Pending, |raw| {
+            JobState::try_from(raw) == Ok(JobState::Succeeded) && request.pr_url.is_some()
+        });
+    (url_ok && log_ok && end_ok).then_some(state)
 }
 
 /// Validates the terminal part of a report. A report without `terminal_state` is a

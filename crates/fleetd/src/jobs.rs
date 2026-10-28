@@ -209,6 +209,7 @@ fn apply_limits(run: &mut RunConfig, config: &Config) {
     run.max_turns = config.max_turns;
     run.max_budget_usd = config.max_budget_usd;
     run.timeout = config.agent_timeout;
+    run.ci_deadline = config.ci_deadline;
 }
 
 fn job_workspace(
@@ -324,6 +325,15 @@ mod tests {
         let mut run = RunConfig::new("claude", false);
         apply_limits(&mut run, &config);
         assert_eq!(run.timeout, Duration::from_secs(77));
+        Ok(())
+    }
+
+    #[test]
+    fn the_ci_deadline_reaches_the_run_config() -> TestResult {
+        let config = Config::resolve(Some("ci_deadline_secs = 77\n"), &|_| None)?;
+        let mut run = RunConfig::new("claude", false);
+        apply_limits(&mut run, &config);
+        assert_eq!(run.ci_deadline, Duration::from_secs(77));
         Ok(())
     }
 

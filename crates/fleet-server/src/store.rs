@@ -6,10 +6,11 @@ use std::time::Duration;
 
 use fleet_core::{BoxName, Envelope, EventId, SCHEMA_VERSION};
 use fleet_proto::v1::{
-    BoxStatus, BoxView, GetJobTranscriptReply, GetProfileBlobReply, GetStatsReply, GetStatsRequest,
-    HeartbeatRequest, Job, JobKind, JobState, JobVerdict, ProfileRef, ReadJobEventsReply,
-    ReadTranscriptReply, ReportJobReply, ReportJobRequest, SessionState, SessionView,
-    SubmitBatchReply, SubmitBatchRequest, SubmitJobRequest, SubmitJudgeRequest, TranscriptChunk,
+    BoxStatus, BoxView, CiState, GetJobTranscriptReply, GetProfileBlobReply, GetStatsReply,
+    GetStatsRequest, HeartbeatRequest, Job, JobCi, JobKind, JobState, JobVerdict, ProfileRef,
+    ReadJobEventsReply, ReadTranscriptReply, ReportJobReply, ReportJobRequest, SessionState,
+    SessionView, SubmitBatchReply, SubmitBatchRequest, SubmitJobRequest, SubmitJudgeRequest,
+    TranscriptChunk,
 };
 use serde_json::{Value, json};
 use sqlx::postgres::PgRow;
@@ -18,8 +19,8 @@ use sqlx::{PgPool, Postgres, Row, Transaction};
 use crate::batches::{self, BatchInvalid};
 use crate::jobs::{
     JobInvalid, MAX_CHUNKS_PER_REPORT, MAX_PHASE_CHARS, MAX_PROGRESS_CHARS, MAX_TRANSCRIPT_BYTES,
-    MAX_TRANSCRIPT_ROWS, MIN_CHUNK_COST_BYTES, NewJob, validate_job_id, validate_judge,
-    validate_submit, validate_terminal, validate_verdict,
+    MAX_TRANSCRIPT_ROWS, MIN_CHUNK_COST_BYTES, NewJob, validate_ci, validate_job_id,
+    validate_judge, validate_submit, validate_terminal, validate_verdict,
 };
 use crate::profiles::{self, ProfileFault};
 use crate::projection::{Projection, State, project};
@@ -121,11 +122,12 @@ ORDER BY box, last_event_at DESC, session_id";
 const SELECT_JOB_BY_KEY: &str = "\
 SELECT job_id, idempotency_key, prompt, repo, base_ref, open_pr, state, box, attempt, \
 progress, phase, branch, pr_url, error, exit_code, cancel_requested, batch_id, \
-kind, target_job_id, profile_name, profile_version, encode(profile_hash, 'hex') AS profile_hash, \
+kind, target_job_id, ci_state, ci_url, profile_name, profile_version, encode(profile_hash, 'hex') AS profile_hash, \
 (EXTRACT(EPOCH FROM lease_expires_at) * 1000)::bigint AS lease_ms, \
 (EXTRACT(EPOCH FROM created_at) * 1000)::bigint AS created_ms, \
 (EXTRACT(EPOCH FROM claimed_at) * 1000)::bigint AS claimed_ms, \
-(EXTRACT(EPOCH FROM finished_at) * 1000)::bigint AS finished_ms \
+(EXTRACT(EPOCH FROM finished_at) * 1000)::bigint AS finished_ms, \
+(EXTRACT(EPOCH FROM ci_checked_at) * 1000)::bigint AS ci_checked_ms \
 FROM jobs WHERE idempotency_key = $1";
 
 const INSERT_JOB: &str = "\
@@ -167,21 +169,23 @@ WHERE job_id = $1 ORDER BY seq LIMIT $2";
 const SELECT_JOB_BY_ID: &str = "\
 SELECT job_id, idempotency_key, prompt, repo, base_ref, open_pr, state, box, attempt, \
 progress, phase, branch, pr_url, error, exit_code, cancel_requested, batch_id, \
-kind, target_job_id, profile_name, profile_version, encode(profile_hash, 'hex') AS profile_hash, \
+kind, target_job_id, ci_state, ci_url, profile_name, profile_version, encode(profile_hash, 'hex') AS profile_hash, \
 (EXTRACT(EPOCH FROM lease_expires_at) * 1000)::bigint AS lease_ms, \
 (EXTRACT(EPOCH FROM created_at) * 1000)::bigint AS created_ms, \
 (EXTRACT(EPOCH FROM claimed_at) * 1000)::bigint AS claimed_ms, \
-(EXTRACT(EPOCH FROM finished_at) * 1000)::bigint AS finished_ms \
+(EXTRACT(EPOCH FROM finished_at) * 1000)::bigint AS finished_ms, \
+(EXTRACT(EPOCH FROM ci_checked_at) * 1000)::bigint AS ci_checked_ms \
 FROM jobs WHERE job_id = $1";
 
 const LIST_JOBS: &str = "\
 SELECT job_id, idempotency_key, prompt, repo, base_ref, open_pr, state, box, attempt, \
 progress, phase, branch, pr_url, error, exit_code, cancel_requested, batch_id, \
-kind, target_job_id, profile_name, profile_version, encode(profile_hash, 'hex') AS profile_hash, \
+kind, target_job_id, ci_state, ci_url, profile_name, profile_version, encode(profile_hash, 'hex') AS profile_hash, \
 (EXTRACT(EPOCH FROM lease_expires_at) * 1000)::bigint AS lease_ms, \
 (EXTRACT(EPOCH FROM created_at) * 1000)::bigint AS created_ms, \
 (EXTRACT(EPOCH FROM claimed_at) * 1000)::bigint AS claimed_ms, \
-(EXTRACT(EPOCH FROM finished_at) * 1000)::bigint AS finished_ms \
+(EXTRACT(EPOCH FROM finished_at) * 1000)::bigint AS finished_ms, \
+(EXTRACT(EPOCH FROM ci_checked_at) * 1000)::bigint AS ci_checked_ms \
 FROM jobs WHERE $1::text IS NULL OR state = $1 \
 ORDER BY created_at DESC, job_id DESC LIMIT $2";
 
@@ -197,11 +201,12 @@ SELECT job_id FROM jobs WHERE state = 'QUEUED' \
 ORDER BY created_at, job_id LIMIT 1 FOR UPDATE SKIP LOCKED) \
 RETURNING job_id, idempotency_key, prompt, repo, base_ref, open_pr, state, box, attempt, \
 progress, phase, branch, pr_url, error, exit_code, cancel_requested, batch_id, \
-kind, target_job_id, profile_name, profile_version, encode(profile_hash, 'hex') AS profile_hash, \
+kind, target_job_id, ci_state, ci_url, profile_name, profile_version, encode(profile_hash, 'hex') AS profile_hash, \
 (EXTRACT(EPOCH FROM lease_expires_at) * 1000)::bigint AS lease_ms, \
 (EXTRACT(EPOCH FROM created_at) * 1000)::bigint AS created_ms, \
 (EXTRACT(EPOCH FROM claimed_at) * 1000)::bigint AS claimed_ms, \
-(EXTRACT(EPOCH FROM finished_at) * 1000)::bigint AS finished_ms";
+(EXTRACT(EPOCH FROM finished_at) * 1000)::bigint AS finished_ms, \
+(EXTRACT(EPOCH FROM ci_checked_at) * 1000)::bigint AS ci_checked_ms";
 
 const CANCEL_JOB: &str = "\
 UPDATE jobs SET \
@@ -211,11 +216,12 @@ cancel_requested = cancel_requested OR state = 'RUNNING' \
 WHERE job_id = $1 \
 RETURNING job_id, idempotency_key, prompt, repo, base_ref, open_pr, state, box, attempt, \
 progress, phase, branch, pr_url, error, exit_code, cancel_requested, batch_id, \
-kind, target_job_id, profile_name, profile_version, encode(profile_hash, 'hex') AS profile_hash, \
+kind, target_job_id, ci_state, ci_url, profile_name, profile_version, encode(profile_hash, 'hex') AS profile_hash, \
 (EXTRACT(EPOCH FROM lease_expires_at) * 1000)::bigint AS lease_ms, \
 (EXTRACT(EPOCH FROM created_at) * 1000)::bigint AS created_ms, \
 (EXTRACT(EPOCH FROM claimed_at) * 1000)::bigint AS claimed_ms, \
-(EXTRACT(EPOCH FROM finished_at) * 1000)::bigint AS finished_ms";
+(EXTRACT(EPOCH FROM finished_at) * 1000)::bigint AS finished_ms, \
+(EXTRACT(EPOCH FROM ci_checked_at) * 1000)::bigint AS ci_checked_ms";
 
 const REPORT_JOB: &str = "\
 UPDATE jobs SET phase = $4, progress = $5, \
@@ -231,8 +237,24 @@ AND ($7::text IS DISTINCT FROM 'CANCELLED' OR cancel_requested) \
 RETURNING cancel_requested, transcript_bytes, \
 (EXTRACT(EPOCH FROM lease_expires_at) * 1000)::bigint AS lease_ms";
 
+const SELECT_CI: &str = "SELECT open_pr, kind, ci_state FROM jobs WHERE job_id = $1";
+
+const SET_CI: &str = "\
+UPDATE jobs SET ci_state = $2, ci_checked_at = now(), ci_url = $3 WHERE job_id = $1";
+
+const INSERT_CI_LOG: &str = "\
+INSERT INTO job_ci_log (job_id, log) VALUES ($1, $2) ON CONFLICT DO NOTHING";
+
+const SELECT_CI_LOG: &str = "SELECT log FROM job_ci_log WHERE job_id = $1";
+
+const END_CI: &str = "\
+UPDATE jobs SET ci_state = 'timeout', ci_checked_at = now() \
+WHERE job_id = $1 AND ci_state = 'pending'";
+
 const REAP_EXPIRED: &str = "\
-UPDATE jobs SET state = 'LOST', finished_at = now(), error = 'lease expired' \
+UPDATE jobs SET state = 'LOST', finished_at = now(), error = 'lease expired', \
+ci_state = CASE WHEN ci_state = 'pending' THEN 'timeout' ELSE ci_state END, \
+ci_checked_at = CASE WHEN ci_state = 'pending' THEN now() ELSE ci_checked_at END \
 WHERE state = 'RUNNING' AND lease_expires_at < now()";
 
 const PRUNE_EVENTS: &str = "\
@@ -244,7 +266,13 @@ LIMIT $2 FOR UPDATE OF e SKIP LOCKED) \
 DELETE FROM job_event d USING doomed WHERE d.job_id = doomed.job_id AND d.seq = doomed.seq";
 
 const PRUNE_SUMMARIES: &str = "\
-WITH doomed AS (\
+WITH old_logs AS (\
+SELECT l.job_id FROM job_ci_log l JOIN jobs j ON j.job_id = l.job_id \
+WHERE j.state IN ('SUCCEEDED', 'FAILED', 'CANCELLED', 'LOST') \
+AND COALESCE(j.finished_at, j.created_at) < now() - make_interval(days => $1) \
+LIMIT $2 FOR UPDATE OF l SKIP LOCKED), \
+cleared AS (DELETE FROM job_ci_log c USING old_logs WHERE c.job_id = old_logs.job_id), \
+doomed AS (\
 SELECT s.job_id FROM job_summary s JOIN jobs j ON j.job_id = s.job_id \
 WHERE j.state IN ('SUCCEEDED', 'FAILED', 'CANCELLED', 'LOST') \
 AND COALESCE(j.finished_at, j.created_at) < now() - make_interval(days => $1) \
@@ -534,7 +562,34 @@ fn job_from_row(row: &PgRow) -> Result<Job, StoreError> {
         batch_id: row.try_get("batch_id")?,
         kind: job_kind(&row.try_get::<String, _>("kind")?)?.into(),
         target_job_id: row.try_get("target_job_id")?,
+        ci_state: row
+            .try_get::<Option<String>, _>("ci_state")?
+            .as_deref()
+            .map(ci_state)
+            .transpose()?
+            .map(Into::into),
+        ci_checked_at_ms: ms(row.try_get("ci_checked_ms")?, "ci_checked_at")?,
+        ci_url: row.try_get("ci_url")?,
     })
+}
+
+fn ci_state(text: &str) -> Result<CiState, StoreError> {
+    match text {
+        "pending" => Ok(CiState::Pending),
+        "success" => Ok(CiState::Success),
+        "failure" => Ok(CiState::Failure),
+        "timeout" => Ok(CiState::Timeout),
+        _ => Err(StoreError::OutOfRange("ci state")),
+    }
+}
+
+const fn ci_name(state: CiState) -> &'static str {
+    match state {
+        CiState::Pending => "pending",
+        CiState::Success => "success",
+        CiState::Failure => "failure",
+        CiState::Timeout | CiState::Unspecified => "timeout",
+    }
 }
 
 fn job_kind(text: &str) -> Result<JobKind, StoreError> {
@@ -1268,6 +1323,13 @@ impl Store {
     /// transaction, so only the holder of the running job can write them. A repeated event
     /// `seq` is skipped, and the summary replaces the stored snapshot.
     ///
+    /// A `ci` status is stored on the job when the job opened a pull request and is an agent
+    /// job. Once the stored state is terminal (`success`, `failure` or `timeout`) a later
+    /// status changes nothing and stores no log. A `failure` log goes to `job_ci_log`. Any
+    /// terminal report turns a `pending` CI state into `timeout`, so a job never ends with CI
+    /// still pending. A bad status, or one for a job without a pull request, gives
+    /// [`StoreError::InvalidTelemetry`] and stores nothing.
+    ///
     /// # Errors
     ///
     /// Returns [`StoreError::InvalidJob`] when the terminal state, `pr_url`, `error` or
@@ -1289,6 +1351,11 @@ impl Store {
         let terminal = validate_terminal(request)?;
         let rows = check_chunks(&request.chunks)?;
         let telemetry = telemetry::check(&request.events, request.summary.as_ref())?;
+        let ci = request
+            .ci
+            .as_ref()
+            .map(|ci| validate_ci(request, ci).ok_or(StoreError::InvalidTelemetry))
+            .transpose()?;
         let phase: String = request.phase.chars().take(MAX_PHASE_CHARS).collect();
         let progress: String = request.progress.chars().take(MAX_PROGRESS_CHARS).collect();
         let mut tx = self.pool.begin().await?;
@@ -1348,6 +1415,12 @@ impl Store {
             let succeeded = terminal.as_ref().is_some_and(|t| t.state == "SUCCEEDED");
             store_verdict(&mut tx, job_id, succeeded, request.verdict.as_ref()).await?;
         }
+        if let (Some(state), Some(report)) = (ci, request.ci.as_ref()) {
+            store_ci(&mut tx, job_id, state, report).await?;
+        }
+        if terminal.is_some() {
+            sqlx::query(END_CI).bind(job_id).execute(&mut *tx).await?;
+        }
         let mut acked: i64 = sqlx::query_scalar(TRANSCRIPT_PREFIX)
             .bind(job_id)
             .fetch_one(&mut *tx)
@@ -1364,12 +1437,26 @@ impl Store {
         })
     }
 
+    /// Returns the redacted failure log fleetd reported with the `failure` CI state of
+    /// `job_id`, or `None` when the job has none.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StoreError::Database`] when the query fails.
+    pub async fn get_ci_log(&self, job_id: &str) -> Result<Option<String>, StoreError> {
+        Ok(sqlx::query_scalar(SELECT_CI_LOG)
+            .bind(job_id)
+            .fetch_optional(&self.pool)
+            .await?)
+    }
+
     /// Marks every `RUNNING` job whose lease has expired as `LOST` and returns how many.
     ///
     /// One statement tests `state = 'RUNNING'` and `lease_expires_at < now()` and sets
     /// `state`, `finished_at` and the fixed `error` text `lease expired`, so a report that
     /// renews the lease first wins and a report that arrives after the reap is stale. A
-    /// `LOST` job is never retried: the box may have pushed commits before it vanished.
+    /// `LOST` job is never retried: the box may have pushed commits before it vanished. A
+    /// `pending` CI state of the job becomes `timeout` in the same statement.
     ///
     /// # Errors
     ///
@@ -1397,7 +1484,9 @@ impl Store {
         Ok(done.rows_affected())
     }
 
-    /// Deletes up to `limit` summary rows by the same rule as [`Store::prune_events`].
+    /// Deletes up to `limit` summary rows by the same rule as [`Store::prune_events`]. The
+    /// same statement deletes up to `limit` CI failure logs of the same kind of job, so the
+    /// logs follow the retention of the telemetry rows. The count holds summary rows only.
     ///
     /// # Errors
     ///
@@ -1480,6 +1569,43 @@ impl Store {
         }
         Ok((as_of_ms, boxes))
     }
+}
+
+async fn store_ci(
+    tx: &mut Transaction<'_, Postgres>,
+    job_id: &str,
+    state: CiState,
+    report: &JobCi,
+) -> Result<(), StoreError> {
+    let (open_pr, kind, stored): (bool, String, Option<String>) = sqlx::query_as(SELECT_CI)
+        .bind(job_id)
+        .fetch_one(&mut **tx)
+        .await?;
+    if !open_pr || kind != "agent" {
+        return Err(StoreError::InvalidTelemetry);
+    }
+    if stored
+        .as_deref()
+        .map(ci_state)
+        .transpose()?
+        .is_some_and(CiState::is_terminal)
+    {
+        return Ok(());
+    }
+    sqlx::query(SET_CI)
+        .bind(job_id)
+        .bind(ci_name(state))
+        .bind(report.url.as_deref())
+        .execute(&mut **tx)
+        .await?;
+    if let Some(log) = &report.failure_log {
+        sqlx::query(INSERT_CI_LOG)
+            .bind(job_id)
+            .bind(log)
+            .execute(&mut **tx)
+            .await?;
+    }
+    Ok(())
 }
 
 async fn store_verdict(

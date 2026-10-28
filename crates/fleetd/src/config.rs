@@ -4,13 +4,18 @@ use std::time::Duration;
 use serde::Deserialize;
 
 use crate::Error;
-use crate::runner::{DEFAULT_MAX_BUDGET_USD, DEFAULT_MAX_TURNS, DEFAULT_TIMEOUT};
+use crate::runner::{
+    DEFAULT_CI_DEADLINE, DEFAULT_MAX_BUDGET_USD, DEFAULT_MAX_TURNS, DEFAULT_TIMEOUT,
+};
 
 /// Config file read when `--config` is not given and the file exists.
 pub const DEFAULT_CONFIG_PATH: &str = "/etc/fleetd/config.toml";
 /// Default secrets env file. A missing file at this path is not an error.
 pub const DEFAULT_SECRETS_PATH: &str = "/etc/swarm/secrets.env";
 const MAX_TURNS_LIMIT: u32 = 1000;
+
+/// Largest `ci_deadline_secs`, two hours.
+const MAX_CI_DEADLINE_SECS: u64 = 7200;
 /// The `RuntimeMaxSec` of `deploy/fleet-agent@.service` in seconds, the unit's own backstop.
 const UNIT_RUNTIME_MAX_SECS: u64 = 2 * 60 * 60;
 /// Seconds the unit's `RuntimeMaxSec` must outlast `agent_timeout_secs`, so fleetd's own
@@ -60,6 +65,7 @@ struct FileConfig {
     max_turns: Option<i64>,
     max_budget_usd: Option<f64>,
     agent_timeout_secs: Option<i64>,
+    ci_deadline_secs: Option<i64>,
     hook_socket: Option<PathBuf>,
     hook_socket_uid: Option<u32>,
     hook_socket_group: Option<String>,
@@ -142,6 +148,11 @@ pub struct Config {
     /// the deadline past which a unit kill reads as a timeout. The unit's `RuntimeMaxSec`
     /// outlasts the maximum by [`RUNTIME_MAX_HEADROOM_SECS`].
     pub agent_timeout: Duration,
+    /// Longest time to wait for the pull request checks to settle after the push, 1 to
+    /// [`MAX_CI_DEADLINE_SECS`] seconds, 900 by default, config file only. A job whose checks
+    /// have not settled by then ends its CI state as `timeout`. It may exceed the 120 s lease,
+    /// because the wait renews the lease every `report_interval`.
+    pub ci_deadline: Duration,
     /// Admits `file://` and absolute-path repos. Always false from [`Config::resolve`],
     /// which has no file key or environment variable for it. Only code that builds a
     /// `Config` for a test sets it.
@@ -292,6 +303,7 @@ impl Config {
             max_turns: resolve_max_turns(file.max_turns)?,
             max_budget_usd,
             agent_timeout: resolve_agent_timeout(file.agent_timeout_secs)?,
+            ci_deadline: resolve_ci_deadline(file.ci_deadline_secs)?,
             allow_file_repos: false,
             hook_socket,
             hook_socket_uid,
@@ -451,6 +463,20 @@ fn resolve_agent_timeout(raw: Option<i64>) -> Result<Duration, Error> {
         })
 }
 
+fn resolve_ci_deadline(raw: Option<i64>) -> Result<Duration, Error> {
+    let Some(raw) = raw else {
+        return Ok(DEFAULT_CI_DEADLINE);
+    };
+    u64::try_from(raw)
+        .ok()
+        .filter(|secs| (1..=MAX_CI_DEADLINE_SECS).contains(secs))
+        .map(Duration::from_secs)
+        .ok_or_else(|| Error::InvalidValue {
+            name: "ci_deadline_secs",
+            value: raw.to_string(),
+        })
+}
+
 /// NaN fails both comparisons and infinity fails the upper bound, so the range alone keeps the
 /// value finite.
 fn resolve_max_budget(raw: Option<f64>) -> Result<f64, Error> {
@@ -584,6 +610,38 @@ mod tests {
             timeout("agent_timeout_secs = 6900").unwrap(),
             Duration::from_secs(MAX_AGENT_TIMEOUT_SECS)
         );
+    }
+
+    #[test]
+    fn ci_deadline_defaults_and_accepts_the_edges() {
+        let deadline =
+            |text: &str| Config::resolve(Some(text), &env_of(&[])).map(|c| c.ci_deadline);
+        assert_eq!(
+            Config::resolve(None, &env_of(&[])).unwrap().ci_deadline,
+            Duration::from_secs(900)
+        );
+        assert_eq!(
+            deadline("ci_deadline_secs = 1").unwrap(),
+            Duration::from_secs(1)
+        );
+        assert_eq!(
+            deadline("ci_deadline_secs = 7200").unwrap(),
+            Duration::from_secs(MAX_CI_DEADLINE_SECS)
+        );
+    }
+
+    #[test]
+    fn invalid_ci_deadlines_fail_startup_naming_the_key() {
+        for text in [
+            "ci_deadline_secs = 0",
+            "ci_deadline_secs = -1",
+            "ci_deadline_secs = 7201",
+        ] {
+            match Config::resolve(Some(text), &env_of(&[])) {
+                Err(Error::InvalidValue { name, .. }) => assert_eq!(name, "ci_deadline_secs"),
+                other => panic!("{text}: {other:?}"),
+            }
+        }
     }
 
     #[test]

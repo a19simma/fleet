@@ -11,7 +11,9 @@ use std::sync::{Arc, Mutex, OnceLock, PoisonError};
 use std::time::Duration;
 
 use fleet_core::Redactor;
-use fleet_proto::v1::{Job, JobState, ReportJobReply, ReportJobRequest};
+use fleet_proto::MAX_CI_LOG_BYTES;
+use fleet_proto::is_ci_log;
+use fleet_proto::v1::{CiState, Job, JobState, ReportJobReply, ReportJobRequest};
 use fleetd::phase::Clock;
 use fleetd::poller::Shutdown;
 use fleetd::runner::{AgentOutcome, AgentRunner, FinishOutcome, Reporter, RunConfig};
@@ -29,6 +31,53 @@ type TestResult = Result<(), Box<dyn std::error::Error>>;
 
 const GH: &str = r#"#!/bin/sh
 root="$GIT_DIR/../.."
+if [ "$1" = pr ] && [ "$2" = checks ]; then
+  env > "$root/checks.env"
+  printf '%s\n' "$@" > "$root/checks.args"
+  echo . >> "$root/checks.calls"
+  n=$(wc -l < "$root/checks.calls")
+  mode=pass
+  [ -f "$root/ci" ] && mode=$(cat "$root/ci")
+  [ "$mode" = flip ] && { if [ "$n" -lt 3 ]; then mode=pending; else mode=pass; fi; }
+  case "$mode" in
+  pass) echo '[{"bucket":"pass","link":"https://example.invalid/actions/runs/9/job/41","name":"build"},{"bucket":"skipping","link":"","name":"docs"}]'; exit 0 ;;
+  fail) echo '[{"bucket":"pass","link":"https://example.invalid/actions/runs/9/job/41","name":"build"},{"bucket":"fail","link":"https://example.invalid/actions/runs/9/job/42","name":"test"}]'; exit 1 ;;
+  pending) echo '[{"bucket":"pending","link":"https://example.invalid/actions/runs/9/job/41","name":"build"}]'; exit 8 ;;
+  mixed) echo '[{"bucket":"pass","link":"https://example.invalid/actions/runs/9/job/41","name":"build"},{"bucket":"pending","link":"https://example.invalid/actions/runs/9/job/43","name":"slow"}]'; exit 8 ;;
+  empty) echo '[]'; exit 0 ;;
+  alt) if [ $((n % 2)) -eq 1 ]; then echo '[{"bucket":"pass","link":"","name":"a"}]'; exit 0; fi; echo '[{"bucket":"pending","link":"","name":"a"}]'; exit 8 ;;
+  partial) if [ "$n" -lt 2 ]; then echo '[{"bucket":"pass","link":"https://example.invalid/actions/runs/9/job/41","name":"lint"}]'; exit 0; fi; echo '[{"bucket":"pass","link":"https://example.invalid/actions/runs/9/job/41","name":"lint"},{"bucket":"fail","link":"https://example.invalid/actions/runs/9/job/42","name":"test"}]'; exit 1 ;;
+  unipass) printf '%s\n' '[{"bucket":"pass","link":"https://example.invalid/caf\u00e9","name":"build"}]'; exit 0 ;;
+  unipend) printf '%s\n' '[{"bucket":"pending","link":"https://example.invalid/a\u200bb","name":"build"}]'; exit 8 ;;
+  bigout) printf '%s\n' '[{"bucket":"pass","link":"","name":"build"}]'; head -c 70000 /dev/zero | tr '\0' ' '; exit 0 ;;
+  passbad) echo '[{"bucket":"pass","link":"https://example.invalid/actions/runs/9/job/41","name":"build"}]'; exit 3 ;;
+  flipfail) if [ "$n" -lt 3 ]; then echo '[{"bucket":"pending","link":"https://example.invalid/actions/runs/9/job/41","name":"build"}]'; exit 8; fi; echo '[{"bucket":"fail","link":"https://example.invalid/actions/runs/9/job/42","name":"test"}]'; exit 1 ;;
+  linkerr) if [ "$n" -lt 2 ]; then echo '[{"bucket":"pending","link":"https://example.invalid/actions/runs/9/job/41","name":"build"}]'; exit 8; fi; echo 'not json'; exit 1 ;;
+  passnolink) if [ "$n" -lt 2 ]; then echo '[{"bucket":"pass","link":"https://example.invalid/actions/runs/9/job/41","name":"build"}]'; exit 0; fi; echo '[{"bucket":"pass","link":"","name":"build"}]'; exit 0 ;;
+  none) echo "no checks reported on the 'swarm/job1' branch" >&2; exit 1 ;;
+  junk) echo 'not json'; exit 0 ;;
+  esac
+  exit 0
+fi
+if [ "$1" = run ] && [ "$2" = view ]; then
+  printf '%s\n' "$@" > "$root/run.args"
+  [ -f "$root/slowlog" ] && sleep 20
+  [ -f "$root/runfail" ] && { echo leaked-log; exit 1; }
+  if [ -f "$root/hugelog" ]; then
+    head -c 1000000 /dev/zero | tr '\0' a
+    echo
+    echo TAIL-MARK
+    exit 0
+  fi
+  if [ -f "$root/biglog" ]; then
+    head -c 30000 /dev/zero | tr '\0' a
+    echo
+    echo TAIL-MARK
+    exit 0
+  fi
+  printf 'step one\n\033[31mred hunter2-hunter2\033[0m\nerror: it broke\r\n'
+  exit 0
+fi
 env > "$root/gh.env"
 printf '%s\n' "$@" > "$root/gh.args"
 if [ -f "$HOME/.config/gh/config.yml" ] || [ -f "$GH_CONFIG_DIR/config.yml" ]; then env > "$root/gh.sawconfig"; fi
@@ -63,6 +112,10 @@ enum Reply {
     Ok,
     Stale,
     Cancel,
+    StaleInCi,
+    CancelInCi,
+    RejectCi,
+    RejectTerminal,
 }
 
 struct Fake(mpsc::UnboundedSender<ReportJobRequest>, Reply);
@@ -73,10 +126,23 @@ impl Reporter for Fake {
         request: ReportJobRequest,
     ) -> impl Future<Output = Result<ReportJobReply, Status>> + Send {
         let renewal = request.chunks.is_empty() && request.terminal_state.is_none();
+        let in_ci = request.ci.is_some();
+        let ends = request.terminal_state.is_some();
         let _ = self.0.send(request);
         match self.1 {
+            Reply::RejectCi if ends && in_ci => {
+                ready(Err(Status::invalid_argument("invalid job telemetry")))
+            }
+            Reply::RejectTerminal if ends => {
+                ready(Err(Status::invalid_argument("invalid job telemetry")))
+            }
             Reply::Stale if renewal => ready(Err(Status::failed_precondition("stale"))),
+            Reply::StaleInCi if in_ci => ready(Err(Status::failed_precondition("stale"))),
             Reply::Cancel if renewal => ready(Ok(ReportJobReply {
+                cancel_requested: true,
+                ..ReportJobReply::default()
+            })),
+            Reply::CancelInCi if in_ci => ready(Ok(ReportJobReply {
                 cancel_requested: true,
                 ..ReportJobReply::default()
             })),
@@ -252,8 +318,46 @@ fn agent_assemble(
     report_interval: Duration,
     reply: Reply,
 ) -> (AgentRunner<Fake>, mpsc::UnboundedReceiver<ReportJobRequest>) {
+    agent_final(
+        rig,
+        askpass_bin,
+        policy,
+        report_interval,
+        reply,
+        Duration::from_secs(30),
+    )
+}
+
+fn agent_waiting(
+    rig: &Rig,
+    report_interval: Duration,
+    reply: Reply,
+    ci_deadline: Duration,
+) -> (AgentRunner<Fake>, mpsc::UnboundedReceiver<ReportJobRequest>) {
+    agent_final(
+        rig,
+        PathBuf::from(env!("CARGO_BIN_EXE_fleetd")),
+        test_policy(),
+        report_interval,
+        reply,
+        ci_deadline,
+    )
+}
+
+fn agent_final(
+    rig: &Rig,
+    askpass_bin: PathBuf,
+    policy: RepoPolicy,
+    report_interval: Duration,
+    reply: Reply,
+    ci_deadline: Duration,
+) -> (AgentRunner<Fake>, mpsc::UnboundedReceiver<ReportJobRequest>) {
     let (tx, rx) = mpsc::unbounded_channel();
     let mut config = RunConfig::new("/bin/echo", false);
+    config.ci_deadline = ci_deadline;
+    config.ci_poll_initial = Duration::from_millis(20);
+    config.ci_poll_cap = Duration::from_millis(50);
+    config.ci_log_budget = Duration::from_secs(2);
     config.repo_policy = policy;
     config.report_interval = report_interval;
     gh().clone_into(&mut config.gh_bin);
@@ -281,6 +385,19 @@ fn agent_assemble(
     ];
     env.extend(std::env::var_os("PATH").map(|path| ("PATH".into(), path)));
     config.base_env = env;
+    if let Ok(path) = std::fs::read_to_string(rig.dir.path().join("ghbin")) {
+        config.gh_bin = path.into();
+    }
+    if let Ok(text) = std::fs::read_to_string(rig.dir.path().join("poll")) {
+        let ms: Vec<u64> = text
+            .split_whitespace()
+            .filter_map(|n| n.parse().ok())
+            .collect();
+        if let [initial, cap] = ms[..] {
+            config.ci_poll_initial = Duration::from_millis(initial);
+            config.ci_poll_cap = Duration::from_millis(cap);
+        }
+    }
     (
         AgentRunner::new(config, Fake(tx, reply), Redactor::new(["hunter2-hunter2"])),
         rx,
@@ -1104,7 +1221,7 @@ async fn a_clean_tree_with_no_commits_succeeds_with_a_no_changes_note() -> TestR
             .flat_map(|r| r.chunks.iter().map(|c| c.text.as_str()))
             .collect();
         assert!(text.contains("no_changes"), "{text}");
-        assert!(logs.text().contains("no changes"));
+        assert!(logs.text().contains("no changes"), "[{}]", logs.text());
         Ok(())
     }))
     .await
@@ -1442,6 +1559,663 @@ async fn a_sha_base_job_with_no_commits_succeeds_without_a_push() -> TestResult 
             }
         );
         assert!(!pushed(&rig)?);
+        Ok(())
+    }))
+    .await
+}
+
+const CI_PR: &str = "https://example.invalid/pr/7";
+const CI_LINK: &str = "https://example.invalid/actions/runs/9/job/";
+
+fn set_ci(rig: &Rig, mode: &str) -> TestResult {
+    std::fs::write(rig.dir.path().join("ci"), mode)?;
+    Ok(())
+}
+
+fn polls(rig: &Rig) -> usize {
+    std::fs::read_to_string(rig.dir.path().join("checks.calls"))
+        .map_or(0, |text| text.lines().count())
+}
+
+fn ci_of(request: &ReportJobRequest) -> Option<(i32, Option<String>)> {
+    request.ci.as_ref().map(|ci| (ci.state, ci.url.clone()))
+}
+
+async fn finished_with(
+    mode: &str,
+    deadline: Duration,
+) -> Result<(Rig, FinishOutcome, Vec<ReportJobRequest>), Box<dyn std::error::Error>> {
+    let rig = rig("ok").await?;
+    commit(&rig)?;
+    set_ci(&rig, mode)?;
+    let (agent, mut rx) = agent_waiting(&rig, Duration::from_millis(100), Reply::Ok, deadline);
+    let (_trigger, shutdown) = Shutdown::channel();
+    let outcome = agent
+        .finish(&job(&rig, true), &rig.worktree, shutdown)
+        .await?;
+    let reports = drain(&mut rx);
+    Ok((rig, outcome, reports))
+}
+
+fn terminal(reports: &[ReportJobRequest]) -> Result<&ReportJobRequest, Box<dyn std::error::Error>> {
+    Ok(reports
+        .last()
+        .filter(|r| r.terminal_state.is_some())
+        .ok_or("no terminal report")?)
+}
+
+#[tokio::test]
+async fn pending_checks_are_reported_until_they_pass() -> TestResult {
+    common::bounded(Box::pin(async {
+        let (rig, outcome, reports) = finished_with("flip", Duration::from_secs(30)).await?;
+        assert_eq!(
+            outcome,
+            FinishOutcome::Succeeded {
+                branch: Some("swarm/job1".into()),
+                pr_url: Some(CI_PR.into())
+            }
+        );
+        let pending: Vec<_> = reports
+            .iter()
+            .filter(|r| {
+                r.ci.as_ref()
+                    .is_some_and(|ci| ci.state == CiState::Pending as i32)
+            })
+            .collect();
+        assert_eq!(pending.len(), 3);
+        assert!(pending.iter().all(|r| r.terminal_state.is_none()));
+        let last = terminal(&reports)?;
+        assert_eq!(last.terminal_state, Some(JobState::Succeeded.into()));
+        assert_eq!(last.pr_url.as_deref(), Some(CI_PR));
+        assert_eq!(
+            ci_of(last),
+            Some((CiState::Success as i32, Some(format!("{CI_LINK}41"))))
+        );
+        assert_eq!(polls(&rig), 4);
+        let args = std::fs::read_to_string(rig.dir.path().join("checks.args"))?;
+        assert_eq!(
+            args.lines().collect::<Vec<_>>(),
+            ["pr", "checks", CI_PR, "--json", "bucket,link"]
+        );
+        Ok(())
+    }))
+    .await
+}
+
+#[tokio::test]
+async fn passing_checks_end_success_on_the_second_settled_poll() -> TestResult {
+    common::bounded(Box::pin(async {
+        let (rig, _, reports) = finished_with("pass", Duration::from_secs(30)).await?;
+        assert_eq!(polls(&rig), 2);
+        let early = reports
+            .iter()
+            .filter(|r| r.ci.is_some() && r.terminal_state.is_none())
+            .count();
+        assert_eq!(early, 1);
+        let last = terminal(&reports)?;
+        assert_eq!(
+            last.ci.as_ref().map(|ci| ci.state),
+            Some(CiState::Success as i32)
+        );
+        assert_eq!(last.ci.as_ref().and_then(|ci| ci.failure_log.clone()), None);
+        Ok(())
+    }))
+    .await
+}
+
+#[tokio::test]
+async fn a_failed_check_ends_failure_with_the_redacted_log() -> TestResult {
+    common::bounded(Box::pin(async {
+        let (rig, outcome, reports) = finished_with("fail", Duration::from_secs(30)).await?;
+        assert!(matches!(outcome, FinishOutcome::Succeeded { .. }));
+        let last = terminal(&reports)?;
+        assert_eq!(last.terminal_state, Some(JobState::Succeeded.into()));
+        let ci = last.ci.as_ref().ok_or("no ci")?;
+        assert_eq!(ci.state, CiState::Failure as i32);
+        assert_eq!(ci.url.as_deref(), Some(format!("{CI_LINK}42").as_str()));
+        let log = ci.failure_log.as_deref().ok_or("no log")?;
+        assert_eq!(log, "step one\n[31mred [REDACTED][0m\nerror: it broke");
+        assert!(is_ci_log(log));
+        let args = std::fs::read_to_string(rig.dir.path().join("run.args"))?;
+        assert_eq!(
+            args.lines().collect::<Vec<_>>(),
+            [
+                "run",
+                "view",
+                "--job",
+                "42",
+                "--repo",
+                &rig.origin.to_string_lossy(),
+                "--log-failed"
+            ]
+        );
+        assert_eq!(polls(&rig), 1);
+        Ok(())
+    }))
+    .await
+}
+
+#[tokio::test]
+async fn a_long_failure_log_keeps_its_tail_within_the_cap() -> TestResult {
+    common::bounded(Box::pin(async {
+        let rig = rig("ok").await?;
+        commit(&rig)?;
+        set_ci(&rig, "fail")?;
+        std::fs::write(rig.dir.path().join("biglog"), "")?;
+        let (agent, mut rx) = agent_waiting(
+            &rig,
+            Duration::from_millis(100),
+            Reply::Ok,
+            Duration::from_secs(30),
+        );
+        let (_trigger, shutdown) = Shutdown::channel();
+        agent
+            .finish(&job(&rig, true), &rig.worktree, shutdown)
+            .await?;
+        let reports = drain(&mut rx);
+        let log = terminal(&reports)?
+            .ci
+            .as_ref()
+            .and_then(|ci| ci.failure_log.clone())
+            .ok_or("no log")?;
+        assert!(log.len() <= MAX_CI_LOG_BYTES);
+        assert!(log.ends_with("TAIL-MARK"));
+        assert!(is_ci_log(&log));
+        Ok(())
+    }))
+    .await
+}
+
+#[tokio::test]
+async fn a_failure_seen_before_the_deadline_stays_failure_when_the_log_is_slow() -> TestResult {
+    common::bounded(Box::pin(async {
+        let rig = rig("ok").await?;
+        commit(&rig)?;
+        set_ci(&rig, "flipfail")?;
+        std::fs::write(rig.dir.path().join("slowlog"), "")?;
+        let (agent, mut rx) = agent_waiting(
+            &rig,
+            Duration::from_millis(100),
+            Reply::Ok,
+            Duration::from_millis(400),
+        );
+        let (_trigger, shutdown) = Shutdown::channel();
+        agent
+            .finish(&job(&rig, true), &rig.worktree, shutdown)
+            .await?;
+        let reports = drain(&mut rx);
+        let last = terminal(&reports)?;
+        assert_eq!(
+            ci_of(last),
+            Some((CiState::Failure as i32, Some(format!("{CI_LINK}42"))))
+        );
+        assert_eq!(last.ci.as_ref().and_then(|ci| ci.failure_log.clone()), None);
+        Ok(())
+    }))
+    .await
+}
+
+#[tokio::test]
+async fn a_gh_error_after_a_link_keeps_the_link_through_the_timeout() -> TestResult {
+    common::bounded(Box::pin(async {
+        let (rig, _, reports) = finished_with("linkerr", Duration::from_millis(400)).await?;
+        assert!(polls(&rig) >= 3);
+        let pending: Vec<_> = reports
+            .iter()
+            .filter_map(|r| r.ci.as_ref())
+            .filter(|ci| ci.state == CiState::Pending as i32)
+            .collect();
+        assert!(pending.len() >= 2);
+        assert!(
+            pending
+                .iter()
+                .all(|ci| ci.url.as_deref() == Some(format!("{CI_LINK}41").as_str()))
+        );
+        assert_eq!(
+            ci_of(terminal(&reports)?),
+            Some((CiState::Timeout as i32, Some(format!("{CI_LINK}41"))))
+        );
+        Ok(())
+    }))
+    .await
+}
+
+#[tokio::test]
+async fn a_passing_poll_without_a_link_keeps_the_first_link_on_success() -> TestResult {
+    common::bounded(Box::pin(async {
+        let (_, _, reports) = finished_with("passnolink", Duration::from_secs(30)).await?;
+        assert_eq!(
+            ci_of(terminal(&reports)?),
+            Some((CiState::Success as i32, Some(format!("{CI_LINK}41"))))
+        );
+        Ok(())
+    }))
+    .await
+}
+
+#[tokio::test]
+async fn checks_still_pending_at_the_deadline_end_timeout() -> TestResult {
+    common::bounded(Box::pin(async {
+        let (rig, outcome, reports) = finished_with("pending", Duration::from_millis(400)).await?;
+        assert!(matches!(outcome, FinishOutcome::Succeeded { .. }));
+        let last = terminal(&reports)?;
+        assert_eq!(last.terminal_state, Some(JobState::Succeeded.into()));
+        assert_eq!(
+            ci_of(last),
+            Some((CiState::Timeout as i32, Some(format!("{CI_LINK}41"))))
+        );
+        assert!(polls(&rig) >= 2);
+        let pending = reports
+            .iter()
+            .filter(|r| {
+                r.ci.as_ref()
+                    .is_some_and(|ci| ci.state == CiState::Pending as i32)
+            })
+            .count();
+        assert!(pending >= 2);
+        Ok(())
+    }))
+    .await
+}
+
+#[tokio::test]
+async fn a_pending_check_blocks_success_until_the_deadline() -> TestResult {
+    common::bounded(Box::pin(async {
+        let (_, _, reports) = finished_with("mixed", Duration::from_millis(300)).await?;
+        let last = terminal(&reports)?;
+        assert_eq!(
+            last.ci.as_ref().map(|ci| ci.state),
+            Some(CiState::Timeout as i32)
+        );
+        Ok(())
+    }))
+    .await
+}
+
+#[tokio::test]
+async fn no_checks_at_the_deadline_end_timeout_without_a_url() -> TestResult {
+    common::bounded(Box::pin(async {
+        for mode in ["none", "empty", "junk"] {
+            let (rig, _, reports) = finished_with(mode, Duration::from_millis(300)).await?;
+            let last = terminal(&reports)?;
+            assert_eq!(ci_of(last), Some((CiState::Timeout as i32, None)), "{mode}");
+            assert!(polls(&rig) >= 2, "{mode}");
+        }
+        Ok(())
+    }))
+    .await
+}
+
+#[tokio::test]
+async fn a_job_without_a_pr_never_polls_checks() -> TestResult {
+    common::bounded(Box::pin(async {
+        let rig = rig("ok").await?;
+        commit(&rig)?;
+        let (agent, mut rx) = agent_waiting(
+            &rig,
+            Duration::from_millis(100),
+            Reply::Ok,
+            Duration::from_secs(30),
+        );
+        let (_trigger, shutdown) = Shutdown::channel();
+        agent
+            .finish(&job(&rig, false), &rig.worktree, shutdown)
+            .await?;
+        assert_eq!(polls(&rig), 0);
+        assert!(drain(&mut rx).iter().all(|r| r.ci.is_none()));
+        Ok(())
+    }))
+    .await
+}
+
+#[tokio::test]
+async fn the_lease_is_renewed_through_a_wait_longer_than_the_report_interval() -> TestResult {
+    common::bounded(Box::pin(async {
+        let (_, _, reports) = finished_with("pending", Duration::from_millis(1200)).await?;
+        let renewals = reports
+            .iter()
+            .filter(|r| r.chunks.is_empty() && r.ci.is_none() && r.terminal_state.is_none())
+            .count();
+        assert!(renewals >= 5, "{renewals}");
+        Ok(())
+    }))
+    .await
+}
+
+#[tokio::test]
+async fn a_lost_lease_during_the_wait_sends_no_terminal_report() -> TestResult {
+    common::bounded(Box::pin(async {
+        let rig = rig("ok").await?;
+        commit(&rig)?;
+        set_ci(&rig, "pending")?;
+        let (agent, mut rx) = agent_waiting(
+            &rig,
+            Duration::from_secs(30),
+            Reply::StaleInCi,
+            Duration::from_secs(30),
+        );
+        let (_trigger, shutdown) = Shutdown::channel();
+        let outcome = agent
+            .finish(&job(&rig, true), &rig.worktree, shutdown)
+            .await?;
+        assert_eq!(outcome, FinishOutcome::Lost);
+        assert!(drain(&mut rx).iter().all(|r| r.terminal_state.is_none()));
+        Ok(())
+    }))
+    .await
+}
+
+#[tokio::test]
+async fn a_cancel_during_the_wait_reports_cancelled_with_no_ci_state() -> TestResult {
+    common::bounded(Box::pin(async {
+        let rig = rig("ok").await?;
+        commit(&rig)?;
+        set_ci(&rig, "pending")?;
+        let (agent, mut rx) = agent_waiting(
+            &rig,
+            Duration::from_secs(30),
+            Reply::CancelInCi,
+            Duration::from_secs(30),
+        );
+        let (_trigger, shutdown) = Shutdown::channel();
+        let outcome = agent
+            .finish(&job(&rig, true), &rig.worktree, shutdown)
+            .await?;
+        assert_eq!(outcome, FinishOutcome::Cancelled);
+        let reports = drain(&mut rx);
+        let last = terminal(&reports)?;
+        assert_eq!(last.terminal_state, Some(JobState::Cancelled.into()));
+        assert!(last.ci.is_none());
+        assert_eq!(last.pr_url.as_deref(), Some(CI_PR));
+        assert_eq!(last.branch.as_deref(), Some("swarm/job1"));
+        Ok(())
+    }))
+    .await
+}
+
+#[tokio::test]
+async fn a_shutdown_during_the_wait_fails_the_job_with_no_ci_state() -> TestResult {
+    common::bounded(Box::pin(async {
+        let rig = rig("ok").await?;
+        commit(&rig)?;
+        set_ci(&rig, "pending")?;
+        let (agent, mut rx) = agent_waiting(
+            &rig,
+            Duration::from_secs(30),
+            Reply::Ok,
+            Duration::from_secs(30),
+        );
+        let (trigger, shutdown) = Shutdown::channel();
+        let calls = rig.dir.path().join("checks.calls");
+        let stop = tokio::spawn(async move {
+            while !calls.exists() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            let _ = trigger.send(true);
+        });
+        let outcome = agent
+            .finish(&job(&rig, true), &rig.worktree, shutdown)
+            .await;
+        stop.await?;
+        assert!(outcome.is_err());
+        let reports = drain(&mut rx);
+        let last = terminal(&reports)?;
+        assert_eq!(last.terminal_state, Some(JobState::Failed.into()));
+        assert!(last.ci.is_none());
+        assert_eq!(last.pr_url.as_deref(), Some(CI_PR));
+        assert_eq!(last.branch.as_deref(), Some("swarm/job1"));
+        Ok(())
+    }))
+    .await
+}
+
+#[tokio::test]
+async fn the_checks_command_runs_with_only_the_gh_credentials() -> TestResult {
+    common::bounded(Box::pin(async {
+        let (rig, _, _) = finished_with("pass", Duration::from_secs(30)).await?;
+        let env = std::fs::read_to_string(rig.dir.path().join("checks.env"))?;
+        assert!(keys(&env).contains("GH_TOKEN"));
+        assert!(!env.contains("FLEET_TOKEN"));
+        assert!(!env.contains("KEPT_VALUE"));
+        assert!(!env.contains("GITHUB_TOKEN"));
+        assert!(!env.contains("LD_PRELOAD"));
+        Ok(())
+    }))
+    .await
+}
+
+async fn finished_in(
+    rig: &Rig,
+    deadline: Duration,
+) -> Result<Vec<ReportJobRequest>, Box<dyn std::error::Error>> {
+    let (agent, mut rx) = agent_waiting(rig, Duration::from_millis(100), Reply::Ok, deadline);
+    let (_trigger, shutdown) = Shutdown::channel();
+    agent
+        .finish(&job(rig, true), &rig.worktree, shutdown)
+        .await?;
+    Ok(drain(&mut rx))
+}
+
+#[tokio::test]
+async fn the_poll_wait_doubles_toward_its_cap() -> TestResult {
+    common::bounded(Box::pin(async {
+        let rig = rig("ok").await?;
+        commit(&rig)?;
+        set_ci(&rig, "pending")?;
+        std::fs::write(rig.dir.path().join("poll"), "30 1000")?;
+        let reports = finished_in(&rig, Duration::from_millis(500)).await?;
+        assert_eq!(
+            terminal(&reports)?.ci.as_ref().map(|ci| ci.state),
+            Some(CiState::Timeout as i32)
+        );
+        let n = polls(&rig);
+        assert!((2..=9).contains(&n), "{n}");
+        Ok(())
+    }))
+    .await
+}
+
+#[tokio::test]
+async fn a_gh_that_cannot_start_never_reads_as_success() -> TestResult {
+    common::bounded(Box::pin(async {
+        let rig = rig("ok").await?;
+        commit(&rig)?;
+        let wrapper = rig.dir.path().join("gh-wrap");
+        std::fs::write(
+            &wrapper,
+            format!(
+                "#!/bin/sh\nif [ \"$1\" = pr ] && [ \"$2\" = checks ]; then\n  rm -f \"$0\"\n  echo '[{{\"bucket\":\"pending\",\"link\":\"\",\"name\":\"n\"}}]'\n  exit 8\nfi\nexec {} \"$@\"\n",
+                gh().display()
+            ),
+        )?;
+        std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o755))?;
+        std::fs::write(rig.dir.path().join("ghbin"), wrapper.to_string_lossy().as_bytes())?;
+        let reports = finished_in(&rig, Duration::from_millis(400)).await?;
+        assert!(!wrapper.exists());
+        assert_eq!(ci_of(terminal(&reports)?), Some((CiState::Timeout as i32, None)));
+        Ok(())
+    }))
+    .await
+}
+
+#[tokio::test]
+async fn a_failed_log_fetch_keeps_the_failure_and_drops_the_log() -> TestResult {
+    common::bounded(Box::pin(async {
+        let rig = rig("ok").await?;
+        commit(&rig)?;
+        set_ci(&rig, "fail")?;
+        std::fs::write(rig.dir.path().join("runfail"), "")?;
+        let reports = finished_in(&rig, Duration::from_secs(30)).await?;
+        let ci = terminal(&reports)?.ci.as_ref().ok_or("no ci")?;
+        assert_eq!(ci.state, CiState::Failure as i32);
+        assert_eq!(ci.failure_log, None);
+        Ok(())
+    }))
+    .await
+}
+
+#[tokio::test]
+async fn an_all_pass_answer_from_a_failing_gh_is_not_success() -> TestResult {
+    common::bounded(Box::pin(async {
+        let (rig, _, reports) = finished_with("passbad", Duration::from_millis(300)).await?;
+        assert_eq!(
+            ci_of(terminal(&reports)?),
+            Some((CiState::Timeout as i32, None))
+        );
+        assert!(polls(&rig) >= 2);
+        Ok(())
+    }))
+    .await
+}
+
+#[tokio::test]
+async fn a_first_poll_that_lists_one_passing_check_never_reads_as_success() -> TestResult {
+    common::bounded(Box::pin(async {
+        let (rig, _, reports) = finished_with("partial", Duration::from_secs(30)).await?;
+        assert_eq!(
+            ci_of(terminal(&reports)?),
+            Some((CiState::Failure as i32, Some(format!("{CI_LINK}42"))))
+        );
+        assert_eq!(polls(&rig), 2);
+        Ok(())
+    }))
+    .await
+}
+
+#[tokio::test]
+async fn a_non_ascii_pass_link_is_dropped_so_the_terminal_report_stays_valid() -> TestResult {
+    common::bounded(Box::pin(async {
+        let (_, _, reports) = finished_with("unipass", Duration::from_secs(30)).await?;
+        assert_eq!(
+            ci_of(terminal(&reports)?),
+            Some((CiState::Success as i32, None))
+        );
+        assert!(
+            reports
+                .iter()
+                .filter_map(|r| r.ci.as_ref())
+                .all(|ci| ci.url.is_none())
+        );
+        Ok(())
+    }))
+    .await
+}
+
+#[tokio::test]
+async fn a_non_ascii_link_never_becomes_the_deadline_url() -> TestResult {
+    common::bounded(Box::pin(async {
+        let (_, _, reports) = finished_with("unipend", Duration::from_millis(300)).await?;
+        assert_eq!(
+            ci_of(terminal(&reports)?),
+            Some((CiState::Timeout as i32, None))
+        );
+        Ok(())
+    }))
+    .await
+}
+
+#[tokio::test]
+async fn a_rejected_ci_field_is_dropped_and_the_terminal_report_resent_once() -> TestResult {
+    common::bounded(Box::pin(async {
+        let rig = rig("ok").await?;
+        commit(&rig)?;
+        set_ci(&rig, "pass")?;
+        let (agent, mut rx) = agent_waiting(
+            &rig,
+            Duration::from_millis(100),
+            Reply::RejectCi,
+            Duration::from_secs(30),
+        );
+        let (_trigger, shutdown) = Shutdown::channel();
+        agent
+            .finish(&job(&rig, true), &rig.worktree, shutdown)
+            .await?;
+        let reports = drain(&mut rx);
+        let ends: Vec<_> = reports
+            .iter()
+            .filter(|r| r.terminal_state.is_some())
+            .collect();
+        assert_eq!(ends.len(), 2);
+        assert!(ends[0].ci.is_some());
+        let resent = ends[1];
+        assert!(resent.ci.is_none());
+        assert_eq!(resent.terminal_state, Some(JobState::Succeeded.into()));
+        assert_eq!(resent.pr_url.as_deref(), Some(CI_PR));
+        assert_eq!(resent.branch.as_deref(), Some("swarm/job1"));
+        Ok(())
+    }))
+    .await
+}
+
+#[tokio::test]
+async fn a_terminal_report_without_a_ci_field_is_never_resent() -> TestResult {
+    common::bounded(Box::pin(async {
+        let rig = rig("ok").await?;
+        commit(&rig)?;
+        set_ci(&rig, "pass")?;
+        let (agent, mut rx) = agent_waiting(
+            &rig,
+            Duration::from_millis(100),
+            Reply::RejectTerminal,
+            Duration::from_secs(30),
+        );
+        let (_trigger, shutdown) = Shutdown::channel();
+        agent
+            .finish(&job(&rig, true), &rig.worktree, shutdown)
+            .await?;
+        let ends = drain(&mut rx)
+            .iter()
+            .filter(|r| r.terminal_state.is_some())
+            .count();
+        assert_eq!(ends, 2);
+        Ok(())
+    }))
+    .await
+}
+
+#[tokio::test]
+async fn a_huge_failed_log_yields_its_last_bytes() -> TestResult {
+    common::bounded(Box::pin(async {
+        let rig = rig("ok").await?;
+        commit(&rig)?;
+        set_ci(&rig, "fail")?;
+        std::fs::write(rig.dir.path().join("hugelog"), "")?;
+        let reports = finished_in(&rig, Duration::from_secs(30)).await?;
+        let log = terminal(&reports)?
+            .ci
+            .as_ref()
+            .and_then(|ci| ci.failure_log.clone())
+            .ok_or("no log")?;
+        assert!(log.len() >= MAX_CI_LOG_BYTES - 1 && log.len() <= MAX_CI_LOG_BYTES);
+        assert!(log.ends_with("\nTAIL-MARK"));
+        Ok(())
+    }))
+    .await
+}
+
+#[tokio::test]
+async fn a_checks_answer_cut_by_the_capture_limit_never_reads_as_success() -> TestResult {
+    common::bounded(Box::pin(async {
+        let (rig, _, reports) = finished_with("bigout", Duration::from_millis(400)).await?;
+        assert_eq!(
+            ci_of(terminal(&reports)?),
+            Some((CiState::Timeout as i32, None))
+        );
+        assert!(polls(&rig) >= 2);
+        Ok(())
+    }))
+    .await
+}
+
+#[tokio::test]
+async fn passing_polls_must_be_consecutive() -> TestResult {
+    common::bounded(Box::pin(async {
+        let (rig, _, reports) = finished_with("alt", Duration::from_millis(600)).await?;
+        assert_eq!(
+            terminal(&reports)?.ci.as_ref().map(|ci| ci.state),
+            Some(CiState::Timeout as i32)
+        );
+        assert!(polls(&rig) >= 4);
         Ok(())
     }))
     .await

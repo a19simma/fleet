@@ -189,6 +189,23 @@ message Job {
   optional string batch_id = 23;
   JobKind kind = 24;
   optional string target_job_id = 25;
+  optional CiState ci_state = 26;
+  optional uint64 ci_checked_at_ms = 27;
+  optional string ci_url = 28;
+}
+
+enum CiState {
+  CI_STATE_UNSPECIFIED = 0;
+  CI_STATE_PENDING = 1;
+  CI_STATE_SUCCESS = 2;
+  CI_STATE_FAILURE = 3;
+  CI_STATE_TIMEOUT = 4;
+}
+
+message JobCi {
+  CiState state = 1;
+  optional string url = 2;
+  optional string failure_log = 3;
 }
 
 message JobVerdict {
@@ -328,6 +345,7 @@ message ReportJobRequest {
   repeated JobEvent events = 12;
   optional JobSummary summary = 13;
   optional JobVerdict verdict = 14;
+  optional JobCi ci = 15;
 }
 
 enum JobEventKind {

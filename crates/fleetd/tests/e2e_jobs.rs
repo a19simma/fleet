@@ -41,7 +41,14 @@ git add hello.txt
 git -c user.name=t -c user.email=t@example.invalid commit -q -m "add hello.txt"
 "#;
 
-const GH: &str = "#!/bin/sh\necho created\necho https://example.invalid/pr/9\n";
+const GH: &str = r#"#!/bin/sh
+if [ "$1" = pr ] && [ "$2" = checks ]; then
+  echo '[{"bucket":"pass","link":"https://example.invalid/actions/runs/9/job/41","name":"build"}]'
+  exit 0
+fi
+echo created
+echo https://example.invalid/pr/9
+"#;
 
 fn script(dir: &Path, name: &str, body: &str) -> Result<std::path::PathBuf, std::io::Error> {
     let path = dir.join(name);

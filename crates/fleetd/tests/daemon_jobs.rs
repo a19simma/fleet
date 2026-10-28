@@ -12,8 +12,8 @@ use std::time::Duration;
 use fleet_core::Profile;
 use fleet_proto::v1::fleet_worker_server::{FleetWorker, FleetWorkerServer};
 use fleet_proto::v1::{
-    ClaimJobReply, ClaimJobRequest, GetProfileBlobReply, GetProfileBlobRequest, Job, JobState,
-    ProfileRef, ReportJobReply, ReportJobRequest,
+    CiState, ClaimJobReply, ClaimJobRequest, GetProfileBlobReply, GetProfileBlobRequest, Job,
+    JobState, ProfileRef, ReportJobReply, ReportJobRequest,
 };
 use fleetd::{Config, forward_hook, run_with_env};
 use tempfile::TempDir;
@@ -52,7 +52,14 @@ echo '{"type":"assistant","message":{"content":[{"type":"text","text":"working"}
 exec tail -f /dev/null
 "#;
 
-const GH: &str = "#!/bin/sh\necho created\necho https://example.invalid/pr/9\n";
+const GH: &str = r#"#!/bin/sh
+if [ "$1" = pr ] && [ "$2" = checks ]; then
+  echo '[{"bucket":"pass","link":"https://example.invalid/actions/runs/9/job/41","name":"build"}]'
+  exit 0
+fi
+echo created
+echo https://example.invalid/pr/9
+"#;
 
 struct Stub(Arc<Worker>);
 
@@ -326,6 +333,10 @@ async fn the_daemon_runs_a_claimed_job_to_a_pushed_branch_and_a_pull_request() -
         assert_eq!(terminal.attempt, 1);
         assert_eq!(terminal.terminal_state, Some(JobState::Succeeded.into()));
         assert_eq!(terminal.pr_url.as_deref(), Some(PR_URL));
+        assert_eq!(
+            terminal.ci.as_ref().map(|ci| ci.state),
+            Some(CiState::Success.into())
+        );
         assert_eq!(terminal.branch.as_deref(), Some("swarm/job1"));
         assert_eq!(
             git(&origin, &["show", "swarm/job1:hello.txt"])?.trim(),
