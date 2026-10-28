@@ -1,6 +1,6 @@
 # Credential broker
 
-Status: Proposed 2026-10-28. Not built. Builds on ADR-0028 and ADR-0036. Amends ADR-0024 (push and `gh` sections) and the "A credential broker only" rejection in ADR-0031.
+Status: Proposed 2026-10-28. Built as library code, not wired: no runtime path builds a broker or serves the broker socket. Builds on ADR-0028 and ADR-0036. Amends ADR-0024 (push and `gh` sections) and the "A credential broker only" rejection in ADR-0031.
 
 Decision by the user: the agent never holds `GH_TOKEN` or `FLEET_TOKEN`. fleetd performs `git push` and `gh` calls on its behalf over the per-job socket of ADR-0036.
 
@@ -31,9 +31,13 @@ fleetd derives a `PushTarget` from the claimed Job on the server side: `Own(job 
 
 A mid-run push is raceable until ADR-0031 P3 ships: an agent-owned clone made with `git clone --reference`, from which fleetd fetches with hooks and fsmonitor off and `GIT_ALLOW_PROTOCOL=file`, then pushes from the mirror. The `push` op depends on P3. The read ops (`pr_checks`, mirror `fetch`, `pr_create`) ship first. The finish step stays as fallback and is idempotent with a broker push through the shared Published state.
 
+### Push and pr_create implementation
+
+`push` runs the finish step's publish path (`PublishGit` in `publish.rs`) for the bound target only: the same scratch repo, the same fast-forward refspec without `+`, no leftover commit. A head already pushed replies `already published`. `pr_create` (`PublishGh`) replies with the URL the shared state holds, else the open pull request of the bound branch, else creates one with the agent's title and body after the broker's bounds, redaction and attribution checks. A Job with `open_pr` off, or a branch not yet pushed, fails. The shared Published state holds the pushed head and the URL under a per-Job lock held by every publish operation, so the broker and the finish step never run git in the scratch repo at once. The finish step skips a head already pushed, pushes any commit made after it, reuses the URL, and looks for an open pull request first after a failed broker `pr_create`, which may have created one. A broker failure changes nothing the finish step needs.
+
 ### Caps
 
-Pushes per Job, one PR per Job, title 256 chars, body 8 KiB, no attribution lines, redacted output. Errors are fixed messages and never echo a token or a client value. Each op has a timeout.
+Pushes per Job (10, at least 5 s apart), one `pr_create` call per Job that reaches `gh` (a repeat after a returned URL costs nothing), title 256 chars, body 8 KiB, no attribution lines, redacted output. Errors are fixed messages and never echo a token or a client value. Each op has a timeout.
 
 ## Failure modes
 
