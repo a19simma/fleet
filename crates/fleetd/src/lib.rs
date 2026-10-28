@@ -14,6 +14,7 @@ pub mod agent_exec;
 mod app;
 pub mod askpass;
 pub mod backoff;
+pub mod broker;
 mod config;
 mod dump;
 mod error;
