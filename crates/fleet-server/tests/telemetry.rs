@@ -143,6 +143,7 @@ async fn every_kind_maps_to_its_stored_name(pool: PgPool) {
         JobEventKind::ApiRetry,
         JobEventKind::Phase,
         JobEventKind::Stuck,
+        JobEventKind::Fetch,
     ];
     let events = kinds
         .iter()
@@ -157,7 +158,82 @@ async fn every_kind_maps_to_its_stored_name(pool: PgPool) {
         .fetch_all(&pool)
         .await
         .unwrap();
-    assert_eq!(stored, ["tool", "denial", "api_retry", "phase", "stuck"]);
+    assert_eq!(
+        stored,
+        ["tool", "denial", "api_retry", "phase", "stuck", "fetch"]
+    );
+}
+
+#[sqlx::test]
+async fn fetch_events_keep_cmd_and_detail_count_toward_the_cap_and_read_back(pool: PgPool) {
+    let store = store(pool.clone()).await;
+    let job = claimed(&store).await;
+    let last = MAX_EVENTS_PER_JOB - 1;
+    let fetch = |seq: u32| JobEvent {
+        kind: JobEventKind::Fetch.into(),
+        cmd: Some("https://example.org/a".to_owned()),
+        detail: Some("intent".to_owned()),
+        ..event(seq)
+    };
+    let mut summary = full_summary();
+    summary.missing = vec!["fetch_outcome".to_owned()];
+    send(
+        &store,
+        &job,
+        vec![fetch(last - 1), fetch(last), fetch(last + 1)],
+        Some(summary),
+    )
+    .await
+    .unwrap();
+    let seqs: Vec<i32> = sqlx::query_scalar("SELECT seq FROM job_event ORDER BY seq")
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+    assert_eq!(
+        seqs,
+        [
+            i32::try_from(last - 1).unwrap(),
+            i32::try_from(last).unwrap()
+        ]
+    );
+    let reply = store.read_job_events(&job.job_id, None, 10).await.unwrap();
+    assert_eq!(reply.events.len(), 2);
+    for read in &reply.events {
+        assert_eq!(read.kind, i32::from(JobEventKind::Fetch));
+        assert_eq!(read.cmd.as_deref(), Some("https://example.org/a"));
+        assert_eq!(read.detail.as_deref(), Some("intent"));
+    }
+    let tool_calls: Option<i64> = sqlx::query_scalar("SELECT tool_calls FROM job_summary")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(
+        tool_calls,
+        full_summary().tool_calls.map(|n| i64::try_from(n).unwrap())
+    );
+}
+
+#[sqlx::test]
+async fn the_database_check_admits_fetch_and_refuses_other_kinds(pool: PgPool) {
+    let store = store(pool.clone()).await;
+    let job = claimed(&store).await;
+    let insert = |kind: &'static str| {
+        let pool = pool.clone();
+        let id = job.job_id.clone();
+        async move {
+            sqlx::query("INSERT INTO job_event (job_id, seq, ts_ms, kind) VALUES ($1, 0, 0, $2)")
+                .bind(id)
+                .bind(kind)
+                .execute(&pool)
+                .await
+        }
+    };
+    insert("fetch").await.unwrap();
+    sqlx::query("DELETE FROM job_event")
+        .execute(&pool)
+        .await
+        .unwrap();
+    insert("fetches").await.unwrap_err();
 }
 
 #[sqlx::test]

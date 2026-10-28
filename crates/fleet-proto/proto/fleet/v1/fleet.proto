@@ -367,6 +367,7 @@ enum JobEventKind {
   JOB_EVENT_KIND_API_RETRY = 3;
   JOB_EVENT_KIND_PHASE = 4;
   JOB_EVENT_KIND_STUCK = 5;
+  JOB_EVENT_KIND_FETCH = 6;
 }
 
 message JobEvent {
