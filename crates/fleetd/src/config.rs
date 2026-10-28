@@ -513,7 +513,7 @@ fn nonzero(name: &'static str, raw: Option<u64>, default: u64) -> Result<u64, Er
 }
 
 fn resolve_jobs_dir(env: &dyn Fn(&str) -> Option<String>, file: Option<PathBuf>) -> PathBuf {
-    env("FLEETD_JOBS_DIR")
+    let dir = env("FLEETD_JOBS_DIR")
         .map(PathBuf::from)
         .or(file)
         .unwrap_or_else(|| {
@@ -521,7 +521,8 @@ fn resolve_jobs_dir(env: &dyn Fn(&str) -> Option<String>, file: Option<PathBuf>)
                 .as_deref()
                 .and_then(first_dir)
                 .map_or_else(|| PathBuf::from("jobs"), |dir| dir.join("jobs"))
-        })
+        });
+    std::path::absolute(&dir).unwrap_or(dir)
 }
 
 type HookSocket = (Option<PathBuf>, Option<u32>, Option<String>);
@@ -931,7 +932,8 @@ mod tests {
         assert!(cfg.disposable);
         assert_eq!(cfg.agent_config_dir, None);
         assert_eq!(cfg.agent_env_passthrough, Vec::<String>::new());
-        assert_eq!(cfg.jobs_dir, PathBuf::from("jobs"));
+        assert_eq!(cfg.jobs_dir, std::path::absolute("jobs").unwrap());
+        assert!(cfg.jobs_dir.is_absolute());
         let state = |name: &str| (name == "STATE_DIRECTORY").then(|| "/var/lib/fleetd".to_owned());
         let cfg = Config::resolve(None, &state).unwrap();
         assert_eq!(cfg.jobs_dir, PathBuf::from("/var/lib/fleetd/jobs"));

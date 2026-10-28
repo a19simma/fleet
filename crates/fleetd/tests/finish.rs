@@ -231,6 +231,21 @@ struct Rig {
 }
 
 async fn rig(mode: &str) -> Result<Rig, Box<dyn std::error::Error>> {
+    rig_at(mode, false).await
+}
+
+fn relative_jobs_root(dir: &Path) -> Result<PathBuf, Box<dyn std::error::Error>> {
+    let mut relative = PathBuf::new();
+    for _ in std::env::current_dir()?.components().skip(1) {
+        relative.push("..");
+    }
+    relative.push(dir.strip_prefix("/")?);
+    relative.push("work");
+    assert!(relative.is_relative());
+    Ok(relative)
+}
+
+async fn rig_at(mode: &str, relative: bool) -> Result<Rig, Box<dyn std::error::Error>> {
     let dir = TempDir::new()?;
     let origin = dir.path().join("origin.git");
     let seed = dir.path().join("seed");
@@ -246,7 +261,17 @@ async fn rig(mode: &str) -> Result<Rig, Box<dyn std::error::Error>> {
         &["push", "--quiet", &origin.to_string_lossy(), "main"],
     )?;
     std::fs::write(dir.path().join("mode"), mode)?;
-    let root = dir.path().join("work");
+    let root = if relative {
+        let raw = relative_jobs_root(dir.path())?
+            .to_string_lossy()
+            .into_owned();
+        fleetd::Config::resolve(None, &|name| {
+            (name == "FLEETD_JOBS_DIR").then(|| raw.clone())
+        })?
+        .jobs_dir
+    } else {
+        dir.path().join("work")
+    };
     let checkout = Workspace::new(&root)
         .with_policy(test_policy())
         .prepare("job1", &origin.to_string_lossy(), "main")
@@ -435,6 +460,24 @@ fn pushed(rig: &Rig) -> Result<bool, Box<dyn std::error::Error>> {
     Ok(!git(&rig.origin, &["branch", "--list", "swarm/job1"])?
         .trim()
         .is_empty())
+}
+
+#[tokio::test]
+async fn a_relative_jobs_dir_still_finishes_and_pushes() -> TestResult {
+    common::bounded(Box::pin(async {
+        let rig = rig_at("ok", true).await?;
+        assert!(rig.worktree.is_absolute());
+        commit(&rig)?;
+        let (agent, _rx) = agent(&rig);
+        let (_trigger, shutdown) = Shutdown::channel();
+        let outcome = agent
+            .finish(&job(&rig, false), &rig.worktree, shutdown)
+            .await?;
+        assert!(matches!(outcome, FinishOutcome::Succeeded { .. }));
+        assert!(pushed(&rig)?);
+        Ok(())
+    }))
+    .await
 }
 
 #[tokio::test]

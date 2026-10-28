@@ -167,6 +167,16 @@ pub fn share_dir(path: &Path, gid: u32) -> io::Result<()> {
     fs::set_permissions(path, fs::Permissions::from_mode(SHARED_DIR_MODE))
 }
 
+/// Gives `path` to `gid` with mode 2750: the group reads and searches, never writes.
+///
+/// # Errors
+///
+/// Returns the chown or chmod error.
+pub fn share_dir_read_only(path: &Path, gid: u32) -> io::Result<()> {
+    std::os::unix::fs::chown(path, None, Some(gid))?;
+    fs::set_permissions(path, fs::Permissions::from_mode(0o2750))
+}
+
 /// Gives the tree at `path` to `gid`: directories become 2770 and a file gets its owner bits
 /// copied to the group. Symlinks are skipped.
 ///

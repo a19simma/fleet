@@ -344,7 +344,7 @@ mod tests {
         let git = dir.path().join("rec-git");
         std::fs::write(
             &git,
-            "#!/bin/sh\ncase \"$*\" in\n*\" fetch \"*) printf %s \"$GH_TOKEN\" > \"$(dirname \"$HOME\")/tok\" ;;\nesac\nexit 0\n",
+            "#!/bin/sh\ncase \"$*\" in\n*\" fetch \"*) [ -n \"$GH_TOKEN\" ] && printf %s \"$GH_TOKEN\" > \"$(dirname \"$HOME\")/tok\" ;;\nesac\nexit 0\n",
         )?;
         std::fs::set_permissions(&git, std::fs::Permissions::from_mode(0o755))?;
         let jobs = dir.path().join("jobs");
