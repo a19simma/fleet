@@ -841,24 +841,51 @@ fn valid_body(body: &str) -> bool {
         && !has_attribution(body)
 }
 
-/// Text that GitHub turns into a notification, a backlink, a closed issue or a fetched image.
+/// Text that GitHub turns into a notification, a backlink, a closed issue, a link or an image.
 ///
-/// Refuses `@` or `#` followed by an ASCII alphanumeric (mentions, `#n`, `owner/repo#n`, so
-/// closing keywords before a reference are covered), any `http://` or `https://` URL (so closing
-/// keywords before an issue or PR URL are covered), markdown `![` and an HTML `<img` tag.
-/// Matching is case-insensitive and the input is never echoed.
+/// Refuses `@` followed by an ASCII alphanumeric, `#` followed by a digit, `gh-` followed by a
+/// digit, any HTML entity (`&` followed by `#`, or by ASCII alphanumerics and `;`, because
+/// markdown decodes entities before GitHub's mention, reference and autolink filters run), any
+/// HTML tag (`<` followed by an ASCII letter, `/` or `!`), the markdown forms `![` and `](`, and
+/// the link schemes `http://`, `https://`, `ftp://`, `mailto:` and `www.`. Matching is
+/// case-insensitive and the input is never echoed.
 fn has_live_markup(text: &str) -> bool {
     let lower = text.to_ascii_lowercase();
     let bytes = lower.as_bytes();
     let sigil = bytes.windows(2).any(|w| match *w {
         [b'@', c] => c.is_ascii_alphanumeric(),
         [b'#', c] => c.is_ascii_digit(),
+        [b'<', c] => c.is_ascii_alphabetic() || matches!(c, b'/' | b'!'),
         _ => false,
     });
     sigil
-        || ["http://", "https://", "![", "<img"]
-            .iter()
-            .any(|needle| lower.contains(needle))
+        || has_entity(&lower)
+        || has_gh_reference(bytes)
+        || [
+            "http://", "https://", "ftp://", "mailto:", "www.", "![", "](",
+        ]
+        .iter()
+        .any(|needle| lower.contains(needle))
+}
+
+fn has_entity(lower: &str) -> bool {
+    lower.split('&').skip(1).any(|rest| {
+        let name_len = rest
+            .find(|c: char| !c.is_ascii_alphanumeric())
+            .unwrap_or(rest.len());
+        rest.starts_with('#')
+            || (name_len > 0
+                && rest
+                    .get(name_len..)
+                    .is_some_and(|tail| tail.starts_with(';')))
+    })
+}
+
+fn has_gh_reference(bytes: &[u8]) -> bool {
+    bytes.windows(4).any(|w| match *w {
+        [b'g', b'h', b'-', c] => c.is_ascii_digit(),
+        _ => false,
+    })
 }
 
 const ATTRIBUTION_TRAILERS: [&str; 3] = ["coauthoredby", "signedoffby", "claudesession"];
@@ -1803,6 +1830,72 @@ mod tests {
     }
 
     #[test]
+    fn entities_and_html_constructs_are_refused_in_title_and_body() {
+        let hostile = [
+            "&#64;victim",
+            "&#x40;victim",
+            "&#X40;victim",
+            "&commat;victim",
+            "&COMMAT;victim",
+            "&#35;12",
+            "&num;12",
+            "h&#116;tps://evil/x",
+            "h&ttp;x",
+            "&lt;img src=x>",
+            "&amp;",
+            "&#",
+            "a &# b",
+            "<b>bold</b>",
+            "<a href=x>",
+            "<A HREF=x>",
+            "</div>",
+            "<!-- hidden -->",
+            "<b",
+            "[x](https://e)",
+            "[x](y)",
+            "](",
+            "see www.example.test",
+            "WWW.example.test",
+            "ftp://example.test/a",
+            "FTP://example.test/a",
+            "mailto:a@b",
+            "MAILTO:x",
+            "gh-12",
+            "GH-7",
+            "fixes gh-3",
+        ];
+        for text in hostile {
+            assert!(has_live_markup(text), "{text:?}");
+            assert!(has_live_markup(&format!("intro\n\n{text}\n")), "{text:?}");
+        }
+        let benign = [
+            "A&B",
+            "R&D team",
+            "Q&A: how it works",
+            "C#",
+            "issue 12",
+            "fixture",
+            "100% done",
+            "a < b",
+            "a <= b",
+            "x > y",
+            "fix: handle 2 > 1",
+            "AT&T line",
+            "a & b",
+            "gh-",
+            "gh-abc",
+            "wwwx",
+            "a < 1",
+            "x&y and z;",
+            "[link] (text)",
+        ];
+        for text in benign {
+            assert!(!has_live_markup(text), "{text:?}");
+            assert!(valid_title(text) && valid_body(text), "{text:?}");
+        }
+    }
+
+    #[test]
     fn finish_step_pull_request_text_passes_the_validators() {
         let job_id = "0190a1b2-c3d4-7e5f-8a6b-7c8d9e0f1a2b";
         let texts = [
@@ -1814,6 +1907,24 @@ mod tests {
             assert!(!has_live_markup(&text), "{text:?}");
             assert!(valid_title(&text) && valid_body(&text), "{text:?}");
         }
+    }
+
+    #[tokio::test]
+    async fn entity_text_is_denied_in_title_and_body() -> TestResult {
+        let fake = Fake::default();
+        let b = broker(&fake)?;
+        for hostile in [
+            "&#64;victim",
+            "&commat;victim",
+            "&num;12",
+            "h&#116;tps://x",
+            "<b>x",
+        ] {
+            assert_eq!(b.handle(pr(hostile, "b")).await, denied(Denial::UnsafeText));
+            assert_eq!(b.handle(pr("t", hostile)).await, denied(Denial::UnsafeText));
+        }
+        assert_eq!(fake.calls(), Vec::<String>::new());
+        Ok(())
     }
 
     #[tokio::test]
