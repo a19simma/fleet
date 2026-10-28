@@ -41,7 +41,7 @@ The Box ceilings for max turns, budget and timeout win over the Profile values (
 
 - `Bash(git push *)`, `Bash(git push*)`, `Bash(gh *)`: the daemon publishes the branch (ADR-0024).
 - `Bash(curl *)`: denied in the default agent settings.
-- `WebFetch`: fetches go through the egress proxy (ADR-0031), not the tool. This is a documented choice.
+- `WebFetch`: fetches go through `fleetd fetch` on the per-job socket (ADR-0036, ADR-0038), not the tool. Amended by ADR-0038.
 - `Edit`, `Write`, `NotebookEdit`, `MultiEdit`: edits go through Bash (ADR-0024).
 
 An `allow` entry matches a Floor deny, and is dropped, when `covers(deny, allow)` holds. Identical strings cover. A bare tool name covers that name and that name followed by `(`. `Tool(prefix*)` covers `Tool(arg)` when `arg` starts with `prefix`, and `Tool(prefix2*)` when `prefix2` starts with `prefix`. Tool names are matched exactly, with case and whitespace significant. `Bash(git push*)` therefore also covers `Bash(git pushd*)`: when in doubt the allow is dropped. fleetd reports each dropped allow. The effective deny list is the Floor set, then the Profile extras in sorted order, with no repeats. Max turns and budget use the Box default when the Profile sets none, then the lower of that value and the Box ceiling.
@@ -109,3 +109,8 @@ This task set builds structure only: Profile storage and application, a batch ta
 - **Mutable named Profiles.** A Job could not tell which content it ran.
 - **`claude_version` inside the Profile.** The stamp already records the version that ran, and a Profile that pins it duplicates that record.
 - **Letting a Profile loosen the Floor.** Removes the one guarantee that holds for every Job.
+
+## Amendment (ADR-0038)
+
+- The Floor gains a fixed `FLOOR_ALLOW` with `Bash(fleetd fetch *)` and `Bash(fleetd broker *)`. A Profile `allow` list cannot drop it. Without it the Overlay rule that any Profile allow rule replaces the default allow list would remove fetch silently.
+- The Profile field list stays closed. A Profile has no egress field, and adding one needs an amendment.
