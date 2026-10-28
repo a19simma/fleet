@@ -139,10 +139,6 @@ impl Feed {
     /// `fetch_outcome` to the summary `missing` list. The caller refuses the fetch when an
     /// intent record fails. "Recorded" means this feed accepted the event, not that the server
     /// confirmed it.
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "the fetch handler lands in the next task")
-    )]
     pub(crate) fn record_fetch(
         &mut self,
         redactor: &Redactor,
@@ -157,10 +153,6 @@ impl Feed {
         result
     }
 
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "the fetch handler lands in the next task")
-    )]
     fn try_record_fetch(
         &mut self,
         redactor: &Redactor,
