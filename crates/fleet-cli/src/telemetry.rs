@@ -153,8 +153,7 @@ fn result(event: &JobEvent) -> String {
     }
 }
 
-fn command(cmd: Option<&String>) -> String {
-    let clean = cmd.map_or_else(|| "-".into(), |cmd| sanitize(cmd));
+fn cut_to_width(clean: String) -> String {
     if clean.chars().count() > CMD_WIDTH {
         let mut cut: String = clean.chars().take(CMD_WIDTH - 1).collect();
         cut.push(ELLIPSIS);
@@ -164,7 +163,59 @@ fn command(cmd: Option<&String>) -> String {
     }
 }
 
+fn command(cmd: Option<&String>) -> String {
+    cut_to_width(cmd.map_or_else(|| "-".into(), |cmd| sanitize(cmd)))
+}
+
+fn valid_scheme(scheme: &str) -> bool {
+    let mut chars = scheme.chars();
+    chars.next().is_some_and(|c| c.is_ascii_alphabetic())
+        && chars.all(|c| c.is_ascii_alphanumeric() || matches!(c, '+' | '.' | '-'))
+}
+
+fn host_of(url: &str) -> Option<String> {
+    let url = url.replace('\\', "/");
+    let (scheme, rest) = url.trim().split_once("://")?;
+    if !valid_scheme(scheme) {
+        return None;
+    }
+    let (authority, tail) = rest.split_once(['/', '?', '#']).unwrap_or((rest, ""));
+    if !authority.contains('@') && tail.contains('@') {
+        return None;
+    }
+    let host = authority.rsplit('@').next()?.trim();
+    (!host.is_empty()).then(|| host.to_owned())
+}
+
+/// Host and optional port of a fetch URL, without scheme, credentials, path or query.
+///
+/// Returns `-` when the scheme is invalid, the host is empty, or an `@` after the
+/// authority cut hints that a delimiter split credentials. A backslash counts as a
+/// delimiter. The host is cut to the command width.
+fn url_host(url: Option<&String>) -> String {
+    url.and_then(|url| host_of(&sanitize(url)))
+        .map_or_else(|| "-".into(), cut_to_width)
+}
+
+fn fetch_result(event: &JobEvent) -> String {
+    event
+        .exit_code
+        .map_or_else(|| "-".into(), |status| format!("status {status}"))
+}
+
 fn write_row(out: &mut impl Write, event: &JobEvent) -> std::io::Result<()> {
+    if event.kind() == JobEventKind::Fetch {
+        return writeln!(
+            out,
+            "{}\t{}\tfetch\t{}\t{}\t{}\t{}",
+            event.seq,
+            clock(event.ts_ms),
+            fetch_result(event),
+            duration(event.dur_ms),
+            or_dash(event.out_bytes.as_ref()),
+            url_host(event.cmd.as_ref()),
+        );
+    }
     writeln!(
         out,
         "{}\t{}\t{}\t{}\t{}\t{}\t{}",
@@ -211,7 +262,7 @@ pub(crate) async fn write_tools(
         for event in reply
             .events
             .iter()
-            .filter(|event| event.kind() == JobEventKind::Tool)
+            .filter(|event| matches!(event.kind(), JobEventKind::Tool | JobEventKind::Fetch))
         {
             write_row(out, event)?;
             rows += 1;
