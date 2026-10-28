@@ -48,7 +48,7 @@ use std::io;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::process::{ExitStatus, Stdio};
-use std::sync::{Arc, Mutex, PoisonError};
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::Duration;
 
 use fleet_core::Redactor;
@@ -69,6 +69,7 @@ use tonic::{Code, Status};
 use crate::agent_config::{Bundle, JOB_EMAIL, JOB_NAME, JUDGE_PROTOCOL, JobDir, protocol_for};
 use crate::askpass;
 use crate::feed::Feed;
+use crate::fetch_service::FeedBook;
 use crate::floor::{BoxCeilings, PERMISSION_MODE};
 use crate::group::GroupGuard;
 use crate::jobsock::ServiceName;
@@ -635,6 +636,7 @@ pub struct AgentRunner<R> {
     profiles: Mutex<HashMap<String, Arc<Applied>>>,
     pub(crate) clock: Arc<dyn Clock>,
     hub: Option<Arc<HookHub>>,
+    feeds: Option<Arc<FeedBook>>,
     claude_version: Mutex<Option<String>>,
 }
 
@@ -644,7 +646,7 @@ struct Carry {
     progress: String,
     pending: VecDeque<TranscriptChunk>,
     pending_bytes: usize,
-    feed: Option<Feed>,
+    feed: Option<Arc<Mutex<Feed>>>,
     result_text: Option<String>,
     model: Option<String>,
 }
@@ -662,6 +664,7 @@ impl<R: Reporter> AgentRunner<R> {
             profiles: Mutex::new(HashMap::new()),
             clock: Arc::new(SystemClock::new()),
             hub: None,
+            feeds: None,
             claude_version: Mutex::new(None),
         }
     }
@@ -922,6 +925,20 @@ impl<R: Reporter> AgentRunner<R> {
         self
     }
 
+    /// Registers the feed of each job with `feeds` while its agent runs, so the fetch service
+    /// can record the job's fetch events. The stream forgets the job when it ends.
+    #[must_use]
+    pub fn with_feed_book(mut self, feeds: Arc<FeedBook>) -> Self {
+        self.feeds = Some(feeds);
+        self
+    }
+
+    fn feed_book(&self) -> Option<(Arc<FeedBook>, Redactor)> {
+        self.feeds
+            .clone()
+            .map(|feeds| (feeds, self.redactor.clone()))
+    }
+
     fn carry_key(job: &Job) -> String {
         format!("{}#{}", job.job_id, job.attempt)
     }
@@ -940,14 +957,15 @@ impl<R: Reporter> AgentRunner<R> {
             .unwrap_or_else(PoisonError::into_inner)
             .remove(&Self::carry_key(job))
             .unwrap_or_default();
-        let mut stream = Stream::new(
+        let stream = Stream::new(
             &self.reporter,
             job,
             self.config.terminal_report_timeout,
             carry,
             self.hub.clone(),
+            self.feed_book(),
         );
-        stream.feed.record(self.take_phases(job));
+        stream.feed().record(self.take_phases(job));
         stream
     }
 
@@ -1069,8 +1087,9 @@ impl<R: Reporter> AgentRunner<R> {
             self.config.terminal_report_timeout,
             Carry::default(),
             self.hub.clone(),
+            self.feed_book(),
         );
-        stream.feed.record(self.take_phases(job));
+        stream.feed().record(self.take_phases(job));
         let result = self
             .run_stream(job, cwd, shutdown, &mut stream, launch)
             .await;
@@ -1109,7 +1128,7 @@ impl<R: Reporter> AgentRunner<R> {
         if let Some(version) = self.claude_version(cwd, &job_dir.home()).await {
             spec.stamp.claude_version = version;
         }
-        stream.feed.set_stamp(spec.stamp.clone());
+        stream.feed().set_stamp(spec.stamp.clone());
         let Launched { stdout, mut proc } = match launch(spec) {
             Ok(launched) => launched,
             Err(err) => {
@@ -1137,7 +1156,8 @@ impl<R: Reporter> AgentRunner<R> {
         let _ = proc.wait().await;
         match end {
             Ok(status) => {
-                if let Some(error) = stream.feed.result_subtype().and_then(cap_error) {
+                let capped = stream.feed().result_subtype().and_then(cap_error);
+                if let Some(error) = capped {
                     return Ok(stream.fail(status.code(), error).await);
                 }
                 match status.code() {
@@ -1209,7 +1229,7 @@ impl<R: Reporter> AgentRunner<R> {
         let raced = ctl
             .race(self.alive(job, &progress, self.publish(job, cwd, &mut phases)))
             .await;
-        stream.feed.record(phases);
+        stream.feed().record(phases);
         match raced {
             Ok(Err(Interrupt::Lost)) => Ok(FinishOutcome::Lost),
             Ok(Err(Interrupt::Cancelled)) => {
@@ -1794,7 +1814,8 @@ struct Stream<'a, R> {
     job: &'a Job,
     pending: VecDeque<TranscriptChunk>,
     pending_bytes: usize,
-    feed: Feed,
+    feed: Arc<Mutex<Feed>>,
+    book: Option<Arc<FeedBook>>,
     in_flight: Option<InFlight<'a>>,
     next_seq: u64,
     progress: String,
@@ -1808,10 +1829,17 @@ struct Stream<'a, R> {
     model: Option<String>,
 }
 
+fn fresh_feed() -> Arc<Mutex<Feed>> {
+    Arc::new(Mutex::new(Feed::new(Instant::now())))
+}
+
 impl<R> Drop for Stream<'_, R> {
     fn drop(&mut self) {
         if let Some(hub) = &self.hub {
             hub.unregister(&self.job.job_id);
+        }
+        if let Some(book) = &self.book {
+            book.forget(&self.job.job_id);
         }
     }
 }
@@ -1823,16 +1851,23 @@ impl<'a, R: Reporter> Stream<'a, R> {
         terminal_timeout: Duration,
         carry: Carry,
         hub: Option<Arc<HookHub>>,
+        feeds: Option<(Arc<FeedBook>, Redactor)>,
     ) -> Self {
         if let Some(hub) = &hub {
             hub.register(&job.job_id);
         }
+        let feed = carry.feed.unwrap_or_else(fresh_feed);
+        let book = feeds.map(|(book, redactor)| {
+            book.register(&job.job_id, Arc::clone(&feed), redactor);
+            book
+        });
         Self {
             reporter,
             job,
             pending: carry.pending,
             pending_bytes: carry.pending_bytes,
-            feed: carry.feed.unwrap_or_else(|| Feed::new(Instant::now())),
+            feed,
+            book,
             in_flight: None,
             next_seq: carry.next_seq.max(1),
             progress: carry.progress,
@@ -1847,10 +1882,14 @@ impl<'a, R: Reporter> Stream<'a, R> {
         }
     }
 
-    fn pull_hooks(&mut self) {
+    fn feed(&self) -> MutexGuard<'_, Feed> {
+        self.feed.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    fn pull_hooks(&self) {
         let Some(hub) = &self.hub else { return };
         for report in hub.drain(&self.job.job_id) {
-            self.feed.hook(report);
+            self.feed().hook(report);
         }
     }
 
@@ -1860,7 +1899,7 @@ impl<'a, R: Reporter> Stream<'a, R> {
             progress: self.progress.clone(),
             pending: std::mem::take(&mut self.pending),
             pending_bytes: std::mem::take(&mut self.pending_bytes),
-            feed: Some(std::mem::replace(&mut self.feed, Feed::new(Instant::now()))),
+            feed: Some(std::mem::replace(&mut self.feed, fresh_feed())),
             result_text: self.result_text.take(),
             model: self.model.take(),
         }
@@ -1871,7 +1910,7 @@ impl<'a, R: Reporter> Stream<'a, R> {
             return;
         }
         let clean = redactor.redact_str(line);
-        self.feed.line(redactor, &clean, Instant::now());
+        self.feed().line(redactor, &clean, Instant::now());
         self.pull_hooks();
         if let Some(text) = assistant_text(&clean) {
             self.progress = text.chars().take(MAX_PROGRESS_CHARS).collect();
@@ -1920,7 +1959,7 @@ impl<'a, R: Reporter> Stream<'a, R> {
     fn beat(&mut self, report_interval: Duration) {
         self.pull_hooks();
         if !self.pending.is_empty()
-            || !self.feed.backlog_empty()
+            || !self.feed().backlog_empty()
             || self.last_report.elapsed() >= report_interval
         {
             self.start();
@@ -1928,7 +1967,7 @@ impl<'a, R: Reporter> Stream<'a, R> {
     }
 
     fn drained(&self) -> bool {
-        self.pending.is_empty() && self.feed.backlog_empty()
+        self.pending.is_empty() && self.feed().backlog_empty()
     }
 
     fn in_flight(&self) -> bool {
@@ -1942,7 +1981,7 @@ impl<'a, R: Reporter> Stream<'a, R> {
         let count = self.batch_len();
         let chunks: Vec<_> = self.pending.iter().take(count).cloned().collect();
         let upto = chunks.last().map_or(0, |chunk| chunk.seq);
-        let events = self.feed.batch();
+        let events = self.feed().batch();
         let events_upto = events.last().map(|event| event.seq);
         let mut request = self.request(chunks);
         request.events = events;
@@ -1978,7 +2017,7 @@ impl<'a, R: Reporter> Stream<'a, R> {
                     }
                 }
                 if let Some(upto) = reply.events_upto {
-                    self.feed.ack(upto);
+                    self.feed().ack(upto);
                 }
                 self.last_report = Instant::now();
                 self.failing = false;
@@ -2139,7 +2178,7 @@ impl<'a, R: Reporter> Stream<'a, R> {
         request.verdict = end.verdict;
         request.ci = end.ci;
         self.pull_hooks();
-        request.summary = Some(self.feed.finish(ending(end.state, end.error)));
+        request.summary = Some(self.feed().finish(ending(end.state, end.error)));
         match Box::pin(Self::report_terminal(self.reporter, request)).await {
             Err(status) if status.code() == Code::FailedPrecondition => {
                 tracing::info!("job already ended");
@@ -2281,9 +2320,11 @@ mod tests {
         ending, parse_version,
     };
     use crate::agent_config::protocol_for;
+    use crate::fetch_service::{FeedBook, FetchRecorder};
     use crate::jobsock::ServiceName;
     use crate::poller::Shutdown;
     use crate::profile_apply::LoadError;
+    use crate::telemetry::{FetchPhase, FetchRecordError};
     use fleet_core::Profile;
     use fleet_core::Redactor;
     use fleet_proto::v1::{GetProfileBlobReply, GetProfileBlobRequest, ProfileRef};
@@ -2988,5 +3029,117 @@ mod tests {
         assert_eq!(seen[0].len(), 1000);
         assert_eq!(seen[1], b"next\n");
         assert_eq!(seen[2], b"last");
+    }
+
+    #[derive(Debug)]
+    struct BookProbe {
+        inner: FakeLauncher,
+        book: Arc<FeedBook>,
+        seen: Arc<Mutex<Vec<Result<(), FetchRecordError>>>>,
+    }
+
+    impl Launcher for BookProbe {
+        fn launch(&self, spec: AgentSpec) -> io::Result<Launched> {
+            let seen = self
+                .book
+                .record("job1", "https://docs.example/", FetchPhase::Intent);
+            self.seen
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .push(seen);
+            self.inner.launch(spec)
+        }
+    }
+
+    #[tokio::test]
+    async fn the_feed_of_a_running_job_is_registered_and_forgotten_when_the_run_ends() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let book = Arc::new(FeedBook::default());
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let launcher = BookProbe {
+            inner: FakeLauncher::new(ExitStatus::from_raw(0), false),
+            book: Arc::clone(&book),
+            seen: Arc::clone(&seen),
+        };
+        let runner = AgentRunner::new(
+            test_config(dir.path()),
+            Replies { cancel: false },
+            Redactor::default(),
+        )
+        .with_launcher(Arc::new(launcher))
+        .with_feed_book(Arc::clone(&book));
+        let url = "https://docs.example/";
+        assert_eq!(
+            book.record("job1", url, FetchPhase::Intent),
+            Err(FetchRecordError::Closed)
+        );
+        let (_trigger, shutdown) = Shutdown::channel();
+        let outcome = runner.run(&test_job(), dir.path(), shutdown).await;
+        assert_eq!(outcome.ok(), Some(AgentOutcome::Succeeded));
+        assert_eq!(
+            *seen.lock().unwrap_or_else(PoisonError::into_inner),
+            [Ok(())]
+        );
+        assert_eq!(
+            book.record("job1", url, FetchPhase::Intent),
+            Err(FetchRecordError::Closed)
+        );
+    }
+
+    #[tokio::test]
+    async fn a_runner_without_a_feed_book_still_runs_and_records_nothing() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let book = Arc::new(FeedBook::default());
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let launcher = BookProbe {
+            inner: FakeLauncher::new(ExitStatus::from_raw(0), false),
+            book: Arc::clone(&book),
+            seen: Arc::clone(&seen),
+        };
+        let runner = AgentRunner::new(
+            test_config(dir.path()),
+            Replies { cancel: false },
+            Redactor::default(),
+        )
+        .with_launcher(Arc::new(launcher));
+        let (_trigger, shutdown) = Shutdown::channel();
+        let outcome = runner.run(&test_job(), dir.path(), shutdown).await;
+        assert_eq!(outcome.ok(), Some(AgentOutcome::Succeeded));
+        assert_eq!(
+            *seen.lock().unwrap_or_else(PoisonError::into_inner),
+            [Err(FetchRecordError::Closed)]
+        );
+    }
+
+    #[tokio::test]
+    async fn a_failed_launch_still_forgets_the_job() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let book = Arc::new(FeedBook::default());
+        let runner = AgentRunner::new(
+            test_config(dir.path()),
+            Replies { cancel: false },
+            Redactor::default(),
+        )
+        .with_launcher(Arc::new(FailingLauncher))
+        .with_feed_book(Arc::clone(&book));
+        let (_trigger, shutdown) = Shutdown::channel();
+        let outcome = runner.run(&test_job(), dir.path(), shutdown).await;
+        assert!(
+            matches!(outcome, Ok(AgentOutcome::Failed { .. })),
+            "{outcome:?}"
+        );
+        assert_eq!(
+            book.record("job1", "https://docs.example/", FetchPhase::Intent),
+            Err(FetchRecordError::Closed)
+        );
+    }
+
+    #[derive(Debug)]
+    struct FailingLauncher;
+
+    impl Launcher for FailingLauncher {
+        fn launch(&self, _: AgentSpec) -> io::Result<Launched> {
+            Err(io::Error::other("no unit"))
+        }
     }
 }

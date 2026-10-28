@@ -15,14 +15,18 @@ use tonic::transport::Channel;
 use crate::Error;
 use crate::agent_config::Bundle;
 use crate::config::Config;
+use crate::connect_proxy::{ConnectProxy, ProxyLimits};
+use crate::fetch::{Fetcher, SystemResolver, TcpDialer};
+use crate::fetch_service::{FeedBook, FetchRecorder, FetchService, MAX_CONCURRENT_FETCHES};
 use crate::jobenv::group_id;
-use crate::jobsock::Services;
+use crate::jobsock::{ServiceName, Services};
 use crate::poller::{
     GrpcReporter, JobRunner, PollRandom, Poller, RunError, SERVER_URL_ENV, Shutdown, TOKEN_ENV,
     Token, channel,
 };
 use crate::runner::{AgentOutcome, AgentRunner, Interrupt, Reporter, RunConfig};
 use crate::systemd::select_launcher;
+use crate::telemetry::{FetchPhase, FetchRecordError};
 use crate::toolhook::HookHub;
 use crate::workspace::{RepoPolicy, Workspace};
 
@@ -233,6 +237,45 @@ fn job_workspace(
     workspace
 }
 
+struct BookRecorder(Arc<FeedBook>);
+
+impl FetchRecorder for BookRecorder {
+    fn record(&self, job_id: &str, url: &str, phase: FetchPhase) -> Result<(), FetchRecordError> {
+        self.0.record(job_id, url, phase)
+    }
+}
+
+/// The services every Job socket of this daemon offers, built once and shared by all sockets.
+///
+/// `Fetch` is a [`FetchService`] over the config's policy and caps, system DNS and plain TCP,
+/// recording through `feeds`. `EgressProxy` is a [`ConnectProxy`] over the config's
+/// `egress_allow` list (the model API host is always allowed) with the system resolver and
+/// dialer, so every dial is pinned to an address that passed `netguard::is_public_address`.
+/// Both key their per-job state by the job id of the socket, never by the client. The broker is
+/// not offered here. The direct launcher refuses a socket and drops these in
+/// [`select_launcher`].
+#[must_use]
+pub(crate) fn job_services(config: &Config, feeds: &Arc<FeedBook>) -> Services {
+    let fetcher = Fetcher::system(config.fetch_policy.clone(), config.fetch_caps);
+    let fetch = FetchService::new(
+        config.fetch_policy.clone(),
+        config.fetch_caps,
+        MAX_CONCURRENT_FETCHES,
+        fetcher,
+        BookRecorder(Arc::clone(feeds)),
+    );
+    let proxy = ConnectProxy::new(
+        config.egress_allow.clone(),
+        ProxyLimits::default(),
+        SystemResolver,
+        TcpDialer,
+    );
+    let mut services = Services::new();
+    services.insert(ServiceName::Fetch, Arc::new(fetch));
+    services.insert(ServiceName::EgressProxy, Arc::new(Arc::new(proxy)));
+    services
+}
+
 /// Builds the poller when `FLEET_SERVER_URL` is set and non-empty, else `None`.
 ///
 /// # Errors
@@ -271,12 +314,14 @@ pub(crate) fn build(
         })?;
     }
     let workspace = job_workspace(config, &mut run, env).with_redactor(redactor.clone());
-    let launcher = select_launcher(config, run.job_gid, Services::new());
+    let feeds = Arc::new(FeedBook::default());
+    let launcher = select_launcher(config, run.job_gid, job_services(config, &feeds));
     let runner = DaemonRunner::new(
         workspace,
         AgentRunner::new(run, reporter, redactor)
             .with_hook_hub(hub)
-            .with_launcher(launcher),
+            .with_launcher(launcher)
+            .with_feed_book(feeds),
         box_name,
     );
     Poller::with_channel(
@@ -744,5 +789,316 @@ mod tests {
         assert!(fx.runner.run(job.clone(), shutdown).await.is_err());
         assert!(!fx.runner.agent.has_profile(&job));
         Ok(())
+    }
+
+    mod wired {
+        use std::io;
+        use std::sync::{Arc, Mutex, PoisonError};
+        use std::time::Duration;
+
+        use fleet_core::Redactor;
+        use tempfile::TempDir;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt, BufReader};
+        use tokio::net::UnixStream;
+        use tokio::time::{Instant, timeout};
+
+        use crate::config::Config;
+        use crate::connect_proxy::FORBIDDEN;
+        use crate::feed::Feed;
+        use crate::fetch_service::{FeedBook, Refusal};
+        use crate::jobsock::{
+            AGENT_SLICE, JobSocket, Limits, Peer, PeerId, ServiceName, Services, read_frame,
+            write_frame,
+        };
+        use crate::systemd::select_launcher;
+
+        use super::super::job_services;
+
+        type TestResult = Result<(), Box<dyn std::error::Error>>;
+
+        const OUTER: Duration = Duration::from_secs(10);
+
+        struct Cgroup;
+
+        impl Peer for Cgroup {
+            fn identity(&self, _: &UnixStream) -> io::Result<PeerId> {
+                Ok(PeerId {
+                    pid: 7,
+                    cgroup: format!("0::/{AGENT_SLICE}/fleet-agent@job1.service\n"),
+                })
+            }
+        }
+
+        fn config_of(file: &str) -> Result<Config, Box<dyn std::error::Error>> {
+            Ok(Config::resolve(Some(file), &|_| None)?)
+        }
+
+        fn names(services: &Services) -> Vec<&'static str> {
+            let mut names: Vec<_> = services.keys().map(|name| name.as_str()).collect();
+            names.sort_unstable();
+            names
+        }
+
+        fn served(config: &Config, feeds: &Arc<FeedBook>) -> Vec<&'static str> {
+            let launcher = select_launcher(config, None, job_services(config, feeds));
+            let mut names: Vec<_> = launcher
+                .job_services()
+                .into_iter()
+                .map(ServiceName::as_str)
+                .collect();
+            names.sort_unstable();
+            names
+        }
+
+        struct Rig {
+            _dir: TempDir,
+            socket: JobSocket,
+        }
+
+        fn rig(config: &Config, feeds: &Arc<FeedBook>) -> Result<Rig, Box<dyn std::error::Error>> {
+            let dir = TempDir::new()?;
+            let socket = JobSocket::bind(
+                &dir.path().join("job.sock"),
+                "job1",
+                job_services(config, feeds),
+                Arc::new(Cgroup),
+                Limits::default(),
+            )?;
+            Ok(Rig { _dir: dir, socket })
+        }
+
+        impl Rig {
+            async fn open(&self, handshake: &[u8]) -> io::Result<UnixStream> {
+                let mut stream = UnixStream::connect(self.socket.path()).await?;
+                write_frame(&mut stream, handshake).await?;
+                Ok(stream)
+            }
+
+            async fn fetch(&self, request: &[u8]) -> Result<String, Box<dyn std::error::Error>> {
+                let stream = self.open(ServiceName::Fetch.as_str().as_bytes()).await?;
+                let (read, mut write) = stream.into_split();
+                write_frame(&mut write, request).await?;
+                let mut read = BufReader::new(read);
+                let frame = timeout(OUTER, read_frame(&mut read)).await??;
+                Ok(String::from_utf8(frame)?)
+            }
+
+            async fn connect(&self, head: &[u8]) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
+                let mut stream = self
+                    .open(ServiceName::EgressProxy.as_str().as_bytes())
+                    .await?;
+                stream.write_all(head).await?;
+                let mut got = Vec::new();
+                timeout(OUTER, stream.read_to_end(&mut got)).await??;
+                Ok(got)
+            }
+        }
+
+        fn register(feeds: &FeedBook, job: &str) -> Arc<Mutex<Feed>> {
+            let feed = Arc::new(Mutex::new(Feed::new(Instant::now())));
+            feeds.register(job, Arc::clone(&feed), Redactor::default());
+            feed
+        }
+
+        #[test]
+        fn a_default_config_serves_exactly_fetch_and_egress_proxy_under_systemd() -> TestResult {
+            let feeds = Arc::new(FeedBook::default());
+            let config = config_of("agent_launcher = \"systemd\"\n")?;
+            assert_eq!(served(&config, &feeds), ["egress proxy", "fetch"]);
+            assert_eq!(
+                names(&job_services(&config, &feeds)),
+                ["egress proxy", "fetch"]
+            );
+            Ok(())
+        }
+
+        #[test]
+        fn the_direct_launcher_serves_nothing_even_with_a_full_service_set() -> TestResult {
+            let feeds = Arc::new(FeedBook::default());
+            let config = config_of("agent_launcher = \"direct\"\n")?;
+            assert_eq!(names(&job_services(&config, &feeds)).len(), 2);
+            assert_eq!(served(&config, &feeds), Vec::<&str>::new());
+            let default = config_of("")?;
+            assert_eq!(served(&default, &feeds), Vec::<&str>::new());
+            Ok(())
+        }
+
+        #[tokio::test]
+        async fn an_unknown_or_unregistered_service_name_closes_with_no_reply() -> TestResult {
+            let feeds = Arc::new(FeedBook::default());
+            let rig = rig(&config_of("agent_launcher = \"systemd\"\n")?, &feeds)?;
+            let names: [&[u8]; 8] = [
+                b"broker", b"bogus", b"Fetch", b"FETCH", b"fetch ", b"egress", b"fetch\0", b"",
+            ];
+            for name in names {
+                let mut stream = rig.open(name).await?;
+                let mut seen = Vec::new();
+                timeout(OUTER, stream.read_to_end(&mut seen)).await??;
+                assert_eq!(seen, Vec::<u8>::new(), "{name:?}");
+            }
+            Ok(())
+        }
+
+        #[tokio::test]
+        async fn fetch_refuses_hostile_requests_with_fixed_text_and_never_echoes_them() -> TestResult
+        {
+            let feeds = Arc::new(FeedBook::default());
+            let rig = rig(&config_of("agent_launcher = \"systemd\"\n")?, &feeds)?;
+            let invalid = format!(
+                r#"{{"status":"error","error":"{}"}}"#,
+                Refusal::InvalidRequest.message()
+            );
+            let table: [(&str, &[u8], Option<&str>); 9] = [
+                ("empty object", b"{}", None),
+                ("not json", b"GET / HTTP/1.1", None),
+                ("url not a string", br#"{"url":1}"#, None),
+                (
+                    "unknown key",
+                    br#"{"url":"https://a.example/","x":1}"#,
+                    None,
+                ),
+                (
+                    "duplicate url",
+                    br#"{"url":"https://a.example/","url":"https://b.example/"}"#,
+                    None,
+                ),
+                (
+                    "file scheme",
+                    br#"{"url":"file:///etc/passwd"}"#,
+                    Some("passwd"),
+                ),
+                (
+                    "loopback literal",
+                    br#"{"url":"http://127.0.0.1:9/secret"}"#,
+                    Some("secret"),
+                ),
+                (
+                    "userinfo",
+                    br#"{"url":"https://user:hunter2@a.example/"}"#,
+                    Some("hunter2"),
+                ),
+                (
+                    "ipv6 literal",
+                    br#"{"url":"http://[::1]/leak"}"#,
+                    Some("leak"),
+                ),
+            ];
+            for (label, request, leak) in table {
+                let reply = rig.fetch(request).await?;
+                assert!(
+                    reply.starts_with(r#"{"status":"error","error":""#),
+                    "{label}: {reply}"
+                );
+                if let Some(leak) = leak {
+                    assert!(!reply.contains(leak), "{label}: {reply}");
+                } else {
+                    assert_eq!(reply, invalid, "{label}");
+                }
+            }
+            Ok(())
+        }
+
+        #[tokio::test]
+        async fn fetch_for_a_job_with_no_registered_feed_is_refused_before_any_lookup() -> TestResult
+        {
+            let feeds = Arc::new(FeedBook::default());
+            let rig = rig(&config_of("agent_launcher = \"systemd\"\n")?, &feeds)?;
+            let reply = rig.fetch(br#"{"url":"https://docs.example/page"}"#).await?;
+            assert_eq!(
+                reply,
+                format!(
+                    r#"{{"status":"error","error":"{}"}}"#,
+                    Refusal::NotRecorded.message()
+                )
+            );
+            Ok(())
+        }
+
+        #[tokio::test]
+        async fn fetch_for_a_registered_job_records_its_intent_in_that_jobs_feed() -> TestResult {
+            let feeds = Arc::new(FeedBook::default());
+            let feed = register(&feeds, "job1");
+            let other = register(&feeds, "job2");
+            let config =
+                config_of("agent_launcher = \"systemd\"\nfetch_connect_timeout_secs = 2\n")?;
+            let rig = rig(&config, &feeds)?;
+            let reply = rig
+                .fetch(br#"{"url":"https://nohost.invalid/page"}"#)
+                .await?;
+            assert!(reply.starts_with(r#"{"status":"error""#), "{reply}");
+            assert!(!reply.contains(Refusal::NotRecorded.message()), "{reply}");
+            let events = feed.lock().unwrap_or_else(PoisonError::into_inner).batch();
+            assert!(!events.is_empty(), "the intent reached the feed of job1");
+            let others = other.lock().unwrap_or_else(PoisonError::into_inner).batch();
+            assert!(others.is_empty(), "job2 saw nothing");
+            Ok(())
+        }
+
+        #[tokio::test]
+        async fn fetch_after_the_feed_is_forgotten_is_refused_again() -> TestResult {
+            let feeds = Arc::new(FeedBook::default());
+            let _feed = register(&feeds, "job1");
+            feeds.forget("job1");
+            let rig = rig(&config_of("agent_launcher = \"systemd\"\n")?, &feeds)?;
+            let reply = rig.fetch(br#"{"url":"https://docs.example/page"}"#).await?;
+            assert!(reply.contains(Refusal::NotRecorded.message()), "{reply}");
+            Ok(())
+        }
+
+        #[tokio::test]
+        async fn the_egress_proxy_refuses_every_hostile_connect_with_the_one_403() -> TestResult {
+            let feeds = Arc::new(FeedBook::default());
+            let rig = rig(&config_of("agent_launcher = \"systemd\"\n")?, &feeds)?;
+            let table: [(&str, &[u8]); 9] = [
+                (
+                    "host off the allow list",
+                    b"CONNECT evil.example:443 HTTP/1.1\r\n\r\n",
+                ),
+                (
+                    "allowed host, wrong port",
+                    b"CONNECT api.anthropic.com:80 HTTP/1.1\r\n\r\n",
+                ),
+                ("ip literal", b"CONNECT 8.8.8.8:443 HTTP/1.1\r\n\r\n"),
+                (
+                    "userinfo trick",
+                    b"CONNECT evil.example@api.anthropic.com:443 HTTP/1.1\r\n\r\n",
+                ),
+                (
+                    "plain GET",
+                    b"GET http://api.anthropic.com/ HTTP/1.1\r\n\r\n",
+                ),
+                (
+                    "sibling domain",
+                    b"CONNECT x.api.anthropic.com:443 HTTP/1.1\r\n\r\n",
+                ),
+                (
+                    "loopback name off the list",
+                    b"CONNECT localhost:443 HTTP/1.1\r\n\r\n",
+                ),
+                (
+                    "metadata address",
+                    b"CONNECT 169.254.169.254:443 HTTP/1.1\r\n\r\n",
+                ),
+                ("garbage", b"\x00\x01\x02\r\n\r\n"),
+            ];
+            for (label, head) in table {
+                assert_eq!(rig.connect(head).await?, FORBIDDEN, "{label}");
+            }
+            Ok(())
+        }
+
+        #[tokio::test]
+        async fn an_allowed_name_that_resolves_to_loopback_is_refused_by_the_pinned_dial()
+        -> TestResult {
+            let feeds = Arc::new(FeedBook::default());
+            let config =
+                config_of("agent_launcher = \"systemd\"\negress_allow = [\"localhost\"]\n")?;
+            let rig = rig(&config, &feeds)?;
+            let got = rig
+                .connect(b"CONNECT localhost:443 HTTP/1.1\r\n\r\n")
+                .await?;
+            assert_eq!(got, FORBIDDEN);
+            Ok(())
+        }
     }
 }

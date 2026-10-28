@@ -25,9 +25,10 @@
 //!
 //! A reply must fit one frame. A rendered page that does not is refused with a fixed error.
 //!
-//! This module is built, not wired: no runtime path registers the service yet. The production
-//! recorder is [`crate::feed::FeedBook`]; the runner registers each job's feed with it and calls
-//! `forget` on both it and the service when the job ends.
+//! `jobs::build` registers one instance under [`crate::jobsock::ServiceName::Fetch`] with a
+//! [`FeedBook`] recorder. The runner registers each job's feed with the book when its stream
+//! starts and forgets it when the stream ends. Calling [`FetchService::forget`] when a job ends
+//! is still to wire.
 
 use std::collections::HashMap;
 use std::fmt;
@@ -82,13 +83,6 @@ impl fmt::Debug for FeedBook {
 
 impl FeedBook {
     /// Makes `feed` the feed that records the fetch events of `job_id`, replacing an earlier one.
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "the runner registers its feeds in WIRE-3 and WIRE-4"
-        )
-    )]
     pub(crate) fn register(&self, job_id: &str, feed: Arc<Mutex<Feed>>, redactor: Redactor) {
         self.feeds
             .lock()
@@ -97,13 +91,6 @@ impl FeedBook {
     }
 
     /// Drops the state of `job_id`. A second call, or a call for an unknown job, does nothing.
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "the runner forgets finished jobs in WIRE-3 and WIRE-4"
-        )
-    )]
     pub(crate) fn forget(&self, job_id: &str) {
         let removed = self
             .feeds
