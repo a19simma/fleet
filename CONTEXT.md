@@ -76,6 +76,10 @@ _Avoid_: job dir, workspace
 Planned, not built: a recorded Job input with an expected outcome, meant to run through `fleet eval run`.
 _Avoid_: test case
 
+**Fetch policy**:
+The Box-level rule for which hosts `fleetd fetch` may reach. Planned, not built: allow all public hosts first, a radiant allowlist later. A Profile cannot change it (ADR-0038).
+_Avoid_: egress allowlist, proxy policy
+
 ## Relationships
 
 - A **Job** has many **Job Events** and at most one **Job Summary**.

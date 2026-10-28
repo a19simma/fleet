@@ -40,3 +40,7 @@ fleetd records two tiers of telemetry per Job and reports them through `ReportJo
 ## Amendment (ADR-0034)
 
 A profile column and a batch comparison read from the existing summary and event data under the same `NULL` and own-n rules. No new metric is added.
+
+## Amendment (ADR-0038)
+
+Kinds gain `fetch` (`EventKind::Fetch`, proto `JOB_EVENT_KIND_FETCH = 6`) and migration `0016` widens the `job_event` kind CHECK. Fetch events count toward the 2000-event cap. The `missing` list gains `fetch_outcome`. Summary figures are unchanged.

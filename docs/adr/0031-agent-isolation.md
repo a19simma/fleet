@@ -28,7 +28,7 @@ Isolate the agent in phases with systemd and a second uid. Each phase ships alon
 
 - **Namespace.** `PrivateNetwork=yes` in the template.
 - **Launcher.** `fleetd agent-exec` runs inside the unit. It listens on `127.0.0.1:PORT` in the private namespace and forwards each connection to the unix socket `/run/fleet/proxy.sock`, then execs `claude`. `HTTPS_PROXY` and `NODE_USE_ENV_PROXY=1` point at that port. `runner.rs` already passes `HTTPS_PROXY` and `HTTP_PROXY` through `AGENT_ENV`. `NODE_USE_ENV_PROXY` appears nowhere in the crates (checked by search).
-- **Proxy.** Inside fleetd, `CONNECT` only, with a hostname allowlist: `api.anthropic.com` plus per-bundle additions such as crates.io, npm and pypi hosts. The proxy resolves names itself and refuses loopback, RFC1918, link-local and tailnet address ranges.
+- **Proxy.** Inside fleetd, `CONNECT` only, with a hostname allowlist: `api.anthropic.com`. The allowlist `egress_allow` is Box config and no Profile or bundle can add hosts (amended by ADR-0038). The proxy resolves names itself and refuses loopback, RFC1918, link-local and tailnet address ranges.
 - **Accepted risk.** Domain fronting through an allowed host.
 - **Hooks.** The hook port `127.0.0.1:7071` is unreachable from the namespace. `deploy/managed-settings.json` sets `PostToolUse` and `PostToolUseFailure` and `SessionStart` to `command` hooks already. `UserPromptSubmit`, `Stop`, `SessionEnd` and `Notification` are `http` hooks to `127.0.0.1:7071`. P2 switches those four to `command` hooks (`fleetd hook X`) that reach fleetd over a bind-mounted unix socket.
 
@@ -109,7 +109,7 @@ Three design corrections came out of the run and are binding constraints in P1: 
 - P1 and P2 leave the shared mirror writable by the agent until P3.
 - fleetd gains a polkit rule, a second uid, a template unit and a launcher subcommand, and loses the process-group cancel path. A Box needs a system-wide Claude install, which changes the Template.
 - Per-job state moves out of `StateDirectory=fleetd` or needs a second state directory owned by `fleet-job`.
-- The allowlist is a new thing to maintain per bundle. A missing host fails a Job at the first request.
+- The allowlist is a new thing to maintain per Box. A missing host fails a Job at the first request.
 
 ## Considered and rejected
 
@@ -118,3 +118,7 @@ Three design corrections came out of the run and are binding constraints in P1: 
 - **A credential broker only.** Keeps the Claude token and the open network, and the agent still reads `/proc` and the mirror.
 - **A microVM now.** Cost and complexity with no untrusted prompt source today. Revisit per the trigger above.
 - **bwrap as the first step.** Not installed on the test box, and it leaves the uid shared with fleetd.
+
+## Amendment (ADR-0038)
+
+The P2 CONNECT proxy serves the model API only. `egress_allow` is Box config. No Profile or bundle can add hosts, which replaces the "per-bundle additions" wording. Page fetches go through `fleetd fetch`, not the proxy.
