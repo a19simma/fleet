@@ -31,6 +31,7 @@ pub mod phase;
 pub mod poller;
 mod proc;
 pub mod profile_apply;
+pub mod publish;
 pub mod runner;
 mod runtime;
 mod store;

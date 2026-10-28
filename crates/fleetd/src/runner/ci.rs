@@ -11,7 +11,8 @@ use serde_json::Value;
 use tokio::time::Instant;
 use tonic::Code;
 
-use super::{AgentRunner, Ctl, Interrupt, Reporter, Scope, Scratch, Stop, report_request};
+use super::{AgentRunner, Ctl, Interrupt, Reporter, Scope, Stop, report_request};
+use crate::publish::Scratch;
 
 /// What one `gh pr checks` call showed.
 #[derive(Debug, Clone, PartialEq, Eq)]

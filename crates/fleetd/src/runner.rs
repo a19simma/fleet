@@ -41,8 +41,7 @@
 //! the fetch, [`AgentRunner::finish`] commits whatever the agent left uncommitted in the
 //! worktree, unless the staged diff holds a value the redactor knows.
 
-use std::borrow::Cow;
-use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
+use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::ffi::OsString;
 use std::future::Future;
 use std::io;
@@ -59,7 +58,7 @@ use fleet_proto::v1::{
 };
 use fleet_proto::{
     MAX_CHUNKS_PER_REPORT, MAX_MODEL_BYTES, MAX_TRANSCRIPT_BYTES, MAX_VERDICT_REASON_BYTES,
-    MAX_VERDICT_SCORE, is_ci_url, is_plain_text, is_swarm_branch,
+    MAX_VERDICT_SCORE, is_plain_text,
 };
 use serde_json::Value;
 use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncRead, BufReader};
@@ -77,11 +76,12 @@ use crate::phase::{Clock, Phases, SystemClock, elapsed_ms};
 use crate::poller::{RunError, Shutdown};
 use crate::proc::{CAPTURE_BYTES, CaptureError, Captured, Keep, capture, capture_keeping};
 use crate::profile_apply::{self, Applied, LoadError};
+use crate::publish::{GH_CONFIG_DIR, HOME_DIR, Published};
 use crate::telemetry::Terminal as Ending;
 use crate::toolhook::HookHub;
 mod ci;
 
-use crate::workspace::{RepoPolicy, is_commit_sha, validate_job_id, validate_ref, validate_repo};
+use crate::workspace::{RepoPolicy, validate_job_id};
 
 /// Variables that never reach the agent's environment block, however it is configured.
 ///
@@ -134,7 +134,6 @@ pub const JUDGE_PROTOCOL: &str = "You run as an unattended fleet judge. The file
 const CLEAN_ENV: [&str; 1] = ["PATH"];
 const PUSH_ENV: [&str; 2] = ["PATH", "GH_TOKEN"];
 const GH_ENV: [&str; 4] = ["PATH", "GH_TOKEN", "GH_HOST", "GH_ENTERPRISE_TOKEN"];
-const MAX_TITLE_CHARS: usize = 256;
 
 /// Default longest time for the whole finish step, and for each helper in it.
 pub const DEFAULT_FINISH_TIMEOUT: Duration = Duration::from_secs(300);
@@ -156,7 +155,6 @@ pub const DEFAULT_CI_POLL_CAP: Duration = Duration::from_secs(30);
 pub const DEFAULT_CI_LOG_BUDGET: Duration = Duration::from_secs(30);
 
 const TAIL_BYTES: usize = 2048;
-const MAX_PR_URL_BYTES: usize = 2048;
 
 /// Default for `max_turns`, passed to every job as `--max-turns`.
 ///
@@ -245,33 +243,9 @@ const JUDGE_DENIED_TOOLS: [&str; 8] = [
     "WebSearch",
     "Task",
 ];
-const ERR_COMMITS: &str = "job commits could not be inspected";
-const ERR_PUSH: &str = "git push failed";
-const ERR_PR: &str = "pull request could not be opened";
-const ERR_PR_URL: &str = "pull request url was not returned";
 const ERR_FINISH_TIMEOUT: &str = "finish step timed out";
-const ERR_SECRET: &str = "uncommitted changes held a secret value";
-const MAX_DIFF_BYTES: u64 = 32 * 1024 * 1024;
 const LOG_TAIL_BYTES: usize = 512;
 const NO_CHANGES_NOTE: &str = "fleet: no_changes";
-const FALLBACK_GUARDS: [&str; 16] = [
-    "-c",
-    "core.hooksPath=/dev/null",
-    "-c",
-    "core.fsmonitor=",
-    "-c",
-    "commit.gpgsign=false",
-    "-c",
-    "core.sshCommand=",
-    "-c",
-    "credential.helper=",
-    "-c",
-    "gc.auto=0",
-    "-c",
-    "maintenance.auto=false",
-    "-c",
-    "core.pager=cat",
-];
 
 /// True when `name` may not reach the agent: a [`STRIPPED_ENV`] name or a `FLEETD_` one.
 #[must_use]
@@ -645,14 +619,14 @@ fn spawn_direct<W: ChildWait + 'static>(
 /// Runs the agent for claimed jobs.
 #[derive(Debug)]
 pub struct AgentRunner<R> {
-    config: RunConfig,
+    pub(crate) config: RunConfig,
     launcher: Arc<dyn Launcher>,
     reporter: R,
-    redactor: Redactor,
+    pub(crate) redactor: Redactor,
     carries: Mutex<HashMap<String, Carry>>,
     phases: Mutex<HashMap<String, Phases>>,
     profiles: Mutex<HashMap<String, Arc<Applied>>>,
-    clock: Arc<dyn Clock>,
+    pub(crate) clock: Arc<dyn Clock>,
     hub: Option<Arc<HookHub>>,
     claude_version: Mutex<Option<String>>,
 }
@@ -1310,73 +1284,6 @@ impl<R: Reporter> AgentRunner<R> {
         stream.fail(None, error).await;
     }
 
-    async fn publish(
-        &self,
-        job: &Job,
-        cwd: &Path,
-        phases: &mut Phases,
-    ) -> Result<Published, Failure> {
-        validate_job_id(&job.job_id).map_err(|_| Failure::bare(ERR_COMMITS))?;
-        validate_repo(&job.repo, &self.config.repo_policy).map_err(|_| Failure::bare(ERR_PUSH))?;
-        validate_ref(&job.base_ref).map_err(|_| Failure::bare(ERR_COMMITS))?;
-        let local = format!("swarm/{}", job.job_id);
-        let target = PushTarget::from_job(job)?;
-        let branch = target.remote_branch();
-        let scratch = Scratch::create(cwd, &job.job_id).map_err(|()| Failure::bare(ERR_COMMITS))?;
-        let dir = scratch.path();
-        self.commit_leftovers(job, cwd, dir).await?;
-        if !self.ahead(job, &local, cwd, dir).await? {
-            return Ok(Published {
-                branch: None,
-                pr_url: None,
-            });
-        }
-        let refspec = format!("refs/heads/{local}:refs/heads/{branch}");
-        let push_start = self.clock.now();
-        let pushed = self
-            .helper(
-                &self.config.git_bin,
-                dir,
-                &[
-                    "-c",
-                    "core.hooksPath=/dev/null",
-                    "-c",
-                    "core.fsmonitor=",
-                    "-c",
-                    "http.followRedirects=false",
-                    "-c",
-                    "credential.helper=",
-                    "push",
-                    "--quiet",
-                    "--no-verify",
-                    "--",
-                    &job.repo,
-                    &refspec,
-                ],
-                Scope::Push,
-            )
-            .await;
-        phases.push = Some(elapsed_ms(&*self.clock, push_start));
-        let pushed = pushed.map_err(|e| e.failure(ERR_PUSH))?;
-        if !pushed.success {
-            return Err(Failure::tail(ERR_PUSH, &pushed.stderr));
-        }
-        let pr_url = match target {
-            PushTarget::Chain(_) => job.pr_url.clone().filter(|url| is_ci_url(url)),
-            PushTarget::Own(_) if !job.open_pr => None,
-            PushTarget::Own(_) => {
-                let pr_start = self.clock.now();
-                let opened = self.open_pr(job, &branch, dir).await;
-                phases.pr = Some(elapsed_ms(&*self.clock, pr_start));
-                Some(opened?)
-            }
-        };
-        Ok(Published {
-            branch: Some(branch),
-            pr_url,
-        })
-    }
-
     fn log_tail(&self, stderr: &str) -> String {
         let redacted = self.redactor.redact_str(stderr);
         let mut start = redacted.len().saturating_sub(LOG_TAIL_BYTES);
@@ -1386,238 +1293,7 @@ impl<R: Reporter> AgentRunner<R> {
         redacted.get(start..).unwrap_or_default().to_owned()
     }
 
-    async fn commit_leftovers(&self, job: &Job, cwd: &Path, dir: &Path) -> Result<(), Failure> {
-        let tree = Scope::Tree(cwd);
-        let listed = self
-            .helper(
-                &self.config.git_bin,
-                dir,
-                &["config", "--list", "--name-only"],
-                tree,
-            )
-            .await
-            .map_err(|e| e.failure(ERR_COMMITS))?;
-        if !listed.success {
-            return Err(Failure::bare(ERR_COMMITS));
-        }
-        let mut guards: Vec<String> = FALLBACK_GUARDS.map(str::to_owned).to_vec();
-        for name in filter_drivers(&listed.stdout).ok_or_else(|| Failure::bare(ERR_COMMITS))? {
-            for (key, value) in [
-                ("clean", ""),
-                ("smudge", ""),
-                ("process", ""),
-                ("required", "false"),
-            ] {
-                guards.push("-c".to_owned());
-                guards.push(format!("filter.{name}.{key}={value}"));
-            }
-        }
-        let status = self
-            .guarded(
-                dir,
-                &guards,
-                tree,
-                &["status", "--porcelain"],
-                CAPTURE_BYTES,
-            )
-            .await
-            .map_err(|e| e.failure(ERR_COMMITS))?;
-        if !status.success {
-            return Err(Failure::bare(ERR_COMMITS));
-        }
-        if status.stdout.trim().is_empty() {
-            return Ok(());
-        }
-        let added = self
-            .guarded(dir, &guards, tree, &["add", "-A"], CAPTURE_BYTES)
-            .await
-            .map_err(|e| e.failure(ERR_COMMITS))?;
-        if !added.success {
-            return Err(Failure::bare(ERR_COMMITS));
-        }
-        let staged = self
-            .guarded(
-                dir,
-                &guards,
-                tree,
-                &[
-                    "diff",
-                    "--cached",
-                    "--text",
-                    "--no-ext-diff",
-                    "--no-textconv",
-                    "--no-color",
-                ],
-                MAX_DIFF_BYTES,
-            )
-            .await
-            .map_err(|e| e.failure(ERR_COMMITS))?;
-        if !staged.success || staged.truncated {
-            return Err(Failure::bare(ERR_COMMITS));
-        }
-        if matches!(self.redactor.redact_str(&staged.stdout), Cow::Owned(_)) {
-            return Err(Failure::bare(ERR_SECRET));
-        }
-        if staged.stdout.is_empty() {
-            return Ok(());
-        }
-        let message = format!("chore: uncommitted job changes (fleet job {})", job.job_id);
-        let committed = self
-            .guarded(
-                dir,
-                &guards,
-                tree,
-                &[
-                    "commit",
-                    "--quiet",
-                    "--no-verify",
-                    "--no-gpg-sign",
-                    "-m",
-                    &message,
-                ],
-                CAPTURE_BYTES,
-            )
-            .await
-            .map_err(|e| e.failure(ERR_COMMITS))?;
-        if committed.success {
-            Ok(())
-        } else {
-            Err(Failure::bare(ERR_COMMITS))
-        }
-    }
-
-    async fn guarded(
-        &self,
-        dir: &Path,
-        guards: &[String],
-        tree: Scope<'_>,
-        rest: &[&str],
-        limit: u64,
-    ) -> Result<Captured, CaptureError> {
-        let mut args: Vec<&str> = guards.iter().map(String::as_str).collect();
-        args.extend_from_slice(rest);
-        self.helper_limited(&self.config.git_bin, dir, &args, tree, limit)
-            .await
-    }
-
-    async fn ahead(
-        &self,
-        job: &Job,
-        branch: &str,
-        cwd: &Path,
-        dir: &Path,
-    ) -> Result<bool, Failure> {
-        self.helper(
-            &self.config.git_bin,
-            dir,
-            &["init", "--bare", "--quiet"],
-            Scope::Clean,
-        )
-        .await
-        .map_err(|e| e.failure(ERR_COMMITS))?;
-        let worktree = cwd.to_str().ok_or_else(|| Failure::bare(ERR_COMMITS))?;
-        let head = format!("+refs/heads/{branch}:refs/heads/{branch}");
-        let pinned = is_commit_sha(&job.base_ref);
-        let base = format!(
-            "+refs/remotes/origin/{base}:refs/remotes/origin/{base}",
-            base = job.base_ref
-        );
-        let mut specs = vec![head.as_str()];
-        if !pinned {
-            specs.push(base.as_str());
-        }
-        let mut fetch_args = vec![
-            "-c",
-            "core.hooksPath=/dev/null",
-            "-c",
-            "core.fsmonitor=",
-            "-c",
-            "core.sshCommand=",
-            "-c",
-            "credential.helper=",
-            "fetch",
-            "--quiet",
-            "--no-tags",
-            "--no-recurse-submodules",
-            "--",
-            worktree,
-        ];
-        fetch_args.extend(specs);
-        let fetched = self
-            .helper(&self.config.git_bin, dir, &fetch_args, Scope::Clean)
-            .await
-            .map_err(|e| e.failure(ERR_COMMITS))?;
-        if !fetched.success {
-            return Err(Failure::bare(ERR_COMMITS));
-        }
-        let floor = if pinned {
-            job.base_ref.clone()
-        } else {
-            format!("refs/remotes/origin/{}", job.base_ref)
-        };
-        let range = format!("{floor}..refs/heads/{branch}");
-        let counted = self
-            .helper(
-                &self.config.git_bin,
-                dir,
-                &["rev-list", "--count", &range],
-                Scope::Clean,
-            )
-            .await
-            .map_err(|e| e.failure(ERR_COMMITS))?;
-        let count = counted.stdout.trim();
-        if !counted.success || count.is_empty() || !count.bytes().all(|b| b.is_ascii_digit()) {
-            return Err(Failure::bare(ERR_COMMITS));
-        }
-        Ok(!count.bytes().all(|b| b == b'0'))
-    }
-
-    async fn open_pr(&self, job: &Job, branch: &str, dir: &Path) -> Result<String, Failure> {
-        let subject = self
-            .helper(
-                &self.config.git_bin,
-                dir,
-                &["log", "-1", "--format=%s", &format!("refs/heads/{branch}")],
-                Scope::Clean,
-            )
-            .await
-            .map_err(|e| e.failure(ERR_PR))?;
-        let title: String = match subject.stdout.trim() {
-            "" => branch,
-            line => line,
-        }
-        .chars()
-        .take(MAX_TITLE_CHARS)
-        .collect();
-        let created = self
-            .helper(
-                &self.config.gh_bin,
-                dir,
-                &[
-                    "pr",
-                    "create",
-                    "--repo",
-                    &job.repo,
-                    "--head",
-                    branch,
-                    "--base",
-                    &job.base_ref,
-                    "--title",
-                    &title,
-                    "--body",
-                    &format!("Fleet job {}", job.job_id),
-                ],
-                Scope::Gh,
-            )
-            .await
-            .map_err(|e| e.failure(ERR_PR))?;
-        if !created.success {
-            return Err(Failure::tail(ERR_PR, &created.stderr));
-        }
-        pr_url(&created.stdout).ok_or_else(|| Failure::bare(ERR_PR_URL))
-    }
-
-    async fn helper(
+    pub(crate) async fn helper(
         &self,
         bin: &Path,
         dir: &Path,
@@ -1628,7 +1304,7 @@ impl<R: Reporter> AgentRunner<R> {
             .await
     }
 
-    async fn helper_limited(
+    pub(crate) async fn helper_limited(
         &self,
         bin: &Path,
         dir: &Path,
@@ -2508,50 +2184,15 @@ struct Terminal {
     ci: Option<JobCi>,
 }
 
-/// The remote branch a job pushes to, built once from the claimed Job.
-///
-/// A normal job pushes to its own `swarm/<job_id>` branch. A fix Job (`parent_job_id` set,
-/// ADR-0028) pushes to the existing chain-root branch named by its `base_ref`, which passed
-/// [`is_swarm_branch`] when the target was built. `git push` receives no branch name except
-/// through [`PushTarget::remote_branch`].
-enum PushTarget {
-    Own(String),
-    Chain(String),
-}
-
-impl PushTarget {
-    fn from_job(job: &Job) -> Result<Self, Failure> {
-        if job.parent_job_id.is_none() {
-            Ok(Self::Own(job.job_id.clone()))
-        } else if is_swarm_branch(&job.base_ref) {
-            Ok(Self::Chain(job.base_ref.clone()))
-        } else {
-            Err(Failure::bare(ERR_PUSH))
-        }
-    }
-
-    fn remote_branch(&self) -> String {
-        match self {
-            Self::Own(job_id) => format!("swarm/{job_id}"),
-            Self::Chain(branch) => branch.clone(),
-        }
-    }
-}
-
-struct Published {
-    branch: Option<String>,
-    pr_url: Option<String>,
-}
-
 #[derive(Clone, Copy)]
-enum Scope<'a> {
+pub(crate) enum Scope<'a> {
     Clean,
     Push,
     Gh,
     Tree(&'a Path),
 }
 
-trait IntoFailure {
+pub(crate) trait IntoFailure {
     fn failure(self, start: &'static str) -> Failure;
 }
 
@@ -2564,48 +2205,20 @@ impl IntoFailure for CaptureError {
     }
 }
 
-const HOME_DIR: &str = "home";
-const GH_CONFIG_DIR: &str = "gh";
-
-struct Scratch(PathBuf);
-
-impl Scratch {
-    fn create(cwd: &Path, job_id: &str) -> Result<Self, ()> {
-        let parent = cwd.parent().ok_or(())?;
-        let path = parent.join(format!(".finish-{job_id}"));
-        let _ = std::fs::remove_dir_all(&path);
-        std::fs::create_dir(&path).map_err(|_| ())?;
-        for sub in [HOME_DIR, GH_CONFIG_DIR] {
-            std::fs::create_dir(path.join(sub)).map_err(|_| ())?;
-        }
-        Ok(Self(path))
-    }
-
-    fn path(&self) -> &Path {
-        &self.0
-    }
-}
-
-impl Drop for Scratch {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.0);
-    }
-}
-
-struct Failure {
-    error: &'static str,
-    tail: String,
+pub(crate) struct Failure {
+    pub(crate) error: &'static str,
+    pub(crate) tail: String,
 }
 
 impl Failure {
-    fn bare(error: &'static str) -> Self {
+    pub(crate) fn bare(error: &'static str) -> Self {
         Self {
             error,
             tail: String::new(),
         }
     }
 
-    fn tail(error: &'static str, stderr: &str) -> Self {
+    pub(crate) fn tail(error: &'static str, stderr: &str) -> Self {
         let mut start = stderr.len().saturating_sub(TAIL_BYTES);
         while !stderr.is_char_boundary(start) {
             start += 1;
@@ -2615,35 +2228,6 @@ impl Failure {
             tail: stderr[start..].to_owned(),
         }
     }
-}
-
-fn filter_drivers(listing: &str) -> Option<BTreeSet<String>> {
-    let mut names = BTreeSet::new();
-    for line in listing.lines() {
-        let Some(rest) = line.strip_prefix("filter.") else {
-            continue;
-        };
-        let Some((name, _)) = rest.rsplit_once('.') else {
-            continue;
-        };
-        if name.contains('=') {
-            return None;
-        }
-        names.insert(name.to_owned());
-    }
-    Some(names)
-}
-
-fn pr_url(stdout: &str) -> Option<String> {
-    let line = stdout
-        .lines()
-        .rev()
-        .map(str::trim)
-        .find(|l| !l.is_empty())?;
-    let plain = line.len() <= MAX_PR_URL_BYTES
-        && line.starts_with("https://")
-        && !line.chars().any(|c| c.is_control() || c.is_whitespace());
-    plain.then(|| line.to_owned())
 }
 
 fn assistant_text(line: &str) -> Option<String> {
@@ -2686,7 +2270,6 @@ mod tests {
         LineReader, Reporter, RunConfig, STRIPPED_ENV, UNKNOWN_STAMP, VERSION_CHARS, VersionStamp,
         ending, parse_version,
     };
-    use super::{ERR_PUSH, PushTarget};
     use crate::poller::Shutdown;
     use crate::profile_apply::LoadError;
     use fleet_core::Profile;
@@ -2830,60 +2413,6 @@ mod tests {
             prompt: "do it".into(),
             ..Job::default()
         }
-    }
-
-    fn fix_job(base_ref: &str) -> Job {
-        Job {
-            parent_job_id: Some("root1".into()),
-            base_ref: base_ref.into(),
-            ..test_job()
-        }
-    }
-
-    #[test]
-    fn a_normal_job_targets_its_own_swarm_branch() {
-        let target = PushTarget::from_job(&test_job()).ok();
-        assert!(matches!(target, Some(PushTarget::Own(_))));
-        assert_eq!(
-            target.map(|t| t.remote_branch()),
-            Some("swarm/job1".to_owned())
-        );
-    }
-
-    #[test]
-    fn a_fix_job_targets_the_chain_branch_of_its_base_ref() {
-        let target = PushTarget::from_job(&fix_job("swarm/root1")).ok();
-        assert!(matches!(target, Some(PushTarget::Chain(_))));
-        assert_eq!(
-            target.map(|t| t.remote_branch()),
-            Some("swarm/root1".to_owned())
-        );
-    }
-
-    #[test]
-    fn a_fix_job_with_a_base_ref_that_is_no_swarm_branch_is_refused() {
-        for base_ref in ["main", "swarm/", "swarm/a/b", "swarm/a-b", ""] {
-            let refused = PushTarget::from_job(&fix_job(base_ref)).err();
-            assert_eq!(
-                refused.map(|f| f.error),
-                Some(ERR_PUSH),
-                "{base_ref:?} accepted"
-            );
-        }
-        let long = format!("swarm/{}", "a".repeat(65));
-        assert!(PushTarget::from_job(&fix_job(&long)).is_err());
-    }
-
-    #[test]
-    fn a_normal_job_ignores_a_base_ref_that_is_no_swarm_branch() {
-        let job = Job {
-            base_ref: "main".into(),
-            ..test_job()
-        };
-        assert_eq!(
-            PushTarget::from_job(&job).ok().map(|t| t.remote_branch()),
-            Some("swarm/job1".to_owned())
-        );
     }
 
     #[test]
