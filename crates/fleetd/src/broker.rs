@@ -16,7 +16,7 @@
 //! Per Job the broker allows [`MAX_PUSHES_PER_JOB`] pushes, no closer together than
 //! [`MIN_PUSH_INTERVAL`], and [`MAX_PRS_PER_JOB`] pull request creation, a title of at most
 //! [`MAX_TITLE_CHARS`] characters and a body of at most [`MAX_BODY_BYTES`] bytes, and refuses
-//! attribution lines. Title and body are redacted before an executor sees them and every output
+//! attribution lines, mentions, `#n` references, links and images ([`Denial::UnsafeText`]). Title and body are redacted before an executor sees them and every output
 //! is redacted and cut to [`MAX_OUTPUT_BYTES`]. A capped operation counts when it is attempted,
 //! so a failed push or a failed pull request still spends its slot. A `pr_create` after one
 //! that returned a URL replies with that URL and calls no executor, so repeats are idempotent
@@ -250,6 +250,8 @@ pub trait GhExecutor: Send + Sync {
 pub enum Denial {
     /// The frame, title or body broke a rule.
     InvalidRequest,
+    /// The title or body has a mention, issue reference, link or image.
+    UnsafeText,
     /// The per-Job cap of the operation is spent.
     CapReached,
     /// The operation was attempted again before its minimum interval passed. It spends no cap.
@@ -268,6 +270,7 @@ impl Denial {
     pub const fn message(self) -> &'static str {
         match self {
             Self::InvalidRequest => "invalid request",
+            Self::UnsafeText => "text has a mention, reference, link or image",
             Self::CapReached => "per-job cap reached",
             Self::RateLimited => "rate limited",
             Self::NoPullRequest => "no pull request recorded",
@@ -450,6 +453,9 @@ impl<G: GitExecutor, H: GhExecutor> Broker<G, H> {
                 let body = self.redactor.redact_str(&body);
                 if !valid_title(&title) || !valid_body(&body) {
                     return Response::denied(Denial::InvalidRequest);
+                }
+                if has_live_markup(&title) || has_live_markup(&body) {
+                    return Response::denied(Denial::UnsafeText);
                 }
                 let _one_at_a_time = self.pr_gate.lock().await;
                 if let Some(output) = self.recorded_pr_url() {
@@ -833,6 +839,26 @@ fn valid_body(body: &str) -> bool {
             .chars()
             .any(|c| is_hidden_text(c) || (c.is_control() && !matches!(c, '\n' | '\r' | '\t')))
         && !has_attribution(body)
+}
+
+/// Text that GitHub turns into a notification, a backlink, a closed issue or a fetched image.
+///
+/// Refuses `@` or `#` followed by an ASCII alphanumeric (mentions, `#n`, `owner/repo#n`, so
+/// closing keywords before a reference are covered), any `http://` or `https://` URL (so closing
+/// keywords before an issue or PR URL are covered), markdown `![` and an HTML `<img` tag.
+/// Matching is case-insensitive and the input is never echoed.
+fn has_live_markup(text: &str) -> bool {
+    let lower = text.to_ascii_lowercase();
+    let bytes = lower.as_bytes();
+    let sigil = bytes.windows(2).any(|w| match *w {
+        [b'@', c] => c.is_ascii_alphanumeric(),
+        [b'#', c] => c.is_ascii_digit(),
+        _ => false,
+    });
+    sigil
+        || ["http://", "https://", "![", "<img"]
+            .iter()
+            .any(|needle| lower.contains(needle))
 }
 
 const ATTRIBUTION_TRAILERS: [&str; 3] = ["coauthoredby", "signedoffby", "claudesession"];
@@ -1732,6 +1758,77 @@ mod tests {
             assert!(valid_title(text), "{text:?}");
             assert!(valid_body(text), "{text:?}");
         }
+    }
+
+    #[test]
+    fn mentions_references_links_and_images_are_refused_in_title_and_body() {
+        let hostile = [
+            "@org/all-engineers @victim fixes #1 closes other/repo#9 ![x](https://evil/?d=1)",
+            "ping @victim",
+            "ping @org/team",
+            "see #12",
+            "other/repo#9",
+            "closes other/repo#9",
+            "Fixes #1",
+            "RESOLVED: #4",
+            "resolves\n#4",
+            "closed https://github.com/o/r/issues/9",
+            "fix https://github.com/o/r/pull/3",
+            "![x](data)",
+            "![",
+            "see http://example.test/a",
+            "see HTTPS://example.test/a",
+            "<img src=\"x\">",
+            "<IMG SRC=x>",
+        ];
+        for text in hostile {
+            assert!(has_live_markup(text), "{text:?}");
+            assert!(has_live_markup(&format!("intro\n\n{text}\n")), "{text:?}");
+        }
+        let benign = [
+            "Refactor the parser and add tests.",
+            "Port the C# client",
+            "handle issue 12",
+            "add fixture loader",
+            "prefix the closes list",
+            "mail me at-sign: @ alone",
+            "item # one",
+            "100% done",
+            "fix(parser): trim trailing space",
+        ];
+        for text in benign {
+            assert!(!has_live_markup(text), "{text:?}");
+            assert!(valid_title(text) && valid_body(text), "{text:?}");
+        }
+    }
+
+    #[test]
+    fn finish_step_pull_request_text_passes_the_validators() {
+        let job_id = "0190a1b2-c3d4-7e5f-8a6b-7c8d9e0f1a2b";
+        let texts = [
+            format!("Fleet job {job_id}"),
+            "fix(fleetd): reject mentions and refs in broker pr text".to_owned(),
+            format!("swarm/{job_id}"),
+        ];
+        for text in texts {
+            assert!(!has_live_markup(&text), "{text:?}");
+            assert!(valid_title(&text) && valid_body(&text), "{text:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn unsafe_text_is_denied_with_a_fixed_reason() -> TestResult {
+        let fake = Fake::default();
+        let b = broker(&fake)?;
+        let hostile = "@victim closes other/repo#9";
+        assert_eq!(b.handle(pr(hostile, "b")).await, denied(Denial::UnsafeText));
+        assert_eq!(b.handle(pr("t", hostile)).await, denied(Denial::UnsafeText));
+        assert_eq!(fake.calls(), Vec::<String>::new());
+        assert_eq!(
+            Denial::UnsafeText.message(),
+            "text has a mention, reference, link or image"
+        );
+        Ok(())
     }
 
     #[tokio::test]
