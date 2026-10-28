@@ -18,6 +18,13 @@ use crate::stuck::{Detector, Stuck, StuckRules};
 const EVENT_OVERHEAD_BYTES: u64 = 48;
 const HASH_HEX_CHARS: usize = 16;
 const TRUNCATED: &str = "truncated";
+const FETCH_TOOL: &str = "fetch";
+const FETCH_INTENT: &str = "intent";
+const FETCH_OK: &str = "ok";
+const FETCH_FAILED: &str = "failed";
+
+/// Longest URL in bytes that a fetch event records whole. A longer URL is refused, never cut.
+pub const MAX_FETCH_URL_BYTES: usize = 1024;
 const MODEL_CAP: usize = fleet_proto::MAX_MODEL_BYTES;
 const EDIT_TOOLS: [&str; 3] = ["Edit", "Write", "MultiEdit"];
 
@@ -59,7 +66,54 @@ pub enum EventKind {
     Phase,
     /// A stuck-job signal.
     Stuck,
+    /// A fetch of a URL: the intent before it or the outcome after it.
+    Fetch,
 }
+
+/// Which side of a fetch an event records.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FetchPhase {
+    /// The fetch is about to start.
+    Intent,
+    /// The fetch ended with a body. `status` goes to `exit_code`, `bytes` to `out_bytes`.
+    Succeeded {
+        /// HTTP status of the response.
+        status: u16,
+        /// Body length in bytes.
+        bytes: u64,
+    },
+    /// The fetch ended without a body. `status` goes to `exit_code` when a response arrived.
+    Failed {
+        /// HTTP status of the response, when one arrived.
+        status: Option<u16>,
+    },
+}
+
+/// Why a fetch event was not recorded.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FetchRecordError {
+    /// The feed is closed: the parser panicked or the job finished.
+    Closed,
+    /// The event cap was reached, so the event was not stored.
+    Truncated,
+    /// The transcript byte budget is spent.
+    OverBudget,
+    /// The URL is longer than [`MAX_FETCH_URL_BYTES`].
+    UrlTooLong,
+}
+
+impl std::fmt::Display for FetchRecordError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::Closed => "telemetry feed closed",
+            Self::Truncated => "telemetry events truncated",
+            Self::OverBudget => "telemetry byte budget spent",
+            Self::UrlTooLong => "url too long to record",
+        })
+    }
+}
+
+impl std::error::Error for FetchRecordError {}
 
 /// How the job ended, as the caller knows it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -348,6 +402,61 @@ impl Telemetry {
             _ => self.ignored += 1,
         }
         out
+    }
+
+    /// Store one fetch event, pushing what was stored into `out`.
+    ///
+    /// Fails with [`FetchRecordError::Truncated`] when the event is the one that goes past the
+    /// cap (the one after the last stored event), because it is replaced by the truncation
+    /// marker. The marker is still pushed into `out`. The event reaching the cap is kept. A URL over [`MAX_FETCH_URL_BYTES`], before or after `redact`,
+    /// fails with [`FetchRecordError::UrlTooLong`] and is never cut.
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`FetchRecordError`] when the event was not stored: the cap, or the URL length.
+    pub fn record_fetch(
+        &mut self,
+        url: &str,
+        phase: FetchPhase,
+        ts_ms: u64,
+        redact: &dyn Fn(&str) -> String,
+        out: &mut Vec<JobEvent>,
+    ) -> Result<(), FetchRecordError> {
+        if url.len() > MAX_FETCH_URL_BYTES {
+            return Err(FetchRecordError::UrlTooLong);
+        }
+        if self.truncated {
+            return Err(FetchRecordError::Truncated);
+        }
+        let cmd = redact(url);
+        if cmd.len() > MAX_FETCH_URL_BYTES {
+            return Err(FetchRecordError::UrlTooLong);
+        }
+        let (ok, detail, exit_code, out_bytes) = match phase {
+            FetchPhase::Intent => (None, FETCH_INTENT, None, None),
+            FetchPhase::Succeeded { status, bytes } => {
+                (Some(true), FETCH_OK, Some(i32::from(status)), Some(bytes))
+            }
+            FetchPhase::Failed { status } => {
+                (Some(false), FETCH_FAILED, status.map(i32::from), None)
+            }
+        };
+        let event = JobEvent {
+            ts_ms,
+            kind: EventKind::Fetch,
+            tool: Some(FETCH_TOOL.to_owned()),
+            ok,
+            exit_code,
+            out_bytes,
+            cmd: Some(cmd),
+            detail: Some(detail.to_owned()),
+            ..JobEvent::default()
+        };
+        self.emit(event, out);
+        if self.truncated {
+            return Err(FetchRecordError::Truncated);
+        }
+        Ok(())
     }
 
     /// Fill the exit code and authoritative duration of an emitted tool event.
