@@ -183,6 +183,8 @@ The unit sets `ProtectProc=invisible`, `ProcSubset=pid`, `PrivateTmp=yes`, `NoNe
 
 The template sets `PrivateNetwork=yes`, and no drop-in relaxes it. ADR-0031 P2 is done on the unit side: inside the namespace the job sees only its own loopback. `fleetd agent-exec` listens on an ephemeral `127.0.0.1` port there and forwards each connection to the egress proxy over `/run/fleet/<job id>/job.sock`. `HTTPS_PROXY` and `NODE_USE_ENV_PROXY=1` point at that port, so the model API is the only reachable host, and only through fleetd's `egress_allow` list. A unix socket on the filesystem crosses a network namespace, and the unit bind-mounts both paths the job needs: `BindPaths=/run/fleet/%i` for `job.sock` and `BindReadOnlyPaths=/run/fleet/hook` for the hook socket. A connect to a socket in a read-only bind mount still works.
 
+The unit needs the wiring: `PrivateNetwork=yes` leaves the job no route to the model API except through the egress proxy that fleetd serves on the job socket. A fleetd that runs `agent_launcher = "systemd"` with no services registered cuts the model API for every job, and logs `agent_launcher is systemd and no services are registered` at startup. Deploy the unit and a fleetd that registers the egress proxy together, never the unit alone.
+
 The host hook port `127.0.0.1:7071` is unreachable from the namespace. All seven managed hooks are therefore `command` hooks, `fleetd hook <event>`, which reach fleetd over the hook socket. Set `hook_socket` in `/etc/fleetd/config.toml` to a socket under `/run/fleet/hook`.
 
 To verify on a box:
@@ -190,7 +192,7 @@ To verify on a box:
 1. `systemd-analyze verify /etc/systemd/system/fleet-agent@.service /etc/systemd/system/fleetd.service` exits 0.
 2. `python3 -m json.tool /etc/claude-code/managed-settings.json` parses and `grep -c '"type": "http"'` prints 0.
 3. Run one job. In its unit, `systemctl show fleet-agent@<job id>.service -p PrivateNetwork` prints `PrivateNetwork=yes`, and the hook events for the job arrive in the fleetd queue.
-4. Upgrading a box that has the old `allow-network.conf` drop-in: delete `/etc/systemd/system/fleet-agent@.service.d/allow-network.conf` and run `sudo systemctl daemon-reload`.
+4. Upgrading a box that has the old `allow-network.conf` drop-in (keep this note until EGRESS-4 passes): delete `/etc/systemd/system/fleet-agent@.service.d/allow-network.conf` and run `sudo systemctl daemon-reload`.
 
 ### Claude install
 

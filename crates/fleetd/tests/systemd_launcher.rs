@@ -607,6 +607,29 @@ fn a_direct_launcher_refuses_the_job_socket_with_one_fixed_line() -> TestResult 
     Ok(())
 }
 
+#[test]
+fn a_systemd_launcher_without_services_warns_once() -> TestResult {
+    let none = |_: &str| None;
+    let direct = Config::resolve(None, &none)?;
+    let systemd = Config::resolve(Some("agent_launcher = \"systemd\"\n"), &none)?;
+    let (services, _events) = probe();
+    let warned = captured(|| {
+        let _ = select_launcher(&systemd, None, Services::new());
+    });
+    assert_eq!(
+        warned.matches("no services are registered").count(),
+        1,
+        "{warned}"
+    );
+    assert!(warned.contains("PrivateNetwork=yes"), "{warned}");
+    let quiet = captured(|| {
+        let _ = select_launcher(&systemd, None, services.clone());
+        let _ = select_launcher(&direct, None, Services::new());
+    });
+    assert!(!quiet.contains("no services"), "{quiet}");
+    Ok(())
+}
+
 fn show_count(case: &Case) -> usize {
     case.log().iter().filter(|l| l.starts_with("show ")).count()
 }

@@ -56,12 +56,17 @@ const MAX_SIGNAL: i32 = 64;
 /// The one log line written when a job socket is asked for in direct mode (ADR-0036).
 pub const JOB_SOCKET_REFUSED: &str = "job socket refused: agent_launcher is direct";
 
+/// The one log line written when the systemd launcher starts with no services registered.
+pub const NO_SERVICES_WARNING: &str = "agent_launcher is systemd and no services are registered: the unit sets PrivateNetwork=yes, so jobs cannot reach the model API";
+
 /// The launcher the config selects.
 ///
 /// With the systemd launcher every job gets a socket that offers `services`, which may be
 /// empty. The direct launcher makes no socket: when `services` is not empty it logs
 /// [`JOB_SOCKET_REFUSED`] once and drops them, because the agent there shares fleetd's uid and
-/// reads its environment, so a peer check adds nothing.
+/// reads its environment, so a peer check adds nothing. The systemd launcher with no services
+/// logs [`NO_SERVICES_WARNING`] once, because the unit's `PrivateNetwork=yes` leaves the job
+/// without the egress proxy.
 #[must_use]
 pub fn select_launcher(
     config: &Config,
@@ -75,12 +80,17 @@ pub fn select_launcher(
             }
             Arc::new(DirectLauncher)
         }
-        AgentLauncher::Systemd => Arc::new(
-            SystemdLauncher::new(&config.systemctl_path)
-                .with_job_gid(job_gid)
-                .with_run_timeout(config.agent_timeout)
-                .with_job_socket(JobSocketSetup::new(services)),
-        ),
+        AgentLauncher::Systemd => {
+            if services.is_empty() {
+                tracing::warn!("{NO_SERVICES_WARNING}");
+            }
+            Arc::new(
+                SystemdLauncher::new(&config.systemctl_path)
+                    .with_job_gid(job_gid)
+                    .with_run_timeout(config.agent_timeout)
+                    .with_job_socket(JobSocketSetup::new(services)),
+            )
+        }
     }
 }
 
