@@ -1,5 +1,5 @@
-//! fleetd binary: `serve` (default), `dump`, `hook`, `askpass`, `fetch`, `agent-exec` and
-//! `pueue-callback`.
+//! fleetd binary: `serve` (default), `dump`, `hook`, `askpass`, `fetch`, `broker`, `agent-exec`
+//! and `pueue-callback`.
 
 use std::ffi::{OsStr, OsString};
 use std::fmt;
@@ -11,6 +11,7 @@ use std::time::Duration;
 
 use clap::{Parser, Subcommand};
 use fleetd::agent_exec::exec_job;
+use fleetd::broker::Denial;
 use fleetd::fetch_policy::MAX_URL_BYTES;
 use fleetd::jobsock::{ServiceName, connect, read_frame, socket_path, write_frame};
 use fleetd::systemd::DEFAULT_RUN_DIR;
@@ -21,6 +22,7 @@ use tracing_subscriber::EnvFilter;
 
 const JOB_ID_ENV: &str = "FLEET_JOB_ID";
 const FETCH_REPLY_WAIT: Duration = Duration::from_secs(45);
+const BROKER_REPLY_WAIT: Duration = Duration::from_secs(150);
 
 #[derive(Parser)]
 #[command(version, about = "Per-box Fleet daemon")]
@@ -58,6 +60,14 @@ enum Command {
     /// Prints a fixed error line to stderr and exits 1 on any refusal or failure.
     Fetch {
         /// The URL. Any other count of arguments is refused.
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true, num_args = 0..)]
+        args: Vec<OsString>,
+    },
+    /// Ask the credential broker over the job socket: `push`, `pr_create <title> <body>`,
+    /// `pr_checks` or `fetch`. Prints the broker output. Prints a fixed error line to stderr and
+    /// exits 1 on any refusal or failure.
+    Broker {
+        /// The op and its arguments. Any other shape is refused.
         #[arg(trailing_var_arg = true, allow_hyphen_values = true, num_args = 0..)]
         args: Vec<OsString>,
     },
@@ -118,6 +128,23 @@ async fn execute(cli: Cli) -> Result<ExitCode, Error> {
                 ExitCode::FAILURE
             })
         }
+        Command::Broker { args } => {
+            let job_id = std::env::var_os(JOB_ID_ENV);
+            let served = run_broker(
+                Path::new(DEFAULT_RUN_DIR),
+                job_id.as_deref(),
+                &args,
+                BROKER_REPLY_WAIT,
+                &mut std::io::stdout(),
+                &mut std::io::stderr(),
+            )
+            .await;
+            Ok(if served {
+                ExitCode::SUCCESS
+            } else {
+                ExitCode::FAILURE
+            })
+        }
         Command::AgentExec { id, run_dir } => {
             eprintln!("fleetd agent-exec: {}", exec_job(&run_dir, &id));
             Ok(ExitCode::from(2))
@@ -163,13 +190,18 @@ fn fetch_url(args: &[OsString]) -> Result<&str, FetchFailure> {
         .ok_or(FetchFailure::Usage)
 }
 
-async fn fetch_exchange(socket: &Path, url: &str) -> std::io::Result<String> {
+async fn exchange(socket: &Path, service: ServiceName, request: &[u8]) -> std::io::Result<Vec<u8>> {
     let invalid = || std::io::Error::from(std::io::ErrorKind::InvalidData);
     let uid = std::fs::metadata(socket.parent().ok_or_else(invalid)?)?.uid();
-    let mut stream = connect(socket, ServiceName::Fetch, uid).await?;
+    let mut stream = connect(socket, service, uid).await?;
+    write_frame(&mut stream, request).await?;
+    read_frame(&mut BufReader::new(stream)).await
+}
+
+async fn fetch_exchange(socket: &Path, url: &str) -> std::io::Result<String> {
+    let invalid = || std::io::Error::from(std::io::ErrorKind::InvalidData);
     let request = serde_json::to_vec(&serde_json::json!({ "url": url })).map_err(|_| invalid())?;
-    write_frame(&mut stream, &request).await?;
-    let frame = read_frame(&mut BufReader::new(stream)).await?;
+    let frame = exchange(socket, ServiceName::Fetch, &request).await?;
     let reply: FetchReply = serde_json::from_slice(&frame).map_err(|_| invalid())?;
     match reply.body {
         Some(body) if reply.status == "ok" => Ok(body),
@@ -205,6 +237,117 @@ async fn run_fetch(
     match fetched {
         Ok(body) => out
             .write_all(body.as_bytes())
+            .and_then(|()| out.flush())
+            .is_ok(),
+        Err(failure) => {
+            let _ = writeln!(err, "{failure}");
+            false
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum BrokerFailure {
+    Usage,
+    Failed,
+    Denied(Denial),
+}
+
+impl fmt::Display for BrokerFailure {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Usage => f.write_str(
+                "fleetd broker: usage: fleetd broker push | pr_create <title> <body> | pr_checks | fetch",
+            ),
+            Self::Failed => f.write_str("fleetd broker: the request failed"),
+            Self::Denied(denial) => write!(f, "fleetd broker: {}", denial.message()),
+        }
+    }
+}
+
+const BROKER_DENIALS: [Denial; 7] = [
+    Denial::InvalidRequest,
+    Denial::UnsafeText,
+    Denial::CapReached,
+    Denial::RateLimited,
+    Denial::NoPullRequest,
+    Denial::Failed,
+    Denial::TimedOut,
+];
+
+#[derive(Deserialize)]
+struct BrokerReply {
+    status: String,
+    output: Option<String>,
+    error: Option<String>,
+}
+
+fn broker_request(args: &[OsString]) -> Result<Vec<u8>, BrokerFailure> {
+    let strs: Vec<&str> = args
+        .iter()
+        .map(|arg| arg.to_str().ok_or(BrokerFailure::Usage))
+        .collect::<Result<_, _>>()?;
+    let request = match strs[..] {
+        ["push"] => serde_json::json!({ "op": "push" }),
+        ["pr_checks"] => serde_json::json!({ "op": "pr_checks" }),
+        ["fetch"] => serde_json::json!({ "op": "fetch" }),
+        ["pr_create", title, body] => {
+            serde_json::json!({ "op": "pr_create", "title": title, "body": body })
+        }
+        _ => return Err(BrokerFailure::Usage),
+    };
+    serde_json::to_vec(&request).map_err(|_| BrokerFailure::Failed)
+}
+
+fn broker_outcome(frame: &[u8]) -> Result<String, BrokerFailure> {
+    let reply: BrokerReply = serde_json::from_slice(frame).map_err(|_| BrokerFailure::Failed)?;
+    match (reply.status.as_str(), reply.output, reply.error) {
+        ("done", Some(output), _) => Ok(output
+            .chars()
+            .filter(|c| !c.is_control() || matches!(c, '\n' | '\t'))
+            .collect()),
+        ("denied", _, Some(code)) => BROKER_DENIALS
+            .into_iter()
+            .find(|denial| {
+                serde_json::to_value(denial).is_ok_and(|v| v.as_str() == Some(code.as_str()))
+            })
+            .map_or(Err(BrokerFailure::Failed), |denial| {
+                Err(BrokerFailure::Denied(denial))
+            }),
+        _ => Err(BrokerFailure::Failed),
+    }
+}
+
+/// Sends the broker request in `args` over the job socket of `job_id` under `run_dir`.
+///
+/// Writes the broker output to `out` on success, control characters other than newline and tab
+/// removed. On a usage error, a refusal, a transport error, a malformed or oversize reply or a
+/// `wait` timeout it writes one fixed line to `err` and returns false. A denial prints the fixed
+/// message of its code, never the text the socket sent.
+async fn run_broker(
+    run_dir: &Path,
+    job_id: Option<&OsStr>,
+    args: &[OsString],
+    wait: Duration,
+    out: &mut impl Write,
+    err: &mut impl Write,
+) -> bool {
+    let served = async {
+        let request = broker_request(args)?;
+        let socket = job_id
+            .and_then(OsStr::to_str)
+            .and_then(|id| socket_path(run_dir, id))
+            .ok_or(BrokerFailure::Failed)?;
+        let frame = tokio::time::timeout(wait, exchange(&socket, ServiceName::Broker, &request))
+            .await
+            .map_err(|_| BrokerFailure::Failed)?
+            .map_err(|_| BrokerFailure::Failed)?;
+        broker_outcome(&frame)
+    }
+    .await;
+    match served {
+        Ok(text) => out
+            .write_all(text.as_bytes())
             .and_then(|()| out.flush())
             .is_ok(),
         Err(failure) => {
@@ -268,6 +411,8 @@ mod tests {
     use tokio::io::AsyncWriteExt;
     use tokio::net::UnixListener;
     use tokio::sync::oneshot;
+
+    use fleetd::jobsock::MAX_FRAME_BYTES;
 
     use super::*;
 
@@ -523,5 +668,241 @@ mod tests {
     fn the_failure_lines_are_fixed() {
         assert_eq!(FetchFailure::Usage.to_string(), USAGE.trim_end());
         assert_eq!(FetchFailure::Failed.to_string(), FIXED.trim_end());
+    }
+
+    const BROKER_FIXED: &str = "fleetd broker: the request failed\n";
+    const BROKER_USAGE: &str =
+        "fleetd broker: usage: fleetd broker push | pr_create <title> <body> | pr_checks | fetch\n";
+
+    async fn broker_os(
+        rig_dir: &Path,
+        job: Option<&str>,
+        args: &[OsString],
+        wait: Duration,
+    ) -> (bool, String, String) {
+        let (mut out, mut err) = (Vec::new(), Vec::new());
+        let ok = tokio::time::timeout(
+            OUTER,
+            run_broker(rig_dir, job.map(OsStr::new), args, wait, &mut out, &mut err),
+        )
+        .await
+        .unwrap_or(false);
+        (
+            ok,
+            String::from_utf8_lossy(&out).into_owned(),
+            String::from_utf8_lossy(&err).into_owned(),
+        )
+    }
+
+    async fn broker(
+        rig_dir: &Path,
+        job: Option<&str>,
+        args: &[&str],
+        wait: Duration,
+    ) -> (bool, String, String) {
+        let args: Vec<OsString> = args.iter().map(OsString::from).collect();
+        broker_os(rig_dir, job, &args, wait).await
+    }
+
+    #[tokio::test]
+    async fn each_op_sends_its_exact_frame_under_the_broker_handshake_and_prints_the_output()
+    -> TestResult {
+        let cases: [(&[&str], &str); 4] = [
+            (&["push"], r#"{"op":"push"}"#),
+            (&["pr_checks"], r#"{"op":"pr_checks"}"#),
+            (&["fetch"], r#"{"op":"fetch"}"#),
+            (
+                &["pr_create", "A \"title\"", "line\nbody"],
+                r#"{"body":"line\nbody","op":"pr_create","title":"A \"title\""}"#,
+            ),
+        ];
+        for (args, frame) in cases {
+            let rig = rig(framed(r#"{"status":"done","output":"ok line\nsecond"}"#))?;
+            let (ok, out, err) = broker(&rig.run_dir, Some("j1"), args, WAIT).await;
+            assert!(ok, "{args:?}");
+            assert_eq!(out, "ok line\nsecond", "{args:?}");
+            assert_eq!(err, "", "{args:?}");
+            let (handshake, request) = rig.seen.await?;
+            assert_eq!(handshake, b"broker");
+            assert_eq!(request, frame.as_bytes(), "{args:?}");
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_denied_reply_prints_the_fixed_message_of_its_code_and_fails() -> TestResult {
+        for denial in BROKER_DENIALS {
+            let code = serde_json::to_string(&denial)?;
+            let rig = rig(framed(&format!(
+                r#"{{"status":"denied","error":{code},"message":"server words"}}"#
+            )))?;
+            let (ok, out, err) = broker(&rig.run_dir, Some("j1"), &["push"], WAIT).await;
+            assert!(!ok, "{denial:?}");
+            assert_eq!(out, "", "{denial:?}");
+            assert_eq!(
+                err,
+                format!("fleetd broker: {}\n", denial.message()),
+                "{denial:?}"
+            );
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn control_characters_in_the_output_are_stripped_but_newline_and_tab_stay() -> TestResult
+    {
+        let rig = rig(framed(
+            r#"{"status":"done","output":"a\u001b[31mred\u001b[0m\tb\r\nc\u0085d\u0000e"}"#,
+        ))?;
+        let (ok, out, _) = broker(&rig.run_dir, Some("j1"), &["fetch"], WAIT).await;
+        assert!(ok);
+        assert_eq!(out, "a[31mred[0m\tb\ncde");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_malformed_or_hostile_reply_fails_with_the_fixed_line_and_echoes_nothing()
+    -> TestResult {
+        let oversize = {
+            let mut line = format!(
+                r#"{{"status":"done","output":"{}"#,
+                "a".repeat(MAX_FRAME_BYTES)
+            );
+            line.push_str("\"}\n");
+            line.into_bytes()
+        };
+        let cases: Vec<(&str, Vec<u8>)> = vec![
+            ("not json", b"nope\n".to_vec()),
+            ("empty line", b"\n".to_vec()),
+            (
+                "eof no newline",
+                br#"{"status":"done","output":"x"}"#.to_vec(),
+            ),
+            ("no reply", Vec::new()),
+            ("array", b"[\"done\"]\n".to_vec()),
+            ("done no output", b"{\"status\":\"done\"}\n".to_vec()),
+            (
+                "output not string",
+                b"{\"status\":\"done\",\"output\":5}\n".to_vec(),
+            ),
+            (
+                "unknown status",
+                b"{\"status\":\"ok\",\"output\":\"x\"}\n".to_vec(),
+            ),
+            (
+                "unknown code",
+                br#"{"status":"denied","error":"GH_TOKEN=abc","message":"GH_TOKEN=abc"}"#
+                    .iter()
+                    .copied()
+                    .chain(*b"\n")
+                    .collect(),
+            ),
+            (
+                "denied no code",
+                b"{\"status\":\"denied\",\"message\":\"x\"}\n".to_vec(),
+            ),
+            ("oversize", oversize),
+            (
+                "invalid utf8",
+                b"{\"status\":\"done\",\"output\":\"\xff\"}\n".to_vec(),
+            ),
+        ];
+        for (name, bytes) in cases {
+            let rig = rig(Script::Reply(bytes))?;
+            let (ok, out, err) = broker(&rig.run_dir, Some("j1"), &["push"], WAIT).await;
+            assert!(!ok, "{name}");
+            assert_eq!(out, "", "{name}");
+            assert_eq!(err, BROKER_FIXED, "{name}");
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_silent_broker_ends_at_the_wait_with_the_fixed_line() -> TestResult {
+        let rig = rig(Script::Stall)?;
+        let (ok, out, err) = broker(
+            &rig.run_dir,
+            Some("j1"),
+            &["push"],
+            Duration::from_millis(300),
+        )
+        .await;
+        assert!(!ok);
+        assert_eq!(out, "");
+        assert_eq!(err, BROKER_FIXED);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_missing_socket_or_job_id_and_an_unsafe_socket_dir_fail_with_the_fixed_line()
+    -> TestResult {
+        let dir = TempDir::new()?;
+        for job in [None, Some(""), Some("../j1"), Some("a/b"), Some("j1")] {
+            let (ok, out, err) = broker(dir.path(), job, &["push"], WAIT).await;
+            assert!(!ok, "{job:?}");
+            assert_eq!(out, "", "{job:?}");
+            assert_eq!(err, BROKER_FIXED, "{job:?}");
+        }
+        let mut rig = rig_with_mode(framed(r#"{"status":"done","output":"x"}"#), 0o770)?;
+        let (ok, _, err) = broker(&rig.run_dir, Some("j1"), &["push"], WAIT).await;
+        assert!(!ok);
+        assert_eq!(err, BROKER_FIXED);
+        assert!(rig.seen.try_recv().is_err());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn bad_arguments_get_the_usage_line_and_nothing_connects() -> TestResult {
+        let rig = rig(framed(r#"{"status":"done","output":"x"}"#))?;
+        let cases: Vec<Vec<OsString>> = vec![
+            vec![],
+            vec!["".into()],
+            vec!["Push".into()],
+            vec!["PUSH".into()],
+            vec!["merge".into()],
+            vec!["push ".into()],
+            vec!["push\",\"title\":\"x".into()],
+            vec!["push\n".into()],
+            vec!["--help".into()],
+            vec!["--".into(), "push".into()],
+            vec!["push".into(), "extra".into()],
+            vec!["pr_checks".into(), "extra".into()],
+            vec!["fetch".into(), "extra".into()],
+            vec!["pr_create".into()],
+            vec!["pr_create".into(), "t".into()],
+            vec!["pr_create".into(), "t".into(), "b".into(), "c".into()],
+            vec![OsString::from_vec(b"push\xff".to_vec())],
+            vec![
+                "pr_create".into(),
+                "t".into(),
+                OsString::from_vec(b"b\xff".to_vec()),
+            ],
+        ];
+        for args in cases {
+            let (ok, out, err) = broker_os(&rig.run_dir, Some("j1"), &args, WAIT).await;
+            assert!(!ok, "{args:?}");
+            assert_eq!(out, "", "{args:?}");
+            assert_eq!(err, BROKER_USAGE, "{args:?}");
+        }
+        assert_eq!(rig.accepted.load(Ordering::SeqCst), 0);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_title_or_body_over_the_frame_cap_fails_with_the_fixed_line() -> TestResult {
+        let rig = rig(framed(r#"{"status":"done","output":"x"}"#))?;
+        let big = "a".repeat(MAX_FRAME_BYTES);
+        let (ok, out, err) =
+            broker(&rig.run_dir, Some("j1"), &["pr_create", "t", &big], WAIT).await;
+        assert!(!ok);
+        assert_eq!(out, "");
+        assert_eq!(err, BROKER_FIXED);
+        Ok(())
+    }
+
+    #[test]
+    fn the_broker_failure_lines_are_fixed() {
+        assert_eq!(BrokerFailure::Usage.to_string(), BROKER_USAGE.trim_end());
+        assert_eq!(BrokerFailure::Failed.to_string(), BROKER_FIXED.trim_end());
     }
 }

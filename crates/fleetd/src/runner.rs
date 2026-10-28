@@ -3102,6 +3102,27 @@ mod tests {
     }
 
     #[test]
+    fn the_agent_env_never_holds_the_push_credentials_and_a_plain_push_cannot_prompt() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut config = test_config(dir.path());
+        config
+            .base_env
+            .push(("GH_HOST".into(), "ghe.invalid".into()));
+        config.env_passthrough = ["GH_TOKEN", "GIT_ASKPASS", "FLEET_TOKEN"]
+            .map(String::from)
+            .to_vec();
+        let runner = AgentRunner::new(config, Replies { cancel: false }, Redactor::default());
+        let spec = runner.agent_spec(&test_job(), dir.path(), &dir.path().join("home"));
+        for name in ["GH_TOKEN", "GH_HOST", "GIT_ASKPASS", "FLEET_TOKEN"] {
+            assert!(!spec.env.contains_key(&OsString::from(name)), "{name}");
+        }
+        assert_eq!(
+            spec.env.get(&OsString::from("GIT_TERMINAL_PROMPT")),
+            Some(&OsString::from("0"))
+        );
+    }
+
+    #[test]
     fn the_system_prompt_follows_the_services_the_launcher_serves() {
         let dir = tempfile::tempdir().expect("tempdir");
         let home = dir.path().join("home");

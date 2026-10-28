@@ -31,8 +31,10 @@ pub const FLOOR_DENY: &[&str] = &[
 /// The fixed allow set. Every job allows all of it, whatever allow list its Profile carries.
 ///
 /// ADR-0034 lets a Profile `allow` list replace the default allow list, so [`with_floor_allow`]
-/// puts these entries back. `Bash(fleetd fetch *)` is the fetch tool of ADR-0038.
-pub const FLOOR_ALLOW: &[&str] = &["Bash(fleetd fetch *)"];
+/// puts these entries back. `Bash(fleetd fetch *)` is the fetch tool of ADR-0038 and
+/// `Bash(fleetd broker *)` is the credential broker client of ADR-0037. Neither widens
+/// [`FLOOR_DENY`]: `git push` and `gh` stay denied.
+pub const FLOOR_ALLOW: &[&str] = &["Bash(fleetd fetch *)", "Bash(fleetd broker *)"];
 
 /// `allow` with [`FLOOR_ALLOW`] first and each entry once.
 #[must_use]
@@ -261,7 +263,10 @@ mod tests {
 
     #[test]
     fn the_floor_allow_names_fetch_and_no_floor_deny_covers_it() {
-        assert_eq!(FLOOR_ALLOW, ["Bash(fleetd fetch *)"]);
+        assert_eq!(
+            FLOOR_ALLOW,
+            ["Bash(fleetd fetch *)", "Bash(fleetd broker *)"]
+        );
         for allow in FLOOR_ALLOW {
             assert!(
                 !FLOOR_DENY.iter().any(|deny| covers(deny, allow)),
@@ -280,7 +285,10 @@ mod tests {
             vec!["Bash(fleetd fetch *)".to_owned(); 3],
         ] {
             let merged = with_floor_allow(&allow);
-            assert_eq!(merged[0], "Bash(fleetd fetch *)");
+            assert_eq!(
+                merged[..2],
+                ["Bash(fleetd fetch *)", "Bash(fleetd broker *)"]
+            );
             assert_eq!(
                 merged
                     .iter()
@@ -294,8 +302,50 @@ mod tests {
         }
         assert_eq!(
             with_floor_allow(&["Read".to_owned(), "Grep".to_owned()]),
-            vec!["Bash(fleetd fetch *)", "Read", "Grep"]
+            vec![
+                "Bash(fleetd fetch *)",
+                "Bash(fleetd broker *)",
+                "Read",
+                "Grep"
+            ]
         );
+    }
+
+    #[test]
+    fn push_and_gh_stay_denied_while_the_broker_is_allowed() {
+        for must_deny in ["Bash(git push *)", "Bash(gh *)"] {
+            assert!(FLOOR_DENY.contains(&must_deny), "{must_deny}");
+            assert!(!FLOOR_ALLOW.contains(&must_deny), "{must_deny}");
+        }
+        assert!(FLOOR_ALLOW.contains(&"Bash(fleetd broker *)"));
+        assert!(
+            !FLOOR_DENY
+                .iter()
+                .any(|deny| covers(deny, "Bash(fleetd broker *)"))
+        );
+        let eff = apply(
+            &profile(
+                &[
+                    "Bash(git push *)",
+                    "Bash(gh *)",
+                    "Bash(gh pr create)",
+                    "Bash(fleetd broker *)",
+                ],
+                &[],
+            ),
+            &ceilings(),
+        );
+        assert_eq!(
+            eff.dropped_allows,
+            vec![
+                "Bash(git push *)".to_owned(),
+                "Bash(gh *)".to_owned(),
+                "Bash(gh pr create)".to_owned()
+            ]
+        );
+        assert_eq!(eff.allow, vec!["Bash(fleetd broker *)".to_owned()]);
+        assert!(eff.deny.contains(&"Bash(git push *)".to_owned()));
+        assert!(eff.deny.contains(&"Bash(gh *)".to_owned()));
     }
 
     #[test]

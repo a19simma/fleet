@@ -507,7 +507,7 @@ mod tests {
         assert_eq!(value["model"], json!("opus"));
         assert_eq!(
             value["permissions"]["allow"],
-            json!(["Bash(fleetd fetch *)", "Read"])
+            json!(["Bash(fleetd fetch *)", "Bash(fleetd broker *)", "Read"])
         );
         let deny = value["permissions"]["deny"]
             .as_array()
@@ -561,6 +561,35 @@ mod tests {
                 .windows(2)
                 .any(|w| w == ["--allowedTools", "Read"])
         );
+        Ok(())
+    }
+
+    #[test]
+    fn the_broker_allow_is_in_settings_only_never_in_the_allowed_tools_argv()
+    -> Result<(), ApplyError> {
+        for profile in [
+            Profile::default(),
+            Profile {
+                allow: vec!["Read".to_owned(), "Bash(gh *)".to_owned()],
+                ..Profile::default()
+            },
+        ] {
+            let applied = run(&profile)?;
+            assert!(applied.argv.iter().all(|arg| !arg.contains("broker")));
+            let raw = body(&applied, "settings.json").unwrap_or_default();
+            let value: Value = serde_json::from_str(&raw).unwrap_or(Value::Null);
+            assert!(
+                value["permissions"]["allow"]
+                    .as_array()
+                    .is_some_and(|allow| allow.contains(&json!("Bash(fleetd broker *)")))
+            );
+            let deny = value["permissions"]["deny"]
+                .as_array()
+                .cloned()
+                .unwrap_or_default();
+            assert!(deny.contains(&json!("Bash(git push *)")));
+            assert!(deny.contains(&json!("Bash(gh *)")));
+        }
         Ok(())
     }
 

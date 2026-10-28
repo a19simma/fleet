@@ -21,13 +21,7 @@ fn settings(dir: &Path, json: &str) -> TestResult {
 fn the_protocol_is_unchanged_with_no_service_and_names_fetch_when_it_is_on() {
     assert_eq!(protocol_for(&[]), AGENT_PROTOCOL);
     assert!(AGENT_PROTOCOL.starts_with("You run as an unattended fleet job."));
-    for quiet in [
-        &[ServiceName::Broker][..],
-        &[ServiceName::EgressProxy],
-        &[ServiceName::Broker, ServiceName::EgressProxy],
-    ] {
-        assert_eq!(protocol_for(quiet), AGENT_PROTOCOL, "{quiet:?}");
-    }
+    assert_eq!(protocol_for(&[ServiceName::EgressProxy]), AGENT_PROTOCOL);
     let with = protocol_for(&[ServiceName::Fetch]);
     assert!(with.starts_with(AGENT_PROTOCOL));
     assert!(with.contains("fleetd fetch <url>"));
@@ -35,6 +29,67 @@ fn the_protocol_is_unchanged_with_no_service_and_names_fetch_when_it_is_on() {
         protocol_for(&[ServiceName::Fetch, ServiceName::Fetch]),
         with
     );
+}
+
+#[test]
+fn the_broker_line_is_added_only_for_the_broker_and_says_push_is_optional() {
+    let with = protocol_for(&[ServiceName::Broker]);
+    assert!(with.starts_with(AGENT_PROTOCOL));
+    assert_ne!(with, AGENT_PROTOCOL);
+    assert!(with.contains("fleetd broker push"));
+    assert!(with.contains("optional"));
+    assert!(with.contains("publishes"));
+    assert_eq!(
+        protocol_for(&[ServiceName::Broker, ServiceName::Broker]),
+        with
+    );
+    assert_eq!(
+        protocol_for(&[ServiceName::EgressProxy, ServiceName::Broker]),
+        with
+    );
+    let both = protocol_for(&[ServiceName::Fetch, ServiceName::Broker]);
+    assert!(both.starts_with(AGENT_PROTOCOL));
+    assert!(both.contains("fleetd fetch <url>"));
+    assert!(both.contains("fleetd broker push"));
+    assert_eq!(
+        protocol_for(&[ServiceName::Broker, ServiceName::Fetch]),
+        both
+    );
+}
+
+#[test]
+fn the_scratch_gitconfig_refuses_a_plain_push_and_keeps_the_job_identity() -> TestResult {
+    let jobs = TempDir::new()?;
+    let job = JobDir::create(jobs.path(), "j1", &Bundle::default())?;
+    let gitconfig = std::fs::read_to_string(job.home().join(".gitconfig"))?;
+    assert!(gitconfig.contains("[push]\n\tdefault = nothing\n"));
+    assert!(gitconfig.contains("gpgsign = false"));
+    assert!(!gitconfig.contains("askpass"));
+    assert!(!gitconfig.contains("credential"));
+    Ok(())
+}
+
+#[test]
+fn the_embedded_bundle_ships_a_broker_skill_with_the_text_rules() -> TestResult {
+    let jobs = TempDir::new()?;
+    let job = JobDir::create(jobs.path(), "j1", &Bundle::default())?;
+    let skill = std::fs::read_to_string(job.home().join(".claude/skills/broker/SKILL.md"))?;
+    assert!(skill.starts_with("---\nname: broker\ndescription: "));
+    for want in [
+        "fleetd broker push",
+        "fleetd broker pr_create <title> <body>",
+        "fleetd broker pr_checks",
+        "fleetd broker fetch",
+        "mentions",
+        "#",
+        "URLs",
+        "HTML",
+        "entities",
+    ] {
+        assert!(skill.contains(want), "{want}");
+    }
+    assert!(skill.contains("Never run git push or gh"));
+    Ok(())
 }
 
 #[test]
