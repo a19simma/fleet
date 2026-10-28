@@ -5,6 +5,11 @@
 //! separately and runs `fleetd agent-exec <id>` as the job uid. Every `systemctl` call uses
 //! the configured absolute path with an argv array and an empty environment.
 //!
+//! With a [`JobSocketSetup`] the launcher also binds the job socket (ADR-0036) inside that
+//! dir after the FIFO and before `start`, so the unit never runs without it. The launcher
+//! closes the socket as soon as the unit has ended and before `stop`, so it is unlinked
+//! before the dir is removed, on every path: poll end, failed start and drop.
+//!
 //! The unit sets `RemainAfterExit=yes`, so a clean exit stays `active (exited)`. The launcher
 //! reads that as ended, then runs `stop` and `reset-failed` before it reports the result.
 
@@ -15,8 +20,8 @@ use std::os::unix::process::ExitStatusExt;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::process::{Command, ExitStatus, Stdio};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
+use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
 use tokio::net::unix::pipe::Receiver;
@@ -26,6 +31,7 @@ use tokio::task::JoinHandle;
 use crate::agent_exec::{SPEC_FILE, write_spec};
 use crate::config::{AgentLauncher, Config};
 use crate::jobenv::{create_stdout_fifo, open_fifo_reader, render_env_file, write_env_file};
+use crate::jobsock::{JobSocket, Limits, Peer, ProcPeer, ServiceName, Services, socket_path};
 use crate::runner::{AgentProc, AgentSpec, DirectLauncher, Launched, Launcher};
 use crate::workspace::validate_job_id;
 
@@ -47,16 +53,65 @@ const SIGTERM: i32 = 15;
 const SIGKILL: i32 = 9;
 const MAX_SIGNAL: i32 = 64;
 
+/// The one log line written when a job socket is asked for in direct mode (ADR-0036).
+pub const JOB_SOCKET_REFUSED: &str = "job socket refused: agent_launcher is direct";
+
 /// The launcher the config selects.
+///
+/// With the systemd launcher every job gets a socket that offers `services`, which may be
+/// empty. The direct launcher makes no socket: when `services` is not empty it logs
+/// [`JOB_SOCKET_REFUSED`] once and drops them, because the agent there shares fleetd's uid and
+/// reads its environment, so a peer check adds nothing.
 #[must_use]
-pub fn select_launcher(config: &Config, job_gid: Option<u32>) -> Arc<dyn Launcher> {
+pub fn select_launcher(
+    config: &Config,
+    job_gid: Option<u32>,
+    services: Services,
+) -> Arc<dyn Launcher> {
     match config.agent_launcher {
-        AgentLauncher::Direct => Arc::new(DirectLauncher),
+        AgentLauncher::Direct => {
+            if !services.is_empty() {
+                tracing::warn!("{JOB_SOCKET_REFUSED}");
+            }
+            Arc::new(DirectLauncher)
+        }
         AgentLauncher::Systemd => Arc::new(
             SystemdLauncher::new(&config.systemctl_path)
                 .with_job_gid(job_gid)
-                .with_run_timeout(config.agent_timeout),
+                .with_run_timeout(config.agent_timeout)
+                .with_job_socket(JobSocketSetup::new(services)),
         ),
+    }
+}
+
+/// What the launcher needs to bind the job socket of each job.
+#[derive(Clone)]
+pub struct JobSocketSetup {
+    /// The services the socket offers by handshake name.
+    pub services: Services,
+    /// How the identity of a connecting peer is read.
+    pub peer: Arc<dyn Peer>,
+    /// The connection and handshake limits.
+    pub limits: Limits,
+}
+
+impl JobSocketSetup {
+    /// The production setup: peers read through `/proc` and the default limits.
+    #[must_use]
+    pub fn new(services: Services) -> Self {
+        Self {
+            services,
+            peer: Arc::new(ProcPeer),
+            limits: Limits::default(),
+        }
+    }
+}
+
+impl std::fmt::Debug for JobSocketSetup {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("JobSocketSetup")
+            .field("services", &self.services.keys().collect::<Vec<_>>())
+            .finish_non_exhaustive()
     }
 }
 
@@ -80,6 +135,7 @@ pub struct SystemdLauncher {
     start_deadline: Duration,
     run_timeout: Option<Duration>,
     gid: Option<u32>,
+    socket: Option<JobSocketSetup>,
 }
 
 impl SystemdLauncher {
@@ -94,7 +150,15 @@ impl SystemdLauncher {
             start_deadline: DEFAULT_START_DEADLINE,
             run_timeout: None,
             gid: None,
+            socket: None,
         }
+    }
+
+    /// Binds a job socket in each run dir, offering the services in `setup`.
+    #[must_use]
+    pub fn with_job_socket(mut self, setup: JobSocketSetup) -> Self {
+        self.socket = Some(setup);
+        self
     }
 
     /// Puts the per-job run directories under `run_dir`.
@@ -282,7 +346,35 @@ fn fail<T>(kind: io::ErrorKind) -> io::Result<T> {
     Err(io::Error::from(kind))
 }
 
+impl SystemdLauncher {
+    fn bind_job_socket(&self, id: &str) -> io::Result<Option<JobSocket>> {
+        let Some(setup) = &self.socket else {
+            return Ok(None);
+        };
+        let path = socket_path(&self.run_dir, id)
+            .ok_or_else(|| io::Error::from(io::ErrorKind::InvalidInput))?;
+        let socket = JobSocket::bind(
+            &path,
+            id,
+            setup.services.clone(),
+            Arc::clone(&setup.peer),
+            setup.limits,
+        )?;
+        if let Some(gid) = self.gid {
+            std::os::unix::fs::chown(&path, None, Some(gid))?;
+        }
+        Ok(Some(socket))
+    }
+}
+
 impl Launcher for SystemdLauncher {
+    fn job_services(&self) -> Vec<ServiceName> {
+        self.socket
+            .as_ref()
+            .map(|setup| setup.services.keys().copied().collect())
+            .unwrap_or_default()
+    }
+
     fn launch(&self, spec: AgentSpec) -> io::Result<Launched> {
         let id = spec
             .env
@@ -312,6 +404,7 @@ impl Launcher for SystemdLauncher {
         create_stdout_fifo(&fifo, self.gid)?;
         let reader = Receiver::from_file(open_fifo_reader(&fifo)?)?;
         let keepalive = fs::OpenOptions::new().write(true).open(&fifo)?;
+        let socket = self.bind_job_socket(&id)?;
         let unit = unit_name(&id);
         self.ctl.run(&["start", "--no-block", &unit])?;
         Ok(Launched {
@@ -324,7 +417,7 @@ impl Launcher for SystemdLauncher {
                 run_timeout: self.run_timeout,
                 launched: Instant::now(),
                 keepalive: Some(keepalive),
-                shared: Arc::new(Shared::default()),
+                shared: Arc::new(Shared::with_socket(socket)),
                 result: None,
                 task: None,
                 dir: guard,
@@ -340,6 +433,36 @@ struct Shared {
     sent: AtomicI32,
     cleaned: AtomicBool,
     timed_out: AtomicBool,
+    socket: Mutex<Option<JobSocket>>,
+}
+
+impl Shared {
+    fn with_socket(socket: Option<JobSocket>) -> Self {
+        Self {
+            socket: Mutex::new(socket),
+            ..Self::default()
+        }
+    }
+
+    fn cancel_socket(&self) {
+        if let Some(socket) = self
+            .socket
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .as_ref()
+        {
+            socket.cancel();
+        }
+    }
+
+    fn close_socket(&self) {
+        let socket = self
+            .socket
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .take();
+        drop(socket);
+    }
 }
 
 struct SystemdProc {
@@ -397,6 +520,7 @@ impl Poller {
         tx: watch::Sender<Option<Outcome>>,
     ) {
         let outcome = self.watch().await;
+        self.shared.close_socket();
         drop(keepalive);
         self.ctl.stop(&self.unit).await;
         self.ctl.reset_failed(&self.unit).await;
@@ -465,10 +589,15 @@ impl AgentProc for SystemdProc {
     fn timed_out(&self) -> bool {
         self.shared.timed_out.load(Ordering::SeqCst)
     }
+
+    fn cancel_services(&self) {
+        self.shared.cancel_socket();
+    }
 }
 
 impl Drop for SystemdProc {
     fn drop(&mut self) {
+        self.shared.close_socket();
         if let Some(task) = &self.task {
             task.abort();
         }

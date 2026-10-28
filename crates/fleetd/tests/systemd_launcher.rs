@@ -3,19 +3,26 @@
 use std::ffi::OsString;
 use std::fs;
 use std::io;
-use std::os::unix::fs::{MetadataExt, PermissionsExt};
+use std::os::unix::fs::{FileTypeExt, MetadataExt, PermissionsExt};
 use std::os::unix::process::ExitStatusExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::sync::OnceLock;
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use fleetd::agent_exec::write_spec;
+use fleetd::jobsock::{
+    AGENT_SLICE, JobContext, Limits, Peer, PeerId, ServeFuture, Service, ServiceName, Services,
+    connect,
+};
 use fleetd::runner::{AgentProc, AgentSpec, Launched, Launcher};
-use fleetd::systemd::{SystemdLauncher, select_launcher, sweep_stale_runs};
+use fleetd::systemd::{JobSocketSetup, SystemdLauncher, select_launcher, sweep_stale_runs};
 use fleetd::{AgentLauncher, Config, Error};
 use tempfile::TempDir;
 use tokio::io::AsyncReadExt;
+use tokio::net::UnixStream;
+use tokio::sync::mpsc;
+use tracing_subscriber::fmt::MakeWriter;
 
 type TestResult = Result<(), Box<dyn std::error::Error>>;
 
@@ -30,6 +37,10 @@ id=${id%.service}
 st=$root/$id
 mkdir -p "$st"
 echo "$*" >> "$st/log"
+if [ -f "$st/rundir" ]; then
+  if [ -S "$(cat "$st/rundir")/$id/job.sock" ]; then s=sock; else s=nosock; fi
+  echo "$1 $s" >> "$st/seen"
+fi
 case "$1" in
   stop)
     if [ -f "$st/stop.to" ]; then cp "$st/stop.to" "$st/show.last"; rm -f "$st"/show.[0-9]*; fi
@@ -88,10 +99,31 @@ impl Case {
     fn new(id: &str) -> Result<Self, io::Error> {
         let state = root().join(id);
         fs::create_dir_all(&state)?;
+        let run = tempfile::tempdir()?;
+        fs::write(
+            state.join("rundir"),
+            run.path().as_os_str().as_encoded_bytes(),
+        )?;
         Ok(Self {
             id: id.to_owned(),
             state,
-            run: tempfile::tempdir()?,
+            run,
+        })
+    }
+
+    fn seen(&self) -> Vec<String> {
+        fs::read_to_string(self.state.join("seen"))
+            .unwrap_or_default()
+            .lines()
+            .map(str::to_owned)
+            .collect()
+    }
+
+    fn socket_launcher(&self, services: Services) -> SystemdLauncher {
+        self.launcher().with_job_socket(JobSocketSetup {
+            services,
+            peer: Arc::new(AgentPeer(self.id.clone())),
+            limits: Limits::default(),
         })
     }
 
@@ -410,6 +442,171 @@ async fn a_failed_start_leaves_nothing_behind() -> TestResult {
 
 const BOUND: Duration = Duration::from_secs(20);
 
+struct AgentPeer(String);
+
+impl Peer for AgentPeer {
+    fn identity(&self, _stream: &UnixStream) -> io::Result<PeerId> {
+        Ok(PeerId {
+            pid: 1,
+            cgroup: format!("0::/{AGENT_SLICE}/fleet-agent@{}.service\n", self.0),
+        })
+    }
+}
+
+struct Probe(mpsc::UnboundedSender<&'static str>);
+
+struct Closed(mpsc::UnboundedSender<&'static str>);
+
+impl Drop for Closed {
+    fn drop(&mut self) {
+        let _ = self.0.send("closed");
+    }
+}
+
+impl Service for Probe {
+    fn serve(&self, _ctx: JobContext, _stream: UnixStream) -> ServeFuture<'_> {
+        let closed = Closed(self.0.clone());
+        let _ = self.0.send("serving");
+        Box::pin(async move {
+            let _closed = closed;
+            std::future::pending::<()>().await;
+        })
+    }
+}
+
+fn probe() -> (Services, mpsc::UnboundedReceiver<&'static str>) {
+    let (tx, rx) = mpsc::unbounded_channel();
+    let service: Arc<dyn Service> = Arc::new(Probe(tx));
+    (Services::from([(ServiceName::Fetch, service)]), rx)
+}
+
+#[derive(Clone, Default)]
+struct Capture(Arc<Mutex<Vec<u8>>>);
+
+impl io::Write for Capture {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        self.0
+            .lock()
+            .map_err(|_| io::Error::other("capture poisoned"))?
+            .extend_from_slice(buf);
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
+impl<'a> MakeWriter<'a> for Capture {
+    type Writer = Self;
+
+    fn make_writer(&'a self) -> Self::Writer {
+        self.clone()
+    }
+}
+
+fn captured(run: impl FnOnce()) -> String {
+    let capture = Capture::default();
+    let guard = tracing::subscriber::set_default(
+        tracing_subscriber::fmt()
+            .with_writer(capture.clone())
+            .with_ansi(false)
+            .finish(),
+    );
+    run();
+    drop(guard);
+    let bytes = capture.0.lock().map(|b| b.clone()).unwrap_or_default();
+    String::from_utf8_lossy(&bytes).into_owned()
+}
+
+#[tokio::test]
+async fn the_job_socket_exists_before_start_and_is_gone_before_stop() -> TestResult {
+    let case = Case::new("t_sock_order")?;
+    case.last(&show("inactive", "success", 1, 0))?;
+    let mut launched = case.socket_launcher(Services::new()).launch(case.spec())?;
+    let socket = case.dir().join("job.sock");
+    assert!(fs::symlink_metadata(&socket)?.file_type().is_socket());
+    assert_eq!(fs::metadata(&socket)?.permissions().mode() & 0o777, 0o660);
+    waited(launched.proc.as_mut()).await?;
+    let seen = case.seen();
+    assert_eq!(seen.first().map(String::as_str), Some("start sock"));
+    assert!(seen.iter().any(|line| line == "stop nosock"), "{seen:?}");
+    assert!(!seen.iter().any(|line| line == "stop sock"), "{seen:?}");
+    assert!(!case.dir().exists());
+    Ok(())
+}
+
+#[tokio::test]
+async fn no_job_socket_is_made_without_a_setup() -> TestResult {
+    let case = Case::new("t_sock_none")?;
+    case.last(&show("inactive", "success", 1, 0))?;
+    let mut launched = case.launch()?;
+    assert!(!case.dir().join("job.sock").exists());
+    waited(launched.proc.as_mut()).await?;
+    assert_eq!(
+        case.seen().first().map(String::as_str),
+        Some("start nosock")
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_failed_start_removes_the_job_socket_with_the_dir() -> TestResult {
+    let case = Case::new("t_sock_startfail")?;
+    case.put("start.rc", "1")?;
+    assert!(
+        case.socket_launcher(Services::new())
+            .launch(case.spec())
+            .is_err()
+    );
+    assert_eq!(case.seen(), ["start sock"]);
+    assert_eq!(fs::read_dir(case.run.path())?.count(), 0);
+    Ok(())
+}
+
+#[tokio::test]
+async fn cancel_services_stops_a_serving_connection_while_the_unit_runs() -> TestResult {
+    let case = Case::new("t_sock_cancel")?;
+    case.last(&show("active", "success", 1, 0))?;
+    let (services, mut events) = probe();
+    let mut launched = case.socket_launcher(services).launch(case.spec())?;
+    let uid = fs::metadata(case.dir())?.uid();
+    let _client = connect(&case.dir().join("job.sock"), ServiceName::Fetch, uid).await?;
+    assert_eq!(
+        tokio::time::timeout(BOUND, events.recv()).await?,
+        Some("serving")
+    );
+    launched.proc.cancel_services();
+    assert_eq!(
+        tokio::time::timeout(BOUND, events.recv()).await?,
+        Some("closed")
+    );
+    assert!(case.dir().exists());
+    launched.proc.kill();
+    Ok(())
+}
+
+#[test]
+fn a_direct_launcher_refuses_the_job_socket_with_one_fixed_line() -> TestResult {
+    let none = |_: &str| None;
+    let direct = Config::resolve(None, &none)?;
+    let systemd = Config::resolve(Some("agent_launcher = \"systemd\"\n"), &none)?;
+    let (services, _events) = probe();
+    let logged = captured(|| {
+        let launcher = select_launcher(&direct, None, services.clone());
+        assert_eq!(launcher.job_services(), Vec::new());
+    });
+    assert_eq!(logged.matches("job socket refused").count(), 1, "{logged}");
+    assert!(logged.contains("job socket refused: agent_launcher is direct"));
+    let quiet = captured(|| {
+        let _ = select_launcher(&direct, None, Services::new());
+        let launcher = select_launcher(&systemd, None, services.clone());
+        assert_eq!(launcher.job_services(), [ServiceName::Fetch]);
+    });
+    assert!(!quiet.contains("job socket"), "{quiet}");
+    Ok(())
+}
+
 fn show_count(case: &Case) -> usize {
     case.log().iter().filter(|l| l.starts_with("show ")).count()
 }
@@ -663,15 +860,20 @@ fn config_defaults_to_direct_and_rejects_bad_values() -> TestResult {
 fn select_launcher_follows_the_config() -> TestResult {
     let none = |_: &str| None;
     let direct = Config::resolve(None, &none)?;
-    assert!(format!("{:?}", select_launcher(&direct, None)).contains("DirectLauncher"));
+    assert!(
+        format!("{:?}", select_launcher(&direct, None, Services::new())).contains("DirectLauncher")
+    );
     let file = "agent_launcher = \"systemd\"\n";
     let systemd = Config::resolve(Some(file), &none)?;
-    assert!(format!("{:?}", select_launcher(&systemd, None)).contains("SystemdLauncher"));
+    assert!(
+        format!("{:?}", select_launcher(&systemd, None, Services::new()))
+            .contains("SystemdLauncher")
+    );
     let timed = Config::resolve(
         Some("agent_launcher = \"systemd\"\nagent_timeout_secs = 321\n"),
         &none,
     )?;
-    let shown = format!("{:?}", select_launcher(&timed, None));
+    let shown = format!("{:?}", select_launcher(&timed, None, Services::new()));
     assert!(shown.contains("321"), "{shown}");
     Ok(())
 }

@@ -16,6 +16,7 @@ use crate::Error;
 use crate::agent_config::Bundle;
 use crate::config::Config;
 use crate::jobenv::group_id;
+use crate::jobsock::Services;
 use crate::poller::{
     GrpcReporter, JobRunner, PollRandom, Poller, RunError, SERVER_URL_ENV, Shutdown, TOKEN_ENV,
     Token, channel,
@@ -270,7 +271,7 @@ pub(crate) fn build(
         })?;
     }
     let workspace = job_workspace(config, &mut run, env).with_redactor(redactor.clone());
-    let launcher = select_launcher(config, run.job_gid);
+    let launcher = select_launcher(config, run.job_gid, Services::new());
     let runner = DaemonRunner::new(
         workspace,
         AgentRunner::new(run, reporter, redactor)

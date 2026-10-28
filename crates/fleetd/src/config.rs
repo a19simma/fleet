@@ -4,6 +4,7 @@ use std::time::Duration;
 use serde::Deserialize;
 
 use crate::Error;
+use crate::fetch_policy::{FetchCaps, FetchPolicy, HostPattern};
 use crate::runner::{
     DEFAULT_CI_DEADLINE, DEFAULT_MAX_BUDGET_USD, DEFAULT_MAX_TURNS, DEFAULT_TIMEOUT,
 };
@@ -32,6 +33,12 @@ const DEFAULT_CLAUDE_BIN: &str = "claude";
 const DEFAULT_GH_BIN: &str = "gh";
 const DEFAULT_REPO_HOSTS: [&str; 1] = ["github.com"];
 const DEFAULT_TOKEN_HOST: &str = "github.com";
+const MAX_FETCH_BODY_BYTES: u64 = 64 * 1024 * 1024;
+const MAX_FETCH_DECODED_BYTES: u64 = 256 * 1024 * 1024;
+const MAX_FETCH_CONNECT_SECS: u64 = 60;
+const MAX_FETCH_TOTAL_SECS: u64 = 300;
+const MAX_FETCH_REDIRECTS: u64 = 10;
+const MAX_FETCH_PER_JOB: u64 = 1000;
 const DEFAULT_HOOK_EVENTS: [&str; 7] = [
     "SessionStart",
     "UserPromptSubmit",
@@ -72,6 +79,15 @@ struct FileConfig {
     job_group: Option<String>,
     agent_launcher: Option<String>,
     systemctl_path: Option<PathBuf>,
+    fetch_policy: Option<String>,
+    fetch_allow: Option<Vec<String>>,
+    fetch_max_body_bytes: Option<i64>,
+    fetch_max_decoded_bytes: Option<i64>,
+    fetch_connect_timeout_secs: Option<i64>,
+    fetch_total_timeout_secs: Option<i64>,
+    fetch_max_redirects: Option<i64>,
+    fetch_max_per_job: Option<i64>,
+    egress_allow: Option<Vec<String>>,
 }
 
 /// How agents are started.
@@ -177,6 +193,20 @@ pub struct Config {
     /// Absolute path of the `systemctl` binary the systemd launcher runs, `/usr/bin/systemctl`
     /// by default. Env `FLEETD_SYSTEMCTL_PATH`.
     pub systemctl_path: PathBuf,
+    /// Which hosts `fleetd fetch` may reach. `fetch_policy` is `allow_all_public` (the default,
+    /// any public host, an exfiltration path by decision in ADR-0038) or `allowlist`, which
+    /// needs `fetch_allow`. Config file only: no environment variable and no Profile field
+    /// sets it.
+    pub fetch_policy: FetchPolicy,
+    /// Limits on one fetch and on the fetches of one Job. Config file only, each key bounded:
+    /// `fetch_max_body_bytes` 1 to 64 MiB, `fetch_max_decoded_bytes` from the body cap to
+    /// 256 MiB, `fetch_connect_timeout_secs` 1 to 60, `fetch_total_timeout_secs` from the
+    /// connect time to 300, `fetch_max_redirects` 0 to 10, `fetch_max_per_job` 1 to 1000. The
+    /// URL cap is fixed at [`crate::fetch_policy::MAX_URL_BYTES`].
+    pub fetch_caps: FetchCaps,
+    /// Hosts the egress proxy may `CONNECT` to, `host.example` or `*.example`, empty by
+    /// default. Config file only: no Profile or bundle can add hosts (ADR-0038).
+    pub egress_allow: Vec<HostPattern>,
 }
 
 impl Config {
@@ -219,6 +249,7 @@ impl Config {
             Some(text) => toml::from_str(text).map_err(Error::ConfigFile)?,
             None => FileConfig::default(),
         };
+        let (fetch_policy, fetch_caps, egress_allow) = resolve_fetch(&file)?;
         let http_port = match env("FLEETD_PORT") {
             Some(raw) => raw.parse().map_err(|_| Error::InvalidValue {
                 name: "FLEETD_PORT",
@@ -247,13 +278,7 @@ impl Config {
                         |dir| dir.join("fleetd.sock"),
                     )
             });
-        let named = env("FLEETD_SECRETS_FILE")
-            .map(PathBuf::from)
-            .or(file.secrets_file);
-        let secrets_file = SecretsFile {
-            required: named.is_some(),
-            path: named.unwrap_or_else(|| PathBuf::from(DEFAULT_SECRETS_PATH)),
-        };
+        let secrets_file = resolve_secrets(&env, file.secrets_file);
         let (queue_max_bytes, queue_max_age) =
             resolve_queue(file.queue_max_bytes, file.queue_max_age_secs)?;
         let repo_hosts = resolve_repo_hosts(file.repo_hosts)?;
@@ -311,8 +336,110 @@ impl Config {
             job_group: resolve_job_group(&env, file.job_group)?,
             agent_launcher,
             systemctl_path,
+            fetch_policy,
+            fetch_caps,
+            egress_allow,
         })
     }
+}
+
+fn resolve_secrets(env: &dyn Fn(&str) -> Option<String>, file: Option<PathBuf>) -> SecretsFile {
+    let named = env("FLEETD_SECRETS_FILE").map(PathBuf::from).or(file);
+    SecretsFile {
+        required: named.is_some(),
+        path: named.unwrap_or_else(|| PathBuf::from(DEFAULT_SECRETS_PATH)),
+    }
+}
+
+fn bad_key(name: &'static str) -> Error {
+    Error::InvalidValue {
+        name,
+        value: "<redacted>".to_owned(),
+    }
+}
+
+fn bounded(
+    name: &'static str,
+    raw: Option<i64>,
+    default: u64,
+    range: std::ops::RangeInclusive<u64>,
+) -> Result<u64, Error> {
+    let Some(raw) = raw else { return Ok(default) };
+    u64::try_from(raw)
+        .ok()
+        .filter(|value| range.contains(value))
+        .ok_or_else(|| Error::InvalidValue {
+            name,
+            value: raw.to_string(),
+        })
+}
+
+fn patterns(name: &'static str, raw: &[String]) -> Result<Vec<HostPattern>, Error> {
+    raw.iter()
+        .map(|text| HostPattern::parse(text).map_err(|_| bad_key(name)))
+        .collect()
+}
+
+fn resolve_fetch(file: &FileConfig) -> Result<(FetchPolicy, FetchCaps, Vec<HostPattern>), Error> {
+    let policy = match (file.fetch_policy.as_deref(), &file.fetch_allow) {
+        (None | Some("allow_all_public"), None) => FetchPolicy::AllowAllPublicHosts,
+        (Some("allowlist"), Some(allow)) => FetchPolicy::Allowlist(patterns("fetch_allow", allow)?),
+        (Some("allowlist"), None) | (None | Some("allow_all_public"), Some(_)) => {
+            return Err(bad_key("fetch_allow"));
+        }
+        (Some(_), _) => return Err(bad_key("fetch_policy")),
+    };
+    let defaults = FetchCaps::default();
+    let body = bounded(
+        "fetch_max_body_bytes",
+        file.fetch_max_body_bytes,
+        defaults.max_body_bytes,
+        1..=MAX_FETCH_BODY_BYTES,
+    )?;
+    let decoded = bounded(
+        "fetch_max_decoded_bytes",
+        file.fetch_max_decoded_bytes,
+        defaults.max_decoded_bytes.max(body),
+        body..=MAX_FETCH_DECODED_BYTES,
+    )?;
+    let connect = bounded(
+        "fetch_connect_timeout_secs",
+        file.fetch_connect_timeout_secs,
+        defaults.connect_timeout.as_secs(),
+        1..=MAX_FETCH_CONNECT_SECS,
+    )?;
+    let total = bounded(
+        "fetch_total_timeout_secs",
+        file.fetch_total_timeout_secs,
+        defaults.total_timeout.as_secs().max(connect),
+        connect..=MAX_FETCH_TOTAL_SECS,
+    )?;
+    let redirects = bounded(
+        "fetch_max_redirects",
+        file.fetch_max_redirects,
+        u64::from(defaults.max_redirects),
+        0..=MAX_FETCH_REDIRECTS,
+    )?;
+    let per_job = bounded(
+        "fetch_max_per_job",
+        file.fetch_max_per_job,
+        u64::from(defaults.max_fetches_per_job),
+        1..=MAX_FETCH_PER_JOB,
+    )?;
+    let caps = FetchCaps {
+        max_body_bytes: body,
+        max_decoded_bytes: decoded,
+        connect_timeout: Duration::from_secs(connect),
+        total_timeout: Duration::from_secs(total),
+        max_redirects: u8::try_from(redirects).map_err(|_| bad_key("fetch_max_redirects"))?,
+        max_fetches_per_job: u32::try_from(per_job).map_err(|_| bad_key("fetch_max_per_job"))?,
+        ..defaults
+    };
+    let egress = patterns(
+        "egress_allow",
+        file.egress_allow.as_deref().unwrap_or_default(),
+    )?;
+    Ok((policy, caps, egress))
 }
 
 fn resolve_launcher(
@@ -828,6 +955,127 @@ mod tests {
             let file = format!("agent_env_passthrough = [\"{bad}\"]\n");
             assert!(Config::resolve(Some(&file), &env_of(&[])).is_err(), "{bad}");
         }
+    }
+
+    #[test]
+    fn fetch_and_egress_default_to_allow_all_public_and_no_egress_hosts() {
+        let cfg = Config::resolve(None, &env_of(&[])).unwrap();
+        assert_eq!(cfg.fetch_policy, FetchPolicy::AllowAllPublicHosts);
+        assert_eq!(cfg.fetch_caps, FetchCaps::default());
+        assert_eq!(cfg.egress_allow, Vec::new());
+    }
+
+    #[test]
+    fn fetch_and_egress_keys_resolve() {
+        let file = "fetch_policy = \"allowlist\"\nfetch_allow = [\"Docs.Example\", \"*.example.org\"]\nfetch_max_body_bytes = 2048\nfetch_max_decoded_bytes = 4096\nfetch_connect_timeout_secs = 3\nfetch_total_timeout_secs = 9\nfetch_max_redirects = 2\nfetch_max_per_job = 7\negress_allow = [\"api.example\"]\n";
+        let cfg = Config::resolve(Some(file), &env_of(&[])).unwrap();
+        assert_eq!(
+            cfg.fetch_policy,
+            FetchPolicy::Allowlist(vec![
+                HostPattern::Exact("docs.example".to_owned()),
+                HostPattern::Subdomain("example.org".to_owned()),
+            ])
+        );
+        let caps = cfg.fetch_caps;
+        assert_eq!(
+            (
+                caps.max_body_bytes,
+                caps.max_decoded_bytes,
+                caps.max_redirects
+            ),
+            (2048, 4096, 2)
+        );
+        assert_eq!(caps.connect_timeout, Duration::from_secs(3));
+        assert_eq!(caps.total_timeout, Duration::from_secs(9));
+        assert_eq!(caps.max_fetches_per_job, 7);
+        assert_eq!(caps.max_url_bytes, FetchCaps::default().max_url_bytes);
+        assert_eq!(
+            cfg.egress_allow,
+            vec![HostPattern::Exact("api.example".to_owned())]
+        );
+        let explicit = Config::resolve(Some("fetch_policy = \"allow_all_public\"\n"), &env_of(&[]));
+        assert_eq!(
+            explicit.unwrap().fetch_policy,
+            FetchPolicy::AllowAllPublicHosts
+        );
+        let env = env_of(&[
+            ("FLEETD_FETCH_POLICY", "allowlist"),
+            ("FLEETD_EGRESS_ALLOW", "x.example"),
+        ]);
+        let cfg = Config::resolve(None, &env).unwrap();
+        assert_eq!(cfg.fetch_policy, FetchPolicy::AllowAllPublicHosts);
+        assert_eq!(cfg.egress_allow, Vec::new());
+    }
+
+    #[test]
+    fn fetch_caps_accept_their_edges_and_reject_the_next_value() {
+        let table: [(&str, i64, i64); 6] = [
+            ("fetch_max_body_bytes", 1, 64 * 1024 * 1024),
+            ("fetch_max_decoded_bytes", 1, 256 * 1024 * 1024),
+            ("fetch_connect_timeout_secs", 1, 60),
+            ("fetch_total_timeout_secs", 1, 300),
+            ("fetch_max_redirects", 0, 10),
+            ("fetch_max_per_job", 1, 1000),
+        ];
+        let resolve = |name: &str, value: i64| {
+            let extra = match name {
+                "fetch_max_decoded_bytes" => "fetch_max_body_bytes = 1\n",
+                "fetch_total_timeout_secs" => "fetch_connect_timeout_secs = 1\n",
+                _ => "",
+            };
+            Config::resolve(Some(&format!("{extra}{name} = {value}\n")), &env_of(&[]))
+        };
+        for (name, low, high) in table {
+            assert!(resolve(name, low).is_ok(), "{name} {low}");
+            assert!(resolve(name, high).is_ok(), "{name} {high}");
+            for bad in [low - 1, high + 1] {
+                match resolve(name, bad) {
+                    Err(Error::InvalidValue { name: got, .. }) => assert_eq!(got, name),
+                    other => panic!("{name} {bad}: {other:?}"),
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn invalid_fetch_and_egress_keys_fail_startup_naming_the_key() {
+        let cases = [
+            ("fetch_policy = \"open\"\n", "fetch_policy"),
+            ("fetch_policy = \"allowlist\"\n", "fetch_allow"),
+            ("fetch_allow = [\"a.example\"]\n", "fetch_allow"),
+            (
+                "fetch_policy = \"allow_all_public\"\nfetch_allow = [\"a.example\"]\n",
+                "fetch_allow",
+            ),
+            (
+                "fetch_policy = \"allowlist\"\nfetch_allow = [\"10.0.0.1\"]\n",
+                "fetch_allow",
+            ),
+            (
+                "fetch_policy = \"allowlist\"\nfetch_allow = [\"*\"]\n",
+                "fetch_allow",
+            ),
+            ("egress_allow = [\"a b\"]\n", "egress_allow"),
+            ("egress_allow = [\"*.com\"]\n", "egress_allow"),
+            ("egress_allow = [\"\"]\n", "egress_allow"),
+            (
+                "fetch_max_body_bytes = 100\nfetch_max_decoded_bytes = 99\n",
+                "fetch_max_decoded_bytes",
+            ),
+            (
+                "fetch_connect_timeout_secs = 10\nfetch_total_timeout_secs = 9\n",
+                "fetch_total_timeout_secs",
+            ),
+        ];
+        for (text, key) in cases {
+            match Config::resolve(Some(text), &env_of(&[])) {
+                Err(Error::InvalidValue { name, .. }) => assert_eq!(name, key, "{text}"),
+                other => panic!("{text}: {other:?}"),
+            }
+        }
+        let empty = "fetch_policy = \"allowlist\"\nfetch_allow = []\n";
+        let cfg = Config::resolve(Some(empty), &env_of(&[])).unwrap();
+        assert_eq!(cfg.fetch_policy, FetchPolicy::Allowlist(Vec::new()));
     }
 
     #[test]
