@@ -28,6 +28,27 @@ pub const FLOOR_DENY: &[&str] = &[
     "MultiEdit",
 ];
 
+/// The fixed allow set. Every job allows all of it, whatever allow list its Profile carries.
+///
+/// ADR-0034 lets a Profile `allow` list replace the default allow list, so [`with_floor_allow`]
+/// puts these entries back. `Bash(fleetd fetch *)` is the fetch tool of ADR-0038.
+pub const FLOOR_ALLOW: &[&str] = &["Bash(fleetd fetch *)"];
+
+/// `allow` with [`FLOOR_ALLOW`] first and each entry once.
+#[must_use]
+pub fn with_floor_allow(allow: &[String]) -> Vec<String> {
+    let mut merged: Vec<String> = FLOOR_ALLOW
+        .iter()
+        .map(|entry| (*entry).to_owned())
+        .collect();
+    for entry in allow {
+        if !merged.contains(entry) {
+            merged.push(entry.clone());
+        }
+    }
+    merged
+}
+
 /// Per-box limits and defaults. Budgets are whole US cents.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct BoxCeilings {
@@ -236,6 +257,52 @@ mod tests {
         for entry in FLOOR_DENY {
             assert!(dropped(entry), "{entry}");
         }
+    }
+
+    #[test]
+    fn the_floor_allow_names_fetch_and_no_floor_deny_covers_it() {
+        assert_eq!(FLOOR_ALLOW, ["Bash(fleetd fetch *)"]);
+        for allow in FLOOR_ALLOW {
+            assert!(
+                !FLOOR_DENY.iter().any(|deny| covers(deny, allow)),
+                "{allow}"
+            );
+        }
+    }
+
+    #[test]
+    fn any_profile_allow_list_keeps_the_floor_allow_first_and_once() {
+        let own = vec!["Read".to_owned(), "Bash(fleetd fetch *)".to_owned()];
+        for allow in [
+            Vec::new(),
+            own,
+            vec!["Bash".to_owned()],
+            vec!["Bash(fleetd fetch *)".to_owned(); 3],
+        ] {
+            let merged = with_floor_allow(&allow);
+            assert_eq!(merged[0], "Bash(fleetd fetch *)");
+            assert_eq!(
+                merged
+                    .iter()
+                    .filter(|e| *e == "Bash(fleetd fetch *)")
+                    .count(),
+                1
+            );
+            for entry in &allow {
+                assert!(merged.contains(entry), "{entry}");
+            }
+        }
+        assert_eq!(
+            with_floor_allow(&["Read".to_owned(), "Grep".to_owned()]),
+            vec!["Bash(fleetd fetch *)", "Read", "Grep"]
+        );
+    }
+
+    #[test]
+    fn webfetch_stays_denied_and_websearch_is_never_dropped() {
+        assert!(FLOOR_DENY.contains(&"WebFetch"));
+        assert!(!FLOOR_DENY.contains(&"WebSearch"));
+        assert!(!dropped("WebSearch"));
     }
 
     #[test]

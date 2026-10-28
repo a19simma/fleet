@@ -1,6 +1,6 @@
 # Fetch tool and Box egress policy
 
-Status: Proposed 2026-10-28. The fetch core (`fetch.rs`), the fetch event recorder and the fetch service on the job socket (`fetch_service.rs`) are built and not wired: no runtime path registers the service, and the `fleetd fetch` command, the Floor allow-set and the migration are not built. Amends ADR-0029, ADR-0031 and ADR-0034. Refers to ADR-0036 for the per-job unix socket and ADR-0037 for the credential broker.
+Status: Proposed 2026-10-28. The fetch core (`fetch.rs`), the fetch event recorder and the fetch service on the job socket (`fetch_service.rs`) are built and not wired: no runtime path registers the service, and the migration is not built. The `fleetd fetch` command, the default `fetch` skill and the Floor allow-set (`FLOOR_ALLOW`, `Bash(fleetd fetch *)`, merged into the generated `settings.json` allow list) are built. Amends ADR-0029, ADR-0031 and ADR-0034. Refers to ADR-0036 for the per-job unix socket and ADR-0037 for the credential broker.
 
 A Job needs to read web pages: documentation, issue threads, package pages. The Floor denies the built-in `WebFetch` (ADR-0034), and `curl` is denied by pattern. The built-in `WebSearch` stays allowed. This ADR fixes how a Job fetches a URL, which hosts it may reach, where the egress policy lives, and what gets recorded.
 
