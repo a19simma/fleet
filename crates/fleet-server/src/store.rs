@@ -12,7 +12,7 @@ use fleet_proto::v1::{
     SessionState, SessionView, SubmitBatchReply, SubmitBatchRequest, SubmitJobRequest,
     SubmitJudgeRequest, TranscriptChunk,
 };
-use fleet_proto::{DEFAULT_CI_RETRIES, MAX_CI_RETRIES, ci_retry_key};
+use fleet_proto::{DEFAULT_CI_RETRIES, MAX_CI_RETRIES};
 use serde_json::{Value, json};
 use sqlx::postgres::PgRow;
 use sqlx::{PgPool, Postgres, Row, Transaction};
@@ -20,13 +20,30 @@ use sqlx::{PgPool, Postgres, Row, Transaction};
 use crate::batches::{self, BatchInvalid};
 use crate::jobs::{
     JobInvalid, MAX_CHUNKS_PER_REPORT, MAX_PHASE_CHARS, MAX_PROGRESS_CHARS, MAX_TRANSCRIPT_BYTES,
-    MAX_TRANSCRIPT_ROWS, MIN_CHUNK_COST_BYTES, NewJob, expected_branch, fix_prompt, validate_ci,
-    validate_job_id, validate_judge, validate_submit, validate_terminal, validate_verdict,
+    MAX_TRANSCRIPT_ROWS, MIN_CHUNK_COST_BYTES, NewJob, validate_ci, validate_job_id,
+    validate_judge, validate_submit, validate_terminal, validate_verdict,
 };
 use crate::profiles::{self, ProfileFault};
 use crate::projection::{Projection, State, project};
 use crate::stats;
 use crate::telemetry;
+
+mod ci_retry;
+
+use ci_retry::{ROOT_ID, decide_ci_retry};
+
+macro_rules! job_columns {
+    () => {
+        "job_id, idempotency_key, prompt, repo, base_ref, open_pr, state, box, attempt, \
+progress, phase, branch, pr_url, error, exit_code, cancel_requested, batch_id, \
+kind, target_job_id, parent_job_id, ci_retry_attempt, ci_retry, ci_state, ci_url, profile_name, profile_version, encode(profile_hash, 'hex') AS profile_hash, \
+(EXTRACT(EPOCH FROM lease_expires_at) * 1000)::bigint AS lease_ms, \
+(EXTRACT(EPOCH FROM created_at) * 1000)::bigint AS created_ms, \
+(EXTRACT(EPOCH FROM claimed_at) * 1000)::bigint AS claimed_ms, \
+(EXTRACT(EPOCH FROM finished_at) * 1000)::bigint AS finished_ms, \
+(EXTRACT(EPOCH FROM ci_checked_at) * 1000)::bigint AS ci_checked_ms"
+    };
+}
 
 const INSERT_EVENTS: &str = "\
 INSERT INTO events (box, id, boot_id, seq, schema_version, source, kind, captured_at_ms, \
@@ -120,16 +137,11 @@ FROM sessions \
 WHERE $1::text IS NULL OR box = $1 \
 ORDER BY box, last_event_at DESC, session_id";
 
-const SELECT_JOB_BY_KEY: &str = "\
-SELECT job_id, idempotency_key, prompt, repo, base_ref, open_pr, state, box, attempt, \
-progress, phase, branch, pr_url, error, exit_code, cancel_requested, batch_id, \
-kind, target_job_id, parent_job_id, ci_retry_attempt, ci_retry, ci_state, ci_url, profile_name, profile_version, encode(profile_hash, 'hex') AS profile_hash, \
-(EXTRACT(EPOCH FROM lease_expires_at) * 1000)::bigint AS lease_ms, \
-(EXTRACT(EPOCH FROM created_at) * 1000)::bigint AS created_ms, \
-(EXTRACT(EPOCH FROM claimed_at) * 1000)::bigint AS claimed_ms, \
-(EXTRACT(EPOCH FROM finished_at) * 1000)::bigint AS finished_ms, \
-(EXTRACT(EPOCH FROM ci_checked_at) * 1000)::bigint AS ci_checked_ms \
-FROM jobs WHERE idempotency_key = $1";
+const SELECT_JOB_BY_KEY: &str = concat!(
+    "SELECT ",
+    job_columns!(),
+    " FROM jobs WHERE idempotency_key = $1"
+);
 
 const INSERT_JOB: &str = "\
 INSERT INTO jobs (job_id, idempotency_key, prompt, repo, base_ref, branch, open_pr) \
@@ -167,62 +179,38 @@ const READ_ALL_TRANSCRIPT: &str = "\
 SELECT seq, ts_ms, chunk, truncated FROM job_transcript \
 WHERE job_id = $1 ORDER BY seq LIMIT $2";
 
-const SELECT_JOB_BY_ID: &str = "\
-SELECT job_id, idempotency_key, prompt, repo, base_ref, open_pr, state, box, attempt, \
-progress, phase, branch, pr_url, error, exit_code, cancel_requested, batch_id, \
-kind, target_job_id, parent_job_id, ci_retry_attempt, ci_retry, ci_state, ci_url, profile_name, profile_version, encode(profile_hash, 'hex') AS profile_hash, \
-(EXTRACT(EPOCH FROM lease_expires_at) * 1000)::bigint AS lease_ms, \
-(EXTRACT(EPOCH FROM created_at) * 1000)::bigint AS created_ms, \
-(EXTRACT(EPOCH FROM claimed_at) * 1000)::bigint AS claimed_ms, \
-(EXTRACT(EPOCH FROM finished_at) * 1000)::bigint AS finished_ms, \
-(EXTRACT(EPOCH FROM ci_checked_at) * 1000)::bigint AS ci_checked_ms \
-FROM jobs WHERE job_id = $1";
+const SELECT_JOB_BY_ID: &str = concat!("SELECT ", job_columns!(), " FROM jobs WHERE job_id = $1");
 
-const LIST_JOBS: &str = "\
-SELECT job_id, idempotency_key, prompt, repo, base_ref, open_pr, state, box, attempt, \
-progress, phase, branch, pr_url, error, exit_code, cancel_requested, batch_id, \
-kind, target_job_id, parent_job_id, ci_retry_attempt, ci_retry, ci_state, ci_url, profile_name, profile_version, encode(profile_hash, 'hex') AS profile_hash, \
-(EXTRACT(EPOCH FROM lease_expires_at) * 1000)::bigint AS lease_ms, \
-(EXTRACT(EPOCH FROM created_at) * 1000)::bigint AS created_ms, \
-(EXTRACT(EPOCH FROM claimed_at) * 1000)::bigint AS claimed_ms, \
-(EXTRACT(EPOCH FROM finished_at) * 1000)::bigint AS finished_ms, \
-(EXTRACT(EPOCH FROM ci_checked_at) * 1000)::bigint AS ci_checked_ms \
-FROM jobs WHERE $1::text IS NULL OR state = $1 \
-ORDER BY created_at DESC, job_id DESC LIMIT $2";
+const LIST_JOBS: &str = concat!(
+    "SELECT ",
+    job_columns!(),
+    " FROM jobs WHERE $1::text IS NULL OR state = $1 \
+ORDER BY created_at DESC, job_id DESC LIMIT $2"
+);
 
 const READ_TRANSCRIPT: &str = "\
 SELECT seq, ts_ms, chunk, truncated FROM job_transcript \
 WHERE job_id = $1 AND seq > $2 ORDER BY seq LIMIT $3";
 
-const CLAIM_JOB: &str = "\
-UPDATE jobs SET state = 'RUNNING', box = $1, attempt = attempt + 1, \
+const CLAIM_JOB: &str = concat!(
+    "UPDATE jobs SET state = 'RUNNING', box = $1, attempt = attempt + 1, \
 claimed_at = now(), lease_expires_at = now() + make_interval(secs => $2) \
 WHERE job_id = ( \
 SELECT job_id FROM jobs WHERE state = 'QUEUED' \
 ORDER BY created_at, job_id LIMIT 1 FOR UPDATE SKIP LOCKED) \
-RETURNING job_id, idempotency_key, prompt, repo, base_ref, open_pr, state, box, attempt, \
-progress, phase, branch, pr_url, error, exit_code, cancel_requested, batch_id, \
-kind, target_job_id, parent_job_id, ci_retry_attempt, ci_retry, ci_state, ci_url, profile_name, profile_version, encode(profile_hash, 'hex') AS profile_hash, \
-(EXTRACT(EPOCH FROM lease_expires_at) * 1000)::bigint AS lease_ms, \
-(EXTRACT(EPOCH FROM created_at) * 1000)::bigint AS created_ms, \
-(EXTRACT(EPOCH FROM claimed_at) * 1000)::bigint AS claimed_ms, \
-(EXTRACT(EPOCH FROM finished_at) * 1000)::bigint AS finished_ms, \
-(EXTRACT(EPOCH FROM ci_checked_at) * 1000)::bigint AS ci_checked_ms";
+RETURNING ",
+    job_columns!()
+);
 
-const CANCEL_JOB: &str = "\
-UPDATE jobs SET \
+const CANCEL_JOB: &str = concat!(
+    "UPDATE jobs SET \
 state = CASE WHEN state = 'QUEUED' THEN 'CANCELLED' ELSE state END, \
 finished_at = CASE WHEN state = 'QUEUED' THEN now() ELSE finished_at END, \
 cancel_requested = cancel_requested OR state = 'RUNNING' \
 WHERE job_id = $1 \
-RETURNING job_id, idempotency_key, prompt, repo, base_ref, open_pr, state, box, attempt, \
-progress, phase, branch, pr_url, error, exit_code, cancel_requested, batch_id, \
-kind, target_job_id, parent_job_id, ci_retry_attempt, ci_retry, ci_state, ci_url, profile_name, profile_version, encode(profile_hash, 'hex') AS profile_hash, \
-(EXTRACT(EPOCH FROM lease_expires_at) * 1000)::bigint AS lease_ms, \
-(EXTRACT(EPOCH FROM created_at) * 1000)::bigint AS created_ms, \
-(EXTRACT(EPOCH FROM claimed_at) * 1000)::bigint AS claimed_ms, \
-(EXTRACT(EPOCH FROM finished_at) * 1000)::bigint AS finished_ms, \
-(EXTRACT(EPOCH FROM ci_checked_at) * 1000)::bigint AS ci_checked_ms";
+RETURNING ",
+    job_columns!()
+);
 
 const REPORT_JOB: &str = "\
 UPDATE jobs SET phase = $4, progress = $5, \
@@ -247,39 +235,6 @@ const INSERT_CI_LOG: &str = "\
 INSERT INTO job_ci_log (job_id, log) VALUES ($1, $2) ON CONFLICT DO NOTHING";
 
 const SELECT_CI_LOG: &str = "SELECT log FROM job_ci_log WHERE job_id = $1";
-
-const SELECT_RETRY_ATTEMPT: &str = "SELECT ci_retry_attempt FROM jobs WHERE job_id = $1";
-
-const ROOT_ID: &str = "\
-WITH RECURSIVE up AS (\
-SELECT job_id, parent_job_id, 0 AS depth FROM jobs WHERE job_id = $1 \
-UNION ALL \
-SELECT p.job_id, p.parent_job_id, up.depth + 1 FROM jobs p \
-JOIN up ON p.job_id = up.parent_job_id WHERE up.depth < 16) \
-SELECT job_id FROM up WHERE parent_job_id IS NULL";
-
-const ROOT_PROMPT: &str = "\
-WITH RECURSIVE up AS (\
-SELECT job_id, parent_job_id, prompt, 0 AS depth FROM jobs WHERE job_id = $1 \
-UNION ALL \
-SELECT p.job_id, p.parent_job_id, p.prompt, up.depth + 1 FROM jobs p \
-JOIN up ON p.job_id = up.parent_job_id WHERE up.depth < 16) \
-SELECT prompt FROM up WHERE parent_job_id IS NULL";
-
-const INSERT_FIX: &str = "\
-INSERT INTO jobs (job_id, idempotency_key, prompt, repo, base_ref, branch, open_pr, pr_url, \
-parent_job_id, ci_retry_attempt) \
-SELECT $1, $2, $3, p.repo, p.branch, p.branch, true, p.pr_url, p.job_id, p.ci_retry_attempt + 1 \
-FROM jobs p \
-WHERE p.job_id = $4 AND p.kind = 'agent' AND p.state = 'SUCCEEDED' AND p.open_pr \
-AND p.pr_url IS NOT NULL AND p.ci_state = 'failure' AND p.batch_id IS NULL \
-AND p.profile_name IS NULL AND p.branch = $5 AND p.branch ~ '^swarm/[A-Za-z0-9]{1,64}$' \
-ON CONFLICT DO NOTHING \
-RETURNING job_id";
-
-const SELECT_FIX_CHILD: &str = "SELECT 1 FROM jobs WHERE parent_job_id = $1";
-
-const SET_RETRY: &str = "UPDATE jobs SET ci_retry = $2 WHERE job_id = $1 AND ci_retry IS NULL";
 
 const END_CI: &str = "\
 UPDATE jobs SET ci_state = 'timeout', ci_checked_at = now() \
@@ -1719,75 +1674,6 @@ impl Store {
             .await?
             .ok_or(StoreError::StaleReport)
     }
-}
-
-async fn decide_ci_retry(
-    tx: &mut Transaction<'_, Postgres>,
-    job_id: &str,
-    log: Option<&str>,
-    max: u32,
-) -> Result<(), StoreError> {
-    let stored: i32 = sqlx::query_scalar(SELECT_RETRY_ATTEMPT)
-        .bind(job_id)
-        .fetch_one(&mut **tx)
-        .await?;
-    let attempt = u32::try_from(stored).map_err(|_| StoreError::OutOfRange("ci retry attempt"))?;
-    let outcome = if max == 0 {
-        CiRetry::Disabled
-    } else if attempt >= max {
-        CiRetry::Exhausted
-    } else {
-        submit_fix(tx, job_id, attempt + 1, log).await?
-    };
-    sqlx::query(SET_RETRY)
-        .bind(job_id)
-        .bind(ci_retry_name(outcome))
-        .execute(&mut **tx)
-        .await?;
-    Ok(())
-}
-
-async fn submit_fix(
-    tx: &mut Transaction<'_, Postgres>,
-    parent: &str,
-    attempt: u32,
-    log: Option<&str>,
-) -> Result<CiRetry, StoreError> {
-    let id = EventId::generate().to_string();
-    let original: String = sqlx::query_scalar(ROOT_PROMPT)
-        .bind(parent)
-        .fetch_one(&mut **tx)
-        .await?;
-    let Some(prompt) = log.and_then(|log| fix_prompt(&original, log, &id)) else {
-        return Ok(CiRetry::NoLog);
-    };
-    let root_id: Option<String> = sqlx::query_scalar(ROOT_ID)
-        .bind(parent)
-        .fetch_optional(&mut **tx)
-        .await?;
-    let Some(root_id) = root_id else {
-        return Ok(CiRetry::Ineligible);
-    };
-    let inserted = sqlx::query(INSERT_FIX)
-        .bind(id)
-        .bind(ci_retry_key(parent, attempt))
-        .bind(prompt)
-        .bind(parent)
-        .bind(expected_branch(&root_id))
-        .fetch_optional(&mut **tx)
-        .await?;
-    if inserted.is_some() {
-        return Ok(CiRetry::Submitted);
-    }
-    let child = sqlx::query(SELECT_FIX_CHILD)
-        .bind(parent)
-        .fetch_optional(&mut **tx)
-        .await?;
-    Ok(if child.is_some() {
-        CiRetry::Submitted
-    } else {
-        CiRetry::Ineligible
-    })
 }
 
 async fn store_verdict(
