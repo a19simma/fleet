@@ -13,19 +13,26 @@
 //! than [`MIN_PR_CHECKS_INTERVAL`] and [`MIN_FETCH_INTERVAL`] ([`Limits`]), and one `fetch`
 //! at a time per Job. [`GhCli`] and [`MirrorGit`] are the real executors of these two reads.
 //!
-//! Per Job the broker allows [`MAX_PUSHES_PER_JOB`] pushes and [`MAX_PRS_PER_JOB`] pull request,
-//! a title of at most [`MAX_TITLE_CHARS`] characters and a body of at most [`MAX_BODY_BYTES`]
-//! bytes, and refuses attribution lines. Title and body are redacted before an executor sees
-//! them and every output is redacted and cut to [`MAX_OUTPUT_BYTES`]. A capped operation counts
-//! when it is attempted, so a failed push or a failed pull request still spends its slot.
-//! Errors are fixed messages: no executor text and no client value reaches the reply. Every
-//! operation has a timeout.
+//! Per Job the broker allows [`MAX_PUSHES_PER_JOB`] pushes, no closer together than
+//! [`MIN_PUSH_INTERVAL`], and [`MAX_PRS_PER_JOB`] pull request creation, a title of at most
+//! [`MAX_TITLE_CHARS`] characters and a body of at most [`MAX_BODY_BYTES`] bytes, and refuses
+//! attribution lines, mentions, `#n` references, links and images ([`Denial::UnsafeText`]). Title and body are redacted before an executor sees them and every output
+//! is redacted and cut to [`MAX_OUTPUT_BYTES`]. A capped operation counts when it is attempted,
+//! so a failed push or a failed pull request still spends its slot. A `pr_create` after one
+//! that returned a URL replies with that URL and calls no executor, so repeats are idempotent
+//! and spend nothing; calls of one Job run one at a time. Errors are fixed messages: no executor
+//! text and no client value reaches the reply. Every operation has a timeout.
+//!
+//! `push` and `pr_create` are real in `crate::publish`: `PublishGit` and `PublishGh` run the
+//! finish step's publish path for the Job's bound target and share its state, so the finish step
+//! skips a head already pushed and reuses the pull request. A broker failure changes nothing the
+//! finish step needs. [`MirrorGit`] and [`GhCli`] refuse those two ops themselves. Built, not
+//! wired: no runtime path builds a [`Broker`] yet.
 //!
 //! The direct launcher gets no broker: [`Broker::new`] refuses it, as the job socket does
 //! (ADR-0036), because the agent there shares fleetd's uid.
 //!
-//! The decision logic is pure. The executors for `push` and `pr_create` are not written yet:
-//! [`MirrorGit`] and [`GhCli`] refuse those two, and ADR-0031 P3 gates the real `push`.
+//! The decision logic is pure.
 
 use std::ffi::OsString;
 use std::fmt;
@@ -50,8 +57,11 @@ use crate::workspace::Workspace;
 
 /// Most `push` calls one Job may attempt.
 pub const MAX_PUSHES_PER_JOB: u32 = 10;
-/// Most `pr_create` calls one Job may attempt.
+/// Most `pr_create` calls one Job may send to an executor. A repeat after a returned URL is
+/// answered from the record and does not count.
 pub const MAX_PRS_PER_JOB: u32 = 1;
+/// Shortest time between two `push` attempts of one Job.
+pub const MIN_PUSH_INTERVAL: Duration = Duration::from_secs(5);
 /// Most characters in a pull request title.
 pub const MAX_TITLE_CHARS: usize = 256;
 /// Most bytes in a pull request body.
@@ -240,6 +250,8 @@ pub trait GhExecutor: Send + Sync {
 pub enum Denial {
     /// The frame, title or body broke a rule.
     InvalidRequest,
+    /// The title or body has a mention, issue reference, link or image.
+    UnsafeText,
     /// The per-Job cap of the operation is spent.
     CapReached,
     /// The operation was attempted again before its minimum interval passed. It spends no cap.
@@ -258,6 +270,7 @@ impl Denial {
     pub const fn message(self) -> &'static str {
         match self {
             Self::InvalidRequest => "invalid request",
+            Self::UnsafeText => "text has a mention, reference, link or image",
             Self::CapReached => "per-job cap reached",
             Self::RateLimited => "rate limited",
             Self::NoPullRequest => "no pull request recorded",
@@ -294,9 +307,15 @@ impl Response {
     }
 }
 
-/// The pacing of the two read operations.
+/// The pacing and caps of the paced operations.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Limits {
+    /// Most `push` attempts per Job.
+    pub max_pushes: u32,
+    /// Shortest time between two `push` attempts.
+    pub push_interval: Duration,
+    /// Most `pr_create` calls per Job that reach an executor.
+    pub max_prs: u32,
     /// Most `pr_checks` attempts per Job.
     pub max_pr_checks: u32,
     /// Shortest time between two `pr_checks` attempts.
@@ -310,6 +329,9 @@ pub struct Limits {
 impl Default for Limits {
     fn default() -> Self {
         Self {
+            max_pushes: MAX_PUSHES_PER_JOB,
+            push_interval: MIN_PUSH_INTERVAL,
+            max_prs: MAX_PRS_PER_JOB,
             max_pr_checks: MAX_PR_CHECKS_PER_JOB,
             pr_checks_interval: MIN_PR_CHECKS_INTERVAL,
             max_fetches: MAX_FETCHES_PER_JOB,
@@ -320,7 +342,7 @@ impl Default for Limits {
 
 #[derive(Debug, Default)]
 struct Counts {
-    pushes: u32,
+    pushes: Paced,
     prs: u32,
     pr_url: Option<String>,
     checks: Paced,
@@ -360,6 +382,7 @@ pub struct Broker<G, H> {
     limits: Limits,
     counts: Mutex<Counts>,
     fetch_gate: tokio::sync::Mutex<()>,
+    pr_gate: tokio::sync::Mutex<()>,
 }
 
 impl<G: GitExecutor, H: GhExecutor> Broker<G, H> {
@@ -387,10 +410,11 @@ impl<G: GitExecutor, H: GhExecutor> Broker<G, H> {
             limits: Limits::default(),
             counts: Mutex::new(Counts::default()),
             fetch_gate: tokio::sync::Mutex::new(()),
+            pr_gate: tokio::sync::Mutex::new(()),
         })
     }
 
-    /// Replaces the pacing of the read operations.
+    /// Replaces the pacing and caps.
     #[must_use]
     pub const fn with_limits(mut self, limits: Limits) -> Self {
         self.limits = limits;
@@ -414,11 +438,13 @@ impl<G: GitExecutor, H: GhExecutor> Broker<G, H> {
     /// Serves one request.
     pub async fn handle(&self, request: Request) -> Response {
         let timeout = request.timeout();
-        let creating = matches!(request, Request::PrCreate { .. });
         let result = match request {
             Request::Push {} => {
-                if !self.reserve(|c| spend(&mut c.pushes, MAX_PUSHES_PER_JOB)) {
-                    return Response::denied(Denial::CapReached);
+                let limits = self.limits;
+                if let Err(denial) =
+                    self.paced(|c| c.pushes.spend(limits.max_pushes, limits.push_interval))
+                {
+                    return Response::denied(denial);
                 }
                 tokio::time::timeout(timeout, self.git.push(&self.target)).await
             }
@@ -428,10 +454,24 @@ impl<G: GitExecutor, H: GhExecutor> Broker<G, H> {
                 if !valid_title(&title) || !valid_body(&body) {
                     return Response::denied(Denial::InvalidRequest);
                 }
-                if !self.reserve(|c| spend(&mut c.prs, MAX_PRS_PER_JOB)) {
+                if has_live_markup(&title) || has_live_markup(&body) {
+                    return Response::denied(Denial::UnsafeText);
+                }
+                let _one_at_a_time = self.pr_gate.lock().await;
+                if let Some(output) = self.recorded_pr_url() {
+                    return Response::Done { output };
+                }
+                let max_prs = self.limits.max_prs;
+                if !self.reserve(|c| spend(&mut c.prs, max_prs)) {
                     return Response::denied(Denial::CapReached);
                 }
-                tokio::time::timeout(timeout, self.gh.pr_create(&self.target, &title, &body)).await
+                let created =
+                    tokio::time::timeout(timeout, self.gh.pr_create(&self.target, &title, &body))
+                        .await;
+                if let Ok(Ok(output)) = &created {
+                    self.record_pr_url(&self.clean(output));
+                }
+                created
             }
             Request::PrChecks {} => {
                 let Some(url) = self.recorded_pr_url() else {
@@ -461,13 +501,9 @@ impl<G: GitExecutor, H: GhExecutor> Broker<G, H> {
             }
         };
         match result {
-            Ok(Ok(output)) => {
-                let output = self.clean(&output);
-                if creating {
-                    self.record_pr_url(&output);
-                }
-                Response::Done { output }
-            }
+            Ok(Ok(output)) => Response::Done {
+                output: self.clean(&output),
+            },
             Ok(Err(ExecError)) => Response::denied(Denial::Failed),
             Err(_) => Response::denied(Denial::TimedOut),
         }
@@ -516,7 +552,8 @@ impl<G, H> fmt::Debug for Broker<G, H> {
     }
 }
 
-/// Refreshes the mirror of the Job's own repo. `push` is refused until the push executor lands.
+/// Refreshes the mirror of the Job's own repo. Its `push` always refuses: the real push is
+/// `PublishGit` in `crate::publish`, which wraps this executor for `fetch`.
 ///
 /// The repo comes from the claimed Job at construction, never from a request. `fetch` runs
 /// [`Workspace::fetch_mirror`], so it uses the production repo policy, an https-only protocol
@@ -556,7 +593,8 @@ impl GitExecutor for MirrorGit {
     }
 }
 
-/// Runs `gh pr checks` for the broker. `pr_create` is refused until its executor lands.
+/// Runs `gh pr checks` for the broker. Its `pr_create` always refuses: the real one is
+/// `PublishGh` in `crate::publish`, which wraps this executor for `pr_checks`.
 ///
 /// The child gets an empty environment plus `PATH`, a scratch `HOME`, `XDG_CONFIG_HOME` and
 /// `GH_CONFIG_DIR`, `GH_TOKEN`, `GH_HOST` and, off `github.com`, `GH_ENTERPRISE_TOKEN`. The
@@ -803,6 +841,53 @@ fn valid_body(body: &str) -> bool {
         && !has_attribution(body)
 }
 
+/// Text that GitHub turns into a notification, a backlink, a closed issue, a link or an image.
+///
+/// Refuses `@` followed by an ASCII alphanumeric, `#` followed by a digit, `gh-` followed by a
+/// digit, any HTML entity (`&` followed by `#`, or by ASCII alphanumerics and `;`, because
+/// markdown decodes entities before GitHub's mention, reference and autolink filters run), any
+/// HTML tag (`<` followed by an ASCII letter, `/` or `!`), the markdown forms `![` and `](`, and
+/// the link schemes `http://`, `https://`, `ftp://`, `mailto:` and `www.`. Matching is
+/// case-insensitive and the input is never echoed.
+fn has_live_markup(text: &str) -> bool {
+    let lower = text.to_ascii_lowercase();
+    let bytes = lower.as_bytes();
+    let sigil = bytes.windows(2).any(|w| match *w {
+        [b'@', c] => c.is_ascii_alphanumeric(),
+        [b'#', c] => c.is_ascii_digit(),
+        [b'<', c] => c.is_ascii_alphabetic() || matches!(c, b'/' | b'!'),
+        _ => false,
+    });
+    sigil
+        || has_entity(&lower)
+        || has_gh_reference(bytes)
+        || [
+            "http://", "https://", "ftp://", "mailto:", "www.", "![", "](",
+        ]
+        .iter()
+        .any(|needle| lower.contains(needle))
+}
+
+fn has_entity(lower: &str) -> bool {
+    lower.split('&').skip(1).any(|rest| {
+        let name_len = rest
+            .find(|c: char| !c.is_ascii_alphanumeric())
+            .unwrap_or(rest.len());
+        rest.starts_with('#')
+            || (name_len > 0
+                && rest
+                    .get(name_len..)
+                    .is_some_and(|tail| tail.starts_with(';')))
+    })
+}
+
+fn has_gh_reference(bytes: &[u8]) -> bool {
+    bytes.windows(4).any(|w| match *w {
+        [b'g', b'h', b'-', c] => c.is_ascii_digit(),
+        _ => false,
+    })
+}
+
 const ATTRIBUTION_TRAILERS: [&str; 3] = ["coauthoredby", "signedoffby", "claudesession"];
 
 const ATTRIBUTION_FRAGMENTS: [&str; 2] = ["claudeaicode", "generatedbyclaude"];
@@ -966,6 +1051,9 @@ mod tests {
 
     fn unpaced() -> Limits {
         Limits {
+            max_pushes: u32::MAX,
+            push_interval: Duration::ZERO,
+            max_prs: 1,
             max_pr_checks: u32::MAX,
             pr_checks_interval: Duration::ZERO,
             max_fetches: u32::MAX,
@@ -1225,7 +1313,10 @@ mod tests {
             fail: true,
             ..Fake::default()
         };
-        let b = broker(&fake)?;
+        let b = broker(&fake)?.with_limits(Limits {
+            max_pushes: MAX_PUSHES_PER_JOB,
+            ..unpaced()
+        });
         for _ in 0..MAX_PUSHES_PER_JOB {
             assert_eq!(b.handle(Request::Push {}).await, denied(Denial::Failed));
         }
@@ -1250,15 +1341,75 @@ mod tests {
     #[tokio::test]
     async fn concurrent_pr_creates_run_once() -> TestResult {
         let fake = Fake {
-            output: "url".to_owned(),
+            output: PR_URL.to_owned(),
             ..Fake::default()
         };
         let b = broker(&fake)?;
         let (a, c) = tokio::join!(b.handle(pr("t", "b")), b.handle(pr("t", "b")));
-        let capped = usize::from(a == denied(Denial::CapReached))
-            + usize::from(c == denied(Denial::CapReached));
-        assert_eq!(capped, 1);
+        assert_eq!(a, c);
+        assert!(matches!(a, Response::Done { .. }));
         assert_eq!(fake.calls().len(), 1);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_pr_create_repeat_returns_the_recorded_url_and_calls_no_executor() -> TestResult {
+        let fake = Fake {
+            output: PR_URL.to_owned(),
+            ..Fake::default()
+        };
+        let b = broker(&fake)?;
+        let done = Response::Done {
+            output: PR_URL.to_owned(),
+        };
+        assert_eq!(b.handle(pr("t", "b")).await, done);
+        assert_eq!(b.handle(pr("other", "text")).await, done);
+        assert_eq!(b.handle(pr("t", "b")).await, done);
+        assert_eq!(fake.calls().len(), 1);
+        assert_eq!(
+            b.handle(pr(&"x".repeat(MAX_TITLE_CHARS + 1), "b")).await,
+            denied(Denial::InvalidRequest)
+        );
+        Ok(())
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_push_inside_its_interval_is_rate_limited_and_spends_no_cap() -> TestResult {
+        let fake = Fake::default();
+        let b = broker(&fake)?;
+        b.handle(Request::Push {}).await;
+        assert_eq!(
+            b.handle(Request::Push {}).await,
+            denied(Denial::RateLimited)
+        );
+        assert_eq!(fake.calls().len(), 1);
+        tokio::time::advance(MIN_PUSH_INTERVAL).await;
+        b.handle(Request::Push {}).await;
+        assert_eq!(fake.calls().len(), 2);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_push_frame_with_a_refspec_force_or_extra_field_never_reaches_an_executor()
+    -> TestResult {
+        let fake = Fake::default();
+        let b = broker(&fake)?;
+        for frame in [
+            r#"{"op":"push","refspec":"+HEAD:refs/heads/main"}"#,
+            r#"{"op":"push","force":true}"#,
+            r#"{"op":"push","branch":"swarm/other"}"#,
+            r#"{"op":"push","remote":"x"}"#,
+            r#"{"op":"push","extra":1}"#,
+            r#"{"op":"pr_create","title":"t","body":"b","head":"main"}"#,
+            r#"{"op":"pr_create","title":"t"}"#,
+        ] {
+            assert_eq!(
+                b.handle_frame(frame.as_bytes()).await,
+                denied(Denial::InvalidRequest),
+                "{frame}"
+            );
+        }
+        assert_eq!(fake.calls(), Vec::<String>::new());
         Ok(())
     }
 
@@ -1299,6 +1450,9 @@ mod tests {
         assert_eq!(
             Limits::default(),
             Limits {
+                max_pushes: MAX_PUSHES_PER_JOB,
+                push_interval: MIN_PUSH_INTERVAL,
+                max_prs: MAX_PRS_PER_JOB,
                 max_pr_checks: MAX_PR_CHECKS_PER_JOB,
                 pr_checks_interval: MIN_PR_CHECKS_INTERVAL,
                 max_fetches: MAX_FETCHES_PER_JOB,
@@ -1633,6 +1787,161 @@ mod tests {
         }
     }
 
+    #[test]
+    fn mentions_references_links_and_images_are_refused_in_title_and_body() {
+        let hostile = [
+            "@org/all-engineers @victim fixes #1 closes other/repo#9 ![x](https://evil/?d=1)",
+            "ping @victim",
+            "ping @org/team",
+            "see #12",
+            "other/repo#9",
+            "closes other/repo#9",
+            "Fixes #1",
+            "RESOLVED: #4",
+            "resolves\n#4",
+            "closed https://github.com/o/r/issues/9",
+            "fix https://github.com/o/r/pull/3",
+            "![x](data)",
+            "![",
+            "see http://example.test/a",
+            "see HTTPS://example.test/a",
+            "<img src=\"x\">",
+            "<IMG SRC=x>",
+        ];
+        for text in hostile {
+            assert!(has_live_markup(text), "{text:?}");
+            assert!(has_live_markup(&format!("intro\n\n{text}\n")), "{text:?}");
+        }
+        let benign = [
+            "Refactor the parser and add tests.",
+            "Port the C# client",
+            "handle issue 12",
+            "add fixture loader",
+            "prefix the closes list",
+            "mail me at-sign: @ alone",
+            "item # one",
+            "100% done",
+            "fix(parser): trim trailing space",
+        ];
+        for text in benign {
+            assert!(!has_live_markup(text), "{text:?}");
+            assert!(valid_title(text) && valid_body(text), "{text:?}");
+        }
+    }
+
+    #[test]
+    fn entities_and_html_constructs_are_refused_in_title_and_body() {
+        let hostile = [
+            "&#64;victim",
+            "&#x40;victim",
+            "&#X40;victim",
+            "&commat;victim",
+            "&COMMAT;victim",
+            "&#35;12",
+            "&num;12",
+            "h&#116;tps://evil/x",
+            "h&ttp;x",
+            "&lt;img src=x>",
+            "&amp;",
+            "&#",
+            "a &# b",
+            "<b>bold</b>",
+            "<a href=x>",
+            "<A HREF=x>",
+            "</div>",
+            "<!-- hidden -->",
+            "<b",
+            "[x](https://e)",
+            "[x](y)",
+            "](",
+            "see www.example.test",
+            "WWW.example.test",
+            "ftp://example.test/a",
+            "FTP://example.test/a",
+            "mailto:a@b",
+            "MAILTO:x",
+            "gh-12",
+            "GH-7",
+            "fixes gh-3",
+        ];
+        for text in hostile {
+            assert!(has_live_markup(text), "{text:?}");
+            assert!(has_live_markup(&format!("intro\n\n{text}\n")), "{text:?}");
+        }
+        let benign = [
+            "A&B",
+            "R&D team",
+            "Q&A: how it works",
+            "C#",
+            "issue 12",
+            "fixture",
+            "100% done",
+            "a < b",
+            "a <= b",
+            "x > y",
+            "fix: handle 2 > 1",
+            "AT&T line",
+            "a & b",
+            "gh-",
+            "gh-abc",
+            "wwwx",
+            "a < 1",
+            "x&y and z;",
+            "[link] (text)",
+        ];
+        for text in benign {
+            assert!(!has_live_markup(text), "{text:?}");
+            assert!(valid_title(text) && valid_body(text), "{text:?}");
+        }
+    }
+
+    #[test]
+    fn finish_step_pull_request_text_passes_the_validators() {
+        let job_id = "0190a1b2-c3d4-7e5f-8a6b-7c8d9e0f1a2b";
+        let texts = [
+            format!("Fleet job {job_id}"),
+            "fix(fleetd): reject mentions and refs in broker pr text".to_owned(),
+            format!("swarm/{job_id}"),
+        ];
+        for text in texts {
+            assert!(!has_live_markup(&text), "{text:?}");
+            assert!(valid_title(&text) && valid_body(&text), "{text:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn entity_text_is_denied_in_title_and_body() -> TestResult {
+        let fake = Fake::default();
+        let b = broker(&fake)?;
+        for hostile in [
+            "&#64;victim",
+            "&commat;victim",
+            "&num;12",
+            "h&#116;tps://x",
+            "<b>x",
+        ] {
+            assert_eq!(b.handle(pr(hostile, "b")).await, denied(Denial::UnsafeText));
+            assert_eq!(b.handle(pr("t", hostile)).await, denied(Denial::UnsafeText));
+        }
+        assert_eq!(fake.calls(), Vec::<String>::new());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn unsafe_text_is_denied_with_a_fixed_reason() -> TestResult {
+        let fake = Fake::default();
+        let b = broker(&fake)?;
+        let hostile = "@victim closes other/repo#9";
+        assert_eq!(b.handle(pr(hostile, "b")).await, denied(Denial::UnsafeText));
+        assert_eq!(b.handle(pr("t", hostile)).await, denied(Denial::UnsafeText));
+        assert_eq!(fake.calls(), Vec::<String>::new());
+        assert_eq!(
+            Denial::UnsafeText.message(),
+            "text has a mention, reference, link or image"
+        );
+        Ok(())
+    }
+
     #[tokio::test]
     async fn attribution_lines_are_refused_in_title_and_body() -> TestResult {
         let fake = Fake::default();
@@ -1738,13 +2047,10 @@ mod tests {
             hang: true,
             ..Fake::default()
         };
+        let fresh = broker(&fake)?;
+        assert_eq!(fresh.handle(pr("t", "b")).await, denied(Denial::TimedOut));
         let b = with_url(broker(&fake)?.with_limits(unpaced()));
-        for request in [
-            Request::Push {},
-            pr("t", "b"),
-            Request::PrChecks {},
-            Request::Fetch {},
-        ] {
+        for request in [Request::Push {}, Request::PrChecks {}, Request::Fetch {}] {
             assert_eq!(b.handle(request).await, denied(Denial::TimedOut));
         }
         Ok(())

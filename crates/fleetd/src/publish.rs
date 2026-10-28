@@ -2,12 +2,16 @@
 
 use std::borrow::Cow;
 use std::collections::BTreeSet;
+use std::future::Future;
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, PoisonError};
 
 use fleet_proto::is_ci_url;
 use fleet_proto::is_swarm_branch;
 use fleet_proto::v1::Job;
+use tokio::sync::Mutex;
 
+use crate::broker::{ExecError, GhCli, GhExecutor, GitExecutor, MirrorGit};
 use crate::phase::{Phases, elapsed_ms};
 use crate::proc::{CAPTURE_BYTES, CaptureError, Captured};
 use crate::runner::{AgentRunner, Failure, IntoFailure, Reporter, Scope};
@@ -53,6 +57,8 @@ impl<R: Reporter> AgentRunner<R> {
         let local = format!("swarm/{}", job.job_id);
         let target = PushTarget::from_job(job)?;
         let branch = target.remote_branch();
+        let shared = self.publish_state(&job.job_id);
+        let mut book = shared.held.lock().await;
         let scratch = Scratch::create(cwd, &job.job_id).map_err(|()| Failure::bare(ERR_COMMITS))?;
         let dir = scratch.path();
         self.commit_leftovers(job, cwd, dir).await?;
@@ -62,8 +68,73 @@ impl<R: Reporter> AgentRunner<R> {
                 pr_url: None,
             });
         }
+        let head = self.local_head(&local, dir).await?;
+        if book.pushed.as_deref() != Some(head.as_str()) {
+            let push_start = self.clock.now();
+            let pushed = self.push_branch(job, dir, &local, &branch).await;
+            phases.push = Some(elapsed_ms(&*self.clock, push_start));
+            pushed?;
+            book.pushed = Some(head);
+        }
+        let pr_url = match target {
+            PushTarget::Chain(_) => job.pr_url.clone().filter(|url| is_ci_url(url)),
+            PushTarget::Own(_) if !job.open_pr => None,
+            PushTarget::Own(_) => Some(self.own_pr(job, &branch, dir, &mut book, phases).await?),
+        };
+        drop(book);
+        Ok(Published {
+            branch: Some(branch),
+            pr_url,
+        })
+    }
+
+    async fn own_pr(
+        &self,
+        job: &Job,
+        branch: &str,
+        dir: &Path,
+        book: &mut Held,
+        phases: &mut Phases,
+    ) -> Result<String, Failure> {
+        if let Some(url) = book.pr_url.clone() {
+            return Ok(url);
+        }
+        let pr_start = self.clock.now();
+        let opened = if book.pr_attempted {
+            self.open_or_find_pr(job, branch, dir).await
+        } else {
+            self.open_pr(job, branch, dir).await
+        };
+        phases.pr = Some(elapsed_ms(&*self.clock, pr_start));
+        let url = opened?;
+        book.pr_url = Some(url.clone());
+        Ok(url)
+    }
+
+    pub(crate) fn publish_state(&self, job_id: &str) -> Arc<JobPublish> {
+        self.publishing
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .entry(job_id.to_owned())
+            .or_default()
+            .clone()
+    }
+
+    pub(crate) fn forget_publish(&self, job_id: &str) {
+        self.publishing
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .remove(job_id);
+    }
+
+    async fn push_branch(
+        &self,
+        job: &Job,
+        dir: &Path,
+        local: &str,
+        branch: &str,
+    ) -> Result<(), Failure> {
         let refspec = format!("refs/heads/{local}:refs/heads/{branch}");
-        let push_start = self.clock.now();
         let pushed = self
             .helper(
                 &self.config.git_bin,
@@ -86,26 +157,145 @@ impl<R: Reporter> AgentRunner<R> {
                 ],
                 Scope::Push,
             )
-            .await;
-        phases.push = Some(elapsed_ms(&*self.clock, push_start));
-        let pushed = pushed.map_err(|e| e.failure(ERR_PUSH))?;
-        if !pushed.success {
-            return Err(Failure::tail(ERR_PUSH, &pushed.stderr));
+            .await
+            .map_err(|e| e.failure(ERR_PUSH))?;
+        if pushed.success {
+            Ok(())
+        } else {
+            Err(Failure::tail(ERR_PUSH, &pushed.stderr))
         }
-        let pr_url = match target {
-            PushTarget::Chain(_) => job.pr_url.clone().filter(|url| is_ci_url(url)),
-            PushTarget::Own(_) if !job.open_pr => None,
-            PushTarget::Own(_) => {
-                let pr_start = self.clock.now();
-                let opened = self.open_pr(job, &branch, dir).await;
-                phases.pr = Some(elapsed_ms(&*self.clock, pr_start));
-                Some(opened?)
+    }
+
+    async fn local_head(&self, local: &str, dir: &Path) -> Result<String, Failure> {
+        let parsed = self
+            .helper(
+                &self.config.git_bin,
+                dir,
+                &["rev-parse", "--verify", &format!("refs/heads/{local}")],
+                Scope::Clean,
+            )
+            .await
+            .map_err(|e| e.failure(ERR_COMMITS))?;
+        let head = parsed.stdout.trim();
+        if parsed.success && is_commit_sha(head) {
+            Ok(head.to_owned())
+        } else {
+            Err(Failure::bare(ERR_COMMITS))
+        }
+    }
+
+    /// Pushes the Job's committed work for the broker `push`. It runs the finish step's
+    /// push into the Job's bound target, never a refspec of the agent, with no leftover commit.
+    /// A head the shared [`JobPublish`] state already holds is not pushed again.
+    pub(crate) async fn broker_push(
+        &self,
+        shared: &JobPublish,
+        job: &Job,
+        cwd: &Path,
+    ) -> Result<Pushed, Failure> {
+        validate_job_id(&job.job_id).map_err(|_| Failure::bare(ERR_COMMITS))?;
+        validate_repo(&job.repo, &self.config.repo_policy).map_err(|_| Failure::bare(ERR_PUSH))?;
+        validate_ref(&job.base_ref).map_err(|_| Failure::bare(ERR_COMMITS))?;
+        let local = format!("swarm/{}", job.job_id);
+        let branch = PushTarget::from_job(job)?.remote_branch();
+        let mut book = shared.held.lock().await;
+        let scratch = Scratch::create(cwd, &job.job_id).map_err(|()| Failure::bare(ERR_COMMITS))?;
+        let dir = scratch.path();
+        if !self.ahead(job, &local, cwd, dir).await? {
+            return Ok(Pushed::Nothing);
+        }
+        let head = self.local_head(&local, dir).await?;
+        if book.pushed.as_deref() == Some(head.as_str()) {
+            return Ok(Pushed::Already);
+        }
+        self.push_branch(job, dir, &local, &branch).await?;
+        book.pushed = Some(head);
+        drop(book);
+        Ok(Pushed::Done)
+    }
+
+    /// Opens the Job's pull request for the broker `pr_create`, or returns the one that exists.
+    pub(crate) async fn broker_pr(
+        &self,
+        shared: &JobPublish,
+        job: &Job,
+        cwd: &Path,
+        title: &str,
+        body: &str,
+    ) -> Result<String, Failure> {
+        validate_job_id(&job.job_id).map_err(|_| Failure::bare(ERR_COMMITS))?;
+        validate_repo(&job.repo, &self.config.repo_policy).map_err(|_| Failure::bare(ERR_PR))?;
+        validate_ref(&job.base_ref).map_err(|_| Failure::bare(ERR_PR))?;
+        let target = PushTarget::from_job(job)?;
+        let branch = target.remote_branch();
+        let mut book = shared.held.lock().await;
+        if let Some(url) = book.pr_url.clone() {
+            return Ok(url);
+        }
+        match target {
+            PushTarget::Chain(_) => {
+                return job
+                    .pr_url
+                    .clone()
+                    .filter(|url| is_ci_url(url))
+                    .ok_or_else(|| Failure::bare(ERR_PR));
             }
+            PushTarget::Own(_) if !job.open_pr => return Err(Failure::bare(ERR_PR)),
+            PushTarget::Own(_) => {}
+        }
+        if book.pushed.is_none() {
+            return Err(Failure::bare(ERR_PR));
+        }
+        let scratch = Scratch::create(cwd, &job.job_id).map_err(|()| Failure::bare(ERR_PR))?;
+        let dir = scratch.path();
+        self.helper(
+            &self.config.git_bin,
+            dir,
+            &["init", "--bare", "--quiet"],
+            Scope::Clean,
+        )
+        .await
+        .map_err(|e| e.failure(ERR_PR))?;
+        book.pr_attempted = true;
+        let url = match self.existing_pr(job, &branch, dir).await {
+            Some(url) => url,
+            None => self.create_pr(job, &branch, dir, title, body).await?,
         };
-        Ok(Published {
-            branch: Some(branch),
-            pr_url,
-        })
+        book.pr_url = Some(url.clone());
+        drop(book);
+        Ok(url)
+    }
+
+    async fn open_or_find_pr(
+        &self,
+        job: &Job,
+        branch: &str,
+        dir: &Path,
+    ) -> Result<String, Failure> {
+        match self.existing_pr(job, branch, dir).await {
+            Some(url) => Ok(url),
+            None => self.open_pr(job, branch, dir).await,
+        }
+    }
+
+    async fn existing_pr(&self, job: &Job, branch: &str, dir: &Path) -> Option<String> {
+        let listed = self
+            .helper(
+                &self.config.gh_bin,
+                dir,
+                &[
+                    "pr", "list", "--repo", &job.repo, "--head", branch, "--state", "open",
+                    "--limit", "1", "--json", "url", "--jq", ".[].url",
+                ],
+                Scope::Gh,
+            )
+            .await
+            .ok()?;
+        if listed.success {
+            pr_url(&listed.stdout)
+        } else {
+            None
+        }
     }
 
     async fn commit_leftovers(&self, job: &Job, cwd: &Path, dir: &Path) -> Result<(), Failure> {
@@ -314,6 +504,24 @@ impl<R: Reporter> AgentRunner<R> {
         .chars()
         .take(MAX_TITLE_CHARS)
         .collect();
+        self.create_pr(
+            job,
+            branch,
+            dir,
+            &title,
+            &format!("Fleet job {}", job.job_id),
+        )
+        .await
+    }
+
+    async fn create_pr(
+        &self,
+        job: &Job,
+        branch: &str,
+        dir: &Path,
+        title: &str,
+        body: &str,
+    ) -> Result<String, Failure> {
         let created = self
             .helper(
                 &self.config.gh_bin,
@@ -328,9 +536,9 @@ impl<R: Reporter> AgentRunner<R> {
                     "--base",
                     &job.base_ref,
                     "--title",
-                    &title,
+                    title,
                     "--body",
-                    &format!("Fleet job {}", job.job_id),
+                    body,
                 ],
                 Scope::Gh,
             )
@@ -370,6 +578,154 @@ impl PushTarget {
             Self::Own(job_id) => format!("swarm/{job_id}"),
             Self::Chain(branch) => branch.clone(),
         }
+    }
+}
+
+/// What a broker `push` did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Pushed {
+    /// The Job's branch has no commit beyond its base.
+    Nothing,
+    /// The head was already published, by an earlier push or by the finish step.
+    Already,
+    /// The head was pushed now.
+    Done,
+}
+
+impl Pushed {
+    const fn status(self) -> &'static str {
+        match self {
+            Self::Nothing => "nothing to push",
+            Self::Already => "already published",
+            Self::Done => "pushed",
+        }
+    }
+}
+
+/// The publish state of one Job, shared by the broker and the finish step.
+///
+/// Its lock is held across every publish operation of the Job, so a broker `push` and the
+/// finish step never run git in the Job's scratch repo at once. It remembers the head commit
+/// already pushed and the pull request URL already known. The finish step skips a push of a
+/// head recorded here and still pushes any commit made after it. After a broker `pr_create`
+/// that did not return a URL, the finish step looks for an open pull request of the branch
+/// before it creates one, because the failed call may have created it.
+#[derive(Debug, Default)]
+pub struct JobPublish {
+    held: Mutex<Held>,
+}
+
+#[derive(Debug, Default)]
+struct Held {
+    pushed: Option<String>,
+    pr_url: Option<String>,
+    pr_attempted: bool,
+}
+
+/// The real `push` of the broker: the finish step's publish path for one Job.
+///
+/// Branch and repo come from the claimed Job, never from a request. The push is fast-forward
+/// only, as in the finish step. A failure logs a fixed line and replies with the broker's fixed
+/// error: no git stderr leaves this executor. `fetch` is [`MirrorGit`]'s. Built, not wired: no
+/// runtime path builds a broker yet.
+pub struct PublishGit<R> {
+    runner: Arc<AgentRunner<R>>,
+    shared: Arc<JobPublish>,
+    job: Job,
+    cwd: PathBuf,
+    mirror: MirrorGit,
+}
+
+impl<R: Reporter> PublishGit<R> {
+    /// An executor that publishes the worktree `cwd` of `job`, on the publish state the
+    /// runner keeps for the Job.
+    #[must_use]
+    pub fn new(runner: Arc<AgentRunner<R>>, job: Job, cwd: PathBuf, mirror: MirrorGit) -> Self {
+        Self {
+            shared: runner.publish_state(&job.job_id),
+            runner,
+            job,
+            cwd,
+            mirror,
+        }
+    }
+}
+
+impl<R: Reporter + Send + Sync + 'static> GitExecutor for PublishGit<R> {
+    async fn push(&self, _target: &crate::broker::PushTarget) -> Result<String, ExecError> {
+        match self
+            .runner
+            .broker_push(&self.shared, &self.job, &self.cwd)
+            .await
+        {
+            Ok(pushed) => Ok(pushed.status().to_owned()),
+            Err(failure) => {
+                tracing::warn!(error = failure.error, "broker push failed");
+                Err(ExecError)
+            }
+        }
+    }
+
+    fn fetch(&self) -> impl Future<Output = Result<String, ExecError>> + Send {
+        self.mirror.fetch()
+    }
+}
+
+/// The real `pr_create` of the broker, with `pr_checks` delegated to [`GhCli`].
+///
+/// It returns the URL the shared [`JobPublish`] state holds, else the open pull request of the
+/// Job's branch, else creates one with the title and body the broker validated and redacted. A
+/// Job with `open_pr` off, or a branch not yet pushed, fails. A fix Job returns the `pr_url`
+/// its Job carries.
+pub struct PublishGh<R> {
+    runner: Arc<AgentRunner<R>>,
+    shared: Arc<JobPublish>,
+    job: Job,
+    cwd: PathBuf,
+    checks: GhCli,
+}
+
+impl<R: Reporter> PublishGh<R> {
+    /// An executor that opens the pull request of `job`, on the publish state the runner
+    /// keeps for the Job.
+    #[must_use]
+    pub fn new(runner: Arc<AgentRunner<R>>, job: Job, cwd: PathBuf, checks: GhCli) -> Self {
+        Self {
+            shared: runner.publish_state(&job.job_id),
+            runner,
+            job,
+            cwd,
+            checks,
+        }
+    }
+}
+
+impl<R: Reporter + Send + Sync + 'static> GhExecutor for PublishGh<R> {
+    async fn pr_create(
+        &self,
+        _target: &crate::broker::PushTarget,
+        title: &str,
+        body: &str,
+    ) -> Result<String, ExecError> {
+        match self
+            .runner
+            .broker_pr(&self.shared, &self.job, &self.cwd, title, body)
+            .await
+        {
+            Ok(url) => Ok(url),
+            Err(failure) => {
+                tracing::warn!(error = failure.error, "broker pr_create failed");
+                Err(ExecError)
+            }
+        }
+    }
+
+    fn pr_checks(
+        &self,
+        target: &crate::broker::PushTarget,
+        pr_url: &str,
+    ) -> impl Future<Output = Result<String, ExecError>> + Send {
+        self.checks.pr_checks(target, pr_url)
     }
 }
 

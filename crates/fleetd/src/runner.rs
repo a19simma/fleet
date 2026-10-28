@@ -78,7 +78,7 @@ use crate::phase::{Clock, Phases, SystemClock, elapsed_ms};
 use crate::poller::{RunError, Shutdown};
 use crate::proc::{CAPTURE_BYTES, CaptureError, Captured, Keep, capture, capture_keeping};
 use crate::profile_apply::{self, Applied, LoadError};
-use crate::publish::{GH_CONFIG_DIR, HOME_DIR, Published};
+use crate::publish::{GH_CONFIG_DIR, HOME_DIR, JobPublish, Published};
 use crate::telemetry::Terminal as Ending;
 use crate::toolhook::HookHub;
 mod ci;
@@ -638,6 +638,7 @@ pub struct AgentRunner<R> {
     hub: Option<Arc<HookHub>>,
     feeds: Option<Arc<FeedBook>>,
     claude_version: Mutex<Option<String>>,
+    pub(crate) publishing: Mutex<HashMap<String, Arc<JobPublish>>>,
 }
 
 #[derive(Debug, Default)]
@@ -666,6 +667,7 @@ impl<R: Reporter> AgentRunner<R> {
             hub: None,
             feeds: None,
             claude_version: Mutex::new(None),
+            publishing: Mutex::new(HashMap::new()),
         }
     }
 
@@ -1209,11 +1211,28 @@ impl<R: Reporter> AgentRunner<R> {
     /// failure sends a `FAILED` report with a fixed error and the redacted, bounded tail of
     /// the helper's stderr as one transcript chunk. The raw output goes nowhere else.
     ///
+    /// The publish state is shared with the credential broker ([`crate::publish::JobPublish`]).
+    /// A head the broker already pushed is not pushed again, a commit made after it is, and a
+    /// pull request the broker opened is reused. The step never depends on the broker having
+    /// succeeded: with no broker call it pushes and opens the pull request itself. Broker and
+    /// finish publish operations of one Job run one at a time.
+    ///
     /// # Errors
     ///
     /// Returns [`RunError`] when `shutdown` fires. A best-effort `FAILED` report is sent
     /// first and the helper's process group is killed.
     pub async fn finish(
+        &self,
+        job: &Job,
+        cwd: &Path,
+        shutdown: Shutdown,
+    ) -> Result<FinishOutcome, RunError> {
+        let outcome = self.finish_inner(job, cwd, shutdown).await;
+        self.forget_publish(&job.job_id);
+        outcome
+    }
+
+    async fn finish_inner(
         &self,
         job: &Job,
         cwd: &Path,
@@ -1227,7 +1246,11 @@ impl<R: Reporter> AgentRunner<R> {
         let progress = stream.progress.clone();
         let mut phases = Phases::default();
         let raced = ctl
-            .race(self.alive(job, &progress, self.publish(job, cwd, &mut phases)))
+            .race(self.alive(
+                job,
+                &progress,
+                Box::pin(self.publish(job, cwd, &mut phases)),
+            ))
             .await;
         stream.feed().record(phases);
         match raced {
