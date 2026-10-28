@@ -139,6 +139,134 @@ pub trait Service: Send + Sync {
 /// The services a socket offers, by handshake name.
 pub type Services = HashMap<ServiceName, Arc<dyn Service>>;
 
+/// Why [`PerJob::register`] refused a Job id.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RegisterError {
+    /// The id is not a valid Job id (see [`valid_job_id`]).
+    InvalidId,
+    /// A service is already registered under the id.
+    Duplicate,
+}
+
+impl std::fmt::Display for RegisterError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::InvalidId => "invalid job id",
+            Self::Duplicate => "job id already registered",
+        })
+    }
+}
+
+impl std::error::Error for RegisterError {}
+
+/// A registry of one service instance per Job, keyed by [`JobContext::job_id`].
+///
+/// The listener of a Job socket sets `job_id`, so a connection reaches only the service
+/// registered for its own Job. Clones share one map: the runner keeps a clone to
+/// [`register`](Self::register) before it launches the Agent unit and to
+/// [`unregister`](Self::unregister) on every end path.
+///
+/// An id with no service closes the connection with no reply, the same as an unknown
+/// handshake name. Unregistering takes effect on the next connection. A connection already
+/// served keeps its service until it finishes or the socket cancels it through
+/// [`JobContext::cancel`].
+///
+/// The lock guards single map operations and is never held across an await. A panic that
+/// poisons it leaves the map whole, so every method recovers the guard.
+#[derive(Debug)]
+pub struct PerJob<S> {
+    jobs: Arc<std::sync::Mutex<HashMap<String, Arc<S>>>>,
+}
+
+impl<S> Clone for PerJob<S> {
+    fn clone(&self) -> Self {
+        Self {
+            jobs: Arc::clone(&self.jobs),
+        }
+    }
+}
+
+impl<S> Default for PerJob<S> {
+    fn default() -> Self {
+        Self {
+            jobs: Arc::default(),
+        }
+    }
+}
+
+impl<S> PerJob<S> {
+    /// An empty registry.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    fn map(&self) -> std::sync::MutexGuard<'_, HashMap<String, Arc<S>>> {
+        self.jobs
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// Registers `service` for `job_id`.
+    ///
+    /// A second registration of a live id is an error and leaves the first service in place,
+    /// so a double registration surfaces instead of swapping a service under a Job.
+    ///
+    /// # Errors
+    ///
+    /// Fails with [`RegisterError::InvalidId`] when `job_id` is not a valid Job id, and with
+    /// [`RegisterError::Duplicate`] when a service is registered for it.
+    pub fn register(&self, job_id: &str, service: Arc<S>) -> Result<(), RegisterError> {
+        if !valid_job_id(job_id) {
+            return Err(RegisterError::InvalidId);
+        }
+        match self.map().entry(job_id.to_owned()) {
+            std::collections::hash_map::Entry::Occupied(_) => Err(RegisterError::Duplicate),
+            std::collections::hash_map::Entry::Vacant(slot) => {
+                slot.insert(service);
+                Ok(())
+            }
+        }
+    }
+
+    /// Removes the service of `job_id` and reports whether one was registered.
+    ///
+    /// Safe to call on every end path of a Job, more than once.
+    pub fn unregister(&self, job_id: &str) -> bool {
+        self.map().remove(job_id).is_some()
+    }
+
+    /// Whether a service is registered for `job_id`.
+    #[must_use]
+    pub fn contains(&self, job_id: &str) -> bool {
+        self.map().contains_key(job_id)
+    }
+
+    /// How many Jobs are registered.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.map().len()
+    }
+
+    /// Whether no Job is registered.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.map().is_empty()
+    }
+}
+
+impl<S: Service + 'static> Service for PerJob<S> {
+    fn serve(&self, ctx: JobContext, stream: UnixStream) -> ServeFuture<'_> {
+        let service = self.map().get(&ctx.job_id).cloned();
+        Box::pin(async move {
+            match service {
+                Some(service) => service.serve(ctx, stream).await,
+                None => drop(stream),
+            }
+        })
+    }
+}
+
 /// What a reading of a connected peer yields.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PeerId {
@@ -540,9 +668,9 @@ mod tests {
     use tokio::sync::mpsc;
 
     use super::{
-        AGENT_SLICE, JobContext, JobSocket, Limits, MAX_FRAME_BYTES, Peer, PeerId, ServeFuture,
-        Service, ServiceName, Services, SocketFacts, cgroup_unit, connect, connect_with,
-        read_frame, socket_acceptable, socket_path, write_frame,
+        AGENT_SLICE, JobContext, JobSocket, Limits, MAX_FRAME_BYTES, Peer, PeerId, PerJob,
+        RegisterError, ServeFuture, Service, ServiceName, Services, SocketFacts, cgroup_unit,
+        connect, connect_with, read_frame, socket_acceptable, socket_path, write_frame,
     };
 
     type TestResult = Result<(), Box<dyn std::error::Error>>;
@@ -1203,6 +1331,198 @@ mod tests {
         std::fs::write(&path, b"other")?;
         drop(sock);
         assert_eq!(std::fs::read(&path)?, b"other");
+        Ok(())
+    }
+
+    fn per_job_socket(
+        dir: &TempDir,
+        registry: &PerJob<impl Service + 'static>,
+    ) -> Result<JobSocket, Box<dyn std::error::Error>> {
+        start(
+            dir,
+            Ok(cgroup_of("job1")),
+            services(ServiceName::Broker, registry.clone()),
+            Limits::default(),
+        )
+    }
+
+    async fn dial(sock: &JobSocket) -> std::io::Result<UnixStream> {
+        let mut stream = UnixStream::connect(sock.path()).await?;
+        write_frame(&mut stream, b"broker").await?;
+        Ok(stream)
+    }
+
+    async fn echoes(stream: &mut UnixStream) -> TestResult {
+        stream.write_all(b"ping").await?;
+        let mut back = [0u8; 4];
+        tokio::time::timeout(WAIT, stream.read_exact(&mut back)).await??;
+        assert_eq!(&back, b"ping");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn per_job_delegates_to_the_service_of_the_listeners_job() -> TestResult {
+        let dir = TempDir::new()?;
+        let (tx, mut seen) = mpsc::unbounded_channel();
+        let (other_tx, mut other_seen) = mpsc::unbounded_channel();
+        let registry = PerJob::new();
+        registry.register("job1", Arc::new(Echo(tx)))?;
+        registry.register("job2", Arc::new(Echo(other_tx)))?;
+        let sock = per_job_socket(&dir, &registry)?;
+        let mut stream = dial(&sock).await?;
+        echoes(&mut stream).await?;
+        assert_eq!(seen.recv().await, Some(("job1".to_owned(), false)));
+        assert!(other_seen.try_recv().is_err());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn an_unknown_job_id_closes_with_no_reply() -> TestResult {
+        let dir = TempDir::new()?;
+        let (tx, mut seen) = mpsc::unbounded_channel();
+        let registry = PerJob::new();
+        registry.register("job2", Arc::new(Echo(tx)))?;
+        let sock = per_job_socket(&dir, &registry)?;
+        let mut stream = dial(&sock).await?;
+        assert_closed_silently(&mut stream).await?;
+        assert!(seen.try_recv().is_err());
+        assert_eq!(sock.rejected(), 0);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn unregister_takes_effect_on_the_next_connection_and_spares_the_open_one() -> TestResult
+    {
+        let dir = TempDir::new()?;
+        let (tx, mut seen) = mpsc::unbounded_channel();
+        let registry = PerJob::new();
+        registry.register("job1", Arc::new(Echo(tx)))?;
+        let sock = per_job_socket(&dir, &registry)?;
+        let mut open = dial(&sock).await?;
+        assert!(tokio::time::timeout(WAIT, seen.recv()).await?.is_some());
+        assert!(registry.unregister("job1"));
+        echoes(&mut open).await?;
+        let mut next = dial(&sock).await?;
+        assert_closed_silently(&mut next).await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn cancel_stops_an_in_flight_per_job_service() -> TestResult {
+        let dir = TempDir::new()?;
+        let (tx, mut entered) = mpsc::unbounded_channel();
+        let registry = PerJob::new();
+        registry.register("job1", Arc::new(Hang(tx)))?;
+        let sock = per_job_socket(&dir, &registry)?;
+        let mut stream = dial(&sock).await?;
+        assert!(tokio::time::timeout(WAIT, entered.recv()).await?.is_some());
+        registry.unregister("job1");
+        sock.cancel();
+        assert_closed_silently(&mut stream).await?;
+        Ok(())
+    }
+
+    #[test]
+    fn a_duplicate_or_invalid_id_is_refused_and_the_first_service_stays() -> TestResult {
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let registry = PerJob::new();
+        let first = Arc::new(Echo(tx.clone()));
+        registry.register("a", Arc::clone(&first))?;
+        assert_eq!(
+            registry.register("a", Arc::new(Echo(tx.clone()))),
+            Err(RegisterError::Duplicate)
+        );
+        assert_eq!(Arc::strong_count(&first), 2);
+        for id in ["", "a/b", "..", "a b", &"x".repeat(65)] {
+            assert_eq!(
+                registry.register(id, Arc::new(Echo(tx.clone()))),
+                Err(RegisterError::InvalidId)
+            );
+        }
+        assert_eq!(registry.len(), 1);
+        assert!(!registry.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn unregister_is_idempotent_and_frees_the_id() -> TestResult {
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let registry = PerJob::new();
+        assert!(!registry.unregister("a"));
+        registry.register("a", Arc::new(Echo(tx.clone())))?;
+        assert!(registry.unregister("a"));
+        assert!(!registry.unregister("a"));
+        assert!(!registry.contains("a"));
+        registry.register("a", Arc::new(Echo(tx)))?;
+        assert!(registry.contains("a"));
+        Ok(())
+    }
+
+    #[test]
+    fn concurrent_register_unregister_and_lookup_stay_consistent() {
+        let (tx, _rx) = mpsc::unbounded_channel::<(String, bool)>();
+        let registry = PerJob::new();
+        let workers: Vec<_> = (0..8)
+            .map(|worker| {
+                let registry = registry.clone();
+                let tx = tx.clone();
+                std::thread::spawn(move || {
+                    for round in 0..200 {
+                        let id = format!("w{worker}-{}", round % 5);
+                        let _ = registry.register(&id, Arc::new(Echo(tx.clone())));
+                        let _ = registry.contains(&id);
+                        if round % 2 == 0 {
+                            registry.unregister(&id);
+                        }
+                    }
+                })
+            })
+            .collect();
+        for worker in workers {
+            assert!(worker.join().is_ok());
+        }
+        for worker in 0..8 {
+            for slot in 0..5 {
+                registry.unregister(&format!("w{worker}-{slot}"));
+            }
+        }
+        assert!(registry.is_empty());
+    }
+
+    #[test]
+    fn many_ids_register_and_unregister() -> TestResult {
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let registry = PerJob::new();
+        for n in 0..20_000 {
+            registry.register(&format!("j{n}"), Arc::new(Echo(tx.clone())))?;
+        }
+        assert_eq!(registry.len(), 20_000);
+        assert!(registry.contains("j19999"));
+        assert!(registry.unregister("j0"));
+        assert_eq!(registry.len(), 19_999);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_poisoned_lock_does_not_stop_the_registry() -> TestResult {
+        let dir = TempDir::new()?;
+        let (tx, _seen) = mpsc::unbounded_channel();
+        let registry = PerJob::new();
+        registry.register("job1", Arc::new(Echo(tx.clone())))?;
+        let poisoner = registry.clone();
+        let outcome = std::thread::spawn(move || {
+            let _guard = poisoner.jobs.lock();
+            panic!("poison the registry lock");
+        })
+        .join();
+        assert!(outcome.is_err());
+        assert!(registry.jobs.is_poisoned());
+        registry.register("job3", Arc::new(Echo(tx)))?;
+        assert!(registry.contains("job3"));
+        let sock = per_job_socket(&dir, &registry)?;
+        let mut stream = dial(&sock).await?;
+        echoes(&mut stream).await?;
+        assert!(registry.unregister("job1"));
         Ok(())
     }
 }

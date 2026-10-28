@@ -1,6 +1,6 @@
 # Fleet
 
-Fleet runs coding-agent Jobs on Boxes and records what each Job did. This file defines the terms used by the telemetry and metrics ADRs (0029, 0030) and the profile ADRs (0034, 0035) and the job socket and broker ADRs (0036, 0037).
+Fleet runs coding-agent Jobs on Boxes and records what each Job did. This file defines the terms used by the telemetry and metrics ADRs (0029, 0030) and the profile ADRs (0034, 0035) and the job socket, broker and registration ADRs (0036, 0037, 0039).
 
 ## Language
 
@@ -87,6 +87,14 @@ _Avoid_: branch argument
 **Fixture**:
 Planned, not built: a recorded Job input with an expected outcome, meant to run through `fleet eval run`.
 _Avoid_: test case
+
+**Service registry**:
+The per-Job map of services behind the **Job socket**, keyed by the Job id the listener sets. The runner registers before launch and unregisters on every end path; an unknown id closes the connection with no reply (ADR-0039).
+_Avoid_: service map, handler table
+
+**Job end hook**:
+The one call site that runs on every end path of a Job (success, failure, cancel, lease loss, timeout, panic) and unregisters the Job from the **Service registry** (ADR-0039).
+_Avoid_: cleanup callback, finalizer
 
 **Fetch policy**:
 The Box-level rule for which hosts `fleetd fetch` may reach. Planned, not built: allow all public hosts first, a radiant allowlist later. A Profile cannot change it (ADR-0038).

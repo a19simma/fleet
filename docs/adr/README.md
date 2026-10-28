@@ -28,5 +28,6 @@ ADRs for fleetd, the Fleet server and the `fleet` CLI. The plan is in `../plan.m
 | [0036](0036-per-job-unix-socket.md) | Per-job unix socket | Proposed 2026-10-28, not built, systemd launcher only, amends 0031 |
 | [0037](0037-credential-broker.md) | Credential broker | Proposed 2026-10-28, built as library code and not wired, push op built on 0031 P3, builds on 0028 and 0036, amends 0024 and 0031 |
 | [0038](0038-fetch-tool-and-box-egress-policy.md) | Fetch tool and Box egress policy | Proposed 2026-10-28, fetch core, fetch event and fetch service built, not wired, amends 0029, 0031 and 0034 |
+| [0039](0039-job-socket-service-registration.md) | Job socket service registration | Proposed 2026-10-28, `PerJob` registry built, not wired, supersedes the unspecified service registration in 0036, 0037 and 0038 |
 
 Each ADR has a "Decisions (2026-10-24)" section with the choices made when the docs moved into this repo: Apache-2.0 licence, repo github.com/a19simma/fleet, `fleet watch` as a client poll in v1, job cost deferred, Tailscale not a hard dependency.
