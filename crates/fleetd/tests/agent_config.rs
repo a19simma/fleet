@@ -4,7 +4,10 @@
 use std::os::unix::fs::symlink;
 use std::path::Path;
 
-use fleetd::agent_config::{Bundle, BundleError, JobDir, MAX_BYTES, MAX_ENTRIES};
+use fleetd::agent_config::{
+    AGENT_PROTOCOL, Bundle, BundleError, JobDir, MAX_BYTES, MAX_ENTRIES, protocol_for,
+};
+use fleetd::jobsock::ServiceName;
 use tempfile::TempDir;
 
 type TestResult = Result<(), Box<dyn std::error::Error>>;
@@ -12,6 +15,26 @@ type TestResult = Result<(), Box<dyn std::error::Error>>;
 fn settings(dir: &Path, json: &str) -> TestResult {
     std::fs::write(dir.join("settings.json"), json)?;
     Ok(())
+}
+
+#[test]
+fn the_protocol_is_unchanged_with_no_service_and_names_fetch_when_it_is_on() {
+    assert_eq!(protocol_for(&[]), AGENT_PROTOCOL);
+    assert!(AGENT_PROTOCOL.starts_with("You run as an unattended fleet job."));
+    for quiet in [
+        &[ServiceName::Broker][..],
+        &[ServiceName::EgressProxy],
+        &[ServiceName::Broker, ServiceName::EgressProxy],
+    ] {
+        assert_eq!(protocol_for(quiet), AGENT_PROTOCOL, "{quiet:?}");
+    }
+    let with = protocol_for(&[ServiceName::Fetch]);
+    assert!(with.starts_with(AGENT_PROTOCOL));
+    assert!(with.contains("fleetd fetch <url>"));
+    assert_eq!(
+        protocol_for(&[ServiceName::Fetch, ServiceName::Fetch]),
+        with
+    );
 }
 
 #[test]

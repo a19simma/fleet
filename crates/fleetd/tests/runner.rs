@@ -16,11 +16,10 @@ use fleet_proto::v1::{
     Job, JobEvent, JobEventKind, JobState, ReportJobReply, ReportJobRequest, TranscriptChunk,
 };
 use fleetd::HookHub;
-use fleetd::agent_config::{Bundle, JOB_EMAIL, JOB_NAME};
+use fleetd::agent_config::{AGENT_PROTOCOL, Bundle, JOB_EMAIL, JOB_NAME};
 use fleetd::poller::{RunError, Shutdown};
 use fleetd::runner::{
-    AGENT_PROTOCOL, AgentOutcome, AgentRunner, ChildWait, Interrupt, Reporter, RunConfig,
-    STRIPPED_ENV,
+    AgentOutcome, AgentRunner, ChildWait, Interrupt, Reporter, RunConfig, STRIPPED_ENV,
 };
 use fleetd::toolhook::ToolReport;
 use serde_json::json;
