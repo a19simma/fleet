@@ -240,6 +240,7 @@ pub struct Workspace {
     after_clone: Option<AfterClone>,
     redactor: Redactor,
     job_gid: Option<u32>,
+    mirror_lock: Arc<tokio::sync::Mutex<()>>,
 }
 
 impl Workspace {
@@ -256,6 +257,7 @@ impl Workspace {
             after_clone: None,
             redactor: Redactor::default(),
             job_gid: None,
+            mirror_lock: Arc::new(tokio::sync::Mutex::new(())),
         }
     }
 
@@ -331,7 +333,8 @@ impl Workspace {
     /// `sync_mirror` is deleted and rebuilt, so a mirror an agent could write before the
     /// job group lost write access needs no manual delete. Stale `*.lock` files in the mirror
     /// are deleted before each fetch.
-    /// The jobs directory must belong to one daemon that runs its jobs one at a time.
+    /// The jobs directory must belong to one daemon. The call holds the mirror lock that
+    /// [`Workspace::fetch_mirror`] also takes, from the mirror sync to the end of the clone.
     ///
     /// # Errors
     ///
@@ -347,14 +350,8 @@ impl Workspace {
         validate_repo(repo, &self.policy)?;
         validate_ref(base_ref)?;
 
-        let cache = self.root.join(CACHE_DIR);
-        tokio::fs::create_dir_all(&cache)
-            .await
-            .map_err(WorkspaceError::Io)?;
-        if let Some(gid) = self.job_gid {
-            crate::jobenv::share_dir_read_only(&cache, gid).map_err(WorkspaceError::Io)?;
-        }
-        let mirror = Self::mirror_dir(&self.root, repo);
+        let _held = self.mirror_lock.lock().await;
+        let mirror = self.prepare_cache(repo).await?;
         self.sync_mirror(&mirror, repo).await?;
 
         let path = self.root.join(job_id);
@@ -393,6 +390,40 @@ impl Workspace {
 }
 
 impl Workspace {
+    async fn prepare_cache(&self, repo: &str) -> Result<PathBuf, WorkspaceError> {
+        let cache = self.root.join(CACHE_DIR);
+        tokio::fs::create_dir_all(&cache)
+            .await
+            .map_err(WorkspaceError::Io)?;
+        if let Some(gid) = self.job_gid {
+            crate::jobenv::share_dir_read_only(&cache, gid).map_err(WorkspaceError::Io)?;
+        }
+        Ok(Self::mirror_dir(&self.root, repo))
+    }
+
+    /// Refreshes the mirror of `repo` for the credential broker.
+    ///
+    /// It runs the same trust check, rename-aside rebuild, lock sweep and credentialed fetch
+    /// as [`Workspace::prepare`], under the same repo policy and protocol list, so a mirror an
+    /// agent wrote is rebuilt before the refresh.
+    ///
+    /// The mirror is used by one operation at a time: `prepare` and this call take the same
+    /// lock, which every clone of the [`Workspace`] shares. A refresh that ran beside a
+    /// `prepare` would race its lock sweep and its rename-aside rebuild, so the later caller
+    /// waits for the earlier one. The broker must build its executor from a clone of the
+    /// runner's `Workspace`, never from a second `Workspace::new`, or the lock is not shared.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`WorkspaceError::InvalidRepo`] before any process starts when `repo` fails the
+    /// policy, else a fixed-message git or filesystem error.
+    pub async fn fetch_mirror(&self, repo: &str) -> Result<(), WorkspaceError> {
+        validate_repo(repo, &self.policy)?;
+        let _held = self.mirror_lock.lock().await;
+        let mirror = self.prepare_cache(repo).await?;
+        self.sync_mirror(&mirror, repo).await
+    }
+
     async fn clone_checkout(
         &self,
         mirror: &Path,

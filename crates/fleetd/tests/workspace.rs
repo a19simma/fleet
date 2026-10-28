@@ -1,11 +1,19 @@
 //! Runs real git against a local bare repo. Own test binary because it spawns children.
 
+use std::future::Future;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::OnceLock;
 use std::time::Duration;
 
+use fleet_core::Redactor;
+use fleet_proto::v1::Job;
+use fleetd::AgentLauncher;
+use fleetd::broker::{
+    Broker, Denial, ExecError, GhCli, GhExecutor, GitExecutor, Limits, MAX_CHECKS,
+    MAX_OUTPUT_BYTES, MirrorGit, PushTarget, Request, Response,
+};
 use fleetd::workspace::{RepoPolicy, Workspace, WorkspaceError};
 use tempfile::TempDir;
 
@@ -768,7 +776,7 @@ async fn git_stderr_is_redacted_before_it_is_kept() -> TestResult {
         )?;
         let ws = workspace(dir.path().join("jobs"))
             .with_git(git, GIT_BAND)
-            .with_redactor(fleet_core::Redactor::new([secret]));
+            .with_redactor(Redactor::new([secret]));
         let err = ws
             .prepare("job1", "/nowhere.git", "main")
             .await
@@ -793,7 +801,7 @@ async fn git_stderr_is_cut_to_a_tail_and_a_split_secret_does_not_leak() -> TestR
         let git = noisy_git(dir.path(), &body)?;
         let ws = workspace(dir.path().join("jobs"))
             .with_git(git, GIT_BAND)
-            .with_redactor(fleet_core::Redactor::new([secret]));
+            .with_redactor(Redactor::new([secret]));
         let err = ws
             .prepare("job1", "/nowhere.git", "main")
             .await
@@ -1105,4 +1113,649 @@ async fn a_symlink_at_the_init_path_is_removed_without_touching_its_target() -> 
     assert_eq!(std::fs::read_to_string(target.join("keep"))?, "kept");
     assert_eq!(std::fs::read_dir(&target)?.count(), 1);
     Ok(())
+}
+
+struct LoggedGit {
+    wrapper: PathBuf,
+    log: PathBuf,
+}
+
+fn logged_git(
+    base: &Path,
+    origin: &str,
+    sleep: &str,
+) -> Result<LoggedGit, Box<dyn std::error::Error>> {
+    let wrapper = base.join("git-logged");
+    let log = base.join("git.log");
+    std::fs::write(
+        &wrapper,
+        format!(
+            "#!/bin/sh\nstep=\"$*\"\necho \"start allow=$GIT_ALLOW_PROTOCOL askpass=$GIT_ASKPASS $step\" >> \"{log}\"\nfor a in \"$@\"; do\n  shift\n  if [ \"$a\" = \"{PRODUCTION_REPO}\" ]; then\n    a=\"{origin}\"\n    export GIT_ALLOW_PROTOCOL=file\n  fi\n  set -- \"$@\" \"$a\"\ndone\nsleep {sleep}\n\"{real}\" \"$@\"\nrc=$?\necho \"end\" >> \"{log}\"\nexit $rc\n",
+            log = log.display(),
+            real = real_git()?.display()
+        ),
+    )?;
+    std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o755))?;
+    Ok(LoggedGit { wrapper, log })
+}
+
+fn production(root: &Path, git: &LoggedGit) -> Workspace {
+    Workspace::new(root)
+        .with_policy(RepoPolicy::new(["github.com"]))
+        .with_git(&git.wrapper, Duration::from_secs(60))
+}
+
+fn single_mirror(root: &Path) -> Result<PathBuf, Box<dyn std::error::Error>> {
+    let mut found = std::fs::read_dir(root.join(".cache"))?
+        .map(|entry| entry.map(|e| e.path()))
+        .collect::<Result<Vec<_>, _>>()?;
+    found.retain(|p| p.extension().is_some_and(|e| e == "git"));
+    match found.as_slice() {
+        [one] => Ok(one.clone()),
+        _ => Err("expected one mirror".into()),
+    }
+}
+
+#[tokio::test]
+async fn a_production_policy_mirror_refresh_fetches_new_commits_through_a_relative_root()
+-> TestResult {
+    common::bounded(Box::pin(async {
+        let dir = TempDir::new()?;
+        let origin = fixture(dir.path())?;
+        let git_wrapper = logged_git(dir.path(), &origin, "0")?;
+        let root = relative_to_cwd(dir.path())?.join("jobs");
+        assert!(root.is_relative());
+        let ws = production(&root, &git_wrapper).with_credential("askpass-bin", "tok".to_owned());
+        ws.prepare("job1", PRODUCTION_REPO, "main").await?;
+        let seed = dir.path().join("seed");
+        std::fs::write(seed.join("b.txt"), "two")?;
+        git(&seed, &["add", "."])?;
+        git(&seed, &["commit", "--quiet", "-m", "two"])?;
+        git(&seed, &["push", "--quiet", &origin, "main"])?;
+        let log_before = std::fs::read_to_string(&git_wrapper.log)?;
+        ws.fetch_mirror(PRODUCTION_REPO).await?;
+        let mirror = single_mirror(&root)?;
+        assert_eq!(
+            git(&mirror, &["rev-parse", "refs/remotes/origin/main"])?,
+            git(&seed, &["rev-parse", "HEAD"])?
+        );
+        let log = std::fs::read_to_string(&git_wrapper.log)?;
+        let new = &log[log_before.len()..];
+        let fetch = new
+            .lines()
+            .find(|l| l.contains(" fetch ") && l.contains(PRODUCTION_REPO))
+            .ok_or("no fetch logged")?;
+        assert!(fetch.contains("allow=https "), "{fetch}");
+        assert!(fetch.contains("askpass=askpass-bin"), "{fetch}");
+        assert!(!log.contains("tok"), "token reached argv");
+        Ok(())
+    }))
+    .await
+}
+
+#[tokio::test]
+async fn a_mirror_refresh_rejects_a_repo_the_policy_refuses_before_git_runs() -> TestResult {
+    common::bounded(Box::pin(async {
+        let dir = TempDir::new()?;
+        let git_wrapper = logged_git(dir.path(), "unused", "0")?;
+        let ws = production(&dir.path().join("jobs"), &git_wrapper);
+        for repo in [
+            "https://evil.example/o/r.git",
+            "file:///etc",
+            "ssh://github.com/o/r.git",
+            "--upload-pack=x",
+            "",
+        ] {
+            assert!(matches!(
+                ws.fetch_mirror(repo).await,
+                Err(WorkspaceError::InvalidRepo)
+            ));
+        }
+        assert!(!git_wrapper.log.exists());
+        Ok(())
+    }))
+    .await
+}
+
+#[tokio::test]
+async fn a_planted_hostile_mirror_is_rebuilt_before_a_broker_refresh() -> TestResult {
+    common::bounded(Box::pin(async {
+        let dir = TempDir::new()?;
+        let origin = fixture(dir.path())?;
+        let git_wrapper = logged_git(dir.path(), &origin, "0")?;
+        let root = dir.path().join("jobs");
+        let ws = production(&root, &git_wrapper);
+        ws.prepare("job1", PRODUCTION_REPO, "main").await?;
+        let mirror = single_mirror(&root)?;
+        std::fs::write(mirror.join("marker"), "old")?;
+        std::fs::write(
+            mirror.join("objects/info/alternates"),
+            format!("{}\n", dir.path().display()),
+        )?;
+        ws.fetch_mirror(PRODUCTION_REPO).await?;
+        assert!(!mirror.join("marker").exists(), "mirror was not rebuilt");
+        assert!(!mirror.join("objects/info/alternates").exists());
+        assert_eq!(
+            git(&mirror, &["rev-parse", "refs/remotes/origin/main"])?,
+            git(&dir.path().join("seed"), &["rev-parse", "HEAD"])?
+        );
+        Ok(())
+    }))
+    .await
+}
+
+#[tokio::test]
+async fn a_broker_refresh_and_a_prepare_never_run_git_at_the_same_time() -> TestResult {
+    common::bounded(Box::pin(async {
+        let dir = TempDir::new()?;
+        let origin = fixture(dir.path())?;
+        let git_wrapper = logged_git(dir.path(), &origin, "0.2")?;
+        let root = dir.path().join("jobs");
+        let ws = production(&root, &git_wrapper);
+        ws.prepare("job0", PRODUCTION_REPO, "main").await?;
+        std::fs::write(&git_wrapper.log, "")?;
+        let other = ws.clone();
+        let (prepared, fetched) = tokio::join!(
+            ws.prepare("job1", PRODUCTION_REPO, "main"),
+            other.fetch_mirror(PRODUCTION_REPO)
+        );
+        prepared?;
+        fetched?;
+        let log = std::fs::read_to_string(&git_wrapper.log)?;
+        let mut open = false;
+        let mut steps = 0;
+        for line in log.lines() {
+            if line.starts_with("start") {
+                assert!(!open, "two git calls overlapped:\n{log}");
+                open = true;
+                steps += 1;
+            } else {
+                open = false;
+            }
+        }
+        assert!(steps >= 4, "{log}");
+        Ok(())
+    }))
+    .await
+}
+
+const GH_URL: &str = "https://github.com/o/r/pull/7";
+const TOKEN: &str = "ghp_brokertoken1234";
+
+fn script_dir() -> &'static Path {
+    static DIR: OnceLock<TempDir> = OnceLock::new();
+    DIR.get_or_init(|| {
+        let dir = TempDir::new().unwrap_or_else(|_| std::process::abort());
+        for (name, body) in [
+            (
+                "gh",
+                "#!/bin/sh\nhere=$(pwd)\nprintf '%s\\n' \"$@\" > \"$here/gh.args\"\nenv > \"$here/gh.env\"\ncat \"$here/gh.out\"\ncode=0\n[ -f \"$here/gh.code\" ] && code=$(cat \"$here/gh.code\")\nexit \"$code\"\n",
+            ),
+            (
+                "git",
+                "#!/bin/sh\nlog=\"$HOME/../fake-git.log\"\n{ echo \"ARGS $*\"; echo \"ALLOW=$GIT_ALLOW_PROTOCOL\"; echo \"ASKPASS=$GIT_ASKPASS\"; echo \"ASKHOST=$FLEETD_ASKPASS_HOST\"; } >> \"$log\"\ncase \"$*\" in *\" fetch \"*) [ -f \"$HOME/../fake-git.fail\" ] && exit 1;; esac\nexit 0\n",
+            ),
+        ] {
+            let path = dir.path().join(name);
+            std::fs::write(&path, body).unwrap_or_else(|_| std::process::abort());
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755))
+                .unwrap_or_else(|_| std::process::abort());
+        }
+        dir
+    })
+    .path()
+}
+
+struct GhCase {
+    _dir: TempDir,
+    scratch: PathBuf,
+    gh: GhCli,
+}
+
+impl GhCase {
+    fn new(out: &str, code: &str) -> Result<Self, Box<dyn std::error::Error>> {
+        Self::on_host("github.com", out, code)
+    }
+
+    fn on_host(host: &str, out: &str, code: &str) -> Result<Self, Box<dyn std::error::Error>> {
+        let dir = TempDir::new()?;
+        let scratch = dir.path().join("scratch");
+        std::fs::create_dir_all(&scratch)?;
+        std::fs::write(scratch.join("gh.out"), out)?;
+        std::fs::write(scratch.join("gh.code"), code)?;
+        let gh = GhCli::new(script_dir().join("gh"), host, TOKEN.to_owned(), &scratch);
+        Ok(Self {
+            _dir: dir,
+            scratch,
+            gh,
+        })
+    }
+
+    fn target() -> PushTarget {
+        PushTarget::Own("job1".to_owned())
+    }
+
+    async fn checks(&self, url: &str) -> Result<serde_json::Value, ExecError> {
+        let out = self.gh.pr_checks(&Self::target(), url).await?;
+        serde_json::from_str(&out).map_err(|_| ExecError)
+    }
+}
+
+fn item(bucket: &str, name: &str, link: &str) -> String {
+    serde_json::json!({"bucket": bucket, "name": name, "link": link, "state": "x", "workflow": "w"})
+        .to_string()
+}
+
+#[tokio::test]
+async fn pr_checks_runs_the_exact_gh_argv_with_the_token_only_on_the_child() -> TestResult {
+    common::bounded(Box::pin(async {
+        let case = GhCase::new("[]", "0")?;
+        let parent_token = std::env::var_os("GH_TOKEN");
+        case.checks(GH_URL).await.map_err(|_| "pr_checks failed")?;
+        assert_eq!(std::env::var_os("GH_TOKEN"), parent_token);
+        let args = std::fs::read_to_string(case.scratch.join("gh.args"))?;
+        assert_eq!(
+            args.lines().collect::<Vec<_>>(),
+            ["pr", "checks", GH_URL, "--json", "bucket,link,name"]
+        );
+        assert!(!args.contains(TOKEN));
+        let env = std::fs::read_to_string(case.scratch.join("gh.env"))?;
+        let names: Vec<&str> = env
+            .lines()
+            .filter_map(|l| l.split_once('=').map(|(k, _)| k))
+            .collect();
+        let allowed = [
+            "PATH",
+            "HOME",
+            "XDG_CONFIG_HOME",
+            "GH_CONFIG_DIR",
+            "GH_TOKEN",
+            "GH_HOST",
+            "GH_PROMPT_DISABLED",
+            "GH_NO_UPDATE_NOTIFIER",
+            "NO_COLOR",
+            "PWD",
+            "OLDPWD",
+            "SHLVL",
+            "_",
+        ];
+        for name in &names {
+            assert!(allowed.contains(name), "child inherited {name}");
+        }
+        assert!(env.contains(&format!("GH_TOKEN={TOKEN}")));
+        assert!(env.contains("GH_HOST=github.com"));
+        assert!(!names.contains(&"GH_ENTERPRISE_TOKEN"));
+        assert!(env.contains(&format!("HOME={}", case.scratch.display())));
+        Ok(())
+    }))
+    .await
+}
+
+#[tokio::test]
+async fn pr_checks_off_github_com_adds_the_enterprise_token() -> TestResult {
+    common::bounded(Box::pin(async {
+        let case = GhCase::on_host("ghe.example", "[]", "0")?;
+        case.checks("https://ghe.example/o/r/pull/7")
+            .await
+            .map_err(|_| "pr_checks failed")?;
+        let env = std::fs::read_to_string(case.scratch.join("gh.env"))?;
+        assert!(env.contains(&format!("GH_ENTERPRISE_TOKEN={TOKEN}")));
+        assert!(env.contains("GH_HOST=ghe.example"));
+        Ok(())
+    }))
+    .await
+}
+
+#[tokio::test]
+async fn pr_checks_returns_a_redacted_subset_with_host_validated_links() -> TestResult {
+    common::bounded(Box::pin(async {
+        let good = "https://github.com/o/r/actions/runs/9/job/41";
+        let items = [
+            item("pass", "build", good),
+            item(
+                "weird",
+                "ansi\u{1b}[31m\u{202e}name\nsecond",
+                "http://github.com/x",
+            ),
+            item("fail", "other host", "https://evil.example/x"),
+            item("pending", "userinfo", "https://github.com@evil.example/x"),
+            item("cancel", "spaced", "https://github.com/a b"),
+            item("skipping", &"n".repeat(500), ""),
+        ];
+        let case = GhCase::new(&format!("[{}]", items.join(",")), "0")?;
+        let value = case.checks(GH_URL).await.map_err(|_| "pr_checks failed")?;
+        let checks = value["checks"].as_array().ok_or("checks")?;
+        assert_eq!(checks.len(), 6);
+        assert_eq!(checks[0]["bucket"], "pass");
+        assert_eq!(checks[0]["link"], good);
+        assert_eq!(checks[1]["bucket"], "unknown");
+        assert_eq!(checks[1]["name"], "ansi[31mnamesecond");
+        for hostile in &checks[1..5] {
+            assert!(hostile.get("link").is_none(), "{hostile}");
+        }
+        assert_eq!(
+            checks[5]["name"].as_str().map(|n| n.chars().count()),
+            Some(120)
+        );
+        for check in checks {
+            let mut keys: Vec<_> = check.as_object().ok_or("object")?.keys().cloned().collect();
+            keys.sort();
+            assert!(
+                keys == ["bucket", "link", "name"] || keys == ["bucket", "name"],
+                "{keys:?}"
+            );
+        }
+        assert_eq!(value["truncated"], false);
+        Ok(())
+    }))
+    .await
+}
+
+#[tokio::test]
+async fn pr_checks_caps_the_count_and_the_bytes() -> TestResult {
+    common::bounded(Box::pin(async {
+        let many: Vec<String> = (0..MAX_CHECKS * 2)
+            .map(|i| item("pass", &format!("c{i}"), ""))
+            .collect();
+        let case = GhCase::new(&format!("[{}]", many.join(",")), "0")?;
+        let value = case.checks(GH_URL).await.map_err(|_| "pr_checks failed")?;
+        assert_eq!(value["checks"].as_array().map(Vec::len), Some(MAX_CHECKS));
+        assert_eq!(value["truncated"], true);
+
+        let link = format!("https://github.com/{}", "a".repeat(1900));
+        let heavy: Vec<String> = (0..MAX_CHECKS)
+            .map(|_| item("pass", &"n".repeat(120), &link))
+            .collect();
+        let case = GhCase::new(&format!("[{}]", heavy.join(",")), "0")?;
+        let out = case
+            .gh
+            .pr_checks(&GhCase::target(), GH_URL)
+            .await
+            .map_err(|_| "pr_checks failed")?;
+        assert!(out.len() <= MAX_OUTPUT_BYTES, "{}", out.len());
+        let value: serde_json::Value = serde_json::from_str(&out)?;
+        assert_eq!(value["truncated"], true);
+        assert!(
+            value["checks"]
+                .as_array()
+                .is_some_and(|c| !c.is_empty() && c.len() < MAX_CHECKS)
+        );
+        Ok(())
+    }))
+    .await
+}
+
+#[tokio::test]
+async fn pr_checks_fails_closed_on_bad_gh_output() -> TestResult {
+    common::bounded(Box::pin(async {
+        for out in ["", "not json", "{\"bucket\":\"pass\"}", "[1,2]", "null"] {
+            let case = GhCase::new(out, "0")?;
+            assert!(case.checks(GH_URL).await.is_err(), "{out}");
+        }
+        let huge = format!("[{}]", "0,".repeat(200 * 1024));
+        let case = GhCase::new(&huge, "0")?;
+        assert!(case.checks(GH_URL).await.is_err());
+        let pending = GhCase::new(&format!("[{}]", item("pending", "a", "")), "8")?;
+        assert!(pending.checks(GH_URL).await.is_ok());
+        Ok(())
+    }))
+    .await
+}
+
+#[tokio::test]
+async fn pr_checks_refuses_a_url_that_is_not_a_pull_request_of_the_host_without_running_gh()
+-> TestResult {
+    common::bounded(Box::pin(async {
+        let case = GhCase::new("[]", "0")?;
+        for url in [
+            "https://evil.example/o/r/pull/7",
+            "https://github.com.evil.example/o/r/pull/7",
+            "https://github.com@evil.example/o/r/pull/7",
+            "http://github.com/o/r/pull/7",
+            "https://github.com/o/r/pull/7?x=1",
+            "https://github.com/o/r/pull/7#frag",
+            "https://github.com/o/r/pull/7/files",
+            "https://github.com/o/r/pull/x",
+            "https://github.com/o/r/issues/7",
+            "https://github.com/o/pull/7",
+            "https://github.com/../r/pull/7",
+            "https://github.com/o/r/pull/7 --repo x",
+            "--json=x",
+            "",
+        ] {
+            assert!(case.checks(url).await.is_err(), "{url}");
+        }
+        assert!(!case.scratch.join("gh.args").exists());
+        Ok(())
+    }))
+    .await
+}
+
+#[tokio::test]
+async fn the_real_executors_refuse_push_and_pr_create() -> TestResult {
+    common::bounded(Box::pin(async {
+        let case = GhCase::new("[]", "0")?;
+        assert!(
+            case.gh
+                .pr_create(&GhCase::target(), "t", "b")
+                .await
+                .is_err()
+        );
+        let git = MirrorGit::new(Workspace::new(case.scratch.join("jobs")), &Job::default());
+        assert!(git.push(&GhCase::target()).await.is_err());
+        Ok(())
+    }))
+    .await
+}
+
+fn job_for(repo: &str) -> Job {
+    Job {
+        job_id: "job1".to_owned(),
+        repo: repo.to_owned(),
+        base_ref: "main".to_owned(),
+        ..Job::default()
+    }
+}
+
+fn fake_git_workspace(root: &Path) -> Workspace {
+    Workspace::new(root)
+        .with_policy(RepoPolicy::new(["github.com"]))
+        .with_git(script_dir().join("git"), Duration::from_secs(60))
+        .with_credential("askpass-bin", TOKEN.to_owned())
+}
+
+#[tokio::test]
+async fn a_fake_git_mirror_fetch_runs_pinned_with_https_and_askpass_for_the_job_repo() -> TestResult
+{
+    common::bounded(Box::pin(async {
+        let dir = TempDir::new()?;
+        let root = dir.path().join("jobs");
+        let git = MirrorGit::new(fake_git_workspace(&root), &job_for(PRODUCTION_REPO));
+        assert_eq!(git.fetch().await.map_err(|_| "fetch failed")?, "fetched");
+        let log = std::fs::read_to_string(root.join("fake-git.log"))?;
+        let fetch = log
+            .lines()
+            .position(|l| l.starts_with("ARGS") && l.contains(" fetch "))
+            .ok_or("no fetch")?;
+        let lines: Vec<&str> = log.lines().collect();
+        let args = lines[fetch];
+        assert!(args.contains("core.hooksPath=/dev/null"), "{args}");
+        assert!(args.contains("core.fsmonitor="), "{args}");
+        assert!(args.contains(&format!("-- {PRODUCTION_REPO} ")), "{args}");
+        assert_eq!(lines[fetch + 1], "ALLOW=https");
+        assert_eq!(lines[fetch + 2], "ASKPASS=askpass-bin");
+        assert_eq!(lines[fetch + 3], "ASKHOST=github.com");
+        for init in lines
+            .iter()
+            .filter(|l| l.contains(" init ") || l.contains(" config "))
+        {
+            let at = lines.iter().position(|l| l == init).ok_or("pos")?;
+            assert_eq!(lines[at + 2], "ASKPASS=", "{init}");
+        }
+        assert!(!log.contains(TOKEN));
+        Ok(())
+    }))
+    .await
+}
+
+#[tokio::test]
+async fn a_failing_fake_git_fetch_replies_with_the_fixed_failure() -> TestResult {
+    common::bounded(Box::pin(async {
+        let dir = TempDir::new()?;
+        let root = dir.path().join("jobs");
+        std::fs::create_dir_all(&root)?;
+        std::fs::write(root.join("fake-git.fail"), "")?;
+        let git = MirrorGit::new(fake_git_workspace(&root), &job_for(PRODUCTION_REPO));
+        assert!(git.fetch().await.is_err());
+        let broker = Broker::new(
+            AgentLauncher::Systemd,
+            &job_for(PRODUCTION_REPO),
+            git,
+            GhCase::new("[]", "0")?.gh,
+            Redactor::new([TOKEN]),
+        )?;
+        let reply = broker.handle(Request::Fetch {}).await;
+        assert!(matches!(
+            reply,
+            Response::Denied {
+                error: Denial::Failed,
+                ..
+            }
+        ));
+        Ok(())
+    }))
+    .await
+}
+
+#[derive(Clone)]
+struct Recording {
+    gh: GhCli,
+}
+
+impl GhExecutor for Recording {
+    fn pr_create(
+        &self,
+        _: &PushTarget,
+        _: &str,
+        _: &str,
+    ) -> impl Future<Output = Result<String, ExecError>> + Send {
+        std::future::ready(Ok(GH_URL.to_owned()))
+    }
+
+    async fn pr_checks(&self, target: &PushTarget, pr_url: &str) -> Result<String, ExecError> {
+        self.gh.pr_checks(target, pr_url).await
+    }
+}
+
+#[tokio::test]
+async fn the_broker_serves_checks_of_the_recorded_url_and_redacts_the_reply() -> TestResult {
+    common::bounded(Box::pin(async {
+        let out = format!("[{}]", item("pass", &format!("leak {TOKEN}"), ""));
+        let case = GhCase::new(&out, "0")?;
+        let dir = TempDir::new()?;
+        let broker = Broker::new(
+            AgentLauncher::Systemd,
+            &job_for(PRODUCTION_REPO),
+            MirrorGit::new(
+                fake_git_workspace(&dir.path().join("jobs")),
+                &job_for(PRODUCTION_REPO),
+            ),
+            Recording {
+                gh: case.gh.clone(),
+            },
+            Redactor::new([TOKEN]),
+        )?
+        .with_limits(Limits::default());
+        assert!(matches!(
+            broker
+                .handle_frame(br#"{"op":"pr_checks","url":"https://github.com/x/y/pull/1"}"#)
+                .await,
+            Response::Denied {
+                error: Denial::InvalidRequest,
+                ..
+            }
+        ));
+        assert!(matches!(
+            broker.handle(Request::PrChecks {}).await,
+            Response::Denied {
+                error: Denial::NoPullRequest,
+                ..
+            }
+        ));
+        broker
+            .handle(Request::PrCreate {
+                title: "t".to_owned(),
+                body: "b".to_owned(),
+            })
+            .await;
+        let Response::Done { output } = broker.handle(Request::PrChecks {}).await else {
+            return Err("not done".into());
+        };
+        assert!(!output.contains(TOKEN), "{output}");
+        assert!(output.contains("[REDACTED]"), "{output}");
+        let args = std::fs::read_to_string(case.scratch.join("gh.args"))?;
+        assert!(args.contains(GH_URL));
+        assert!(matches!(
+            broker.handle(Request::PrChecks {}).await,
+            Response::Denied {
+                error: Denial::RateLimited,
+                ..
+            }
+        ));
+        Ok(())
+    }))
+    .await
+}
+
+#[tokio::test]
+async fn a_broker_fetch_refreshes_the_job_repo_mirror_and_ignores_a_repo_in_the_request()
+-> TestResult {
+    common::bounded(Box::pin(async {
+        let dir = TempDir::new()?;
+        let origin = fixture(dir.path())?;
+        let git_wrapper = logged_git(dir.path(), &origin, "0")?;
+        let root = relative_to_cwd(dir.path())?.join("jobs");
+        let ws = production(&root, &git_wrapper);
+        ws.prepare("job1", PRODUCTION_REPO, "main").await?;
+        let seed = dir.path().join("seed");
+        std::fs::write(seed.join("c.txt"), "three")?;
+        git(&seed, &["add", "."])?;
+        git(&seed, &["commit", "--quiet", "-m", "three"])?;
+        git(&seed, &["push", "--quiet", &origin, "main"])?;
+        let broker = Broker::new(
+            AgentLauncher::Systemd,
+            &job_for(PRODUCTION_REPO),
+            MirrorGit::new(ws.clone(), &job_for(PRODUCTION_REPO)),
+            GhCase::new("[]", "0")?.gh,
+            Redactor::default(),
+        )?;
+        assert!(matches!(
+            broker
+                .handle_frame(br#"{"op":"fetch","repo":"https://github.com/evil/x.git"}"#)
+                .await,
+            Response::Denied {
+                error: Denial::InvalidRequest,
+                ..
+            }
+        ));
+        assert!(!std::fs::read_to_string(&git_wrapper.log)?.contains("evil"));
+        assert!(matches!(
+            broker.handle(Request::Fetch {}).await,
+            Response::Done { .. }
+        ));
+        let mirror = single_mirror(&root)?;
+        assert_eq!(
+            git(&mirror, &["rev-parse", "refs/remotes/origin/main"])?,
+            git(&seed, &["rev-parse", "HEAD"])?
+        );
+        assert!(matches!(
+            broker.handle(Request::Fetch {}).await,
+            Response::Denied {
+                error: Denial::RateLimited,
+                ..
+            }
+        ));
+        Ok(())
+    }))
+    .await
 }
