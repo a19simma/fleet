@@ -25,17 +25,21 @@
 //!
 //! A reply must fit one frame. A rendered page that does not is refused with a fixed error.
 //!
-//! This module is built, not wired: no runtime path registers the service yet, and the
-//! production recorder over the runner's feed lands with that wiring.
+//! This module is built, not wired: no runtime path registers the service yet. The production
+//! recorder is [`crate::feed::FeedBook`]; the runner registers each job's feed with it and calls
+//! `forget` on both it and the service when the job ends.
 
 use std::collections::HashMap;
 use std::fmt;
-use std::sync::{Mutex, PoisonError};
+use std::sync::{Arc, Mutex, PoisonError};
 
+use fleet_core::Redactor;
 use serde::{Deserialize, Serialize};
 use tokio::io::BufReader;
 use tokio::net::UnixStream;
+use tokio::time::Instant;
 
+use crate::feed::Feed;
 use crate::fetch::{Dialer, FetchError, Fetcher, Resolver};
 use crate::fetch_policy::{FetchCaps, FetchPolicy};
 use crate::jobsock::{JobContext, MAX_FRAME_BYTES, ServeFuture, Service, read_frame, write_frame};
@@ -53,6 +57,76 @@ pub trait FetchRecorder: Send + Sync {
     ///
     /// Fails when the event feed did not accept the event.
     fn record(&self, job_id: &str, url: &str, phase: FetchPhase) -> Result<(), FetchRecordError>;
+}
+
+type Registered = (Arc<Mutex<Feed>>, Redactor);
+
+/// The production [`FetchRecorder`]: routes each fetch event to the [`crate::feed::Feed`] of its job.
+///
+/// A job is known from [`FeedBook::register`] until [`FeedBook::forget`]. A record for a job that
+/// was never registered or was forgotten fails with [`FetchRecordError::Closed`] and creates no
+/// state, so a late record after `forget` cannot revive a job. A poisoned lock, on the book or on
+/// a feed, fails with [`FetchRecordError::Poisoned`]. Nothing here panics: a failed outcome
+/// record is marked `fetch_outcome` in the summary by `Feed::record_fetch` itself, and the
+/// intent failure refuses the fetch in the service. "Recorded" means the feed accepted the event.
+#[derive(Default)]
+pub struct FeedBook {
+    feeds: Mutex<HashMap<String, Registered>>,
+}
+
+impl fmt::Debug for FeedBook {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("FeedBook").finish_non_exhaustive()
+    }
+}
+
+impl FeedBook {
+    /// Makes `feed` the feed that records the fetch events of `job_id`, replacing an earlier one.
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "the runner registers its feeds in WIRE-3 and WIRE-4"
+        )
+    )]
+    pub(crate) fn register(&self, job_id: &str, feed: Arc<Mutex<Feed>>, redactor: Redactor) {
+        self.feeds
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .insert(job_id.to_owned(), (feed, redactor));
+    }
+
+    /// Drops the state of `job_id`. A second call, or a call for an unknown job, does nothing.
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "the runner forgets finished jobs in WIRE-3 and WIRE-4"
+        )
+    )]
+    pub(crate) fn forget(&self, job_id: &str) {
+        let removed = self
+            .feeds
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .remove(job_id);
+        drop(removed);
+    }
+}
+
+impl FetchRecorder for FeedBook {
+    fn record(&self, job_id: &str, url: &str, phase: FetchPhase) -> Result<(), FetchRecordError> {
+        let (feed, redactor) = self
+            .feeds
+            .lock()
+            .map_err(|_| FetchRecordError::Poisoned)?
+            .get(job_id)
+            .cloned()
+            .ok_or(FetchRecordError::Closed)?;
+        feed.lock()
+            .map_err(|_| FetchRecordError::Poisoned)?
+            .record_fetch(&redactor, url, phase, Instant::now())
+    }
 }
 
 /// One fetch request. The URL is the only key.
@@ -369,54 +443,10 @@ mod tests {
     use tokio_rustls::TlsAcceptor;
 
     use super::*;
-    use crate::feed::Feed;
     use crate::fetch::tls_config_with_roots;
     use crate::fetch_policy::HostPattern;
     use crate::jobsock::{AGENT_SLICE, JobSocket, Limits, Peer, PeerId, ServiceName, Services};
     use crate::telemetry::{Limits as TelemetryLimits, Telemetry, Terminal};
-
-    type Registered = (Arc<Mutex<Feed>>, Redactor);
-
-    #[derive(Default)]
-    struct FeedBook {
-        feeds: Mutex<HashMap<String, Registered>>,
-    }
-
-    impl fmt::Debug for FeedBook {
-        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-            f.debug_struct("FeedBook").finish_non_exhaustive()
-        }
-    }
-
-    impl FeedBook {
-        /// Makes `feed` the feed that records the fetch events of `job_id`.
-        fn register(&self, job_id: &str, feed: Arc<Mutex<Feed>>, redactor: Redactor) {
-            self.feeds
-                .lock()
-                .unwrap_or_else(PoisonError::into_inner)
-                .insert(job_id.to_owned(), (feed, redactor));
-        }
-    }
-
-    impl FetchRecorder for FeedBook {
-        fn record(
-            &self,
-            job_id: &str,
-            url: &str,
-            phase: FetchPhase,
-        ) -> Result<(), FetchRecordError> {
-            let found = self
-                .feeds
-                .lock()
-                .unwrap_or_else(PoisonError::into_inner)
-                .get(job_id)
-                .cloned();
-            let (feed, redactor) = found.ok_or(FetchRecordError::Closed)?;
-            feed.lock()
-                .unwrap_or_else(PoisonError::into_inner)
-                .record_fetch(&redactor, url, phase, Instant::now())
-        }
-    }
 
     type Log = Arc<Mutex<Vec<String>>>;
     type TestResult = Result<(), Box<dyn std::error::Error>>;
@@ -1218,6 +1248,201 @@ mod tests {
         assert_eq!(
             run(&svc, "j", GOOD).await,
             Err("fetch connect failed".to_owned())
+        );
+    }
+
+    const URL: &str = "https://docs.example.org/a?q=1";
+    const SECRET: &str = "pa\"ss-word-xyz";
+
+    fn redactor() -> Redactor {
+        Redactor::new([SECRET])
+    }
+
+    fn booked(job: &str) -> (Arc<FeedBook>, Arc<Mutex<Feed>>) {
+        let feed = Arc::new(Mutex::new(Feed::new(Instant::now())));
+        let book = Arc::new(FeedBook::default());
+        book.register(job, Arc::clone(&feed), redactor());
+        (book, feed)
+    }
+
+    fn poison<T: Send + 'static>(lock: &Arc<Mutex<T>>) {
+        let lock = Arc::clone(lock);
+        let _ = std::thread::spawn(move || {
+            let _held = lock.lock().unwrap();
+            std::panic::resume_unwind(Box::new("poison"));
+        })
+        .join();
+    }
+
+    #[test]
+    fn the_book_delivers_an_intent_then_an_outcome_to_the_feed_in_order() {
+        let (book, feed) = booked("j1");
+        book.record("j1", URL, FetchPhase::Intent).unwrap();
+        book.record(
+            "j1",
+            URL,
+            FetchPhase::Succeeded {
+                status: 200,
+                bytes: 9,
+            },
+        )
+        .unwrap();
+        let batch = feed.lock().unwrap().batch();
+        assert_eq!(batch.len(), 2);
+        assert!(
+            batch
+                .iter()
+                .all(|e| e.kind == i32::from(fleet_proto::v1::JobEventKind::Fetch))
+        );
+        assert!(batch[0].seq < batch[1].seq);
+        assert_eq!(batch[0].exit_code, None);
+        assert_eq!(batch[1].exit_code, Some(200));
+        assert_eq!(batch[1].out_bytes, Some(9));
+    }
+
+    #[test]
+    fn an_unknown_job_is_an_error_and_creates_no_state() {
+        let book = FeedBook::default();
+        assert_eq!(
+            book.record("ghost", URL, FetchPhase::Intent),
+            Err(FetchRecordError::Closed)
+        );
+        assert!(book.feeds.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn a_record_after_forget_fails_and_does_not_recreate_the_job() {
+        let (book, feed) = booked("j1");
+        book.forget("j1");
+        assert_eq!(
+            book.record("j1", URL, FetchPhase::Intent),
+            Err(FetchRecordError::Closed)
+        );
+        assert!(book.feeds.lock().unwrap().is_empty());
+        assert!(feed.lock().unwrap().backlog_empty());
+    }
+
+    #[test]
+    fn forget_is_idempotent_and_accepts_an_unknown_job() {
+        let (book, _feed) = booked("j1");
+        book.forget("j1");
+        book.forget("j1");
+        book.forget("never");
+        assert!(book.feeds.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn forget_leaves_other_jobs_recording() {
+        let (book, _feed) = booked("j1");
+        let other = Arc::new(Mutex::new(Feed::new(Instant::now())));
+        book.register("j2", Arc::clone(&other), redactor());
+        book.forget("j1");
+        book.record("j2", URL, FetchPhase::Intent).unwrap();
+        assert!(!other.lock().unwrap().backlog_empty());
+    }
+
+    #[test]
+    fn a_poisoned_feed_lock_is_an_error_not_a_panic() {
+        let (book, feed) = booked("j1");
+        poison(&feed);
+        assert_eq!(
+            book.record("j1", URL, FetchPhase::Intent),
+            Err(FetchRecordError::Poisoned)
+        );
+    }
+
+    #[test]
+    fn a_poisoned_book_lock_is_an_error_and_forget_still_works() {
+        let (book, _feed) = booked("j1");
+        let shared = Arc::new(book);
+        let inner = Arc::clone(&shared);
+        let _ = std::thread::spawn(move || {
+            let _held = inner.feeds.lock().unwrap();
+            std::panic::resume_unwind(Box::new("poison"));
+        })
+        .join();
+        assert_eq!(
+            shared.record("j1", URL, FetchPhase::Intent),
+            Err(FetchRecordError::Poisoned)
+        );
+        shared.forget("j1");
+        shared.register(
+            "j1",
+            Arc::new(Mutex::new(Feed::new(Instant::now()))),
+            redactor(),
+        );
+    }
+
+    #[test]
+    fn a_finished_job_is_closed_and_a_lost_outcome_is_marked_missing() {
+        let (book, feed) = booked("j1");
+        book.record("j1", URL, FetchPhase::Intent).unwrap();
+        let _ = feed.lock().unwrap().finish(Terminal::Failed);
+        assert_eq!(
+            book.record("j1", URL, FetchPhase::Failed { status: None }),
+            Err(FetchRecordError::Closed)
+        );
+        let summary = feed.lock().unwrap().finish(Terminal::Failed);
+        assert!(summary.missing.iter().any(|m| m == "fetch_outcome"));
+    }
+
+    #[test]
+    fn an_overlong_url_through_the_book_is_refused_not_cut() {
+        let (book, feed) = booked("j1");
+        let long = format!(
+            "https://docs.example.org/{}",
+            "a".repeat(crate::telemetry::MAX_FETCH_URL_BYTES)
+        );
+        assert_eq!(
+            book.record("j1", &long, FetchPhase::Intent),
+            Err(FetchRecordError::UrlTooLong)
+        );
+        assert!(feed.lock().unwrap().backlog_empty());
+    }
+
+    #[test]
+    fn a_secret_in_the_url_is_redacted_through_the_book() {
+        let (book, feed) = booked("j1");
+        let url = format!("https://docs.example.org/?k={SECRET}");
+        book.record("j1", &url, FetchPhase::Intent).unwrap();
+        let batch = feed.lock().unwrap().batch();
+        let cmd = batch[0].cmd.clone().unwrap_or_default();
+        assert!(!cmd.contains(SECRET));
+    }
+
+    #[test]
+    fn concurrent_record_and_forget_never_panic_and_only_ok_or_closed() {
+        let (book, _feed) = booked("j1");
+        let recorders: Vec<_> = (0..4)
+            .map(|_| {
+                let book = Arc::clone(&book);
+                std::thread::spawn(move || {
+                    (0..200)
+                        .map(|_| book.record("j1", URL, FetchPhase::Intent))
+                        .collect::<Vec<_>>()
+                })
+            })
+            .collect();
+        let forgetter = {
+            let book = Arc::clone(&book);
+            std::thread::spawn(move || {
+                for _ in 0..50 {
+                    book.forget("j1");
+                }
+            })
+        };
+        forgetter.join().unwrap();
+        for handle in recorders {
+            for result in handle.join().unwrap() {
+                assert!(matches!(
+                    result,
+                    Ok(()) | Err(FetchRecordError::Closed | FetchRecordError::Truncated)
+                ));
+            }
+        }
+        assert_eq!(
+            book.record("j1", URL, FetchPhase::Intent),
+            Err(FetchRecordError::Closed)
         );
     }
 }

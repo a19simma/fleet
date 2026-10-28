@@ -1120,6 +1120,35 @@ fn unit_directives(name: &str) -> Vec<String> {
 }
 
 #[test]
+fn agent_unit_runs_in_a_private_network_namespace() {
+    let lines = unit_directives("fleet-agent@.service");
+    assert!(lines.iter().any(|l| l == "PrivateNetwork=yes"));
+    assert!(!lines.iter().any(|l| l == "PrivateNetwork=no"));
+    let drop_in = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../deploy/fleet-agent@.service.d/allow-network.conf.example");
+    assert!(!drop_in.exists());
+}
+
+#[test]
+fn managed_settings_use_only_command_hooks() {
+    let text = unit_directives("managed-settings.json").join("\n");
+    assert!(!text.contains("\"type\": \"http\""));
+    assert!(!text.contains("7071"));
+    for event in [
+        "SessionStart",
+        "UserPromptSubmit",
+        "Stop",
+        "SessionEnd",
+        "Notification",
+        "PostToolUse",
+        "PostToolUseFailure",
+    ] {
+        let want = format!("\"command\": \"fleetd hook {event}\", \"timeout\": 5");
+        assert!(text.contains(&want), "{event}");
+    }
+}
+
+#[test]
 fn agent_unit_exposes_only_own_run_dir_and_hook_dir() {
     let lines = unit_directives("fleet-agent@.service");
     let has = |l: &str| lines.iter().any(|x| x == l);

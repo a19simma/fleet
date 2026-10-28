@@ -51,7 +51,7 @@
 
 ## Named pipes and modes
 
-- **No `mknodat` on macOS, no `unsafe` allowed.** `jobenv::create_stdout_fifo` runs the `mkfifo` program. A nonblocking FIFO reader reads 0 until a writer opens, then `WouldBlock`, so a test opens the writer before it asserts idle.
+- **No `mknodat` on macOS, no `unsafe` allowed.** `jobenv::create_stdout_fifo` runs the `mkfifo` program. A nonblocking FIFO reader reads 0 until a writer opens, then `WouldBlock`, so a test opens the writer before it asserts idle. A read after the writer opened can still return `WouldBlock` under load: `the_fifo_is_0660_carries_the_group_and_streams_to_a_reader` failed with Os code 35 in two full verifies (PF-2, P3-2) and passed in 5 and 6 isolated reruns. Retry on `WouldBlock` with a bounded wait in the test helper.
 - **Mode asserts need the umask in mind.** `create_dir_all` and git leave 0755 dirs, so assert group-write and setgid bits (`& 0o2020`), not group-read.
 
 ## Systemd launcher test

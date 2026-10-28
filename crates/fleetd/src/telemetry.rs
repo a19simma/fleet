@@ -100,6 +100,8 @@ pub enum FetchRecordError {
     OverBudget,
     /// The URL is longer than [`MAX_FETCH_URL_BYTES`].
     UrlTooLong,
+    /// A lock of the feed was poisoned by a panic, so the event was not recorded.
+    Poisoned,
 }
 
 impl std::fmt::Display for FetchRecordError {
@@ -109,6 +111,7 @@ impl std::fmt::Display for FetchRecordError {
             Self::Truncated => "telemetry events truncated",
             Self::OverBudget => "telemetry byte budget spent",
             Self::UrlTooLong => "url too long to record",
+            Self::Poisoned => "telemetry feed lock poisoned",
         })
     }
 }

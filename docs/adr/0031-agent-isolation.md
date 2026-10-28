@@ -30,7 +30,7 @@ Isolate the agent in phases with systemd and a second uid. Each phase ships alon
 - **Launcher.** `fleetd agent-exec` runs inside the unit. It listens on an ephemeral `127.0.0.1:PORT` in the private namespace and forwards each connection to the `egress proxy` service on the Job socket `<run_dir>/<id>/job.sock`, then runs `claude` as its child and exits with the child's code. The forwarder is a thread of `agent-exec`, so it lives as long as `claude` and dies with the unit. It dials only that path, taken from its own arguments, never from the agent environment. It serves at most 4 connections and closes one after 120 s without bytes. `agent-exec` sets the proxy variables after it reads the unit environment, and removes `NO_PROXY` and `ALL_PROXY`. Built, not wired: the runner does not yet register the proxy on the Job socket. `HTTPS_PROXY` and `NODE_USE_ENV_PROXY=1` point at that port. `runner.rs` passes `HTTPS_PROXY`, `HTTP_PROXY` and `NODE_USE_ENV_PROXY` through `AGENT_ENV`, and `agent-exec` overrides them in the unit.
 - **Proxy.** Inside fleetd, `CONNECT` only, with a hostname allowlist: `api.anthropic.com`. The allowlist `egress_allow` is Box config and no Profile or bundle can add hosts (amended by ADR-0038). The proxy resolves names itself and refuses loopback, RFC1918, link-local and tailnet address ranges.
 - **Accepted risk.** Domain fronting through an allowed host.
-- **Hooks.** The hook port `127.0.0.1:7071` is unreachable from the namespace. `deploy/managed-settings.json` sets `PostToolUse` and `PostToolUseFailure` and `SessionStart` to `command` hooks already. `UserPromptSubmit`, `Stop`, `SessionEnd` and `Notification` are `http` hooks to `127.0.0.1:7071`. P2 switches those four to `command` hooks (`fleetd hook X`) that reach fleetd over a bind-mounted unix socket.
+- **Hooks.** The hook port `127.0.0.1:7071` is unreachable from the namespace. `deploy/managed-settings.json` sets `PostToolUse` and `PostToolUseFailure` and `SessionStart` to `command` hooks already. `UserPromptSubmit`, `Stop`, `SessionEnd` and `Notification` are `command` hooks too (`fleetd hook X`), which reach fleetd over the bind-mounted unix socket.
 
 ### P3: workspace and limits
 
@@ -101,7 +101,7 @@ Three design corrections came out of the run and are binding constraints in P1: 
 
 - The startup sweep runs only after the daemon holds its sockets, so a second instance cannot sweep a running one. It removes stale run dirs and resets their failed units only. The job worktree and `.agent/<id>` of a crashed job stay, because `Workspace::remove` needs the repo, which a crash no longer records.
 - On a `systemctl show` error the launcher runs `reset-failed` but not `kill`, so a still-running unit could outlive its removed run dir.
-- Egress and the credential proxy (P2) are not built. Until then the template has no route to the model API, and a box needs the `PrivateNetwork=no` drop-in (`deploy/fleet-agent@.service.d/allow-network.conf.example`) to run a real agent.
+- The unit side of P2 is built: the template sets `PrivateNetwork=yes`, the `PrivateNetwork=no` drop-in is removed, and all hooks are `command` hooks. The runner does not yet register the egress proxy on the Job socket, so a real agent has no route to the model API until it does.
 - A Firecracker microVM per job stays the escalation path if third-party repos or public prompt sources are ever run.
 
 ## Consequences
