@@ -905,3 +905,33 @@ async fn startup_sweeps_only_for_the_systemd_launcher() -> TestResult {
     assert!(!case.dir().exists());
     Ok(())
 }
+
+fn unit_directives(name: &str) -> Vec<String> {
+    let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../deploy")
+        .join(name);
+    fs::read_to_string(path)
+        .unwrap_or_default()
+        .lines()
+        .map(str::to_owned)
+        .collect()
+}
+
+#[test]
+fn agent_unit_exposes_only_own_run_dir_and_hook_dir() {
+    let lines = unit_directives("fleet-agent@.service");
+    let has = |l: &str| lines.iter().any(|x| x == l);
+    assert!(has("TemporaryFileSystem=/run/fleet:ro"));
+    assert!(has("BindPaths=/run/fleet/%i"));
+    assert!(has("BindReadOnlyPaths=/run/fleet/hook"));
+    let binds = lines
+        .iter()
+        .filter(|l| l.starts_with("BindPaths=") || l.starts_with("BindReadOnlyPaths="))
+        .count();
+    assert_eq!(binds, 2);
+    assert!(
+        !lines
+            .iter()
+            .any(|l| l.contains("/run/fleet ") || l == "ReadWritePaths=/run/fleet")
+    );
+}
