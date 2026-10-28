@@ -1954,3 +1954,148 @@ async fn without_a_hook_the_summary_keeps_exit_codes_missing() -> TestResult {
     }))
     .await
 }
+
+mod agent_exec_forwarder {
+    use std::io::Write;
+    use std::os::unix::fs::PermissionsExt;
+    use std::path::Path;
+    use std::process::{Command, Stdio};
+    use std::sync::Arc;
+    use std::time::{Duration, Instant};
+
+    use fleetd::agent_exec::write_spec;
+    use fleetd::jobsock::{
+        AGENT_SLICE, JobContext, JobSocket, Limits, Peer, PeerId, ServeFuture, Service,
+        ServiceName, Services,
+    };
+    use fleetd::runner::AgentSpec;
+    use tempfile::TempDir;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::{TcpStream, UnixStream};
+    use tokio::time::timeout;
+
+    use super::{TestResult, common};
+
+    const WIDE: Duration = Duration::from_secs(20);
+
+    struct AgentPeer;
+
+    impl Peer for AgentPeer {
+        fn identity(&self, _: &UnixStream) -> std::io::Result<PeerId> {
+            Ok(PeerId {
+                pid: 1,
+                cgroup: format!("0::/{AGENT_SLICE}/fleet-agent@fw_job.service\n"),
+            })
+        }
+    }
+
+    struct Echo;
+
+    impl Service for Echo {
+        fn serve(&self, _: JobContext, mut stream: UnixStream) -> ServeFuture<'_> {
+            Box::pin(async move {
+                let mut buf = [0_u8; 256];
+                while let Ok(n @ 1..) = stream.read(&mut buf).await {
+                    if stream
+                        .write_all(buf.get(..n).unwrap_or_default())
+                        .await
+                        .is_err()
+                    {
+                        return;
+                    }
+                }
+            })
+        }
+    }
+
+    fn read_when_ready(path: &Path) -> TestResult2<String> {
+        let end = Instant::now() + WIDE;
+        loop {
+            if let Ok(text) = std::fs::read_to_string(path)
+                && text.ends_with('\n')
+            {
+                return Ok(text);
+            }
+            if Instant::now() >= end {
+                return Err("the agent wrote nothing in time".into());
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+
+    type TestResult2<T> = Result<T, Box<dyn std::error::Error>>;
+
+    #[tokio::test]
+    async fn the_agent_gets_the_forwarder_env_and_the_exit_code_while_a_connection_is_open()
+    -> TestResult {
+        common::bounded(Box::pin(async {
+            let run = TempDir::new()?;
+            let cwd = TempDir::new()?;
+            let job_dir = run.path().join("fw_job");
+            std::fs::create_dir(&job_dir)?;
+            std::fs::set_permissions(&job_dir, std::fs::Permissions::from_mode(0o750))?;
+            let mut services = Services::new();
+            services.insert(ServiceName::EgressProxy, Arc::new(Echo));
+            let socket = JobSocket::bind(
+                &job_dir.join("job.sock"),
+                "fw_job",
+                services,
+                Arc::new(AgentPeer),
+                Limits::default(),
+            )?;
+            let out = cwd.path().join("env.txt");
+            let script = format!(
+                "echo \"$HTTPS_PROXY $https_proxy $HTTP_PROXY $NODE_USE_ENV_PROXY [$NO_PROXY] [$ALL_PROXY]\" > '{}'; read line; exit 7",
+                out.display()
+            );
+            let spec = AgentSpec {
+                argv: ["/bin/sh", "-c", script.as_str()].map(Into::into).to_vec(),
+                cwd: cwd.path().to_path_buf(),
+                ..AgentSpec::default()
+            };
+            write_spec(&job_dir.join("spec.json"), "fw_job", &spec, None)?;
+            let mut child = Command::new(env!("CARGO_BIN_EXE_fleetd"))
+                .args(["agent-exec", "fw_job", "--run-dir"])
+                .arg(run.path())
+                .env("HTTPS_PROXY", "http://attacker.invalid:1")
+                .env("NO_PROXY", "*")
+                .env("ALL_PROXY", "socks5://attacker.invalid:2")
+                .env("NODE_USE_ENV_PROXY", "0")
+                .stdin(Stdio::piped())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()?;
+            let text = read_when_ready(&out)?;
+            let url = text.split(' ').next().ok_or("no proxy url")?.to_owned();
+            let port: u16 = url
+                .strip_prefix("http://127.0.0.1:")
+                .ok_or("proxy is not the loopback forwarder")?
+                .parse()?;
+            assert_eq!(text, format!("{url} {url} {url} 1 [] []\n"));
+            let mut client = TcpStream::connect(("127.0.0.1", port)).await?;
+            client.write_all(b"ping").await?;
+            let mut back = [0_u8; 4];
+            timeout(WIDE, client.read_exact(&mut back)).await??;
+            assert_eq!(&back, b"ping");
+            child.stdin.take().ok_or("no stdin")?.flush()?;
+            let end = Instant::now() + WIDE;
+            let status = loop {
+                if let Some(status) = child.try_wait()? {
+                    break status;
+                }
+                if Instant::now() >= end {
+                    child.kill()?;
+                    return Err("agent-exec outlived the agent".into());
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            };
+            assert_eq!(status.code(), Some(7));
+            let mut rest = Vec::new();
+            timeout(WIDE, client.read_to_end(&mut rest)).await??;
+            assert_eq!(rest, Vec::<u8>::new());
+            drop(socket);
+            Ok(())
+        }))
+        .await
+    }
+}

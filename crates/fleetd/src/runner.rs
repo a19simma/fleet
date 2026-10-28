@@ -102,7 +102,7 @@ pub const STRIPPED_ENV: [&str; 9] = [
     "FLEET_CLIENT_TOKEN",
 ];
 
-const AGENT_ENV: [&str; 12] = [
+const AGENT_ENV: [&str; 13] = [
     "PATH",
     "LANG",
     "TERM",
@@ -113,6 +113,7 @@ const AGENT_ENV: [&str; 12] = [
     "http_proxy",
     "https_proxy",
     "no_proxy",
+    "NODE_USE_ENV_PROXY",
     "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC",
     "DISABLE_TELEMETRY",
 ];
@@ -2424,6 +2425,7 @@ mod tests {
             .chain([
                 (OsString::from("PATH"), OsString::from("/bin")),
                 (OsString::from("HTTPS_PROXY"), OsString::from("http://p:1")),
+                (OsString::from("NODE_USE_ENV_PROXY"), OsString::from("1")),
                 (OsString::from("HOME"), OsString::from("/real/operator")),
             ])
             .collect();
@@ -2463,6 +2465,10 @@ mod tests {
         assert_eq!(
             spec.env.get(&OsString::from("HTTPS_PROXY")),
             Some(&OsString::from("http://p:1"))
+        );
+        assert_eq!(
+            spec.env.get(&OsString::from("NODE_USE_ENV_PROXY")),
+            Some(&OsString::from("1"))
         );
         assert_eq!(spec.cwd, Path::new("/work"));
         assert_eq!(spec.argv.first(), Some(&OsString::from("claude-fake")));
