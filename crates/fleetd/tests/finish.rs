@@ -2472,14 +2472,14 @@ fn brokered(
         Arc::clone(runner),
         spec.clone(),
         rig.worktree.clone(),
-        MirrorGit::new(workspace, spec),
+        MirrorGit::new(workspace.clone(), spec),
     );
     let checks = GhCli::new(
         gh(),
         "example.invalid",
         "not-a-real-gh-value".to_owned(),
-        rig.dir.path().join("ghscratch"),
-    );
+        workspace.create_broker_scratch(&spec.job_id)?,
+    )?;
     let gh = PublishGh::new(
         Arc::clone(runner),
         spec.clone(),

@@ -26,15 +26,18 @@
 //! `push` and `pr_create` are real in `crate::publish`: `PublishGit` and `PublishGh` run the
 //! finish step's publish path for the Job's bound target and share its state, so the finish step
 //! skips a head already pushed and reuses the pull request. A broker failure changes nothing the
-//! finish step needs. [`MirrorGit`] and [`GhCli`] refuse those two ops themselves. Built, not
-//! wired: no runtime path builds a [`Broker`] yet.
+//! finish step needs. [`MirrorGit`] and [`GhCli`] refuse those two ops themselves.
+//!
+//! `DaemonRunner` builds one [`Broker`] per claimed Job under the systemd launcher and registers
+//! it in the `PerJob` registry before launch; the direct launcher registers none. The
+//! [`Service`] impl reads one frame at a time and replies with the [`Response`]; an oversized or
+//! unterminated frame gets an invalid-request reply and the connection closes.
 //!
 //! The direct launcher gets no broker: [`Broker::new`] refuses it, as the job socket does
 //! (ADR-0036), because the agent there shares fleetd's uid.
 //!
 //! The decision logic is pure.
 
-use std::ffi::OsString;
 use std::fmt;
 use std::future::Future;
 use std::path::PathBuf;
@@ -46,14 +49,15 @@ use fleet_core::Redactor;
 use fleet_proto::v1::Job;
 use fleet_proto::{is_ci_url, is_swarm_branch};
 use serde::{Deserialize, Serialize};
-use tokio::io::AsyncReadExt;
+use tokio::io::{AsyncReadExt, BufReader};
+use tokio::net::UnixStream;
 use tokio::process::Command;
 use tokio::time::Instant;
 
 use crate::AgentLauncher;
 use crate::group::GroupGuard;
-use crate::jobsock::MAX_FRAME_BYTES;
-use crate::workspace::Workspace;
+use crate::jobsock::{JobContext, MAX_FRAME_BYTES, ServeFuture, Service, read_frame, write_frame};
+use crate::workspace::{Workspace, scratch_is_private};
 
 /// Most `push` calls one Job may attempt.
 pub const MAX_PUSHES_PER_JOB: u32 = 10;
@@ -91,6 +95,9 @@ pub const PR_CREATE_TIMEOUT: Duration = Duration::from_secs(60);
 pub const PR_CHECKS_TIMEOUT: Duration = Duration::from_secs(30);
 /// Timeout of `fetch`.
 pub const FETCH_TIMEOUT: Duration = Duration::from_secs(120);
+
+/// The `PATH` of every `gh` child: fixed, never copied from fleetd.
+pub const GH_PATH: &str = "/usr/local/bin:/usr/bin:/bin";
 
 /// An operation the agent may request. No variant has a field for a branch, repo, URL or id.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
@@ -190,6 +197,8 @@ pub enum BrokerError {
     DirectLauncher,
     /// The claimed Job names no valid push target.
     Target,
+    /// The `gh` binary path is not absolute.
+    RelativeGhBin,
 }
 
 impl fmt::Display for BrokerError {
@@ -197,6 +206,7 @@ impl fmt::Display for BrokerError {
         f.write_str(match self {
             Self::DirectLauncher => "broker refused: agent_launcher is direct",
             Self::Target => "broker refused: the job names no valid push target",
+            Self::RelativeGhBin => "broker refused: the gh binary path is not absolute",
         })
     }
 }
@@ -427,6 +437,31 @@ impl<G: GitExecutor, H: GhExecutor> Broker<G, H> {
         &self.target
     }
 
+    async fn serve_stream(&self, stream: UnixStream) {
+        let (read, mut write) = stream.into_split();
+        let mut reader = BufReader::new(read);
+        loop {
+            let frame = match read_frame(&mut reader).await {
+                Ok(frame) => frame,
+                Err(err) if err.kind() == std::io::ErrorKind::InvalidData => {
+                    let reply = Response::denied(Denial::InvalidRequest);
+                    if let Ok(bytes) = serde_json::to_vec(&reply) {
+                        let _ = write_frame(&mut write, &bytes).await;
+                    }
+                    return;
+                }
+                Err(_) => return,
+            };
+            let reply = self.handle_frame(&frame).await;
+            let Ok(bytes) = serde_json::to_vec(&reply) else {
+                return;
+            };
+            if write_frame(&mut write, &bytes).await.is_err() {
+                return;
+            }
+        }
+    }
+
     /// Parses one frame and serves it.
     pub async fn handle_frame(&self, frame: &[u8]) -> Response {
         match Request::parse(frame) {
@@ -544,6 +579,12 @@ impl<G: GitExecutor, H: GhExecutor> Broker<G, H> {
     }
 }
 
+impl<G: GitExecutor + 'static, H: GhExecutor + 'static> Service for Broker<G, H> {
+    fn serve(&self, _ctx: JobContext, stream: UnixStream) -> ServeFuture<'_> {
+        Box::pin(self.serve_stream(stream))
+    }
+}
+
 impl<G, H> fmt::Debug for Broker<G, H> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("Broker")
@@ -596,7 +637,7 @@ impl GitExecutor for MirrorGit {
 /// Runs `gh pr checks` for the broker. Its `pr_create` always refuses: the real one is
 /// `PublishGh` in `crate::publish`, which wraps this executor for `pr_checks`.
 ///
-/// The child gets an empty environment plus `PATH`, a scratch `HOME`, `XDG_CONFIG_HOME` and
+/// The child gets an empty environment plus the fixed [`GH_PATH`], a scratch `HOME`, `XDG_CONFIG_HOME` and
 /// `GH_CONFIG_DIR`, `GH_TOKEN`, `GH_HOST` and, off `github.com`, `GH_ENTERPRISE_TOKEN`. The
 /// token never reaches argv or fleetd's own environment. The agent shares fleetd's uid under
 /// some launchers, so this hides the token from other uids only (ADR-0024 Known limit).
@@ -606,7 +647,6 @@ pub struct GhCli {
     host: String,
     token: String,
     scratch: PathBuf,
-    path_env: Option<OsString>,
 }
 
 impl fmt::Debug for GhCli {
@@ -642,30 +682,34 @@ struct Checks {
 impl GhCli {
     /// A `gh` executor for the pull requests of `host`, with `token` as that host's credential
     /// and `scratch` as the child's home and working directory.
-    #[must_use]
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BrokerError::RelativeGhBin`] when `bin` is not an absolute path.
     pub fn new(
         bin: impl Into<PathBuf>,
         host: impl Into<String>,
         token: String,
         scratch: impl Into<PathBuf>,
-    ) -> Self {
-        Self {
-            bin: bin.into(),
+    ) -> Result<Self, BrokerError> {
+        let bin = bin.into();
+        if !bin.is_absolute() {
+            return Err(BrokerError::RelativeGhBin);
+        }
+        Ok(Self {
+            bin,
             host: host.into(),
             token,
             scratch: scratch.into(),
-            path_env: std::env::var_os("PATH"),
-        }
+        })
     }
 
     fn command(&self, pr_url: &str) -> Command {
         let home = &self.scratch;
         let mut command = Command::new(&self.bin);
         command.env_clear();
-        if let Some(path) = &self.path_env {
-            command.env("PATH", path);
-        }
         command
+            .env("PATH", GH_PATH)
             .env("HOME", home)
             .env("XDG_CONFIG_HOME", home.join(".config"))
             .env("GH_CONFIG_DIR", home.join("gh"))
@@ -689,9 +733,9 @@ impl GhCli {
     }
 
     async fn run(&self, pr_url: &str) -> Result<Vec<u8>, ExecError> {
-        tokio::fs::create_dir_all(&self.scratch)
-            .await
-            .map_err(|_| ExecError)?;
+        if !scratch_is_private(&self.scratch) {
+            return Err(ExecError);
+        }
         let mut child = self.command(pr_url).spawn().map_err(|_| ExecError)?;
         let _guard = GroupGuard::new(child.id());
         let mut stdout = child.stdout.take().ok_or(ExecError)?;

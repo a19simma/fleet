@@ -11,8 +11,8 @@ use fleet_core::Redactor;
 use fleet_proto::v1::Job;
 use fleetd::AgentLauncher;
 use fleetd::broker::{
-    Broker, Denial, ExecError, GhCli, GhExecutor, GitExecutor, Limits, MAX_CHECKS,
-    MAX_OUTPUT_BYTES, MirrorGit, PushTarget, Request, Response,
+    Broker, BrokerError, Denial, ExecError, GH_PATH, GhCli, GhExecutor, GitExecutor, Limits,
+    MAX_CHECKS, MAX_OUTPUT_BYTES, MirrorGit, PushTarget, Request, Response,
 };
 use fleetd::workspace::{RepoPolicy, Workspace, WorkspaceError};
 use tempfile::TempDir;
@@ -1319,11 +1319,10 @@ impl GhCase {
 
     fn on_host(host: &str, out: &str, code: &str) -> Result<Self, Box<dyn std::error::Error>> {
         let dir = TempDir::new()?;
-        let scratch = dir.path().join("scratch");
-        std::fs::create_dir_all(&scratch)?;
+        let scratch = Workspace::new(dir.path().join("jobs")).create_broker_scratch("job1")?;
         std::fs::write(scratch.join("gh.out"), out)?;
         std::fs::write(scratch.join("gh.code"), code)?;
-        let gh = GhCli::new(script_dir().join("gh"), host, TOKEN.to_owned(), &scratch);
+        let gh = GhCli::new(script_dir().join("gh"), host, TOKEN.to_owned(), &scratch)?;
         Ok(Self {
             _dir: dir,
             scratch,
@@ -1401,6 +1400,153 @@ async fn pr_checks_off_github_com_adds_the_enterprise_token() -> TestResult {
         let env = std::fs::read_to_string(case.scratch.join("gh.env"))?;
         assert!(env.contains(&format!("GH_ENTERPRISE_TOKEN={TOKEN}")));
         assert!(env.contains("GH_HOST=ghe.example"));
+        Ok(())
+    }))
+    .await
+}
+
+const SHELL_VARS: [&str; 4] = ["PWD", "OLDPWD", "SHLVL", "_"];
+
+fn env_of_child(
+    case: &GhCase,
+) -> Result<std::collections::BTreeMap<String, String>, std::io::Error> {
+    Ok(std::fs::read_to_string(case.scratch.join("gh.env"))?
+        .lines()
+        .filter_map(|line| line.split_once('='))
+        .filter(|(name, _)| !SHELL_VARS.contains(name))
+        .map(|(name, value)| (name.to_owned(), value.to_owned()))
+        .collect())
+}
+
+#[tokio::test]
+async fn the_gh_child_env_is_exactly_the_fixed_set() -> TestResult {
+    common::bounded(Box::pin(async {
+        let case = GhCase::new("[]", "0")?;
+        case.checks(GH_URL).await.map_err(|_| "pr_checks failed")?;
+        let env = env_of_child(&case)?;
+        let home = case.scratch.display().to_string();
+        let expected: std::collections::BTreeMap<String, String> = [
+            ("GH_CONFIG_DIR", format!("{home}/gh")),
+            ("GH_HOST", "github.com".to_owned()),
+            ("GH_NO_UPDATE_NOTIFIER", "1".to_owned()),
+            ("GH_PROMPT_DISABLED", "1".to_owned()),
+            ("GH_TOKEN", TOKEN.to_owned()),
+            ("HOME", home.clone()),
+            ("NO_COLOR", "1".to_owned()),
+            ("PATH", GH_PATH.to_owned()),
+            ("XDG_CONFIG_HOME", format!("{home}/.config")),
+        ]
+        .into_iter()
+        .map(|(name, value)| (name.to_owned(), value))
+        .collect();
+        assert_eq!(env, expected);
+        Ok(())
+    }))
+    .await
+}
+
+#[tokio::test]
+async fn the_gh_child_env_off_github_com_adds_only_the_enterprise_token() -> TestResult {
+    common::bounded(Box::pin(async {
+        let case = GhCase::on_host("ghe.example", "[]", "0")?;
+        case.checks("https://ghe.example/o/r/pull/7")
+            .await
+            .map_err(|_| "pr_checks failed")?;
+        let env = env_of_child(&case)?;
+        let names: Vec<&str> = env.keys().map(String::as_str).collect();
+        assert_eq!(
+            names,
+            [
+                "GH_CONFIG_DIR",
+                "GH_ENTERPRISE_TOKEN",
+                "GH_HOST",
+                "GH_NO_UPDATE_NOTIFIER",
+                "GH_PROMPT_DISABLED",
+                "GH_TOKEN",
+                "HOME",
+                "NO_COLOR",
+                "PATH",
+                "XDG_CONFIG_HOME",
+            ]
+        );
+        assert_eq!(env.get("PATH").map(String::as_str), Some(GH_PATH));
+        Ok(())
+    }))
+    .await
+}
+
+#[test]
+fn a_relative_gh_bin_is_refused_at_construction() {
+    let dir = TempDir::new().unwrap_or_else(|_| std::process::abort());
+    for bin in ["gh", "./gh", "bin/gh", "../gh", ""] {
+        let built = GhCli::new(bin, "github.com", TOKEN.to_owned(), dir.path());
+        assert_eq!(built.err(), Some(BrokerError::RelativeGhBin), "{bin:?}");
+    }
+    assert!(GhCli::new("/usr/bin/gh", "github.com", TOKEN.to_owned(), dir.path()).is_ok());
+}
+
+#[tokio::test]
+async fn a_gh_bin_that_is_missing_or_a_directory_fails_the_op_with_the_fixed_error() -> TestResult {
+    common::bounded(Box::pin(async {
+        let case = GhCase::new("[]", "0")?;
+        for bin in [
+            case.scratch.join("no-such-gh"),
+            case.scratch.clone(),
+            PathBuf::from("/"),
+        ] {
+            let gh = GhCli::new(&bin, "github.com", TOKEN.to_owned(), &case.scratch)?;
+            let got = gh.pr_checks(&GhCase::target(), GH_URL).await;
+            assert!(got.is_err(), "{bin:?}");
+        }
+        Ok(())
+    }))
+    .await
+}
+
+#[tokio::test]
+async fn a_scratch_that_is_not_private_is_refused_and_gh_never_runs() -> TestResult {
+    common::bounded(Box::pin(async {
+        for mode in [0o755, 0o770, 0o707, 0o2700, 0o500] {
+            let case = GhCase::new("[]", "0")?;
+            std::fs::set_permissions(&case.scratch, std::fs::Permissions::from_mode(mode))?;
+            assert!(case.checks(GH_URL).await.is_err(), "{mode:o}");
+            std::fs::set_permissions(&case.scratch, std::fs::Permissions::from_mode(0o700))?;
+            assert!(!case.scratch.join("gh.env").exists(), "{mode:o}");
+        }
+        Ok(())
+    }))
+    .await
+}
+
+#[tokio::test]
+async fn a_symlink_or_a_missing_dir_at_the_scratch_path_is_refused() -> TestResult {
+    common::bounded(Box::pin(async {
+        let case = GhCase::new("[]", "0")?;
+        let target = case.scratch.with_file_name("victim");
+        std::fs::create_dir(&target)?;
+        std::fs::write(target.join("gh.out"), "[]")?;
+        std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o700))?;
+        std::fs::remove_dir_all(&case.scratch)?;
+        std::os::unix::fs::symlink(&target, &case.scratch)?;
+        assert!(case.checks(GH_URL).await.is_err());
+        assert!(!target.join("gh.env").exists());
+        std::fs::remove_file(&case.scratch)?;
+        assert!(case.checks(GH_URL).await.is_err());
+        assert!(!case.scratch.exists(), "the executor does not create it");
+        Ok(())
+    }))
+    .await
+}
+
+#[tokio::test]
+async fn the_scratch_is_checked_on_every_run_not_once() -> TestResult {
+    common::bounded(Box::pin(async {
+        let case = GhCase::new("[]", "0")?;
+        case.checks(GH_URL).await.map_err(|_| "first run")?;
+        std::fs::set_permissions(&case.scratch, std::fs::Permissions::from_mode(0o755))?;
+        assert!(case.checks(GH_URL).await.is_err());
+        std::fs::set_permissions(&case.scratch, std::fs::Permissions::from_mode(0o700))?;
+        case.checks(GH_URL).await.map_err(|_| "third run")?;
         Ok(())
     }))
     .await

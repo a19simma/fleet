@@ -626,8 +626,8 @@ struct Held {
 ///
 /// Branch and repo come from the claimed Job, never from a request. The push is fast-forward
 /// only, as in the finish step. A failure logs a fixed line and replies with the broker's fixed
-/// error: no git stderr leaves this executor. `fetch` is [`MirrorGit`]'s. Built, not wired: no
-/// runtime path builds a broker yet.
+/// error: no git stderr leaves this executor. `fetch` is [`MirrorGit`]'s. `DaemonRunner` builds it per
+/// claimed Job under the systemd launcher.
 pub struct PublishGit<R> {
     runner: Arc<AgentRunner<R>>,
     shared: Arc<JobPublish>,

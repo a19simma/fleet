@@ -6,6 +6,7 @@
 
 use std::ffi::OsString;
 use std::fmt;
+use std::os::unix::fs::{DirBuilderExt, MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::Arc;
@@ -23,6 +24,7 @@ use crate::group::GroupGuard;
 const STDERR_KEEP: usize = 64 * 1024;
 const DETAIL_MAX: usize = 512;
 const CACHE_DIR: &str = ".cache";
+const BROKER_DIR: &str = ".broker";
 const BRANCH_PREFIX: &str = "swarm/";
 const MAX_JOB_ID_LEN: usize = 64;
 const HOME_DIR: &str = ".git-home";
@@ -271,6 +273,58 @@ impl Workspace {
         self
     }
 
+    /// The job group gid the clones are shared with, `None` when no group is set.
+    #[must_use]
+    pub const fn job_group(&self) -> Option<u32> {
+        self.job_gid
+    }
+
+    /// Makes the broker scratch dir of `job_id`, `<root>/.broker/<job_id>`.
+    ///
+    /// # Errors
+    ///
+    /// Fails when the id is invalid or the dir cannot be made private.
+    pub fn create_broker_scratch(&self, job_id: &str) -> Result<PathBuf, WorkspaceError> {
+        validate_job_id(job_id)?;
+        let io = |err: std::io::Error| WorkspaceError::Io(err);
+        let denied =
+            || WorkspaceError::Io(std::io::Error::from(std::io::ErrorKind::PermissionDenied));
+        std::fs::create_dir_all(&self.root).map_err(io)?;
+        let parent = self.root.join(BROKER_DIR);
+        match std::fs::symlink_metadata(&parent) {
+            Ok(meta) => {
+                if !is_private_dir(&meta) {
+                    return Err(denied());
+                }
+            }
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+                let mut builder = std::fs::DirBuilder::new();
+                builder.mode(0o700);
+                builder.create(&parent).map_err(io)?;
+                let meta = std::fs::symlink_metadata(&parent).map_err(io)?;
+                if !is_private_dir(&meta) {
+                    return Err(denied());
+                }
+            }
+            Err(err) => return Err(io(err)),
+        }
+        let path = parent.join(job_id);
+        match std::fs::symlink_metadata(&path) {
+            Ok(meta) if meta.file_type().is_dir() => std::fs::remove_dir_all(&path).map_err(io)?,
+            Ok(_) => return Err(denied()),
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+            Err(err) => return Err(io(err)),
+        }
+        let mut builder = std::fs::DirBuilder::new();
+        builder.mode(0o700);
+        builder.create(&path).map_err(io)?;
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700)).map_err(io)?;
+        if !scratch_is_private(&path) {
+            return Err(denied());
+        }
+        Ok(path)
+    }
+
     /// Scrubs `redactor`'s secrets from the git stderr kept in [`WorkspaceError::Git`].
     #[must_use]
     pub fn with_redactor(mut self, redactor: Redactor) -> Self {
@@ -486,6 +540,7 @@ impl Workspace {
             self.root.join(format!(".finish-{job_id}")),
             self.root.join(AGENT_DIR).join(job_id),
             self.root.join(AGENT_DIR).join(format!("{job_id}.tmp")),
+            self.root.join(BROKER_DIR).join(job_id),
         ] {
             match tokio::fs::remove_dir_all(&path).await {
                 Ok(()) => {}
@@ -768,6 +823,51 @@ fn mirror_is_trusted(mirror: &Path) -> bool {
             .is_ok_and(|text| mirror_config_is_trusted(&text))
 }
 
+/// The broker scratch dir of `job_id` under the jobs `root`, or `None` for an invalid id.
+#[must_use]
+pub fn broker_scratch_path(root: &Path, job_id: &str) -> Option<PathBuf> {
+    validate_job_id(job_id).ok()?;
+    Some(root.join(BROKER_DIR).join(job_id))
+}
+
+fn is_private_dir(meta: &std::fs::Metadata) -> bool {
+    meta.file_type().is_dir()
+        && meta.uid() == rustix::process::geteuid().as_raw()
+        && meta.mode().trailing_zeros() >= 6
+}
+
+/// Whether `path` is a broker scratch dir no other uid can reach.
+#[must_use]
+pub fn scratch_is_private(path: &Path) -> bool {
+    if !path.is_absolute() {
+        return false;
+    }
+    let Ok(meta) = std::fs::symlink_metadata(path) else {
+        return false;
+    };
+    if !is_private_dir(&meta) || meta.mode() & 0o7777 != 0o700 {
+        return false;
+    }
+    let Some(parent) = path.parent() else {
+        return false;
+    };
+    let Ok(parent_meta) = std::fs::symlink_metadata(parent) else {
+        return false;
+    };
+    if !is_private_dir(&parent_meta) {
+        return false;
+    }
+    let Some(root) = parent.parent() else {
+        return false;
+    };
+    std::fs::symlink_metadata(root).is_ok_and(|root_meta| {
+        let uid = root_meta.uid();
+        root_meta.file_type().is_dir()
+            && (uid == rustix::process::geteuid().as_raw() || uid == 0)
+            && root_meta.mode() & 0o022 == 0
+    })
+}
+
 /// Removes whatever sits at `path` without following symlinks: a directory tree, or a file or
 /// symlink. A missing path is fine.
 async fn remove_path(path: &Path) -> Result<(), WorkspaceError> {
@@ -970,7 +1070,159 @@ pub(crate) fn validate_ref(name: &str) -> Result<(), WorkspaceError> {
 mod tests {
     use fleet_core::EventId;
 
+    use std::os::unix::fs::{MetadataExt, PermissionsExt, symlink};
+
     use super::*;
+
+    fn workspace_in(dir: &tempfile::TempDir) -> Workspace {
+        Workspace::new(dir.path().join("jobs"))
+    }
+
+    fn mode_of(path: &Path) -> u32 {
+        std::fs::symlink_metadata(path).unwrap().mode() & 0o7777
+    }
+
+    #[test]
+    fn a_created_scratch_is_0700_and_owned_by_the_daemon_under_a_0700_parent() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let scratch = workspace_in(&dir).create_broker_scratch("job1").unwrap();
+        assert_eq!(scratch, dir.path().join("jobs/.broker/job1"));
+        assert_eq!(mode_of(&scratch), 0o700);
+        assert_eq!(mode_of(scratch.parent().unwrap()), 0o700);
+        let euid = rustix::process::geteuid().as_raw();
+        assert_eq!(std::fs::metadata(&scratch).unwrap().uid(), euid);
+        assert!(scratch_is_private(&scratch));
+    }
+
+    #[test]
+    fn two_jobs_get_distinct_scratch_dirs() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let ws = workspace_in(&dir);
+        let first = ws.create_broker_scratch("job1").unwrap();
+        let second = ws.create_broker_scratch("job2").unwrap();
+        assert_ne!(first, second);
+        std::fs::write(first.join("mark"), "x").unwrap();
+        assert!(!second.join("mark").exists());
+        assert!(scratch_is_private(&first) && scratch_is_private(&second));
+    }
+
+    #[test]
+    fn a_reused_job_id_gets_a_fresh_scratch_dir() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let ws = workspace_in(&dir);
+        let first = ws.create_broker_scratch("job1").unwrap();
+        std::fs::write(first.join("mark"), "x").unwrap();
+        std::fs::create_dir(first.join("sub")).unwrap();
+        let again = ws.create_broker_scratch("job1").unwrap();
+        assert_eq!(again, first);
+        assert!(!again.join("mark").exists() && !again.join("sub").exists());
+        assert_eq!(mode_of(&again), 0o700);
+    }
+
+    #[test]
+    fn a_symlink_at_the_scratch_path_is_refused_and_its_target_left_alone() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let ws = workspace_in(&dir);
+        ws.create_broker_scratch("other").unwrap();
+        let target = dir.path().join("victim");
+        std::fs::create_dir(&target).unwrap();
+        std::fs::write(target.join("keep"), "x").unwrap();
+        symlink(&target, dir.path().join("jobs/.broker/job1")).unwrap();
+        assert!(ws.create_broker_scratch("job1").is_err());
+        assert!(target.join("keep").exists());
+        assert!(!scratch_is_private(&dir.path().join("jobs/.broker/job1")));
+    }
+
+    #[test]
+    fn a_file_at_the_scratch_path_is_refused() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let ws = workspace_in(&dir);
+        ws.create_broker_scratch("other").unwrap();
+        std::fs::write(dir.path().join("jobs/.broker/job1"), "x").unwrap();
+        assert!(ws.create_broker_scratch("job1").is_err());
+    }
+
+    #[test]
+    fn a_broker_parent_that_others_can_reach_is_refused() {
+        for mode in [0o755, 0o750, 0o770, 0o707, 0o702] {
+            let dir = tempfile::TempDir::new().unwrap();
+            let ws = workspace_in(&dir);
+            ws.create_broker_scratch("other").unwrap();
+            let parent = dir.path().join("jobs/.broker");
+            std::fs::set_permissions(&parent, std::fs::Permissions::from_mode(mode)).unwrap();
+            assert!(ws.create_broker_scratch("job1").is_err(), "{mode:o}");
+            assert!(!scratch_is_private(&parent.join("other")), "{mode:o}");
+        }
+    }
+
+    #[test]
+    fn a_broker_parent_that_is_a_symlink_is_refused() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let root = dir.path().join("jobs");
+        std::fs::create_dir_all(&root).unwrap();
+        let elsewhere = dir.path().join("elsewhere");
+        std::fs::create_dir(&elsewhere).unwrap();
+        symlink(&elsewhere, root.join(".broker")).unwrap();
+        assert!(workspace_in(&dir).create_broker_scratch("job1").is_err());
+        assert!(!elsewhere.join("job1").exists());
+    }
+
+    #[test]
+    fn a_scratch_with_the_wrong_mode_fails_the_private_check() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let scratch = workspace_in(&dir).create_broker_scratch("job1").unwrap();
+        for mode in [0o755, 0o770, 0o707, 0o702, 0o2700, 0o1700, 0o500, 0o600] {
+            std::fs::set_permissions(&scratch, std::fs::Permissions::from_mode(mode)).unwrap();
+            assert!(!scratch_is_private(&scratch), "{mode:o}");
+        }
+        std::fs::set_permissions(&scratch, std::fs::Permissions::from_mode(0o700)).unwrap();
+        assert!(scratch_is_private(&scratch));
+        assert!(!scratch_is_private(&dir.path().join("missing")));
+        assert!(!scratch_is_private(Path::new("relative")));
+    }
+
+    #[test]
+    fn a_jobs_root_that_others_can_write_fails_the_private_check() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let scratch = workspace_in(&dir).create_broker_scratch("job1").unwrap();
+        let root = dir.path().join("jobs");
+        for mode in [0o777, 0o775, 0o757] {
+            std::fs::set_permissions(&root, std::fs::Permissions::from_mode(mode)).unwrap();
+            assert!(!scratch_is_private(&scratch), "{mode:o}");
+        }
+        std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(scratch_is_private(&scratch));
+    }
+
+    #[test]
+    fn an_invalid_job_id_makes_no_scratch_dir() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let ws = workspace_in(&dir);
+        for bad in ["", "../x", "a/b", ".", "a b"] {
+            assert!(
+                matches!(
+                    ws.create_broker_scratch(bad),
+                    Err(WorkspaceError::InvalidJobId)
+                ),
+                "{bad:?}"
+            );
+            assert_eq!(broker_scratch_path(&dir.path().join("jobs"), bad), None);
+        }
+        assert!(!dir.path().join("jobs/.broker").exists());
+    }
+
+    #[tokio::test]
+    async fn removing_a_job_removes_its_scratch_dir_and_only_its_own() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let ws = workspace_in(&dir);
+        let gone = ws.create_broker_scratch("job1").unwrap();
+        let kept = ws.create_broker_scratch("job2").unwrap();
+        ws.remove("job1", "https://github.com/o/r.git")
+            .await
+            .unwrap();
+        assert!(!gone.exists());
+        assert!(kept.exists());
+    }
 
     #[test]
     fn every_job_id_the_server_issues_passes_the_daemon_rule() {

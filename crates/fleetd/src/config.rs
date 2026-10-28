@@ -30,7 +30,8 @@ const DEFAULT_QUEUE_MAX_BYTES: u64 = 256 * 1024 * 1024;
 const DEFAULT_QUEUE_MAX_AGE_SECS: u64 = 14 * 24 * 60 * 60;
 const DEFAULT_DEDUPE_SECS: u64 = 10;
 const DEFAULT_CLAUDE_BIN: &str = "claude";
-const DEFAULT_GH_BIN: &str = "gh";
+const GH_SEARCH_DIRS: [&str; 4] = ["/usr/local/bin", "/usr/bin", "/opt/homebrew/bin", "/bin"];
+const GH_FALLBACK: &str = "/usr/bin/gh";
 const DEFAULT_REPO_HOSTS: [&str; 1] = ["github.com"];
 const DEFAULT_TOKEN_HOST: &str = "github.com";
 const MAX_FETCH_BODY_BYTES: u64 = 64 * 1024 * 1024;
@@ -133,7 +134,9 @@ pub struct Config {
     pub dedupe_window: Duration,
     /// Agent binary that runs jobs.
     pub claude_bin: PathBuf,
-    /// GitHub CLI binary that opens pull requests, `gh` by default.
+    /// GitHub CLI binary that opens pull requests. It is an absolute path: a relative value
+    /// fails the load. When the key is unset, the first `gh` in `/usr/local/bin`, `/usr/bin`,
+    /// `/opt/homebrew/bin` and `/bin` is used, else `/usr/bin/gh`. No job looks `gh` up in `PATH`.
     pub gh_bin: PathBuf,
     /// True when the box is disposable, which lets jobs run with permission checks off.
     pub disposable: bool,
@@ -318,7 +321,7 @@ impl Config {
             claude_bin: file
                 .claude_bin
                 .unwrap_or_else(|| PathBuf::from(DEFAULT_CLAUDE_BIN)),
-            gh_bin: file.gh_bin.unwrap_or_else(|| PathBuf::from(DEFAULT_GH_BIN)),
+            gh_bin: resolve_gh_bin(file.gh_bin)?,
             disposable: file.disposable.unwrap_or(false),
             jobs_dir: resolve_jobs_dir(&env, file.jobs_dir),
             repo_hosts,
@@ -476,6 +479,25 @@ fn group_name_ok(name: &str) -> bool {
         && name
             .bytes()
             .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-' | b'.'))
+}
+
+fn resolve_gh_bin(file: Option<PathBuf>) -> Result<PathBuf, Error> {
+    resolve_gh_bin_in(file, &GH_SEARCH_DIRS)
+}
+
+fn resolve_gh_bin_in(file: Option<PathBuf>, dirs: &[&str]) -> Result<PathBuf, Error> {
+    match file {
+        Some(path) if !path.is_absolute() => Err(Error::InvalidValue {
+            name: "gh_bin",
+            value: path.display().to_string(),
+        }),
+        Some(path) => Ok(path),
+        None => Ok(dirs
+            .iter()
+            .map(|dir| Path::new(dir).join("gh"))
+            .find(|candidate| candidate.is_file())
+            .unwrap_or_else(|| PathBuf::from(GH_FALLBACK))),
+    }
 }
 
 fn resolve_job_group(
@@ -920,10 +942,46 @@ mod tests {
     }
 
     #[test]
+    fn a_relative_gh_bin_is_rejected_at_load_naming_the_key() {
+        for bad in ["gh", "bin/gh", "./gh", "../gh", ""] {
+            let file = format!("gh_bin = {bad:?}\n");
+            match Config::resolve(Some(&file), &env_of(&[])) {
+                Err(Error::InvalidValue { name, .. }) => assert_eq!(name, "gh_bin", "{bad:?}"),
+                other => panic!("{bad:?}: {other:?}"),
+            }
+        }
+        let cfg = Config::resolve(Some("gh_bin = \"/opt/gh\"\n"), &env_of(&[])).unwrap();
+        assert_eq!(cfg.gh_bin, PathBuf::from("/opt/gh"));
+    }
+
+    #[test]
+    fn the_default_gh_bin_is_absolute_and_comes_from_the_fixed_dir_list() {
+        let cfg = Config::resolve(None, &env_of(&[])).unwrap();
+        assert!(cfg.gh_bin.is_absolute(), "{:?}", cfg.gh_bin);
+        assert!(cfg.gh_bin.ends_with("gh"));
+        let tmp = tempfile::TempDir::new().unwrap();
+        let (first, second) = (tmp.path().join("a"), tmp.path().join("b"));
+        for dir in [&first, &second] {
+            std::fs::create_dir(dir).unwrap();
+            std::fs::write(dir.join("gh"), "").unwrap();
+        }
+        let dirs = [first.to_str().unwrap(), second.to_str().unwrap()];
+        assert_eq!(resolve_gh_bin_in(None, &dirs).unwrap(), first.join("gh"));
+        assert_eq!(
+            resolve_gh_bin_in(None, &["/nonexistent-dir-for-gh"]).unwrap(),
+            PathBuf::from(GH_FALLBACK)
+        );
+        assert_eq!(
+            resolve_gh_bin_in(Some(PathBuf::from("/opt/gh")), &dirs).unwrap(),
+            PathBuf::from("/opt/gh")
+        );
+    }
+
+    #[test]
     fn job_settings_default_to_a_cautious_agent() {
         let cfg = Config::resolve(None, &env_of(&[])).unwrap();
         assert_eq!(cfg.claude_bin, PathBuf::from("claude"));
-        assert_eq!(cfg.gh_bin, PathBuf::from("gh"));
+        assert!(cfg.gh_bin.is_absolute());
         assert!(!cfg.disposable);
         let file = "claude_bin = \"/opt/claude\"\ngh_bin = \"/opt/gh\"\ndisposable = true\n";
         let cfg = Config::resolve(Some(file), &env_of(&[])).unwrap();

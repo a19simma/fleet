@@ -10,29 +10,34 @@ use std::sync::Arc;
 
 use fleet_core::Redactor;
 use fleet_proto::v1::{Job, JobKind};
+use tokio::net::UnixStream;
 use tonic::transport::Channel;
 
+use crate::AgentLauncher;
 use crate::Error;
 use crate::agent_config::Bundle;
+use crate::broker::{Broker, GhCli, MirrorGit};
 use crate::config::Config;
 use crate::connect_proxy::{ConnectProxy, ProxyLimits};
 use crate::fetch::{Fetcher, SystemResolver, TcpDialer};
 use crate::fetch_service::{FeedBook, FetchRecorder, FetchService, MAX_CONCURRENT_FETCHES};
 use crate::jobenv::group_id;
-use crate::jobsock::{ServiceName, Services};
+use crate::jobsock::{JobContext, PerJob, ServeFuture, Service, ServiceName, Services};
 use crate::poller::{
     GrpcReporter, JobRunner, PollRandom, Poller, RunError, SERVER_URL_ENV, Shutdown, TOKEN_ENV,
     Token, channel,
 };
+use crate::publish::{PublishGh, PublishGit};
 use crate::runner::{AgentOutcome, AgentRunner, Interrupt, JobEnd, Reporter, RunConfig};
 use crate::systemd::select_launcher;
 use crate::telemetry::{FetchPhase, FetchRecordError};
 use crate::toolhook::HookHub;
-use crate::workspace::{RepoPolicy, Workspace};
+use crate::workspace::{RepoPolicy, Workspace, broker_scratch_path};
 
 const ERR_WORKSPACE: &str = "workspace could not be prepared";
 const ERR_PREPARE_TIMEOUT: &str = "workspace preparation timed out";
 const ERR_SHUTDOWN: &str = "agent stopped by daemon shutdown";
+const ERR_BROKER: &str = "job broker could not be set up";
 
 /// The poller the daemon runs.
 pub(crate) type JobPoller = Poller<DaemonRunner<GrpcReporter>>;
@@ -40,17 +45,43 @@ pub(crate) type JobPoller = Poller<DaemonRunner<GrpcReporter>>;
 /// Runs one claimed job from checkout to terminal report.
 pub(crate) struct DaemonRunner<R> {
     workspace: Workspace,
-    agent: AgentRunner<R>,
+    agent: Arc<AgentRunner<R>>,
     box_name: String,
+    broker: Option<BrokerWiring>,
+}
+
+/// A [`Broker`] with its executor types erased, so one [`PerJob`] registry holds them all.
+pub(crate) struct DynBroker(Box<dyn Service>);
+
+impl Service for DynBroker {
+    fn serve(&self, ctx: JobContext, stream: UnixStream) -> ServeFuture<'_> {
+        self.0.serve(ctx, stream)
+    }
+}
+
+/// What the runner needs to build and register the broker of a claimed job.
+pub(crate) struct BrokerWiring {
+    registry: PerJob<DynBroker>,
+    launcher: AgentLauncher,
+    gh_bin: PathBuf,
+    host: String,
+    token: String,
+    redactor: Redactor,
 }
 
 impl<R: Reporter> DaemonRunner<R> {
     fn new(workspace: Workspace, agent: AgentRunner<R>, box_name: &str) -> Self {
         Self {
             workspace,
-            agent,
+            agent: Arc::new(agent),
             box_name: box_name.to_owned(),
+            broker: None,
         }
+    }
+
+    fn with_broker(mut self, wiring: BrokerWiring) -> Self {
+        self.broker = Some(wiring);
+        self
     }
 
     async fn load_profile(&self, job: &Job, mut shutdown: Shutdown) -> Result<(), RunError> {
@@ -176,7 +207,64 @@ impl<R: Reporter> DaemonRunner<R> {
     }
 }
 
-impl<R: Reporter + 'static> JobRunner for DaemonRunner<R> {
+impl<R: Reporter + Send + Sync + 'static> DaemonRunner<R> {
+    /// Builds the broker of `job` and registers it before the agent launches.
+    ///
+    /// Only the systemd launcher gets one: the direct launcher refuses the job socket, so
+    /// nothing is built, no scratch dir is made, and the decision is logged. A failure fails the
+    /// job with a fixed message; the detail only goes to the log.
+    async fn register_broker(&self, job: &Job, cwd: &Path) -> Result<(), RunError> {
+        let Some(wiring) = &self.broker else {
+            return Ok(());
+        };
+        if wiring.launcher != AgentLauncher::Systemd {
+            tracing::info!("no job broker: the direct launcher serves no job socket");
+            return Ok(());
+        }
+        match self.build_broker(wiring, job, cwd) {
+            Ok(()) => Ok(()),
+            Err(detail) => {
+                tracing::warn!(detail, "job broker could not be set up");
+                self.agent.fail_job(job, ERR_BROKER).await;
+                Err(RunError)
+            }
+        }
+    }
+
+    fn build_broker(&self, wiring: &BrokerWiring, job: &Job, cwd: &Path) -> Result<(), String> {
+        let scratch = self
+            .workspace
+            .create_broker_scratch(&job.job_id)
+            .map_err(|err| err.to_string())?;
+        let git = PublishGit::new(
+            Arc::clone(&self.agent),
+            job.clone(),
+            cwd.to_path_buf(),
+            MirrorGit::new(self.workspace.clone(), job),
+        );
+        let checks = GhCli::new(
+            wiring.gh_bin.clone(),
+            wiring.host.clone(),
+            wiring.token.clone(),
+            scratch,
+        )
+        .map_err(|err| err.to_string())?;
+        let gh = PublishGh::new(
+            Arc::clone(&self.agent),
+            job.clone(),
+            cwd.to_path_buf(),
+            checks,
+        );
+        let broker = Broker::new(wiring.launcher, job, git, gh, wiring.redactor.clone())
+            .map_err(|err| err.to_string())?;
+        wiring
+            .registry
+            .register(&job.job_id, Arc::new(DynBroker(Box::new(broker))))
+            .map_err(|err| format!("{err:?}"))
+    }
+}
+
+impl<R: Reporter + Send + Sync + 'static> JobRunner for DaemonRunner<R> {
     async fn run(&self, job: Job, shutdown: Shutdown) -> Result<(), RunError> {
         let _ended = self.agent.end_guard(&job);
         if job.kind() == JobKind::Judge {
@@ -187,7 +275,10 @@ impl<R: Reporter + 'static> JobRunner for DaemonRunner<R> {
             return Err(stop);
         }
         let result = match self.prepare(&job, shutdown.clone()).await {
-            Ok(path) => self.execute(&job, &path, shutdown).await,
+            Ok(path) => match self.register_broker(&job, &path).await {
+                Ok(()) => self.execute(&job, &path, shutdown).await,
+                Err(stop) => Err(stop),
+            },
             Err(stop) => Err(stop),
         };
         self.agent.clear_profile(&job);
@@ -250,6 +341,7 @@ impl FetchRecorder for BookRecorder {
 pub(crate) struct JobServices {
     pub(crate) services: Services,
     pub(crate) end: JobEnd,
+    pub(crate) broker: PerJob<DynBroker>,
     #[cfg(test)]
     pub(crate) proxy: Arc<ConnectProxy<SystemResolver, TcpDialer>>,
 }
@@ -263,8 +355,10 @@ pub(crate) struct JobServices {
 /// Both key their per-job state by the job id of the socket, never by the client. The `end`
 /// hook of the result calls [`FetchService::forget`] and [`ConnectProxy::forget`], so the
 /// runner passes it to [`AgentRunner::with_job_end`] and a job id reused later starts at zero.
-/// The broker is not offered here. The direct launcher refuses a socket and drops these in
-/// [`select_launcher`].
+/// `Broker` is a [`PerJob`] registry the runner fills at claim time ([`DaemonRunner`]); the
+/// `end` hook unregisters the job id from it and removes the job's broker scratch dir, so a
+/// connection after the job ended finds no broker. The direct launcher refuses a socket and
+/// drops these in [`select_launcher`].
 #[must_use]
 pub(crate) fn job_services(config: &Config, feeds: &Arc<FeedBook>) -> JobServices {
     let fetcher = Fetcher::system(config.fetch_policy.clone(), config.fetch_caps);
@@ -291,11 +385,20 @@ pub(crate) fn job_services(config: &Config, feeds: &Arc<FeedBook>) -> JobService
             let proxy = Arc::clone(&proxy);
             move |job_id| proxy.forget(job_id)
         });
+    let broker = PerJob::new();
+    let jobs_dir = PathBuf::from(&config.jobs_dir);
+    let end = end.unregistering(broker.clone()).on_end(move |job_id| {
+        if let Some(scratch) = broker_scratch_path(&jobs_dir, job_id) {
+            let _ = std::fs::remove_dir_all(scratch);
+        }
+    });
+    services.insert(ServiceName::Broker, Arc::new(broker.clone()));
     services.insert(ServiceName::Fetch, fetch);
     services.insert(ServiceName::EgressProxy, Arc::new(Arc::clone(&proxy)));
     JobServices {
         services,
         end,
+        broker,
         #[cfg(test)]
         proxy,
     }
@@ -342,6 +445,18 @@ pub(crate) fn build(
     let feeds = Arc::new(FeedBook::default());
     let wired = job_services(config, &feeds);
     let launcher = select_launcher(config, run.job_gid, wired.services);
+    let wiring = BrokerWiring {
+        registry: wired.broker,
+        launcher: config.agent_launcher,
+        gh_bin: config.gh_bin.clone(),
+        host: run
+            .repo_policy
+            .token_host()
+            .unwrap_or("github.com")
+            .to_owned(),
+        token: env("GH_TOKEN").unwrap_or_default(),
+        redactor: redactor.clone(),
+    };
     let runner = DaemonRunner::new(
         workspace,
         AgentRunner::new(run, reporter, redactor)
@@ -350,7 +465,8 @@ pub(crate) fn build(
             .with_feed_book(feeds)
             .with_job_end(wired.end),
         box_name,
-    );
+    )
+    .with_broker(wiring);
     Poller::with_channel(
         channel,
         &token,
@@ -932,13 +1048,14 @@ mod tests {
         }
 
         #[test]
-        fn a_default_config_serves_exactly_fetch_and_egress_proxy_under_systemd() -> TestResult {
+        fn a_default_config_serves_exactly_broker_fetch_and_egress_proxy_under_systemd()
+        -> TestResult {
             let feeds = Arc::new(FeedBook::default());
             let config = config_of("agent_launcher = \"systemd\"\n")?;
-            assert_eq!(served(&config, &feeds), ["egress proxy", "fetch"]);
+            assert_eq!(served(&config, &feeds), ["broker", "egress proxy", "fetch"]);
             assert_eq!(
                 names(&job_services(&config, &feeds).services),
-                ["egress proxy", "fetch"]
+                ["broker", "egress proxy", "fetch"]
             );
             Ok(())
         }
@@ -947,7 +1064,7 @@ mod tests {
         fn the_direct_launcher_serves_nothing_even_with_a_full_service_set() -> TestResult {
             let feeds = Arc::new(FeedBook::default());
             let config = config_of("agent_launcher = \"direct\"\n")?;
-            assert_eq!(names(&job_services(&config, &feeds).services).len(), 2);
+            assert_eq!(names(&job_services(&config, &feeds).services).len(), 3);
             assert_eq!(served(&config, &feeds), Vec::<&str>::new());
             let default = config_of("")?;
             assert_eq!(served(&default, &feeds), Vec::<&str>::new());
@@ -1132,6 +1249,487 @@ mod tests {
             Ok(())
         }
 
+        mod broker_wired {
+            use std::os::unix::fs::{PermissionsExt, symlink};
+            use std::path::{Path, PathBuf};
+            use std::process::Command;
+
+            use fleet_proto::v1::{Job, JobState, ReportJobRequest};
+            use tokio::sync::mpsc;
+
+            use super::*;
+            use crate::AgentLauncher;
+            use crate::broker::{Broker, ExecError, GhExecutor, GitExecutor, PushTarget};
+            use crate::jobsock::{JobContext, ServeFuture, Service};
+            use crate::poller::{JobRunner, RunError, Shutdown};
+            use crate::runner::{
+                AgentRunner, AgentSpec, DirectLauncher, Launched, Launcher, RunConfig,
+            };
+            use crate::workspace::{RepoPolicy, Workspace, scratch_is_private};
+
+            use super::super::super::{
+                BrokerWiring, DaemonRunner, DynBroker, ERR_BROKER, JobServices, job_workspace,
+            };
+            use super::super::Recorder;
+
+            const SYSTEMD: &str = "agent_launcher = \"systemd\"\n";
+            const LAUNCHES: Duration = Duration::from_secs(60);
+
+            struct Fixture {
+                dir: TempDir,
+                origin: PathBuf,
+                claude: PathBuf,
+            }
+
+            fn run_git(dir: &Path, args: &[&str]) -> TestResult {
+                let status = Command::new("git")
+                    .arg("-C")
+                    .arg(dir)
+                    .args(["-c", "user.name=t", "-c", "user.email=t@t.invalid"])
+                    .args(args)
+                    .status()?;
+                assert!(status.success(), "git {args:?}");
+                Ok(())
+            }
+
+            fn fixture() -> Result<Fixture, Box<dyn std::error::Error>> {
+                let dir = TempDir::new()?;
+                let origin = dir.path().join("origin.git");
+                let seed = dir.path().join("seed");
+                std::fs::create_dir_all(&origin)?;
+                run_git(&origin, &["init", "--bare", "-b", "main"])?;
+                run_git(
+                    dir.path(),
+                    &["clone", origin.to_str().unwrap_or(""), "seed"],
+                )?;
+                run_git(&seed, &["commit", "--allow-empty", "-m", "init"])?;
+                run_git(&seed, &["push", "origin", "HEAD:main"])?;
+                let claude = dir.path().join("claude");
+                std::fs::write(
+                    &claude,
+                    "#!/bin/sh\nif [ \"$1\" = \"--version\" ]; then echo '2.1.289 (Claude Code)'; fi\nexit 0\n",
+                )?;
+                std::fs::set_permissions(&claude, std::fs::Permissions::from_mode(0o755))?;
+                Ok(Fixture {
+                    dir,
+                    origin,
+                    claude,
+                })
+            }
+
+            impl Fixture {
+                fn jobs(&self) -> PathBuf {
+                    self.dir.path().join("jobs")
+                }
+
+                fn job(&self, id: &str) -> Job {
+                    Job {
+                        job_id: id.into(),
+                        repo: format!("file://{}", self.origin.display()),
+                        base_ref: "main".into(),
+                        attempt: 1,
+                        ..Job::default()
+                    }
+                }
+
+                fn services(&self) -> Result<JobServices, Box<dyn std::error::Error>> {
+                    let mut config = config_of(SYSTEMD)?;
+                    config.jobs_dir = self.jobs();
+                    Ok(job_services(&config, &Arc::new(FeedBook::default())))
+                }
+
+                fn runner(
+                    &self,
+                    wired: &JobServices,
+                    launcher: AgentLauncher,
+                    spy: Spy,
+                ) -> (
+                    DaemonRunner<Recorder>,
+                    mpsc::UnboundedReceiver<ReportJobRequest>,
+                ) {
+                    let (tx, rx) = mpsc::unbounded_channel();
+                    let policy = RepoPolicy::new(Vec::<String>::new()).with_file_repos();
+                    let workspace = Workspace::new(self.jobs()).with_policy(policy.clone());
+                    let mut cfg = RunConfig::new(&self.claude, false);
+                    cfg.repo_policy = policy;
+                    let agent = AgentRunner::new(cfg, Recorder(tx), Redactor::default())
+                        .with_launcher(Arc::new(spy))
+                        .with_job_end(wired.end.clone());
+                    let wiring = BrokerWiring {
+                        registry: wired.broker.clone(),
+                        launcher,
+                        gh_bin: PathBuf::from("/usr/bin/gh"),
+                        host: "github.com".to_owned(),
+                        token: "tok".to_owned(),
+                        redactor: Redactor::default(),
+                    };
+                    (
+                        DaemonRunner::new(workspace, agent, "").with_broker(wiring),
+                        rx,
+                    )
+                }
+            }
+
+            type OnLaunch = Arc<dyn Fn(&AgentSpec) + Send + Sync>;
+
+            struct Spy {
+                on_launch: OnLaunch,
+                fail: bool,
+            }
+
+            impl Spy {
+                fn new(on_launch: impl Fn(&AgentSpec) + Send + Sync + 'static) -> Self {
+                    Self {
+                        on_launch: Arc::new(on_launch),
+                        fail: false,
+                    }
+                }
+
+                const fn failing(mut self) -> Self {
+                    self.fail = true;
+                    self
+                }
+            }
+
+            impl std::fmt::Debug for Spy {
+                fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                    f.debug_struct("Spy").finish_non_exhaustive()
+                }
+            }
+
+            impl Launcher for Spy {
+                fn launch(&self, spec: AgentSpec) -> io::Result<Launched> {
+                    (self.on_launch)(&spec);
+                    if self.fail {
+                        return Err(io::Error::other("spy"));
+                    }
+                    DirectLauncher.launch(spec)
+                }
+            }
+
+            fn push_to<T>(log: &Arc<Mutex<Vec<T>>>, entry: T) {
+                log.lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .push(entry);
+            }
+
+            fn taken<T: Clone>(log: &Arc<Mutex<Vec<T>>>) -> Vec<T> {
+                log.lock().unwrap_or_else(PoisonError::into_inner).clone()
+            }
+
+            async fn finished(
+                runner: &DaemonRunner<Recorder>,
+                job: Job,
+            ) -> Result<Result<(), RunError>, Box<dyn std::error::Error>> {
+                let (_trigger, shutdown) = Shutdown::channel();
+                Ok(timeout(LAUNCHES, runner.run(job, shutdown)).await?)
+            }
+
+            fn succeeded(rx: &mut mpsc::UnboundedReceiver<ReportJobRequest>) -> bool {
+                let mut done = false;
+                while let Ok(report) = rx.try_recv() {
+                    done |= report.terminal_state == Some(JobState::Succeeded as i32);
+                }
+                done
+            }
+
+            #[tokio::test]
+            async fn the_broker_is_registered_with_a_private_scratch_before_the_agent_launches()
+            -> TestResult {
+                let fx = fixture()?;
+                let wired = fx.services()?;
+                let seen = Arc::new(Mutex::new(Vec::new()));
+                let scratch = fx.jobs().join(".broker").join("job1");
+                let spy = Spy::new({
+                    let seen = Arc::clone(&seen);
+                    let registry = wired.broker.clone();
+                    let scratch = scratch.clone();
+                    move |_| {
+                        push_to(
+                            &seen,
+                            (registry.contains("job1"), scratch_is_private(&scratch)),
+                        );
+                    }
+                });
+                let (runner, mut rx) = fx.runner(&wired, AgentLauncher::Systemd, spy);
+                let ended = finished(&runner, fx.job("job1")).await?;
+                assert!(ended.is_ok(), "{ended:?}");
+                assert_eq!(taken(&seen), [(true, true)]);
+                assert!(succeeded(&mut rx));
+                assert!(!wired.broker.contains("job1"), "unregistered at the end");
+                assert!(!scratch.exists(), "scratch removed at the end");
+                Ok(())
+            }
+
+            #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+            async fn two_concurrent_jobs_get_their_own_broker_and_distinct_scratch_dirs()
+            -> TestResult {
+                let fx = fixture()?;
+                let wired = fx.services()?;
+                let seen = Arc::new(Mutex::new(Vec::new()));
+                let spy = Spy::new({
+                    let seen = Arc::clone(&seen);
+                    let registry = wired.broker.clone();
+                    let jobs = fx.jobs();
+                    move |spec| {
+                        let id = spec
+                            .cwd
+                            .file_name()
+                            .map(|name| name.to_string_lossy().into_owned())
+                            .unwrap_or_default();
+                        let scratch = jobs.join(".broker").join(&id);
+                        push_to(&seen, (id, scratch.clone(), scratch_is_private(&scratch)));
+                        let deadline = std::time::Instant::now() + Duration::from_secs(20);
+                        while taken(&seen).len() < 2 && std::time::Instant::now() < deadline {
+                            std::thread::sleep(Duration::from_millis(20));
+                        }
+                        assert_eq!(registry.len(), 2, "both brokers live while both launch");
+                    }
+                });
+                let (runner, _rx) = fx.runner(&wired, AgentLauncher::Systemd, spy);
+                let runner = Arc::new(runner);
+                let tasks: Vec<_> = ["job1", "job2"]
+                    .into_iter()
+                    .map(|id| {
+                        let runner = Arc::clone(&runner);
+                        let job = fx.job(id);
+                        tokio::spawn(async move {
+                            let (_trigger, shutdown) = Shutdown::channel();
+                            runner.run(job, shutdown).await
+                        })
+                    })
+                    .collect();
+                for task in tasks {
+                    let ended = timeout(LAUNCHES, task).await??;
+                    assert!(ended.is_ok(), "{ended:?}");
+                }
+                let mut got = taken(&seen);
+                got.sort();
+                assert_eq!(got.len(), 2);
+                assert_ne!(got[0].1, got[1].1, "distinct scratch dirs");
+                assert!(got.iter().all(|entry| entry.2), "both private");
+                assert!(wired.broker.is_empty());
+                Ok(())
+            }
+
+            #[tokio::test]
+            async fn a_reused_job_id_gets_a_fresh_scratch_dir() -> TestResult {
+                let fx = fixture()?;
+                let wired = fx.services()?;
+                let stale = Workspace::new(fx.jobs()).create_broker_scratch("job1")?;
+                std::fs::write(stale.join("leftover"), "old")?;
+                let seen = Arc::new(Mutex::new(Vec::new()));
+                let spy = Spy::new({
+                    let seen = Arc::clone(&seen);
+                    let stale = stale.clone();
+                    move |_| {
+                        push_to(
+                            &seen,
+                            (stale.join("leftover").exists(), scratch_is_private(&stale)),
+                        );
+                    }
+                });
+                let (runner, _rx) = fx.runner(&wired, AgentLauncher::Systemd, spy);
+                let ended = finished(&runner, fx.job("job1")).await?;
+                assert!(ended.is_ok(), "{ended:?}");
+                assert_eq!(taken(&seen), [(false, true)]);
+                Ok(())
+            }
+
+            #[tokio::test]
+            async fn the_direct_launcher_registers_no_broker_and_makes_no_scratch() -> TestResult {
+                let fx = fixture()?;
+                let wired = fx.services()?;
+                let seen = Arc::new(Mutex::new(Vec::new()));
+                let spy = Spy::new({
+                    let seen = Arc::clone(&seen);
+                    let registry = wired.broker.clone();
+                    let broker_dir = fx.jobs().join(".broker");
+                    move |_| push_to(&seen, (registry.len(), broker_dir.exists()))
+                });
+                let (runner, mut rx) = fx.runner(&wired, AgentLauncher::Direct, spy);
+                let ended = finished(&runner, fx.job("job1")).await?;
+                assert!(ended.is_ok(), "{ended:?}");
+                assert_eq!(taken(&seen), [(0, false)]);
+                assert!(succeeded(&mut rx));
+                Ok(())
+            }
+
+            #[tokio::test]
+            async fn a_symlink_at_the_scratch_path_fails_the_job_and_the_agent_never_launches()
+            -> TestResult {
+                let fx = fixture()?;
+                let wired = fx.services()?;
+                let scratch = Workspace::new(fx.jobs()).create_broker_scratch("job1")?;
+                std::fs::remove_dir_all(&scratch)?;
+                let victim = fx.dir.path().join("victim");
+                std::fs::create_dir(&victim)?;
+                std::fs::write(victim.join("keep"), "x")?;
+                symlink(&victim, &scratch)?;
+                let launches = Arc::new(Mutex::new(Vec::new()));
+                let spy = Spy::new({
+                    let launches = Arc::clone(&launches);
+                    move |_| push_to(&launches, ())
+                });
+                let (runner, mut rx) = fx.runner(&wired, AgentLauncher::Systemd, spy);
+                let ended = finished(&runner, fx.job("job1")).await?;
+                assert!(ended.is_err());
+                assert!(taken(&launches).is_empty(), "never launched");
+                assert_eq!(super::super::errors(&mut rx), vec![ERR_BROKER.to_owned()]);
+                assert!(victim.join("keep").exists(), "target untouched");
+                assert!(wired.broker.is_empty());
+                Ok(())
+            }
+
+            #[tokio::test]
+            async fn a_launch_error_leaves_no_publish_state_and_no_broker() -> TestResult {
+                let fx = fixture()?;
+                let wired = fx.services()?;
+                let launches = Arc::new(Mutex::new(Vec::new()));
+                let spy = Spy::new({
+                    let launches = Arc::clone(&launches);
+                    move |_| push_to(&launches, ())
+                })
+                .failing();
+                let (runner, _rx) = fx.runner(&wired, AgentLauncher::Systemd, spy);
+                let ended = finished(&runner, fx.job("job1")).await?;
+                let _ = ended;
+                assert_eq!(taken(&launches).len(), 1);
+                assert!(
+                    runner
+                        .agent
+                        .publishing
+                        .lock()
+                        .unwrap_or_else(PoisonError::into_inner)
+                        .is_empty(),
+                    "publish state leaked"
+                );
+                assert!(wired.broker.is_empty());
+                assert!(!fx.jobs().join(".broker").join("job1").exists());
+                Ok(())
+            }
+
+            struct Live;
+
+            impl Service for Live {
+                fn serve(&self, _: JobContext, mut stream: UnixStream) -> ServeFuture<'_> {
+                    Box::pin(async move {
+                        let _ = stream.write_all(b"live").await;
+                    })
+                }
+            }
+
+            async fn broker_bytes(rig: &Rig) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
+                let mut stream = rig.open(ServiceName::Broker.as_str().as_bytes()).await?;
+                let mut got = Vec::new();
+                timeout(OUTER, stream.read_to_end(&mut got)).await??;
+                Ok(got)
+            }
+
+            #[tokio::test]
+            async fn a_connection_after_the_job_ended_reaches_no_broker() -> TestResult {
+                let fx = fixture()?;
+                let mut wired = fx.services()?;
+                wired
+                    .broker
+                    .register("job1", Arc::new(DynBroker(Box::new(Live))))?;
+                let rig = rig_with(std::mem::take(&mut wired.services))?;
+                assert_eq!(broker_bytes(&rig).await?, b"live");
+                let (tx, _rx) = mpsc::unbounded_channel();
+                let agent = AgentRunner::new(
+                    RunConfig::new("claude", false),
+                    Recorder(tx),
+                    Redactor::default(),
+                )
+                .with_job_end(wired.end.clone());
+                agent.end_job(&fx.job("job1"));
+                assert_eq!(broker_bytes(&rig).await?, Vec::<u8>::new());
+                Ok(())
+            }
+
+            struct FakeGit;
+
+            impl GitExecutor for FakeGit {
+                fn push(
+                    &self,
+                    _: &PushTarget,
+                ) -> impl Future<Output = Result<String, ExecError>> + Send {
+                    std::future::ready(Ok("pushed".to_owned()))
+                }
+
+                fn fetch(&self) -> impl Future<Output = Result<String, ExecError>> + Send {
+                    std::future::ready(Ok("fetched".to_owned()))
+                }
+            }
+
+            struct FakeGh;
+
+            impl GhExecutor for FakeGh {
+                fn pr_create(
+                    &self,
+                    _: &PushTarget,
+                    _: &str,
+                    _: &str,
+                ) -> impl Future<Output = Result<String, ExecError>> + Send {
+                    std::future::ready(Err(ExecError))
+                }
+
+                fn pr_checks(
+                    &self,
+                    _: &PushTarget,
+                    _: &str,
+                ) -> impl Future<Output = Result<String, ExecError>> + Send {
+                    std::future::ready(Err(ExecError))
+                }
+            }
+
+            async fn ask(rig: &Rig, request: &[u8]) -> Result<String, Box<dyn std::error::Error>> {
+                let stream = rig.open(ServiceName::Broker.as_str().as_bytes()).await?;
+                let (read, mut write) = stream.into_split();
+                write_frame(&mut write, request).await?;
+                let mut read = BufReader::new(read);
+                let frame = timeout(OUTER, read_frame(&mut read)).await??;
+                Ok(String::from_utf8(frame)?)
+            }
+
+            #[tokio::test]
+            async fn a_registered_broker_answers_requests_over_the_job_socket() -> TestResult {
+                let fx = fixture()?;
+                let mut wired = fx.services()?;
+                let broker = Broker::new(
+                    AgentLauncher::Systemd,
+                    &fx.job("job1"),
+                    FakeGit,
+                    FakeGh,
+                    Redactor::default(),
+                )?;
+                wired
+                    .broker
+                    .register("job1", Arc::new(DynBroker(Box::new(broker))))?;
+                let rig = rig_with(std::mem::take(&mut wired.services))?;
+                assert_eq!(
+                    ask(&rig, br#"{"op":"fetch"}"#).await?,
+                    r#"{"status":"done","output":"fetched"}"#
+                );
+                let hostile =
+                    ask(&rig, br#"{"op":"fetch","repo":"https://evil.example/x"}"#).await?;
+                assert!(hostile.contains("invalid_request"), "{hostile}");
+                assert!(!hostile.contains("evil"), "{hostile}");
+                Ok(())
+            }
+
+            #[test]
+            fn the_job_group_reaches_the_workspace_the_broker_clones_for_its_mirror() -> TestResult
+            {
+                let config = config_of("")?;
+                let mut run = RunConfig::new("claude", false);
+                run.job_gid = Some(4242);
+                let workspace = job_workspace(&config, &mut run, &|_| None);
+                assert_eq!(workspace.job_group(), Some(4242));
+                Ok(())
+            }
+        }
+
         mod ended {
             use std::os::unix::fs::PermissionsExt;
             use std::path::Path;
@@ -1150,7 +1748,7 @@ mod tests {
             use crate::telemetry::{FetchPhase, FetchRecordError};
             use crate::workspace::{RepoPolicy, Workspace};
 
-            use super::super::super::{DaemonRunner, JobServices};
+            use super::super::super::{DaemonRunner, DynBroker, JobServices};
 
             const URL: &str = "https://nohost.invalid/page";
             const FETCH: &[u8] = br#"{"url":"https://nohost.invalid/page"}"#;
@@ -1178,6 +1776,9 @@ mod tests {
                 let mut services = job_services(&config_of(CONFIG)?, &feeds);
                 let registry = PerJob::new();
                 registry.register("job1", Arc::new(Probe))?;
+                services
+                    .broker
+                    .register("job1", Arc::new(DynBroker(Box::new(Probe))))?;
                 let end = services.end.clone().unregistering(registry.clone());
                 let rig = rig_with(std::mem::take(&mut services.services))?;
                 Ok(Wiring {
@@ -1215,11 +1816,13 @@ mod tests {
                     assert_eq!(self.rig.connect(HOSTILE).await?, FORBIDDEN);
                     assert_eq!(self.services.proxy.stats("job1").refusals, 1);
                     assert!(self.registry.contains("job1"));
+                    assert!(self.services.broker.contains("job1"));
                     Ok(())
                 }
 
                 async fn assert_cleared(&self) -> TestResult {
                     assert!(!self.registry.contains("job1"), "registry entry");
+                    assert!(!self.services.broker.contains("job1"), "broker entry");
                     assert_eq!(
                         self.feeds.record("job1", URL, FetchPhase::Intent),
                         Err(FetchRecordError::Closed),
