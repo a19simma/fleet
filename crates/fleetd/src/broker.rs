@@ -6,6 +6,13 @@
 //! claimed Job, and the executors ([`GitExecutor`], [`GhExecutor`]) receive that target, never
 //! a client value.
 //!
+//! `pr_checks` reads the checks of the pull request URL the broker itself recorded from the
+//! Job's `pr_create` reply, never one from a request, and is refused until one is recorded.
+//! `fetch` refreshes the mirror of the Job's own repo. Both are paced: at most
+//! [`MAX_PR_CHECKS_PER_JOB`] and [`MAX_FETCHES_PER_JOB`] attempts per Job, no closer together
+//! than [`MIN_PR_CHECKS_INTERVAL`] and [`MIN_FETCH_INTERVAL`] ([`Limits`]), and one `fetch`
+//! at a time per Job. [`GhCli`] and [`MirrorGit`] are the real executors of these two reads.
+//!
 //! Per Job the broker allows [`MAX_PUSHES_PER_JOB`] pushes and [`MAX_PRS_PER_JOB`] pull request,
 //! a title of at most [`MAX_TITLE_CHARS`] characters and a body of at most [`MAX_BODY_BYTES`]
 //! bytes, and refuses attribution lines. Title and body are redacted before an executor sees
@@ -17,21 +24,29 @@
 //! The direct launcher gets no broker: [`Broker::new`] refuses it, as the job socket does
 //! (ADR-0036), because the agent there shares fleetd's uid.
 //!
-//! This module is pure decision logic. The executors that run `git` and `gh` are separate and
-//! not wired here, and ADR-0031 P3 gates the real `push`.
+//! The decision logic is pure. The executors for `push` and `pr_create` are not written yet:
+//! [`MirrorGit`] and [`GhCli`] refuse those two, and ADR-0031 P3 gates the real `push`.
 
+use std::ffi::OsString;
 use std::fmt;
 use std::future::Future;
+use std::path::PathBuf;
+use std::process::Stdio;
 use std::sync::{Mutex, PoisonError};
 use std::time::Duration;
 
 use fleet_core::Redactor;
-use fleet_proto::is_swarm_branch;
 use fleet_proto::v1::Job;
+use fleet_proto::{is_ci_url, is_swarm_branch};
 use serde::{Deserialize, Serialize};
+use tokio::io::AsyncReadExt;
+use tokio::process::Command;
+use tokio::time::Instant;
 
 use crate::AgentLauncher;
+use crate::group::GroupGuard;
 use crate::jobsock::MAX_FRAME_BYTES;
+use crate::workspace::Workspace;
 
 /// Most `push` calls one Job may attempt.
 pub const MAX_PUSHES_PER_JOB: u32 = 10;
@@ -43,6 +58,21 @@ pub const MAX_TITLE_CHARS: usize = 256;
 pub const MAX_BODY_BYTES: usize = 8 * 1024;
 /// Most bytes in the output of one operation.
 pub const MAX_OUTPUT_BYTES: usize = 16 * 1024;
+/// Most `pr_checks` calls one Job may attempt.
+pub const MAX_PR_CHECKS_PER_JOB: u32 = 240;
+/// Most `fetch` calls one Job may attempt.
+pub const MAX_FETCHES_PER_JOB: u32 = 10;
+/// Shortest time between two `pr_checks` attempts of one Job.
+pub const MIN_PR_CHECKS_INTERVAL: Duration = Duration::from_secs(5);
+/// Shortest time between two `fetch` attempts of one Job.
+pub const MIN_FETCH_INTERVAL: Duration = Duration::from_secs(30);
+/// Most bytes in a recorded pull request URL.
+pub const MAX_PR_URL_BYTES: usize = 2048;
+/// Most checks `pr_checks` returns.
+pub const MAX_CHECKS: usize = 50;
+/// Most characters of a check name `pr_checks` returns.
+pub const MAX_CHECK_NAME_CHARS: usize = 120;
+const MAX_GH_STDOUT_BYTES: usize = 256 * 1024;
 /// Timeout of `push`.
 pub const PUSH_TIMEOUT: Duration = Duration::from_secs(120);
 /// Timeout of `pr_create`.
@@ -72,14 +102,16 @@ pub enum Request {
 }
 
 impl Request {
-    /// Parses one frame. An oversize frame, an unknown op and any extra key yield
+    /// Parses one frame. An oversize frame, a frame that is not a JSON object (serde also reads
+    /// `["fetch"]` as a tagged enum), an unknown op and any extra key yield
     /// [`Denial::InvalidRequest`].
     ///
     /// # Errors
     ///
     /// Returns [`Denial::InvalidRequest`] when the frame is not exactly one known request.
     pub fn parse(frame: &[u8]) -> Result<Self, Denial> {
-        if frame.len() > MAX_FRAME_BYTES {
+        let object = frame.iter().find(|b| !b.is_ascii_whitespace()) == Some(&b'{');
+        if frame.len() > MAX_FRAME_BYTES || !object {
             return Err(Denial::InvalidRequest);
         }
         serde_json::from_slice(frame).map_err(|_| Denial::InvalidRequest)
@@ -193,10 +225,12 @@ pub trait GhExecutor: Send + Sync {
         body: &str,
     ) -> impl Future<Output = Result<String, ExecError>> + Send;
 
-    /// Returns the check results of the pull request on the target branch.
+    /// Returns the check results of the pull request at `pr_url`, the URL the broker recorded
+    /// for this Job. The executor still validates it.
     fn pr_checks(
         &self,
         target: &PushTarget,
+        pr_url: &str,
     ) -> impl Future<Output = Result<String, ExecError>> + Send;
 }
 
@@ -208,6 +242,10 @@ pub enum Denial {
     InvalidRequest,
     /// The per-Job cap of the operation is spent.
     CapReached,
+    /// The operation was attempted again before its minimum interval passed. It spends no cap.
+    RateLimited,
+    /// `pr_checks` came before the broker recorded a pull request URL for the Job.
+    NoPullRequest,
     /// The executor failed.
     Failed,
     /// The operation exceeded its timeout.
@@ -221,6 +259,8 @@ impl Denial {
         match self {
             Self::InvalidRequest => "invalid request",
             Self::CapReached => "per-job cap reached",
+            Self::RateLimited => "rate limited",
+            Self::NoPullRequest => "no pull request recorded",
             Self::Failed => "operation failed",
             Self::TimedOut => "operation timed out",
         }
@@ -254,10 +294,61 @@ impl Response {
     }
 }
 
+/// The pacing of the two read operations.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Limits {
+    /// Most `pr_checks` attempts per Job.
+    pub max_pr_checks: u32,
+    /// Shortest time between two `pr_checks` attempts.
+    pub pr_checks_interval: Duration,
+    /// Most `fetch` attempts per Job.
+    pub max_fetches: u32,
+    /// Shortest time between two `fetch` attempts.
+    pub fetch_interval: Duration,
+}
+
+impl Default for Limits {
+    fn default() -> Self {
+        Self {
+            max_pr_checks: MAX_PR_CHECKS_PER_JOB,
+            pr_checks_interval: MIN_PR_CHECKS_INTERVAL,
+            max_fetches: MAX_FETCHES_PER_JOB,
+            fetch_interval: MIN_FETCH_INTERVAL,
+        }
+    }
+}
+
 #[derive(Debug, Default)]
 struct Counts {
     pushes: u32,
     prs: u32,
+    pr_url: Option<String>,
+    checks: Paced,
+    fetches: Paced,
+}
+
+#[derive(Debug, Default)]
+struct Paced {
+    count: u32,
+    last: Option<Instant>,
+}
+
+impl Paced {
+    fn spend(&mut self, cap: u32, interval: Duration) -> Result<(), Denial> {
+        if self.count >= cap {
+            return Err(Denial::CapReached);
+        }
+        let now = Instant::now();
+        if self
+            .last
+            .is_some_and(|last| now.saturating_duration_since(last) < interval)
+        {
+            return Err(Denial::RateLimited);
+        }
+        self.count += 1;
+        self.last = Some(now);
+        Ok(())
+    }
 }
 
 /// The broker of one Job.
@@ -266,7 +357,9 @@ pub struct Broker<G, H> {
     git: G,
     gh: H,
     redactor: Redactor,
+    limits: Limits,
     counts: Mutex<Counts>,
+    fetch_gate: tokio::sync::Mutex<()>,
 }
 
 impl<G: GitExecutor, H: GhExecutor> Broker<G, H> {
@@ -291,8 +384,17 @@ impl<G: GitExecutor, H: GhExecutor> Broker<G, H> {
             git,
             gh,
             redactor,
+            limits: Limits::default(),
             counts: Mutex::new(Counts::default()),
+            fetch_gate: tokio::sync::Mutex::new(()),
         })
+    }
+
+    /// Replaces the pacing of the read operations.
+    #[must_use]
+    pub const fn with_limits(mut self, limits: Limits) -> Self {
+        self.limits = limits;
+        self
     }
 
     /// The push target of the Job.
@@ -312,6 +414,7 @@ impl<G: GitExecutor, H: GhExecutor> Broker<G, H> {
     /// Serves one request.
     pub async fn handle(&self, request: Request) -> Response {
         let timeout = request.timeout();
+        let creating = matches!(request, Request::PrCreate { .. });
         let result = match request {
             Request::Push {} => {
                 if !self.reserve(|c| spend(&mut c.pushes, MAX_PUSHES_PER_JOB)) {
@@ -331,16 +434,63 @@ impl<G: GitExecutor, H: GhExecutor> Broker<G, H> {
                 tokio::time::timeout(timeout, self.gh.pr_create(&self.target, &title, &body)).await
             }
             Request::PrChecks {} => {
-                tokio::time::timeout(timeout, self.gh.pr_checks(&self.target)).await
+                let Some(url) = self.recorded_pr_url() else {
+                    return Response::denied(Denial::NoPullRequest);
+                };
+                let limits = self.limits;
+                if let Err(denial) = self.paced(|c| {
+                    c.checks
+                        .spend(limits.max_pr_checks, limits.pr_checks_interval)
+                }) {
+                    return Response::denied(denial);
+                }
+                tokio::time::timeout(timeout, self.gh.pr_checks(&self.target, &url)).await
             }
-            Request::Fetch {} => tokio::time::timeout(timeout, self.git.fetch()).await,
+            Request::Fetch {} => {
+                let limits = self.limits;
+                if let Err(denial) =
+                    self.paced(|c| c.fetches.spend(limits.max_fetches, limits.fetch_interval))
+                {
+                    return Response::denied(denial);
+                }
+                tokio::time::timeout(timeout, async {
+                    let _one_at_a_time = self.fetch_gate.lock().await;
+                    self.git.fetch().await
+                })
+                .await
+            }
         };
         match result {
-            Ok(Ok(output)) => Response::Done {
-                output: self.clean(&output),
-            },
+            Ok(Ok(output)) => {
+                let output = self.clean(&output);
+                if creating {
+                    self.record_pr_url(&output);
+                }
+                Response::Done { output }
+            }
             Ok(Err(ExecError)) => Response::denied(Denial::Failed),
             Err(_) => Response::denied(Denial::TimedOut),
+        }
+    }
+
+    fn paced(&self, spend: impl FnOnce(&mut Counts) -> Result<(), Denial>) -> Result<(), Denial> {
+        spend(&mut self.counts.lock().unwrap_or_else(PoisonError::into_inner))
+    }
+
+    fn recorded_pr_url(&self) -> Option<String> {
+        self.counts
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .pr_url
+            .clone()
+    }
+
+    fn record_pr_url(&self, output: &str) {
+        if let Some(url) = pr_url_of(output) {
+            self.counts
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .pr_url = Some(url);
         }
     }
 
@@ -364,6 +514,270 @@ impl<G, H> fmt::Debug for Broker<G, H> {
             .field("target", &self.target)
             .finish_non_exhaustive()
     }
+}
+
+/// Refreshes the mirror of the Job's own repo. `push` is refused until the push executor lands.
+///
+/// The repo comes from the claimed Job at construction, never from a request. `fetch` runs
+/// [`Workspace::fetch_mirror`], so it uses the production repo policy, an https-only protocol
+/// list, `core.hooksPath` and `core.fsmonitor` off, and the askpass helper bound to the token
+/// host. Build it from a clone of the runner's [`Workspace`]: only clones share the lock that
+/// serializes the refresh with `prepare`.
+#[derive(Debug, Clone)]
+pub struct MirrorGit {
+    workspace: Workspace,
+    repo: String,
+}
+
+impl MirrorGit {
+    /// An executor that refreshes the mirror of `job.repo`.
+    #[must_use]
+    pub fn new(workspace: Workspace, job: &Job) -> Self {
+        Self {
+            workspace,
+            repo: job.repo.clone(),
+        }
+    }
+}
+
+impl GitExecutor for MirrorGit {
+    fn push(&self, _target: &PushTarget) -> impl Future<Output = Result<String, ExecError>> + Send {
+        std::future::ready(Err(ExecError))
+    }
+
+    async fn fetch(&self) -> Result<String, ExecError> {
+        match self.workspace.fetch_mirror(&self.repo).await {
+            Ok(()) => Ok("fetched".to_owned()),
+            Err(err) => {
+                tracing::warn!(error = %err, detail = err.detail(), "broker fetch failed");
+                Err(ExecError)
+            }
+        }
+    }
+}
+
+/// Runs `gh pr checks` for the broker. `pr_create` is refused until its executor lands.
+///
+/// The child gets an empty environment plus `PATH`, a scratch `HOME`, `XDG_CONFIG_HOME` and
+/// `GH_CONFIG_DIR`, `GH_TOKEN`, `GH_HOST` and, off `github.com`, `GH_ENTERPRISE_TOKEN`. The
+/// token never reaches argv or fleetd's own environment. The agent shares fleetd's uid under
+/// some launchers, so this hides the token from other uids only (ADR-0024 Known limit).
+#[derive(Clone)]
+pub struct GhCli {
+    bin: PathBuf,
+    host: String,
+    token: String,
+    scratch: PathBuf,
+    path_env: Option<OsString>,
+}
+
+impl fmt::Debug for GhCli {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("GhCli")
+            .field("bin", &self.bin)
+            .field("host", &self.host)
+            .finish_non_exhaustive()
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct RawCheck {
+    bucket: Option<String>,
+    name: Option<String>,
+    link: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct Check {
+    bucket: &'static str,
+    name: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    link: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct Checks {
+    checks: Vec<Check>,
+    truncated: bool,
+}
+
+impl GhCli {
+    /// A `gh` executor for the pull requests of `host`, with `token` as that host's credential
+    /// and `scratch` as the child's home and working directory.
+    #[must_use]
+    pub fn new(
+        bin: impl Into<PathBuf>,
+        host: impl Into<String>,
+        token: String,
+        scratch: impl Into<PathBuf>,
+    ) -> Self {
+        Self {
+            bin: bin.into(),
+            host: host.into(),
+            token,
+            scratch: scratch.into(),
+            path_env: std::env::var_os("PATH"),
+        }
+    }
+
+    fn command(&self, pr_url: &str) -> Command {
+        let home = &self.scratch;
+        let mut command = Command::new(&self.bin);
+        command.env_clear();
+        if let Some(path) = &self.path_env {
+            command.env("PATH", path);
+        }
+        command
+            .env("HOME", home)
+            .env("XDG_CONFIG_HOME", home.join(".config"))
+            .env("GH_CONFIG_DIR", home.join("gh"))
+            .env("GH_TOKEN", &self.token)
+            .env("GH_HOST", &self.host)
+            .env("GH_PROMPT_DISABLED", "1")
+            .env("GH_NO_UPDATE_NOTIFIER", "1")
+            .env("NO_COLOR", "1");
+        if !self.host.eq_ignore_ascii_case("github.com") {
+            command.env("GH_ENTERPRISE_TOKEN", &self.token);
+        }
+        command
+            .args(["pr", "checks", pr_url, "--json", "bucket,link,name"])
+            .current_dir(home)
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .process_group(0)
+            .kill_on_drop(true);
+        command
+    }
+
+    async fn run(&self, pr_url: &str) -> Result<Vec<u8>, ExecError> {
+        tokio::fs::create_dir_all(&self.scratch)
+            .await
+            .map_err(|_| ExecError)?;
+        let mut child = self.command(pr_url).spawn().map_err(|_| ExecError)?;
+        let _guard = GroupGuard::new(child.id());
+        let mut stdout = child.stdout.take().ok_or(ExecError)?;
+        let mut raw = Vec::new();
+        (&mut stdout)
+            .take(MAX_GH_STDOUT_BYTES as u64 + 1)
+            .read_to_end(&mut raw)
+            .await
+            .map_err(|_| ExecError)?;
+        if raw.len() > MAX_GH_STDOUT_BYTES {
+            return Err(ExecError);
+        }
+        let _ = child.wait().await;
+        Ok(raw)
+    }
+
+    fn subset(&self, raw: &[u8]) -> Result<String, ExecError> {
+        let items: Vec<RawCheck> = serde_json::from_slice(raw).map_err(|_| ExecError)?;
+        let mut shown = Checks {
+            checks: Vec::new(),
+            truncated: items.len() > MAX_CHECKS,
+        };
+        for item in items.into_iter().take(MAX_CHECKS) {
+            shown.checks.push(Check {
+                bucket: bucket_name(item.bucket.as_deref()),
+                name: check_name(item.name.as_deref()),
+                link: item.link.filter(|link| link_on_host(link, &self.host)),
+            });
+            if serde_json::to_string(&shown).map_err(|_| ExecError)?.len() > MAX_OUTPUT_BYTES {
+                shown.checks.pop();
+                shown.truncated = true;
+                break;
+            }
+        }
+        serde_json::to_string(&shown).map_err(|_| ExecError)
+    }
+}
+
+impl GhExecutor for GhCli {
+    fn pr_create(
+        &self,
+        _target: &PushTarget,
+        _title: &str,
+        _body: &str,
+    ) -> impl Future<Output = Result<String, ExecError>> + Send {
+        std::future::ready(Err(ExecError))
+    }
+
+    async fn pr_checks(&self, _target: &PushTarget, pr_url: &str) -> Result<String, ExecError> {
+        if !is_pull_url(pr_url, &self.host) {
+            return Err(ExecError);
+        }
+        let raw = self.run(pr_url).await?;
+        self.subset(&raw)
+    }
+}
+
+fn bucket_name(bucket: Option<&str>) -> &'static str {
+    match bucket {
+        Some("pass") => "pass",
+        Some("fail") => "fail",
+        Some("pending") => "pending",
+        Some("skipping") => "skipping",
+        Some("cancel") => "cancel",
+        _ => "unknown",
+    }
+}
+
+fn check_name(name: Option<&str>) -> String {
+    name.unwrap_or_default()
+        .chars()
+        .filter(|c| !c.is_control() && !is_hidden_text(*c) && !is_line_separator(*c))
+        .take(MAX_CHECK_NAME_CHARS)
+        .collect::<String>()
+        .trim()
+        .to_owned()
+}
+
+fn host_of(url: &str) -> Option<&str> {
+    url.strip_prefix("https://")?.split(['/', '?', '#']).next()
+}
+
+fn link_on_host(link: &str, host: &str) -> bool {
+    is_ci_url(link) && host_of(link).is_some_and(|h| h.eq_ignore_ascii_case(host))
+}
+
+fn is_pull_url(url: &str, host: &str) -> bool {
+    if url.len() > MAX_PR_URL_BYTES || !link_on_host(url, host) {
+        return false;
+    }
+    let Some(path) = url
+        .strip_prefix("https://")
+        .and_then(|rest| rest.split_once('/'))
+        .map(|(_, path)| path)
+    else {
+        return false;
+    };
+    let mut parts = path.split('/');
+    let plain = |part: Option<&str>| {
+        part.is_some_and(|p| {
+            !p.is_empty()
+                && p != "."
+                && p != ".."
+                && p.bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.'))
+        })
+    };
+    plain(parts.next())
+        && plain(parts.next())
+        && parts.next() == Some("pull")
+        && parts
+            .next()
+            .is_some_and(|n| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()))
+        && parts.next().is_none()
+}
+
+/// The pull request URL in the redacted `pr_create` output: the last non-empty line, when it
+/// is one plain `https` URL of at most [`MAX_PR_URL_BYTES`] bytes.
+fn pr_url_of(output: &str) -> Option<String> {
+    let line = output
+        .split(is_line_separator)
+        .map(str::trim)
+        .rfind(|l| !l.is_empty())?;
+    (line.len() <= MAX_PR_URL_BYTES && is_ci_url(line)).then(|| line.to_owned())
 }
 
 fn spend(count: &mut u32, cap: u32) -> bool {
@@ -501,8 +915,9 @@ mod tests {
         fn pr_checks(
             &self,
             target: &PushTarget,
+            pr_url: &str,
         ) -> impl Future<Output = Result<String, ExecError>> + Send {
-            self.reply(format!("pr_checks {}", target.branch()))
+            self.reply(format!("pr_checks {} {pr_url}", target.branch()))
         }
     }
 
@@ -547,6 +962,22 @@ mod tests {
         Response::denied(error)
     }
 
+    const PR_URL: &str = "https://github.com/o/r/pull/7";
+
+    fn unpaced() -> Limits {
+        Limits {
+            max_pr_checks: u32::MAX,
+            pr_checks_interval: Duration::ZERO,
+            max_fetches: u32::MAX,
+            fetch_interval: Duration::ZERO,
+        }
+    }
+
+    fn with_url(b: Broker<Fake, Fake>) -> Broker<Fake, Fake> {
+        b.record_pr_url(PR_URL);
+        b
+    }
+
     #[test]
     fn requests_parse_with_no_extra_keys() {
         assert_eq!(Request::parse(br#"{"op":"push"}"#), Ok(Request::Push {}));
@@ -577,6 +1008,85 @@ mod tests {
                     "{frame}"
                 );
             }
+        }
+    }
+
+    #[test]
+    fn the_hostile_input_table_never_reaches_a_read_op() {
+        let keys = [
+            "url",
+            "pr",
+            "pr_url",
+            "pr_number",
+            "number",
+            "repo",
+            "repository",
+            "remote",
+            "ref",
+            "refspec",
+            "refs",
+            "branch",
+            "job_id",
+            "token",
+            "host",
+            "args",
+            "argv",
+            "flags",
+            "json",
+            "fields",
+            "depth",
+            "prune",
+            "force",
+            "all",
+            "tags",
+            "dir",
+            "cwd",
+            "env",
+            "config",
+            "-c",
+            "--upload-pack",
+            "",
+            "OP",
+            "Op",
+            "\u{0}",
+            "op ",
+        ];
+        for op in [r#""op":"pr_checks""#, r#""op":"fetch""#] {
+            for key in keys {
+                let key = key.replace('\u{0}', "\\u0000");
+                for value in [r#""x""#, "1", "null", "[]", r#"{"a":1}"#, "true"] {
+                    let frame = format!(r#"{{{op},"{key}":{value}}}"#);
+                    assert_eq!(
+                        Request::parse(frame.as_bytes()),
+                        Err(Denial::InvalidRequest),
+                        "{frame}"
+                    );
+                }
+            }
+        }
+        for frame in [
+            &br#"{"op":"PR_CHECKS"}"#[..],
+            br#"{"op":"Fetch"}"#,
+            br#"{"op":"fetch "}"#,
+            br#"{"op":" fetch"}"#,
+            br#"{"op":"fetch\u0000"}"#,
+            br#"{"op":["fetch"]}"#,
+            br#"{"op":null}"#,
+            br#"["fetch"]"#,
+            br#""fetch""#,
+            b"null",
+            br#"{"op":"fetch"}x"#,
+            br#"{"op":"fetch"}{"op":"fetch"}"#,
+            br#"{"op":"pr_checks","op":"pr_checks","url":"u"}"#,
+            b"{\"op\":\"fetch\"}\xff",
+            b"\xef\xbb\xbf{\"op\":\"fetch\"}",
+        ] {
+            assert_eq!(
+                Request::parse(frame),
+                Err(Denial::InvalidRequest),
+                "{}",
+                String::from_utf8_lossy(frame)
+            );
         }
     }
 
@@ -670,14 +1180,15 @@ mod tests {
                 output: "ok".to_owned()
             }
         );
-        own.handle(Request::PrChecks {}).await;
         own.handle(pr("t", "b")).await;
+        own.record_pr_url(PR_URL);
+        own.handle(Request::PrChecks {}).await;
         assert_eq!(
             fake.calls(),
             [
                 "push swarm/job1",
-                "pr_checks swarm/job1",
-                "pr_create swarm/job1 t b"
+                "pr_create swarm/job1 t b",
+                format!("pr_checks swarm/job1 {PR_URL}").as_str()
             ]
         );
 
@@ -752,19 +1263,223 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn read_ops_are_not_capped() -> TestResult {
+    async fn read_ops_run_up_to_their_own_cap_and_no_further() -> TestResult {
         let fake = Fake::default();
-        let b = broker(&fake)?;
-        for _ in 0..(MAX_PUSHES_PER_JOB + 5) {
+        let b = with_url(broker(&fake)?.with_limits(Limits {
+            max_pr_checks: 3,
+            max_fetches: 2,
+            ..unpaced()
+        }));
+        for _ in 0..3 {
             assert!(matches!(
                 b.handle(Request::PrChecks {}).await,
                 Response::Done { .. }
             ));
+        }
+        for _ in 0..2 {
             assert!(matches!(
                 b.handle(Request::Fetch {}).await,
                 Response::Done { .. }
             ));
         }
+        assert_eq!(
+            b.handle(Request::PrChecks {}).await,
+            denied(Denial::CapReached)
+        );
+        assert_eq!(
+            b.handle(Request::Fetch {}).await,
+            denied(Denial::CapReached)
+        );
+        assert_eq!(fake.calls().len(), 5);
+        Ok(())
+    }
+
+    #[test]
+    fn the_default_limits_are_the_documented_constants() {
+        assert_eq!(
+            Limits::default(),
+            Limits {
+                max_pr_checks: MAX_PR_CHECKS_PER_JOB,
+                pr_checks_interval: MIN_PR_CHECKS_INTERVAL,
+                max_fetches: MAX_FETCHES_PER_JOB,
+                fetch_interval: MIN_FETCH_INTERVAL,
+            }
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_read_op_inside_its_interval_is_rate_limited_and_spends_no_cap() -> TestResult {
+        let fake = Fake::default();
+        let b = with_url(broker(&fake)?);
+        assert!(matches!(
+            b.handle(Request::Fetch {}).await,
+            Response::Done { .. }
+        ));
+        for _ in 0..(MAX_FETCHES_PER_JOB + 3) {
+            assert_eq!(
+                b.handle(Request::Fetch {}).await,
+                denied(Denial::RateLimited)
+            );
+        }
+        tokio::time::advance(MIN_FETCH_INTERVAL.saturating_sub(Duration::from_millis(1))).await;
+        assert_eq!(
+            b.handle(Request::Fetch {}).await,
+            denied(Denial::RateLimited)
+        );
+        tokio::time::advance(Duration::from_millis(1)).await;
+        assert!(matches!(
+            b.handle(Request::Fetch {}).await,
+            Response::Done { .. }
+        ));
+        assert!(matches!(
+            b.handle(Request::PrChecks {}).await,
+            Response::Done { .. }
+        ));
+        assert_eq!(
+            b.handle(Request::PrChecks {}).await,
+            denied(Denial::RateLimited)
+        );
+        tokio::time::advance(MIN_PR_CHECKS_INTERVAL).await;
+        assert!(matches!(
+            b.handle(Request::PrChecks {}).await,
+            Response::Done { .. }
+        ));
+        assert_eq!(fake.calls().len(), 4);
+        Ok(())
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_failed_read_op_still_spends_its_slot_and_its_interval() -> TestResult {
+        let fake = Fake {
+            fail: true,
+            ..Fake::default()
+        };
+        let b = broker(&fake)?;
+        assert_eq!(b.handle(Request::Fetch {}).await, denied(Denial::Failed));
+        assert_eq!(
+            b.handle(Request::Fetch {}).await,
+            denied(Denial::RateLimited)
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn pr_checks_before_a_recorded_pull_request_is_refused_without_a_call() -> TestResult {
+        let fake = Fake::default();
+        let b = broker(&fake)?;
+        for _ in 0..3 {
+            assert_eq!(
+                b.handle(Request::PrChecks {}).await,
+                denied(Denial::NoPullRequest)
+            );
+        }
+        assert_eq!(fake.calls(), Vec::<String>::new());
+        assert_eq!(
+            b.handle(Request::PrChecks {}).await,
+            denied(Denial::NoPullRequest),
+            "a refused call must not spend the interval"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn pr_checks_uses_the_url_the_pr_create_reply_recorded() -> TestResult {
+        let fake = Fake {
+            output: format!("Creating pull request\n{PR_URL}\n"),
+            ..Fake::default()
+        };
+        let b = broker(&fake)?;
+        b.handle(pr("t", "b")).await;
+        b.handle(Request::PrChecks {}).await;
+        assert_eq!(
+            fake.calls(),
+            [
+                "pr_create swarm/job1 t b".to_owned(),
+                format!("pr_checks swarm/job1 {PR_URL}")
+            ]
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_pr_create_reply_that_is_not_one_plain_https_url_records_nothing() -> TestResult {
+        let long = format!(
+            "https://github.com/o/r/pull/{}",
+            "1".repeat(MAX_PR_URL_BYTES)
+        );
+        for output in [
+            "ok",
+            "",
+            "http://github.com/o/r/pull/1",
+            "https://github.com/o/r/pull/1 extra",
+            "https://user@github.com/o/r/pull/1",
+            "https://github.com/o\\r/pull/1",
+            "javascript:alert(1)",
+            long.as_str(),
+        ] {
+            let fake = Fake {
+                output: output.to_owned(),
+                ..Fake::default()
+            };
+            let b = broker(&fake)?;
+            b.handle(pr("t", "b")).await;
+            assert_eq!(
+                b.handle(Request::PrChecks {}).await,
+                denied(Denial::NoPullRequest),
+                "{output}"
+            );
+        }
+        Ok(())
+    }
+
+    #[derive(Clone, Default)]
+    struct Overlap {
+        running: Arc<Mutex<(u32, u32)>>,
+    }
+
+    impl GitExecutor for Overlap {
+        fn push(
+            &self,
+            _target: &PushTarget,
+        ) -> impl Future<Output = Result<String, ExecError>> + Send {
+            std::future::ready(Err(ExecError))
+        }
+
+        fn fetch(&self) -> impl Future<Output = Result<String, ExecError>> + Send {
+            let running = Arc::clone(&self.running);
+            async move {
+                {
+                    let mut state = running.lock().unwrap_or_else(PoisonError::into_inner);
+                    state.0 += 1;
+                    state.1 = state.1.max(state.0);
+                }
+                tokio::time::sleep(Duration::from_millis(50)).await;
+                running.lock().unwrap_or_else(PoisonError::into_inner).0 -= 1;
+                Ok(String::new())
+            }
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn concurrent_fetches_of_one_job_run_one_at_a_time() -> TestResult {
+        let overlap = Overlap::default();
+        let b = Broker::new(
+            AgentLauncher::Systemd,
+            &job("job1"),
+            overlap.clone(),
+            Fake::default(),
+            Redactor::new([SECRET]),
+        )?
+        .with_limits(unpaced());
+        let replies = tokio::join!(
+            b.handle(Request::Fetch {}),
+            b.handle(Request::Fetch {}),
+            b.handle(Request::Fetch {})
+        );
+        for reply in [replies.0, replies.1, replies.2] {
+            assert!(matches!(reply, Response::Done { .. }));
+        }
+        assert_eq!(overlap.running.lock().map(|s| s.1).ok(), Some(1));
         Ok(())
     }
 
@@ -982,7 +1697,7 @@ mod tests {
             ..Fake::default()
         };
         let b = broker(&fake)?;
-        let Response::Done { output } = b.handle(Request::PrChecks {}).await else {
+        let Response::Done { output } = b.handle(Request::Fetch {}).await else {
             return Err("not done".into());
         };
         assert_eq!(output.len(), MAX_OUTPUT_BYTES);
@@ -1023,7 +1738,7 @@ mod tests {
             hang: true,
             ..Fake::default()
         };
-        let b = broker(&fake)?;
+        let b = with_url(broker(&fake)?.with_limits(unpaced()));
         for request in [
             Request::Push {},
             pr("t", "b"),
