@@ -16,6 +16,7 @@ pub mod askpass;
 pub mod backoff;
 pub mod broker;
 mod config;
+pub mod connect_proxy;
 mod dump;
 mod error;
 pub mod events;
