@@ -596,10 +596,13 @@ dependencies = [
  "fleet-core",
  "fleet-proto",
  "fleet-server",
+ "http-body-util",
+ "hyper",
  "hyper-util",
  "prost",
  "rcgen",
  "rustix",
+ "rustls",
  "sd-notify",
  "serde",
  "serde_json",
@@ -607,12 +610,15 @@ dependencies = [
  "sqlx",
  "tempfile",
  "tokio",
+ "tokio-rustls",
  "tokio-stream",
  "toml",
  "tonic",
  "tower",
  "tracing",
  "tracing-subscriber",
+ "unicode-general-category",
+ "webpki-roots",
 ]
 
 [[package]]
@@ -2450,6 +2456,12 @@ name = "unicode-bidi"
 version = "0.3.18"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "5c1cb5db39152898a79168971543b1cb5020dff7fe43c8dc468b0885f5e29df5"
+
+[[package]]
+name = "unicode-general-category"
+version = "1.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "0b993bddc193ae5bd0d623b49ec06ac3e9312875fdae725a975c51db1cc1677f"
 
 [[package]]
 name = "unicode-ident"
