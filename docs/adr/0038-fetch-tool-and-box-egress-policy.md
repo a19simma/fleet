@@ -1,6 +1,6 @@
 # Fetch tool and Box egress policy
 
-Status: Proposed 2026-10-28, not built. Amends ADR-0029, ADR-0031 and ADR-0034. Refers to ADR-0036 for the per-job unix socket and ADR-0037 for the credential broker.
+Status: Proposed 2026-10-28. The fetch core (`fetch.rs`), the fetch event recorder and the fetch service on the job socket (`fetch_service.rs`) are built and not wired: no runtime path registers the service, and the `fleetd fetch` command, the Floor allow-set and the migration are not built. Amends ADR-0029, ADR-0031 and ADR-0034. Refers to ADR-0036 for the per-job unix socket and ADR-0037 for the credential broker.
 
 A Job needs to read web pages: documentation, issue threads, package pages. The Floor denies the built-in `WebFetch` (ADR-0034), and `curl` is denied by pattern. The built-in `WebSearch` stays allowed. This ADR fixes how a Job fetches a URL, which hosts it may reach, where the egress policy lives, and what gets recorded.
 
@@ -38,6 +38,8 @@ Fetch still enforces these limits:
 - An intent event is recorded before the fetch and an outcome event after it.
 - Fail closed: if the intent event cannot be recorded, the fetch is refused with a fixed error. "Recorded" means the fleetd event feed accepted the event and has not truncated. It does not mean the server confirmed it.
 - A failed outcome record adds `fetch_outcome` to the summary `missing` list.
+- If the fetch is cut off after the intent (socket cancelled, lease lost, panic), the handler records a failed outcome with no status. If the feed refuses that record, `fetch_outcome` is added to `missing`, so every intent has an outcome or a mark.
+- A cap slot is spent once the intent is recorded. A refusal before that point, including a failed intent record, spends none.
 - Build order: the recorder first, then the fetch handler.
 
 ### Output
