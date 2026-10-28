@@ -38,6 +38,25 @@ fn the_protocol_is_unchanged_with_no_service_and_names_fetch_when_it_is_on() {
 }
 
 #[test]
+fn the_embedded_bundle_ships_a_fetch_skill_that_forbids_curl_and_wget() -> TestResult {
+    let jobs = TempDir::new()?;
+    let job = JobDir::create(jobs.path(), "j1", &Bundle::default())?;
+    let skill = std::fs::read_to_string(job.home().join(".claude/skills/fetch/SKILL.md"))?;
+    assert!(skill.starts_with("---\nname: fetch\ndescription: "));
+    assert!(skill.contains("fleetd fetch <url>"));
+    assert!(skill.contains("Never use curl or wget"));
+    assert!(skill.contains("untrusted"));
+    let dir = TempDir::new()?;
+    std::fs::write(dir.path().join("CLAUDE.md"), "persona")?;
+    let kept = Bundle::from_dir(dir.path())?;
+    assert_ne!(kept.sha256(), Bundle::default().sha256());
+    let jobs = TempDir::new()?;
+    let job = JobDir::create(jobs.path(), "j2", &kept)?;
+    assert!(job.home().join(".claude/skills/fetch/SKILL.md").is_file());
+    Ok(())
+}
+
+#[test]
 fn a_plain_directory_is_accepted() -> TestResult {
     let dir = TempDir::new()?;
     std::fs::write(dir.path().join("CLAUDE.md"), "persona")?;

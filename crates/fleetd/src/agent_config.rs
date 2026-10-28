@@ -4,7 +4,8 @@
 //! `HOME` and `CLAUDE_CONFIG_DIR` there, so it never reads the operator's `~/.claude`. The
 //! directory sits outside the worktree and is built as `<job id>.tmp`, then renamed.
 //!
-//! The default bundle holds a short `CLAUDE.md` and a `settings.json` with permissions only.
+//! The default bundle holds a short `CLAUDE.md`, a `settings.json` with permissions only and
+//! the `fetch` skill.
 //! `agent_config_dir` replaces files of the same name and adds others under `home/.claude`.
 //! A directory is a plain copy: regular files only, at most [`MAX_ENTRIES`] entries and
 //! [`MAX_BYTES`] bytes in total, no symlinks and no `..` in the path. Its `settings.json`
@@ -65,9 +66,13 @@ const HOME: &str = "home";
 const CLAUDE_DIR: &str = ".claude";
 const SETTINGS: &str = "settings.json";
 const ALLOWED_SETTINGS_KEYS: [&str; 3] = ["permissions", "model", "attribution"];
-const EMBEDDED: [(&str, &str); 2] = [
+const EMBEDDED: [(&str, &str); 3] = [
     ("CLAUDE.md", include_str!("../agent-config/CLAUDE.md")),
     (SETTINGS, include_str!("../agent-config/settings.json")),
+    (
+        "skills/fetch/SKILL.md",
+        include_str!("../agent-config/skills/fetch/SKILL.md"),
+    ),
 ];
 const GITCONFIG: &str =
     "[user]\n\tname = Fleet Job\n\temail = fleet-job@fleet.invalid\n[commit]\n\tgpgsign = false\n";

@@ -211,7 +211,8 @@ pub fn apply_profile(
     if effective.allow.is_empty() {
         effective.allow = default_allow(default);
     }
-    let settings = settings_json(default, profile, &effective.allow, &effective.deny);
+    let settings_allow = floor::with_floor_allow(&effective.allow);
+    let settings = settings_json(default, profile, &settings_allow, &effective.deny);
     let bundle = Bundle::from_files(overlay(default, profile, settings)?)?;
     let mut argv = Vec::new();
     if let Some(model) = &effective.model {
@@ -504,7 +505,10 @@ mod tests {
         let raw = body(&applied, "settings.json").unwrap_or_default();
         let value: Value = serde_json::from_str(&raw).unwrap_or(Value::Null);
         assert_eq!(value["model"], json!("opus"));
-        assert_eq!(value["permissions"]["allow"], json!(["Read"]));
+        assert_eq!(
+            value["permissions"]["allow"],
+            json!(["Bash(fleetd fetch *)", "Read"])
+        );
         let deny = value["permissions"]["deny"]
             .as_array()
             .cloned()
@@ -513,6 +517,38 @@ mod tests {
             assert!(deny.contains(&json!(entry)));
         }
         assert!(deny.contains(&json!("Bash(rm *)")));
+        Ok(())
+    }
+
+    #[test]
+    fn settings_allow_always_holds_the_floor_allow_with_or_without_a_profile_allow()
+    -> Result<(), ApplyError> {
+        for profile in [
+            Profile::default(),
+            full(),
+            Profile {
+                allow: vec!["Bash(fleetd fetch *)".to_owned(), "Edit".to_owned()],
+                ..Profile::default()
+            },
+        ] {
+            let applied = run(&profile)?;
+            let raw = body(&applied, "settings.json").unwrap_or_default();
+            let value: Value = serde_json::from_str(&raw).unwrap_or(Value::Null);
+            let allow = value["permissions"]["allow"]
+                .as_array()
+                .cloned()
+                .unwrap_or_default();
+            assert_eq!(
+                allow
+                    .iter()
+                    .filter(|entry| **entry == json!("Bash(fleetd fetch *)"))
+                    .count(),
+                1
+            );
+            assert!(!allow.contains(&json!("Edit")));
+        }
+        let defaults = body(&run(&Profile::default())?, "settings.json").unwrap_or_default();
+        assert!(defaults.contains("\"Glob\""));
         Ok(())
     }
 
