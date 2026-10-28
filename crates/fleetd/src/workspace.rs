@@ -493,7 +493,8 @@ impl Workspace {
     /// timed out would otherwise fail every later fetch.
     ///
     /// An existing mirror is trusted only when it passes [`mirror_is_trusted`]. Otherwise it is
-    /// deleted and created again, which costs one full fetch. A new mirror is built in a
+    /// renamed to a sibling `.old`, deleted and created again, which costs one full fetch. A
+    /// crash mid-delete leaves only `.old` debris, which the next call removes. A new mirror is built in a
     /// sibling directory and renamed into place, so a mirror path never holds a repo without
     /// its gc settings.
     async fn sync_mirror(&self, mirror: &Path, repo: &str) -> Result<(), WorkspaceError> {
@@ -529,23 +530,22 @@ impl Workspace {
                 if trusted {
                     return Ok(());
                 }
-                let removed = if meta.is_dir() {
-                    tokio::fs::remove_dir_all(mirror).await
+                let aside = mirror.with_extension("old");
+                remove_path(&aside).await?;
+                if meta.is_dir() {
+                    tokio::fs::rename(mirror, &aside)
+                        .await
+                        .map_err(WorkspaceError::Io)?;
+                    remove_path(&aside).await?;
                 } else {
-                    tokio::fs::remove_file(mirror).await
-                };
-                removed.map_err(WorkspaceError::Io)?;
+                    remove_path(mirror).await?;
+                }
             }
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
             Err(e) => return Err(WorkspaceError::Io(e)),
         }
         let staging = mirror.with_extension("init");
-        match tokio::fs::remove_dir_all(&staging).await {
-            Err(e) if e.kind() != std::io::ErrorKind::NotFound => {
-                return Err(WorkspaceError::Io(e));
-            }
-            _ => {}
-        }
+        remove_path(&staging).await?;
         let dir = staging.to_str().ok_or(WorkspaceError::InvalidRepo)?;
         self.git(
             Path::new("."),
@@ -682,12 +682,24 @@ const FORBIDDEN_MIRROR_PATHS: [&str; 10] = [
     "objects/info/http-alternates",
 ];
 
+/// Entries `git init --bare` creates and a fetch needs, as `(path, is_file)`. A mirror missing
+/// one is a half-deleted tree and fails trust.
+const REQUIRED_MIRROR_PATHS: [(&str, bool); 6] = [
+    ("HEAD", true),
+    ("config", true),
+    ("objects", false),
+    ("refs", false),
+    ("objects/pack", false),
+    ("objects/info", false),
+];
+
 /// Whether `mirror` is a repo fleetd made and nobody else changed.
 ///
 /// A mirror made before the job group lost write access could hold anything an agent wrote,
 /// and fleetd fetches into it with the PAT in the environment. So the whole tree is walked
 /// without following symlinks, and every entry must be a regular file or directory owned by
-/// fleetd's effective uid with no group or other write bit. `HEAD` must exist. No path in
+/// fleetd's effective uid with no group or other write bit. Every entry of
+/// [`REQUIRED_MIRROR_PATHS`] must exist with the right kind. No path in
 /// [`FORBIDDEN_MIRROR_PATHS`] may exist: alternates, `commondir`, `config.worktree`, shallow
 /// or graft files, attributes, worktrees and submodule dirs. The `config` file may hold only
 /// the `core` keys git writes at init and the gc settings fleetd seeds, with `gc.auto` 0
@@ -699,7 +711,7 @@ fn mirror_is_trusted(mirror: &Path) -> bool {
     let Ok(entries) = mirror_entries(mirror, false) else {
         return false;
     };
-    let mut head = false;
+    let mut layout = 0_u8;
     for (path, meta) in &entries {
         let kind = meta.file_type();
         if !(kind.is_file() || kind.is_dir()) || meta.uid() != euid || meta.mode() & 0o022 != 0 {
@@ -714,10 +726,29 @@ fn mirror_is_trusted(mirror: &Path) -> bool {
         {
             return false;
         }
-        head |= relative == Path::new("HEAD") && kind.is_file();
+        for (bit, (name, is_file)) in REQUIRED_MIRROR_PATHS.iter().enumerate() {
+            if relative == Path::new(name) && kind.is_file() == *is_file {
+                layout |= 1 << bit;
+            }
+        }
     }
-    head && std::fs::read_to_string(mirror.join("config"))
-        .is_ok_and(|text| mirror_config_is_trusted(&text))
+    layout == (1 << REQUIRED_MIRROR_PATHS.len()) - 1
+        && std::fs::read_to_string(mirror.join("config"))
+            .is_ok_and(|text| mirror_config_is_trusted(&text))
+}
+
+/// Removes whatever sits at `path` without following symlinks: a directory tree, or a file or
+/// symlink. A missing path is fine.
+async fn remove_path(path: &Path) -> Result<(), WorkspaceError> {
+    let removed = match tokio::fs::symlink_metadata(path).await {
+        Ok(meta) if meta.is_dir() => tokio::fs::remove_dir_all(path).await,
+        Ok(_) => tokio::fs::remove_file(path).await,
+        Err(e) => Err(e),
+    };
+    match removed {
+        Err(e) if e.kind() != std::io::ErrorKind::NotFound => Err(WorkspaceError::Io(e)),
+        _ => Ok(()),
+    }
 }
 
 fn mirror_config_is_trusted(text: &str) -> bool {

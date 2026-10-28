@@ -207,9 +207,12 @@ async fn a_job_group_shares_the_cache_and_worktree_and_unset_does_not() -> TestR
 
 fn only_mirror(root: &Path) -> Result<PathBuf, Box<dyn std::error::Error>> {
     Ok(std::fs::read_dir(root.join(".cache"))?
-        .next()
-        .ok_or("no mirror")??
-        .path())
+        .map(|entry| entry.map(|e| e.path()))
+        .find(|path| {
+            path.as_ref()
+                .is_ok_and(|p| p.extension().is_some_and(|e| e == "git"))
+        })
+        .ok_or("no mirror")??)
 }
 
 #[tokio::test]
@@ -984,4 +987,122 @@ async fn the_mirror_config_turns_off_auto_gc_and_pruning() -> TestResult {
         Ok(())
     }))
     .await
+}
+
+async fn prepared_mirror()
+-> Result<(TempDir, String, PathBuf, Workspace, PathBuf), Box<dyn std::error::Error>> {
+    let dir = TempDir::new()?;
+    let repo = fixture(dir.path())?;
+    let root = dir.path().join("jobs");
+    let ws = workspace(&root);
+    ws.prepare("job1", &repo, "main").await?;
+    let mirror = only_mirror(&root)?;
+    Ok((dir, repo, root, ws, mirror))
+}
+
+#[tokio::test]
+async fn a_half_deleted_mirror_is_rebuilt_and_the_next_prepare_succeeds() -> TestResult {
+    for gone in ["objects", "refs", "objects/pack", "objects/info"] {
+        tokio::time::timeout(Duration::from_secs(60), async {
+            let (_dir, repo, _root, ws, mirror) = prepared_mirror().await?;
+            std::fs::write(mirror.join("marker"), "old")?;
+            std::fs::remove_dir_all(mirror.join(gone))?;
+            let second = ws.prepare("job2", &repo, "main").await?;
+            assert!(second.path.join("a.txt").is_file(), "{gone}");
+            assert!(!mirror.join("marker").exists(), "{gone} not rebuilt");
+            assert!(mirror.join("refs").is_dir() && mirror.join("objects/pack").is_dir());
+            Ok::<(), Box<dyn std::error::Error>>(())
+        })
+        .await??;
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_mirror_missing_head_or_config_is_rebuilt() -> TestResult {
+    for gone in ["HEAD", "config"] {
+        let (_dir, repo, _root, ws, mirror) = prepared_mirror().await?;
+        std::fs::write(mirror.join("marker"), "old")?;
+        std::fs::remove_file(mirror.join(gone))?;
+        let second = ws.prepare("job2", &repo, "main").await?;
+        assert!(second.path.join("a.txt").is_file(), "{gone}");
+        assert!(!mirror.join("marker").exists(), "{gone} not rebuilt");
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_stale_old_directory_does_not_break_prepare() -> TestResult {
+    let (_dir, repo, _root, ws, mirror) = prepared_mirror().await?;
+    let old = mirror.with_extension("old");
+    std::fs::create_dir_all(old.join("nested"))?;
+    std::fs::write(old.join("nested/f"), "x")?;
+    std::fs::write(mirror.join("marker"), "old")?;
+    std::fs::remove_dir_all(mirror.join("objects"))?;
+    ws.prepare("job2", &repo, "main").await?;
+    assert!(!old.exists());
+    assert!(!mirror.join("marker").exists());
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_stale_old_file_does_not_break_prepare() -> TestResult {
+    let (_dir, repo, _root, ws, mirror) = prepared_mirror().await?;
+    let old = mirror.with_extension("old");
+    std::fs::write(&old, "x")?;
+    std::fs::write(mirror.join("marker"), "old")?;
+    std::fs::remove_dir_all(mirror.join("refs"))?;
+    ws.prepare("job2", &repo, "main").await?;
+    assert!(!old.exists());
+    assert!(!mirror.join("marker").exists());
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_stale_old_symlink_is_removed_without_touching_its_target() -> TestResult {
+    let (dir, repo, _root, ws, mirror) = prepared_mirror().await?;
+    let target = dir.path().join("victim");
+    std::fs::create_dir_all(&target)?;
+    std::fs::write(target.join("keep"), "kept")?;
+    std::os::unix::fs::symlink(&target, mirror.with_extension("old"))?;
+    std::fs::remove_dir_all(mirror.join("refs"))?;
+    ws.prepare("job2", &repo, "main").await?;
+    assert_eq!(std::fs::read_to_string(target.join("keep"))?, "kept");
+    assert!(std::fs::symlink_metadata(mirror.with_extension("old")).is_err());
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_file_at_the_init_path_does_not_break_prepare() -> TestResult {
+    let dir = TempDir::new()?;
+    let repo = fixture(dir.path())?;
+    let root = dir.path().join("jobs");
+    let ws = workspace(&root);
+    ws.prepare("job1", &repo, "main").await?;
+    let mirror = only_mirror(&root)?;
+    std::fs::remove_dir_all(&mirror)?;
+    std::fs::write(mirror.with_extension("init"), "x")?;
+    let second = ws.prepare("job2", &repo, "main").await?;
+    assert!(second.path.join("a.txt").is_file());
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_symlink_at_the_init_path_is_removed_without_touching_its_target() -> TestResult {
+    let dir = TempDir::new()?;
+    let repo = fixture(dir.path())?;
+    let root = dir.path().join("jobs");
+    let ws = workspace(&root);
+    ws.prepare("job1", &repo, "main").await?;
+    let mirror = only_mirror(&root)?;
+    std::fs::remove_dir_all(&mirror)?;
+    let target = dir.path().join("victim");
+    std::fs::create_dir_all(&target)?;
+    std::fs::write(target.join("keep"), "kept")?;
+    std::os::unix::fs::symlink(&target, mirror.with_extension("init"))?;
+    let second = ws.prepare("job2", &repo, "main").await?;
+    assert!(second.path.join("a.txt").is_file());
+    assert_eq!(std::fs::read_to_string(target.join("keep"))?, "kept");
+    assert_eq!(std::fs::read_dir(&target)?.count(), 1);
+    Ok(())
 }
