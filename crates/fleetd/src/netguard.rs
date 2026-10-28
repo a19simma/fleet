@@ -80,9 +80,447 @@ pub fn is_public_address(ip: IpAddr) -> bool {
     }
 }
 
+/// Longest URL a fetch accepts, in bytes (ADR-0038).
+pub const MAX_URL_BYTES: usize = 1024;
+
+/// Why [`precheck_url`] refused a URL. Display text is fixed and holds no part of the input.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UrlRefusal {
+    /// The URL is longer than [`MAX_URL_BYTES`].
+    TooLong,
+    /// The URL holds a byte outside printable ASCII, or a backslash.
+    InvalidCharacter,
+    /// The scheme is not `https`.
+    NotHttps,
+    /// The URL holds a `#`.
+    Fragment,
+    /// The authority holds an `@`.
+    Userinfo,
+    /// The port is not exactly `443`.
+    BadPort,
+    /// The host is empty.
+    EmptyHost,
+    /// The host is not a valid ASCII DNS name or IPv6 literal.
+    InvalidHost,
+    /// The host ends in a dot.
+    TrailingDot,
+    /// The host is an IP literal that fails [`is_public_address`].
+    NonPublicAddress,
+}
+
+impl std::fmt::Display for UrlRefusal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::TooLong => "url too long",
+            Self::InvalidCharacter => "url holds a disallowed character",
+            Self::NotHttps => "url scheme must be https",
+            Self::Fragment => "url fragment refused",
+            Self::Userinfo => "url userinfo refused",
+            Self::BadPort => "url port must be 443",
+            Self::EmptyHost => "url host empty",
+            Self::InvalidHost => "url host invalid",
+            Self::TrailingDot => "url host trailing dot refused",
+            Self::NonPublicAddress => "url host address not public",
+        })
+    }
+}
+
+impl std::error::Error for UrlRefusal {}
+
+/// A URL that passed [`precheck_url`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ParsedTarget {
+    /// Lowercase ASCII host; an IPv6 literal has no brackets.
+    pub host: String,
+    /// Always 443.
+    pub port: u16,
+    /// Path and query, starting with `/`.
+    pub path: String,
+}
+
+const HTTPS_PREFIX: &str = "https://";
+const MAX_HOST_BYTES: usize = 253;
+const MAX_LABEL_BYTES: usize = 63;
+const HTTPS_PORT: u16 = 443;
+
+fn parse_port(text: &str) -> Result<u16, UrlRefusal> {
+    if text.is_empty() || !text.bytes().all(|b| b.is_ascii_digit()) {
+        return Err(UrlRefusal::BadPort);
+    }
+    match text.parse::<u16>() {
+        Ok(HTTPS_PORT) if text == "443" => Ok(HTTPS_PORT),
+        _ => Err(UrlRefusal::BadPort),
+    }
+}
+
+fn check_dns_host(host: &str) -> Result<(), UrlRefusal> {
+    if host.is_empty() {
+        return Err(UrlRefusal::EmptyHost);
+    }
+    if host.ends_with('.') {
+        return Err(UrlRefusal::TrailingDot);
+    }
+    if host.len() > MAX_HOST_BYTES {
+        return Err(UrlRefusal::InvalidHost);
+    }
+    for label in host.split('.') {
+        let bytes = label.as_bytes();
+        let edge_ok = bytes.first() != Some(&b'-') && bytes.last() != Some(&b'-');
+        let chars_ok = bytes
+            .iter()
+            .all(|b| b.is_ascii_alphanumeric() || *b == b'-');
+        if bytes.is_empty() || bytes.len() > MAX_LABEL_BYTES || !edge_ok || !chars_ok {
+            return Err(UrlRefusal::InvalidHost);
+        }
+    }
+    let tld_starts_with_letter = host
+        .rsplit('.')
+        .next()
+        .and_then(|tld| tld.bytes().next())
+        .is_some_and(|b| b.is_ascii_alphabetic());
+    if !tld_starts_with_letter || !host.contains('.') {
+        return Err(UrlRefusal::InvalidHost);
+    }
+    Ok(())
+}
+
+fn parse_host(authority_host: &str) -> Result<String, UrlRefusal> {
+    if let Some(inner) = authority_host.strip_prefix('[') {
+        let literal = inner.strip_suffix(']').ok_or(UrlRefusal::InvalidHost)?;
+        let ip = literal
+            .parse::<Ipv6Addr>()
+            .map_err(|_| UrlRefusal::InvalidHost)?;
+        return if is_public_address(IpAddr::V6(ip)) {
+            Ok(ip.to_string())
+        } else {
+            Err(UrlRefusal::NonPublicAddress)
+        };
+    }
+    let host = authority_host.to_ascii_lowercase();
+    if let Ok(ip) = host.parse::<Ipv4Addr>() {
+        return if is_public_address(IpAddr::V4(ip)) {
+            Ok(host)
+        } else {
+            Err(UrlRefusal::NonPublicAddress)
+        };
+    }
+    check_dns_host(&host)?;
+    Ok(host)
+}
+
+/// Checks a URL without touching the network and returns its host, port and path.
+///
+/// Accepts only `https` on port 443, written as `443` or left out. Refuses, with a fixed
+/// [`UrlRefusal`] that holds no part of the input: a length over [`MAX_URL_BYTES`], any byte
+/// outside printable ASCII (whitespace, controls and non-ASCII, so an internationalised host
+/// must arrive as punycode), a backslash, a fragment, userinfo, an empty host, a percent sign in
+/// the host, a trailing-dot host (refused, never stripped, so one host has one spelling), a
+/// single-label host, a host whose last label does not start with a letter (which refuses the
+/// numeric and hex forms resolvers read as IPv4), and an IP literal that fails
+/// [`is_public_address`]. The returned host is lowercase ASCII; an IPv6 literal comes back
+/// without brackets. The path keeps its query and is `/` when the URL has none.
+///
+/// This is the pre-check only. The resolved address is checked again at dial time.
+///
+/// # Errors
+/// Returns the [`UrlRefusal`] for the first rule the URL breaks.
+pub fn precheck_url(input: &str) -> Result<ParsedTarget, UrlRefusal> {
+    if input.len() > MAX_URL_BYTES {
+        return Err(UrlRefusal::TooLong);
+    }
+    if !input.bytes().all(|b| b.is_ascii_graphic()) || input.contains('\\') {
+        return Err(UrlRefusal::InvalidCharacter);
+    }
+    let rest = input
+        .get(..HTTPS_PREFIX.len())
+        .filter(|head| head.eq_ignore_ascii_case(HTTPS_PREFIX))
+        .and_then(|_| input.get(HTTPS_PREFIX.len()..))
+        .ok_or(UrlRefusal::NotHttps)?;
+    if rest.contains('#') {
+        return Err(UrlRefusal::Fragment);
+    }
+    let authority_end = rest.find(['/', '?']).unwrap_or(rest.len());
+    let (authority, tail) = rest.split_at(authority_end);
+    if authority.contains('@') {
+        return Err(UrlRefusal::Userinfo);
+    }
+    let (host_text, port) = match authority.rfind(':') {
+        Some(at) if !authority.starts_with('[') || authority[..at].ends_with(']') => {
+            (&authority[..at], parse_port(&authority[at + 1..])?)
+        }
+        _ => (authority, HTTPS_PORT),
+    };
+    if host_text.contains('%') {
+        return Err(UrlRefusal::InvalidHost);
+    }
+    let host = parse_host(host_text)?;
+    let path = if tail.is_empty() {
+        "/".to_owned()
+    } else if tail.starts_with('?') {
+        format!("/{tail}")
+    } else {
+        tail.to_owned()
+    };
+    Ok(ParsedTarget { host, port, path })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn refusal(s: &str) -> Option<UrlRefusal> {
+        precheck_url(s).err()
+    }
+
+    fn target(host: &str, path: &str) -> ParsedTarget {
+        ParsedTarget {
+            host: host.to_owned(),
+            port: 443,
+            path: path.to_owned(),
+        }
+    }
+
+    #[test]
+    fn named_range_edges_are_refused_and_neighbours_allowed() {
+        let refused = [
+            "0.0.0.0",
+            "0.255.255.255",
+            "10.0.0.0",
+            "10.255.255.255",
+            "127.0.0.1",
+            "127.255.255.255",
+            "169.254.0.0",
+            "169.254.255.255",
+            "172.16.0.0",
+            "172.31.255.255",
+            "192.168.0.0",
+            "192.168.255.255",
+            "192.0.2.0",
+            "198.51.100.255",
+            "203.0.113.0",
+            "224.0.0.0",
+            "239.255.255.255",
+            "255.255.255.255",
+        ];
+        for s in refused {
+            assert!(!is_public_address(ip4(s)), "{s}");
+        }
+        for ip in [
+            Ipv4Addr::new(100, 64, 0, 0),
+            Ipv4Addr::new(100, 127, 255, 255),
+        ] {
+            assert!(!is_public_address(IpAddr::V4(ip)), "{ip}");
+        }
+        for s in [
+            "1.0.0.0",
+            "9.255.255.255",
+            "11.0.0.0",
+            "172.15.255.255",
+            "172.32.0.0",
+        ] {
+            assert!(is_public_address(ip4(s)), "{s}");
+        }
+        for s in [
+            "fe80::",
+            "febf:ffff:ffff:ffff:ffff:ffff:ffff:ffff",
+            "fc00::",
+            "fdff::1",
+        ] {
+            assert!(!is_public_address(ip6(s)), "{s}");
+        }
+        for s in [
+            "2002:7f00:1::1",
+            "2002:0a00:1::1",
+            "64:ff9b::7f00:1",
+            "64:ff9b::a00:1",
+        ] {
+            assert!(!is_public_address(ip6(s)), "{s}");
+        }
+    }
+
+    #[test]
+    fn precheck_accepts_plain_https_and_normalises() {
+        assert_eq!(
+            precheck_url("https://example.com"),
+            Ok(target("example.com", "/"))
+        );
+        assert_eq!(
+            precheck_url("HTTPS://Example.COM/a/b"),
+            Ok(target("example.com", "/a/b"))
+        );
+        assert_eq!(
+            precheck_url("https://example.com:443/x?q=1"),
+            Ok(target("example.com", "/x?q=1"))
+        );
+        assert_eq!(
+            precheck_url("https://example.com?q=1"),
+            Ok(target("example.com", "/?q=1"))
+        );
+        assert_eq!(
+            precheck_url("https://xn--bcher-kva.example/"),
+            Ok(target("xn--bcher-kva.example", "/"))
+        );
+        assert_eq!(
+            precheck_url("https://example.com/a@b"),
+            Ok(target("example.com", "/a@b"))
+        );
+        assert_eq!(
+            precheck_url("https://example.com/%41"),
+            Ok(target("example.com", "/%41"))
+        );
+        assert_eq!(precheck_url("https://8.8.8.8/"), Ok(target("8.8.8.8", "/")));
+        assert_eq!(
+            precheck_url("https://[2606:4700:4700::1111]:443/"),
+            Ok(target("2606:4700:4700::1111", "/"))
+        );
+    }
+
+    #[test]
+    fn precheck_refuses_scheme_and_userinfo() {
+        assert_eq!(refusal("http://example.com/"), Some(UrlRefusal::NotHttps));
+        assert_eq!(refusal("ftp://example.com/"), Some(UrlRefusal::NotHttps));
+        assert_eq!(refusal("example.com/"), Some(UrlRefusal::NotHttps));
+        assert_eq!(refusal("https:/example.com"), Some(UrlRefusal::NotHttps));
+        assert_eq!(
+            refusal("https://u@example.com/"),
+            Some(UrlRefusal::Userinfo)
+        );
+        assert_eq!(
+            refusal("https://u:p@example.com/"),
+            Some(UrlRefusal::Userinfo)
+        );
+        assert_eq!(refusal("https://@example.com/"), Some(UrlRefusal::Userinfo));
+        assert_eq!(
+            refusal("https://good.example@evil.example/"),
+            Some(UrlRefusal::Userinfo)
+        );
+    }
+
+    #[test]
+    fn precheck_refuses_ports_other_than_443() {
+        for s in [
+            "https://example.com:0/",
+            "https://example.com:80/",
+            "https://example.com:8443/",
+            "https://example.com:00443/",
+            "https://example.com:65536/",
+            "https://example.com:+443/",
+            "https://example.com:/",
+            "https://example.com:44a/",
+            "https://[2606:4700:4700::1111]:80/",
+        ] {
+            assert_eq!(refusal(s), Some(UrlRefusal::BadPort), "{s}");
+        }
+    }
+
+    #[test]
+    fn precheck_refuses_length_over_cap_and_accepts_at_cap() {
+        let head = "https://example.com/";
+        let at = format!("{head}{}", "a".repeat(MAX_URL_BYTES - head.len()));
+        assert_eq!(at.len(), MAX_URL_BYTES);
+        assert!(precheck_url(&at).is_ok());
+        let over = format!("{at}a");
+        assert_eq!(refusal(&over), Some(UrlRefusal::TooLong));
+    }
+
+    #[test]
+    fn precheck_refuses_hostile_characters() {
+        for s in [
+            "https://example.com\\@evil.example/",
+            "https://example.com/a\\b",
+            "https://example.com/a b",
+            " https://example.com/",
+            "https://example.com/\t",
+            "https://example.com/\n",
+            "https://exa\tmple.com/",
+            "https://exa\u{0}mple.com/",
+            "https://b\u{fc}cher.example/",
+            "https://example.com/\u{e9}",
+        ] {
+            assert_eq!(refusal(s), Some(UrlRefusal::InvalidCharacter), "{s}");
+        }
+    }
+
+    #[test]
+    fn precheck_refuses_fragments() {
+        for s in [
+            "https://example.com/#a",
+            "https://example.com#a",
+            "https://example.com/a?b#c",
+        ] {
+            assert_eq!(refusal(s), Some(UrlRefusal::Fragment), "{s}");
+        }
+    }
+
+    #[test]
+    fn precheck_refuses_bad_hosts() {
+        assert_eq!(refusal("https:///path"), Some(UrlRefusal::EmptyHost));
+        assert_eq!(refusal("https://"), Some(UrlRefusal::EmptyHost));
+        assert_eq!(refusal("https://:443/"), Some(UrlRefusal::EmptyHost));
+        assert_eq!(refusal("https://?q=1"), Some(UrlRefusal::EmptyHost));
+        for s in [
+            "https://example.com./",
+            "https://example.com.:443/",
+            "https://./",
+        ] {
+            assert_eq!(refusal(s), Some(UrlRefusal::TrailingDot), "{s}");
+        }
+        for s in [
+            "https://exa%6dple.com/",
+            "https://%65xample.com/",
+            "https://a..example/",
+            "https://.example.com/",
+            "https://-a.example/",
+            "https://a-.example/",
+            "https://a_b.example/",
+            "https://*.example.com/",
+            "https://example.com:443:443/",
+            "https://[::1/",
+            "https://[::1]x/",
+            "https://[nope]/",
+            "https://localhost/",
+            "https://intranet/",
+            "https://0x7f000001/",
+            "https://0x7f.0.0.1/",
+            "https://127.1/",
+            "https://2130706433/",
+            "https://017700000001/",
+            "https://1.2.3/",
+        ] {
+            assert_eq!(refusal(s), Some(UrlRefusal::InvalidHost), "{s}");
+        }
+        let long_label = format!("https://{}.example/", "a".repeat(64));
+        assert_eq!(refusal(&long_label), Some(UrlRefusal::InvalidHost));
+        let ok_label = format!("https://{}.example/", "a".repeat(63));
+        assert!(precheck_url(&ok_label).is_ok());
+        let long_host = format!("https://{}/", vec!["a".repeat(60); 5].join(".") + ".com");
+        assert_eq!(refusal(&long_host), Some(UrlRefusal::InvalidHost));
+    }
+
+    #[test]
+    fn precheck_refuses_non_public_ip_literals() {
+        for s in [
+            "https://127.0.0.1/",
+            "https://10.0.0.1/",
+            "https://169.254.169.254/",
+            "https://192.168.1.1/",
+            "https://0.0.0.0/",
+            "https://255.255.255.255/",
+            "https://[::1]/",
+            "https://[::]/",
+            "https://[fe80::1]/",
+            "https://[fd00::1]/",
+            "https://[::ffff:127.0.0.1]/",
+            "https://[::ffff:7f00:1]/",
+            "https://[64:ff9b::7f00:1]/",
+            "https://[2002:7f00:1::1]/",
+            "https://[ff02::1]/",
+        ] {
+            assert_eq!(refusal(s), Some(UrlRefusal::NonPublicAddress), "{s}");
+        }
+        let cgnat = format!("https://{}/", Ipv4Addr::new(100, 64, 0, 1));
+        assert_eq!(refusal(&cgnat), Some(UrlRefusal::NonPublicAddress));
+    }
 
     fn v4_span(block: V4Block) -> (Ipv4Addr, Ipv4Addr) {
         let (net, len) = block;
