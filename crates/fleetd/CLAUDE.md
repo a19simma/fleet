@@ -11,7 +11,7 @@
 ## Runner loop
 
 - **List every exit arm of a loop with several, and test each one for the heartbeat and the group kill.** The arms are stdout EOF, child exit, deadline, shutdown and report error. A17 failed twice because each retry fixed the named arm and left a sibling: group disarmed after wait, report awaited inside `select`, no heartbeat arm after stdout EOF.
-- **A change to the spawn path needs every test binary that spawns the fake agent.** `grep -l claude_bin crates/fleetd/tests/*.rs` lists them, and `daemon_jobs` and `e2e_jobs` are among them. TEL-A3 ran only `telemetry` and `runner::` tests and went red on both in the independent verify.
+- **A change to the spawn path, or to a default that changes what a job does after the agent exits, needs every test binary that spawns the fake agent.** `grep -l 'claude_bin\|fake_gh\|"gh"' crates/fleetd/tests/*.rs` lists them, and `daemon_jobs` and `e2e_jobs` are among them. TEL-A3 ran only `telemetry` and `runner::` tests, and TEL-J2 added a 900 s CI wait after the PR that a fake `gh` answering every call alike turned into four red integration tests; both went red only in the independent verify.
 
 ## Profile jobs
 
