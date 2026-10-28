@@ -413,6 +413,106 @@ async fn tools_pages_through_every_page_and_keeps_only_tool_events() -> TestResu
     Ok(())
 }
 
+fn fetch(seq: u32, url: &str, status: Option<i32>, bytes: Option<u64>) -> JobEvent {
+    JobEvent {
+        seq,
+        ts_ms: 3_725_000 + u64::from(seq) * 1_000,
+        kind: JobEventKind::Fetch.into(),
+        exit_code: status,
+        out_bytes: bytes,
+        cmd: Some(url.into()),
+        detail: Some("detail".into()),
+        ..JobEvent::default()
+    }
+}
+
+#[tokio::test]
+async fn tools_shows_fetch_rows_with_host_status_and_bytes() -> TestResult {
+    let events = vec![
+        fetch(
+            0,
+            "https://user:pw@docs.example.org:8443/a/b?q=secret#f",
+            None,
+            None,
+        ),
+        fetch(
+            1,
+            "https://docs.example.org/a/b?q=secret",
+            Some(200),
+            Some(1_234),
+        ),
+        fetch(2, "not a url", Some(404), Some(0)),
+        tool(3, "Bash"),
+    ];
+    let url = serve(Stub {
+        events,
+        page: 10,
+        ..Stub::default()
+    })
+    .await?;
+    let (res, out) = cli(&url, TOKEN, &["status", "job-1", "--tools"]).await;
+    res?;
+    let table = out.split("seq\t").nth(1).ok_or("no table")?;
+    let rows: Vec<&str> = table.lines().skip(1).collect();
+    assert_eq!(
+        rows,
+        [
+            "0\t01:02:05\tfetch\t-\t-\t-\tdocs.example.org:8443",
+            "1\t01:02:06\tfetch\tstatus 200\t-\t1234\tdocs.example.org",
+            "2\t01:02:07\tfetch\tstatus 404\t-\t0\t-",
+            "3\t01:02:08\tBash\tok\t31ms\t4096\tcmd 3",
+        ]
+    );
+    assert!(!out.contains("secret"), "{out}");
+    Ok(())
+}
+
+#[tokio::test]
+async fn tools_fetch_host_fails_closed_on_hostile_urls() -> TestResult {
+    let long_host = format!("https://{}/x", "h".repeat(200));
+    let cases: Vec<(String, String)> = vec![
+        ("https://[::1]:8080/p?q=secret".into(), "[::1]:8080".into()),
+        ("https:///path".into(), "-".into()),
+        ("https://@/path".into(), "-".into()),
+        (
+            "https://u:p@ss@host.example/x".into(),
+            "host.example".into(),
+        ),
+        ("https://u:pa/secret@host.example/x".into(), "-".into()),
+        ("https://u:pa?secret@host.example/x".into(), "-".into()),
+        ("https://u:pa#secret@host.example/x".into(), "-".into()),
+        ("https://good.example\\@evil.example/x".into(), "-".into()),
+        ("https://u:secret\\@host.example/x".into(), "-".into()),
+        ("1http://host.example/".into(), "-".into()),
+        ("ht tp://host.example/".into(), "-".into()),
+        ("://host.example/".into(), "-".into()),
+        (long_host, format!("{}\u{2026}", "h".repeat(59))),
+    ];
+    let events: Vec<JobEvent> = cases
+        .iter()
+        .enumerate()
+        .map(|(i, (url, _))| fetch(u32::try_from(i).unwrap_or(0), url, None, None))
+        .collect();
+    let url = serve(Stub {
+        events,
+        page: 100,
+        ..Stub::default()
+    })
+    .await?;
+    let (res, out) = cli(&url, TOKEN, &["status", "job-1", "--tools"]).await;
+    res?;
+    let table = out.split("seq\t").nth(1).ok_or("no table")?;
+    let hosts: Vec<&str> = table
+        .lines()
+        .skip(1)
+        .filter_map(|row| row.rsplit('\t').next())
+        .collect();
+    let want: Vec<&str> = cases.iter().map(|(_, host)| host.as_str()).collect();
+    assert_eq!(hosts, want);
+    assert!(!out.contains("secret"), "{out}");
+    Ok(())
+}
+
 #[tokio::test]
 async fn tools_row_shows_exit_codes_dashes_and_cuts_the_command() -> TestResult {
     let long = JobEvent {
