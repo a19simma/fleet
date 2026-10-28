@@ -98,6 +98,69 @@ async fn worktree_on_branch() -> TestResult {
 }
 
 #[tokio::test]
+async fn the_checkout_is_a_clone_that_borrows_the_mirror_objects() -> TestResult {
+    common::bounded(Box::pin(async {
+        let dir = TempDir::new()?;
+        let repo = fixture(dir.path())?;
+        let root = dir.path().join("jobs");
+        let checkout = workspace(&root).prepare("job1", &repo, "main").await?;
+        assert!(checkout.path.join(".git").is_dir());
+        let mirror = only_mirror(&root)?;
+        let alternates =
+            std::fs::read_to_string(checkout.path.join(".git/objects/info/alternates"))?;
+        assert_eq!(
+            std::fs::canonicalize(alternates.trim())?,
+            std::fs::canonicalize(mirror.join("objects"))?
+        );
+        assert!(!mirror.join("worktrees").exists());
+        assert!(
+            git(
+                &mirror,
+                &["rev-parse", "--verify", "--quiet", "refs/heads/swarm/job1"]
+            )
+            .is_err()
+        );
+        assert_eq!(
+            git(&checkout.path, &["rev-parse", "--abbrev-ref", "HEAD"])?,
+            "swarm/job1"
+        );
+        assert_eq!(git(&checkout.path, &["status", "--porcelain"])?, "");
+        Ok(())
+    }))
+    .await
+}
+
+#[tokio::test]
+async fn the_clone_holds_no_objects_and_links_none_from_the_mirror() -> TestResult {
+    common::bounded(Box::pin(async {
+        use std::os::unix::fs::MetadataExt;
+        let dir = TempDir::new()?;
+        let repo = fixture(dir.path())?;
+        let root = dir.path().join("jobs");
+        let checkout = workspace(&root).prepare("job1", &repo, "main").await?;
+        let mut names = std::fs::read_dir(checkout.path.join(".git/objects"))?
+            .map(|entry| entry.map(|e| e.file_name().to_string_lossy().into_owned()))
+            .collect::<Result<Vec<_>, _>>()?;
+        names.sort();
+        assert_eq!(names, ["info", "pack"]);
+        let mirror = only_mirror(&root)?;
+        let mut stack = vec![mirror.join("objects")];
+        while let Some(path) = stack.pop() {
+            for entry in std::fs::read_dir(&path)? {
+                let entry = entry?;
+                if entry.file_type()?.is_dir() {
+                    stack.push(entry.path());
+                } else {
+                    assert_eq!(entry.metadata()?.nlink(), 1, "{:?}", entry.path());
+                }
+            }
+        }
+        Ok(())
+    }))
+    .await
+}
+
+#[tokio::test]
 async fn a_job_id_of_the_longest_accepted_length_prepares() -> TestResult {
     common::bounded(Box::pin(async {
         let dir = TempDir::new()?;
@@ -130,7 +193,10 @@ async fn a_job_group_shares_the_cache_and_worktree_and_unset_does_not() -> TestR
             .with_job_group(Some(gid))
             .prepare("j1", &repo, "main")
             .await?;
-        assert_eq!(mode(&shared.join(".cache"))?, 0o2770);
+        assert_eq!(mode(&shared.join(".cache"))?, 0o2750);
+        let mirror = only_mirror(&shared)?;
+        assert_eq!(mode(&mirror)? & 0o022, 0);
+        assert_eq!(mode(&mirror.join("objects"))? & 0o022, 0);
         assert_eq!(mode(&checkout.path)?, 0o2770);
         assert_eq!(mode(&checkout.path.join("a.txt"))? & 0o070, 0o060);
         assert_eq!(mode(&shared.join(".git-home"))? & 0o2020, 0);
@@ -373,6 +439,7 @@ async fn a_second_prepare_of_the_same_job_after_remove_succeeds_and_remove_delet
             )
             .is_err()
         );
+        assert!(!root.join("job1").exists());
         let again = ws.prepare("job1", &repo, "main").await?;
         assert_eq!(std::fs::read_to_string(again.path.join("a.txt"))?, "one");
         Ok(())
@@ -413,7 +480,7 @@ async fn stale_lock_files_in_the_mirror_are_cleared_before_the_fetch() -> TestRe
         let locks = [
             mirror.join("shallow.lock"),
             mirror.join("refs/remotes/origin/main.lock"),
-            mirror.join("worktrees/job1/index.lock"),
+            mirror.join("packed-refs.lock"),
         ];
         for lock in &locks {
             std::fs::write(lock, "")?;
@@ -784,6 +851,116 @@ async fn a_branch_named_like_a_short_hex_is_still_a_branch() -> TestResult {
         let ws = workspace(dir.path().join("jobs"));
         let checkout = ws.prepare("job1", &repo, "abcdef0").await?;
         assert!(checkout.path.join("a.txt").exists());
+        Ok(())
+    }))
+    .await
+}
+
+fn real_git() -> Result<PathBuf, Box<dyn std::error::Error>> {
+    let path = std::env::var_os("PATH").ok_or("PATH")?;
+    std::env::split_paths(&path)
+        .map(|dir| dir.join("git"))
+        .find(|candidate| candidate.is_file())
+        .ok_or_else(|| "git".into())
+}
+
+const PRODUCTION_REPO: &str = "https://github.com/o/r.git";
+
+#[tokio::test]
+async fn a_production_policy_prepare_clones_from_a_local_mirror_end_to_end() -> TestResult {
+    common::bounded(Box::pin(async {
+        let dir = TempDir::new()?;
+        let origin = fixture(dir.path())?;
+        let wrapper = dir.path().join("git-wrapper");
+        std::fs::write(
+            &wrapper,
+            format!(
+                "#!/bin/sh\nn=$#\ni=0\nwhile [ $i -lt $n ]; do\n  a=$1\n  shift\n  if [ \"$a\" = \"{PRODUCTION_REPO}\" ]; then\n    a=\"{origin}\"\n    export GIT_ALLOW_PROTOCOL=file\n  fi\n  set -- \"$@\" \"$a\"\n  i=$((i+1))\ndone\nexec \"{}\" \"$@\"\n",
+                real_git()?.display()
+            ),
+        )?;
+        std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o755))?;
+        let root = dir.path().join("jobs");
+        let checkout = Workspace::new(&root)
+            .with_policy(RepoPolicy::new(["github.com"]))
+            .with_git(&wrapper, Duration::from_secs(60))
+            .prepare("job1", PRODUCTION_REPO, "main")
+            .await?;
+        assert_eq!(
+            git(&checkout.path, &["rev-parse", "--abbrev-ref", "HEAD"])?,
+            "swarm/job1"
+        );
+        assert!(checkout.path.join("a.txt").is_file());
+        assert!(checkout.path.join(".git/objects/info/alternates").is_file());
+        Ok(())
+    }))
+    .await
+}
+
+fn relative_to_cwd(target: &Path) -> Result<PathBuf, Box<dyn std::error::Error>> {
+    let cwd = std::env::current_dir()?.canonicalize()?;
+    let target = target.canonicalize()?;
+    let shared = cwd
+        .components()
+        .zip(target.components())
+        .take_while(|(a, b)| a == b)
+        .count();
+    let mut out = PathBuf::new();
+    for _ in cwd.components().skip(shared) {
+        out.push("..");
+    }
+    out.extend(target.components().skip(shared));
+    Ok(out)
+}
+
+#[tokio::test]
+async fn a_relative_jobs_root_prepares_a_checkout() -> TestResult {
+    common::bounded(Box::pin(async {
+        let dir = TempDir::new()?;
+        let repo = fixture(dir.path())?;
+        let root = relative_to_cwd(dir.path())?.join("jobs");
+        assert!(root.is_relative());
+        let checkout = workspace(&root).prepare("job1", &repo, "main").await?;
+        assert_eq!(
+            git(&checkout.path, &["rev-parse", "--abbrev-ref", "HEAD"])?,
+            "swarm/job1"
+        );
+        assert!(checkout.path.join("a.txt").is_file());
+        Ok(())
+    }))
+    .await
+}
+
+#[tokio::test]
+async fn the_clone_dir_is_removed_when_a_step_after_the_clone_fails() -> TestResult {
+    common::bounded(Box::pin(async {
+        let dir = TempDir::new()?;
+        let repo = fixture(dir.path())?;
+        let root = dir.path().join("jobs");
+        let result = workspace(&root)
+            .with_after_clone(|_| Err(std::io::Error::other("injected")))
+            .prepare("job1", &repo, "main")
+            .await;
+        assert!(matches!(result, Err(WorkspaceError::Io(_))));
+        assert!(!root.join("job1").exists());
+        Ok(())
+    }))
+    .await
+}
+
+#[tokio::test]
+async fn the_mirror_config_turns_off_auto_gc_and_pruning() -> TestResult {
+    common::bounded(Box::pin(async {
+        let dir = TempDir::new()?;
+        let repo = fixture(dir.path())?;
+        let root = dir.path().join("jobs");
+        workspace(&root).prepare("job1", &repo, "main").await?;
+        let mirror = only_mirror(&root)?;
+        assert_eq!(git(&mirror, &["config", "--get", "gc.auto"])?, "0");
+        assert_eq!(
+            git(&mirror, &["config", "--get", "gc.pruneExpire"])?,
+            "never"
+        );
         Ok(())
     }))
     .await

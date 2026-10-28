@@ -1,4 +1,4 @@
-//! Job workspaces: a bare mirror per repo and one git worktree per job.
+//! Job workspaces: a bare mirror per repo and one clone per job that borrows the mirror's objects.
 //!
 //! Every input is validated before git runs. Error messages (`Display`) are fixed text and
 //! never carry the repo, ref, job id or git output. A failed git step keeps a redacted
@@ -30,8 +30,7 @@ const HOME_DIR: &str = ".git-home";
 const DEFAULT_REPO_HOST: &str = "github.com";
 const PROTOCOLS: &str = "https";
 const PROTOCOLS_WITH_FILE: &str = "file:https";
-const MIRROR_CONFIG: &str =
-    "[core]\n\trepositoryformatversion = 0\n\tfilemode = true\n\tbare = true\n";
+const MIRROR_CONFIG: &str = "[core]\n\trepositoryformatversion = 0\n\tfilemode = true\n\tbare = true\n[gc]\n\tauto = 0\n\tpruneExpire = never\n";
 const MIRROR_CONFIG_STAGING: &str = "config.fleetd-new";
 const REDIRECT_FILES: [&str; 2] = ["commondir", "config.worktree"];
 static STAGING_SEQ: AtomicU64 = AtomicU64::new(0);
@@ -225,6 +224,17 @@ impl fmt::Debug for Credential {
 #[derive(Clone)]
 struct BeforeFetch(Arc<dyn Fn(&Path) + Send + Sync>);
 
+type AfterCloneFn = dyn Fn(&Path) -> std::io::Result<()> + Send + Sync;
+
+#[derive(Clone)]
+struct AfterClone(Arc<AfterCloneFn>);
+
+impl fmt::Debug for AfterClone {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("AfterClone")
+    }
+}
+
 impl fmt::Debug for BeforeFetch {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str("BeforeFetch")
@@ -241,6 +251,7 @@ pub struct Workspace {
     path_env: Option<OsString>,
     credential: Option<Credential>,
     before_fetch: Option<BeforeFetch>,
+    after_clone: Option<AfterClone>,
     redactor: Redactor,
     job_gid: Option<u32>,
 }
@@ -257,14 +268,16 @@ impl Workspace {
             path_env: std::env::var_os("PATH"),
             credential: None,
             before_fetch: None,
+            after_clone: None,
             redactor: Redactor::default(),
             job_gid: None,
         }
     }
 
-    /// Makes the cache dir and each job worktree group-writable for `gid` (2770). `None`, the
-    /// default, leaves the modes git and `create_dir_all` set. `.git-home` and
-    /// `.finish-<id>` stay private either way.
+    /// Gives the cache dir to `gid` read-only (2750) and makes each job clone group-writable
+    /// (2770), so the job group can read the mirror but never write it. `None`, the default,
+    /// leaves the modes git and `create_dir_all` set. `.git-home` and `.finish-<id>` stay
+    /// private either way.
     #[must_use]
     pub fn with_job_group(mut self, gid: Option<u32>) -> Self {
         self.job_gid = gid;
@@ -284,6 +297,19 @@ impl Workspace {
     #[must_use]
     pub fn with_before_fetch(mut self, hook: impl Fn(&Path) + Send + Sync + 'static) -> Self {
         self.before_fetch = Some(BeforeFetch(Arc::new(hook)));
+        self
+    }
+
+    /// Test seam: runs `hook` with the clone path once the clone and checkout finish and before
+    /// the job group share, to model a failure in that window. An error from `hook` fails
+    /// `prepare` and removes the clone directory.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn with_after_clone(
+        mut self,
+        hook: impl Fn(&Path) -> std::io::Result<()> + Send + Sync + 'static,
+    ) -> Self {
+        self.after_clone = Some(AfterClone(Arc::new(hook)));
         self
     }
 
@@ -315,15 +341,17 @@ impl Workspace {
     }
 
     /// Resets the bare mirror's config, fetches `repo` into it by explicit url, then runs
-    /// `git worktree add -B swarm/<job_id>` from `origin/<base_ref>`.
+    /// `git clone --reference <mirror>` into `<root>/<job_id>`, then checks out
+    /// `swarm/<job_id>` from `origin/<base_ref>`. The clone shares the mirror's objects
+    /// through alternates and owns its refs, so the mirror records nothing about the job.
     ///
     /// A `base_ref` of 40 lowercase hex characters (see [`is_commit_sha`]) names a commit and
-    /// the worktree starts at that commit. The commit must be reachable from a branch of
+    /// the checkout starts at that commit. The commit must be reachable from a branch of
     /// `repo`, because the mirror fetches branches only. Otherwise the call fails at the
-    /// worktree step.
+    /// checkout step and the clone directory is removed.
     ///
-    /// A leftover worktree directory or branch of the same job id, from a prepare that was
-    /// killed or never removed, is replaced. Before the fetch, stale `*.lock` files in the
+    /// A leftover directory of the same job id, from a prepare that was killed or never
+    /// removed, is replaced. Before the fetch, stale `*.lock` files in the
     /// mirror are deleted. That is safe only when one daemon uses the jobs directory and runs
     /// its jobs one at a time, so the jobs directory must belong to one daemon.
     ///
@@ -346,7 +374,7 @@ impl Workspace {
             .await
             .map_err(WorkspaceError::Io)?;
         if let Some(gid) = self.job_gid {
-            crate::jobenv::share_dir(&cache, gid).map_err(WorkspaceError::Io)?;
+            crate::jobenv::share_dir_read_only(&cache, gid).map_err(WorkspaceError::Io)?;
         }
         let mirror = self.mirror_path(repo);
         self.sync_mirror(&mirror, repo).await?;
@@ -357,43 +385,85 @@ impl Workspace {
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
             Err(err) => return Err(WorkspaceError::Io(err)),
         }
-        self.git(&mirror, &["worktree", "prune"], "worktree prune")
-            .await?;
         let branch = format!("{BRANCH_PREFIX}{job_id}");
         let start = if is_commit_sha(base_ref) {
             base_ref.to_owned()
         } else {
             format!("origin/{base_ref}")
         };
-        self.git(
-            &mirror,
-            &[
-                "worktree",
-                "add",
-                "-B",
-                &branch,
-                path.to_str().ok_or(WorkspaceError::InvalidJobId)?,
-                &start,
-            ],
-            "worktree add",
-        )
-        .await?;
-        if let Some(gid) = self.job_gid {
-            let shared = path.clone();
-            tokio::task::spawn_blocking(move || crate::jobenv::share_tree(&shared, gid))
-                .await
-                .map_err(|_| WorkspaceError::Io(std::io::Error::other("share task failed")))?
-                .map_err(WorkspaceError::Io)?;
+        let built = async {
+            self.clone_checkout(&mirror, &path, &branch, &start).await?;
+            if let Some(AfterClone(hook)) = &self.after_clone {
+                hook(&path).map_err(WorkspaceError::Io)?;
+            }
+            if let Some(gid) = self.job_gid {
+                let shared = path.clone();
+                tokio::task::spawn_blocking(move || crate::jobenv::share_tree(&shared, gid))
+                    .await
+                    .map_err(|_| WorkspaceError::Io(std::io::Error::other("share task failed")))?
+                    .map_err(WorkspaceError::Io)?;
+            }
+            Ok(())
+        }
+        .await;
+        if let Err(err) = built {
+            let _ = tokio::fs::remove_dir_all(&path).await;
+            return Err(err);
         }
         Ok(Checkout { path, branch })
     }
 }
 
 impl Workspace {
-    /// Removes the job's worktree, its `.finish-<job_id>` scratch dir and its `.agent/<job_id>`
-    /// agent config dir with the staging dir, then prunes the
-    /// mirror's worktree records and deletes the job's branch. The bare mirror stays. Every
-    /// step runs even when an earlier one fails.
+    async fn clone_checkout(
+        &self,
+        mirror: &Path,
+        path: &Path,
+        branch: &str,
+        start: &str,
+    ) -> Result<(), WorkspaceError> {
+        let absolute = std::path::absolute(mirror).map_err(WorkspaceError::Io)?;
+        let source = absolute.to_str().ok_or(WorkspaceError::InvalidRepo)?;
+        let target = path.to_str().ok_or(WorkspaceError::InvalidJobId)?;
+        self.git(
+            Path::new("."),
+            &[
+                "clone",
+                "--quiet",
+                "--no-checkout",
+                "--no-local",
+                "--reference",
+                source,
+                "--",
+                source,
+                target,
+            ],
+            "clone",
+        )
+        .await?;
+        self.git(
+            path,
+            &[
+                "fetch",
+                "--quiet",
+                "--",
+                source,
+                "+refs/remotes/origin/*:refs/remotes/origin/*",
+            ],
+            "clone fetch",
+        )
+        .await?;
+        self.git(
+            path,
+            &["checkout", "--quiet", "-B", branch, start, "--"],
+            "checkout",
+        )
+        .await
+    }
+
+    /// Removes the job's clone, its `.finish-<job_id>` scratch dir and its `.agent/<job_id>`
+    /// agent config dir with the staging dir. The bare mirror holds no record of the job and
+    /// stays. Every step runs even when an earlier one fails.
     ///
     /// # Errors
     ///
@@ -414,23 +484,6 @@ impl Workspace {
                 Err(err) => {
                     first.get_or_insert(WorkspaceError::Io(err));
                 }
-            }
-        }
-        let mirror = self.mirror_path(repo);
-        if mirror.join("HEAD").exists()
-            && let Err(err) = self
-                .git(&mirror, &["worktree", "prune"], "worktree prune")
-                .await
-        {
-            first.get_or_insert(err);
-        }
-        if mirror.join("HEAD").exists() {
-            let reference = format!("refs/heads/{BRANCH_PREFIX}{job_id}");
-            if let Err(err) = self
-                .git(&mirror, &["update-ref", "-d", &reference], "branch delete")
-                .await
-            {
-                first.get_or_insert(err);
             }
         }
         first.map_or(Ok(()), Err)
@@ -590,8 +643,11 @@ impl Workspace {
                 .env(askpass::HOST_ENV, host)
                 .env("GH_TOKEN", &credential.token);
         }
-        if args.first() != Some(&"init") {
-            let git_dir = std::path::absolute(dir).map_err(WorkspaceError::Io)?;
+        if !matches!(args.first(), Some(&"init" | &"clone")) {
+            let mut git_dir = std::path::absolute(dir).map_err(WorkspaceError::Io)?;
+            if matches!(step, "clone fetch" | "checkout") {
+                git_dir.push(".git");
+            }
             command
                 .env("GIT_DIR", &git_dir)
                 .env("GIT_COMMON_DIR", &git_dir);
@@ -606,7 +662,14 @@ impl Workspace {
             .env("GIT_CONFIG_GLOBAL", "/dev/null")
             .env("GIT_CONFIG_NOSYSTEM", "1")
             .env("GIT_TERMINAL_PROMPT", "0")
-            .env("GIT_ALLOW_PROTOCOL", self.policy.protocols())
+            .env(
+                "GIT_ALLOW_PROTOCOL",
+                if matches!(step, "clone" | "clone fetch") {
+                    "file"
+                } else {
+                    self.policy.protocols()
+                },
+            )
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::piped())

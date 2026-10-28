@@ -99,7 +99,7 @@ const REPO: &str = "https://github.com/o/r.git";
 async fn every_call_runs_with_a_cleared_environment() -> TestResult {
     common::bounded(Box::pin(async {
         let (_dir, _root, all) = run(default_run(), REPO).await?;
-        assert_eq!(all.len(), 4);
+        assert_eq!(all.len(), 5);
         let expected = [
             "GIT_ALLOW_PROTOCOL",
             "GIT_CONFIG_GLOBAL",
@@ -127,7 +127,7 @@ async fn every_call_runs_with_a_cleared_environment() -> TestResult {
                 .map(String::as_str)
                 .filter(|n| !matches!(*n, "PWD" | "OLDPWD" | "SHLVL" | "_"))
                 .collect();
-            let init = call.args.contains(" init ");
+            let init = call.args.contains(" init ") || call.args.contains(" clone ");
             assert_eq!(
                 names,
                 if init { &expected[..] } else { &pinned[..] },
@@ -140,6 +140,10 @@ async fn every_call_runs_with_a_cleared_environment() -> TestResult {
     .await
 }
 
+fn is_unpinned(args: &str) -> bool {
+    args.contains(" init ") || args.contains(" clone ")
+}
+
 #[tokio::test]
 async fn the_git_dir_pins_equal_the_absolute_mirror_path() -> TestResult {
     common::bounded(Box::pin(async {
@@ -150,11 +154,18 @@ async fn the_git_dir_pins_equal_the_absolute_mirror_path() -> TestResult {
         let mirror = mirror.to_str().ok_or("path")?;
         assert!(Path::new(mirror).is_absolute());
         let mut pinned = 0;
-        for call in all.iter().filter(|c| !c.args.contains(" init ")) {
-            assert_eq!(call.env.get("GIT_DIR").map(String::as_str), Some(mirror));
+        let clone_git = root.join("job1").join(".git");
+        let clone_git = clone_git.to_str().ok_or("path")?;
+        for call in all.iter().filter(|c| !is_unpinned(&c.args)) {
+            let want = if call.args.contains("--prune") {
+                mirror
+            } else {
+                clone_git
+            };
+            assert_eq!(call.env.get("GIT_DIR").map(String::as_str), Some(want));
             assert_eq!(
                 call.env.get("GIT_COMMON_DIR").map(String::as_str),
-                Some(mirror)
+                Some(want)
             );
             pinned += 1;
         }
@@ -197,11 +208,18 @@ async fn the_git_dir_pins_are_absolute_for_a_relative_root() -> TestResult {
             .join("bc3fbd4dd8dbadfc9793e2a816228cf8fa84d7954992c487a510aced135fecdf.git");
         let mirror = mirror.to_str().ok_or("path")?;
         let mut pinned = 0;
-        for call in all.iter().filter(|c| !c.args.contains(" init ")) {
+        let clone_git = cwd.join(&relative).join("job1").join(".git");
+        let clone_git = clone_git.to_str().ok_or("path")?;
+        for call in all.iter().filter(|c| !is_unpinned(&c.args)) {
+            let want = if call.args.contains("--prune") {
+                mirror
+            } else {
+                clone_git
+            };
             for name in ["GIT_DIR", "GIT_COMMON_DIR"] {
                 let value = call.env.get(name).ok_or(name)?;
                 assert!(Path::new(value).is_absolute(), "{name}={value}");
-                assert_eq!(value, mirror, "{name}");
+                assert_eq!(value, want, "{name}");
             }
             pinned += 1;
         }
@@ -349,17 +367,29 @@ async fn git_is_limited_to_https_unless_the_test_policy_adds_file() -> TestResul
     common::bounded(Box::pin(async {
         let (_dir, _root, all) = run(default_run(), REPO).await?;
         for call in &all {
+            let expected =
+                if call.args.contains(" clone ") || call.args.contains("+refs/remotes/origin/*") {
+                    "file"
+                } else {
+                    "https"
+                };
             assert_eq!(
                 call.env.get("GIT_ALLOW_PROTOCOL").map(String::as_str),
-                Some("https")
+                Some(expected)
             );
         }
         let local = RepoPolicy::new(Vec::<String>::new()).with_file_repos();
         let (_dir, _root, all) = run(local, "/some/origin.git").await?;
         for call in &all {
+            let expected =
+                if call.args.contains(" clone ") || call.args.contains("+refs/remotes/origin/*") {
+                    "file"
+                } else {
+                    "file:https"
+                };
             assert_eq!(
                 call.env.get("GIT_ALLOW_PROTOCOL").map(String::as_str),
-                Some("file:https")
+                Some(expected)
             );
         }
         Ok(())
@@ -375,7 +405,7 @@ async fn the_mirror_fetches_by_explicit_url_and_configures_no_remote() -> TestRe
         .iter()
         .filter_map(|c| c.args.split(' ').nth(16))
         .collect();
-    assert_eq!(subs, ["init", "fetch", "worktree", "worktree"]);
+    assert_eq!(subs, ["init", "fetch", "clone", "fetch", "checkout"]);
     assert!(
         all[1]
             .args
@@ -431,7 +461,7 @@ async fn only_the_fetch_child_carries_the_scoped_credential() -> TestResult {
             .await?;
         let all = calls(&root)?;
         for call in &all {
-            let fetch = call.args.contains(" fetch ");
+            let fetch = call.args.contains(" fetch ") && call.args.contains("--prune");
             assert_eq!(call.env.contains_key("GH_TOKEN"), fetch, "{}", call.args);
             assert_eq!(call.env.contains_key("GIT_ASKPASS"), fetch, "{}", call.args);
             assert_eq!(
@@ -443,7 +473,7 @@ async fn only_the_fetch_child_carries_the_scoped_credential() -> TestResult {
         }
         let fetch = all
             .iter()
-            .find(|c| c.args.contains(" fetch "))
+            .find(|c| c.args.contains(" fetch ") && c.args.contains("--prune"))
             .ok_or("fetch")?;
         assert_eq!(fetch.env["GH_TOKEN"], "tok-for-fetch");
         assert_eq!(fetch.env["FLEETD_ASKPASS_HOST"], "github.com");
