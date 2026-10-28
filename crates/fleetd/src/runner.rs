@@ -72,7 +72,7 @@ use crate::feed::Feed;
 use crate::fetch_service::FeedBook;
 use crate::floor::{BoxCeilings, PERMISSION_MODE};
 use crate::group::GroupGuard;
-use crate::jobsock::ServiceName;
+use crate::jobsock::{PerJob, ServiceName};
 use crate::now_ms;
 use crate::phase::{Clock, Phases, SystemClock, elapsed_ms};
 use crate::poller::{RunError, Shutdown};
@@ -624,6 +624,73 @@ fn spawn_direct<W: ChildWait + 'static>(
     })
 }
 
+/// The hooks that clear per-job service state when a job ends.
+///
+/// Every hook takes the job id and must be idempotent: the runner fires them once per job end
+/// path, and a job that passes two paths (a panic after a cancel report) fires them twice. A
+/// hook for an id that never started does nothing. A hook that panics does not stop the hooks
+/// after it. Clones share the hooks.
+#[derive(Clone, Default)]
+pub struct JobEnd {
+    hooks: Vec<EndHook>,
+}
+
+type EndHook = Arc<dyn Fn(&str) + Send + Sync>;
+
+impl std::fmt::Debug for JobEnd {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("JobEnd")
+            .field("hooks", &self.hooks.len())
+            .finish()
+    }
+}
+
+impl JobEnd {
+    /// No hooks.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Adds a hook that runs with the job id when the job ends.
+    #[must_use]
+    pub fn on_end(mut self, hook: impl Fn(&str) + Send + Sync + 'static) -> Self {
+        self.hooks.push(Arc::new(hook));
+        self
+    }
+
+    /// Adds a hook that unregisters the job id from `registry`, the registry of
+    /// [`PerJob`] services the runner registers a broker in. Unregistering an id that is not
+    /// there does nothing.
+    #[must_use]
+    pub fn unregistering<S: Send + Sync + 'static>(self, registry: PerJob<S>) -> Self {
+        self.on_end(move |job_id| {
+            registry.unregister(job_id);
+        })
+    }
+
+    /// Runs every hook for `job_id`.
+    pub fn fire(&self, job_id: &str) {
+        for hook in &self.hooks {
+            let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| hook(job_id)));
+        }
+    }
+}
+
+/// Runs [`AgentRunner::end_job`] when dropped, on return, on a panic unwind and when the
+/// future that owns it is dropped.
+#[must_use = "the job end hook runs when the guard drops"]
+pub struct JobEndGuard<'a, R: Reporter> {
+    runner: &'a AgentRunner<R>,
+    job: &'a Job,
+}
+
+impl<R: Reporter> Drop for JobEndGuard<'_, R> {
+    fn drop(&mut self) {
+        self.runner.end_job(self.job);
+    }
+}
+
 /// Runs the agent for claimed jobs.
 #[derive(Debug)]
 pub struct AgentRunner<R> {
@@ -637,6 +704,7 @@ pub struct AgentRunner<R> {
     pub(crate) clock: Arc<dyn Clock>,
     hub: Option<Arc<HookHub>>,
     feeds: Option<Arc<FeedBook>>,
+    end: JobEnd,
     claude_version: Mutex<Option<String>>,
     pub(crate) publishing: Mutex<HashMap<String, Arc<JobPublish>>>,
 }
@@ -666,6 +734,7 @@ impl<R: Reporter> AgentRunner<R> {
             clock: Arc::new(SystemClock::new()),
             hub: None,
             feeds: None,
+            end: JobEnd::default(),
             claude_version: Mutex::new(None),
             publishing: Mutex::new(HashMap::new()),
         }
@@ -928,11 +997,50 @@ impl<R: Reporter> AgentRunner<R> {
     }
 
     /// Registers the feed of each job with `feeds` while its agent runs, so the fetch service
-    /// can record the job's fetch events. The stream forgets the job when it ends.
+    /// can record the job's fetch events. The stream forgets the feed when the agent run ends and
+    /// [`AgentRunner::end_job`] forgets it again when the whole job ends.
     #[must_use]
     pub fn with_feed_book(mut self, feeds: Arc<FeedBook>) -> Self {
         self.feeds = Some(feeds);
         self
+    }
+
+    /// Runs `end` when a job ends, see [`AgentRunner::end_job`].
+    #[must_use]
+    pub fn with_job_end(mut self, end: JobEnd) -> Self {
+        self.end = end;
+        self
+    }
+
+    /// A guard that calls [`AgentRunner::end_job`] for `job` when it drops. The caller holds
+    /// it for the whole job so every end path passes it.
+    pub fn end_guard<'a>(&'a self, job: &'a Job) -> JobEndGuard<'a, R> {
+        JobEndGuard { runner: self, job }
+    }
+
+    /// Clears what the runner and its services keep for `job` once the whole job is over.
+    ///
+    /// The stream forgets the feed when the agent run ends, and `finish` resumes it from a
+    /// carry, so the job is over only after both. This drops a carry that nothing resumed,
+    /// the phases and publish state kept for the job, forgets the feed, and fires the
+    /// [`JobEnd`] hooks (fetch and proxy counters, registry entries). The job id keys all of
+    /// it, and a retry attempt of the same id starts from nothing, because each attempt ends
+    /// here. Safe to call twice and for an unknown job.
+    pub fn end_job(&self, job: &Job) {
+        let key = Self::carry_key(job);
+        self.carries
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .remove(&key);
+        self.phases
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .remove(&key);
+        self.forget_publish(&job.job_id);
+        if let Some(feeds) = &self.feeds {
+            feeds.forget(&job.job_id);
+        }
+        self.end.fire(&job.job_id);
     }
 
     fn feed_book(&self) -> Option<(Arc<FeedBook>, Redactor)> {
@@ -3164,5 +3272,60 @@ mod tests {
         fn launch(&self, _: AgentSpec) -> io::Result<Launched> {
             Err(io::Error::other("no unit"))
         }
+    }
+
+    #[tokio::test]
+    async fn ending_a_job_drops_a_carry_nothing_resumed() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let runner = AgentRunner::new(
+            test_config(dir.path()),
+            Replies { cancel: false },
+            Redactor::default(),
+        )
+        .with_launcher(Arc::new(FakeLauncher::new(ExitStatus::from_raw(0), false)));
+        let (_trigger, shutdown) = Shutdown::channel();
+        let outcome = runner.run(&test_job(), dir.path(), shutdown).await;
+        assert_eq!(outcome.ok(), Some(AgentOutcome::Succeeded));
+        let held = |runner: &AgentRunner<Replies>| {
+            runner
+                .carries
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .len()
+        };
+        assert_eq!(held(&runner), 1);
+        runner.end_job(&test_job());
+        assert_eq!(held(&runner), 0);
+        runner.end_job(&test_job());
+        assert_eq!(held(&runner), 0);
+    }
+
+    #[test]
+    fn a_dropped_guard_fires_the_hooks_once_per_drop_and_a_panicking_hook_blocks_none() {
+        let seen = Arc::new(Mutex::new(Vec::<String>::new()));
+        let end = super::JobEnd::new()
+            .on_end(|_| assert!(std::hint::black_box(false), "hook panic"))
+            .on_end({
+                let seen = Arc::clone(&seen);
+                move |id| {
+                    seen.lock()
+                        .unwrap_or_else(PoisonError::into_inner)
+                        .push(id.to_owned());
+                }
+            });
+        let dir = tempfile::tempdir().expect("tempdir");
+        let runner = AgentRunner::new(
+            test_config(dir.path()),
+            Replies { cancel: false },
+            Redactor::default(),
+        )
+        .with_job_end(end);
+        let job = test_job();
+        drop(runner.end_guard(&job));
+        drop(runner.end_guard(&job));
+        assert_eq!(
+            *seen.lock().unwrap_or_else(PoisonError::into_inner),
+            ["job1", "job1"]
+        );
     }
 }

@@ -24,7 +24,7 @@ use crate::poller::{
     GrpcReporter, JobRunner, PollRandom, Poller, RunError, SERVER_URL_ENV, Shutdown, TOKEN_ENV,
     Token, channel,
 };
-use crate::runner::{AgentOutcome, AgentRunner, Interrupt, Reporter, RunConfig};
+use crate::runner::{AgentOutcome, AgentRunner, Interrupt, JobEnd, Reporter, RunConfig};
 use crate::systemd::select_launcher;
 use crate::telemetry::{FetchPhase, FetchRecordError};
 use crate::toolhook::HookHub;
@@ -178,6 +178,7 @@ impl<R: Reporter> DaemonRunner<R> {
 
 impl<R: Reporter + 'static> JobRunner for DaemonRunner<R> {
     async fn run(&self, job: Job, shutdown: Shutdown) -> Result<(), RunError> {
+        let _ended = self.agent.end_guard(&job);
         if job.kind() == JobKind::Judge {
             return self.run_judge(&job, shutdown).await;
         }
@@ -245,35 +246,59 @@ impl FetchRecorder for BookRecorder {
     }
 }
 
+/// What [`job_services`] builds: the services and the hook that clears their per-job state.
+pub(crate) struct JobServices {
+    pub(crate) services: Services,
+    pub(crate) end: JobEnd,
+    #[cfg(test)]
+    pub(crate) proxy: Arc<ConnectProxy<SystemResolver, TcpDialer>>,
+}
+
 /// The services every Job socket of this daemon offers, built once and shared by all sockets.
 ///
 /// `Fetch` is a [`FetchService`] over the config's policy and caps, system DNS and plain TCP,
 /// recording through `feeds`. `EgressProxy` is a [`ConnectProxy`] over the config's
 /// `egress_allow` list (the model API host is always allowed) with the system resolver and
 /// dialer, so every dial is pinned to an address that passed `netguard::is_public_address`.
-/// Both key their per-job state by the job id of the socket, never by the client. The broker is
-/// not offered here. The direct launcher refuses a socket and drops these in
+/// Both key their per-job state by the job id of the socket, never by the client. The `end`
+/// hook of the result calls [`FetchService::forget`] and [`ConnectProxy::forget`], so the
+/// runner passes it to [`AgentRunner::with_job_end`] and a job id reused later starts at zero.
+/// The broker is not offered here. The direct launcher refuses a socket and drops these in
 /// [`select_launcher`].
 #[must_use]
-pub(crate) fn job_services(config: &Config, feeds: &Arc<FeedBook>) -> Services {
+pub(crate) fn job_services(config: &Config, feeds: &Arc<FeedBook>) -> JobServices {
     let fetcher = Fetcher::system(config.fetch_policy.clone(), config.fetch_caps);
-    let fetch = FetchService::new(
+    let fetch = Arc::new(FetchService::new(
         config.fetch_policy.clone(),
         config.fetch_caps,
         MAX_CONCURRENT_FETCHES,
         fetcher,
         BookRecorder(Arc::clone(feeds)),
-    );
-    let proxy = ConnectProxy::new(
+    ));
+    let proxy = Arc::new(ConnectProxy::new(
         config.egress_allow.clone(),
         ProxyLimits::default(),
         SystemResolver,
         TcpDialer,
-    );
+    ));
     let mut services = Services::new();
-    services.insert(ServiceName::Fetch, Arc::new(fetch));
-    services.insert(ServiceName::EgressProxy, Arc::new(Arc::new(proxy)));
-    services
+    let end = JobEnd::new()
+        .on_end({
+            let fetch = Arc::clone(&fetch);
+            move |job_id| fetch.forget(job_id)
+        })
+        .on_end({
+            let proxy = Arc::clone(&proxy);
+            move |job_id| proxy.forget(job_id)
+        });
+    services.insert(ServiceName::Fetch, fetch);
+    services.insert(ServiceName::EgressProxy, Arc::new(Arc::clone(&proxy)));
+    JobServices {
+        services,
+        end,
+        #[cfg(test)]
+        proxy,
+    }
 }
 
 /// Builds the poller when `FLEET_SERVER_URL` is set and non-empty, else `None`.
@@ -315,13 +340,15 @@ pub(crate) fn build(
     }
     let workspace = job_workspace(config, &mut run, env).with_redactor(redactor.clone());
     let feeds = Arc::new(FeedBook::default());
-    let launcher = select_launcher(config, run.job_gid, job_services(config, &feeds));
+    let wired = job_services(config, &feeds);
+    let launcher = select_launcher(config, run.job_gid, wired.services);
     let runner = DaemonRunner::new(
         workspace,
         AgentRunner::new(run, reporter, redactor)
             .with_hook_hub(hub)
             .with_launcher(launcher)
-            .with_feed_book(feeds),
+            .with_feed_book(feeds)
+            .with_job_end(wired.end),
         box_name,
     );
     Poller::with_channel(
@@ -840,7 +867,7 @@ mod tests {
         }
 
         fn served(config: &Config, feeds: &Arc<FeedBook>) -> Vec<&'static str> {
-            let launcher = select_launcher(config, None, job_services(config, feeds));
+            let launcher = select_launcher(config, None, job_services(config, feeds).services);
             let mut names: Vec<_> = launcher
                 .job_services()
                 .into_iter()
@@ -856,11 +883,15 @@ mod tests {
         }
 
         fn rig(config: &Config, feeds: &Arc<FeedBook>) -> Result<Rig, Box<dyn std::error::Error>> {
+            rig_with(job_services(config, feeds).services)
+        }
+
+        fn rig_with(services: Services) -> Result<Rig, Box<dyn std::error::Error>> {
             let dir = TempDir::new()?;
             let socket = JobSocket::bind(
                 &dir.path().join("job.sock"),
                 "job1",
-                job_services(config, feeds),
+                services,
                 Arc::new(Cgroup),
                 Limits::default(),
             )?;
@@ -906,7 +937,7 @@ mod tests {
             let config = config_of("agent_launcher = \"systemd\"\n")?;
             assert_eq!(served(&config, &feeds), ["egress proxy", "fetch"]);
             assert_eq!(
-                names(&job_services(&config, &feeds)),
+                names(&job_services(&config, &feeds).services),
                 ["egress proxy", "fetch"]
             );
             Ok(())
@@ -916,7 +947,7 @@ mod tests {
         fn the_direct_launcher_serves_nothing_even_with_a_full_service_set() -> TestResult {
             let feeds = Arc::new(FeedBook::default());
             let config = config_of("agent_launcher = \"direct\"\n")?;
-            assert_eq!(names(&job_services(&config, &feeds)).len(), 2);
+            assert_eq!(names(&job_services(&config, &feeds).services).len(), 2);
             assert_eq!(served(&config, &feeds), Vec::<&str>::new());
             let default = config_of("")?;
             assert_eq!(served(&default, &feeds), Vec::<&str>::new());
@@ -1099,6 +1130,289 @@ mod tests {
                 .await?;
             assert_eq!(got, FORBIDDEN);
             Ok(())
+        }
+
+        mod ended {
+            use std::os::unix::fs::PermissionsExt;
+            use std::path::Path;
+            use std::process::Command;
+
+            use fleet_proto::v1::{Job, JobState, ReportJobReply, ReportJobRequest};
+            use tokio::sync::mpsc;
+            use tonic::Status;
+
+            use super::*;
+            use crate::connect_proxy::ProxyStats;
+            use crate::fetch_service::FetchRecorder;
+            use crate::jobsock::{JobContext, PerJob, ServeFuture, Service};
+            use crate::poller::JobRunner;
+            use crate::runner::{AgentRunner, Reporter, RunConfig};
+            use crate::telemetry::{FetchPhase, FetchRecordError};
+            use crate::workspace::{RepoPolicy, Workspace};
+
+            use super::super::super::{DaemonRunner, JobServices};
+
+            const URL: &str = "https://nohost.invalid/page";
+            const FETCH: &[u8] = br#"{"url":"https://nohost.invalid/page"}"#;
+            const HOSTILE: &[u8] = b"CONNECT localhost:443 HTTP/1.1\r\n\r\n";
+            const CONFIG: &str = "agent_launcher = \"systemd\"\nfetch_max_per_job = 1\nfetch_connect_timeout_secs = 2\n";
+
+            struct Probe;
+
+            impl Service for Probe {
+                fn serve(&self, _: JobContext, stream: UnixStream) -> ServeFuture<'_> {
+                    Box::pin(async move { drop(stream) })
+                }
+            }
+
+            struct Wiring {
+                feeds: Arc<FeedBook>,
+                registry: PerJob<Probe>,
+                rig: Rig,
+                services: JobServices,
+                end: crate::runner::JobEnd,
+            }
+
+            fn wiring() -> Result<Wiring, Box<dyn std::error::Error>> {
+                let feeds = Arc::new(FeedBook::default());
+                let mut services = job_services(&config_of(CONFIG)?, &feeds);
+                let registry = PerJob::new();
+                registry.register("job1", Arc::new(Probe))?;
+                let end = services.end.clone().unregistering(registry.clone());
+                let rig = rig_with(std::mem::take(&mut services.services))?;
+                Ok(Wiring {
+                    feeds,
+                    registry,
+                    rig,
+                    services,
+                    end,
+                })
+            }
+
+            fn job(id: &str) -> Job {
+                Job {
+                    job_id: id.into(),
+                    repo: "file:///nonexistent.git".into(),
+                    base_ref: "main".into(),
+                    attempt: 1,
+                    ..Job::default()
+                }
+            }
+
+            impl Wiring {
+                fn agent<R: Reporter>(&self, cfg: RunConfig, reporter: R) -> AgentRunner<R> {
+                    AgentRunner::new(cfg, reporter, Redactor::default())
+                        .with_feed_book(Arc::clone(&self.feeds))
+                        .with_job_end(self.end.clone())
+                }
+
+                async fn spend(&self) -> TestResult {
+                    register(&self.feeds, "job1");
+                    let first = self.rig.fetch(FETCH).await?;
+                    assert!(!first.contains(Refusal::CapReached.message()), "{first}");
+                    let second = self.rig.fetch(FETCH).await?;
+                    assert!(second.contains(Refusal::CapReached.message()), "{second}");
+                    assert_eq!(self.rig.connect(HOSTILE).await?, FORBIDDEN);
+                    assert_eq!(self.services.proxy.stats("job1").refusals, 1);
+                    assert!(self.registry.contains("job1"));
+                    Ok(())
+                }
+
+                async fn assert_cleared(&self) -> TestResult {
+                    assert!(!self.registry.contains("job1"), "registry entry");
+                    assert_eq!(
+                        self.feeds.record("job1", URL, FetchPhase::Intent),
+                        Err(FetchRecordError::Closed),
+                        "feed"
+                    );
+                    assert_eq!(self.services.proxy.stats("job1"), ProxyStats::default());
+                    register(&self.feeds, "job1");
+                    let first = self.rig.fetch(FETCH).await?;
+                    assert!(!first.contains(Refusal::CapReached.message()), "{first}");
+                    let second = self.rig.fetch(FETCH).await?;
+                    assert!(second.contains(Refusal::CapReached.message()), "{second}");
+                    Ok(())
+                }
+            }
+
+            struct Cancelling;
+
+            impl Reporter for Cancelling {
+                fn report(
+                    &self,
+                    _: ReportJobRequest,
+                ) -> impl Future<Output = Result<ReportJobReply, Status>> + Send {
+                    std::future::ready(Ok(ReportJobReply {
+                        cancel_requested: true,
+                        ..ReportJobReply::default()
+                    }))
+                }
+            }
+
+            struct Panicking;
+
+            impl Reporter for Panicking {
+                fn report(
+                    &self,
+                    _: ReportJobRequest,
+                ) -> impl Future<Output = Result<ReportJobReply, Status>> + Send {
+                    assert!(std::hint::black_box(false), "boom");
+                    std::future::ready(Ok(ReportJobReply::default()))
+                }
+            }
+
+            fn slow_prepare(dir: &Path) -> Result<Workspace, io::Error> {
+                let git = super::super::script(dir, "sleep 30")?;
+                Ok(super::super::workspace(dir, &git))
+            }
+
+            fn fast() -> RunConfig {
+                let mut cfg = RunConfig::new("claude", false);
+                cfg.report_interval = Duration::from_millis(100);
+                cfg
+            }
+
+            #[tokio::test]
+            async fn a_lost_lease_clears_every_service_and_the_next_job_starts_at_zero()
+            -> TestResult {
+                let wiring = wiring()?;
+                wiring.spend().await?;
+                let dir = TempDir::new()?;
+                let (tx, _rx) = mpsc::unbounded_channel();
+                let runner = DaemonRunner::new(
+                    slow_prepare(dir.path())?,
+                    wiring.agent(fast(), super::super::Stale(tx)),
+                    "",
+                );
+                let (_trigger, shutdown) = crate::poller::Shutdown::channel();
+                let ended =
+                    timeout(Duration::from_secs(20), runner.run(job("job1"), shutdown)).await?;
+                assert!(ended.is_err());
+                wiring.assert_cleared().await
+            }
+
+            #[tokio::test]
+            async fn a_cancelled_job_clears_every_service_and_the_next_job_starts_at_zero()
+            -> TestResult {
+                let wiring = wiring()?;
+                wiring.spend().await?;
+                let dir = TempDir::new()?;
+                let runner = DaemonRunner::new(
+                    slow_prepare(dir.path())?,
+                    wiring.agent(fast(), Cancelling),
+                    "",
+                );
+                let (_trigger, shutdown) = crate::poller::Shutdown::channel();
+                let ended =
+                    timeout(Duration::from_secs(20), runner.run(job("job1"), shutdown)).await?;
+                assert!(ended.is_err());
+                wiring.assert_cleared().await
+            }
+
+            #[tokio::test]
+            async fn a_panicking_job_clears_every_service_and_the_next_job_starts_at_zero()
+            -> TestResult {
+                let wiring = wiring()?;
+                wiring.spend().await?;
+                let dir = TempDir::new()?;
+                let runner = Arc::new(DaemonRunner::new(
+                    slow_prepare(dir.path())?,
+                    wiring.agent(fast(), Panicking),
+                    "",
+                ));
+                let (_trigger, shutdown) = crate::poller::Shutdown::channel();
+                let task = tokio::spawn(async move { runner.run(job("job1"), shutdown).await });
+                let joined = timeout(Duration::from_secs(20), task).await?;
+                assert!(joined.is_err_and(|err| err.is_panic()));
+                wiring.assert_cleared().await
+            }
+
+            fn git(dir: &Path, args: &[&str]) -> TestResult {
+                let status = Command::new("git")
+                    .arg("-C")
+                    .arg(dir)
+                    .args(["-c", "user.name=t", "-c", "user.email=t@t.invalid"])
+                    .args(args)
+                    .status()?;
+                assert!(status.success(), "git {args:?}");
+                Ok(())
+            }
+
+            #[tokio::test]
+            async fn a_job_that_succeeds_clears_every_service_and_the_next_job_starts_at_zero()
+            -> TestResult {
+                let wiring = wiring()?;
+                wiring.spend().await?;
+                let dir = TempDir::new()?;
+                let origin = dir.path().join("origin.git");
+                let seed = dir.path().join("seed");
+                std::fs::create_dir_all(&origin)?;
+                git(&origin, &["init", "--bare", "-b", "main"])?;
+                git(
+                    dir.path(),
+                    &["clone", origin.to_str().unwrap_or(""), "seed"],
+                )?;
+                git(&seed, &["commit", "--allow-empty", "-m", "init"])?;
+                git(&seed, &["push", "origin", "HEAD:main"])?;
+                let claude = dir.path().join("claude");
+                std::fs::write(
+                    &claude,
+                    "#!/bin/sh\nif [ \"$1\" = \"--version\" ]; then echo '2.1.289 (Claude Code)'; fi\nexit 0\n",
+                )?;
+                std::fs::set_permissions(&claude, std::fs::Permissions::from_mode(0o755))?;
+                let (tx, mut rx) = mpsc::unbounded_channel();
+                let policy = RepoPolicy::new(Vec::<String>::new()).with_file_repos();
+                let workspace = Workspace::new(dir.path().join("jobs")).with_policy(policy.clone());
+                let mut cfg = RunConfig::new(&claude, false);
+                cfg.repo_policy = policy;
+                let runner =
+                    DaemonRunner::new(workspace, wiring.agent(cfg, super::super::Recorder(tx)), "");
+                let mut job = job("job1");
+                job.repo = format!("file://{}", origin.display());
+                let (_trigger, shutdown) = crate::poller::Shutdown::channel();
+                let ended = timeout(Duration::from_secs(60), runner.run(job, shutdown)).await?;
+                assert!(ended.is_ok(), "{ended:?}");
+                let mut succeeded = false;
+                while let Ok(report) = rx.try_recv() {
+                    succeeded |= report.terminal_state == Some(JobState::Succeeded as i32);
+                }
+                assert!(succeeded, "the job reached its SUCCEEDED report");
+                wiring.assert_cleared().await
+            }
+
+            #[tokio::test]
+            async fn ending_a_job_twice_and_ending_an_unknown_job_are_harmless() -> TestResult {
+                let wiring = wiring()?;
+                wiring.spend().await?;
+                let (tx, _rx) = mpsc::unbounded_channel();
+                let agent = wiring.agent(fast(), super::super::Recorder(tx));
+                agent.end_job(&job("job2"));
+                agent.end_job(&job("never"));
+                assert!(wiring.registry.contains("job1"), "other ids leave job1");
+                assert_eq!(wiring.services.proxy.stats("job1").refusals, 1);
+                let capped = wiring.rig.fetch(FETCH).await?;
+                assert!(capped.contains(Refusal::CapReached.message()), "{capped}");
+                agent.end_job(&job("job1"));
+                agent.end_job(&job("job1"));
+                wiring.assert_cleared().await
+            }
+
+            #[tokio::test]
+            async fn ending_a_job_while_its_fetch_is_in_flight_does_not_hang_or_revive_it()
+            -> TestResult {
+                let wiring = wiring()?;
+                register(&wiring.feeds, "job1");
+                let (tx, _rx) = mpsc::unbounded_channel();
+                let agent = wiring.agent(fast(), super::super::Recorder(tx));
+                let ender = async {
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                    agent.end_job(&job("job1"));
+                };
+                let (reply, ()) = tokio::join!(wiring.rig.fetch(FETCH), ender);
+                let reply = reply?;
+                assert!(reply.starts_with(r#"{"status":"error""#), "{reply}");
+                wiring.assert_cleared().await
+            }
         }
     }
 }
