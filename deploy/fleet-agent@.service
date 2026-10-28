@@ -31,3 +31,6 @@ LockPersonality=yes
 CapabilityBoundingSet=
 ReadWritePaths=/var/lib/fleet/jobs
 InaccessiblePaths=/etc/swarm
+TemporaryFileSystem=/run/fleet:ro
+BindPaths=/run/fleet/%i
+BindReadOnlyPaths=/run/fleet/hook

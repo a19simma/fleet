@@ -100,7 +100,7 @@ sqlite3 /var/lib/fleetd/queue.db 'select seq, kind, state from events order by s
 | `fleetd-systemd.service` | `/etc/systemd/system/fleetd.service`, replacing the legacy unit |
 | `fleet-agent@.service.d/allow-network.conf.example` | optional, see [Network](#network) |
 
-The units and `sysusers.d` file were installed live on systemd 257, and no `systemd-analyze verify` run is recorded. Run `systemd-analyze verify /etc/systemd/system/fleet-agent@.service /etc/systemd/system/fleetd.service` on the box before the first start anyway.
+The units and `sysusers.d` file were installed live on systemd 257. `systemd-analyze verify ./fleet-agent@.service ./fleetd.service` on a scratch copy of the repo units (with the mount lines above, `fleetd-systemd.service` copied as `fleetd.service`) on systemd 257.13 exited 0 with no output. That checks syntax only, not the mount behaviour. Run `systemd-analyze verify /etc/systemd/system/fleet-agent@.service /etc/systemd/system/fleetd.service` on the box before the first start anyway.
 
 ### Users and groups
 
@@ -109,6 +109,17 @@ The units and `sysusers.d` file were installed live on systemd 257, and no `syst
 - `fleet-work` is the shared group. `fleetd` is a member, through `sysusers.d` and `SupplementaryGroups=fleet-work`. A non-root daemon can only chown to a group it belongs to.
 - `/var/lib/fleet/jobs` is mode 3770 `fleetd:fleet-work`: group-writable, setgid and sticky. Each job has its worktree there, plus `.agent/<job id>` (the per-job home) and the `.cache` mirror. The unit's `ReadWritePaths=` covers only this directory.
 - `/run/fleet` is mode 0750 `fleetd:fleet-work` and holds the per-job run dirs. `/run/fleet/hook` holds the hook socket, mode 0750 `fleetd:fleet-work`.
+
+The agent unit mounts an empty read-only tmpfs over `/run/fleet` (`TemporaryFileSystem=/run/fleet:ro`) and bind-mounts back only `/run/fleet/%i` (`BindPaths=`, its own run dir with the per-job socket) and `/run/fleet/hook` (`BindReadOnlyPaths=`). Other jobs' run dirs and sockets are absent from the agent's mount namespace (ADR-0036). This is the first isolation layer; the cgroup check in `jobsock.rs` is the second.
+
+Unverified:
+
+- The mount shape on a live box: that the per-job socket stays connectable through the bind, and that the agent still reads `env` and writes what it needs in its run dir.
+- Ordering of `TemporaryFileSystem=` and `BindPaths=`. systemd documents that bind mounts are applied after the tmpfs, but no probe was run here.
+- `BindReadOnlyPaths=` for the hook dir is stricter than ADR-0036's plain `BindPaths=`. Linux lets `connect()` reach a socket on a read-only mount, but this was not probed. If the hook client fails to connect, switch that line to `BindPaths=`.
+- The fixed path `/run/fleet`: it must equal the `run_dir` fleetd uses. A different run dir needs a drop-in that changes all three lines.
+- The hook dir path `/run/fleet/hook` is taken from `tmpfiles.d/fleet.conf` and the `hook_socket` example; it is not read from fleetd config.
+- `systemd-analyze verify`: see the note under the unit table for what ran.
 
 `tmpfiles.d` creates `/run/fleet` and `/run/fleet/hook` instead of a second `RuntimeDirectory=` in the unit, because `RuntimeDirectoryMode=` applies to every name in the unit and `/run/fleetd` must stay 0700.
 
