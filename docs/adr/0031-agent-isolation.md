@@ -60,6 +60,10 @@ Option (iv), a microVM per Job, is adopted only if untrusted prompt sources appe
 
 Jobs run with `--disallowedTools Edit Write NotebookEdit MultiEdit`, and `deploy/managed-settings.json` denies the same tools. Edits go through Bash heredocs, so the stored command holds every edit. The live comparison of heredoc edits against Edit and Write (calls, output tokens, error rate) is outstanding.
 
+## Amendment (ADR-0036 and ADR-0037)
+
+ADR-0036 replaces the global `/run/fleet/proxy.sock` of P2 with a per-job service on a per-job socket, so the proxy carries job identity. ADR-0037 adds a credential broker on that socket and reconciles the "A credential broker only" rejection below. Neither is built.
+
 ## Decisions (2026-10-26)
 
 Recorded as the architect's recommendations.
@@ -115,7 +119,7 @@ Three design corrections came out of the run and are binding constraints in P1: 
 
 - **Helper binary or root fleetd for launch.** More privileged code than a polkit rule scoped to one unit pattern.
 - **`DynamicUser=`.** Ownership across fleetd restarts needs a stable uid.
-- **A credential broker only.** Keeps the Claude token and the open network, and the agent still reads `/proc` and the mirror.
+- **A credential broker only.** Superseded in part by ADR-0037, which adds a broker on top of P1 to P3. Alone it keeps the Claude token and the open network, and the agent still reads `/proc` and the mirror.
 - **A microVM now.** Cost and complexity with no untrusted prompt source today. Revisit per the trigger above.
 - **bwrap as the first step.** Not installed on the test box, and it leaves the uid shared with fleetd.
 

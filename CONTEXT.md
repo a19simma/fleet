@@ -1,6 +1,6 @@
 # Fleet
 
-Fleet runs coding-agent Jobs on Boxes and records what each Job did. This file defines the terms used by the telemetry and metrics ADRs (0029, 0030) and the profile ADRs (0034, 0035).
+Fleet runs coding-agent Jobs on Boxes and records what each Job did. This file defines the terms used by the telemetry and metrics ADRs (0029, 0030) and the profile ADRs (0034, 0035) and the job socket and broker ADRs (0036, 0037).
 
 ## Language
 
@@ -71,6 +71,18 @@ _Avoid_: main socket
 **Run dir**:
 The directory `/run/fleet/<job id>/` holding a Job's `env`, `spec.json` and `stdout` FIFO for an **Agent unit**.
 _Avoid_: job dir, workspace
+
+**Job socket**:
+The per-job unix socket under the **Run dir** that carries one handshake line selecting a service (broker, fetch, egress proxy). fleetd accepts a peer only when its cgroup is the Job's **Agent unit** (ADR-0036).
+_Avoid_: proxy socket, main socket
+
+**Broker**:
+The fleetd service on the **Job socket** that performs `push`, `pr_create`, `pr_checks` and `fetch` for the agent, which never holds the token (ADR-0037).
+_Avoid_: wrapper, credential helper
+
+**Push target**:
+`Own(job id)` or `Chain(root job id)`, derived server side from the claimed Job. Names the branch `swarm/<id>` the **Broker** may push; the agent never supplies it (ADR-0037).
+_Avoid_: branch argument
 
 **Fixture**:
 Planned, not built: a recorded Job input with an expected outcome, meant to run through `fleet eval run`.

@@ -33,6 +33,10 @@ Pushing a branch and opening a pull request need write access to the repo, and A
 
 - The agent runs as the same uid as fleetd and can read the fleetd process environment through `/proc/<pid>/environ` and any file fleetd reads, so `GH_TOKEN` and `FLEET_TOKEN` are exposed to the agent on this box. The same uid also reads `/etc/swarm/secrets.env`. Use a fine-grained PAT scoped to throwaway repos on disposable Boxes only. Per-job isolation (a separate uid or a credential broker) is not built.
 
+## Amendment (ADR-0036 and ADR-0037)
+
+ADR-0037 amends the push and `gh` sections: the agent will request `push`, `pr_create`, `pr_checks` and `fetch` from fleetd over the per-job socket of ADR-0036 and never holds `GH_TOKEN`. The finish step stays as fallback. Neither ADR is built.
+
 ## Considered and rejected
 
 - **A GitHub App installation token per Job.** Safer and short lived, but needs an App and a minting step. A later upgrade.
