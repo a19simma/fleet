@@ -30,6 +30,7 @@ RestrictSUIDSGID=yes
 LockPersonality=yes
 CapabilityBoundingSet=
 ReadWritePaths=/var/lib/fleet/jobs
+ReadOnlyPaths=-/var/lib/fleet/jobs/.cache
 InaccessiblePaths=/etc/swarm
 TemporaryFileSystem=/run/fleet:ro
 BindPaths=/run/fleet/%i

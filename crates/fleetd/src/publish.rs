@@ -11,7 +11,7 @@ use fleet_proto::v1::Job;
 use crate::phase::{Phases, elapsed_ms};
 use crate::proc::{CAPTURE_BYTES, CaptureError, Captured};
 use crate::runner::{AgentRunner, Failure, IntoFailure, Reporter, Scope};
-use crate::workspace::{is_commit_sha, validate_job_id, validate_ref, validate_repo};
+use crate::workspace::{Workspace, is_commit_sha, validate_job_id, validate_ref, validate_repo};
 
 const MAX_TITLE_CHARS: usize = 256;
 const MAX_PR_URL_BYTES: usize = 2048;
@@ -237,6 +237,9 @@ impl<R: Reporter> AgentRunner<R> {
         )
         .await
         .map_err(|e| e.failure(ERR_COMMITS))?;
+        let root = cwd.parent().ok_or_else(|| Failure::bare(ERR_COMMITS))?;
+        link_mirror(dir, &Workspace::mirror_dir(root, &job.repo))
+            .map_err(|_| Failure::bare(ERR_COMMITS))?;
         let worktree = cwd.to_str().ok_or_else(|| Failure::bare(ERR_COMMITS))?;
         let head = format!("+refs/heads/{branch}:refs/heads/{branch}");
         let pinned = is_commit_sha(&job.base_ref);
@@ -403,6 +406,24 @@ impl Drop for Scratch {
     }
 }
 
+/// Points the scratch repo's object store at the mirror's, so the fetch from the job dir
+/// moves only the objects the job added. Does nothing when the mirror has no object store.
+///
+/// The mirror is fleetd's own and the job group cannot write it, so the alternate is
+/// trusted. The path is made absolute because git resolves a relative alternate against the
+/// objects directory, not the caller's cwd.
+fn link_mirror(scratch: &Path, mirror: &Path) -> std::io::Result<()> {
+    let objects = std::path::absolute(mirror)?.join("objects");
+    if !objects.is_dir() {
+        return Ok(());
+    }
+    let info = scratch.join("objects").join("info");
+    std::fs::create_dir_all(&info)?;
+    let mut line = objects.into_os_string();
+    line.push("\n");
+    std::fs::write(info.join("alternates"), line.as_encoded_bytes())
+}
+
 fn filter_drivers(listing: &str) -> Option<BTreeSet<String>> {
     let mut names = BTreeSet::new();
     for line in listing.lines() {
@@ -434,8 +455,178 @@ fn pr_url(stdout: &str) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{ERR_PUSH, PushTarget};
+    use super::{ERR_PUSH, PushTarget, Scratch, link_mirror};
+    use crate::runner::{AgentRunner, Reporter, RunConfig};
+    use crate::workspace::{RepoPolicy, Workspace};
+    use fleet_core::Redactor;
     use fleet_proto::v1::Job;
+    use fleet_proto::v1::{ReportJobReply, ReportJobRequest};
+    use std::future::Future;
+    use std::path::{Path, PathBuf};
+    use std::process::Command;
+
+    type TestResult = Result<(), Box<dyn std::error::Error>>;
+
+    fn git(dir: &Path, args: &[&str]) -> Result<String, Box<dyn std::error::Error>> {
+        let out = Command::new("git")
+            .arg("-C")
+            .arg(dir)
+            .args(["-c", "user.name=t", "-c", "user.email=t@example.invalid"])
+            .args(args)
+            .output()?;
+        if !out.status.success() {
+            return Err(format!("git {args:?} failed").into());
+        }
+        Ok(String::from_utf8(out.stdout)?.trim().to_owned())
+    }
+
+    fn relative_to_cwd(path: &Path) -> Result<PathBuf, Box<dyn std::error::Error>> {
+        let mut relative = PathBuf::new();
+        for _ in std::env::current_dir()?.components().skip(1) {
+            relative.push("..");
+        }
+        relative.push(path.strip_prefix("/")?);
+        assert!(relative.is_relative());
+        Ok(relative)
+    }
+
+    fn mirror_with_commit(dir: &Path) -> Result<(PathBuf, String), Box<dyn std::error::Error>> {
+        let mirror = dir.join("mirror.git");
+        let seed = dir.join("seed");
+        std::fs::create_dir_all(&seed)?;
+        git(dir, &["init", "--bare", "--quiet", "mirror.git"])?;
+        git(&seed, &["init", "--quiet", "-b", "main"])?;
+        std::fs::write(seed.join("a.txt"), "one")?;
+        git(&seed, &["add", "."])?;
+        git(&seed, &["commit", "--quiet", "-m", "one"])?;
+        let target = mirror.to_str().ok_or("path")?;
+        git(&seed, &["push", "--quiet", target, "main"])?;
+        Ok((mirror, git(&seed, &["rev-parse", "HEAD"])?))
+    }
+
+    #[test]
+    fn the_scratch_repo_reads_the_mirror_objects_through_a_relative_path() -> TestResult {
+        let dir = tempfile::TempDir::new()?;
+        let (mirror, sha) = mirror_with_commit(dir.path())?;
+        let scratch = dir.path().join("scratch");
+        git(dir.path(), &["init", "--bare", "--quiet", "scratch"])?;
+        assert!(git(&scratch, &["cat-file", "-e", &sha]).is_err());
+        link_mirror(&scratch, &relative_to_cwd(&mirror)?)?;
+        git(&scratch, &["cat-file", "-e", &sha])?;
+        let alternates = std::fs::read_to_string(scratch.join("objects/info/alternates"))?;
+        assert!(Path::new(alternates.trim()).is_absolute(), "{alternates}");
+        Ok(())
+    }
+
+    #[test]
+    fn a_fetch_into_the_linked_scratch_moves_only_the_new_objects() -> TestResult {
+        let dir = tempfile::TempDir::new()?;
+        let (mirror, _) = mirror_with_commit(dir.path())?;
+        let job = dir.path().join("job");
+        let source = mirror.to_str().ok_or("path")?;
+        git(
+            dir.path(),
+            &["clone", "--quiet", "--no-local", source, "job"],
+        )?;
+        std::fs::write(job.join("b.txt"), "two")?;
+        git(&job, &["add", "."])?;
+        git(&job, &["commit", "--quiet", "-m", "two"])?;
+        let scratch = dir.path().join("scratch");
+        git(dir.path(), &["init", "--bare", "--quiet", "scratch"])?;
+        link_mirror(&scratch, &mirror)?;
+        let worktree = job.to_str().ok_or("path")?;
+        git(
+            &scratch,
+            &[
+                "fetch",
+                "--quiet",
+                "--",
+                worktree,
+                "+refs/heads/main:refs/heads/main",
+            ],
+        )?;
+        let counts = git(&scratch, &["count-objects", "-v"])?;
+        let loose = counts
+            .lines()
+            .find_map(|l| l.strip_prefix("count: "))
+            .ok_or("count")?;
+        assert!(loose.parse::<u32>()? <= 3, "{counts}");
+        let packed = counts
+            .lines()
+            .find_map(|l| l.strip_prefix("in-pack: "))
+            .ok_or("in-pack")?;
+        assert!(packed.parse::<u32>()? <= 3, "{counts}");
+        Ok(())
+    }
+
+    #[test]
+    fn a_mirror_without_an_object_store_is_skipped() -> TestResult {
+        let dir = tempfile::TempDir::new()?;
+        let scratch = dir.path().join("scratch");
+        git(dir.path(), &["init", "--bare", "--quiet", "scratch"])?;
+        link_mirror(&scratch, &dir.path().join("absent.git"))?;
+        assert!(!scratch.join("objects/info/alternates").exists());
+        Ok(())
+    }
+
+    struct Quiet;
+
+    impl Reporter for Quiet {
+        fn report(
+            &self,
+            _request: ReportJobRequest,
+        ) -> impl Future<Output = Result<ReportJobReply, tonic::Status>> + Send {
+            std::future::ready(Ok(ReportJobReply::default()))
+        }
+    }
+
+    #[tokio::test]
+    async fn the_production_ahead_path_borrows_the_mirror_objects() -> TestResult {
+        let dir = tempfile::TempDir::new()?;
+        let origin = dir.path().join("origin.git");
+        let seed = dir.path().join("seed");
+        std::fs::create_dir_all(&seed)?;
+        git(
+            dir.path(),
+            &["init", "--bare", "--quiet", "-b", "main", "origin.git"],
+        )?;
+        git(&seed, &["init", "--quiet", "-b", "main"])?;
+        std::fs::write(seed.join("a.txt"), "one")?;
+        git(&seed, &["add", "."])?;
+        git(&seed, &["commit", "--quiet", "-m", "one"])?;
+        let url = origin.to_str().ok_or("path")?.to_owned();
+        git(&seed, &["push", "--quiet", &url, "main"])?;
+        let root = dir.path().join("jobs");
+        let checkout = Workspace::new(&root)
+            .with_policy(RepoPolicy::new(Vec::<String>::new()).with_file_repos())
+            .prepare("job1", &url, "main")
+            .await?;
+        std::fs::write(checkout.path.join("b.txt"), "two")?;
+        git(&checkout.path, &["add", "."])?;
+        git(&checkout.path, &["commit", "--quiet", "-m", "two"])?;
+        let mut config = RunConfig::new("claude-fake", false);
+        config.jobs_dir = Some(root.clone());
+        let runner = AgentRunner::new(config, Quiet, Redactor::default());
+        let job = Job {
+            job_id: "job1".into(),
+            repo: url.clone(),
+            base_ref: "main".into(),
+            ..Job::default()
+        };
+        let scratch = Scratch::create(&checkout.path, "job1").map_err(|()| "scratch")?;
+        let ahead = runner
+            .ahead(&job, "swarm/job1", &checkout.path, scratch.path())
+            .await
+            .map_err(|_| "ahead")?;
+        assert!(ahead);
+        let alternates = std::fs::read_to_string(scratch.path().join("objects/info/alternates"))?;
+        let mirror = Workspace::mirror_dir(&root, &url);
+        assert_eq!(
+            Path::new(alternates.trim()),
+            std::path::absolute(mirror)?.join("objects")
+        );
+        Ok(())
+    }
 
     fn test_job() -> Job {
         Job {

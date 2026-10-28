@@ -22,7 +22,7 @@ ADRs for fleetd, the Fleet server and the `fleet` CLI. The plan is in `../plan.m
 | [0028](0028-eval-judge-and-ci-follow-up.md) | Eval, judge and CI follow-up | Accepted 2026-10-27, CI retry built, rest not built, builds on 0029 and 0030, amends 0021 and 0023 |
 | [0029](0029-job-telemetry.md) | Job telemetry | Accepted, built in the daemon and the server, amends 0021, beside 0022 |
 | [0030](0030-metrics-and-improvement-loop.md) | Metrics and the improvement loop | Accepted, `GetStats`, caps and shadow stuck detector built, enforcement not built, builds on 0029 |
-| [0031](0031-agent-isolation.md) | Agent isolation | Accepted 2026-10-26, P1 built behind `agent_launcher = "systemd"` and cut over on the first Box, P2 and P3 not built, supersedes the Known limit paragraph of 0024 and amends its credential and mirror-hardening sections |
+| [0031](0031-agent-isolation.md) | Agent isolation | Accepted 2026-10-26, P1 built behind `agent_launcher = "systemd"` and cut over on the first Box, P2 not built, P3 clone and publish built, supersedes the Known limit paragraph of 0024 and amends its credential and mirror-hardening sections |
 | [0034](0034-profiles-and-batches.md) | Profiles and batches | Accepted 2026-10-27, storage, profile and batch RPCs and `fleet batch show` and `fleet batch submit` built, fleetd profile apply and clone by commit id built, live probe not run, amends 0021, 0023, 0029 and 0030 |
 | [0035](0035-profile-blob-distribution.md) | Profile blob distribution | Accepted 2026-10-27, server side and fleetd materialisation built, amends 0021 and 0023, implements 0034 |
 | [0036](0036-per-job-unix-socket.md) | Per-job unix socket | Proposed 2026-10-28, not built, systemd launcher only, amends 0031 |

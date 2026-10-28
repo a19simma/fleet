@@ -99,7 +99,7 @@ const REPO: &str = "https://github.com/o/r.git";
 async fn every_call_runs_with_a_cleared_environment() -> TestResult {
     common::bounded(Box::pin(async {
         let (_dir, _root, all) = run(default_run(), REPO).await?;
-        assert_eq!(all.len(), 5);
+        assert_eq!(all.len(), 7);
         let expected = [
             "GIT_ALLOW_PROTOCOL",
             "GIT_CONFIG_GLOBAL",
@@ -152,6 +152,7 @@ async fn the_git_dir_pins_equal_the_absolute_mirror_path() -> TestResult {
             .join(".cache")
             .join("bc3fbd4dd8dbadfc9793e2a816228cf8fa84d7954992c487a510aced135fecdf.git");
         let mirror = mirror.to_str().ok_or("path")?;
+        let staging = mirror.replace(".git", ".init");
         assert!(Path::new(mirror).is_absolute());
         let mut pinned = 0;
         let clone_git = root.join("job1").join(".git");
@@ -159,6 +160,8 @@ async fn the_git_dir_pins_equal_the_absolute_mirror_path() -> TestResult {
         for call in all.iter().filter(|c| !is_unpinned(&c.args)) {
             let want = if call.args.contains("--prune") {
                 mirror
+            } else if call.args.contains(" config ") {
+                staging.as_str()
             } else {
                 clone_git
             };
@@ -169,7 +172,7 @@ async fn the_git_dir_pins_equal_the_absolute_mirror_path() -> TestResult {
             );
             pinned += 1;
         }
-        assert_eq!(pinned, 3);
+        assert_eq!(pinned, 5);
         Ok(())
     }))
     .await
@@ -207,12 +210,15 @@ async fn the_git_dir_pins_are_absolute_for_a_relative_root() -> TestResult {
             .join(".cache")
             .join("bc3fbd4dd8dbadfc9793e2a816228cf8fa84d7954992c487a510aced135fecdf.git");
         let mirror = mirror.to_str().ok_or("path")?;
+        let staging = mirror.replace(".git", ".init");
         let mut pinned = 0;
         let clone_git = cwd.join(&relative).join("job1").join(".git");
         let clone_git = clone_git.to_str().ok_or("path")?;
         for call in all.iter().filter(|c| !is_unpinned(&c.args)) {
             let want = if call.args.contains("--prune") {
                 mirror
+            } else if call.args.contains(" config ") {
+                staging.as_str()
             } else {
                 clone_git
             };
@@ -223,7 +229,7 @@ async fn the_git_dir_pins_are_absolute_for_a_relative_root() -> TestResult {
             }
             pinned += 1;
         }
-        assert_eq!(pinned, 3);
+        assert_eq!(pinned, 5);
         Ok(())
     }))
     .await
@@ -405,13 +411,16 @@ async fn the_mirror_fetches_by_explicit_url_and_configures_no_remote() -> TestRe
         .iter()
         .filter_map(|c| c.args.split(' ').nth(16))
         .collect();
-    assert_eq!(subs, ["init", "fetch", "clone", "fetch", "checkout"]);
+    assert_eq!(
+        subs,
+        ["init", "config", "config", "fetch", "clone", "fetch", "checkout"]
+    );
     assert!(
-        all[1]
+        all[3]
             .args
             .ends_with("fetch --prune --quiet -- https://github.com/o/r.git +refs/heads/*:refs/remotes/origin/*"),
         "{}",
-        all[1].args
+        all[3].args
     );
     assert!(!all.iter().any(|c| c.args.contains(" remote ")));
     Ok(())
@@ -434,13 +443,13 @@ async fn the_mirror_is_named_by_the_sha256_of_the_repo_url() -> TestResult {
         assert_eq!(a.len(), 1);
         assert_ne!(a, b);
         for name in a.iter().chain(&b) {
-            let stem = name.strip_suffix(".git").ok_or("suffix")?;
+            let stem = name.strip_suffix(".init").ok_or("suffix")?;
             assert_eq!(stem.len(), 64, "{name}");
             assert!(stem.bytes().all(|c| c.is_ascii_hexdigit()), "{name}");
         }
         assert_eq!(
             a[0],
-            "bc3fbd4dd8dbadfc9793e2a816228cf8fa84d7954992c487a510aced135fecdf.git"
+            "bc3fbd4dd8dbadfc9793e2a816228cf8fa84d7954992c487a510aced135fecdf.init"
         );
         Ok(())
     }))
