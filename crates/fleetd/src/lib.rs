@@ -27,6 +27,7 @@ mod hook;
 pub mod http1;
 pub mod jobenv;
 mod jobs;
+pub mod jobsock;
 pub mod phase;
 pub mod poller;
 mod proc;
