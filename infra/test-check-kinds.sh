@@ -10,12 +10,12 @@ failures=0
 fresh() {
   d="$scratch/$1"
   mkdir -p "$d"
-  cp "$here/kustomization.yaml" "$here/deployment.yaml" "$here/service.yaml" "$d/"
+  cp "$here/kustomization.yaml" "$here/deployment.yaml" "$here/service.yaml" "$here/master-key-generator.yaml" "$here/master-key-externalsecret.yaml" "$d/"
   printf '%s\n' "$d"
 }
 
 add_resource() {
-  insert_after '^  - service.yaml$' '  - extra.yaml' "$1/kustomization.yaml" >"$1/kustomization.next"
+  insert_after '^  - master-key-externalsecret.yaml$' '  - extra.yaml' "$1/kustomization.yaml" >"$1/kustomization.next"
   cp "$1/kustomization.next" "$1/kustomization.yaml"
 }
 
@@ -97,7 +97,7 @@ for field in hostNetwork hostPID hostIPC; do
 done
 
 d=$(fresh hostpath)
-insert_after '^    spec:$' "      volumes: [{name: v, hostPath: {path: /etc}}]" "$here/deployment.yaml" >"$d/deployment.yaml"
+insert_after '^      volumes:$' "        - {name: v, hostPath: {path: /etc}}" "$here/deployment.yaml" >"$d/deployment.yaml"
 expect_fail "$d" "hostPath volume" "pod uses"
 
 d=$(fresh privileged)

@@ -7,12 +7,14 @@ Kubernetes manifests for fleet-server. An Argo CD Application in the cluster ope
 - `deployment.yaml`: the fleet-server Deployment in namespace `fleet-server`.
 - `service.yaml`: a ClusterIP Service for the gRPC port (7070) and the health port (7072).
 - `kustomization.yaml`: lists both and pins the image `ghcr.io/a19simma/fleet-server` to tag 0.2.1. That tag is a baseline floor.
-- `check-kinds.sh`: renders the kustomization and fails on any kind outside Deployment and Service, and on any container or initContainer in a Deployment that lacks requests for cpu, memory and ephemeral-storage or limits for memory and ephemeral-storage. A cpu limit is allowed but not required.
+- `master-key-generator.yaml` and `master-key-externalsecret.yaml`: an external-secrets Password generator and an ExternalSecret that create Secret `fleet-master-key` once. See Master key.
+- `check-master-key-kind.sh`: creates a uniquely named kind cluster, installs external-secrets, applies both objects, and proves a restricted pod reads the key ring file, the mount is read-only, and the key survives a forced sync, a controller restart and an ExternalSecret recreate. It deletes only its own cluster. Needs `kind`, `kubectl`, `helm` and network access.
+- `check-kinds.sh`: renders the kustomization and fails on any kind outside Deployment, Service, ExternalSecret and Password, and on any container or initContainer in a Deployment that lacks requests for cpu, memory and ephemeral-storage or limits for memory and ephemeral-storage. A cpu limit is allowed but not required.
 - `test-check-kinds.sh`: proves the check rejects a Role, Namespace, Secret, non-ClusterIP Service, other namespace, `hostNetwork`, `hostPID`, `hostIPC`, `hostPath`, privileged containers and containers missing a cpu, memory or ephemeral-storage request or a memory or ephemeral-storage limit. It also proves a container with or without a cpu limit is accepted.
 
 ## Allowed kinds
 
-Deployment and Service, in namespace `fleet-server`. The Argo CD project that owns the Application allows nothing else, and CI runs `check-kinds.sh` so a change outside that set fails before merge. The check also rejects Service shapes `NodePort`, `LoadBalancer`, `ExternalName` and `externalIPs`.
+Deployment, Service, ExternalSecret and Password (the external-secrets generator), in namespace `fleet-server`. The Argo CD project that owns the Application allows nothing else, and CI runs `check-kinds.sh` so a change outside that set fails before merge. The check also rejects Service shapes `NodePort`, `LoadBalancer`, `ExternalName` and `externalIPs`.
 
 The check does not cover `runAsUser`, `capabilities.add` or `serviceAccountName`. Pod Security `restricted` and the operator cover those.
 
@@ -24,8 +26,25 @@ The operator owns everything this directory leaves out.
 - Secret `fleet-server-secrets` exists in that namespace with keys `FLEET_DATABASE_URL` and `FLEET_TOKEN`. The key `FLEET_CLIENT_TOKEN` is optional: the Deployment reads it with `optional: true`, and without it the server leaves `FleetQuery` and `FleetJobs` closed (ADR-0023).
 - Optional retention settings, set as plain `env` entries in the Deployment when the defaults do not fit: `FLEET_EVENTS_RETENTION_DAYS` (default 90), `FLEET_SUMMARIES_RETENTION_DAYS` (default 365, not below the events value) and `FLEET_RETENTION_INTERVAL_SECS` (default 3600, minimum 60). The server prunes job events and summaries of finished jobs on that schedule and keeps job rows and transcripts. An invalid value stops startup.
 - Optional CI retry: `FLEET_MAX_CI_RETRIES` (0 to 5, default 0, which turns it off). When a job's pull request CI fails, the server submits up to that many fix jobs on the same branch (ADR-0028). An invalid value stops startup.
+- The external-secrets operator runs in the cluster and the Argo CD project allows `ExternalSecret` (`external-secrets.io`) and `Password` (`generators.external-secrets.io`) in the namespace.
 - A Postgres 17 database and a role for the server exist, and `FLEET_DATABASE_URL` points at them.
 - The route and gateway that expose port 7070 belong to the operator. The route holds a private hostname, so it does not live in this repo.
+
+## Master key
+
+ADR-0040 keeps the credential master key in a file. The Deployment mounts Secret `fleet-master-key` read-only at `/etc/fleet/master-key` and sets `FLEET_MASTER_KEY_FILE=/etc/fleet/master-key/keyring`. The file holds one key ring line, `k1:` followed by 64 hex characters. The first line is the active key.
+
+The Password generator makes the value: `length: 32` with `encoding: hex` gives 64 hex characters, and `prefix: "k1:"` adds the key id. The ExternalSecret sets `refreshInterval: "0s"`, `refreshPolicy: CreatedOnce` and `creationPolicy: Orphan`, so the Secret is created once and never rewritten, and it outlives the ExternalSecret. A regenerated key would make every stored credential unreadable.
+
+Sources, read 2026-10-29:
+
+- Official docs, [Generator guide](https://external-secrets.io/latest/guides/generator/): "The generator does not keep track of the produced values. Every invocation produces a new set of values." So stability comes from the ExternalSecret settings alone.
+- Source code, [externalsecret_types.go](https://github.com/external-secrets/external-secrets/blob/main/apis/externalsecrets/v1/externalsecret_types.go): `refreshInterval` "May be set to "0s" to fetch and create it once". `refreshPolicy` `CreatedOnce` "Creates the Secret only if it does not exist and does not update it thereafter". `creationPolicy` `Orphan` "creates the Secret and does not set the ownerReference. I.e. it will be orphaned after the deletion of the ExternalSecret."
+- Official docs, [Password generator](https://external-secrets.io/latest/api/generator/password/) (raw page): "The prefix and suffix are added after `encoding`" and the hex example turns a 16 character password into 32 hex characters.
+
+Verified in kind with `check-master-key-kind.sh` against chart `external-secrets` 2.14.0: the key file is unchanged and the Secret uid is the same after a forced sync annotation, a controller restart and an ExternalSecret delete and recreate. Unverified: behaviour under a different operator version, and whether a new CRD default would change the semantics. Pin the operator version in the operator's repo.
+
+The operator must enable etcd encryption at rest. Without it the Secret sits in etcd in the clear (ADR-0040).
 
 ## Image tag
 
