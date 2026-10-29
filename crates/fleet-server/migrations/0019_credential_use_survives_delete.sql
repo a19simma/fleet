@@ -1,0 +1,1 @@
+ALTER TABLE credential_use DROP CONSTRAINT credential_use_credential_id_fkey;

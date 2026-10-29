@@ -172,3 +172,36 @@ async fn deleting_a_user_with_credentials_is_refused(pool: PgPool) {
         .unwrap_err();
     assert_eq!(code(&err), "23503");
 }
+
+#[sqlx::test]
+async fn deleting_a_credential_with_use_rows_succeeds_and_keeps_the_rows(pool: PgPool) {
+    let id = user(&pool, "alice").await.unwrap();
+    let cred = credential(&pool, id, "github_pat", "static_secret")
+        .await
+        .unwrap();
+    sqlx::query("INSERT INTO credential_use (credential_id, job_id) VALUES ($1, 'job')")
+        .bind(cred)
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query("DELETE FROM credentials WHERE id = $1")
+        .bind(cred)
+        .execute(&pool)
+        .await
+        .unwrap();
+    let kept: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM credential_use WHERE credential_id = $1")
+            .bind(cred)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(kept, 1);
+    for statement in [
+        "UPDATE credential_use SET job_id = 'other'",
+        "DELETE FROM credential_use",
+        "TRUNCATE credential_use",
+    ] {
+        let err = sqlx::query(statement).execute(&pool).await.unwrap_err();
+        assert!(err.to_string().contains("insert-only"), "{statement}");
+    }
+}
