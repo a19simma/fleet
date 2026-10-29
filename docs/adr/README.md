@@ -31,5 +31,7 @@ ADRs for fleetd, the Fleet server and the `fleet` CLI. The plan is in `../plan.m
 | [0039](0039-job-socket-service-registration.md) | Job socket service registration | Proposed 2026-10-28, `PerJob` registry built, not wired, supersedes the unspecified service registration in 0036, 0037 and 0038 |
 | [0040](0040-credential-store-and-key-custody.md) | Credential store and key custody | Proposed 2026-10-29, not built, amends 0013, builds on 0043 |
 | [0043](0043-agent-credential-kinds-and-shapes.md) | Agent credential kinds and shapes | Proposed 2026-10-29, not built, builds on 0040, supersedes the box PAT decision for user Jobs |
+| [0041](0041-web-ui.md) | Web UI | Proposed 2026-10-29, not built, spike passed with workarounds, amends 0013 |
+| [0042](0042-users-and-auth.md) | Users and auth | Proposed 2026-10-29, not built, amends 0013 and 0014, builds on 0041 and 0040 |
 
 Each ADR has a "Decisions (2026-10-24)" section with the choices made when the docs moved into this repo: Apache-2.0 licence, repo github.com/a19simma/fleet, `fleet watch` as a client poll in v1, job cost deferred, Tailscale not a hard dependency.
