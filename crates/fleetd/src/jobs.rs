@@ -295,6 +295,13 @@ impl<R: Reporter + Send + Sync + 'static> DaemonRunner<R> {
 impl<R: Reporter + Send + Sync + 'static> JobRunner for DaemonRunner<R> {
     async fn run(&self, job: Job, shutdown: Shutdown) -> Result<(), RunError> {
         let _ended = self.agent.end_guard(&job);
+        if crate::agent::resolve(&job.agent).is_none() {
+            tracing::warn!("job names an unsupported agent");
+            self.agent
+                .fail_job(&job, crate::agent::ERR_UNKNOWN_AGENT)
+                .await;
+            return Err(RunError);
+        }
         if job.kind() == JobKind::Judge {
             return self.run_judge(&job, shutdown).await;
         }
@@ -891,6 +898,24 @@ mod tests {
             vec!["judge transcript could not be fetched".to_owned()]
         );
         assert!(!stale.exists());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn an_unknown_agent_fails_the_job_with_a_fixed_message_before_the_clone() -> TestResult {
+        let profile = Profile::default();
+        let job = Job {
+            agent: "no-such-agent".into(),
+            ..profile_job(&profile)
+        };
+        let mut fx = fixture(Ok(reply_for(&job, profile.canonical_json())))?;
+        let (_trigger, shutdown) = Shutdown::channel();
+        assert!(fx.runner.run(job, shutdown).await.is_err());
+        assert_eq!(
+            errors(&mut fx.reports),
+            vec!["agent is not supported".to_owned()]
+        );
+        assert!(!fx.marker.exists());
         Ok(())
     }
 

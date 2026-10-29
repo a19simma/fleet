@@ -9,6 +9,7 @@
 //! and a summary parsed from the agent's output ([`telemetry`]). The push's `GIT_ASKPASS` is
 //! `fleetd askpass` ([`askpass`]).
 
+pub mod agent;
 pub mod agent_config;
 pub mod agent_exec;
 mod app;
