@@ -3,6 +3,7 @@
 pub mod auth;
 pub mod batches;
 pub mod config;
+pub mod cred;
 pub mod jobs;
 pub mod profiles;
 pub mod projection;
