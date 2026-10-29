@@ -32,6 +32,7 @@ The Fleet server is a long-running service in Rust, with gRPC through tonic and 
 
 - **Services (ADR-0021), built.** Claim and lease move off `FleetIngest` to a new box-scope service, `FleetWorker` (`ClaimJob`, `ReportJob`). `FleetIngest` keeps events and heartbeat. `FleetJobs` gains `GetJob`, `ListJobs` and `ReadTranscript`. `QueueDepth` and drain are not part of the first job system.
 - **Transcripts (ADR-0022), built.** "No transcripts" now holds only for the session transcripts fleetd reads for previews. The server stores the stream-json output of Jobs in `job_transcript`, capped at 4 MiB per Job.
+- **Credentials (ADR-0040), not built.** Postgres also holds `credentials` and `credential_use`, sealed with XChaCha20-Poly1305 under a master key file. It protects DB backups and read-only SQL, not a compromised server pod.
 - **Retention.** `job_attempts` is not created in the first job system, so only `jobs` and `job_transcript` exist. The one year retention of `jobs` stands. No transcript retention job is designed.
 
 ## Considered and rejected
