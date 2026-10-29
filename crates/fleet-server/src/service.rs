@@ -26,12 +26,15 @@ use fleet_proto::v1::{
     VerifyCredentialReply, VerifyCredentialRequest,
 };
 use fleet_proto::{ConvertError, validate_box};
-use tonic::transport::server::Router;
+use tonic::service::Routes;
+use tonic::transport::Server;
+use tonic::transport::server::{Router, TcpIncoming};
 use tonic::{Request, Response, Status};
 use tower::layer::util::{Identity, Stack};
 
 use crate::auth::BearerAuth;
 use crate::store::{Store, StoreError};
+use crate::web::{Dispatch, Web};
 use fleet_proto::MAX_PROFILE_MESSAGE_BYTES;
 
 /// Seconds a box should wait before its next heartbeat.
@@ -544,6 +547,41 @@ impl FleetJobs for FleetService {
 /// concurrent streams per connection, an HTTP/2 keepalive ping every 30 seconds and a
 /// 1 MiB request message limit.
 pub fn router(store: &Store, auth: &BearerAuth) -> Router<Stack<BearerAuth, Identity>> {
+    server().layer(auth.clone()).add_routes(routes(store))
+}
+
+fn server() -> Server {
+    Server::builder()
+        .timeout(REQUEST_TIMEOUT)
+        .concurrency_limit_per_connection(CONCURRENCY_PER_CONNECTION)
+        .http2_keepalive_interval(Some(KEEPALIVE_INTERVAL))
+        .max_concurrent_streams(MAX_CONCURRENT_STREAMS)
+}
+
+/// Serves the gRPC services and the web pages on one listener until `shutdown` resolves.
+///
+/// Uses the connection settings of [`router`] and also accepts HTTP/1.1 for browsers. The
+/// bearer `auth` wraps the gRPC services only; the web router has its own session checks.
+/// In-flight requests drain on shutdown, as for [`router`].
+///
+/// # Errors
+///
+/// Returns the transport error that stopped the server.
+pub async fn serve_with_web(
+    store: &Store,
+    auth: &BearerAuth,
+    web: Web,
+    incoming: TcpIncoming,
+    shutdown: impl Future<Output = ()>,
+) -> Result<(), tonic::transport::Error> {
+    let grpc = tower::Layer::layer(auth, routes(store));
+    server()
+        .accept_http1(true)
+        .serve_with_incoming_shutdown(Dispatch::new(grpc, web), incoming, shutdown)
+        .await
+}
+
+fn routes(store: &Store) -> Routes {
     let service = FleetService::new(store.clone());
     let ingest =
         FleetIngestServer::new(service.clone()).max_decoding_message_size(MAX_MESSAGE_BYTES);
@@ -559,13 +597,7 @@ pub fn router(store: &Store, auth: &BearerAuth) -> Router<Stack<BearerAuth, Iden
         FleetCredentialsServer::new(service.clone()).max_decoding_message_size(MAX_MESSAGE_BYTES);
     let profiles =
         FleetProfilesServer::new(service).max_decoding_message_size(MAX_PROFILE_MESSAGE_BYTES);
-    tonic::transport::Server::builder()
-        .timeout(REQUEST_TIMEOUT)
-        .concurrency_limit_per_connection(CONCURRENCY_PER_CONNECTION)
-        .http2_keepalive_interval(Some(KEEPALIVE_INTERVAL))
-        .max_concurrent_streams(MAX_CONCURRENT_STREAMS)
-        .layer(auth.clone())
-        .add_service(ingest)
+    Routes::new(ingest)
         .add_service(query)
         .add_service(worker)
         .add_service(jobs)

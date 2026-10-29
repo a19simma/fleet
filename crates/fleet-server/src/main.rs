@@ -12,9 +12,10 @@ use fleet_server::config::{Config, CredentialsState, exposed_binds, is_loopback}
 use fleet_server::cred::Users;
 use fleet_server::reaper::{DEFAULT_REAP_PERIOD, run_reaper};
 use fleet_server::retention::run_retention;
-use fleet_server::service::router;
+use fleet_server::service::serve_with_web;
 use fleet_server::store::Store;
 use fleet_server::supervise::{BoxError, supervise};
+use fleet_server::web::Web;
 use sqlx::postgres::{PgConnectOptions, PgPoolOptions};
 use tokio::net::TcpListener;
 use tokio::signal::unix::{SignalKind, signal};
@@ -131,8 +132,7 @@ async fn run() -> Result<(), BoxError> {
     ));
     let auth = BearerAuth::new(&config.token, config.client_token.as_ref()).with_users(users);
     let grpc_server = async {
-        router(&store, &auth)
-            .serve_with_incoming_shutdown(grpc, stopped(stop_rx.clone()))
+        serve_with_web(&store, &auth, Web::new(), grpc, stopped(stop_rx.clone()))
             .await
             .map_err(BoxError::from)
     };

@@ -14,3 +14,4 @@ pub mod stats;
 pub mod store;
 pub mod supervise;
 pub mod telemetry;
+pub mod web;
