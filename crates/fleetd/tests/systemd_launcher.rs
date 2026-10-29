@@ -1152,6 +1152,46 @@ fn agent_unit_runs_in_a_private_network_namespace() {
     assert!(!drop_in.exists());
 }
 
+const EXEC_PREFIX_CHARS: [char; 5] = ['@', '-', ':', '+', '!'];
+
+fn exec_prefix(value: &str) -> &str {
+    let value = value.trim_start();
+    let rest = value.trim_start_matches(EXEC_PREFIX_CHARS);
+    &value[..value.len() - rest.len()]
+}
+
+fn privileged_exec_lines(lines: &[String]) -> Vec<&String> {
+    lines
+        .iter()
+        .filter(|l| {
+            l.split_once('=').is_some_and(|(key, value)| {
+                key.starts_with("Exec") && exec_prefix(value).contains(['+', '!'])
+            })
+        })
+        .collect()
+}
+
+#[test]
+fn exec_prefix_guard_rejects_every_privileged_prefix() {
+    for value in [
+        "+/bin/x",
+        "!/bin/x",
+        "-+/bin/x",
+        ":+/bin/x",
+        "+-/bin/x",
+        "!!/bin/x",
+        "@-!/bin/x",
+        " +/bin/x",
+    ] {
+        let lines = vec![format!("ExecStopPost={value}")];
+        assert_eq!(privileged_exec_lines(&lines).len(), 1, "{value}");
+    }
+    for value in ["/bin/x", "-/bin/x", "@/bin/x", "-:/bin/x", "/bin/x +a !b"] {
+        let lines = vec![format!("ExecStopPost={value}")];
+        assert!(privileged_exec_lines(&lines).is_empty(), "{value}");
+    }
+}
+
 #[test]
 fn agent_unit_makes_its_agent_tree_group_writable_as_the_job_user_on_stop() {
     let lines = unit_directives("fleet-agent@.service");
@@ -1161,12 +1201,10 @@ fn agent_unit_makes_its_agent_tree_group_writable_as_the_job_user_on_stop() {
         .collect();
     assert_eq!(
         stops,
-        ["ExecStopPost=/bin/chmod -R g+rwX /var/lib/fleet/jobs/.agent/%i"]
+        ["ExecStopPost=-/bin/chmod -R g+rwX /var/lib/fleet/jobs/.agent/%i"]
     );
-    let privileged: Vec<_> = lines
-        .iter()
-        .filter(|l| l.contains("=+") || l.contains("=!"))
-        .collect();
+    assert!(lines.iter().any(|l| l == "User=fleet-job"));
+    let privileged = privileged_exec_lines(&lines);
     assert!(privileged.is_empty(), "{privileged:?}");
 }
 
