@@ -35,4 +35,4 @@ InaccessiblePaths=/etc/swarm
 TemporaryFileSystem=/run/fleet:ro
 BindPaths=/run/fleet/%i
 BindReadOnlyPaths=/run/fleet/hook
-ExecStopPost=/bin/chmod -R g+rwX /var/lib/fleet/jobs/.agent/%i
+ExecStopPost=-/bin/chmod -R g+rwX /var/lib/fleet/jobs/.agent/%i
