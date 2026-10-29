@@ -1153,6 +1153,24 @@ fn agent_unit_runs_in_a_private_network_namespace() {
 }
 
 #[test]
+fn agent_unit_makes_its_agent_tree_group_writable_as_the_job_user_on_stop() {
+    let lines = unit_directives("fleet-agent@.service");
+    let stops: Vec<_> = lines
+        .iter()
+        .filter(|l| l.starts_with("ExecStopPost="))
+        .collect();
+    assert_eq!(
+        stops,
+        ["ExecStopPost=/bin/chmod -R g+rwX /var/lib/fleet/jobs/.agent/%i"]
+    );
+    let privileged: Vec<_> = lines
+        .iter()
+        .filter(|l| l.contains("=+") || l.contains("=!"))
+        .collect();
+    assert!(privileged.is_empty(), "{privileged:?}");
+}
+
+#[test]
 fn managed_settings_use_only_command_hooks() {
     let text = unit_directives("managed-settings.json").join("\n");
     assert!(!text.contains("\"type\": \"http\""));
