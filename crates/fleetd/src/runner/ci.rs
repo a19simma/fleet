@@ -1,17 +1,19 @@
 //! Watches the checks of the pull request a job opened, until they settle or a deadline passes.
 
+use std::future::{self, Future};
 use std::path::Path;
-
 use std::time::Duration;
 
 use fleet_core::Redactor;
 use fleet_proto::v1::{CiState, Job, JobCi};
 use fleet_proto::{MAX_CI_LOG_BYTES, is_ci_log, is_ci_url};
-use serde_json::Value;
+use serde_json::{Value, json};
 use tokio::time::Instant;
 use tonic::Code;
 
 use super::{AgentRunner, Ctl, Interrupt, Reporter, Scope, Stop, report_request};
+use crate::broker::{ExecError, GhExecutor, GitExecutor, PushTarget};
+use crate::forge::{CiResult, Forge, GitHubForge};
 use crate::publish::Scratch;
 
 /// What one `gh pr checks` call showed.
@@ -69,6 +71,71 @@ pub(super) fn classify(stdout: &str) -> Seen {
         Seen::Passed { url }
     } else {
         Seen::Waiting { url }
+    }
+}
+
+struct Replay(String);
+
+impl GitExecutor for Replay {
+    fn push(&self, _target: &PushTarget) -> impl Future<Output = Result<String, ExecError>> + Send {
+        future::ready(Err(ExecError))
+    }
+
+    fn fetch(&self) -> impl Future<Output = Result<String, ExecError>> + Send {
+        future::ready(Err(ExecError))
+    }
+}
+
+impl GhExecutor for Replay {
+    fn pr_create(
+        &self,
+        _target: &PushTarget,
+        _title: &str,
+        _body: &str,
+    ) -> impl Future<Output = Result<String, ExecError>> + Send {
+        future::ready(Err(ExecError))
+    }
+
+    fn pr_checks(
+        &self,
+        _target: &PushTarget,
+        _pr_url: &str,
+    ) -> impl Future<Output = Result<String, ExecError>> + Send {
+        future::ready(Ok(self.0.clone()))
+    }
+}
+
+fn link_of(seen: Seen) -> Option<String> {
+    match seen {
+        Seen::Passed { url } | Seen::Failed { url } | Seen::Waiting { url } => url,
+    }
+}
+
+/// Reads one `gh pr checks` answer through [`Forge::ci_result`], with the capture's
+/// `truncated` flag carried into the forge input.
+///
+/// `Success` and `Neutral` give [`Seen::Passed`] only when `success` holds, `Failure` gives
+/// [`Seen::Failed`], and everything else gives [`Seen::Waiting`]. A forge error, which
+/// includes a list the capture cut without a visible failure, is [`Seen::Waiting`], so an
+/// unknown or truncated result never counts as success.
+pub(super) async fn read_checks(
+    target: &PushTarget,
+    pr_url: &str,
+    stdout: &str,
+    truncated: bool,
+    success: bool,
+) -> Seen {
+    let Ok(Value::Array(items)) = serde_json::from_str::<Value>(stdout) else {
+        return Seen::Waiting { url: None };
+    };
+    let url = link_of(classify(stdout));
+    let body = json!({ "checks": items, "truncated": truncated }).to_string();
+    let forge = GitHubForge::new(Replay(body.clone()), Replay(body));
+    match forge.ci_result(target, pr_url).await {
+        Ok(CiResult::Failure) => Seen::Failed { url },
+        Ok(CiResult::Success | CiResult::Neutral) if success => Seen::Passed { url },
+        Ok(CiResult::Success | CiResult::Neutral) => Seen::Waiting { url: None },
+        _ => Seen::Waiting { url },
     }
 }
 
@@ -186,7 +253,7 @@ impl<R: Reporter> AgentRunner<R> {
         let mut pause = self.config.ci_poll_initial;
         let mut passes = 0;
         loop {
-            let (url, settled) = match self.check_pr(dir, pr_url).await {
+            let (url, settled) = match self.check_pr(job, dir, pr_url).await {
                 Seen::Passed { url } => {
                     passes += 1;
                     (url, passes >= SETTLED_POLLS)
@@ -217,9 +284,13 @@ impl<R: Reporter> AgentRunner<R> {
         }
     }
 
-    /// Runs `gh pr checks` and reads it. An answer cut by the capture limit, a failed start
-    /// and a nonzero exit with an all-pass list read as [`Seen::Waiting`], never as a pass.
-    async fn check_pr(&self, dir: &Path, pr_url: &str) -> Seen {
+    /// Runs `gh pr checks` and reads it with [`read_checks`]. An answer cut by the capture
+    /// limit, a failed start and a nonzero exit with an all-pass list read as [`Seen::Waiting`],
+    /// never as a pass.
+    async fn check_pr(&self, job: &Job, dir: &Path, pr_url: &str) -> Seen {
+        let Ok(target) = PushTarget::from_job(job) else {
+            return Seen::Waiting { url: None };
+        };
         let checked = self
             .helper(
                 &self.config.gh_bin,
@@ -229,11 +300,7 @@ impl<R: Reporter> AgentRunner<R> {
             )
             .await;
         match checked {
-            Ok(out) if out.truncated => Seen::Waiting { url: None },
-            Ok(out) => match classify(&out.stdout) {
-                Seen::Passed { .. } if !out.success => Seen::Waiting { url: None },
-                seen => seen,
-            },
+            Ok(out) => read_checks(&target, pr_url, &out.stdout, out.truncated, out.success).await,
             Err(_) => Seen::Waiting { url: None },
         }
     }
@@ -268,6 +335,8 @@ mod tests {
     use super::*;
 
     use fleet_proto::MAX_CI_URL_BYTES;
+
+    use crate::broker::PushTarget;
 
     const LINK: &str = "https://example.invalid/actions/runs/9/job/41";
 
@@ -366,6 +435,48 @@ mod tests {
             classify(&list(&[item("pass", &link)])),
             Seen::Passed { url: Some(link) }
         );
+    }
+
+    fn own() -> PushTarget {
+        PushTarget::Own("job1".to_owned())
+    }
+
+    #[tokio::test]
+    async fn a_truncated_all_pass_list_waits_and_never_passes() {
+        let items: Vec<String> = (0..50).map(|_| item("pass", LINK)).collect();
+        let seen = read_checks(&own(), "u", &list(&items), true, true).await;
+        assert!(matches!(seen, Seen::Waiting { .. }), "{seen:?}");
+    }
+
+    #[tokio::test]
+    async fn a_truncated_list_with_a_visible_failure_fails() {
+        let out = list(&[item("pass", LINK), item("fail", LINK)]);
+        let seen = read_checks(&own(), "u", &out, true, false).await;
+        assert!(matches!(seen, Seen::Failed { .. }), "{seen:?}");
+    }
+
+    #[tokio::test]
+    async fn the_forge_result_maps_to_the_seen_state() {
+        let cases = [
+            (list(&[item("pass", LINK)]), true, true),
+            (list(&[item("pass", LINK)]), false, false),
+            (
+                list(&[item("pass", LINK), item("skipping", "")]),
+                true,
+                true,
+            ),
+        ];
+        for (out, success, passed) in cases {
+            let seen = read_checks(&own(), "u", &out, false, success).await;
+            assert_eq!(matches!(seen, Seen::Passed { .. }), passed, "{seen:?}");
+        }
+        let pending = list(&[item("pass", LINK), item("pending", LINK)]);
+        let seen = read_checks(&own(), "u", &pending, false, false).await;
+        assert!(matches!(seen, Seen::Waiting { .. }), "{seen:?}");
+        let seen = read_checks(&own(), "u", "[]", false, true).await;
+        assert!(matches!(seen, Seen::Waiting { .. }), "{seen:?}");
+        let seen = read_checks(&own(), "u", "junk", false, true).await;
+        assert!(matches!(seen, Seen::Waiting { .. }), "{seen:?}");
     }
 
     #[test]
