@@ -58,3 +58,7 @@ Pushes per Job (10, at least 5 s apart), one `pr_create` call per Job that reach
 - **Broker only, without P1 to P3.** Amends the "A credential broker only" rejection in ADR-0031: the broker alone leaves the shared mirror and `/proc` open, so it is accepted as one layer on top of P1 to P3.
 - **A wrapper on PATH.** Bypassing a wrapper yields no credential, so it is convenience only.
 - **Flipping the default launcher to systemd now.** Out of scope here.
+
+## Amendment (ADR-0033, ADR-0045)
+
+The broker holds the Job owner's credentials from `GetJobCredentials` in memory, in place of the Box PAT. Its `push`, `pr_create` and `pr_checks` ops call the `Forge` trait, with GitHub as the only v1 implementation.

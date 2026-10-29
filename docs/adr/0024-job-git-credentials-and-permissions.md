@@ -44,3 +44,7 @@ ADR-0037 amends the push and `gh` sections: the agent will request `push`, `pr_c
 - **Always skip permissions.** Ties safety entirely to the environment, including on a Box that is not disposable.
 - **A permission allowlist only.** Stalls on any tool outside the list.
 - **One repo set in fleetd config.** Blocks multi-repo use.
+
+## Amendment (ADR-0033, ADR-0045, ADR-0046)
+
+For user Jobs the `GH_TOKEN` comes from the owner's stored `github_pat`, delivered by `GetJobCredentials` (ADR-0033), and never from the Box PAT. A missing credential fails the Job with a fixed error. The Box PAT is temporary and will be removed. The mirror directory is keyed by `(user, repo)` (ADR-0046). Push and pull request go through the `Forge` trait (ADR-0045).

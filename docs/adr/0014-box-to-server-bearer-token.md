@@ -74,3 +74,7 @@ A shared bearer token, for the proof of concept.
 - **Authorization.** A valid token allows ingest, heartbeat and claim of Jobs addressed to the sending `box`, and also every `FleetQuery` and `FleetJobs` call: any holder can read all Boxes and submit or cancel Jobs.
 - **Downside.** One leaked token exposes the fleet: an attacker with it can inject events, claim Jobs as any `box-<n>`, and read every Box's prompts and transcript summaries.
 - **Only fleet auth.** Tailscale is not a hard dependency. The token is the only fleet auth.
+
+## Amendment (ADR-0033)
+
+The Box token also reaches `FleetWorker.GetJobCredentials`, which releases a Job owner's stored credentials. A leaked Box token therefore exposes those credentials for any live Job. The user accepted this while there is one Box and one user.
