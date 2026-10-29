@@ -100,6 +100,82 @@ _Avoid_: cleanup callback, finalizer
 The Box-level rule for which hosts `fleetd fetch` may reach. Planned, not built: allow all public hosts first, a radiant allowlist later. A Profile cannot change it (ADR-0038).
 _Avoid_: egress allowlist, proxy policy
 
+**User**:
+A person who owns **Credentials** and submits Jobs. Planned, not built (ADR-0040, ADR-0043).
+_Avoid_: account, tenant
+
+**Credential**:
+One secret a **User** stores for a Job: an agent key or token, or a forge token. Sealed in the `credentials` table (ADR-0040).
+_Avoid_: token, secret, key
+
+**Credential kind**:
+Which service a **Credential** is for: `anthropic_api_key`, `claude_subscription_token`, `github_pat`, `kimi_membership_key`, `kimi_platform_key` or `codex_api_key` (ADR-0043).
+_Avoid_: credential type, provider
+
+**Credential shape**:
+How a **Credential** behaves over time: `static_secret` (accepted in v1) or `refreshing_file` (reserved, rejected in v1) (ADR-0043).
+_Avoid_: credential format
+
+**Fingerprint**:
+A plaintext display value derived from a **Credential** so the **User** can tell stored credentials apart. It never reveals the secret (ADR-0040).
+_Avoid_: hash, checksum
+
+**Sealer**:
+The trait that seals and opens **Credential** ciphertext. `FileSealer` is the first implementation; a KMS or Vault Transit backend can replace it (ADR-0040).
+_Avoid_: encryptor, vault
+
+**Master key**:
+The key file mounted into the server pod from a Kubernetes Secret that a **Sealer** uses. It protects DB backups and read-only SQL, not a compromised server pod (ADR-0040).
+_Avoid_: root key, secret key
+
+**Key ring**:
+The set of **Master keys** selected by `key_id`, so rotation needs no downtime (ADR-0040).
+_Avoid_: key store
+
+**API token**:
+Planned, not built: a bearer token a **User** uses with the API or CLI, in place of the shared client token.
+_Avoid_: token, client token
+
+**Web session**:
+Planned, not built: the browser login state of a **User**.
+_Avoid_: login token, cookie
+
+**Credential holder**:
+The server component that opens a **Credential** for one claimed Job and records the read in `credential_use`. Planned, not built (ADR-0040).
+_Avoid_: vault, secret manager
+
+**Job credentials**:
+The **Credentials** the server releases to a Box for one Job and no other. Planned, not built (ADR-0043).
+_Avoid_: job secrets, job tokens
+
+**Agent runner**:
+The agent CLI a Job runs, such as Claude Code, Codex or Kimi, which a **Credential kind** feeds. Planned, not built.
+_Avoid_: agent, model
+
+**Forge**:
+The git host of a repository: GitHub, Gitea or Forgejo (ADR-0043, ADR-0045).
+_Avoid_: git server, SCM
+
+**CI result**:
+The pass or fail outcome of a forge check on a Job's pull request, read through the **Broker** (ADR-0028, ADR-0037).
+_Avoid_: build status
+
+**Mirror key**:
+Planned, not built: the key that grants read access to a repository mirror. Owned by another ADR.
+_Avoid_: deploy key
+
+**Owner**:
+The **User** a **Credential** or Job belongs to. Planned, not built.
+_Avoid_: creator, tenant
+
+**Box token**:
+The bearer token a Box uses with the server, `FLEET_TOKEN`, in box scope (ADR-0014, ADR-0023).
+_Avoid_: token, worker token
+
+**Client token**:
+The bearer token the CLI uses with the server, `FLEET_CLIENT_TOKEN`, in client scope (ADR-0014, ADR-0023).
+_Avoid_: token, API token
+
 ## Relationships
 
 - A **Job** has many **Job Events** and at most one **Job Summary**.
@@ -108,5 +184,6 @@ _Avoid_: egress allowlist, proxy policy
 
 ## Flagged ambiguities
 
+- "token" now means **Box token**, **Client token**, **API token**, **Web session** or **Credential**. Always use the qualified term.
 - "egress" and "fixture" appear in planning notes only. No product code defines them, and ADR-0030 lists them as out of scope.
 - "bundle" and "profile" overlap. A **Bundle** is the on-disk files; a **Profile** is the named config overlaying it for one Job (ADR-0034, ADR-0035).
