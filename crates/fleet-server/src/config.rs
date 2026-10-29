@@ -2,10 +2,13 @@
 
 use std::fmt;
 use std::net::SocketAddr;
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::Duration;
 
 use fleet_proto::{DEFAULT_CI_RETRIES, MAX_CI_RETRIES};
 
+use crate::cred::{FileSealer, KeyRingError};
 use crate::retention::{
     DEFAULT_EVENTS_DAYS, DEFAULT_INTERVAL, DEFAULT_SUMMARIES_DAYS, MIN_INTERVAL, Policy,
     PolicyError,
@@ -134,6 +137,76 @@ pub struct Config {
     /// Most fix Jobs one failed pull request may start, from `FLEET_MAX_CI_RETRIES`: 0 to
     /// [`MAX_CI_RETRIES`], default [`DEFAULT_CI_RETRIES`]. 0 turns the retry off.
     pub max_ci_retries: u32,
+    /// Path of the credential master key file, from `FLEET_MASTER_KEY_FILE`. `None` when
+    /// unset or empty.
+    pub master_key_file: Option<PathBuf>,
+}
+
+/// Why the credential store cannot start. Messages carry no key bytes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum CredentialsStartError {
+    /// Credential rows exist but `FLEET_MASTER_KEY_FILE` is unset.
+    RowsWithoutKey,
+    /// The key file is missing, unreadable or malformed.
+    KeyRing(KeyRingError),
+}
+
+impl fmt::Display for CredentialsStartError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::RowsWithoutKey => {
+                f.write_str("credentials are stored but FLEET_MASTER_KEY_FILE is not set")
+            }
+            Self::KeyRing(err) => write!(f, "FLEET_MASTER_KEY_FILE: {err}"),
+        }
+    }
+}
+
+impl std::error::Error for CredentialsStartError {}
+
+impl From<KeyRingError> for CredentialsStartError {
+    fn from(err: KeyRingError) -> Self {
+        Self::KeyRing(err)
+    }
+}
+
+/// Whether the credential RPCs are available, decided once at startup (ADR-0040).
+#[derive(Debug, Clone)]
+pub enum CredentialsState {
+    /// The key ring loaded; the credential RPCs may seal and open with it.
+    Enabled(Arc<FileSealer>),
+    /// No key file and no stored credentials; the credential RPCs are off.
+    Disabled,
+}
+
+impl CredentialsState {
+    /// The line logged once when the credential RPCs are off.
+    pub const DISABLED_NOTICE: &'static str =
+        "credential RPCs disabled: FLEET_MASTER_KEY_FILE is unset and no credentials are stored";
+
+    /// Decides the state from the configured key file and whether any credential row exists.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CredentialsStartError::RowsWithoutKey`] when `key_file` is `None` and
+    /// `rows_exist` is true, and [`CredentialsStartError::KeyRing`] when a configured key
+    /// file cannot be loaded.
+    pub fn resolve(
+        key_file: Option<&Path>,
+        rows_exist: bool,
+    ) -> Result<Self, CredentialsStartError> {
+        match key_file {
+            Some(path) => Ok(Self::Enabled(Arc::new(FileSealer::load(path)?))),
+            None if rows_exist => Err(CredentialsStartError::RowsWithoutKey),
+            None => Ok(Self::Disabled),
+        }
+    }
+
+    /// Whether the credential RPCs are available.
+    pub fn is_enabled(&self) -> bool {
+        matches!(self, Self::Enabled(_))
+    }
 }
 
 /// Lists the listeners bound to a non-loopback address, as `(variable, address)`.
@@ -272,6 +345,9 @@ impl Config {
             client_token,
             retention: retention(&lookup)?,
             max_ci_retries: ci_retries(&lookup)?,
+            master_key_file: lookup("FLEET_MASTER_KEY_FILE")
+                .filter(|v| !v.is_empty())
+                .map(PathBuf::from),
             retention_interval: Duration::from_secs(number(
                 &lookup,
                 "FLEET_RETENTION_INTERVAL_SECS",
@@ -308,6 +384,89 @@ mod tests {
         assert_eq!(config.listen.to_string(), "127.0.0.1:7070");
         assert_eq!(config.health_listen.to_string(), "0.0.0.0:7072");
         assert_eq!(config.token.expose(), TOKEN);
+    }
+
+    fn key_file(tag: &str, body: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("fleet-cred28-{}-{tag}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("keys");
+        std::fs::write(&path, body).unwrap();
+        path
+    }
+
+    fn good_ring() -> String {
+        format!("k1:{}\n", "ab".repeat(32))
+    }
+
+    #[test]
+    fn master_key_file_is_read_from_the_environment() {
+        let base = [
+            ("FLEET_DATABASE_URL", "postgres://u:pw@h/db"),
+            ("FLEET_TOKEN", TOKEN),
+        ];
+        let unset = Config::from_lookup(lookup(&base)).unwrap();
+        assert_eq!(unset.master_key_file, None);
+        let empty = Config::from_lookup(lookup(&[base[0], base[1], ("FLEET_MASTER_KEY_FILE", "")]))
+            .unwrap();
+        assert_eq!(empty.master_key_file, None);
+        let set = Config::from_lookup(lookup(&[
+            base[0],
+            base[1],
+            ("FLEET_MASTER_KEY_FILE", "/run/keys"),
+        ]))
+        .unwrap();
+        assert_eq!(set.master_key_file, Some(PathBuf::from("/run/keys")));
+    }
+
+    #[test]
+    fn no_key_file_and_no_rows_disables_credentials() {
+        let state = CredentialsState::resolve(None, false).unwrap();
+        assert!(!state.is_enabled());
+    }
+
+    #[test]
+    fn no_key_file_with_rows_is_a_startup_error() {
+        let err = CredentialsState::resolve(None, true).unwrap_err();
+        assert_eq!(err, CredentialsStartError::RowsWithoutKey);
+        assert_eq!(
+            err.to_string(),
+            "credentials are stored but FLEET_MASTER_KEY_FILE is not set"
+        );
+    }
+
+    #[test]
+    fn readable_key_file_enables_credentials() {
+        let path = key_file("ok", &good_ring());
+        for rows in [false, true] {
+            let state = CredentialsState::resolve(Some(&path), rows).unwrap();
+            assert!(state.is_enabled());
+        }
+    }
+
+    #[test]
+    fn missing_or_bad_key_file_is_a_startup_error_without_key_text() {
+        let dir = std::env::temp_dir().join(format!("fleet-cred28-{}-none", std::process::id()));
+        let missing = CredentialsState::resolve(Some(&dir.join("absent")), false).unwrap_err();
+        assert_eq!(
+            missing,
+            CredentialsStartError::KeyRing(KeyRingError::Missing)
+        );
+        let secret = "ab".repeat(31);
+        let bad = key_file("bad", &format!("k1:{secret}\n"));
+        let err = CredentialsState::resolve(Some(&bad), false).unwrap_err();
+        assert!(matches!(
+            err,
+            CredentialsStartError::KeyRing(KeyRingError::BadKeyLength(1))
+        ));
+        assert!(!err.to_string().contains(&secret));
+        assert!(!format!("{err:?}").contains(&secret));
+    }
+
+    #[test]
+    fn state_debug_hides_the_key() {
+        let path = key_file("dbg", &good_ring());
+        let state = CredentialsState::resolve(Some(&path), false).unwrap();
+        assert!(!format!("{state:?}").contains(&"ab".repeat(32)));
     }
 
     #[test]
