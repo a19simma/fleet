@@ -9,6 +9,7 @@ use axum::Router;
 use axum::routing::get;
 use fleet_server::auth::BearerAuth;
 use fleet_server::config::{Config, CredentialsState, exposed_binds, is_loopback};
+use fleet_server::cred::Users;
 use fleet_server::reaper::{DEFAULT_REAP_PERIOD, run_reaper};
 use fleet_server::retention::run_retention;
 use fleet_server::service::router;
@@ -74,6 +75,14 @@ async fn run() -> Result<(), BoxError> {
         tracing::info!("{}", CredentialsState::DISABLED_NOTICE);
     }
 
+    let users = Users::new(pool.clone());
+    if let Some(code) = users.issue_setup_code().await? {
+        tracing::warn!(
+            setup_path = %format!("/setup/{}", String::from_utf8_lossy(code.expose())),
+            "no users exist: open this path on the server's public address to create the admin; it works once and changes on restart"
+        );
+    }
+
     if !is_loopback(&config.listen) {
         tracing::warn!(
             listen = %config.listen,
@@ -120,7 +129,7 @@ async fn run() -> Result<(), BoxError> {
         stop_rx.clone(),
         None,
     ));
-    let auth = BearerAuth::new(&config.token, config.client_token.as_ref());
+    let auth = BearerAuth::new(&config.token, config.client_token.as_ref()).with_users(users);
     let grpc_server = async {
         router(&store, &auth)
             .serve_with_incoming_shutdown(grpc, stopped(stop_rx.clone()))

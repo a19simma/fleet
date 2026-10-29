@@ -6,6 +6,7 @@ use std::sync::Arc;
 use fleet_core::credential::{CredentialKind, CredentialShape, Secret};
 use fleet_server::cred::FileSealer;
 use fleet_server::cred::store::{CredentialStore, StoreError};
+use fleet_server::cred::users::{UserError, Users};
 use sqlx::PgPool;
 
 const PAT: &str = "github_pat_11ABCDEFG0abcdefghijklmnop";
@@ -238,4 +239,84 @@ async fn database_holds_no_plaintext(pool: PgPool) {
         .await
         .unwrap();
     assert!(!blob.windows(PAT.len()).any(|w| w == PAT.as_bytes()));
+}
+
+#[sqlx::test]
+async fn api_token_is_stored_as_hash_and_shown_once(pool: PgPool) {
+    let users = Users::new(pool.clone());
+    let alice = user(&pool, "alice").await.unwrap();
+    let bob = user(&pool, "bob").await.unwrap();
+    let made = users.create_api_token(alice, "cli").await.unwrap();
+    let plain = made.token.expose().to_vec();
+    assert!(!format!("{made:?}").contains(std::str::from_utf8(&plain).unwrap()));
+    let hashed: bool = sqlx::query_scalar(
+        "SELECT hash = sha256($1::bytea) AND position($1::bytea IN hash) = 0 \
+         FROM api_tokens WHERE id = $2",
+    )
+    .bind(&plain)
+    .bind(made.id)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert!(hashed);
+    assert_eq!(users.authenticate(&plain).await.unwrap(), Some(alice));
+    assert_eq!(users.authenticate(b"flt_wrong").await.unwrap(), None);
+    assert!(matches!(
+        users.revoke_api_token(bob, made.id).await,
+        Err(UserError::NotFound)
+    ));
+    assert_eq!(users.authenticate(&plain).await.unwrap(), Some(alice));
+    users.revoke_api_token(alice, made.id).await.unwrap();
+    assert_eq!(users.authenticate(&plain).await.unwrap(), None);
+    assert!(matches!(
+        users.revoke_api_token(alice, made.id).await,
+        Err(UserError::NotFound)
+    ));
+}
+
+#[sqlx::test]
+async fn setup_code_is_single_use_and_ignores_the_bootstrap_user(pool: PgPool) {
+    let users = Users::new(pool.clone());
+    let boot = users.bootstrap_user().await.unwrap();
+    assert_eq!(users.bootstrap_user().await.unwrap(), boot);
+    assert!(!users.has_real_users().await.unwrap());
+    let code = users.issue_setup_code().await.unwrap().unwrap();
+    let code = code.expose().to_vec();
+    assert!(matches!(
+        users.redeem_setup(b"wrong", "admin").await,
+        Err(UserError::BadSetupCode)
+    ));
+    assert!(matches!(
+        users.redeem_setup(&code, "Bootstrap").await,
+        Err(UserError::ReservedUsername)
+    ));
+    assert!(matches!(
+        users.redeem_setup(&code, "bad name").await,
+        Err(UserError::InvalidUsername)
+    ));
+    let admin = users.redeem_setup(&code, "admin").await.unwrap();
+    assert_ne!(admin, boot);
+    assert!(users.has_real_users().await.unwrap());
+    assert!(matches!(
+        users.redeem_setup(&code, "other").await,
+        Err(UserError::BadSetupCode)
+    ));
+    assert!(users.issue_setup_code().await.unwrap().is_none());
+}
+
+#[sqlx::test]
+async fn setup_is_inert_once_any_user_exists(pool: PgPool) {
+    let users = Users::new(pool.clone());
+    let code = users.issue_setup_code().await.unwrap().unwrap();
+    user(&pool, "alice").await.unwrap();
+    assert!(matches!(
+        users.redeem_setup(code.expose(), "admin").await,
+        Err(UserError::SetupClosed)
+    ));
+    assert!(matches!(
+        users.redeem_setup(code.expose(), "admin").await,
+        Err(UserError::BadSetupCode)
+    ));
+    let fresh = Users::new(pool);
+    assert!(fresh.issue_setup_code().await.unwrap().is_none());
 }

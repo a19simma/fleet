@@ -1,6 +1,6 @@
 # Users and auth
 
-Status: Proposed 2026-10-29. Not built. Amends ADR-0013 and ADR-0014. Builds on ADR-0041 (web UI) and ADR-0040 (credential store).
+Status: Proposed 2026-10-29. Partly built: users, hashed API tokens, the setup code and the user-aware auth layer exist in fleet-server; the web UI, passkeys and job ownership are not wired. Amends ADR-0013 and ADR-0014. Builds on ADR-0041 (web UI) and ADR-0040 (credential store).
 
 Credentials and the web UI make Fleet multi-user. The shared client token cannot say whose a Job or a credential is. This ADR adds users, browser login, per-user API tokens and Job ownership.
 
