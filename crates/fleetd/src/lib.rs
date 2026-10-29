@@ -25,6 +25,7 @@ pub mod fetch;
 pub mod fetch_policy;
 pub mod fetch_service;
 pub mod floor;
+pub mod forge;
 pub mod forwarder;
 mod group;
 pub mod heartbeat;

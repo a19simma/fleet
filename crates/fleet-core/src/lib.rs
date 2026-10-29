@@ -7,6 +7,7 @@ pub mod credential;
 mod ct;
 mod envelope;
 mod error;
+pub mod forge;
 mod id;
 mod normalize;
 mod profile;
