@@ -13,6 +13,7 @@ authors = ["Simon Malm"]
 [workspace.dependencies]
 axum = { version = "0.8.9", default-features = false, features = ["http1", "tokio"] }
 clap = { version = "4.6.7", features = ["derive"] }
+chacha20poly1305 = "0.10.1"
 fleet-core = { path = "crates/fleet-core" }
 fleet-proto = { path = "crates/fleet-proto" }
 prost = "0.14"
