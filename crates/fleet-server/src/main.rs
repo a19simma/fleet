@@ -8,7 +8,7 @@ use std::time::Duration;
 use axum::Router;
 use axum::routing::get;
 use fleet_server::auth::BearerAuth;
-use fleet_server::config::{Config, exposed_binds, is_loopback};
+use fleet_server::config::{Config, CredentialsState, exposed_binds, is_loopback};
 use fleet_server::reaper::{DEFAULT_REAP_PERIOD, run_reaper};
 use fleet_server::retention::run_retention;
 use fleet_server::service::router;
@@ -61,8 +61,18 @@ async fn run() -> Result<(), BoxError> {
         .acquire_timeout(ACQUIRE_TIMEOUT)
         .connect_with(options)
         .await?;
-    let store = Store::new(pool).with_max_ci_retries(config.max_ci_retries);
+    let store = Store::new(pool.clone()).with_max_ci_retries(config.max_ci_retries);
     store.migrate().await?;
+
+    let rows_exist: bool = sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM credentials)")
+        .fetch_one(&pool)
+        .await?;
+    let credentials = CredentialsState::resolve(config.master_key_file.as_deref(), rows_exist)?;
+    if credentials.is_enabled() {
+        tracing::info!("credential master key loaded");
+    } else {
+        tracing::info!("{}", CredentialsState::DISABLED_NOTICE);
+    }
 
     if !is_loopback(&config.listen) {
         tracing::warn!(
