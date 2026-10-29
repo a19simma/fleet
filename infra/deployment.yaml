@@ -20,8 +20,14 @@ spec:
         runAsNonRoot: true
         runAsUser: 65532
         runAsGroup: 65532
+        fsGroup: 65532
         seccompProfile:
           type: RuntimeDefault
+      volumes:
+        - name: master-key
+          secret:
+            secretName: fleet-master-key
+            defaultMode: 0440
       containers:
         - name: fleet-server
           image: ghcr.io/a19simma/fleet-server:0.2.5
@@ -51,6 +57,12 @@ spec:
                   name: fleet-server-secrets
                   key: FLEET_CLIENT_TOKEN
                   optional: true
+            - name: FLEET_MASTER_KEY_FILE
+              value: /etc/fleet/master-key/keyring
+          volumeMounts:
+            - name: master-key
+              mountPath: /etc/fleet/master-key
+              readOnly: true
           readinessProbe:
             httpGet:
               path: /healthz

@@ -1,0 +1,11 @@
+apiVersion: generators.external-secrets.io/v1alpha1
+kind: Password
+metadata:
+  name: fleet-master-key
+  namespace: fleet-server
+spec:
+  length: 32
+  encoding: hex
+  prefix: "k1:"
+  secretKeys:
+    - keyring

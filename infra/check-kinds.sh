@@ -26,8 +26,8 @@ fi
 kinds=$(printf '%s\n' "$out" | sed -n 's/^kind:[[:space:]]*//p')
 for k in $kinds; do
   case "$k" in
-    Deployment | Service) ;;
-    *) bad "kind $k is not allowed, only Deployment and Service" ;;
+    Deployment | Service | ExternalSecret | Password) ;;
+    *) bad "kind $k is not allowed, only Deployment, Service, ExternalSecret and Password" ;;
   esac
 done
 
