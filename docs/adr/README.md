@@ -33,7 +33,7 @@ ADRs for fleetd, the Fleet server and the `fleet` CLI. The plan is in `../plan.m
 | [0040](0040-credential-store-and-key-custody.md) | Credential store and key custody | Proposed 2026-10-29, not built, amends 0013, builds on 0043 |
 | [0043](0043-agent-credential-kinds-and-shapes.md) | Agent credential kinds and shapes | Proposed 2026-10-29, not built, builds on 0040, supersedes the box PAT decision for user Jobs |
 | [0041](0041-web-ui.md) | Web UI | Proposed 2026-10-29, not built, spike passed with workarounds, amends 0013 |
-| [0042](0042-users-and-auth.md) | Users and auth | Proposed 2026-10-29, not built, amends 0013 and 0014, builds on 0041 and 0040 |
+| [0042](0042-users-and-auth.md) | Users and auth | Proposed 2026-10-29, partly built (users, API tokens, auth layer), amends 0013 and 0014, builds on 0041 and 0040 |
 | [0044](0044-agent-runners.md) | Agent runners | Proposed 2026-10-29, not built, builds on 0033 and 0043, amends 0021, 0029, 0034 and 0038 |
 | [0045](0045-forge-trait.md) | Forge trait | Proposed 2026-10-29, not built, builds on 0033 and 0043, amends 0024 and 0037 |
 | [0046](0046-mirror-key.md) | Mirror key | Proposed 2026-10-29, not built, amends 0024 and 0031 |

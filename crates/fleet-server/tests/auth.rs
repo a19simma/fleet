@@ -451,4 +451,113 @@ mod tests {
         let seqs: Vec<u64> = reply.rejected.iter().map(|r| r.seq).collect();
         assert_eq!(seqs, vec![7, 9]);
     }
+
+    mod caller {
+        use std::convert::Infallible;
+
+        use fleet_server::auth::{BearerAuth, Caller};
+        use fleet_server::config::Token;
+        use fleet_server::cred::Users;
+        use sqlx::PgPool;
+        use tonic::body::Body;
+        use tonic::codegen::http::{Request, Response};
+        use tower::{Layer, Service, ServiceExt, service_fn};
+
+        const BOX: &str = "test-token-0123456789abcdef0123456789";
+        const CLIENT: &str = "client-token-0123456789abcdef012345";
+        const WORKER_PATH: &str = "/fleet.v1.FleetWorker/ClaimJob";
+        const JOBS_PATH: &str = "/fleet.v1.FleetJobs/ListJobs";
+
+        async fn send(pool: &PgPool, path: &str, bearer: &str) -> (Option<i64>, String) {
+            let auth = BearerAuth::new(
+                &Token::new(BOX.to_owned()).unwrap(),
+                Some(&Token::new(CLIENT.to_owned()).unwrap()),
+            )
+            .with_users(Users::new(pool.clone()));
+            let echo = service_fn(|request: Request<Body>| async move {
+                let mut response = Response::new(Body::empty());
+                if let Some(caller) = request.extensions().get::<Caller>() {
+                    response
+                        .headers_mut()
+                        .insert("x-caller", caller.user_id.to_string().parse().unwrap());
+                }
+                Ok::<_, Infallible>(response)
+            });
+            let mut service = auth.layer(echo);
+            let request = Request::builder()
+                .uri(path)
+                .header("authorization", format!("Bearer {bearer}"))
+                .body(Body::empty())
+                .unwrap();
+            let response = service.ready().await.unwrap().call(request).await.unwrap();
+            let caller = response
+                .headers()
+                .get("x-caller")
+                .map(|v| v.to_str().unwrap().parse().unwrap());
+            let status = response
+                .headers()
+                .get("grpc-status")
+                .map_or_else(String::new, |v| v.to_str().unwrap().to_owned());
+            (caller, status)
+        }
+
+        async fn user(pool: &PgPool, name: &str) -> i64 {
+            sqlx::query_scalar("INSERT INTO users (username) VALUES ($1) RETURNING id")
+                .bind(name)
+                .fetch_one(pool)
+                .await
+                .unwrap()
+        }
+
+        #[sqlx::test]
+        async fn api_token_maps_to_its_user(pool: PgPool) {
+            let alice = user(&pool, "alice").await;
+            let made = Users::new(pool.clone())
+                .create_api_token(alice, "cli")
+                .await
+                .unwrap();
+            let token = String::from_utf8(made.token.expose().to_vec()).unwrap();
+            assert_eq!(
+                send(&pool, JOBS_PATH, &token).await,
+                (Some(alice), String::new())
+            );
+        }
+
+        #[sqlx::test]
+        async fn client_token_maps_to_the_bootstrap_user(pool: PgPool) {
+            let boot = Users::new(pool.clone()).bootstrap_user().await.unwrap();
+            assert_eq!(
+                send(&pool, JOBS_PATH, CLIENT).await,
+                (Some(boot), String::new())
+            );
+        }
+
+        #[sqlx::test]
+        async fn unknown_and_revoked_tokens_are_unauthenticated(pool: PgPool) {
+            let alice = user(&pool, "alice").await;
+            let users = Users::new(pool.clone());
+            let made = users.create_api_token(alice, "cli").await.unwrap();
+            let token = String::from_utf8(made.token.expose().to_vec()).unwrap();
+            let unauthenticated = (None, "16".to_owned());
+            assert_eq!(send(&pool, JOBS_PATH, "flt_unknown").await, unauthenticated);
+            users.revoke_api_token(alice, made.id).await.unwrap();
+            assert_eq!(send(&pool, JOBS_PATH, &token).await, unauthenticated);
+        }
+
+        #[sqlx::test]
+        async fn box_token_keeps_box_scope_and_api_tokens_are_not_box(pool: PgPool) {
+            let alice = user(&pool, "alice").await;
+            let made = Users::new(pool.clone())
+                .create_api_token(alice, "cli")
+                .await
+                .unwrap();
+            let token = String::from_utf8(made.token.expose().to_vec()).unwrap();
+            assert_eq!(send(&pool, WORKER_PATH, BOX).await, (None, String::new()));
+            assert_eq!(send(&pool, JOBS_PATH, BOX).await, (None, "7".to_owned()));
+            assert_eq!(
+                send(&pool, WORKER_PATH, &token).await,
+                (None, "7".to_owned())
+            );
+        }
+    }
 }

@@ -4,9 +4,13 @@
 //! the client token covers `FleetQuery`, `FleetJobs`, `FleetProfiles`, `FleetBatches` and
 //! `FleetCredentials`. Any other path
 //! is denied.
+//!
+//! With a [`Users`] store the layer also resolves the caller: a per-user API token maps to its
+//! user, `FLEET_CLIENT_TOKEN` maps to the `bootstrap` user, and the result rides the request
+//! as a [`Caller`] extension. The box token carries no user.
 
 use std::convert::Infallible;
-use std::future::{Future, ready};
+use std::future::Future;
 use std::pin::Pin;
 use std::task::{Context, Poll};
 
@@ -18,6 +22,7 @@ use tonic::transport::server::TcpConnectInfo;
 use tower::{Layer, Service};
 
 use crate::config::{Secret, Token};
+use crate::cred::Users;
 
 const INGEST: &str = "/fleet.v1.FleetIngest/";
 const WORKER: &str = "/fleet.v1.FleetWorker/";
@@ -27,6 +32,14 @@ const JUDGE: &str = "/fleet.v1.FleetJudge/";
 const PROFILES: &str = "/fleet.v1.FleetProfiles/";
 const BATCHES: &str = "/fleet.v1.FleetBatches/";
 const CREDENTIALS: &str = "/fleet.v1.FleetCredentials/";
+
+/// The user a request acts as, set by [`BearerAuth`] on every client-scope request when it has a
+/// [`Users`] store.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Caller {
+    /// The user's row id.
+    pub user_id: i64,
+}
 
 /// Which token a request carried.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -45,6 +58,7 @@ enum Scope {
 pub struct BearerAuth {
     box_token: Secret,
     client_token: Option<Secret>,
+    users: Option<Users>,
 }
 
 impl BearerAuth {
@@ -54,7 +68,16 @@ impl BearerAuth {
         Self {
             box_token: header(box_token),
             client_token: client_token.map(header),
+            users: None,
         }
+    }
+
+    /// Adds user resolution: API tokens authenticate as their user and the client token as
+    /// the `bootstrap` user.
+    #[must_use]
+    pub fn with_users(mut self, users: Users) -> Self {
+        self.users = Some(users);
+        self
     }
 
     fn scope_of(&self, header: &[u8]) -> Option<Scope> {
@@ -110,6 +133,53 @@ impl BearerAuth {
     }
 }
 
+impl BearerAuth {
+    /// Authenticates a request and resolves its caller.
+    ///
+    /// A value that matches neither static token is looked up as an API token when a
+    /// [`Users`] store is set. The caller is `None` for the box token and when no store is set.
+    ///
+    /// # Errors
+    ///
+    /// Returns `UNAUTHENTICATED` for a missing, unknown or revoked token, `PERMISSION_DENIED`
+    /// when the scope excludes `path`, and `UNAVAILABLE` when the user lookup fails.
+    pub async fn authenticate(
+        &self,
+        path: &str,
+        header: Option<&[u8]>,
+    ) -> Result<Option<Caller>, Status> {
+        let header = header.unwrap_or_default();
+        let unavailable = |_| Status::unavailable("user lookup unavailable");
+        let (scope, caller) = match self.scope_of(header) {
+            Some(Scope::Box) => (Scope::Box, None),
+            Some(Scope::Client) => (Scope::Client, None),
+            None => {
+                let users = self.users.as_ref();
+                let token = header.strip_prefix(b"Bearer ");
+                let found = match (users, token) {
+                    (Some(users), Some(token)) => {
+                        users.authenticate(token).await.map_err(unavailable)?
+                    }
+                    _ => None,
+                };
+                let user_id = found
+                    .ok_or_else(|| Status::unauthenticated("missing or invalid bearer token"))?;
+                (Scope::Client, Some(Caller { user_id }))
+            }
+        };
+        if !Self::allows(scope, path) {
+            return Err(Status::permission_denied(
+                "bearer token not valid for this service",
+            ));
+        }
+        if let (Scope::Client, None, Some(users)) = (scope, caller, self.users.as_ref()) {
+            let user_id = users.bootstrap_user().await.map_err(unavailable)?;
+            return Ok(Some(Caller { user_id }));
+        }
+        Ok(caller)
+    }
+}
+
 impl<S> Layer<S> for BearerAuth {
     type Service = AuthService<S>;
 
@@ -132,8 +202,9 @@ type AuthFuture = Pin<Box<dyn Future<Output = Result<Response<Body>, Infallible>
 
 impl<S, B> Service<Request<B>> for AuthService<S>
 where
-    S: Service<Request<B>, Response = Response<Body>, Error = Infallible>,
+    S: Service<Request<B>, Response = Response<Body>, Error = Infallible> + Clone + Send + 'static,
     S::Future: Send + 'static,
+    B: Send + 'static,
 {
     type Response = Response<Body>;
     type Error = Infallible;
@@ -143,27 +214,37 @@ where
         self.inner.poll_ready(cx)
     }
 
-    fn call(&mut self, request: Request<B>) -> Self::Future {
-        let header = request
-            .headers()
-            .get("authorization")
-            .map(HeaderValue::as_bytes);
-        match self.auth.check(request.uri().path(), header) {
-            Ok(()) => Box::pin(self.inner.call(request)),
-            Err(status) => {
-                let peer = request
-                    .extensions()
-                    .get::<TcpConnectInfo>()
-                    .and_then(TcpConnectInfo::remote_addr);
-                let code = status.code();
-                tracing::warn!(
-                    ?peer,
-                    ?code,
-                    "rejected request: unauthenticated or out of scope"
-                );
-                Box::pin(ready(Ok(status.into_http())))
+    fn call(&mut self, mut request: Request<B>) -> Self::Future {
+        let auth = self.auth.clone();
+        let spare = self.inner.clone();
+        let mut inner = std::mem::replace(&mut self.inner, spare);
+        Box::pin(async move {
+            let header = request
+                .headers()
+                .get("authorization")
+                .map(HeaderValue::as_bytes);
+            match auth.authenticate(request.uri().path(), header).await {
+                Ok(caller) => {
+                    if let Some(caller) = caller {
+                        request.extensions_mut().insert(caller);
+                    }
+                    inner.call(request).await
+                }
+                Err(status) => {
+                    let peer = request
+                        .extensions()
+                        .get::<TcpConnectInfo>()
+                        .and_then(TcpConnectInfo::remote_addr);
+                    let code = status.code();
+                    tracing::warn!(
+                        ?peer,
+                        ?code,
+                        "rejected request: unauthenticated or out of scope"
+                    );
+                    Ok(status.into_http())
+                }
             }
-        }
+        })
     }
 }
 
