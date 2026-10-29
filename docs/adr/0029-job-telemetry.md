@@ -44,3 +44,7 @@ A profile column and a batch comparison read from the existing summary and event
 ## Amendment (ADR-0038)
 
 Kinds gain `fetch` (`EventKind::Fetch`, proto `JOB_EVENT_KIND_FETCH = 6`) and migration `0016` widens the `job_event` kind CHECK. Fetch events count toward the 2000-event cap. The `missing` list gains `fetch_outcome`. Summary figures are unchanged.
+
+## Amendment (ADR-0044)
+
+A Job Summary from a non-claude runner is marked Incomplete until that runner's output parser exists. Figures it cannot supply stay `NULL`.

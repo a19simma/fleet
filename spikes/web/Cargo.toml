@@ -1,0 +1,30 @@
+[package]
+name = "web-spike"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+[workspace]
+
+[dependencies]
+topcoat = "=0.11.0"
+tonic = { version = "=0.14.6", default-features = false, features = ["codegen", "transport", "router"] }
+tonic-health = "=0.14.6"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "sync"] }
+hyper = { version = "1", features = ["http1", "http2", "server"] }
+hyper-util = { version = "=0.1.21", features = ["tokio", "server-auto", "http1", "http2"] }
+http-body-util = "0.1"
+tower = { version = "0.5", features = ["util"] }
+webauthn-rs = "=0.5.5"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+url = "2"
+uuid = { version = "1", features = ["v4"] }
+
+[dev-dependencies]
+webauthn-authenticator-rs = { version = "=0.5.5", features = ["softpasskey"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "http2"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "sync", "time"] }
+
+[lints.clippy]
+pedantic = { level = "warn", priority = -1 }

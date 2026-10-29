@@ -126,3 +126,7 @@ Three design corrections came out of the run and are binding constraints in P1: 
 ## Amendment (ADR-0038)
 
 The P2 CONNECT proxy serves the model API only. `egress_allow` is Box config. No Profile or bundle can add hosts, which replaces the "per-bundle additions" wording. Page fetches go through `fleetd fetch`, not the proxy.
+
+## Amendment (ADR-0033, ADR-0046)
+
+Job credentials reach fleetd only and stay in broker memory. They are never written into the agent's environment or files (ADR-0033). The P3 mirror is keyed by `(user, repo)` (ADR-0046).

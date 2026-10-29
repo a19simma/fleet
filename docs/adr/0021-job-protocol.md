@@ -43,3 +43,7 @@ Jobs are rows in the server's Postgres, driven by two new gRPC services in packa
 ## Amendment (ADR-0034, ADR-0035)
 
 A Job carries `Job.profile = 22` and `Job.batch_id = 23`, and the `jobs` table records `batch_id`, `profile_name`, `profile_version` and `profile_hash`. A Batch submits one Job per Profile.
+
+## Amendment (ADR-0033, ADR-0044)
+
+A Job carries `agent`, the runner name (ADR-0044). The worker protocol gains `FleetWorker.GetJobCredentials{job_id, attempt, box}` (ADR-0033).
