@@ -50,7 +50,7 @@ Config file keys: `http_port`, `socket_path`, `db_path`, `queue_max_bytes`, `que
 
 ## Job agent environment
 
-`claude` and `gh` must be real binaries on the `PATH` of the unit, or set by absolute path in `claude_bin` and `gh_bin`. A version manager shim (a mise or asdf shim) resolves its tool from the home directory and the working directory, and the agent no longer has the operator home, so the shim fails or picks another version.
+`claude` and `gh` must be real binaries on the `PATH` of the unit, or set by absolute path in `claude_bin` and `gh_bin`. For broker `pr` operations `gh` must exist at an absolute `gh_bin` (default `/usr/bin/gh`). On the test box `gh` exists only as a mise shim, so install the distro package or set `gh_bin`. A version manager shim (a mise or asdf shim) resolves its tool from the home directory and the working directory, and the agent no longer has the operator home, so the shim fails or picks another version.
 
 Each job runs `claude` with `HOME` set to `<jobs_dir>/.agent/<job id>/home`, outside the worktree. `CLAUDE_CONFIG_DIR` is `home/.claude`, the four `XDG_*_HOME` variables point under `home`, `GIT_CONFIG_GLOBAL` is `home/.gitconfig` (author `Fleet Job`, no commit signing), and `XDG_RUNTIME_DIR` and the real `HOME` are not passed. fleetd builds the directory as `<job id>.tmp`, renames it, and removes it when the agent ends. The workspace cleanup also removes it after a crash.
 
@@ -106,6 +106,7 @@ The units and `sysusers.d` file were installed live on systemd 257. `systemd-ana
 - `fleet-job` runs agents. Its primary group is `fleet-work`.
 - `fleet-work` is the shared group. `fleetd` is a member, through `sysusers.d` and `SupplementaryGroups=fleet-work`. A non-root daemon can only chown to a group it belongs to.
 - `/var/lib/fleet/jobs` is mode 3770 `fleetd:fleet-work`: group-writable, setgid and sticky. Each job has its clone there, plus `.agent/<job id>` (the per-job home) and the `.cache` mirror, which `fleetd` owns and the job group reads but never writes. The daemon unit's `ReadWritePaths=` covers only this directory. The agent unit reopens it too, then `ReadOnlyPaths=-/var/lib/fleet/jobs/.cache` makes the mirror read-only inside the agent's mount namespace, on top of the file modes.
+- The broker scratch check (`scratch_is_private`) accepts the jobs root only when it is owned by the daemon uid or root, has no world write, and has group write only with the sticky bit. Mode 3770 passes; 2770 or 0775 without the sticky bit and any mode with world write make every job fail with `job broker could not be set up`. The `.broker` dir and each scratch dir must be mode 0700 owned by the daemon.
 - `/run/fleet` is mode 0750 `fleetd:fleet-work` and holds the per-job run dirs. `/run/fleet/hook` holds the hook socket, mode 0750 `fleetd:fleet-work`.
 
 The agent unit mounts an empty read-only tmpfs over `/run/fleet` (`TemporaryFileSystem=/run/fleet:ro`) and bind-mounts back only `/run/fleet/%i` (`BindPaths=`, its own run dir with the per-job socket) and `/run/fleet/hook` (`BindReadOnlyPaths=`). Other jobs' run dirs and sockets are absent from the agent's mount namespace (ADR-0036). This is the first isolation layer; the cgroup check in `jobsock.rs` is the second.

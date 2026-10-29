@@ -837,6 +837,10 @@ fn is_private_dir(meta: &std::fs::Metadata) -> bool {
 }
 
 /// Whether `path` is a broker scratch dir no other uid can reach.
+///
+/// The jobs root must be owned by
+/// the daemon or root, must not be world writable, and may be group writable only with the sticky
+/// bit (the deployed mode 3770), so a group member cannot rename or remove `.broker`.
 #[must_use]
 pub fn scratch_is_private(path: &Path) -> bool {
     if !path.is_absolute() {
@@ -862,9 +866,12 @@ pub fn scratch_is_private(path: &Path) -> bool {
     };
     std::fs::symlink_metadata(root).is_ok_and(|root_meta| {
         let uid = root_meta.uid();
+        let mode = root_meta.mode();
+        let group_write_is_sticky = mode & 0o020 == 0 || mode & 0o1000 != 0;
         root_meta.file_type().is_dir()
             && (uid == rustix::process::geteuid().as_raw() || uid == 0)
-            && root_meta.mode() & 0o022 == 0
+            && mode & 0o002 == 0
+            && group_write_is_sticky
     })
 }
 
@@ -1182,16 +1189,51 @@ mod tests {
     }
 
     #[test]
-    fn a_jobs_root_that_others_can_write_fails_the_private_check() {
+    fn the_jobs_root_mode_table_decides_the_private_check() {
         let dir = tempfile::TempDir::new().unwrap();
         let scratch = workspace_in(&dir).create_broker_scratch("job1").unwrap();
         let root = dir.path().join("jobs");
-        for mode in [0o777, 0o775, 0o757] {
+        let table = [
+            (0o755, true),
+            (0o750, true),
+            (0o700, true),
+            (0o3770, true),
+            (0o1770, true),
+            (0o3750, true),
+            (0o1775, true),
+            (0o770, false),
+            (0o2770, false),
+            (0o775, false),
+            (0o777, false),
+            (0o757, false),
+            (0o702, false),
+            (0o1777, false),
+            (0o1757, false),
+            (0o3777, false),
+            (0o1702, false),
+        ];
+        for (mode, accepted) in table {
             std::fs::set_permissions(&root, std::fs::Permissions::from_mode(mode)).unwrap();
-            assert!(!scratch_is_private(&scratch), "{mode:o}");
+            assert_eq!(scratch_is_private(&scratch), accepted, "{mode:o}");
         }
-        std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+
+    #[test]
+    fn a_deployed_mode_root_lets_scratch_be_created_and_a_group_write_root_refuses() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let ws = workspace_in(&dir);
+        ws.create_broker_scratch("job1").unwrap();
+        let root = dir.path().join("jobs");
+        std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o3770)).unwrap();
+        let scratch = ws.create_broker_scratch("job2").unwrap();
         assert!(scratch_is_private(&scratch));
+        std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o2770)).unwrap();
+        let err = ws.create_broker_scratch("job3").unwrap_err();
+        assert!(
+            matches!(&err, WorkspaceError::Io(e) if e.kind() == std::io::ErrorKind::PermissionDenied),
+            "{err:?}"
+        );
+        assert!(!scratch_is_private(&root.join(".broker/job3")));
     }
 
     #[test]
