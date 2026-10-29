@@ -71,6 +71,15 @@ pub fn is_swarm_branch(text: &str) -> bool {
     })
 }
 
+/// Longest credential value a client may put and a box may receive, in bytes.
+pub const MAX_CREDENTIAL_VALUE_BYTES: usize = fleet_core::credential::MAX_CREDENTIAL_LEN;
+
+/// Longest credential login, in bytes.
+pub const MAX_CREDENTIAL_LOGIN_BYTES: usize = 256;
+
+/// Most credentials one user may store, and so the most one list or job reply carries.
+pub const MAX_CREDENTIALS_PER_USER: usize = 64;
+
 /// Most transcript chunks one report may carry. The server rejects more.
 pub const MAX_CHUNKS_PER_REPORT: usize = 256;
 

@@ -1,7 +1,8 @@
 //! Bearer token check, applied once as a tower layer around the whole gRPC router.
 //!
 //! Two tokens, scoped by gRPC path: the box token covers `FleetIngest` and `FleetWorker`,
-//! the client token covers `FleetQuery`, `FleetJobs`, `FleetProfiles` and `FleetBatches`. Any other path
+//! the client token covers `FleetQuery`, `FleetJobs`, `FleetProfiles`, `FleetBatches` and
+//! `FleetCredentials`. Any other path
 //! is denied.
 
 use std::convert::Infallible;
@@ -25,6 +26,7 @@ const JOBS: &str = "/fleet.v1.FleetJobs/";
 const JUDGE: &str = "/fleet.v1.FleetJudge/";
 const PROFILES: &str = "/fleet.v1.FleetProfiles/";
 const BATCHES: &str = "/fleet.v1.FleetBatches/";
+const CREDENTIALS: &str = "/fleet.v1.FleetCredentials/";
 
 /// Which token a request carried.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -71,8 +73,8 @@ impl BearerAuth {
     }
 
     /// Allow-lists paths per scope: the box token takes `FleetIngest` and `FleetWorker`,
-    /// the client token takes `FleetQuery`, `FleetJobs`, `FleetJudge`, `FleetProfiles` and
-    /// `FleetBatches`.
+    /// the client token takes `FleetQuery`, `FleetJobs`, `FleetJudge`, `FleetProfiles`,
+    /// `FleetBatches` and `FleetCredentials`.
     /// Every other path is denied.
     fn allows(scope: Scope, path: &str) -> bool {
         match scope {
@@ -83,6 +85,7 @@ impl BearerAuth {
                     || path.starts_with(JUDGE)
                     || path.starts_with(PROFILES)
                     || path.starts_with(BATCHES)
+                    || path.starts_with(CREDENTIALS)
             }
         }
     }

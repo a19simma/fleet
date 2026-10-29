@@ -36,11 +36,73 @@ service FleetBatches {
   rpc GetBatch(GetBatchRequest) returns (GetBatchReply);
 }
 
+service FleetCredentials {
+  rpc PutCredential(PutCredentialRequest) returns (CredentialInfo);
+  rpc ListCredentials(ListCredentialsRequest) returns (ListCredentialsReply);
+  rpc DeleteCredential(DeleteCredentialRequest) returns (DeleteCredentialReply);
+  rpc VerifyCredential(VerifyCredentialRequest) returns (VerifyCredentialReply);
+}
+
 service FleetWorker {
   rpc ClaimJob(ClaimJobRequest) returns (ClaimJobReply);
   rpc ReportJob(ReportJobRequest) returns (ReportJobReply);
   rpc GetProfileBlob(GetProfileBlobRequest) returns (GetProfileBlobReply);
   rpc GetJobTranscript(GetJobTranscriptRequest) returns (GetJobTranscriptReply);
+  rpc GetJobCredentials(GetJobCredentialsRequest) returns (GetJobCredentialsReply);
+}
+
+message PutCredentialRequest {
+  string kind = 1;
+  string shape = 2;
+  string value = 3;
+  optional uint64 expires_at_ms = 4;
+}
+
+message CredentialInfo {
+  uint64 id = 1;
+  string kind = 2;
+  string shape = 3;
+  string fingerprint = 4;
+  optional string login = 5;
+  optional uint64 expires_at_ms = 6;
+}
+
+message ListCredentialsRequest {}
+
+message ListCredentialsReply {
+  repeated CredentialInfo credentials = 1;
+}
+
+message DeleteCredentialRequest {
+  uint64 id = 1;
+}
+
+message DeleteCredentialReply {}
+
+message VerifyCredentialRequest {
+  uint64 id = 1;
+}
+
+message VerifyCredentialReply {
+  bool valid = 1;
+  optional string login = 2;
+  optional uint64 expires_at_ms = 3;
+}
+
+message GetJobCredentialsRequest {
+  string job_id = 1;
+  uint32 attempt = 2;
+  string box = 3;
+}
+
+message JobCredential {
+  string kind = 1;
+  string shape = 2;
+  string value = 3;
+}
+
+message GetJobCredentialsReply {
+  repeated JobCredential credentials = 1;
 }
 
 message Envelope {
@@ -195,6 +257,8 @@ message Job {
   optional string parent_job_id = 29;
   uint32 ci_retry_attempt = 30;
   optional CiRetry ci_retry = 31;
+  uint64 user_id = 32;
+  string agent = 33;
 }
 
 enum CiRetry {

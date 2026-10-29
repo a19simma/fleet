@@ -8,14 +8,16 @@ mod tests {
     use std::time::Duration;
 
     use fleet_proto::v1::fleet_batches_client::FleetBatchesClient;
+    use fleet_proto::v1::fleet_credentials_client::FleetCredentialsClient;
     use fleet_proto::v1::fleet_ingest_client::FleetIngestClient;
     use fleet_proto::v1::fleet_jobs_client::FleetJobsClient;
     use fleet_proto::v1::fleet_profiles_client::FleetProfilesClient;
     use fleet_proto::v1::fleet_query_client::FleetQueryClient;
     use fleet_proto::v1::fleet_worker_client::FleetWorkerClient;
     use fleet_proto::v1::{
-        ClaimJobRequest, Envelope, GetStatsRequest, HeartbeatRequest, ListFleetRequest,
-        ListJobsRequest, ListProfilesRequest, PushEventsRequest, QueuedEvent, ReadJobEventsRequest,
+        ClaimJobRequest, Envelope, GetJobCredentialsRequest, GetStatsRequest, HeartbeatRequest,
+        ListCredentialsRequest, ListFleetRequest, ListJobsRequest, ListProfilesRequest,
+        PushEventsRequest, QueuedEvent, ReadJobEventsRequest,
     };
     use fleet_server::auth::BearerAuth;
     use fleet_server::config::Token;
@@ -196,6 +198,22 @@ mod tests {
                 .submit_batch(fleet_proto::v1::SubmitBatchRequest::default())
                 .await
                 .map(|_| ()),
+            "credentials" => {
+                FleetCredentialsClient::with_interceptor(chan, move |r| header.apply(r))
+                    .list_credentials(ListCredentialsRequest::default())
+                    .await
+                    .map(|_| ())
+            }
+            "job_credentials" => {
+                FleetWorkerClient::with_interceptor(chan, move |r| header.apply(r))
+                    .get_job_credentials(GetJobCredentialsRequest {
+                        job_id: "01ARZ3NDEKTSV4RRFFQ69G5FAV".to_owned(),
+                        attempt: 1,
+                        r#box: box_name(1),
+                    })
+                    .await
+                    .map(|_| ())
+            }
             "stats" => FleetJobsClient::with_interceptor(chan, move |r| header.apply(r))
                 .get_stats(GetStatsRequest::default())
                 .await
@@ -221,6 +239,8 @@ mod tests {
             ("stats", false, true),
             ("profiles", false, true),
             ("batches", false, true),
+            ("credentials", false, true),
+            ("job_credentials", true, false),
         ] {
             for (name, token, ok) in [("box", TOKEN, box_ok), ("client", CLIENT, client_ok)] {
                 let code = code_of(addr, service, Some(token)).await;

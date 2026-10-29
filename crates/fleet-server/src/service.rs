@@ -1,10 +1,11 @@
-//! The `FleetIngest`, `FleetQuery`, `FleetWorker`, `FleetJobs`, `FleetJudge`, `FleetProfiles`
-//! and `FleetBatches` gRPC handlers.
+//! The `FleetIngest`, `FleetQuery`, `FleetWorker`, `FleetJobs`, `FleetJudge`, `FleetProfiles`,
+//! `FleetBatches` and `FleetCredentials` gRPC handlers.
 
 use std::time::Duration;
 
 use fleet_core::Envelope;
 use fleet_proto::v1::fleet_batches_server::{FleetBatches, FleetBatchesServer};
+use fleet_proto::v1::fleet_credentials_server::{FleetCredentials, FleetCredentialsServer};
 use fleet_proto::v1::fleet_ingest_server::{FleetIngest, FleetIngestServer};
 use fleet_proto::v1::fleet_jobs_server::{FleetJobs, FleetJobsServer};
 use fleet_proto::v1::fleet_judge_server::{FleetJudge, FleetJudgeServer};
@@ -12,14 +13,17 @@ use fleet_proto::v1::fleet_profiles_server::{FleetProfiles, FleetProfilesServer}
 use fleet_proto::v1::fleet_query_server::{FleetQuery, FleetQueryServer};
 use fleet_proto::v1::fleet_worker_server::{FleetWorker, FleetWorkerServer};
 use fleet_proto::v1::{
-    CancelJobRequest, ClaimJobReply, ClaimJobRequest, CreateProfileRequest, GetBatchReply,
-    GetBatchRequest, GetJobRequest, GetJobTranscriptReply, GetJobTranscriptRequest,
-    GetProfileBlobReply, GetProfileBlobRequest, GetProfileRequest, GetStatsReply, GetStatsRequest,
-    HeartbeatReply, HeartbeatRequest, Job, ListFleetReply, ListFleetRequest, ListJobsReply,
-    ListJobsRequest, ListProfilesReply, ListProfilesRequest, ProfileVersion, PushEventsReply,
-    PushEventsRequest, QueuedEvent, ReadJobEventsReply, ReadJobEventsRequest, ReadTranscriptReply,
-    ReadTranscriptRequest, Rejection, ReportJobReply, ReportJobRequest, SubmitBatchReply,
-    SubmitBatchRequest, SubmitJobRequest, SubmitJudgeRequest,
+    CancelJobRequest, ClaimJobReply, ClaimJobRequest, CreateProfileRequest, CredentialInfo,
+    DeleteCredentialReply, DeleteCredentialRequest, GetBatchReply, GetBatchRequest,
+    GetJobCredentialsReply, GetJobCredentialsRequest, GetJobRequest, GetJobTranscriptReply,
+    GetJobTranscriptRequest, GetProfileBlobReply, GetProfileBlobRequest, GetProfileRequest,
+    GetStatsReply, GetStatsRequest, HeartbeatReply, HeartbeatRequest, Job, ListCredentialsReply,
+    ListCredentialsRequest, ListFleetReply, ListFleetRequest, ListJobsReply, ListJobsRequest,
+    ListProfilesReply, ListProfilesRequest, ProfileVersion, PushEventsReply, PushEventsRequest,
+    PutCredentialRequest, QueuedEvent, ReadJobEventsReply, ReadJobEventsRequest,
+    ReadTranscriptReply, ReadTranscriptRequest, Rejection, ReportJobReply, ReportJobRequest,
+    SubmitBatchReply, SubmitBatchRequest, SubmitJobRequest, SubmitJudgeRequest,
+    VerifyCredentialReply, VerifyCredentialRequest,
 };
 use fleet_proto::{ConvertError, validate_box};
 use tonic::transport::server::Router;
@@ -274,6 +278,13 @@ impl FleetWorker for FleetService {
         Ok(Response::new(reply))
     }
 
+    async fn get_job_credentials(
+        &self,
+        _request: Request<GetJobCredentialsRequest>,
+    ) -> Result<Response<GetJobCredentialsReply>, Status> {
+        Err(Status::unimplemented("get_job_credentials"))
+    }
+
     async fn report_job(
         &self,
         request: Request<ReportJobRequest>,
@@ -287,6 +298,37 @@ impl FleetWorker for FleetService {
             .await
             .map_err(|err| worker_error(&err))?;
         Ok(Response::new(reply))
+    }
+}
+
+#[tonic::async_trait]
+impl FleetCredentials for FleetService {
+    async fn put_credential(
+        &self,
+        _request: Request<PutCredentialRequest>,
+    ) -> Result<Response<CredentialInfo>, Status> {
+        Err(Status::unimplemented("put_credential"))
+    }
+
+    async fn list_credentials(
+        &self,
+        _request: Request<ListCredentialsRequest>,
+    ) -> Result<Response<ListCredentialsReply>, Status> {
+        Err(Status::unimplemented("list_credentials"))
+    }
+
+    async fn delete_credential(
+        &self,
+        _request: Request<DeleteCredentialRequest>,
+    ) -> Result<Response<DeleteCredentialReply>, Status> {
+        Err(Status::unimplemented("delete_credential"))
+    }
+
+    async fn verify_credential(
+        &self,
+        _request: Request<VerifyCredentialRequest>,
+    ) -> Result<Response<VerifyCredentialReply>, Status> {
+        Err(Status::unimplemented("verify_credential"))
     }
 }
 
@@ -513,6 +555,8 @@ pub fn router(store: &Store, auth: &BearerAuth) -> Router<Stack<BearerAuth, Iden
     let judge = FleetJudgeServer::new(service.clone()).max_decoding_message_size(MAX_MESSAGE_BYTES);
     let batches =
         FleetBatchesServer::new(service.clone()).max_decoding_message_size(MAX_MESSAGE_BYTES);
+    let credentials =
+        FleetCredentialsServer::new(service.clone()).max_decoding_message_size(MAX_MESSAGE_BYTES);
     let profiles =
         FleetProfilesServer::new(service).max_decoding_message_size(MAX_PROFILE_MESSAGE_BYTES);
     tonic::transport::Server::builder()
@@ -528,6 +572,7 @@ pub fn router(store: &Store, auth: &BearerAuth) -> Router<Stack<BearerAuth, Iden
         .add_service(judge)
         .add_service(profiles)
         .add_service(batches)
+        .add_service(credentials)
 }
 
 #[cfg(test)]
