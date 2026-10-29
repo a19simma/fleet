@@ -90,3 +90,7 @@ The P2 CONNECT proxy serves the model API only. The allowlist `egress_allow` is 
 ## Amendment (ADR-0034)
 
 The Floor bullet "WebFetch: fetches go through the egress proxy (ADR-0031), not the tool" is replaced: fetch goes through `fleetd fetch` on the per-job socket (ADR-0036). The Floor gains `FLOOR_ALLOW` as described above, so the Overlay rule that a Profile `allow` replaces the default allow list does not remove the fetch and broker rules.
+
+## Amendment (ADR-0044)
+
+A non-claude runner calls its own model API. Those hosts must be in the Box `egress_allow` for the P2 proxy to pass them. No Profile can add them.

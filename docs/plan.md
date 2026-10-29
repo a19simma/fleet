@@ -81,7 +81,7 @@ Non-goals:
 - fleetd pushing to git or holding git credentials (superseded in part, see ADR-0020 and ADR-0024). Results leave the Box only through git remotes (see Background).
 - Storing transcripts on the server. They stay on the Box under `transcript_path`. fleetd reads them for derived preview text and a timeline only.
 - Autoscaling Boxes. Scale stays the Box count plus apply. The queue seam only exposes depth.
-- A web UI. The laptop `fleet` CLI is the only client for now.
+- A web UI as a first-class client: see ADR-0041.
 
 ## Component diagram
 

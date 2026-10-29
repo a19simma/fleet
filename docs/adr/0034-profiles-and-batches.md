@@ -114,3 +114,7 @@ This task set builds structure only: Profile storage and application, a batch ta
 
 - The Floor gains a fixed `FLOOR_ALLOW` with `Bash(fleetd fetch *)` and `Bash(fleetd broker *)`. A Profile `allow` list cannot drop it. Without it the Overlay rule that any Profile allow rule replaces the default allow list would remove fetch silently.
 - The Profile field list stays closed. A Profile has no egress field, and adding one needs an amendment.
+
+## Amendment (ADR-0044)
+
+The agent runner is `Job.agent`. A Profile has no agent field, and the closed field list stays closed.

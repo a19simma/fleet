@@ -161,7 +161,7 @@ The pass or fail outcome of a forge check on a Job's pull request, read through 
 _Avoid_: build status
 
 **Mirror key**:
-Planned, not built: the key that grants read access to a repository mirror. Owned by another ADR.
+The `(user, repo)` pair that names a repository mirror, so each user fetches into a separate mirror (ADR-0046). Planned, not built.
 _Avoid_: deploy key
 
 **Owner**:

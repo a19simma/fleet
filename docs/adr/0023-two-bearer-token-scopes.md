@@ -32,3 +32,7 @@ The server holds two static bearer tokens, each with a scope.
 ## Amendment (ADR-0034, ADR-0035)
 
 `FleetProfiles` and `FleetBatches` are client scope. `FleetWorker.GetProfileBlob` is worker scope and is authorised against the lease.
+
+## Amendment (ADR-0033)
+
+`FleetWorker.GetJobCredentials` is worker scope and is authorised against the lease. The shared Box token makes the lease check the only guard until per-Box tokens exist. ADR-0033 records the accepted risk.
