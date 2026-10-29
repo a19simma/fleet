@@ -1643,13 +1643,14 @@ impl<R: Reporter> AgentRunner<R> {
         if cached.is_some() {
             return cached;
         }
-        let mut command = Command::new(&self.config.claude_bin);
+        let runner = crate::agent::resolve("")?;
+        let mut command = Command::new(runner.program(&self.config));
         command
             .arg("--version")
             .current_dir(cwd)
             .env_clear()
             .env("HOME", home)
-            .env("CLAUDE_CONFIG_DIR", home.join(".claude"))
+            .env(runner.config_dir_env(), home.join(".claude"))
             .env("DISABLE_AUTOUPDATER", "1");
         command.envs(
             self.config
