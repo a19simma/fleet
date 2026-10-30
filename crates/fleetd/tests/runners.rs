@@ -28,7 +28,7 @@ fn the_claude_name_resolves_to_claude() {
 
 #[test]
 fn an_unknown_agent_name_resolves_to_nothing() {
-    assert!(resolve("kimi").is_none());
+    assert!(resolve("gemini").is_none());
     assert!(resolve("Claude").is_none());
     assert_eq!(ERR_UNKNOWN_AGENT, "agent is not supported");
 }

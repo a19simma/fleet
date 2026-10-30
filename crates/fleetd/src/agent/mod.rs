@@ -1,9 +1,10 @@
 //! The agent CLI a Job runs under (ADR-0044).
 //!
-//! [`AgentRunner`] owns what differs between agent CLIs. `claude` and `codex` exist; the
+//! [`AgentRunner`] owns what differs between agent CLIs. `claude`, `codex` and `kimi` exist; the
 //! [`resolve`] table maps a `Job.agent` name to its runner.
 
 pub mod codex;
+pub mod kimi;
 
 mod claude;
 
@@ -36,6 +37,7 @@ pub fn resolve(agent: &str) -> Option<&'static dyn AgentRunner> {
     match agent {
         "" | claude::NAME => Some(&claude::Claude),
         codex::NAME => Some(&codex::Codex),
+        kimi::NAME => Some(&kimi::Kimi),
         _ => None,
     }
 }
