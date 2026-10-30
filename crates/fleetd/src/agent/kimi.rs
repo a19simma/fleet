@@ -59,6 +59,8 @@ const ENV_ALLOW: [&str; 9] = [
 pub const CONFIG_TOML: &str =
     "default_yolo = false\n\n[providers.kimi]\ntype = \"kimi\"\napi_key_env = \"KIMI_API_KEY\"\n";
 
+const MODEL_HOSTS: &[&str] = &["api.moonshot.ai", "api.kimi.com"];
+
 pub(super) struct Kimi;
 
 impl AgentRunner for Kimi {
@@ -72,6 +74,10 @@ impl AgentRunner for Kimi {
 
     fn config_dir_env(&self) -> &'static str {
         HOME_ENV
+    }
+
+    fn model_hosts(&self) -> &'static [&'static str] {
+        MODEL_HOSTS
     }
 }
 

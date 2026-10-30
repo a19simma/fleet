@@ -108,6 +108,7 @@ pub struct ProxyStats {
 struct JobCounts {
     stats: ProxyStats,
     open: u32,
+    hosts: Option<Vec<HostPattern>>,
 }
 
 type Jobs = Mutex<HashMap<String, JobCounts>>;
@@ -262,8 +263,50 @@ impl<R: Resolver, D: Dialer> ConnectProxy<R, D> {
             .remove(job_id);
     }
 
-    fn allowed(&self, host: &str) -> bool {
+    /// Narrows a Job to the hosts its runner declares, keeping only those inside the Box
+    /// `egress_allow` ceiling. [`MODEL_API_HOST`] is always kept. A declared host outside the
+    /// ceiling, or one that is not an exact host name, is dropped and never widens the
+    /// ceiling. Returns how many declared hosts were admitted.
+    ///
+    /// A Job never narrowed keeps the whole ceiling. [`ConnectProxy::forget`] clears the
+    /// narrowing.
+    pub fn set_job_hosts(&self, job_id: &str, declared: &[&str]) -> usize {
+        let admitted: Vec<HostPattern> = declared
+            .iter()
+            .filter_map(|raw| match HostPattern::parse(raw) {
+                Ok(pattern @ HostPattern::Exact(_)) => Some(pattern),
+                _ => None,
+            })
+            .filter(|pattern| match pattern {
+                HostPattern::Exact(name) => self.in_ceiling(name),
+                HostPattern::Subdomain(_) => false,
+            })
+            .collect();
+        let count = admitted.len();
+        self.jobs
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .entry(job_id.to_owned())
+            .or_default()
+            .hosts = Some(admitted);
+        count
+    }
+
+    fn in_ceiling(&self, host: &str) -> bool {
         host == MODEL_API_HOST || self.allow.iter().any(|pattern| pattern.matches(host))
+    }
+
+    fn allowed(&self, job_id: &str, host: &str) -> bool {
+        if host == MODEL_API_HOST {
+            return true;
+        }
+        let jobs = self.jobs.lock().unwrap_or_else(PoisonError::into_inner);
+        jobs.get(job_id)
+            .and_then(|counts| counts.hosts.as_ref())
+            .map_or_else(
+                || self.in_ceiling(host),
+                |hosts| hosts.iter().any(|pattern| pattern.matches(host)),
+            )
     }
 
     fn refused(&self, job_id: &str) {
@@ -347,7 +390,7 @@ impl<R: Resolver, D: Dialer> ConnectProxy<R, D> {
                 return None;
             }
             let host = self.read_head(&mut stream).await?;
-            if !self.allowed(&host) {
+            if !self.allowed(job_id, &host) {
                 return None;
             }
             let tunnel = self.reserve(job_id)?;
@@ -706,6 +749,62 @@ mod tests {
         );
         assert_eq!(rig.resolver.queries(), vec!["api.anthropic.com"]);
         assert_eq!(rig.dialer.dialed(), vec![SocketAddr::new(PUBLIC, 443)]);
+        Ok(())
+    }
+
+    async fn connect_status(rig: &Rig, host: &str) -> TestResult2<bool> {
+        let mut stream = rig.connect().await?;
+        stream
+            .write_all(format!("CONNECT {host}:443 HTTP/1.1\r\n\r\n").as_bytes())
+            .await?;
+        let got = read_prefix(&mut stream).await?;
+        Ok(got.starts_with(b"HTTP/1.1 200"))
+    }
+
+    async fn read_prefix(stream: &mut UnixStream) -> TestResult2<Vec<u8>> {
+        let mut buf = [0_u8; 12];
+        timeout(OUTER, stream.read_exact(&mut buf)).await??;
+        Ok(buf.to_vec())
+    }
+
+    #[tokio::test]
+    async fn a_runner_host_inside_the_ceiling_is_allowed_and_siblings_are_not() -> TestResult {
+        let rig = Rig::start(Setup {
+            allow: vec!["api.openai.com", "other.example"],
+            ..Setup::default()
+        })
+        .await?;
+        assert_eq!(rig.proxy.set_job_hosts("job1", &["api.openai.com"]), 1);
+        assert!(connect_status(&rig, "api.openai.com").await?);
+        assert!(connect_status(&rig, "api.anthropic.com").await?);
+        assert!(!connect_status(&rig, "other.example").await?);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_runner_host_outside_the_ceiling_is_refused_and_never_widens_it() -> TestResult {
+        let rig = Rig::start(Setup {
+            allow: vec!["api.openai.com"],
+            ..Setup::default()
+        })
+        .await?;
+        let admitted = rig
+            .proxy
+            .set_job_hosts("job1", &["evil.example", "*.openai.com", "api.openai.com"]);
+        assert_eq!(admitted, 1);
+        assert!(!connect_status(&rig, "evil.example").await?);
+        assert!(!connect_status(&rig, "x.openai.com").await?);
+        assert!(connect_status(&rig, "api.openai.com").await?);
+        assert!(rig.resolver.queries().iter().all(|q| q == "api.openai.com"));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn an_empty_ceiling_admits_no_runner_host_and_unknown_hosts_are_refused() -> TestResult {
+        let rig = Rig::start(Setup::default()).await?;
+        assert_eq!(rig.proxy.set_job_hosts("job1", &["api.openai.com"]), 0);
+        assert!(!connect_status(&rig, "api.openai.com").await?);
+        assert!(!connect_status(&rig, "unknown.example").await?);
         Ok(())
     }
 

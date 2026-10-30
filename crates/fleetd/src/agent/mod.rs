@@ -25,6 +25,12 @@ pub trait AgentRunner: Send + Sync {
 
     /// The environment variable that points the CLI at its config directory.
     fn config_dir_env(&self) -> &'static str;
+
+    /// The model API host names this runner calls, exact names only.
+    ///
+    /// The proxy allows each only when it lies inside the Box `egress_allow` ceiling
+    /// (ADR-0038). Declaring a host never adds it to that ceiling.
+    fn model_hosts(&self) -> &'static [&'static str];
 }
 
 /// The runner for the `agent` field of a Job.
@@ -39,5 +45,22 @@ pub fn resolve(agent: &str) -> Option<&'static dyn AgentRunner> {
         codex::NAME => Some(&codex::Codex),
         kimi::NAME => Some(&kimi::Kimi),
         _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{AgentRunner, resolve};
+
+    #[test]
+    fn each_runner_declares_exact_model_hosts() {
+        for (name, hosts) in [
+            ("claude", &["api.anthropic.com"][..]),
+            ("codex", &["api.openai.com"][..]),
+            ("kimi", &["api.moonshot.ai", "api.kimi.com"][..]),
+        ] {
+            let runner = resolve(name).map(AgentRunner::model_hosts);
+            assert_eq!(runner, Some(hosts), "{name}");
+        }
     }
 }

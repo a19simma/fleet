@@ -58,6 +58,8 @@ pub const CONFIG_TOML: &str = "approval_policy = \"never\"\nsandbox_mode = \"wor
 /// forms only. The sandbox with network off is the Floor.
 pub const RULES: &str = "prefix_rule(pattern = [\"git\", \"push\"], decision = \"forbidden\", justification = \"the daemon publishes the branch\")\nprefix_rule(pattern = [\"gh\"], decision = \"forbidden\", justification = \"the daemon opens the pull request\")\nprefix_rule(pattern = [\"curl\"], decision = \"forbidden\", justification = \"fetches go through the egress proxy\")\n";
 
+const MODEL_HOSTS: &[&str] = &["api.openai.com"];
+
 pub(super) struct Codex;
 
 impl AgentRunner for Codex {
@@ -71,6 +73,10 @@ impl AgentRunner for Codex {
 
     fn config_dir_env(&self) -> &'static str {
         HOME_ENV
+    }
+
+    fn model_hosts(&self) -> &'static [&'static str] {
+        MODEL_HOSTS
     }
 }
 
