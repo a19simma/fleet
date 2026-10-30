@@ -21,8 +21,8 @@ const SELECT_BATCH_BY_KEY: &str =
 const SELECT_BATCH_JOBS: &str = "SELECT job_id, profile_name, user_id, agent FROM jobs WHERE batch_id = $1 ORDER BY batch_pos LIMIT $2";
 const SELECT_BATCH_BY_ID: &str = "SELECT prompt, repo, base_sha, repeats, \
      (EXTRACT(EPOCH FROM created_at) * 1000)::bigint AS created_at_ms FROM batch WHERE batch_id = $1";
-const SELECT_BATCH_JOB_IDS: &str =
-    "SELECT job_id FROM jobs WHERE batch_id = $1 ORDER BY batch_pos LIMIT $2";
+const SELECT_BATCH_JOB_IDS: &str = "SELECT job_id FROM jobs WHERE batch_id = $1 \
+     AND ($3::bigint IS NULL OR user_id = $3) ORDER BY batch_pos LIMIT $2";
 const LOCK_NAME: &str = "SELECT pg_advisory_xact_lock(hashtextextended($1, 0))";
 const SELECT_LATEST: &str =
     "SELECT version, hash FROM profile_version WHERE name = $1 ORDER BY version DESC LIMIT 1";
@@ -121,9 +121,11 @@ pub fn validate_batch(request: &SubmitBatchRequest) -> Result<NewBatch, StoreErr
 /// Reads a batch row and the ids of its jobs in profile order.
 ///
 /// The reply carries no jobs; the caller fills them in. The id is checked once here and an
-/// unknown id is [`StoreError::NotFound`]. At most [`MAX_BATCH_PROFILES`] ids come back.
+/// unknown id is [`StoreError::NotFound`]. With an `owner`, only that user's jobs count and a
+/// batch without any is [`StoreError::NotFound`] too. At most [`MAX_BATCH_PROFILES`] ids come back.
 pub(crate) async fn get_head(
     pool: &PgPool,
+    owner: Option<i64>,
     batch_id: &str,
 ) -> Result<(GetBatchReply, Vec<String>), StoreError> {
     validate_job_id(batch_id).map_err(|_| StoreError::InvalidBatch(BatchInvalid::BatchId))?;
@@ -135,11 +137,15 @@ pub(crate) async fn get_head(
     let ids = sqlx::query(SELECT_BATCH_JOB_IDS)
         .bind(batch_id)
         .bind(i64::try_from(MAX_BATCH_PROFILES).unwrap_or(i64::MAX))
+        .bind(owner)
         .fetch_all(pool)
         .await?
         .iter()
         .map(|row| row.try_get::<String, _>("job_id"))
         .collect::<Result<Vec<_>, _>>()?;
+    if owner.is_some() && ids.is_empty() {
+        return Err(StoreError::NotFound);
+    }
     let repeats = u32::try_from(row.try_get::<i32, _>("repeats")?)
         .map_err(|_| StoreError::OutOfRange("batch repeats"))?;
     let created_at_ms = u64::try_from(row.try_get::<i64, _>("created_at_ms")?)

@@ -396,9 +396,10 @@ impl FleetBatches for FleetService {
         &self,
         request: Request<GetBatchRequest>,
     ) -> Result<Response<GetBatchReply>, Status> {
+        let owner = caller_of(&request);
         let reply = self
             .store
-            .get_batch(&request.into_inner().batch_id)
+            .get_batch_for(owner, &request.into_inner().batch_id)
             .await
             .map_err(|err| batches_error(&err))?;
         Ok(Response::new(reply))
@@ -479,9 +480,10 @@ impl FleetJobs for FleetService {
     }
 
     async fn get_job(&self, request: Request<GetJobRequest>) -> Result<Response<Job>, Status> {
+        let owner = caller_of(&request);
         let job = self
             .store
-            .get_job_with_summary(&request.into_inner().job_id)
+            .get_job_with_summary_for(owner, &request.into_inner().job_id)
             .await
             .map_err(|err| jobs_error(&err))?;
         Ok(Response::new(job))
@@ -491,10 +493,11 @@ impl FleetJobs for FleetService {
         &self,
         request: Request<ListJobsRequest>,
     ) -> Result<Response<ListJobsReply>, Status> {
+        let owner = caller_of(&request);
         let request = request.into_inner();
         let jobs = self
             .store
-            .list_jobs(request.state, request.limit)
+            .list_jobs_for(owner, request.state, request.limit)
             .await
             .map_err(|err| jobs_error(&err))?;
         Ok(Response::new(ListJobsReply { jobs }))
@@ -516,10 +519,11 @@ impl FleetJobs for FleetService {
         &self,
         request: Request<ReadTranscriptRequest>,
     ) -> Result<Response<ReadTranscriptReply>, Status> {
+        let owner = caller_of(&request);
         let request = request.into_inner();
         let reply = self
             .store
-            .read_transcript(&request.job_id, request.after_seq, request.limit)
+            .read_transcript_for(owner, &request.job_id, request.after_seq, request.limit)
             .await
             .map_err(|err| jobs_error(&err))?;
         Ok(Response::new(reply))
@@ -529,10 +533,11 @@ impl FleetJobs for FleetService {
         &self,
         request: Request<ReadJobEventsRequest>,
     ) -> Result<Response<ReadJobEventsReply>, Status> {
+        let owner = caller_of(&request);
         let request = request.into_inner();
         let reply = self
             .store
-            .read_job_events(&request.job_id, request.after_seq, request.limit)
+            .read_job_events_for(owner, &request.job_id, request.after_seq, request.limit)
             .await
             .map_err(|err| jobs_error(&err))?;
         Ok(Response::new(reply))

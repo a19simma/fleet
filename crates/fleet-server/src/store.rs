@@ -182,12 +182,18 @@ const READ_ALL_TRANSCRIPT: &str = "\
 SELECT seq, ts_ms, chunk, truncated FROM job_transcript \
 WHERE job_id = $1 ORDER BY seq LIMIT $2";
 
-const SELECT_JOB_BY_ID: &str = concat!("SELECT ", job_columns!(), " FROM jobs WHERE job_id = $1");
+const SELECT_JOB_BY_ID: &str = concat!(
+    "SELECT ",
+    job_columns!(),
+    " FROM jobs WHERE job_id = $1 AND ($2::bigint IS NULL OR user_id = $2)"
+);
+
+const SELECT_OWNED_JOB: &str = "SELECT 1 FROM jobs WHERE job_id = $1 AND user_id = $2";
 
 const LIST_JOBS: &str = concat!(
     "SELECT ",
     job_columns!(),
-    " FROM jobs WHERE $1::text IS NULL OR state = $1 \
+    " FROM jobs WHERE ($1::text IS NULL OR state = $1) AND ($3::bigint IS NULL OR user_id = $3) \
 ORDER BY created_at DESC, job_id DESC LIMIT $2"
 );
 
@@ -952,6 +958,7 @@ impl Store {
     }
 
     async fn insert_job(&self, owner: Option<i64>, job: NewJob) -> Result<Job, StoreError> {
+        let scoped = owner;
         let owner = match owner {
             Some(owner) => owner,
             None => {
@@ -967,6 +974,14 @@ impl Store {
                 .bind(target)
                 .fetch_optional(&mut *tx)
                 .await?;
+            if let Some(scoped) = scoped {
+                sqlx::query(SELECT_OWNED_JOB)
+                    .bind(target)
+                    .bind(scoped)
+                    .fetch_optional(&mut *tx)
+                    .await?
+                    .ok_or(StoreError::NotFound)?;
+            }
             sqlx::query(INSERT_JUDGE)
                 .bind(id)
                 .bind(&job.key)
@@ -1037,9 +1052,23 @@ impl Store {
     /// [`StoreError::NotFound`] when no job has it, and [`StoreError::Database`] when the
     /// query fails.
     pub async fn get_job(&self, job_id: &str) -> Result<Job, StoreError> {
+        self.get_job_for(None, job_id).await
+    }
+
+    /// Returns the job with `job_id` when `owner` may read it.
+    ///
+    /// `Some(user)` reads only that user's jobs and answers [`StoreError::NotFound`] for
+    /// another user's job exactly as for an unknown id. `None` is the box token and reads any
+    /// job.
+    ///
+    /// # Errors
+    ///
+    /// The errors of [`Store::get_job`].
+    pub async fn get_job_for(&self, owner: Option<i64>, job_id: &str) -> Result<Job, StoreError> {
         validate_job_id(job_id)?;
         let row = sqlx::query(SELECT_JOB_BY_ID)
             .bind(job_id)
+            .bind(owner)
             .fetch_optional(&self.pool)
             .await?
             .ok_or(StoreError::NotFound)?;
@@ -1056,6 +1085,20 @@ impl Store {
     /// Returns [`StoreError::InvalidJob`] when `state` is unspecified or unknown, and
     /// [`StoreError::Database`] when the query fails.
     pub async fn list_jobs(&self, state: Option<i32>, limit: u32) -> Result<Vec<Job>, StoreError> {
+        self.list_jobs_for(None, state, limit).await
+    }
+
+    /// Lists jobs like [`Store::list_jobs`], only those `owner` owns. `None` lists all.
+    ///
+    /// # Errors
+    ///
+    /// The errors of [`Store::list_jobs`].
+    pub async fn list_jobs_for(
+        &self,
+        owner: Option<i64>,
+        state: Option<i32>,
+        limit: u32,
+    ) -> Result<Vec<Job>, StoreError> {
         let state = state
             .map(|raw| match JobState::try_from(raw) {
                 Ok(JobState::Unspecified) | Err(_) => Err(JobInvalid::State),
@@ -1069,6 +1112,7 @@ impl Store {
         let rows = sqlx::query(LIST_JOBS)
             .bind(state)
             .bind(i64::from(limit))
+            .bind(owner)
             .fetch_all(&self.pool)
             .await?;
         rows.iter().map(job_from_row).collect()
@@ -1091,7 +1135,24 @@ impl Store {
         after_seq: u64,
         limit: u32,
     ) -> Result<ReadTranscriptReply, StoreError> {
-        let job = self.get_job(job_id).await?;
+        self.read_transcript_for(None, job_id, after_seq, limit)
+            .await
+    }
+
+    /// Reads transcript chunks like [`Store::read_transcript`] for a job `owner` may read.
+    ///
+    /// # Errors
+    ///
+    /// The errors of [`Store::read_transcript`], with [`StoreError::NotFound`] for another
+    /// user's job.
+    pub async fn read_transcript_for(
+        &self,
+        owner: Option<i64>,
+        job_id: &str,
+        after_seq: u64,
+        limit: u32,
+    ) -> Result<ReadTranscriptReply, StoreError> {
+        let job = self.get_job_for(owner, job_id).await?;
         let limit = match limit {
             0 => DEFAULT_TRANSCRIPT_LIMIT,
             n => n.min(MAX_TRANSCRIPT_LIMIT),
@@ -1129,7 +1190,21 @@ impl Store {
     ///
     /// Returns the errors of [`Store::get_job`].
     pub async fn get_job_with_summary(&self, job_id: &str) -> Result<Job, StoreError> {
-        let mut job = self.get_job(job_id).await?;
+        self.get_job_with_summary_for(None, job_id).await
+    }
+
+    /// Returns the job and its summary like [`Store::get_job_with_summary`] when `owner` may
+    /// read it.
+    ///
+    /// # Errors
+    ///
+    /// The errors of [`Store::get_job_for`].
+    pub async fn get_job_with_summary_for(
+        &self,
+        owner: Option<i64>,
+        job_id: &str,
+    ) -> Result<Job, StoreError> {
+        let mut job = self.get_job_for(owner, job_id).await?;
         job.summary = telemetry::read_summary(&self.pool, job_id).await?;
         Ok(job)
     }
@@ -1152,7 +1227,24 @@ impl Store {
         after_seq: Option<u32>,
         limit: u32,
     ) -> Result<ReadJobEventsReply, StoreError> {
-        self.get_job(job_id).await?;
+        self.read_job_events_for(None, job_id, after_seq, limit)
+            .await
+    }
+
+    /// Reads telemetry events like [`Store::read_job_events`] for a job `owner` may read.
+    ///
+    /// # Errors
+    ///
+    /// The errors of [`Store::read_job_events`], with [`StoreError::NotFound`] for another
+    /// user's job.
+    pub async fn read_job_events_for(
+        &self,
+        owner: Option<i64>,
+        job_id: &str,
+        after_seq: Option<u32>,
+        limit: u32,
+    ) -> Result<ReadJobEventsReply, StoreError> {
+        self.get_job_for(owner, job_id).await?;
         let limit = match limit {
             0 => DEFAULT_EVENTS_LIMIT,
             n => n.min(MAX_EVENTS_LIMIT),
@@ -1278,9 +1370,25 @@ impl Store {
         &self,
         batch_id: &str,
     ) -> Result<fleet_proto::v1::GetBatchReply, StoreError> {
-        let (mut reply, ids) = batches::get_head(&self.pool, batch_id).await?;
+        self.get_batch_for(None, batch_id).await
+    }
+
+    /// Returns a batch like [`Store::get_batch`] when `owner` owns its jobs.
+    ///
+    /// A batch with none of `owner`'s jobs is [`StoreError::NotFound`], the same as an unknown
+    /// id. `None` reads any batch.
+    ///
+    /// # Errors
+    ///
+    /// The errors of [`Store::get_batch`].
+    pub async fn get_batch_for(
+        &self,
+        owner: Option<i64>,
+        batch_id: &str,
+    ) -> Result<fleet_proto::v1::GetBatchReply, StoreError> {
+        let (mut reply, ids) = batches::get_head(&self.pool, owner, batch_id).await?;
         for id in &ids {
-            let mut job = self.get_job_with_summary(id).await?;
+            let mut job = self.get_job_with_summary_for(owner, id).await?;
             job.prompt.clear();
             reply.jobs.push(job);
         }
