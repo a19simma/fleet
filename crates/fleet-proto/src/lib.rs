@@ -193,6 +193,27 @@ impl v1::CiState {
     }
 }
 
+impl std::fmt::Debug for v1::PutCredentialRequest {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PutCredentialRequest")
+            .field("kind", &self.kind)
+            .field("shape", &self.shape)
+            .field("value", &"<redacted>")
+            .field("expires_at_ms", &self.expires_at_ms)
+            .finish()
+    }
+}
+
+impl std::fmt::Debug for v1::JobCredential {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("JobCredential")
+            .field("kind", &self.kind)
+            .field("shape", &self.shape)
+            .field("value", &"<redacted>")
+            .finish()
+    }
+}
+
 /// Generated `fleet.v1` messages and services.
 #[expect(
     missing_docs,
