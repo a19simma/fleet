@@ -255,7 +255,11 @@ async fn login_start(cx: &Cx, Json(body): Json<Value>) -> Result<Json<Value>> {
 #[route(POST "/passkey/login/finish")]
 async fn login_finish(cx: &Cx, Json(body): Json<Value>) -> Result<Json<Value>> {
     let session = auth(cx)?
-        .login_finish(field(&body, "ceremony")?, &assertion(&body)?)
+        .login_finish(
+            field(&body, "ceremony")?,
+            &assertion(&body)?,
+            session_cookie(headers(cx)).map(str::as_bytes),
+        )
         .await
         .map_err(fail)?;
     set_cookie(

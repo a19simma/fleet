@@ -15,5 +15,8 @@ mod serve;
 pub use dispatch::{Dispatch, GRPC_PREFIX, harden};
 pub use pages::{HOME_MARKER, MAX_BODY_BYTES, PASSKEY_JS, SCRIPT_PATH, STYLE_CSS, STYLE_PATH, Web};
 pub use panic::CatchPanic;
-pub use passkeys::{AuthError, NewSession, SESSION_COOKIE, SESSION_TTL_SECS, SessionInfo, WebAuth};
+pub use passkeys::{
+    AuthError, NewSession, SESSION_COOKIE, SESSION_IDLE_SECS, SESSION_TTL_SECS, SessionInfo,
+    WebAuth,
+};
 pub use serve::{HEADER_READ_TIMEOUT, serve};

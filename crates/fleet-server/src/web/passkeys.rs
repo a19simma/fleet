@@ -29,6 +29,9 @@ pub const SESSION_COOKIE: &str = "__Host-fleet_session";
 /// How long a browser session lives, in seconds.
 pub const SESSION_TTL_SECS: i64 = 12 * 60 * 60;
 
+/// How long a browser session may sit unused before it expires, in seconds.
+pub const SESSION_IDLE_SECS: i64 = 30 * 60;
+
 const CEREMONY_TTL: Duration = Duration::from_secs(300);
 const MAX_PENDING_PER_KIND: usize = 256;
 const RANDOM_BYTES: usize = 32;
@@ -45,10 +48,13 @@ const USERNAME_OF: &str = "SELECT username FROM users WHERE id = $1";
 const INSERT_SESSION: &str = "\
 INSERT INTO web_sessions (id_hash, user_id, csrf, expires_at) \
 VALUES (sha256($1::bytea), $2, $3, now() + ($4::bigint * interval '1 second'))";
-const PURGE_SESSIONS: &str = "DELETE FROM web_sessions WHERE expires_at <= now()";
+const PURGE_SESSIONS: &str = "\
+DELETE FROM web_sessions \
+WHERE expires_at <= now() OR last_seen <= now() - ($1::bigint * interval '1 second')";
 const FIND_SESSION: &str = "\
 UPDATE web_sessions s SET last_seen = now() FROM users u \
 WHERE u.id = s.user_id AND s.id_hash = sha256($1::bytea) AND s.expires_at > now() \
+AND s.last_seen > now() - ($2::bigint * interval '1 second') \
 RETURNING s.user_id, u.username, s.csrf";
 const DELETE_SESSION: &str = "DELETE FROM web_sessions WHERE id_hash = sha256($1::bytea)";
 
@@ -416,17 +422,21 @@ impl WebAuth {
         Ok((ceremony, challenge))
     }
 
-    /// Finishes a login: verifies the assertion and the signature counter, stores the new
-    /// counter and opens a session.
+    /// Finishes a login: verifies the assertion, re-checks the signature counter against the
+    /// locked row, stores the new counter and opens a session in the same transaction.
+    ///
+    /// `previous` is the session cookie the browser sent, if any. Its session is deleted in
+    /// that transaction, so the id rotates on every login.
     ///
     /// # Errors
     ///
     /// Returns [`AuthError::Refused`] for an unknown or replayed ceremony, a wrong origin or
-    /// relying party, a bad signature or a counter that did not advance.
+    /// relying party, a bad signature or a counter that did not advance past the stored one.
     pub async fn login_finish(
         &self,
         ceremony: &str,
         credential: &PublicKeyCredential,
+        previous: Option<&[u8]>,
     ) -> Result<NewSession, AuthError> {
         let Pending::Login { state, user_id } = self.take(ceremony)? else {
             return Err(AuthError::Refused);
@@ -442,6 +452,12 @@ impl WebAuth {
         let mut matched = false;
         for (credential_id, blob) in rows {
             let mut key: Passkey = serde_json::from_slice(&blob)?;
+            if key.cred_id() == result.cred_id() {
+                let stored = stored_counter(&blob)?;
+                if (result.counter() > 0 || stored > 0) && result.counter() <= stored {
+                    return Err(AuthError::Refused);
+                }
+            }
             match key.update_credential(&result) {
                 Some(true) => {
                     sqlx::query(UPDATE_KEY)
@@ -458,8 +474,9 @@ impl WebAuth {
         if !matched {
             return Err(AuthError::Refused);
         }
+        let session = insert_session(&mut tx, user_id, previous).await?;
         tx.commit().await?;
-        self.open_session(user_id).await
+        Ok(session)
     }
 
     /// Resolves a session cookie value to its user, or `None` when unknown or expired.
@@ -470,6 +487,7 @@ impl WebAuth {
     pub async fn session(&self, cookie: &[u8]) -> Result<Option<SessionInfo>, AuthError> {
         let row: Option<(i64, String, String)> = sqlx::query_as(FIND_SESSION)
             .bind(cookie)
+            .bind(SESSION_IDLE_SECS)
             .fetch_optional(&self.pool)
             .await?;
         Ok(row.map(|(user_id, username, csrf)| SessionInfo {
@@ -518,18 +536,47 @@ impl WebAuth {
     }
 
     async fn open_session(&self, user_id: i64) -> Result<NewSession, AuthError> {
-        sqlx::query(PURGE_SESSIONS).execute(&self.pool).await?;
-        let id = Secret::new(random_hex());
-        let csrf = Secret::new(random_hex());
-        sqlx::query(INSERT_SESSION)
-            .bind(id.expose())
-            .bind(user_id)
-            .bind(String::from_utf8_lossy(csrf.expose()).into_owned())
-            .bind(SESSION_TTL_SECS)
-            .execute(&self.pool)
-            .await?;
-        Ok(NewSession { id, csrf })
+        let mut tx = self.pool.begin().await?;
+        let session = insert_session(&mut tx, user_id, None).await?;
+        tx.commit().await?;
+        Ok(session)
     }
+}
+
+fn stored_counter(blob: &[u8]) -> Result<u32, AuthError> {
+    let value: serde_json::Value = serde_json::from_slice(blob)?;
+    Ok(value
+        .pointer("/cred/counter")
+        .and_then(serde_json::Value::as_u64)
+        .and_then(|n| u32::try_from(n).ok())
+        .unwrap_or(0))
+}
+
+async fn insert_session(
+    conn: &mut sqlx::PgConnection,
+    user_id: i64,
+    previous: Option<&[u8]>,
+) -> Result<NewSession, AuthError> {
+    sqlx::query(PURGE_SESSIONS)
+        .bind(SESSION_IDLE_SECS)
+        .execute(&mut *conn)
+        .await?;
+    if let Some(old) = previous {
+        sqlx::query(DELETE_SESSION)
+            .bind(old)
+            .execute(&mut *conn)
+            .await?;
+    }
+    let id = Secret::new(random_hex());
+    let csrf = Secret::new(random_hex());
+    sqlx::query(INSERT_SESSION)
+        .bind(id.expose())
+        .bind(user_id)
+        .bind(String::from_utf8_lossy(csrf.expose()).into_owned())
+        .bind(SESSION_TTL_SECS)
+        .execute(&mut *conn)
+        .await?;
+    Ok(NewSession { id, csrf })
 }
 
 #[cfg(test)]

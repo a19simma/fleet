@@ -95,9 +95,15 @@ impl Harness {
     async fn send(&self, method: &str, path: &str, extra: &[(&str, &str)], body: &[u8]) -> Reply {
         let mut stream = TcpStream::connect(self.addr).await.unwrap();
         let mut request = format!(
-            "{method} {path} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\nOrigin: {ORIGIN}\r\nContent-Length: {}\r\n",
+            "{method} {path} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\nContent-Length: {}\r\n",
             body.len()
         );
+        if !extra
+            .iter()
+            .any(|(key, _)| key.eq_ignore_ascii_case("origin"))
+        {
+            let _ = write!(request, "Origin: {ORIGIN}\r\n");
+        }
         for (key, value) in extra {
             let _ = write!(request, "{key}: {value}\r\n");
         }
@@ -551,5 +557,272 @@ async fn adding_an_already_registered_credential_is_refused_not_a_500(pool: PgPo
         .await;
     assert_eq!(finish.status, 400, "{}", finish.body);
     assert_eq!(count(&h.pool, "SELECT count(*) FROM passkeys").await, 2);
+    h.finish().await;
+}
+
+const FORM: (&str, &str) = ("Content-Type", "application/x-www-form-urlencoded");
+
+async fn session_csrf(pool: &PgPool) -> String {
+    sqlx::query_scalar("SELECT csrf FROM web_sessions")
+        .fetch_one(pool)
+        .await
+        .unwrap()
+}
+
+#[sqlx::test]
+async fn an_idle_session_expires_and_activity_keeps_one_alive(pool: PgPool) {
+    let h = Harness::start(pool).await;
+    let mut authn = authenticator();
+    let cookie = cookie_header(&h.setup(&mut authn, "alice").await);
+
+    sqlx::query("UPDATE web_sessions SET last_seen = now() - interval '20 minutes'")
+        .execute(&h.pool)
+        .await
+        .unwrap();
+    let active = h.get("/account", &[("Cookie", &cookie)]).await;
+    assert_eq!(active.status, 200, "{}", active.head);
+
+    sqlx::query("UPDATE web_sessions SET last_seen = now() - interval '31 minutes'")
+        .execute(&h.pool)
+        .await
+        .unwrap();
+    let idle = h.get("/account", &[("Cookie", &cookie)]).await;
+    assert_eq!(idle.status, 303, "{}", idle.head);
+    assert!(idle.head.to_lowercase().contains("location: /login"));
+    h.finish().await;
+}
+
+#[sqlx::test]
+async fn an_expired_session_redirects_to_login(pool: PgPool) {
+    let h = Harness::start(pool).await;
+    let mut authn = authenticator();
+    let cookie = cookie_header(&h.setup(&mut authn, "alice").await);
+    let ok = h.get("/account", &[("Cookie", &cookie)]).await;
+    assert_eq!(ok.status, 200);
+
+    sqlx::query("UPDATE web_sessions SET expires_at = now() - interval '1 second'")
+        .execute(&h.pool)
+        .await
+        .unwrap();
+    let expired = h.get("/account", &[("Cookie", &cookie)]).await;
+    assert_eq!(expired.status, 303, "{}", expired.head);
+    assert!(expired.head.to_lowercase().contains("location: /login"));
+    let none = h.get("/account", &[]).await;
+    assert_eq!(none.status, 303);
+    h.finish().await;
+}
+
+#[sqlx::test]
+async fn login_rotates_the_session_id_and_revokes_the_old_one(pool: PgPool) {
+    let h = Harness::start(pool).await;
+    let mut authn = authenticator();
+    let first = cookie_header(&h.setup(&mut authn, "alice").await);
+    let first_csrf = session_csrf(&h.pool).await;
+
+    let second_reply = h
+        .login_at_with(&mut authn, "alice", &[("Cookie", &first)])
+        .await;
+    assert_eq!(second_reply.status, 200, "{}", second_reply.body);
+    let second = cookie_header(&second_reply);
+    assert_ne!(first, second);
+    assert_eq!(count(&h.pool, "SELECT count(*) FROM web_sessions").await, 1);
+    assert_ne!(session_csrf(&h.pool).await, first_csrf);
+
+    let old = h.get("/account", &[("Cookie", &first)]).await;
+    assert_eq!(old.status, 303);
+    let new = h.get("/account", &[("Cookie", &second)]).await;
+    assert_eq!(new.status, 200);
+
+    let third = cookie_header(&h.login_at(&mut authn, "alice", ORIGIN).await);
+    assert_ne!(second, third);
+    assert_eq!(count(&h.pool, "SELECT count(*) FROM web_sessions").await, 2);
+    h.finish().await;
+}
+
+impl Harness {
+    async fn login_at_with(
+        &self,
+        authn: &mut Authenticator,
+        name: &str,
+        extra: &[(&str, &str)],
+    ) -> Reply {
+        let (ceremony, options) = self.login_start(name).await;
+        let credential = authn
+            .do_authentication(
+                Url::parse(ORIGIN).unwrap(),
+                serde_json::from_value(options).unwrap(),
+            )
+            .unwrap();
+        self.post(
+            "/passkey/login/finish",
+            extra,
+            &json!({ "ceremony": ceremony, "credential": credential }),
+        )
+        .await
+    }
+}
+
+#[sqlx::test]
+async fn logout_revokes_the_session_on_the_server(pool: PgPool) {
+    let h = Harness::start(pool).await;
+    let mut authn = authenticator();
+    let cookie = cookie_header(&h.setup(&mut authn, "alice").await);
+    let csrf = session_csrf(&h.pool).await;
+
+    let body = format!("csrf={csrf}");
+    let out = h
+        .send(
+            "POST",
+            "/logout",
+            &[("Cookie", &cookie), FORM],
+            body.as_bytes(),
+        )
+        .await;
+    assert_eq!(out.status, 303, "{}", out.head);
+    let cleared = out.cookie().unwrap();
+    assert!(cleared.contains("Max-Age=0"), "{cleared}");
+    assert_eq!(count(&h.pool, "SELECT count(*) FROM web_sessions").await, 0);
+
+    let replay = h.get("/account", &[("Cookie", &cookie)]).await;
+    assert_eq!(replay.status, 303);
+    let add = h
+        .post(
+            "/passkey/add/start",
+            &[("Cookie", &cookie), ("X-CSRF-Token", &csrf)],
+            &json!({}),
+        )
+        .await;
+    assert_eq!(add.status, 403);
+    h.finish().await;
+}
+
+#[sqlx::test]
+async fn every_state_changing_route_refuses_a_foreign_origin(pool: PgPool) {
+    let h = Harness::start(pool).await;
+    let mut authn = authenticator();
+    let cookie = cookie_header(&h.setup(&mut authn, "alice").await);
+    let csrf = session_csrf(&h.pool).await;
+    let evil = ("Origin", EVIL);
+    let session = [
+        ("Cookie", cookie.as_str()),
+        ("X-CSRF-Token", csrf.as_str()),
+        evil,
+    ];
+    let cases: [(&str, &[(&str, &str)]); 6] = [
+        ("/passkey/setup/start", &[evil]),
+        ("/passkey/setup/finish", &[evil]),
+        ("/passkey/login/start", &[evil]),
+        ("/passkey/login/finish", &[evil]),
+        ("/passkey/add/start", &session),
+        ("/passkey/add/finish", &session),
+    ];
+    for (path, extra) in cases {
+        let reply = h.post(path, extra, &json!({})).await;
+        assert_eq!(reply.status, 403, "{path}: {}", reply.head);
+    }
+
+    let body = format!("csrf={csrf}");
+    let logout = h
+        .send(
+            "POST",
+            "/logout",
+            &[("Cookie", &cookie), FORM, evil],
+            body.as_bytes(),
+        )
+        .await;
+    assert_eq!(logout.status, 403, "{}", logout.head);
+    assert_eq!(count(&h.pool, "SELECT count(*) FROM web_sessions").await, 1);
+    h.finish().await;
+}
+
+#[sqlx::test]
+async fn every_session_route_refuses_a_missing_csrf_token(pool: PgPool) {
+    let h = Harness::start(pool).await;
+    let mut authn = authenticator();
+    let cookie = cookie_header(&h.setup(&mut authn, "alice").await);
+    let csrf = session_csrf(&h.pool).await;
+
+    for path in ["/passkey/add/start", "/passkey/add/finish"] {
+        let none = h.post(path, &[("Cookie", &cookie)], &json!({})).await;
+        assert_eq!(none.status, 403, "{path}");
+        let wrong = h
+            .post(
+                path,
+                &[("Cookie", &cookie), ("X-CSRF-Token", "nope")],
+                &json!({}),
+            )
+            .await;
+        assert_eq!(wrong.status, 403, "{path}");
+    }
+    let empty = h
+        .send("POST", "/logout", &[("Cookie", &cookie), FORM], b"")
+        .await;
+    assert!(empty.status == 403 || empty.status == 400, "{}", empty.head);
+    assert_eq!(count(&h.pool, "SELECT count(*) FROM web_sessions").await, 1);
+    let ok = h
+        .post(
+            "/passkey/add/start",
+            &[("Cookie", &cookie), ("X-CSRF-Token", &csrf)],
+            &json!({}),
+        )
+        .await;
+    assert_eq!(ok.status, 200);
+    h.finish().await;
+}
+
+#[sqlx::test]
+async fn a_counter_that_moved_during_the_ceremony_is_refused(pool: PgPool) {
+    let h = Harness::start(pool).await;
+    let mut authn = authenticator();
+    assert_eq!(h.setup(&mut authn, "alice").await.status, 200);
+    assert_eq!(h.login_at(&mut authn, "alice", ORIGIN).await.status, 200);
+
+    let (ceremony, options) = h.login_start("alice").await;
+    let credential = authn
+        .do_authentication(
+            Url::parse(ORIGIN).unwrap(),
+            serde_json::from_value(options).unwrap(),
+        )
+        .unwrap();
+    sqlx::query(
+        "UPDATE passkeys SET public_key = convert_to(jsonb_set(convert_from(public_key, 'UTF8')::jsonb, '{cred,counter}', '1000')::text, 'UTF8')",
+    )
+    .execute(&h.pool)
+    .await
+    .unwrap();
+    let before = count(&h.pool, "SELECT count(*) FROM web_sessions").await;
+    let refused = h
+        .post(
+            "/passkey/login/finish",
+            &[],
+            &json!({ "ceremony": ceremony, "credential": credential }),
+        )
+        .await;
+    assert_eq!(refused.status, 400, "{}", refused.body);
+    assert!(refused.cookie().is_none());
+    assert_eq!(
+        count(&h.pool, "SELECT count(*) FROM web_sessions").await,
+        before
+    );
+    h.finish().await;
+}
+
+#[sqlx::test]
+async fn a_login_purges_expired_and_idle_sessions(pool: PgPool) {
+    let h = Harness::start(pool).await;
+    let mut authn = authenticator();
+    assert_eq!(h.setup(&mut authn, "alice").await.status, 200);
+    sqlx::query("UPDATE web_sessions SET last_seen = now() - interval '31 minutes'")
+        .execute(&h.pool)
+        .await
+        .unwrap();
+    assert_eq!(h.login_at(&mut authn, "alice", ORIGIN).await.status, 200);
+    assert_eq!(count(&h.pool, "SELECT count(*) FROM web_sessions").await, 1);
+    sqlx::query("UPDATE web_sessions SET expires_at = now() - interval '1 second'")
+        .execute(&h.pool)
+        .await
+        .unwrap();
+    assert_eq!(h.login_at(&mut authn, "alice", ORIGIN).await.status, 200);
+    assert_eq!(count(&h.pool, "SELECT count(*) FROM web_sessions").await, 1);
     h.finish().await;
 }
