@@ -57,6 +57,10 @@ spec:
                   name: fleet-server-secrets
                   key: FLEET_CLIENT_TOKEN
                   optional: true
+            - name: FLEET_WEB_RP_ID
+              value: fleet.example.com
+            - name: FLEET_WEB_ORIGIN
+              value: https://fleet.example.com
             - name: FLEET_MASTER_KEY_FILE
               value: /etc/fleet/master-key/keyring
           volumeMounts:

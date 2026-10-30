@@ -10,7 +10,7 @@ failures=0
 fresh() {
   d="$scratch/$1"
   mkdir -p "$d"
-  cp "$here/kustomization.yaml" "$here/deployment.yaml" "$here/service.yaml" "$here/master-key-generator.yaml" "$here/master-key-externalsecret.yaml" "$d/"
+  cp "$here/kustomization.yaml" "$here/deployment.yaml" "$here/service.yaml" "$here/master-key-generator.yaml" "$here/master-key-externalsecret.yaml" "$here/httproute.yaml" "$d/"
   printf '%s\n' "$d"
 }
 
