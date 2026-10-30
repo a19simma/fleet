@@ -11,7 +11,7 @@ Credentials and the web UI make Fleet multi-user. The shared client token cannot
 - A **User** has a username and one or more passkeys. Login is local username plus passkey through webauthn-rs 0.5.5 (ADR-0041). No passwords. No external identity provider in v1.
 - A browser session is a server-side row. The cookie holds an opaque random id only. The session table arrives with the `jobs.user_id` migration (CRED-11).
 - The cookie uses the `__Host-` prefix: `Secure`, `Path=/`, no `Domain`, plus `HttpOnly` and `SameSite=Strict`.
-- A session expires after 12 hours absolute or 30 minutes without use, whichever comes first. A login deletes the session the browser presented and creates a new one in the same transaction as the counter update, so the id rotates on every login. Logout deletes the row.
+- A session expires after 12 hours absolute or 30 minutes without use, whichever comes first. The idle window slides: each request that resolves the session renews `last_seen`, so a session in steady use lives until the 12 hour limit. The id rotates at login only: a login deletes the session the browser presented and creates a new one in the same transaction as the counter update. A session keeps its id between logins. Logout deletes the row.
 - Every state-changing route behind a session carries a CSRF token tied to the session, checked on the server. The Origin check on every POST route, including the pre-session passkey routes that have no token yet, stays on as a second guard and answers 403 for a foreign Origin.
 
 ### Bootstrap admin
@@ -39,6 +39,7 @@ On first start with no users, the server logs a one-time setup URL containing a 
 - The server holds session state, so a session survives a restart and can be revoked.
 - Accepted risk (SEC-002): `login/start` answers 400 for an unknown username and a challenge for a known one, so an attacker can enumerate usernames. A decoy challenge needs a fake passkey credential per name and is not built. Usernames are not secret in a small private deployment, and a guess still needs a passkey to proceed.
 - Login rate limiting is not part of this ADR. It is later work, and passkeys reduce but do not remove the need.
+- The SEC-002 acceptance has no expiry. Revisit it together with login rate limiting.
 
 ## Considered and rejected
 

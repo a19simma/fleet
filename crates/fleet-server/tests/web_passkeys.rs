@@ -757,7 +757,17 @@ async fn every_session_route_refuses_a_missing_csrf_token(pool: PgPool) {
     let empty = h
         .send("POST", "/logout", &[("Cookie", &cookie), FORM], b"")
         .await;
-    assert!(empty.status == 403 || empty.status == 400, "{}", empty.head);
+    assert_eq!(empty.status, 403, "{}", empty.head);
+    assert_eq!(count(&h.pool, "SELECT count(*) FROM web_sessions").await, 1);
+    let wrong = h
+        .send(
+            "POST",
+            "/logout",
+            &[("Cookie", &cookie), FORM],
+            b"csrf=nope",
+        )
+        .await;
+    assert_eq!(wrong.status, 403, "{}", wrong.head);
     assert_eq!(count(&h.pool, "SELECT count(*) FROM web_sessions").await, 1);
     let ok = h
         .post(
@@ -804,6 +814,65 @@ async fn a_counter_that_moved_during_the_ceremony_is_refused(pool: PgPool) {
         count(&h.pool, "SELECT count(*) FROM web_sessions").await,
         before
     );
+    h.finish().await;
+}
+
+#[sqlx::test]
+async fn an_equal_non_zero_counter_is_refused(pool: PgPool) {
+    let h = Harness::start(pool).await;
+    let mut authn = authenticator();
+    assert_eq!(h.setup(&mut authn, "alice").await.status, 200);
+    assert_eq!(h.login_at(&mut authn, "alice", ORIGIN).await.status, 200);
+
+    let (ceremony, options) = h.login_start("alice").await;
+    let credential = authn
+        .do_authentication(
+            Url::parse(ORIGIN).unwrap(),
+            serde_json::from_value(options).unwrap(),
+        )
+        .unwrap();
+    let presented: i64 = {
+        let stored: i64 = sqlx::query_scalar(
+            "SELECT (convert_from(public_key, 'UTF8')::jsonb #>> '{cred,counter}')::bigint FROM passkeys",
+        )
+        .fetch_one(&h.pool)
+        .await
+        .unwrap();
+        stored + 1
+    };
+    sqlx::query(
+        "UPDATE passkeys SET public_key = convert_to(jsonb_set(convert_from(public_key, 'UTF8')::jsonb, '{cred,counter}', to_jsonb($1::bigint))::text, 'UTF8')",
+    )
+    .bind(presented)
+    .execute(&h.pool)
+    .await
+    .unwrap();
+    assert!(presented > 0);
+    let refused = h
+        .post(
+            "/passkey/login/finish",
+            &[],
+            &json!({ "ceremony": ceremony, "credential": credential }),
+        )
+        .await;
+    assert_eq!(refused.status, 400, "{}", refused.body);
+    assert!(refused.cookie().is_none());
+    h.finish().await;
+}
+
+#[sqlx::test]
+async fn a_login_keeps_sessions_inside_both_windows(pool: PgPool) {
+    let h = Harness::start(pool).await;
+    let mut authn = authenticator();
+    assert_eq!(h.setup(&mut authn, "alice").await.status, 200);
+    sqlx::query(
+        "UPDATE web_sessions SET last_seen = now() - interval '29 minutes', expires_at = now() + interval '1 minute'",
+    )
+    .execute(&h.pool)
+    .await
+    .unwrap();
+    assert_eq!(h.login_at(&mut authn, "alice", ORIGIN).await.status, 200);
+    assert_eq!(count(&h.pool, "SELECT count(*) FROM web_sessions").await, 2);
     h.finish().await;
 }
 

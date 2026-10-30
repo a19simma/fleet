@@ -454,7 +454,7 @@ impl WebAuth {
             let mut key: Passkey = serde_json::from_slice(&blob)?;
             if key.cred_id() == result.cred_id() {
                 let stored = stored_counter(&blob)?;
-                if (result.counter() > 0 || stored > 0) && result.counter() <= stored {
+                if counter_regressed(result.counter(), stored) {
                     return Err(AuthError::Refused);
                 }
             }
@@ -543,6 +543,12 @@ impl WebAuth {
     }
 }
 
+/// Whether an assertion counter fails to advance past the stored one. An authenticator that
+/// always reports zero never advances, so a zero beside a zero is allowed.
+fn counter_regressed(presented: u32, stored: u32) -> bool {
+    (presented > 0 || stored > 0) && presented <= stored
+}
+
 fn stored_counter(blob: &[u8]) -> Result<u32, AuthError> {
     let value: serde_json::Value = serde_json::from_slice(blob)?;
     Ok(value
@@ -582,6 +588,30 @@ async fn insert_session(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn an_equal_non_zero_counter_regressed() {
+        assert!(counter_regressed(7, 7));
+        assert!(counter_regressed(1, 1));
+    }
+
+    #[test]
+    fn a_lower_counter_regressed() {
+        assert!(counter_regressed(6, 7));
+        assert!(counter_regressed(0, 7));
+    }
+
+    #[test]
+    fn a_higher_counter_advanced() {
+        assert!(!counter_regressed(8, 7));
+        assert!(!counter_regressed(1, 0));
+    }
+
+    #[test]
+    fn a_zero_counter_authenticator_may_log_in_repeatedly() {
+        assert!(!counter_regressed(0, 0));
+        assert!(!counter_regressed(0, 0));
+    }
 
     fn auth(pool: &PgPool, users: &Users) -> WebAuth {
         WebAuth::new(
