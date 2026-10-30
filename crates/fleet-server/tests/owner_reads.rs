@@ -8,9 +8,11 @@
 use fleet_proto::v1::fleet_batches_server::FleetBatches;
 use fleet_proto::v1::fleet_jobs_server::FleetJobs;
 use fleet_proto::v1::fleet_judge_server::FleetJudge;
+use fleet_proto::v1::fleet_query_server::FleetQuery;
 use fleet_proto::v1::{
-    GetBatchRequest, GetJobRequest, ListJobsRequest, ReadJobEventsRequest, ReadTranscriptRequest,
-    SubmitBatchRequest, SubmitJobRequest, SubmitJudgeRequest,
+    CancelJobRequest, GetBatchRequest, GetJobRequest, GetStatsRequest, JobState, ListFleetRequest,
+    ListJobsRequest, ReadJobEventsRequest, ReadTranscriptRequest, StatsGroupBy, SubmitBatchRequest,
+    SubmitJobRequest, SubmitJudgeRequest,
 };
 use fleet_server::auth::Caller;
 use fleet_server::service::FleetService;
@@ -297,4 +299,295 @@ async fn a_batch_lists_only_the_callers_jobs(pool: PgPool) {
     assert_eq!(alice.jobs.len(), 1);
     assert_eq!(bob.jobs.len(), 1);
     assert_ne!(alice.jobs[0].job_id, bob.jobs[0].job_id);
+}
+
+async fn seed_stats(w: &World, pool: &PgPool) -> String {
+    sqlx::query("UPDATE jobs SET box = 'box-a', state = 'SUCCEEDED' WHERE job_id = $1")
+        .bind(&w.job)
+        .execute(pool)
+        .await
+        .unwrap();
+    sqlx::query(
+        "INSERT INTO job_summary (job_id, cost_est_usd, complete, missing) \
+         VALUES ($1, 12.5, true, '{}')",
+    )
+    .bind(&w.job)
+    .execute(pool)
+    .await
+    .unwrap();
+    "box-a".to_owned()
+}
+
+fn stats_request(
+    group_by: StatsGroupBy,
+    repo: Option<&str>,
+    box_name: Option<&str>,
+) -> GetStatsRequest {
+    GetStatsRequest {
+        since: None,
+        until: None,
+        repo: repo.map(str::to_owned),
+        r#box: box_name.map(str::to_owned),
+        group_by: group_by.into(),
+    }
+}
+
+const GROUPINGS: [StatsGroupBy; 8] = [
+    StatsGroupBy::None,
+    StatsGroupBy::Repo,
+    StatsGroupBy::Box,
+    StatsGroupBy::State,
+    StatsGroupBy::Day,
+    StatsGroupBy::BundleSha,
+    StatsGroupBy::ClaudeVersion,
+    StatsGroupBy::Model,
+];
+
+#[sqlx::test]
+async fn get_stats_aggregates_only_the_callers_jobs(pool: PgPool) {
+    let w = world(pool.clone()).await;
+    let box_name = seed_stats(&w, &pool).await;
+    for group in GROUPINGS {
+        let mine = w
+            .svc
+            .get_stats(as_user(w.alice, stats_request(group, None, None)))
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(
+            mine.groups.iter().map(|g| g.jobs).sum::<u64>(),
+            2,
+            "{group:?}"
+        );
+        let theirs = w
+            .svc
+            .get_stats(as_user(w.bob, stats_request(group, None, None)))
+            .await
+            .unwrap()
+            .into_inner();
+        assert!(theirs.groups.is_empty(), "{group:?} {theirs:?}");
+        let probe = w
+            .svc
+            .get_stats(as_user(
+                w.bob,
+                stats_request(group, Some(REPO), Some(&box_name)),
+            ))
+            .await
+            .unwrap()
+            .into_inner();
+        assert!(probe.groups.is_empty(), "{group:?} {probe:?}");
+        let repo_probe = w
+            .svc
+            .get_stats(as_user(w.bob, stats_request(group, Some(REPO), None)))
+            .await
+            .unwrap()
+            .into_inner();
+        assert!(repo_probe.groups.is_empty(), "{group:?}");
+        let box_probe = w
+            .svc
+            .get_stats(as_user(w.bob, stats_request(group, None, Some(&box_name))))
+            .await
+            .unwrap()
+            .into_inner();
+        assert!(box_probe.groups.is_empty(), "{group:?}");
+    }
+    let all = w
+        .svc
+        .get_stats(Request::new(stats_request(StatsGroupBy::Repo, None, None)))
+        .await
+        .unwrap()
+        .into_inner();
+    let cost = all.groups[0].cost_est_usd.as_ref().unwrap().sum;
+    assert!((cost - 12.5).abs() < f64::EPSILON);
+    let bob_cost = w
+        .svc
+        .get_stats(as_user(
+            w.bob,
+            stats_request(StatsGroupBy::Repo, None, None),
+        ))
+        .await
+        .unwrap()
+        .into_inner();
+    assert!(bob_cost.groups.iter().all(|g| g.cost_est_usd.is_none()));
+}
+
+#[sqlx::test]
+async fn cancel_job_is_owner_only(pool: PgPool) {
+    let w = world(pool).await;
+    let queued = w
+        .svc
+        .submit_job(as_user(w.alice, job_request("alice-queued")))
+        .await
+        .unwrap()
+        .into_inner();
+    let cancel = |u: i64, id: &str| {
+        as_user(
+            u,
+            CancelJobRequest {
+                job_id: id.to_owned(),
+            },
+        )
+    };
+    let other = w
+        .svc
+        .cancel_job(cancel(w.bob, &queued.job_id))
+        .await
+        .unwrap_err();
+    let unknown = w.svc.cancel_job(cancel(w.bob, UNKNOWN)).await.unwrap_err();
+    assert_hidden(&other, "job not found");
+    assert_hidden(&unknown, "job not found");
+    let kept = w
+        .svc
+        .get_job(as_user(
+            w.alice,
+            GetJobRequest {
+                job_id: queued.job_id.clone(),
+            },
+        ))
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(kept.state, JobState::Queued as i32);
+    let own = w
+        .svc
+        .cancel_job(cancel(w.alice, &queued.job_id))
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(own.state, JobState::Cancelled as i32);
+}
+
+#[sqlx::test]
+async fn list_fleet_blanks_session_text_for_other_users(pool: PgPool) {
+    let w = world(pool.clone()).await;
+    sqlx::query(
+        "INSERT INTO boxes (box, hostname, machine_id, boot_id) VALUES ('box-a', 'h', 'm', 'b')",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO sessions (box, session_id, state, state_at, workdir, last_prompt, \
+         last_message, last_event_at, last_event_kind, state_event_at) \
+         VALUES ('box-a', 's1', 'idle', now(), '/work/secret', 'private prompt', \
+         'private reply', now(), 'stop', now())",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+    let bootstrap: i64 = sqlx::query_scalar("SELECT bootstrap_user_id()")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    let list = |request: Request<ListFleetRequest>| {
+        let svc = w.svc.clone();
+        async move { svc.list_fleet(request).await.unwrap().into_inner().boxes }
+    };
+    let session = |boxes: Vec<fleet_proto::v1::BoxView>| {
+        assert_eq!(boxes.len(), 1);
+        let mut sessions = boxes.into_iter().next().unwrap().sessions;
+        assert_eq!(sessions.len(), 1);
+        sessions.remove(0)
+    };
+    let legacy = session(list(Request::new(ListFleetRequest::default())).await);
+    assert_eq!(legacy.last_prompt.as_deref(), Some("private prompt"));
+    assert_eq!(legacy.last_message.as_deref(), Some("private reply"));
+    assert_eq!(legacy.workdir.as_deref(), Some("/work/secret"));
+    let admin = session(list(as_user(bootstrap, ListFleetRequest::default())).await);
+    assert_eq!(admin.last_prompt.as_deref(), Some("private prompt"));
+    assert_eq!(admin.workdir.as_deref(), Some("/work/secret"));
+    let bob = session(list(as_user(w.bob, ListFleetRequest::default())).await);
+    assert_eq!(bob.session_id, "s1");
+    assert_eq!(bob.last_prompt, None);
+    assert_eq!(bob.last_message, None);
+    assert_eq!(bob.workdir, None);
+}
+
+const CLASSIFIED: &[(&str, &str)] = &[
+    ("FleetIngest", "PushEvents:box-only"),
+    ("FleetIngest", "Heartbeat:box-only"),
+    ("FleetQuery", "ListFleet:scoped-redacted"),
+    ("FleetJobs", "SubmitJob:scoped"),
+    ("FleetJobs", "GetJob:scoped"),
+    ("FleetJobs", "ListJobs:scoped"),
+    ("FleetJobs", "CancelJob:scoped"),
+    ("FleetJobs", "ReadTranscript:scoped"),
+    ("FleetJobs", "ReadJobEvents:scoped"),
+    ("FleetJobs", "GetStats:scoped"),
+    ("FleetProfiles", "CreateProfile:global"),
+    ("FleetProfiles", "GetProfile:global"),
+    ("FleetProfiles", "ListProfiles:global"),
+    ("FleetJudge", "SubmitJudge:scoped"),
+    ("FleetBatches", "SubmitBatch:scoped"),
+    ("FleetBatches", "GetBatch:scoped"),
+    ("FleetCredentials", "PutCredential:scoped"),
+    ("FleetCredentials", "ListCredentials:scoped"),
+    ("FleetCredentials", "DeleteCredential:scoped"),
+    ("FleetCredentials", "VerifyCredential:scoped"),
+    ("FleetWorker", "ClaimJob:box-only"),
+    ("FleetWorker", "ReportJob:box-only"),
+    ("FleetWorker", "GetProfileBlob:box-only"),
+    ("FleetWorker", "GetJobTranscript:box-only"),
+    ("FleetWorker", "GetJobCredentials:box-only"),
+];
+
+#[test]
+fn every_rpc_in_the_proto_is_classified() {
+    let proto = include_str!("../../fleet-proto/proto/fleet/v1/fleet.proto");
+    let mut found = Vec::new();
+    let mut service = "";
+    for line in proto.lines().map(str::trim) {
+        if let Some(rest) = line.strip_prefix("service ") {
+            service = rest.trim_end_matches('{').trim();
+        } else if let Some(rest) = line.strip_prefix("rpc ") {
+            let name = rest.split('(').next().unwrap().trim();
+            found.push((service.to_owned(), name.to_owned()));
+        }
+    }
+    let mut listed: Vec<(String, String)> = CLASSIFIED
+        .iter()
+        .map(|(s, entry)| ((*s).to_owned(), entry.split(':').next().unwrap().to_owned()))
+        .collect();
+    found.sort();
+    listed.sort();
+    assert_eq!(
+        found, listed,
+        "classify new RPCs in CLASSIFIED and ADR-0042"
+    );
+}
+
+#[sqlx::test]
+async fn get_stats_stuck_split_excludes_other_users(pool: PgPool) {
+    let w = world(pool.clone()).await;
+    seed_stats(&w, &pool).await;
+    let theirs = w
+        .svc
+        .submit_job(as_user(w.bob, job_request("bob-job")))
+        .await
+        .unwrap()
+        .into_inner();
+    sqlx::query(
+        "INSERT INTO job_summary (job_id, complete, missing, stuck_rule) \
+         VALUES ($1, true, '{}', 'monologue')",
+    )
+    .bind(&theirs.job_id)
+    .execute(&pool)
+    .await
+    .unwrap();
+    let mine = w
+        .svc
+        .get_stats(as_user(
+            w.alice,
+            stats_request(StatsGroupBy::None, None, None),
+        ))
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(mine.groups.len(), 1);
+    assert!(
+        mine.groups[0].stuck_rules.is_empty(),
+        "{:?}",
+        mine.groups[0]
+    );
+    assert_eq!(mine.groups[0].stuck_jobs, 0);
 }

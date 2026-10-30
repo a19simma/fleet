@@ -29,6 +29,12 @@ On first start with no users, the server logs a one-time setup URL containing a 
 - `jobs.user_id` records the owner. Jobs are owner-only for now: a User lists, reads and cancels only their own. Sharing comes later.
 - `credentials.user_id` (ADR-0040) follows the same rule.
 
+### Read scope
+
+Every read and cancel on jobs is scoped to the caller: `GetJob`, `ListJobs`, `CancelJob`, `ReadTranscript`, `ReadJobEvents`, `GetBatch`, the judge target and `GetStats`. Another user's job, batch or transcript answers `NOT_FOUND` with the same message as an unknown id, and a cancel by a non-owner leaves the job untouched. `GetStats` counts only the caller's jobs in every group and under every repo or box filter. `GetBatch` shows the batch row to the owner of any member job and lists only the jobs that user owns. The box token carries no user and reads everything, because the box services need to.
+
+Boxes and sessions have no user owner. `ListFleet` therefore returns every box to every client caller. The bootstrap user and a caller with no user (the box token, the legacy path) see each session in full. Any other user token gets each session with `last_prompt`, `last_message` and `workdir` blanked, because those fields carry other people's prompts and paths. A real owner for boxes and sessions would replace this rule.
+
 ### Transition
 
 `FLEET_CLIENT_TOKEN` stays accepted for the existing CLI during transition. A Job submitted with it has no owner and is visible only to the admin. The shared token is removed in a later ADR once the CLI uses API tokens. `FLEET_TOKEN` (box scope, ADR-0023) is unchanged.

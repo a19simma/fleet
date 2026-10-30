@@ -45,7 +45,8 @@ WITH scoped AS ( \
     FROM jobs j LEFT JOIN job_summary s ON s.job_id = j.job_id \
     LEFT JOIN LATERAL (SELECT avg(score)::double precision AS score FROM job_verdict \
         WHERE target_job_id = j.job_id) v ON true \
-    WHERE j.kind = 'agent' AND j.created_at >= to_timestamp($1::bigint::double precision) \
+    WHERE j.kind = 'agent' AND ($6::bigint IS NULL OR j.user_id = $6) \
+        AND j.created_at >= to_timestamp($1::bigint::double precision) \
         AND j.created_at < to_timestamp($2::bigint::double precision) \
         AND ($3::text IS NULL OR j.repo = $3) \
         AND ($4::text IS NULL OR j.box = $4)) \
@@ -58,8 +59,8 @@ const STATS: &str = concat!(
     "\
 SELECT grp, grp IS NULL AS unknown, count(*) AS jobs, \
     count(*) FILTER (WHERE state = 'SUCCEEDED') AS succeeded, \
-    count(*) FILTER (WHERE state = 'FAILED' AND error IS DISTINCT FROM $6) AS failed, \
-    count(*) FILTER (WHERE state = 'FAILED' AND error = $6) AS timed_out, \
+    count(*) FILTER (WHERE state = 'FAILED' AND error IS DISTINCT FROM $7) AS failed, \
+    count(*) FILTER (WHERE state = 'FAILED' AND error = $7) AS timed_out, \
     count(*) FILTER (WHERE state = 'CANCELLED') AS cancelled, \
     count(*) FILTER (WHERE state = 'LOST') AS lost, \
     count(*) FILTER (WHERE state NOT IN ('SUCCEEDED', 'FAILED', 'CANCELLED', 'LOST')) AS other, \
@@ -126,7 +127,7 @@ SELECT grp, grp IS NULL AS unknown, count(*) AS jobs, \
     count(api_retries) AS api_retries_n, sum(api_retries)::bigint AS api_retries_sum \
 FROM scoped GROUP BY grp \
 ORDER BY CASE WHEN $5::text = 'day' THEN 0 ELSE -count(*) END, grp \
-LIMIT $7"
+LIMIT $8"
 );
 
 const STUCK_STATS: &str = concat!(
@@ -320,7 +321,10 @@ fn group(row: &PgRow) -> Result<StatsGroup, StoreError> {
     })
 }
 
-/// Validates `request` and runs the aggregate.
+/// Validates `request` and runs the aggregate over the jobs `owner` may read.
+///
+/// `Some(user)` adds the owner predicate to the scoped set, so every group, filter and
+/// stuck-rule split sees only that user's jobs. `None` reads every job.
 ///
 /// A second query over the same scope splits the jobs with a summary by stuck rule. Each
 /// rule's jobs carry their outcome split, and jobs with a summary and no rule form `clean`.
@@ -338,6 +342,7 @@ fn group(row: &PgRow) -> Result<StatsGroup, StoreError> {
 /// [`StoreError::Database`] when the query fails.
 pub(crate) async fn stats(
     pool: &PgPool,
+    owner: Option<i64>,
     request: &GetStatsRequest,
 ) -> Result<GetStatsReply, StoreError> {
     let now: i64 = sqlx::query_scalar(NOW_SECONDS).fetch_one(pool).await?;
@@ -349,6 +354,7 @@ pub(crate) async fn stats(
         .bind(plan.repo)
         .bind(plan.box_name)
         .bind(plan.group)
+        .bind(owner)
         .bind(TIMED_OUT_ERROR)
         .bind(limit)
         .fetch_all(pool)
@@ -365,6 +371,7 @@ pub(crate) async fn stats(
         .bind(plan.repo)
         .bind(plan.box_name)
         .bind(plan.group)
+        .bind(owner)
         .fetch_all(pool)
         .await?;
     attach_stuck(&mut groups, &stuck_rows)?;

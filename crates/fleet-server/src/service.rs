@@ -198,10 +198,11 @@ impl FleetQuery for FleetService {
         &self,
         request: Request<ListFleetRequest>,
     ) -> Result<Response<ListFleetReply>, Status> {
+        let owner = caller_of(&request);
         let only = request.into_inner().r#box;
         let (as_of_ms, boxes) = self
             .store
-            .list_fleet(only.as_deref())
+            .list_fleet_for(owner, only.as_deref())
             .await
             .map_err(|err| storage_unavailable(&err))?;
         Ok(Response::new(ListFleetReply { as_of_ms, boxes }))
@@ -507,9 +508,10 @@ impl FleetJobs for FleetService {
         &self,
         request: Request<CancelJobRequest>,
     ) -> Result<Response<Job>, Status> {
+        let owner = caller_of(&request);
         let job = self
             .store
-            .cancel_job(&request.into_inner().job_id)
+            .cancel_job_for(owner, &request.into_inner().job_id)
             .await
             .map_err(|err| jobs_error(&err))?;
         Ok(Response::new(job))
@@ -547,9 +549,10 @@ impl FleetJobs for FleetService {
         &self,
         request: Request<GetStatsRequest>,
     ) -> Result<Response<GetStatsReply>, Status> {
+        let owner = caller_of(&request);
         let reply = self
             .store
-            .stats(&request.into_inner())
+            .stats_for(owner, &request.into_inner())
             .await
             .map_err(|err| jobs_error(&err))?;
         Ok(Response::new(reply))

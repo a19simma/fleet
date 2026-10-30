@@ -216,7 +216,7 @@ const CANCEL_JOB: &str = concat!(
 state = CASE WHEN state = 'QUEUED' THEN 'CANCELLED' ELSE state END, \
 finished_at = CASE WHEN state = 'QUEUED' THEN now() ELSE finished_at END, \
 cancel_requested = cancel_requested OR state = 'RUNNING' \
-WHERE job_id = $1 \
+WHERE job_id = $1 AND ($2::bigint IS NULL OR user_id = $2) \
 RETURNING ",
     job_columns!()
 );
@@ -1044,7 +1044,10 @@ impl Store {
         row.as_ref().map(job_from_row).transpose()
     }
 
-    /// Returns the job with `job_id`.
+    /// Returns the job with `job_id` with no owner check.
+    ///
+    /// This is [`Store::get_job_for`] with `None`, the box token and legacy view that reads any
+    /// job. A handler that acts for a user calls [`Store::get_job_for`] with that user.
     ///
     /// # Errors
     ///
@@ -1263,7 +1266,24 @@ impl Store {
     /// Returns [`StoreError::InvalidJob`] when the window, a filter or the grouping fails
     /// validation, and [`StoreError::Database`] when the query fails.
     pub async fn stats(&self, request: &GetStatsRequest) -> Result<GetStatsReply, StoreError> {
-        stats::stats(&self.pool, request).await
+        self.stats_for(None, request).await
+    }
+
+    /// Aggregates like [`Store::stats`] over the jobs `owner` may read.
+    ///
+    /// `Some(user)` counts only that user's jobs in every group and under every filter, so a
+    /// repo or box filter cannot probe another user's jobs. `None` is the box token and legacy
+    /// view and counts every job.
+    ///
+    /// # Errors
+    ///
+    /// The errors of [`Store::stats`].
+    pub async fn stats_for(
+        &self,
+        owner: Option<i64>,
+        request: &GetStatsRequest,
+    ) -> Result<GetStatsReply, StoreError> {
+        stats::stats(&self.pool, owner, request).await
     }
 
     /// Stores a profile under `name` and returns its version.
@@ -1373,10 +1393,11 @@ impl Store {
         self.get_batch_for(None, batch_id).await
     }
 
-    /// Returns a batch like [`Store::get_batch`] when `owner` owns its jobs.
+    /// Returns a batch like [`Store::get_batch`] when `owner` owns any of its jobs.
     ///
-    /// A batch with none of `owner`'s jobs is [`StoreError::NotFound`], the same as an unknown
-    /// id. `None` reads any batch.
+    /// The batch row shows to the owner of any member job, and the reply lists only the jobs
+    /// `owner` owns. A batch with none of `owner`'s jobs is [`StoreError::NotFound`], the same
+    /// as an unknown id. `None` reads any batch.
     ///
     /// # Errors
     ///
@@ -1488,9 +1509,27 @@ impl Store {
     /// [`StoreError::NotFound`] when no job has it, and [`StoreError::Database`] when the
     /// statement fails.
     pub async fn cancel_job(&self, job_id: &str) -> Result<Job, StoreError> {
+        self.cancel_job_for(None, job_id).await
+    }
+
+    /// Cancels a job like [`Store::cancel_job`] when `owner` may cancel it.
+    ///
+    /// `Some(user)` matches only that user's jobs. Another user's job is
+    /// [`StoreError::NotFound`], the same as an unknown id, and stays untouched. `None` is the
+    /// box token and legacy view and matches any job.
+    ///
+    /// # Errors
+    ///
+    /// The errors of [`Store::cancel_job`].
+    pub async fn cancel_job_for(
+        &self,
+        owner: Option<i64>,
+        job_id: &str,
+    ) -> Result<Job, StoreError> {
         validate_job_id(job_id)?;
         let row = sqlx::query(CANCEL_JOB)
             .bind(job_id)
+            .bind(owner)
             .fetch_optional(&self.pool)
             .await?
             .ok_or(StoreError::NotFound)?;
@@ -1742,6 +1781,32 @@ impl Store {
     ///
     /// Returns [`StoreError::Database`] when a query fails.
     pub async fn list_fleet(&self, only: Option<&str>) -> Result<(u64, Vec<BoxView>), StoreError> {
+        self.list_fleet_for(None, only).await
+    }
+
+    /// Lists boxes like [`Store::list_fleet`] for `owner`.
+    ///
+    /// Boxes and sessions have no user owner. `None` and the bootstrap user see every field.
+    /// Any other user gets each session with `last_prompt`, `last_message` and `workdir`
+    /// cleared, because those carry the text of other people's work.
+    ///
+    /// # Errors
+    ///
+    /// The errors of [`Store::list_fleet`].
+    pub async fn list_fleet_for(
+        &self,
+        owner: Option<i64>,
+        only: Option<&str>,
+    ) -> Result<(u64, Vec<BoxView>), StoreError> {
+        let redact = match owner {
+            Some(user) => {
+                let bootstrap: i64 = sqlx::query_scalar(SELECT_BOOTSTRAP_USER)
+                    .fetch_one(&self.pool)
+                    .await?;
+                user != bootstrap
+            }
+            None => false,
+        };
         let mut tx = self.begin_read().await?;
         let as_of_ms = count(
             sqlx::query_scalar::<_, i64>(NOW_MS)
@@ -1776,7 +1841,14 @@ impl Store {
         for row in &box_rows {
             let name: String = row.try_get("box")?;
             let status: String = row.try_get("status")?;
-            let sessions = sessions.remove(&name).unwrap_or_default();
+            let mut sessions = sessions.remove(&name).unwrap_or_default();
+            if redact {
+                for session in &mut sessions {
+                    session.last_prompt = None;
+                    session.last_message = None;
+                    session.workdir = None;
+                }
+            }
             boxes.push(BoxView {
                 sessions,
                 ..box_view(row, name, &status, &mut bad_counts)?
