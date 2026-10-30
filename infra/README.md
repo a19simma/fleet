@@ -8,13 +8,16 @@ Kubernetes manifests for fleet-server. An Argo CD Application in the cluster ope
 - `service.yaml`: a ClusterIP Service for the gRPC port (7070) and the health port (7072).
 - `kustomization.yaml`: lists both and pins the image `ghcr.io/a19simma/fleet-server` to tag 0.2.1. That tag is a baseline floor.
 - `master-key-generator.yaml` and `master-key-externalsecret.yaml`: an external-secrets Password generator and an ExternalSecret that create Secret `fleet-master-key` once. See Master key.
+- `httproute.yaml`: HTTPRoute `fleet-server` on one host. It sends every path to Service port 7070 (pages under `/` and `/static/style.css`, gRPC under `/fleet.v1.`), sets `Strict-Transport-Security: max-age=31536000` on responses, and disables the route request timeout so gRPC streams survive. The host is the placeholder `fleet.example.com`.
+- `check-web-route.sh`: renders the kustomization and fails unless the HTTPRoute sets HSTS, targets port 7070, and `FLEET_WEB_RP_ID` and `FLEET_WEB_ORIGIN` equal the route host and `https://` plus the host.
+- `check-web-kind.sh`: creates a kind cluster, installs Envoy Gateway, creates a Gateway `fleet` with a self-signed HTTPS listener, applies `service.yaml` and `httproute.yaml` over a stand-in backend, then fetches the page over HTTP/2 and TLS, checks HSTS, and POSTs a gRPC call to `/fleet.v1.` and checks `grpc-status`. The stand-in is Caddy, not fleet-server: it proves gateway routing, TLS, h2c to the backend and the HSTS header, and does not prove the server's own handlers. Needs `kind`, `kubectl`, `helm`, `openssl` and network access. Set `ENVOY_GATEWAY_VERSION` to pin the chart.
 - `check-master-key-kind.sh`: creates a uniquely named kind cluster, installs external-secrets, applies both objects, and proves a restricted pod reads the key ring file, the mount is read-only, and the key survives a forced sync, a controller restart and an ExternalSecret recreate. It deletes only its own cluster. Needs `kind`, `kubectl`, `helm` and network access.
-- `check-kinds.sh`: renders the kustomization and fails on any kind outside Deployment, Service, ExternalSecret and Password, and on any container or initContainer in a Deployment that lacks requests for cpu, memory and ephemeral-storage or limits for memory and ephemeral-storage. A cpu limit is allowed but not required.
+- `check-kinds.sh`: renders the kustomization and fails on any kind outside Deployment, Service, ExternalSecret, Password and HTTPRoute, and on any container or initContainer in a Deployment that lacks requests for cpu, memory and ephemeral-storage or limits for memory and ephemeral-storage. A cpu limit is allowed but not required.
 - `test-check-kinds.sh`: proves the check rejects a Role, Namespace, Secret, non-ClusterIP Service, other namespace, `hostNetwork`, `hostPID`, `hostIPC`, `hostPath`, privileged containers and containers missing a cpu, memory or ephemeral-storage request or a memory or ephemeral-storage limit. It also proves a container with or without a cpu limit is accepted.
 
 ## Allowed kinds
 
-Deployment, Service, ExternalSecret and Password (the external-secrets generator), in namespace `fleet-server`. The Argo CD project that owns the Application allows nothing else, and CI runs `check-kinds.sh` so a change outside that set fails before merge. The check also rejects Service shapes `NodePort`, `LoadBalancer`, `ExternalName` and `externalIPs`.
+Deployment, Service, ExternalSecret, Password (the external-secrets generator) and HTTPRoute (`gateway.networking.k8s.io`), in namespace `fleet-server`. The Argo CD project that owns the Application allows nothing else, and CI runs `check-kinds.sh` so a change outside that set fails before merge. The check also rejects Service shapes `NodePort`, `LoadBalancer`, `ExternalName` and `externalIPs`.
 
 The check does not cover `runAsUser`, `capabilities.add` or `serviceAccountName`. Pod Security `restricted` and the operator cover those.
 
@@ -28,7 +31,9 @@ The operator owns everything this directory leaves out.
 - Optional CI retry: `FLEET_MAX_CI_RETRIES` (0 to 5, default 0, which turns it off). When a job's pull request CI fails, the server submits up to that many fix jobs on the same branch (ADR-0028). An invalid value stops startup.
 - The external-secrets operator runs in the cluster and the Argo CD project allows `ExternalSecret` (`external-secrets.io`) and `Password` (`generators.external-secrets.io`) in the namespace.
 - A Postgres 17 database and a role for the server exist, and `FLEET_DATABASE_URL` points at them.
-- The route and gateway that expose port 7070 belong to the operator. The route holds a private hostname, so it does not live in this repo.
+- A Gateway named `fleet` in namespace `fleet-server` with an HTTPS listener named `https` and its certificate exist. The Gateway belongs to the operator, and so does the Argo CD project permission for `HTTPRoute`.
+- The operator sets the real host in its own Application with a kustomize patch of `/spec/hostnames/0` on HTTPRoute `fleet-server`. The kustomization copies that value into `FLEET_WEB_RP_ID` (the bare host) and `FLEET_WEB_ORIGIN` (`https://` plus the host) after patches apply, so the three always match. The repo keeps only the placeholder host.
+- Header and idle timeouts for the shared HTTP/1.1 and h2c port (SEC-001) are not HTTPRoute fields. The operator sets them in the gateway implementation's policy, for example a client traffic policy with a client request header timeout and an idle timeout, and keeps them short enough to bound slow clients.
 
 ## Master key
 

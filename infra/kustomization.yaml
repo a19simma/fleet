@@ -5,6 +5,26 @@ resources:
   - service.yaml
   - master-key-generator.yaml
   - master-key-externalsecret.yaml
+  - httproute.yaml
+replacements:
+  - source:
+      kind: HTTPRoute
+      name: fleet-server
+      fieldPath: spec.hostnames.0
+    targets:
+      - select:
+          kind: Deployment
+          name: fleet-server
+        fieldPaths:
+          - spec.template.spec.containers.[name=fleet-server].env.[name=FLEET_WEB_RP_ID].value
+      - select:
+          kind: Deployment
+          name: fleet-server
+        fieldPaths:
+          - spec.template.spec.containers.[name=fleet-server].env.[name=FLEET_WEB_ORIGIN].value
+        options:
+          delimiter: "/"
+          index: 2
 images:
   - name: ghcr.io/a19simma/fleet-server
     newTag: 0.2.5
