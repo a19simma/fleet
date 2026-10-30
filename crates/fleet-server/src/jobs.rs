@@ -73,6 +73,8 @@ pub enum JobInvalid {
     Filter,
     /// The stats grouping is not a known value.
     GroupBy,
+    /// The agent is not a known runner.
+    Agent,
     /// A judge job names no valid, finished agent job as its target.
     Target,
     /// The verdict score, reason or model is out of range, or the report is not a
@@ -96,6 +98,7 @@ impl fmt::Display for JobInvalid {
             Self::Window => "invalid stats window",
             Self::Filter => "invalid stats filter",
             Self::GroupBy => "invalid stats grouping",
+            Self::Agent => "invalid agent",
             Self::Target => "invalid target job",
             Self::Verdict => "invalid verdict",
         })
@@ -112,6 +115,7 @@ pub struct NewJob {
     pub(crate) repo: String,
     pub(crate) base_ref: String,
     pub(crate) open_pr: bool,
+    pub(crate) agent: &'static str,
     pub(crate) target_job_id: Option<String>,
 }
 
@@ -236,8 +240,33 @@ pub fn validate_submit(request: &SubmitJobRequest) -> Result<NewJob, JobInvalid>
         repo: request.repo.clone(),
         base_ref: request.base_ref.clone(),
         open_pr: request.open_pr,
+        agent: DEFAULT_AGENT,
         target_job_id: None,
     })
+}
+
+/// The runner a job gets when it names none (ADR-0044).
+pub const DEFAULT_AGENT: &str = "claude";
+
+/// The runners a job may name (ADR-0044). Matches the `jobs.agent` check constraint.
+pub const KNOWN_AGENTS: [&str; 3] = [DEFAULT_AGENT, "codex", "kimi"];
+
+/// Resolves a job's agent name to a known runner.
+///
+/// The empty string means [`DEFAULT_AGENT`]. Any other value must equal a name in
+/// [`KNOWN_AGENTS`] exactly: no trimming and no case folding.
+///
+/// # Errors
+///
+/// Returns [`JobInvalid::Agent`], never carrying the value, for an unknown name.
+pub fn validate_agent(agent: &str) -> Result<&'static str, JobInvalid> {
+    if agent.is_empty() {
+        return Ok(DEFAULT_AGENT);
+    }
+    KNOWN_AGENTS
+        .into_iter()
+        .find(|known| *known == agent)
+        .ok_or(JobInvalid::Agent)
 }
 
 /// Validates a judge submit request: the key, the rubric prompt and the target job id.
@@ -263,6 +292,7 @@ pub fn validate_judge(request: &SubmitJudgeRequest) -> Result<NewJob, JobInvalid
         repo: String::new(),
         base_ref: String::new(),
         open_pr: false,
+        agent: DEFAULT_AGENT,
         target_job_id: Some(request.target_job_id.clone()),
     })
 }

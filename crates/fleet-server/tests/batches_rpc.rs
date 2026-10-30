@@ -631,3 +631,125 @@ async fn get_batch_refuses_unknown_bad_and_wrong_scope_without_echo(pool: PgPool
         .unwrap_err();
     assert_eq!(anon.code(), Code::Unauthenticated);
 }
+
+async fn user(pool: &PgPool, name: &str) -> i64 {
+    sqlx::query_scalar("INSERT INTO users (username) VALUES ($1) RETURNING id")
+        .bind(name)
+        .fetch_one(pool)
+        .await
+        .unwrap()
+}
+
+async fn drop_owner_default(pool: &PgPool) {
+    sqlx::query("ALTER TABLE jobs ALTER COLUMN user_id DROP DEFAULT")
+        .execute(pool)
+        .await
+        .unwrap();
+}
+
+async fn owners(pool: &PgPool, batch_id: &str) -> Vec<(i64, String)> {
+    sqlx::query_as("SELECT user_id, agent FROM jobs WHERE batch_id = $1 ORDER BY batch_pos")
+        .bind(batch_id)
+        .fetch_all(pool)
+        .await
+        .unwrap()
+}
+
+#[sqlx::test]
+async fn every_batch_job_records_the_owner_and_agent_explicitly(pool: PgPool) {
+    let store = store(pool.clone()).await;
+    drop_owner_default(&pool).await;
+    two_profiles(&store).await;
+    let alice = user(&pool, "alice").await;
+    let reply = store
+        .submit_batch_for(Some(alice), &request("k1", &["alpha", "beta"]))
+        .await
+        .unwrap();
+    let claude = || (alice, "claude".to_owned());
+    assert_eq!(
+        owners(&pool, &reply.batch_id).await,
+        vec![claude(), claude()]
+    );
+}
+
+#[sqlx::test]
+async fn the_legacy_batch_path_stamps_the_bootstrap_user(pool: PgPool) {
+    let store = store(pool.clone()).await;
+    drop_owner_default(&pool).await;
+    two_profiles(&store).await;
+    let reply = store
+        .submit_batch(&request("k1", &["alpha", "beta"]))
+        .await
+        .unwrap();
+    let boot: i64 = sqlx::query_scalar("SELECT id FROM users WHERE username = 'bootstrap'")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    let rows = owners(&pool, &reply.batch_id).await;
+    assert_eq!(rows.len(), 2);
+    assert!(rows.iter().all(|(id, _)| *id == boot));
+}
+
+#[sqlx::test]
+async fn a_batch_key_stored_for_another_owner_conflicts(pool: PgPool) {
+    let store = store(pool.clone()).await;
+    two_profiles(&store).await;
+    let alice = user(&pool, "alice").await;
+    let bob = user(&pool, "bob").await;
+    let first = store
+        .submit_batch_for(Some(alice), &request("k1", &["alpha", "beta"]))
+        .await
+        .unwrap();
+    let again = store
+        .submit_batch_for(Some(alice), &request("k1", &["alpha", "beta"]))
+        .await
+        .unwrap();
+    assert_eq!(first.batch_id, again.batch_id);
+    assert!(!again.created);
+    let other = store
+        .submit_batch_for(Some(bob), &request("k1", &["alpha", "beta"]))
+        .await;
+    assert!(matches!(
+        other,
+        Err(fleet_server::store::StoreError::KeyConflict)
+    ));
+    assert_eq!(count(&pool, "jobs").await, 2);
+}
+
+#[sqlx::test]
+async fn a_batch_agent_other_than_the_default_conflicts_on_resubmit(pool: PgPool) {
+    let store = store(pool.clone()).await;
+    two_profiles(&store).await;
+    let reply = store
+        .submit_batch(&request("k1", &["alpha", "beta"]))
+        .await
+        .unwrap();
+    sqlx::query("UPDATE jobs SET agent = 'codex' WHERE batch_id = $1 AND batch_pos = 1")
+        .bind(&reply.batch_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+    let again = store.submit_batch(&request("k1", &["alpha", "beta"])).await;
+    assert!(matches!(
+        again,
+        Err(fleet_server::store::StoreError::KeyConflict)
+    ));
+}
+
+#[sqlx::test]
+async fn a_client_token_batch_stamps_the_bootstrap_user_over_rpc(pool: PgPool) {
+    let store = store(pool.clone()).await;
+    two_profiles(&store).await;
+    let addr = serve(&store);
+    let reply = batches(addr, as_client)
+        .submit_batch(request("k1", &["alpha", "beta"]))
+        .await
+        .unwrap()
+        .into_inner();
+    let boot: i64 = sqlx::query_scalar("SELECT id FROM users WHERE username = 'bootstrap'")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    let rows = owners(&pool, &reply.batch_id).await;
+    assert!(rows.iter().all(|(id, _)| *id == boot));
+}

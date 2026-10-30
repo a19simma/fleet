@@ -32,7 +32,7 @@ use tonic::transport::server::{Router, TcpIncoming};
 use tonic::{Request, Response, Status};
 use tower::layer::util::{Identity, Stack};
 
-use crate::auth::BearerAuth;
+use crate::auth::{BearerAuth, Caller};
 use crate::store::{Store, StoreError};
 use crate::web::{Dispatch, Web};
 use fleet_proto::MAX_PROFILE_MESSAGE_BYTES;
@@ -335,6 +335,13 @@ impl FleetCredentials for FleetService {
     }
 }
 
+fn caller_of<T>(request: &Request<T>) -> Option<i64> {
+    request
+        .extensions()
+        .get::<Caller>()
+        .map(|caller| caller.user_id)
+}
+
 fn jobs_error(err: &StoreError) -> Status {
     match err {
         StoreError::KeyConflict => {
@@ -376,9 +383,10 @@ impl FleetBatches for FleetService {
         &self,
         request: Request<SubmitBatchRequest>,
     ) -> Result<Response<SubmitBatchReply>, Status> {
+        let owner = caller_of(&request);
         let reply = self
             .store
-            .submit_batch(&request.into_inner())
+            .submit_batch_for(owner, &request.into_inner())
             .await
             .map_err(|err| batches_error(&err))?;
         Ok(Response::new(reply))
@@ -445,9 +453,10 @@ impl FleetJudge for FleetService {
         &self,
         request: Request<SubmitJudgeRequest>,
     ) -> Result<Response<Job>, Status> {
+        let owner = caller_of(&request);
         let job = self
             .store
-            .submit_judge(&request.into_inner())
+            .submit_judge_for(owner, &request.into_inner())
             .await
             .map_err(|err| jobs_error(&err))?;
         Ok(Response::new(job))
@@ -460,9 +469,10 @@ impl FleetJobs for FleetService {
         &self,
         request: Request<SubmitJobRequest>,
     ) -> Result<Response<Job>, Status> {
+        let owner = caller_of(&request);
         let job = self
             .store
-            .submit_job(&request.into_inner())
+            .submit_job_for(owner, &request.into_inner())
             .await
             .map_err(|err| jobs_error(&err))?;
         Ok(Response::new(job))

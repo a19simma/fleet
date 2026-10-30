@@ -7,12 +7,14 @@ use std::time::Duration;
 
 use fleet_core::BoxName;
 use fleet_proto::v1::{
-    JobState, ReportJobReply, ReportJobRequest, SubmitJobRequest, TranscriptChunk,
+    JobState, ReportJobReply, ReportJobRequest, SubmitJobRequest, SubmitJudgeRequest,
+    TranscriptChunk,
 };
 use fleet_server::jobs::{
-    JobInvalid, MAX_BASE_REF_BYTES, MAX_BRANCH_BYTES, MAX_CHUNKS_PER_REPORT, MAX_ERROR_CHARS,
-    MAX_KEY_BYTES, MAX_PHASE_CHARS, MAX_PR_URL_BYTES, MAX_PROGRESS_CHARS, MAX_PROMPT_BYTES,
-    MAX_REPO_BYTES, MAX_TRANSCRIPT_BYTES, MAX_TRANSCRIPT_ROWS, MIN_CHUNK_COST_BYTES,
+    DEFAULT_AGENT, JobInvalid, MAX_BASE_REF_BYTES, MAX_BRANCH_BYTES, MAX_CHUNKS_PER_REPORT,
+    MAX_ERROR_CHARS, MAX_KEY_BYTES, MAX_PHASE_CHARS, MAX_PR_URL_BYTES, MAX_PROGRESS_CHARS,
+    MAX_PROMPT_BYTES, MAX_REPO_BYTES, MAX_TRANSCRIPT_BYTES, MAX_TRANSCRIPT_ROWS,
+    MIN_CHUNK_COST_BYTES, validate_agent,
 };
 use fleet_server::reaper::{MAX_BACKOFF, backoff_after, error_kind, run_reaper};
 use fleet_server::store::{Store, StoreError};
@@ -1122,4 +1124,125 @@ async fn a_failing_pass_logs_a_kind_and_the_loop_stops_on_request(pool: PgPool) 
     timeout(Duration::from_secs(5), async { tokio::join!(run, check) })
         .await
         .unwrap();
+}
+
+async fn user(pool: &PgPool, name: &str) -> i64 {
+    sqlx::query_scalar("INSERT INTO users (username) VALUES ($1) RETURNING id")
+        .bind(name)
+        .fetch_one(pool)
+        .await
+        .unwrap()
+}
+
+async fn drop_owner_default(pool: &PgPool) {
+    sqlx::query("ALTER TABLE jobs ALTER COLUMN user_id DROP DEFAULT")
+        .execute(pool)
+        .await
+        .unwrap();
+}
+
+#[sqlx::test]
+async fn a_submit_records_the_caller_and_a_claim_carries_it(pool: PgPool) {
+    let store = store(pool.clone()).await;
+    drop_owner_default(&pool).await;
+    let alice = user(&pool, "alice").await;
+    let submitted = store
+        .submit_job_for(Some(alice), &request("k1"))
+        .await
+        .unwrap();
+    assert_eq!(i64::try_from(submitted.user_id), Ok(alice));
+    assert_eq!(submitted.agent, DEFAULT_AGENT);
+    let claimed = store
+        .claim_job(&BoxName::new(&format!("box-{}", 1)).unwrap())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(i64::try_from(claimed.user_id), Ok(alice));
+    assert_eq!(claimed.agent, DEFAULT_AGENT);
+}
+
+#[sqlx::test]
+async fn the_legacy_path_stamps_the_bootstrap_user(pool: PgPool) {
+    let store = store(pool.clone()).await;
+    drop_owner_default(&pool).await;
+    let job = store.submit_job(&request("k1")).await.unwrap();
+    let boot: i64 = sqlx::query_scalar("SELECT id FROM users WHERE username = 'bootstrap'")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(i64::try_from(job.user_id), Ok(boot));
+}
+
+#[sqlx::test]
+async fn a_key_stored_for_another_owner_conflicts(pool: PgPool) {
+    let store = store(pool.clone()).await;
+    let alice = user(&pool, "alice").await;
+    let bob = user(&pool, "bob").await;
+    let first = store
+        .submit_job_for(Some(alice), &request("k1"))
+        .await
+        .unwrap();
+    let again = store
+        .submit_job_for(Some(alice), &request("k1"))
+        .await
+        .unwrap();
+    assert_eq!(first, again);
+    let other = store.submit_job_for(Some(bob), &request("k1")).await;
+    assert!(matches!(other, Err(StoreError::KeyConflict)));
+    assert_eq!(job_rows(&pool).await, 1);
+}
+
+#[sqlx::test]
+async fn a_judge_job_records_the_caller(pool: PgPool) {
+    let store = store(pool.clone()).await;
+    drop_owner_default(&pool).await;
+    let alice = user(&pool, "alice").await;
+    let box_name = BoxName::new(&format!("box-{}", 1)).unwrap();
+    store
+        .submit_job_for(Some(alice), &request("k1"))
+        .await
+        .unwrap();
+    let target = store.claim_job(&box_name).await.unwrap().unwrap();
+    store
+        .report_job(
+            &box_name,
+            &ReportJobRequest {
+                job_id: target.job_id.clone(),
+                attempt: target.attempt,
+                r#box: box_name.as_str().to_owned(),
+                terminal_state: Some(JobState::Succeeded as i32),
+                ..ReportJobRequest::default()
+            },
+        )
+        .await
+        .unwrap();
+    let judge = store
+        .submit_judge_for(
+            Some(alice),
+            &SubmitJudgeRequest {
+                idempotency_key: "j1".to_owned(),
+                prompt: "rubric".to_owned(),
+                target_job_id: target.job_id,
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(i64::try_from(judge.user_id), Ok(alice));
+    assert_eq!(judge.agent, DEFAULT_AGENT);
+}
+
+#[test]
+fn agents_resolve_to_known_runners_and_empty_means_claude() {
+    assert_eq!(validate_agent(""), Ok("claude"));
+    assert_eq!(validate_agent("claude"), Ok("claude"));
+    assert_eq!(validate_agent("codex"), Ok("codex"));
+    assert_eq!(validate_agent("kimi"), Ok("kimi"));
+    for unknown in ["Claude", " claude", "claude ", "gpt", "kimi\0"] {
+        assert_eq!(
+            validate_agent(unknown),
+            Err(JobInvalid::Agent),
+            "{unknown:?}"
+        );
+    }
+    assert_eq!(JobInvalid::Agent.to_string(), "invalid agent");
 }

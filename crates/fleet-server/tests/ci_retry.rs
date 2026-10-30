@@ -526,3 +526,27 @@ async fn no_room_for_the_log_submits_nothing(pool: PgPool) {
     assert_eq!(total(&pool).await, 1);
     assert_eq!(outcome(&store, &root).await, Some(CiRetry::NoLog));
 }
+
+#[sqlx::test]
+async fn a_fix_job_keeps_the_owner_and_agent_of_its_parent(pool: PgPool) {
+    let store = store(pool.clone(), 2).await;
+    sqlx::query("ALTER TABLE jobs ALTER COLUMN user_id DROP DEFAULT")
+        .execute(&pool)
+        .await
+        .unwrap();
+    let alice: i64 =
+        sqlx::query_scalar("INSERT INTO users (username) VALUES ('alice') RETURNING id")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    store
+        .submit_job_for(Some(alice), &submit("root", "do it"))
+        .await
+        .unwrap();
+    let root = claim(&store).await;
+    fail_ci(&store, &root, Some(LOG)).await.unwrap();
+    let fix = claim(&store).await;
+    assert_eq!(fix.parent_job_id.as_deref(), Some(root.job_id.as_str()));
+    assert_eq!(i64::try_from(fix.user_id), Ok(alice));
+    assert_eq!(fix.agent, "claude");
+}

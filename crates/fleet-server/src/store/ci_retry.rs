@@ -28,8 +28,9 @@ SELECT prompt FROM up WHERE parent_job_id IS NULL";
 
 const INSERT_FIX: &str = "\
 INSERT INTO jobs (job_id, idempotency_key, prompt, repo, base_ref, branch, open_pr, pr_url, \
-parent_job_id, ci_retry_attempt) \
-SELECT $1, $2, $3, p.repo, p.branch, p.branch, true, p.pr_url, p.job_id, p.ci_retry_attempt + 1 \
+parent_job_id, ci_retry_attempt, user_id, agent) \
+SELECT $1, $2, $3, p.repo, p.branch, p.branch, true, p.pr_url, p.job_id, p.ci_retry_attempt + 1, \
+p.user_id, p.agent \
 FROM jobs p \
 WHERE p.job_id = $4 AND p.kind = 'agent' AND p.state = 'SUCCEEDED' AND p.open_pr \
 AND p.pr_url IS NOT NULL AND p.ci_state = 'failure' AND p.batch_id IS NULL \

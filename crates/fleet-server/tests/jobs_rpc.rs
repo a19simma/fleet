@@ -16,6 +16,7 @@ use fleet_proto::v1::{
 };
 use fleet_server::auth::BearerAuth;
 use fleet_server::config::Token;
+use fleet_server::cred::Users;
 use fleet_server::service::router;
 use fleet_server::store::Store;
 use sqlx::PgPool;
@@ -781,4 +782,55 @@ async fn get_job_carries_the_summary_only_when_stored(pool: PgPool) {
         .into_inner()
         .jobs;
     assert_eq!(listed[0].summary, None);
+}
+
+#[sqlx::test]
+async fn submit_records_the_authenticated_caller_and_the_client_token_is_bootstrap(pool: PgPool) {
+    let store = store(pool.clone()).await;
+    sqlx::query("ALTER TABLE jobs ALTER COLUMN user_id DROP DEFAULT")
+        .execute(&pool)
+        .await
+        .unwrap();
+    let alice: i64 =
+        sqlx::query_scalar("INSERT INTO users (username) VALUES ('alice') RETURNING id")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    let users = Users::new(pool.clone());
+    let made = users.create_api_token(alice, "cli").await.unwrap();
+    let api_token = String::from_utf8(made.token.expose().to_vec()).unwrap();
+    let boot = users.bootstrap_user().await.unwrap();
+    let auth = BearerAuth::new(
+        &Token::new("box-token-0123456789abcdef0123456789".to_owned()).unwrap(),
+        Some(&Token::new(TOKEN.to_owned()).unwrap()),
+    )
+    .with_users(users);
+    let incoming = TcpIncoming::bind("127.0.0.1:0".parse().unwrap()).unwrap();
+    let addr: SocketAddr = incoming.local_addr().unwrap();
+    tokio::spawn(router(&store, &auth).serve_with_incoming(incoming));
+    let channel = Endpoint::from_shared(format!("http://{addr}"))
+        .unwrap()
+        .connect_lazy();
+    let client_as = |token: String| {
+        FleetJobsClient::with_interceptor(channel.clone(), move |mut request: Request<()>| {
+            request.metadata_mut().insert(
+                "authorization",
+                MetadataValue::try_from(format!("Bearer {token}")).unwrap(),
+            );
+            Ok::<_, Status>(request)
+        })
+    };
+
+    let by_alice = client_as(api_token)
+        .submit_job(submit_request("k1"))
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(i64::try_from(by_alice.user_id), Ok(alice));
+    let by_client = client_as(TOKEN.to_owned())
+        .submit_job(submit_request("k2"))
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(i64::try_from(by_client.user_id), Ok(boot));
 }

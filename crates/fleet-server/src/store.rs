@@ -144,14 +144,15 @@ const SELECT_JOB_BY_KEY: &str = concat!(
 );
 
 const INSERT_JOB: &str = "\
-INSERT INTO jobs (job_id, idempotency_key, prompt, repo, base_ref, branch, open_pr) \
-VALUES ($1, $2, $3, $4, $5, 'swarm/' || $1, $6) \
+INSERT INTO jobs (job_id, idempotency_key, prompt, repo, base_ref, branch, open_pr, user_id, agent) \
+VALUES ($1, $2, $3, $4, $5, 'swarm/' || $1, $6, $7, $8) \
 ON CONFLICT (idempotency_key) DO NOTHING \
 RETURNING job_id";
 
 const INSERT_JUDGE: &str = "\
-INSERT INTO jobs (job_id, idempotency_key, prompt, repo, base_ref, branch, open_pr, kind, target_job_id) \
-SELECT $1, $2, $3, '', '', '', false, 'judge', t.job_id FROM jobs t \
+INSERT INTO jobs (job_id, idempotency_key, prompt, repo, base_ref, branch, open_pr, kind, target_job_id, \
+user_id, agent) \
+SELECT $1, $2, $3, '', '', '', false, 'judge', t.job_id, $5, $6 FROM jobs t \
 WHERE t.job_id = $4 AND t.kind = 'agent' \
 AND t.state IN ('SUCCEEDED', 'FAILED', 'CANCELLED', 'LOST') \
 AND NOT EXISTS (\
@@ -160,6 +161,8 @@ AND (d.state IN ('QUEUED', 'RUNNING') \
 OR EXISTS (SELECT 1 FROM job_verdict v WHERE v.job_id = d.job_id))) \
 ON CONFLICT (idempotency_key) DO NOTHING \
 RETURNING job_id";
+
+const SELECT_BOOTSTRAP_USER: &str = "SELECT bootstrap_user_id()";
 
 const LOCK_JUDGE_TARGET: &str = "SELECT 1 FROM jobs WHERE job_id = $1 FOR NO KEY UPDATE";
 
@@ -893,8 +896,25 @@ impl Store {
     /// [`StoreError::KeyConflict`] when the key exists with different parameters, and
     /// [`StoreError::Database`] when a query fails.
     pub async fn submit_job(&self, request: &SubmitJobRequest) -> Result<Job, StoreError> {
+        self.submit_job_for(None, request).await
+    }
+
+    /// Queues a job owned by `owner`, or returns the one already stored under the same key.
+    ///
+    /// Works like [`Store::submit_job`] and binds `owner` as `jobs.user_id`. `None` is the
+    /// legacy path and stamps the `bootstrap` user. The agent is bound explicitly too. A key
+    /// already stored for another owner or another agent is a [`StoreError::KeyConflict`].
+    ///
+    /// # Errors
+    ///
+    /// The errors of [`Store::submit_job`].
+    pub async fn submit_job_for(
+        &self,
+        owner: Option<i64>,
+        request: &SubmitJobRequest,
+    ) -> Result<Job, StoreError> {
         let job = validate_submit(request)?;
-        self.insert_job(job).await
+        self.insert_job(owner, job).await
     }
 
     /// Submits a judge job over the stored transcript of a finished agent job, idempotent by
@@ -912,11 +932,34 @@ impl Store {
     /// not a finished agent job, [`StoreError::KeyConflict`] when the key exists with
     /// different parameters, and [`StoreError::Database`] when a query fails.
     pub async fn submit_judge(&self, request: &SubmitJudgeRequest) -> Result<Job, StoreError> {
-        let job = validate_judge(request)?;
-        self.insert_job(job).await
+        self.submit_judge_for(None, request).await
     }
 
-    async fn insert_job(&self, job: NewJob) -> Result<Job, StoreError> {
+    /// Submits a judge job owned by `owner`, like [`Store::submit_judge`].
+    ///
+    /// `None` is the legacy path and stamps the `bootstrap` user.
+    ///
+    /// # Errors
+    ///
+    /// The errors of [`Store::submit_judge`].
+    pub async fn submit_judge_for(
+        &self,
+        owner: Option<i64>,
+        request: &SubmitJudgeRequest,
+    ) -> Result<Job, StoreError> {
+        let job = validate_judge(request)?;
+        self.insert_job(owner, job).await
+    }
+
+    async fn insert_job(&self, owner: Option<i64>, job: NewJob) -> Result<Job, StoreError> {
+        let owner = match owner {
+            Some(owner) => owner,
+            None => {
+                sqlx::query_scalar(SELECT_BOOTSTRAP_USER)
+                    .fetch_one(&self.pool)
+                    .await?
+            }
+        };
         let id = EventId::generate().to_string();
         if let Some(target) = &job.target_job_id {
             let mut tx = self.pool.begin().await?;
@@ -929,6 +972,8 @@ impl Store {
                 .bind(&job.key)
                 .bind(&job.prompt)
                 .bind(target)
+                .bind(owner)
+                .bind(job.agent)
                 .fetch_optional(&mut *tx)
                 .await?;
             tx.commit().await?;
@@ -940,6 +985,8 @@ impl Store {
                 .bind(&job.repo)
                 .bind(&job.base_ref)
                 .bind(job.open_pr)
+                .bind(owner)
+                .bind(job.agent)
                 .fetch_optional(&self.pool)
                 .await?;
         }
@@ -949,7 +996,9 @@ impl Store {
             .await?
             .ok_or(JobInvalid::Target)?;
         let stored = job_from_row(&row)?;
-        if stored.prompt != job.prompt
+        if i64::try_from(stored.user_id) != Ok(owner)
+            || stored.agent != job.agent
+            || stored.prompt != job.prompt
             || stored.repo != job.repo
             || stored.base_ref != job.base_ref
             || stored.open_pr != job.open_pr
@@ -1194,7 +1243,24 @@ impl Store {
         &self,
         request: &SubmitBatchRequest,
     ) -> Result<SubmitBatchReply, StoreError> {
-        batches::submit(&self.pool, request).await
+        batches::submit(&self.pool, None, request).await
+    }
+
+    /// Submits a batch owned by `owner`, like [`Store::submit_batch`].
+    ///
+    /// Every job of the batch binds `owner` as `jobs.user_id` and the default agent. `None` is
+    /// the legacy path and stamps the `bootstrap` user. A key already stored for another owner
+    /// is a [`StoreError::KeyConflict`].
+    ///
+    /// # Errors
+    ///
+    /// The errors of [`Store::submit_batch`].
+    pub async fn submit_batch_for(
+        &self,
+        owner: Option<i64>,
+        request: &SubmitBatchRequest,
+    ) -> Result<SubmitBatchReply, StoreError> {
+        batches::submit(&self.pool, owner, request).await
     }
 
     /// Returns a batch with its jobs in profile order, each with its profile and telemetry

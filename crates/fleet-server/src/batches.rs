@@ -7,7 +7,7 @@ use fleet_core::EventId;
 use fleet_proto::v1::{GetBatchReply, SubmitBatchReply, SubmitBatchRequest, SubmitJobRequest};
 use sqlx::{PgPool, Row};
 
-use crate::jobs::{validate_job_id, validate_submit};
+use crate::jobs::{DEFAULT_AGENT, validate_job_id, validate_submit};
 use crate::profiles::validate_name;
 use crate::store::StoreError;
 
@@ -18,8 +18,7 @@ const INSERT_BATCH: &str = "INSERT INTO batch (batch_id, idempotency_key, prompt
      VALUES ($1, $2, $3, $4, $5, 1) ON CONFLICT (idempotency_key) DO NOTHING RETURNING batch_id";
 const SELECT_BATCH_BY_KEY: &str =
     "SELECT batch_id, prompt, repo, base_sha FROM batch WHERE idempotency_key = $1";
-const SELECT_BATCH_JOBS: &str =
-    "SELECT job_id, profile_name FROM jobs WHERE batch_id = $1 ORDER BY batch_pos LIMIT $2";
+const SELECT_BATCH_JOBS: &str = "SELECT job_id, profile_name, user_id, agent FROM jobs WHERE batch_id = $1 ORDER BY batch_pos LIMIT $2";
 const SELECT_BATCH_BY_ID: &str = "SELECT prompt, repo, base_sha, repeats, \
      (EXTRACT(EPOCH FROM created_at) * 1000)::bigint AS created_at_ms FROM batch WHERE batch_id = $1";
 const SELECT_BATCH_JOB_IDS: &str =
@@ -28,8 +27,9 @@ const LOCK_NAME: &str = "SELECT pg_advisory_xact_lock(hashtextextended($1, 0))";
 const SELECT_LATEST: &str =
     "SELECT version, hash FROM profile_version WHERE name = $1 ORDER BY version DESC LIMIT 1";
 const INSERT_BATCH_JOB: &str = "INSERT INTO jobs (job_id, prompt, repo, base_ref, branch, open_pr, \
-     batch_id, repeat_idx, batch_pos, profile_name, profile_version, profile_hash) \
-     VALUES ($1, $2, $3, $4, 'swarm/' || $1, false, $5, 0, $6, $7, $8, $9)";
+     batch_id, repeat_idx, batch_pos, profile_name, profile_version, profile_hash, user_id, agent) \
+     VALUES ($1, $2, $3, $4, 'swarm/' || $1, false, $5, 0, $6, $7, $8, $9, $10, $11)";
+const SELECT_BOOTSTRAP_USER: &str = "SELECT bootstrap_user_id()";
 
 /// Why a batch request was refused. The variants carry no client input.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -158,9 +158,18 @@ pub(crate) async fn get_head(
 
 pub(crate) async fn submit(
     pool: &PgPool,
+    owner: Option<i64>,
     request: &SubmitBatchRequest,
 ) -> Result<SubmitBatchReply, StoreError> {
     let batch = validate_batch(request)?;
+    let owner = match owner {
+        Some(owner) => owner,
+        None => {
+            sqlx::query_scalar(SELECT_BOOTSTRAP_USER)
+                .fetch_one(pool)
+                .await?
+        }
+    };
     let batch_id = EventId::generate().to_string();
     let mut tx = pool.begin().await?;
     let inserted = sqlx::query(INSERT_BATCH)
@@ -187,11 +196,14 @@ pub(crate) async fn submit(
             .await?;
         let mut names = Vec::with_capacity(rows.len());
         let mut job_ids = Vec::with_capacity(rows.len());
+        let mut same_owner = true;
         for row in &rows {
             names.push(row.try_get::<String, _>("profile_name")?);
             job_ids.push(row.try_get::<String, _>("job_id")?);
+            same_owner &= row.try_get::<i64, _>("user_id")? == owner
+                && row.try_get::<String, _>("agent")? == DEFAULT_AGENT;
         }
-        if !same || names != batch.profiles {
+        if !same || !same_owner || names != batch.profiles {
             return Err(StoreError::KeyConflict);
         }
         return Ok(SubmitBatchReply {
@@ -223,6 +235,8 @@ pub(crate) async fn submit(
             .bind(name)
             .bind(pinned.try_get::<i32, _>("version")?)
             .bind(pinned.try_get::<Vec<u8>, _>("hash")?)
+            .bind(owner)
+            .bind(DEFAULT_AGENT)
             .execute(&mut *tx)
             .await?;
         job_ids.push(job_id);
