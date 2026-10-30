@@ -906,10 +906,14 @@ dependencies = [
  "chacha20poly1305",
  "fleet-core",
  "fleet-proto",
+ "http-body-util",
+ "hyper",
  "hyper-util",
+ "rustls",
  "serde_json",
  "sqlx",
  "tokio",
+ "tokio-rustls",
  "tonic",
  "tonic-prost",
  "topcoat",
@@ -918,6 +922,7 @@ dependencies = [
  "tracing-subscriber",
  "webauthn-authenticator-rs",
  "webauthn-rs",
+ "webpki-roots",
  "zeroize",
 ]
 

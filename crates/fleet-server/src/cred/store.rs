@@ -8,8 +8,10 @@ use std::sync::Arc;
 use fleet_core::credential::{
     CredentialError, CredentialKind, CredentialShape, Secret, fingerprint, validate,
 };
+use fleet_proto::MAX_CREDENTIALS_PER_USER;
 use sqlx::{PgPool, Row};
 
+use super::github::MAX_EXPIRY_MS;
 use super::seal::{Aad, SealError, Sealer};
 
 const UPSERT: &str = "\
@@ -18,6 +20,10 @@ VALUES ($1, $2, $3, '\\x'::bytea, 'pending', $4, $5, to_timestamp($6::bigint / 1
 ON CONFLICT (user_id, kind) DO UPDATE SET shape = EXCLUDED.shape, \
 fingerprint = EXCLUDED.fingerprint, login = EXCLUDED.login, expires_at = EXCLUDED.expires_at \
 RETURNING id";
+
+const LOCK_USER: &str = "SELECT pg_advisory_xact_lock($1)";
+
+const COUNT_OTHERS: &str = "SELECT count(*) FROM credentials WHERE user_id = $1 AND kind <> $2";
 
 const STORE_SEALED: &str = "UPDATE credentials SET ciphertext = $1, key_id = $2 WHERE id = $3";
 
@@ -55,10 +61,14 @@ pub struct CredentialSummary {
 pub enum StoreError {
     /// The value failed validation.
     Invalid(CredentialError),
+    /// The expiry lies outside `0..=MAX_EXPIRY_MS`.
+    InvalidExpiry,
     /// No such credential, or it belongs to another user.
     NotFound,
     /// Sealing or opening failed.
     Seal(SealError),
+    /// The user already holds the most credentials allowed.
+    TooMany,
     /// The database failed.
     Db(sqlx::Error),
 }
@@ -67,7 +77,9 @@ impl fmt::Display for StoreError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Invalid(e) => e.fmt(f),
+            Self::InvalidExpiry => f.write_str("invalid expiry"),
             Self::NotFound => f.write_str("credential not found"),
+            Self::TooMany => f.write_str("too many credentials"),
             Self::Seal(e) => e.fmt(f),
             Self::Db(_) => f.write_str("credential store database error"),
         }
@@ -99,6 +111,7 @@ impl From<CredentialError> for StoreError {
 pub struct CredentialStore {
     pool: PgPool,
     sealer: Arc<dyn Sealer>,
+    limit: usize,
 }
 
 impl fmt::Debug for CredentialStore {
@@ -122,15 +135,26 @@ fn shape_of(name: &str) -> CredentialShape {
 impl CredentialStore {
     /// Builds a store over `pool` that seals with `sealer`.
     pub fn new(pool: PgPool, sealer: Arc<dyn Sealer>) -> Self {
-        Self { pool, sealer }
+        Self::with_limit(pool, sealer, MAX_CREDENTIALS_PER_USER)
+    }
+
+    /// Builds a store that holds at most `limit` credentials per user.
+    pub fn with_limit(pool: PgPool, sealer: Arc<dyn Sealer>, limit: usize) -> Self {
+        Self {
+            pool,
+            sealer,
+            limit,
+        }
     }
 
     /// Validates, seals and stores `value`, replacing the user's credential of the same kind.
     ///
     /// # Errors
     ///
-    /// Returns [`StoreError::Invalid`] for a rejected value, [`StoreError::Seal`] when sealing
-    /// fails and [`StoreError::Db`] for a database failure.
+    /// Returns [`StoreError::Invalid`] for a rejected value, [`StoreError::InvalidExpiry`] for an
+    /// expiry outside `0..=MAX_EXPIRY_MS`, [`StoreError::TooMany`] when a new kind would pass the
+    /// per-user cap, [`StoreError::Seal`] when sealing fails and [`StoreError::Db`] for a
+    /// database failure.
     pub async fn put(
         &self,
         user_id: i64,
@@ -142,8 +166,23 @@ impl CredentialStore {
     ) -> Result<CredentialSummary, StoreError> {
         let text = std::str::from_utf8(value.expose()).map_err(|_| CredentialError::Whitespace)?;
         validate(kind, shape, text)?;
+        if expires_at_ms.is_some_and(|ms| !(0..=MAX_EXPIRY_MS).contains(&ms)) {
+            return Err(StoreError::InvalidExpiry);
+        }
         let print = fingerprint(&value);
         let mut tx = self.pool.begin().await?;
+        sqlx::query(LOCK_USER)
+            .bind(user_id)
+            .execute(&mut *tx)
+            .await?;
+        let others: i64 = sqlx::query_scalar(COUNT_OTHERS)
+            .bind(user_id)
+            .bind(kind.wire_name())
+            .fetch_one(&mut *tx)
+            .await?;
+        if usize::try_from(others).map_or(true, |n| n >= self.limit) {
+            return Err(StoreError::TooMany);
+        }
         let id: i64 = sqlx::query_scalar(UPSERT)
             .bind(user_id)
             .bind(kind.wire_name())
@@ -215,6 +254,46 @@ impl CredentialStore {
         Ok(())
     }
 
+    /// Unseals the user's credential to check it with its provider. No use row is written.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StoreError::NotFound`] when the id is unknown or owned by another user and
+    /// [`StoreError::Seal`] when the value cannot be opened.
+    pub async fn open_for_verify(
+        &self,
+        user_id: i64,
+        credential_id: i64,
+    ) -> Result<(CredentialKind, Secret), StoreError> {
+        let mut tx = self.pool.begin().await?;
+        let (kind, secret) = self.unseal(&mut tx, user_id, credential_id).await?;
+        tx.commit().await?;
+        Ok((kind, secret))
+    }
+
+    async fn unseal(
+        &self,
+        tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+        user_id: i64,
+        credential_id: i64,
+    ) -> Result<(CredentialKind, Secret), StoreError> {
+        let row = sqlx::query(SELECT_FOR_USE)
+            .bind(credential_id)
+            .bind(user_id)
+            .fetch_optional(&mut **tx)
+            .await?
+            .ok_or(StoreError::NotFound)?;
+        let name: String = row.try_get("kind")?;
+        let ciphertext: Vec<u8> = row.try_get("ciphertext")?;
+        let key_id: String = row.try_get("key_id")?;
+        let kind = kind_of(&name)?;
+        let aad = Aad::new(&user_id.to_string(), &credential_id.to_string(), kind);
+        let mut plain = self.sealer.open(&aad, &key_id, &ciphertext)?;
+        let text = String::from_utf8(std::mem::take(&mut *plain))
+            .map_err(|_| StoreError::Seal(SealError::Open))?;
+        Ok((kind, Secret::new(text)))
+    }
+
     /// Unseals the user's credential for `job_id` and records the use in the same transaction.
     ///
     /// # Errors
@@ -228,29 +307,13 @@ impl CredentialStore {
         job_id: &str,
     ) -> Result<Secret, StoreError> {
         let mut tx = self.pool.begin().await?;
-        let row = sqlx::query(SELECT_FOR_USE)
-            .bind(credential_id)
-            .bind(user_id)
-            .fetch_optional(&mut *tx)
-            .await?
-            .ok_or(StoreError::NotFound)?;
-        let kind: String = row.try_get("kind")?;
-        let ciphertext: Vec<u8> = row.try_get("ciphertext")?;
-        let key_id: String = row.try_get("key_id")?;
-        let aad = Aad::new(
-            &user_id.to_string(),
-            &credential_id.to_string(),
-            kind_of(&kind)?,
-        );
-        let mut plain = self.sealer.open(&aad, &key_id, &ciphertext)?;
-        let text = String::from_utf8(std::mem::take(&mut *plain))
-            .map_err(|_| StoreError::Seal(SealError::Open))?;
+        let (_, secret) = self.unseal(&mut tx, user_id, credential_id).await?;
         sqlx::query(INSERT_USE)
             .bind(credential_id)
             .bind(job_id)
             .execute(&mut *tx)
             .await?;
         tx.commit().await?;
-        Ok(Secret::new(text))
+        Ok(secret)
     }
 }

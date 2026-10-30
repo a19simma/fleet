@@ -5,6 +5,7 @@ use std::sync::Arc;
 
 use fleet_core::credential::{CredentialKind, CredentialShape, Secret};
 use fleet_server::cred::FileSealer;
+use fleet_server::cred::github::MAX_EXPIRY_MS;
 use fleet_server::cred::store::{CredentialStore, StoreError};
 use fleet_server::cred::users::{UserError, Users};
 use sqlx::PgPool;
@@ -110,6 +111,40 @@ async fn put_rejects_an_invalid_value(pool: PgPool) {
         .unwrap_err();
     assert!(matches!(err, StoreError::Invalid(_)));
     assert_eq!(store.list(alice).await.unwrap().len(), 0);
+}
+
+#[sqlx::test]
+async fn put_rejects_an_expiry_outside_the_range(pool: PgPool) {
+    let store = store(&pool, "expiry").unwrap();
+    let alice = user(&pool, "alice").await.unwrap();
+    for ms in [-1, MAX_EXPIRY_MS + 1, i64::MAX, i64::MIN] {
+        let err = store
+            .put(
+                alice,
+                CredentialKind::AnthropicApiKey,
+                STATIC,
+                Secret::new(ANT.into()),
+                None,
+                Some(ms),
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(err, StoreError::InvalidExpiry), "{ms}");
+    }
+    assert_eq!(store.list(alice).await.unwrap().len(), 0);
+    for ms in [0, MAX_EXPIRY_MS] {
+        store
+            .put(
+                alice,
+                CredentialKind::AnthropicApiKey,
+                STATIC,
+                Secret::new(ANT.into()),
+                None,
+                Some(ms),
+            )
+            .await
+            .unwrap();
+    }
 }
 
 #[sqlx::test]

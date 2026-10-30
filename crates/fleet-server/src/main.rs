@@ -9,10 +9,12 @@ use axum::Router;
 use axum::routing::get;
 use fleet_server::auth::BearerAuth;
 use fleet_server::config::{Config, CredentialsState, exposed_binds, is_loopback};
-use fleet_server::cred::Users;
+use fleet_server::cred::github::HttpsGithub;
+use fleet_server::cred::store::CredentialStore;
+use fleet_server::cred::{CredentialService, Users};
 use fleet_server::reaper::{DEFAULT_REAP_PERIOD, run_reaper};
 use fleet_server::retention::run_retention;
-use fleet_server::service::serve_with_web;
+use fleet_server::service::serve_with_credentials;
 use fleet_server::store::Store;
 use fleet_server::supervise::{BoxError, supervise};
 use fleet_server::web::{Web, WebAuth};
@@ -68,6 +70,26 @@ fn build_web(config: &Config, pool: &sqlx::PgPool, users: &Users) -> Result<Web,
     Ok(Web::with_auth(auth))
 }
 
+async fn credential_service(
+    config: &Config,
+    pool: &sqlx::PgPool,
+) -> Result<Option<CredentialService>, BoxError> {
+    let rows_exist: bool = sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM credentials)")
+        .fetch_one(pool)
+        .await?;
+    let state = CredentialsState::resolve(config.master_key_file.as_deref(), rows_exist)?;
+    let CredentialsState::Enabled(sealer) = state else {
+        tracing::info!("{}", CredentialsState::DISABLED_NOTICE);
+        return Ok(None);
+    };
+    tracing::info!("credential master key loaded");
+    let github = HttpsGithub::new()?;
+    Ok(Some(CredentialService::new(
+        CredentialStore::new(pool.clone(), sealer),
+        Arc::new(github),
+    )))
+}
+
 async fn run() -> Result<(), BoxError> {
     let config = Config::from_env()?;
     let options = PgConnectOptions::from_str(config.database_url.expose())?
@@ -80,15 +102,7 @@ async fn run() -> Result<(), BoxError> {
     let store = Store::new(pool.clone()).with_max_ci_retries(config.max_ci_retries);
     store.migrate().await?;
 
-    let rows_exist: bool = sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM credentials)")
-        .fetch_one(&pool)
-        .await?;
-    let credentials = CredentialsState::resolve(config.master_key_file.as_deref(), rows_exist)?;
-    if credentials.is_enabled() {
-        tracing::info!("credential master key loaded");
-    } else {
-        tracing::info!("{}", CredentialsState::DISABLED_NOTICE);
-    }
+    let credential_service = credential_service(&config, &pool).await?;
 
     let users = Users::new(pool.clone());
     if let Some(code) = users.issue_setup_code().await? {
@@ -148,9 +162,16 @@ async fn run() -> Result<(), BoxError> {
     ));
     let auth = BearerAuth::new(&config.token, config.client_token.as_ref()).with_users(users);
     let grpc_server = async {
-        serve_with_web(&store, &auth, web, grpc, stopped(stop_rx.clone()))
-            .await
-            .map_err(BoxError::from)
+        serve_with_credentials(
+            &store,
+            &auth,
+            web,
+            credential_service,
+            grpc,
+            stopped(stop_rx.clone()),
+        )
+        .await
+        .map_err(BoxError::from)
     };
     let health_server = async {
         let app = Router::new().route("/healthz", get(|| async { "ok" }));

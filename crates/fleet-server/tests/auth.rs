@@ -167,6 +167,10 @@ mod tests {
     }
 
     async fn code_of(addr: SocketAddr, service: &str, token: Option<&str>) -> Code {
+        status_of(addr, service, token).await.code()
+    }
+
+    async fn status_of(addr: SocketAddr, service: &str, token: Option<&str>) -> Status {
         let header = Header(token.map(|t| format!("Bearer {t}").into_bytes()));
         let chan = channel(addr);
         let result = match service {
@@ -223,7 +227,7 @@ mod tests {
                 .await
                 .map(|_| ()),
         };
-        result.err().map_or(Code::Ok, |status| status.code())
+        result.err().unwrap_or_else(|| Status::ok(""))
     }
 
     #[tokio::test]
@@ -243,11 +247,24 @@ mod tests {
             ("job_credentials", true, false),
         ] {
             for (name, token, ok) in [("box", TOKEN, box_ok), ("client", CLIENT, client_ok)] {
-                let code = code_of(addr, service, Some(token)).await;
-                if ok {
+                let status = status_of(addr, service, Some(token)).await;
+                let code = status.code();
+                if ok && service == "credentials" {
+                    assert_eq!(code, Code::PermissionDenied, "{name} on {service}");
+                    assert_eq!(
+                        status.message(),
+                        "credentials need a user token",
+                        "{name} on {service}"
+                    );
+                } else if ok {
                     assert!(scoped(code), "{name} on {service}: {code:?}");
                 } else {
                     assert_eq!(code, Code::PermissionDenied, "{name} on {service}");
+                    assert_eq!(
+                        status.message(),
+                        "bearer token not valid for this service",
+                        "{name} on {service}"
+                    );
                 }
             }
             for token in [None, Some("wrong-token-0123456789abcdef01234567")] {

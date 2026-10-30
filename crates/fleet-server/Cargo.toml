@@ -25,6 +25,11 @@ tracing.workspace = true
 tracing-subscriber.workspace = true
 topcoat = "=0.11.0"
 webauthn-rs = "=0.5.5"
+http-body-util = "0.1.5"
+hyper = { version = "1.12.0", default-features = false, features = ["client", "http1"] }
+rustls = { version = "0.23.45", default-features = false, features = ["ring", "std", "tls12"] }
+tokio-rustls = { version = "0.26.5", default-features = false, features = ["ring", "tls12"] }
+webpki-roots = "1.0.9"
 hyper-util = { version = "=0.1.21", features = ["tokio", "server-auto", "server-graceful", "service", "http1", "http2"] }
 zeroize.workspace = true
 sqlx = { version = "0.9.0", default-features = false, features = ["runtime-tokio", "tls-rustls-ring-webpki", "postgres", "migrate", "macros"] }

@@ -33,6 +33,7 @@ use tonic::{Request, Response, Status};
 use tower::layer::util::{Identity, Stack};
 
 use crate::auth::{BearerAuth, Caller};
+use crate::cred::CredentialService;
 use crate::store::{Store, StoreError};
 use crate::web::{Dispatch, HEADER_READ_TIMEOUT, Web, serve};
 use fleet_proto::MAX_PROFILE_MESSAGE_BYTES;
@@ -51,6 +52,9 @@ pub const CLAIM_INTERVAL_S: u32 = 5;
 
 /// Largest request message the server decodes, in bytes.
 pub const MAX_MESSAGE_BYTES: usize = 1024 * 1024;
+
+/// Largest `FleetCredentials` request message the server decodes, in bytes.
+pub const MAX_CREDENTIAL_MESSAGE_BYTES: usize = 4 * 1024;
 
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 const KEEPALIVE_INTERVAL: Duration = Duration::from_secs(30);
@@ -92,12 +96,36 @@ fn no_nul(field: &str, value: &str) -> Result<(), Status> {
 #[derive(Debug, Clone)]
 pub struct FleetService {
     store: Store,
+    credentials: Option<CredentialService>,
 }
 
 impl FleetService {
-    /// Builds the handler over `store`.
+    /// Builds the handler over `store`. The credential RPCs answer `FAILED_PRECONDITION`.
     pub fn new(store: Store) -> Self {
-        Self { store }
+        Self {
+            store,
+            credentials: None,
+        }
+    }
+
+    /// Enables the credential RPCs.
+    #[must_use]
+    pub fn with_credentials(mut self, credentials: Option<CredentialService>) -> Self {
+        self.credentials = credentials;
+        self
+    }
+
+    fn credential_owner<T>(
+        &self,
+        request: &Request<T>,
+    ) -> Result<(&CredentialService, i64), Status> {
+        let user_id = caller_of(request)
+            .ok_or_else(|| Status::permission_denied("credentials need a user token"))?;
+        let service = self
+            .credentials
+            .as_ref()
+            .ok_or_else(|| Status::failed_precondition("credentials are not configured"))?;
+        Ok((service, user_id))
     }
 }
 
@@ -309,30 +337,39 @@ impl FleetWorker for FleetService {
 impl FleetCredentials for FleetService {
     async fn put_credential(
         &self,
-        _request: Request<PutCredentialRequest>,
+        request: Request<PutCredentialRequest>,
     ) -> Result<Response<CredentialInfo>, Status> {
-        Err(Status::unimplemented("put_credential"))
+        let (service, user_id) = self.credential_owner(&request)?;
+        let info = service.put(user_id, request.into_inner()).await?;
+        Ok(Response::new(info))
     }
 
     async fn list_credentials(
         &self,
-        _request: Request<ListCredentialsRequest>,
+        request: Request<ListCredentialsRequest>,
     ) -> Result<Response<ListCredentialsReply>, Status> {
-        Err(Status::unimplemented("list_credentials"))
+        let (service, user_id) = self.credential_owner(&request)?;
+        Ok(Response::new(service.list(user_id).await?))
     }
 
     async fn delete_credential(
         &self,
-        _request: Request<DeleteCredentialRequest>,
+        request: Request<DeleteCredentialRequest>,
     ) -> Result<Response<DeleteCredentialReply>, Status> {
-        Err(Status::unimplemented("delete_credential"))
+        let (service, user_id) = self.credential_owner(&request)?;
+        Ok(Response::new(
+            service.delete(user_id, request.get_ref()).await?,
+        ))
     }
 
     async fn verify_credential(
         &self,
-        _request: Request<VerifyCredentialRequest>,
+        request: Request<VerifyCredentialRequest>,
     ) -> Result<Response<VerifyCredentialReply>, Status> {
-        Err(Status::unimplemented("verify_credential"))
+        let (service, user_id) = self.credential_owner(&request)?;
+        Ok(Response::new(
+            service.verify(user_id, request.get_ref()).await?,
+        ))
     }
 }
 
@@ -565,7 +602,18 @@ impl FleetJobs for FleetService {
 /// concurrent streams per connection, an HTTP/2 keepalive ping every 30 seconds and a
 /// 1 MiB request message limit.
 pub fn router(store: &Store, auth: &BearerAuth) -> Router<Stack<BearerAuth, Identity>> {
-    server().layer(auth.clone()).add_routes(routes(store))
+    router_with(store, auth, None)
+}
+
+/// Same as [`router`] with the credential RPCs backed by `credentials`.
+pub fn router_with(
+    store: &Store,
+    auth: &BearerAuth,
+    credentials: Option<CredentialService>,
+) -> Router<Stack<BearerAuth, Identity>> {
+    server()
+        .layer(auth.clone())
+        .add_routes(routes(store, credentials))
 }
 
 fn server() -> Server {
@@ -593,7 +641,31 @@ pub async fn serve_with_web(
     incoming: TcpIncoming,
     shutdown: impl Future<Output = ()>,
 ) -> std::io::Result<()> {
-    serve_with_web_timeout(store, auth, web, incoming, shutdown, HEADER_READ_TIMEOUT).await
+    serve_with_credentials(store, auth, web, None, incoming, shutdown).await
+}
+
+/// Same as [`serve_with_web`] with the credential RPCs backed by `credentials`.
+///
+/// # Errors
+///
+/// Returns the I/O error that stopped the server.
+pub async fn serve_with_credentials(
+    store: &Store,
+    auth: &BearerAuth,
+    web: Web,
+    credentials: Option<CredentialService>,
+    incoming: TcpIncoming,
+    shutdown: impl Future<Output = ()>,
+) -> std::io::Result<()> {
+    serve_routes(
+        routes(store, credentials),
+        auth,
+        web,
+        incoming,
+        shutdown,
+        HEADER_READ_TIMEOUT,
+    )
+    .await
 }
 
 /// Same as [`serve_with_web`] with an explicit HTTP/1 header-read timeout.
@@ -609,7 +681,26 @@ pub async fn serve_with_web_timeout(
     shutdown: impl Future<Output = ()>,
     header_read_timeout: Duration,
 ) -> std::io::Result<()> {
-    let grpc = tower::Layer::layer(auth, routes(store));
+    serve_routes(
+        routes(store, None),
+        auth,
+        web,
+        incoming,
+        shutdown,
+        header_read_timeout,
+    )
+    .await
+}
+
+async fn serve_routes(
+    routes: Routes,
+    auth: &BearerAuth,
+    web: Web,
+    incoming: TcpIncoming,
+    shutdown: impl Future<Output = ()>,
+    header_read_timeout: Duration,
+) -> std::io::Result<()> {
+    let grpc = tower::Layer::layer(auth, routes);
     serve(
         Dispatch::new(grpc, web),
         incoming,
@@ -619,8 +710,8 @@ pub async fn serve_with_web_timeout(
     .await
 }
 
-fn routes(store: &Store) -> Routes {
-    let service = FleetService::new(store.clone());
+fn routes(store: &Store, credentials: Option<CredentialService>) -> Routes {
+    let service = FleetService::new(store.clone()).with_credentials(credentials);
     let ingest =
         FleetIngestServer::new(service.clone()).max_decoding_message_size(MAX_MESSAGE_BYTES);
     let query = FleetQueryServer::new(service.clone()).max_decoding_message_size(MAX_MESSAGE_BYTES);
@@ -631,8 +722,8 @@ fn routes(store: &Store) -> Routes {
     let judge = FleetJudgeServer::new(service.clone()).max_decoding_message_size(MAX_MESSAGE_BYTES);
     let batches =
         FleetBatchesServer::new(service.clone()).max_decoding_message_size(MAX_MESSAGE_BYTES);
-    let credentials =
-        FleetCredentialsServer::new(service.clone()).max_decoding_message_size(MAX_MESSAGE_BYTES);
+    let credentials = FleetCredentialsServer::new(service.clone())
+        .max_decoding_message_size(MAX_CREDENTIAL_MESSAGE_BYTES);
     let profiles =
         FleetProfilesServer::new(service).max_decoding_message_size(MAX_PROFILE_MESSAGE_BYTES);
     Routes::new(ingest)
