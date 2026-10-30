@@ -24,11 +24,14 @@ tower.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
 topcoat = "=0.11.0"
+webauthn-rs = "=0.5.5"
+hyper-util = { version = "=0.1.21", features = ["tokio", "server-auto", "server-graceful", "service", "http1", "http2"] }
 zeroize.workspace = true
 sqlx = { version = "0.9.0", default-features = false, features = ["runtime-tokio", "tls-rustls-ring-webpki", "postgres", "migrate", "macros"] }
 
 [dev-dependencies]
 tonic-prost.workspace = true
+webauthn-authenticator-rs = { version = "=0.5.5", features = ["softpasskey"] }
 
 [lints]
 workspace = true

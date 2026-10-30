@@ -1,12 +1,19 @@
 //! The browser UI: Topcoat pages served on the gRPC port.
 //!
-//! ADR 0041 picks Topcoat and dispatch by content type and path. Tonic owns the accept
-//! loop and the connection settings, so the web stack inherits its keepalive, request
-//! timeout and graceful shutdown. [`Dispatch`] sends gRPC calls to the authenticated tonic
-//! routes and every other request to the Topcoat router, then stamps the security headers.
+//! ADR 0041 picks Topcoat and dispatch by content type and path. [`serve`] owns the accept
+//! loop so HTTP/1 clients get a header-read timeout. [`Dispatch`] sends gRPC calls to the
+//! authenticated tonic routes and every other request to the Topcoat router, behind
+//! [`CatchPanic`], then stamps the security headers. [`WebAuth`] holds passkey login and
+//! sessions (ADR 0042).
 
 mod dispatch;
 mod pages;
+mod panic;
+mod passkeys;
+mod serve;
 
 pub use dispatch::{Dispatch, GRPC_PREFIX, harden};
-pub use pages::{HOME_MARKER, STYLE_CSS, STYLE_PATH, Web};
+pub use pages::{HOME_MARKER, MAX_BODY_BYTES, PASSKEY_JS, SCRIPT_PATH, STYLE_CSS, STYLE_PATH, Web};
+pub use panic::CatchPanic;
+pub use passkeys::{AuthError, NewSession, SESSION_COOKIE, SESSION_TTL_SECS, SessionInfo, WebAuth};
+pub use serve::{HEADER_READ_TIMEOUT, serve};

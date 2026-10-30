@@ -34,7 +34,7 @@ use tower::layer::util::{Identity, Stack};
 
 use crate::auth::{BearerAuth, Caller};
 use crate::store::{Store, StoreError};
-use crate::web::{Dispatch, Web};
+use crate::web::{Dispatch, HEADER_READ_TIMEOUT, Web, serve};
 use fleet_proto::MAX_PROFILE_MESSAGE_BYTES;
 
 /// Seconds a box should wait before its next heartbeat.
@@ -570,25 +570,45 @@ fn server() -> Server {
 
 /// Serves the gRPC services and the web pages on one listener until `shutdown` resolves.
 ///
-/// Uses the connection settings of [`router`] and also accepts HTTP/1.1 for browsers. The
-/// bearer `auth` wraps the gRPC services only; the web router has its own session checks.
-/// In-flight requests drain on shutdown, as for [`router`].
+/// Runs the accept loop in [`crate::web::serve`] with the connection limits of [`router`]
+/// and accepts HTTP/1.1 for browsers, giving each client [`HEADER_READ_TIMEOUT`] to send a
+/// request head. The bearer `auth` wraps the gRPC services only; the web router has its own
+/// session checks. In-flight requests drain on shutdown.
 ///
 /// # Errors
 ///
-/// Returns the transport error that stopped the server.
+/// Returns the I/O error that stopped the server.
 pub async fn serve_with_web(
     store: &Store,
     auth: &BearerAuth,
     web: Web,
     incoming: TcpIncoming,
     shutdown: impl Future<Output = ()>,
-) -> Result<(), tonic::transport::Error> {
+) -> std::io::Result<()> {
+    serve_with_web_timeout(store, auth, web, incoming, shutdown, HEADER_READ_TIMEOUT).await
+}
+
+/// Same as [`serve_with_web`] with an explicit HTTP/1 header-read timeout.
+///
+/// # Errors
+///
+/// Returns the I/O error that stopped the server.
+pub async fn serve_with_web_timeout(
+    store: &Store,
+    auth: &BearerAuth,
+    web: Web,
+    incoming: TcpIncoming,
+    shutdown: impl Future<Output = ()>,
+    header_read_timeout: Duration,
+) -> std::io::Result<()> {
     let grpc = tower::Layer::layer(auth, routes(store));
-    server()
-        .accept_http1(true)
-        .serve_with_incoming_shutdown(Dispatch::new(grpc, web), incoming, shutdown)
-        .await
+    serve(
+        Dispatch::new(grpc, web),
+        incoming,
+        shutdown,
+        header_read_timeout,
+    )
+    .await
 }
 
 fn routes(store: &Store) -> Routes {

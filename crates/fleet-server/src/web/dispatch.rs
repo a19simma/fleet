@@ -11,9 +11,10 @@ use axum::http::header::{
 };
 use axum::http::{HeaderName, HeaderValue, Request, Response};
 use tonic::body::Body;
-use tower::Service;
+use tower::{Service, ServiceExt};
 
 use super::pages::Web;
+use super::panic::CatchPanic;
 
 /// Path prefix shared by every gRPC service the server registers.
 pub const GRPC_PREFIX: &str = "/fleet.v1.";
@@ -41,7 +42,7 @@ pub fn harden<B>(response: &mut Response<B>) {
     }
 }
 
-fn is_grpc<B>(request: &Request<B>) -> bool {
+pub(super) fn is_grpc<B>(request: &Request<B>) -> bool {
     let content_type = request
         .headers()
         .get(CONTENT_TYPE)
@@ -58,13 +59,40 @@ fn is_grpc<B>(request: &Request<B>) -> bool {
 #[derive(Clone)]
 pub struct Dispatch<G> {
     grpc: G,
-    web: Web,
+    web: CatchPanic<WebService>,
+}
+
+#[derive(Clone)]
+struct WebService(Web);
+
+impl Service<Request<Body>> for WebService {
+    type Response = Response<Body>;
+    type Error = Infallible;
+    type Future = DispatchFuture;
+
+    fn poll_ready(&mut self, _cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+        Poll::Ready(Ok(()))
+    }
+
+    fn call(&mut self, request: Request<Body>) -> Self::Future {
+        let web = self.0.clone();
+        Box::pin(async move {
+            let response = web
+                .router()
+                .handle(request.map(topcoat::router::Body::new))
+                .await;
+            Ok(response.map(Body::new))
+        })
+    }
 }
 
 impl<G> Dispatch<G> {
     /// Pairs the authenticated gRPC service with the web router.
     pub const fn new(grpc: G, web: Web) -> Self {
-        Self { grpc, web }
+        Self {
+            grpc,
+            web: CatchPanic::new(WebService(web)),
+        }
     }
 }
 
@@ -92,13 +120,9 @@ where
             let mut grpc = std::mem::replace(&mut self.grpc, spare);
             return Box::pin(async move { grpc.call(request).await });
         }
-        let web = self.web.clone();
+        let mut web = self.web.clone();
         Box::pin(async move {
-            let response = web
-                .router()
-                .handle(request.map(topcoat::router::Body::new))
-                .await;
-            let mut response = response.map(Body::new);
+            let mut response = web.ready().await?.call(request).await?;
             harden(&mut response);
             Ok(response)
         })

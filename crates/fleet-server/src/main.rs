@@ -15,7 +15,7 @@ use fleet_server::retention::run_retention;
 use fleet_server::service::serve_with_web;
 use fleet_server::store::Store;
 use fleet_server::supervise::{BoxError, supervise};
-use fleet_server::web::Web;
+use fleet_server::web::{Web, WebAuth};
 use sqlx::postgres::{PgConnectOptions, PgPoolOptions};
 use tokio::net::TcpListener;
 use tokio::signal::unix::{SignalKind, signal};
@@ -54,6 +54,20 @@ async fn stopped(mut rx: watch::Receiver<bool>) {
     let _ = rx.wait_for(|stop| *stop).await;
 }
 
+fn build_web(config: &Config, pool: &sqlx::PgPool, users: &Users) -> Result<Web, BoxError> {
+    let Some(origin) = config.web_origin.as_deref() else {
+        tracing::warn!("FLEET_WEB_ORIGIN is unset: web login is off");
+        return Ok(Web::new());
+    };
+    let auth = WebAuth::new(
+        pool.clone(),
+        users.clone(),
+        origin,
+        config.web_rp_id.as_deref(),
+    )?;
+    Ok(Web::with_auth(auth))
+}
+
 async fn run() -> Result<(), BoxError> {
     let config = Config::from_env()?;
     let options = PgConnectOptions::from_str(config.database_url.expose())?
@@ -83,6 +97,8 @@ async fn run() -> Result<(), BoxError> {
             "no users exist: open this path on the server's public address to create the admin; it works once and changes on restart"
         );
     }
+
+    let web = build_web(&config, &pool, &users)?;
 
     if !is_loopback(&config.listen) {
         tracing::warn!(
@@ -132,7 +148,7 @@ async fn run() -> Result<(), BoxError> {
     ));
     let auth = BearerAuth::new(&config.token, config.client_token.as_ref()).with_users(users);
     let grpc_server = async {
-        serve_with_web(&store, &auth, Web::new(), grpc, stopped(stop_rx.clone()))
+        serve_with_web(&store, &auth, web, grpc, stopped(stop_rx.clone()))
             .await
             .map_err(BoxError::from)
     };

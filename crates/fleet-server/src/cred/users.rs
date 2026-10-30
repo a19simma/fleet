@@ -179,6 +179,24 @@ impl Users {
             .map(|code| Secret::new(String::from_utf8_lossy(code.expose()).into_owned())))
     }
 
+    /// Checks `code` against the issued setup code without spending it.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`UserError::BadSetupCode`] when no code is issued or `code` differs.
+    pub async fn check_setup(&self, code: &[u8]) -> Result<(), UserError> {
+        let slot = self.setup.lock().await;
+        let matches = slot
+            .as_ref()
+            .is_some_and(|issued| constant_time_eq(issued.expose(), code));
+        drop(slot);
+        if matches {
+            Ok(())
+        } else {
+            Err(UserError::BadSetupCode)
+        }
+    }
+
     /// Creates the admin user when `code` matches the issued setup code.
     ///
     /// The code is spent on success. A wrong code leaves it in place. Once any user exists

@@ -140,6 +140,11 @@ pub struct Config {
     /// Path of the credential master key file, from `FLEET_MASTER_KEY_FILE`. `None` when
     /// unset or empty.
     pub master_key_file: Option<PathBuf>,
+    /// Public origin of the web UI, from `FLEET_WEB_ORIGIN` (for example
+    /// `https://fleet.example.com`). `None` when unset or empty, which turns web login off.
+    pub web_origin: Option<String>,
+    /// `WebAuthn` relying party id, from `FLEET_WEB_RP_ID`. `None` means the host of the origin.
+    pub web_rp_id: Option<String>,
 }
 
 /// Why the credential store cannot start. Messages carry no key bytes.
@@ -348,6 +353,8 @@ impl Config {
             master_key_file: lookup("FLEET_MASTER_KEY_FILE")
                 .filter(|v| !v.is_empty())
                 .map(PathBuf::from),
+            web_origin: lookup("FLEET_WEB_ORIGIN").filter(|v| !v.is_empty()),
+            web_rp_id: lookup("FLEET_WEB_RP_ID").filter(|v| !v.is_empty()),
             retention_interval: Duration::from_secs(number(
                 &lookup,
                 "FLEET_RETENTION_INTERVAL_SECS",
