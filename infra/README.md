@@ -49,6 +49,8 @@ Sources, read 2026-10-29:
 
 Verified in kind with `check-master-key-kind.sh` against chart `external-secrets` 2.14.0: the key file is unchanged and the Secret uid is the same after a forced sync annotation, a controller restart and an ExternalSecret delete and recreate. Unverified: behaviour under a different operator version, and whether a new CRD default would change the semantics. Pin the operator version in the operator's repo.
 
+Rotation, backup and restore steps are in [docs/credential-key-runbook.md](../docs/credential-key-runbook.md).
+
 The operator must enable etcd encryption at rest. Without it the Secret sits in etcd in the clear (ADR-0040).
 
 ## Image tag
