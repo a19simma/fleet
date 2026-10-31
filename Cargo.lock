@@ -862,7 +862,7 @@ dependencies = [
 
 [[package]]
 name = "fleet-cli"
-version = "0.2.5"
+version = "0.3.0"
 dependencies = [
  "clap",
  "fleet-proto",
@@ -877,7 +877,7 @@ dependencies = [
 
 [[package]]
 name = "fleet-core"
-version = "0.2.5"
+version = "0.3.0"
 dependencies = [
  "serde",
  "serde_json",
@@ -887,7 +887,7 @@ dependencies = [
 
 [[package]]
 name = "fleet-proto"
-version = "0.2.5"
+version = "0.3.0"
 dependencies = [
  "fleet-core",
  "prost",
@@ -900,7 +900,7 @@ dependencies = [
 
 [[package]]
 name = "fleet-server"
-version = "0.2.5"
+version = "0.3.0"
 dependencies = [
  "axum",
  "chacha20poly1305",
@@ -928,7 +928,7 @@ dependencies = [
 
 [[package]]
 name = "fleetd"
-version = "0.2.5"
+version = "0.3.0"
 dependencies = [
  "axum",
  "clap",
