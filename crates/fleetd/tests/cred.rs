@@ -665,6 +665,28 @@ async fn run_drops_the_credentials_after_a_fetch_that_succeeded() -> TestResult 
 }
 
 #[tokio::test]
+async fn run_fails_a_claude_job_with_no_claude_credential_and_never_uses_the_box_token()
+-> TestResult {
+    let reply = GetJobCredentialsReply {
+        credentials: vec![
+            wire("github_pat", "static_secret", GITHUB),
+            wire("codex_api_key", "static_secret", AGENT),
+        ],
+    };
+    let mut lane = lane(Ok(reply), Renew::Quiet, None).await?;
+    let (_trigger, shutdown) = Shutdown::channel();
+    let result = bounded(Box::pin(lane.runner.run(repo_job(), shutdown))).await?;
+    assert!(result.is_err());
+    assert_eq!(lane.fake.steps(), ["credentials"]);
+    let all = drain(&mut lane.reports);
+    let last = terminal(&all).ok_or("no terminal report")?;
+    assert_eq!(last.terminal_state, Some(JobState::Failed as i32));
+    assert_eq!(last.error.as_deref(), Some(ERR_NO_AGENT));
+    assert!(lane.book.get("job1").is_none());
+    Ok(())
+}
+
+#[tokio::test]
 async fn run_cancels_the_job_when_cancel_arrives_during_the_fetch() -> TestResult {
     let mut lane = lane(Ok(good()), Renew::Cancel, None).await?;
     lane.fake.hang.store(true, Ordering::SeqCst);

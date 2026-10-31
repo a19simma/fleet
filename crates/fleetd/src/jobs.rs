@@ -21,7 +21,7 @@ use crate::agent_config::Bundle;
 use crate::broker::{Broker, GhCli, MirrorGit};
 use crate::config::Config;
 use crate::connect_proxy::{ConnectProxy, ProxyLimits};
-use crate::cred::{CredentialBook, CredentialClient};
+use crate::cred::{CredentialBook, CredentialClient, ERR_NO_AGENT};
 use crate::fetch::{Dialer, Fetcher, Resolver, SystemResolver, TcpDialer, webpki_tls_config};
 use crate::fetch_service::{FeedBook, FetchRecorder, FetchService, MAX_CONCURRENT_FETCHES};
 use crate::jobenv::group_id;
@@ -139,6 +139,15 @@ impl<R: Reporter> DaemonRunner<R> {
             .with_redactor(self.agent.job_redactor(&job.job_id).as_ref().clone())
     }
 
+    fn has_model_credential(job: &Job, held: &crate::cred::JobCredentials) -> bool {
+        match crate::agent::resolve(&job.agent) {
+            Some(runner) if runner.name() == crate::agent::CLAUDE => {
+                crate::agent::model_env(held).is_some()
+            }
+            _ => true,
+        }
+    }
+
     async fn fetch_credentials(&self, job: &Job, mut shutdown: Shutdown) -> Result<(), RunError> {
         let Some(book) = &self.credentials else {
             return Ok(());
@@ -153,6 +162,11 @@ impl<R: Reporter> DaemonRunner<R> {
         };
         match guarded {
             Ok(Ok(held)) => {
+                if !Self::has_model_credential(job, &held) {
+                    tracing::warn!(reason = ERR_NO_AGENT, "job credentials refused");
+                    self.agent.fail_job(job, ERR_NO_AGENT).await;
+                    return Err(RunError);
+                }
                 self.agent.adopt_credentials(&job.job_id, &held);
                 Ok(())
             }
