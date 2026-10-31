@@ -63,7 +63,7 @@ pub struct Cli {
 }
 
 /// Agent names `--agent` accepts.
-const AGENTS: [&str; 3] = ["claude", "codex", "kimi"];
+pub const AGENTS: [&str; 3] = ["claude", "codex", "kimi"];
 
 /// A subcommand.
 #[derive(Debug, Subcommand)]
@@ -89,7 +89,7 @@ pub enum Command {
             long,
             value_name = "AGENT",
             value_parser = AGENTS,
-            help = "Agent that runs the job: claude, codex or kimi [default: claude]"
+            help = "Agent that runs the job [default: claude]"
         )]
         agent: Option<String>,
         /// Task prompt, or `-` to read it from stdin.
@@ -190,7 +190,7 @@ pub enum BatchAction {
             long,
             value_name = "AGENT",
             value_parser = AGENTS,
-            help = "Agent that runs every job: claude, codex or kimi [default: claude]"
+            help = "Agent that runs every job [default: claude]"
         )]
         agent: Option<String>,
     },
