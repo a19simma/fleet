@@ -498,6 +498,19 @@ async fn exchange(
     .map_err(|_| io::Error::other("timed out"))?
 }
 
+/// Whether the listener closed the connection and sent no reply frame. A close with the
+/// request unread surfaces as end of file on macOS and as a reset on Linux.
+fn closed_without_reply(reply: &io::Result<Vec<u8>>) -> bool {
+    reply.as_ref().is_err_and(|e| {
+        matches!(
+            e.kind(),
+            io::ErrorKind::UnexpectedEof
+                | io::ErrorKind::ConnectionReset
+                | io::ErrorKind::BrokenPipe
+        )
+    })
+}
+
 fn json(frame: &[u8]) -> Result<serde_json::Value, Box<dyn Error>> {
     Ok(serde_json::from_slice(frame)?)
 }
@@ -677,11 +690,8 @@ async fn another_jobs_entry_is_refused() -> TestResult {
         &world.wired,
         Arc::new(Mutex::new(String::from("jobb"))),
     )?;
-    let err = broker_reply(&world, "jobb", "pr_checks").await.err();
-    assert!(
-        err.is_some_and(|e| e.kind() == io::ErrorKind::UnexpectedEof),
-        "jobb used the broker of joba"
-    );
+    let reply = broker_reply(&world, "jobb", "pr_checks").await;
+    assert!(closed_without_reply(&reply), "jobb used the broker of joba");
     let theirs = json(&fetch_reply(&world, "jobb").await?)?;
     assert_eq!(theirs["status"], "error", "{theirs}");
     assert_eq!(theirs["error"], Refusal::NotRecorded.message(), "{theirs}");
@@ -704,7 +714,7 @@ async fn another_jobs_entry_is_refused() -> TestResult {
     )
     .await;
     assert!(
-        reply.is_err_and(|e| e.kind() == io::ErrorKind::UnexpectedEof),
+        closed_without_reply(&reply),
         "joba identity served on jobc socket"
     );
     drop((other, spoof));
@@ -719,11 +729,8 @@ async fn reconnect_after_job_end_closes_without_reply() -> TestResult {
     assert_eq!(live["status"], "ok", "{live}");
     finish(running).await?;
     let reached = world.hits.load(Ordering::SeqCst);
-    let err = broker_reply(&world, "joba", "pr_checks").await.err();
-    assert!(
-        err.is_some_and(|e| e.kind() == io::ErrorKind::UnexpectedEof),
-        "broker replied after end"
-    );
+    let reply = broker_reply(&world, "joba", "pr_checks").await;
+    assert!(closed_without_reply(&reply), "broker replied after end");
     let after = json(&fetch_reply(&world, "joba").await?)?;
     assert_eq!(after["status"], "error", "{after}");
     assert_eq!(after["error"], Refusal::NotRecorded.message(), "{after}");
