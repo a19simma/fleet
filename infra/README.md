@@ -6,7 +6,7 @@ Kubernetes manifests for fleet-server. An Argo CD Application in the cluster ope
 
 - `deployment.yaml`: the fleet-server Deployment in namespace `fleet-server`.
 - `service.yaml`: a ClusterIP Service for the gRPC port (7070) and the health port (7072).
-- `kustomization.yaml`: lists both and pins the image `ghcr.io/a19simma/fleet-server` to tag 0.2.5. That tag is a baseline floor.
+- `kustomization.yaml`: lists both and pins the image `ghcr.io/a19simma/fleet-server` to tag 0.3.2. That tag is a baseline floor.
 - `master-key-generator.yaml` and `master-key-externalsecret.yaml`: an external-secrets Password generator and an ExternalSecret that create Secret `fleet-master-key` once. See Master key.
 - `httproute.yaml`: HTTPRoute `fleet-server` on one host. It sends every path to Service port 7070 (pages under `/` and `/static/style.css`, gRPC under `/fleet.v1.`), sets `Strict-Transport-Security: max-age=31536000` on responses, and disables the route request timeout so gRPC streams survive. The host is the placeholder `fleet.example.com`.
 - `check-web-route.sh`: renders the kustomization and fails unless the HTTPRoute sets HSTS, targets port 7070, and `FLEET_WEB_RP_ID` and `FLEET_WEB_ORIGIN` equal the route host and `https://` plus the host.
