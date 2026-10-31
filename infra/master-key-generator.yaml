@@ -5,7 +5,3 @@ metadata:
   namespace: fleet-server
 spec:
   length: 32
-  encoding: hex
-  prefix: "k1:"
-  secretKeys:
-    - keyring

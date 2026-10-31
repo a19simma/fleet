@@ -40,15 +40,14 @@ The operator owns everything this directory leaves out.
 
 ADR-0040 keeps the credential master key in a file. The Deployment mounts Secret `fleet-master-key` read-only at `/etc/fleet/master-key` and sets `FLEET_MASTER_KEY_FILE=/etc/fleet/master-key/keyring`. The file holds one key ring line, `k1:` followed by 64 hex characters. The first line is the active key.
 
-The Password generator makes the value: `length: 32` with `encoding: hex` gives 64 hex characters, and `prefix: "k1:"` adds the key id. The ExternalSecret sets `refreshInterval: "0s"`, `refreshPolicy: CreatedOnce` and `creationPolicy: Orphan`, so the Secret is created once and never rewritten, and it outlives the ExternalSecret. A regenerated key would make every stored credential unreadable.
+The Password generator makes 32 random characters under the key `password`. The ExternalSecret template writes `keyring` as `k1:` plus the sha256 of that password, which is 64 hex characters. The installed operator's Password CRD has no `encoding`, `prefix` or `secretKeys` fields, so the template does that work. The ExternalSecret sets `refreshInterval: "0s"`, `refreshPolicy: CreatedOnce` and `creationPolicy: Orphan`, so the Secret is created once and never rewritten, and it outlives the ExternalSecret. A regenerated key would make every stored credential unreadable.
 
 Sources, read 2026-10-29:
 
 - Official docs, [Generator guide](https://external-secrets.io/latest/guides/generator/): "The generator does not keep track of the produced values. Every invocation produces a new set of values." So stability comes from the ExternalSecret settings alone.
 - Source code, [externalsecret_types.go](https://github.com/external-secrets/external-secrets/blob/main/apis/externalsecrets/v1/externalsecret_types.go): `refreshInterval` "May be set to "0s" to fetch and create it once". `refreshPolicy` `CreatedOnce` "Creates the Secret only if it does not exist and does not update it thereafter". `creationPolicy` `Orphan` "creates the Secret and does not set the ownerReference. I.e. it will be orphaned after the deletion of the ExternalSecret."
-- Official docs, [Password generator](https://external-secrets.io/latest/api/generator/password/) (raw page): "The prefix and suffix are added after `encoding`" and the hex example turns a 16 character password into 32 hex characters.
 
-Verified in kind with `check-master-key-kind.sh` against chart `external-secrets` 2.14.0: the key file is unchanged and the Secret uid is the same after a forced sync annotation, a controller restart and an ExternalSecret delete and recreate. Unverified: behaviour under a different operator version, and whether a new CRD default would change the semantics. Pin the operator version in the operator's repo.
+Verified in kind with `check-master-key-kind.sh` against chart `external-secrets` 2.14.0: the key file is unchanged and the Secret uid is the same after a forced sync annotation, a controller restart and an ExternalSecret delete and recreate. Unverified: behaviour under a different operator version, and whether a new CRD default would change the semantics. The live cluster rejected the generator's `encoding`, `prefix` and `secretKeys`; the first deploy produced a key named `password` and the server refused to start. Pin the operator version in the operator's repo.
 
 Rotation, backup and restore steps are in [docs/credential-key-runbook.md](../docs/credential-key-runbook.md).
 
