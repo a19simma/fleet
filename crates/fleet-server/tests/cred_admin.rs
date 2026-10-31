@@ -3,7 +3,7 @@
 
 use std::process::{Command, Output};
 
-use fleet_server::cred::admin::{AdminCommand, AdminError, parse_args, run};
+use fleet_server::cred::admin::{AdminCommand, AdminError, SETUP_CODE_TTL_HOURS, parse_args, run};
 use fleet_server::cred::users::{UserError, Users};
 use sqlx::{ConnectOptions, PgPool};
 
@@ -46,6 +46,131 @@ async fn user_with_passkey(pool: &PgPool, name: &str) -> Res<i64> {
     .execute(pool)
     .await?;
     Ok(id)
+}
+
+async fn add_tokens(pool: &PgPool, user: i64, active: usize, revoked: usize) -> Res<()> {
+    for n in 0..active + revoked {
+        sqlx::query(
+            "INSERT INTO api_tokens (user_id, hash, revoked_at) \
+             VALUES ($1, sha256($2::bytea), CASE WHEN $3 THEN now() - interval '1 day' END)",
+        )
+        .bind(user)
+        .bind(format!("tok-{user}-{n}").into_bytes())
+        .bind(n >= active)
+        .execute(pool)
+        .await?;
+    }
+    Ok(())
+}
+
+async fn active_tokens(pool: &PgPool, user: i64) -> Res<i64> {
+    Ok(sqlx::query_scalar(
+        "SELECT count(*) FROM api_tokens WHERE user_id = $1 AND revoked_at IS NULL",
+    )
+    .bind(user)
+    .fetch_one(pool)
+    .await?)
+}
+
+#[sqlx::test]
+async fn reset_revokes_active_tokens_of_that_user_only_and_counts_them(pool: PgPool) {
+    let alice = user_with_passkey(&pool, "alice").await.unwrap();
+    let bob = user_with_passkey(&pool, "bob").await.unwrap();
+    add_tokens(&pool, alice, 2, 1).await.unwrap();
+    add_tokens(&pool, bob, 2, 0).await.unwrap();
+    let old: String = sqlx::query_scalar(
+        "SELECT revoked_at::text FROM api_tokens WHERE user_id = $1 AND revoked_at IS NOT NULL",
+    )
+    .bind(alice)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    let done = run(&pool, &AdminCommand::ResetPasskeys("alice".into()), "op")
+        .await
+        .unwrap();
+    assert_eq!(done.tokens_revoked, 2);
+    assert_eq!(active_tokens(&pool, alice).await.unwrap(), 0);
+    assert_eq!(active_tokens(&pool, bob).await.unwrap(), 2);
+    let after: String = sqlx::query_scalar(
+        "SELECT min(revoked_at)::text FROM api_tokens WHERE user_id = $1 \
+         AND revoked_at < now() - interval '12 hours'",
+    )
+    .bind(alice)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(old, after);
+    let audited: i32 =
+        sqlx::query_scalar("SELECT tokens_revoked FROM admin_audit WHERE user_id = $1")
+            .bind(alice)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(audited, 2);
+}
+
+#[sqlx::test]
+async fn create_user_audits_zero_tokens_revoked(pool: PgPool) {
+    let done = run(&pool, &AdminCommand::CreateUser("alice".into()), "op")
+        .await
+        .unwrap();
+    assert_eq!(done.tokens_revoked, 0);
+    let audited: i32 = sqlx::query_scalar("SELECT tokens_revoked FROM admin_audit")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(audited, 0);
+}
+
+#[sqlx::test]
+async fn a_rolled_back_reset_leaves_tokens_valid(pool: PgPool) {
+    let alice = user_with_passkey(&pool, "alice").await.unwrap();
+    add_tokens(&pool, alice, 2, 0).await.unwrap();
+    sqlx::query("DROP TABLE admin_audit")
+        .execute(&pool)
+        .await
+        .unwrap();
+    run(&pool, &AdminCommand::ResetPasskeys("alice".into()), "op")
+        .await
+        .unwrap_err();
+    assert_eq!(active_tokens(&pool, alice).await.unwrap(), 2);
+    assert_eq!(
+        count(&pool, "SELECT count(*) FROM passkeys").await.unwrap(),
+        1
+    );
+}
+
+#[sqlx::test]
+async fn the_binary_reports_tokens_ttl_and_a_blank_operator(pool: PgPool) {
+    let url = pool.connect_options().to_url_lossy().to_string();
+    let alice = user_with_passkey(&pool, "alice").await.unwrap();
+    add_tokens(&pool, alice, 3, 0).await.unwrap();
+    let out = Command::new(env!("CARGO_BIN_EXE_fleet-server"))
+        .args(["admin", "reset-passkeys", "alice"])
+        .env_clear()
+        .env("FLEET_DATABASE_URL", &url)
+        .env("USER", "")
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(0));
+    let stdout = String::from_utf8(out.stdout).unwrap();
+    assert!(stdout.contains("api tokens revoked: 3\n"), "{stdout}");
+    assert!(
+        stdout.contains(&format!("expires in {SETUP_CODE_TTL_HOURS} hours")),
+        "{stdout}"
+    );
+    let operator: String = sqlx::query_scalar("SELECT operator FROM admin_audit")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(operator, "unknown");
+}
+
+#[test]
+fn database_failure_prints_the_migration_hint() {
+    let err = AdminError::from(sqlx::Error::PoolTimedOut);
+    assert_eq!(err.to_string(), "database error: is the database migrated?");
+    assert_eq!(err.exit_code(), 1);
 }
 
 #[test]

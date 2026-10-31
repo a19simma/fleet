@@ -18,20 +18,22 @@ SELECT id, username FROM users WHERE lower(username) = lower($1) AND lower(usern
 const INSERT_USER: &str = "INSERT INTO users (username) VALUES ($1) RETURNING id";
 const DELETE_PASSKEYS: &str = "DELETE FROM passkeys WHERE user_id = $1";
 const DELETE_SESSIONS: &str = "DELETE FROM web_sessions WHERE user_id = $1";
+const REVOKE_TOKENS: &str =
+    "UPDATE api_tokens SET revoked_at = now() WHERE user_id = $1 AND revoked_at IS NULL";
 const DELETE_OPEN_CODES: &str = "DELETE FROM setup_codes WHERE user_id = $1 AND used_at IS NULL";
 const INSERT_CODE: &str = "\
 INSERT INTO setup_codes (user_id, hash, expires_at) \
 VALUES ($1, sha256($2::bytea), now() + make_interval(hours => $3))";
 const INSERT_AUDIT: &str = "\
-INSERT INTO admin_audit (action, user_id, username, passkeys_removed, sessions_revoked, operator) \
-VALUES ($1, $2, $3, $4, $5, $6)";
+INSERT INTO admin_audit (action, user_id, username, passkeys_removed, sessions_revoked, tokens_revoked, operator) \
+VALUES ($1, $2, $3, $4, $5, $6, $7)";
 
 /// A parsed `admin` invocation.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AdminCommand {
     /// Create a user and issue a setup code.
     CreateUser(String),
-    /// Delete the user's passkeys and sessions and issue a fresh setup code.
+    /// Delete the user's passkeys and sessions, revoke the api tokens and issue a fresh setup code.
     ResetPasskeys(String),
 }
 
@@ -76,6 +78,9 @@ impl fmt::Display for AdminError {
             Self::NoSuchUser => f.write_str("no such user"),
             Self::MissingDatabaseUrl => f.write_str("FLEET_DATABASE_URL is not set"),
             Self::Output => f.write_str("cannot write to standard output"),
+            Self::User(UserError::Db(_)) => {
+                f.write_str("database error: is the database migrated?")
+            }
             Self::User(e) => e.fmt(f),
         }
     }
@@ -107,6 +112,8 @@ pub struct AdminOutcome {
     pub passkeys_removed: u64,
     /// How many web sessions the command deleted.
     pub sessions_revoked: u64,
+    /// How many active api tokens the command revoked.
+    pub tokens_revoked: u64,
 }
 
 impl fmt::Debug for AdminOutcome {
@@ -143,7 +150,7 @@ pub async fn run(
     operator: &str,
 ) -> Result<AdminOutcome, AdminError> {
     let mut tx = pool.begin().await?;
-    let (action, user_id, username, passkeys, sessions) = match cmd {
+    let (action, user_id, username, passkeys, sessions, tokens) = match cmd {
         AdminCommand::CreateUser(name) => {
             validate_username(name)?;
             let id: i64 = sqlx::query_scalar(INSERT_USER)
@@ -154,7 +161,7 @@ pub async fn run(
                     sqlx::Error::Database(db) if db.is_unique_violation() => UserError::Taken,
                     _ => UserError::Db(e),
                 })?;
-            ("user_create", id, name.clone(), 0, 0)
+            ("user_create", id, name.clone(), 0, 0, 0)
         }
         AdminCommand::ResetPasskeys(name) => {
             let (id, stored): (i64, String) = sqlx::query_as(FIND_USER)
@@ -172,11 +179,16 @@ pub async fn run(
                 .execute(&mut *tx)
                 .await?
                 .rows_affected();
+            let tokens = sqlx::query(REVOKE_TOKENS)
+                .bind(id)
+                .execute(&mut *tx)
+                .await?
+                .rows_affected();
             sqlx::query(DELETE_OPEN_CODES)
                 .bind(id)
                 .execute(&mut *tx)
                 .await?;
-            ("passkey_reset", id, stored, passkeys, sessions)
+            ("passkey_reset", id, stored, passkeys, sessions, tokens)
         }
     };
     let setup_code = Secret::new(random_hex());
@@ -192,6 +204,7 @@ pub async fn run(
         .bind(&username)
         .bind(i32::try_from(passkeys).unwrap_or(i32::MAX))
         .bind(i32::try_from(sessions).unwrap_or(i32::MAX))
+        .bind(i32::try_from(tokens).unwrap_or(i32::MAX))
         .bind(operator)
         .execute(&mut *tx)
         .await?;
@@ -202,5 +215,6 @@ pub async fn run(
         setup_code,
         passkeys_removed: passkeys,
         sessions_revoked: sessions,
+        tokens_revoked: tokens,
     })
 }

@@ -16,6 +16,7 @@ CREATE TABLE admin_audit (
     username text NOT NULL,
     passkeys_removed integer NOT NULL DEFAULT 0,
     sessions_revoked integer NOT NULL DEFAULT 0,
+    tokens_revoked integer NOT NULL DEFAULT 0,
     operator text NOT NULL,
     created_at timestamptz NOT NULL DEFAULT now()
 );

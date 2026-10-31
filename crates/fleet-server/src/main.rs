@@ -10,7 +10,7 @@ use axum::Router;
 use axum::routing::get;
 use fleet_server::auth::BearerAuth;
 use fleet_server::config::{Config, CredentialsState, exposed_binds, is_loopback};
-use fleet_server::cred::admin::{AdminError, parse_args, run as run_admin};
+use fleet_server::cred::admin::{AdminError, SETUP_CODE_TTL_HOURS, parse_args, run as run_admin};
 use fleet_server::cred::github::HttpsGithub;
 use fleet_server::cred::store::CredentialStore;
 use fleet_server::cred::{CredentialService, Users};
@@ -201,14 +201,19 @@ async fn admin(args: &[String]) -> Result<(), AdminError> {
         .acquire_timeout(ACQUIRE_TIMEOUT)
         .connect_with(options)
         .await?;
-    let operator = std::env::var("USER").unwrap_or_else(|_| "unknown".to_owned());
+    let operator = std::env::var("USER")
+        .ok()
+        .filter(|name| !name.is_empty())
+        .unwrap_or_else(|| "unknown".to_owned());
     let done = run_admin(&pool, &cmd, &operator).await?;
     let report = format!(
-        "user: {}\npasskeys removed: {}\nsessions revoked: {}\nsetup code: {}\nthe code works once and expires in 24 hours\n",
+        "user: {}\npasskeys removed: {}\nsessions revoked: {}\napi tokens revoked: {}\nsetup code: {}\nthe code works once and expires in {} hours\n",
         done.username,
         done.passkeys_removed,
         done.sessions_revoked,
-        String::from_utf8_lossy(done.setup_code.expose())
+        done.tokens_revoked,
+        String::from_utf8_lossy(done.setup_code.expose()),
+        SETUP_CODE_TTL_HOURS
     );
     std::io::stdout()
         .write_all(report.as_bytes())
