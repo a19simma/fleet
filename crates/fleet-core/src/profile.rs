@@ -8,8 +8,13 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 
+use crate::tools::ToolSpec;
+
 /// Domain-separation prefix hashed before the canonical bytes of a [`Profile`].
 pub const PROFILE_HASH_DOMAIN: &[u8] = b"fleet-profile-v1\0";
+
+/// Domain-separation prefix for a [`Profile`] that sets `tools` (ADR-0048).
+pub const PROFILE_HASH_DOMAIN_V2: &[u8] = b"fleet-profile-v2\0";
 
 /// Failures from parsing a [`Profile`] or a [`ProfileHash`].
 ///
@@ -21,6 +26,8 @@ pub enum ProfileError {
     Malformed,
     /// A hash string is not 64 lowercase hex characters.
     InvalidHash,
+    /// The input is JSON and sets a non-empty `tools` field; only TOML input accepts it.
+    ToolsNotAllowed,
 }
 
 impl fmt::Display for ProfileError {
@@ -28,6 +35,7 @@ impl fmt::Display for ProfileError {
         match self {
             Self::Malformed => f.write_str("profile is not valid profile JSON"),
             Self::InvalidHash => f.write_str("profile hash is not 64 lowercase hex characters"),
+            Self::ToolsNotAllowed => f.write_str("profile tools are accepted only from TOML input"),
         }
     }
 }
@@ -198,6 +206,9 @@ pub struct Profile {
     /// Agent settings.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub settings: Option<Settings>,
+    /// Tool pins; accepted only from TOML input (ADR-0048).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tools: Vec<ToolSpec>,
 }
 
 /// The sha256 identity of a [`Profile`]; displays as 64 lowercase hex characters.
@@ -291,12 +302,27 @@ impl Profile {
     /// # Errors
     ///
     /// Returns [`ProfileError::Malformed`] for bad JSON, a top level that is not an object, unknown fields, wrong types or an env
-    /// flag other than `"0"` or `"1"`.
+    /// flag other than `"0"` or `"1"`, and [`ProfileError::ToolsNotAllowed`] for a non-empty `tools`.
     pub fn from_json(bytes: &[u8]) -> Result<Self, ProfileError> {
         if bytes.trim_ascii_start().first() != Some(&b'{') {
             return Err(ProfileError::Malformed);
         }
-        serde_json::from_slice(bytes).map_err(|_| ProfileError::Malformed)
+        let profile: Self = serde_json::from_slice(bytes).map_err(|_| ProfileError::Malformed)?;
+        if profile.tools.is_empty() {
+            Ok(profile)
+        } else {
+            Err(ProfileError::ToolsNotAllowed)
+        }
+    }
+
+    /// Parses a Profile from TOML text, the only input that accepts `tools`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ProfileError::Malformed`] for bad TOML, unknown fields, wrong types, an unknown
+    /// tool or a version that is not an exact pin.
+    pub fn from_toml(text: &str) -> Result<Self, ProfileError> {
+        toml::from_str(text).map_err(|_| ProfileError::Malformed)
     }
 
     /// The canonical JSON: keys sorted by byte at every depth, no whitespace, absent fields omitted.
@@ -309,16 +335,30 @@ impl Profile {
             clippy::expect_used,
             reason = "a Profile holds only strings, integers and lists, which always serialise"
         )]
-        let value = serde_json::to_value(self).expect("profile serialises to a JSON value");
+        let value = if self.tools.len() > 1 {
+            let mut sorted = self.clone();
+            sorted.tools.sort_by(|a, b| {
+                (a.name(), a.version().as_str()).cmp(&(b.name(), b.version().as_str()))
+            });
+            serde_json::to_value(&sorted)
+        } else {
+            serde_json::to_value(self)
+        }
+        .expect("profile serialises to a JSON value");
         let mut out = String::new();
         write_canonical(&value, &mut out);
         out.into_bytes()
     }
 
-    /// The Profile hash: `sha256(PROFILE_HASH_DOMAIN + canonical bytes)`.
+    /// The Profile hash: `sha256(PROFILE_HASH_DOMAIN + canonical bytes)`, or with
+    /// [`PROFILE_HASH_DOMAIN_V2`] when `tools` is non-empty. Tools hash in sorted order.
     pub fn hash(&self) -> ProfileHash {
         let mut hasher = Sha256::new();
-        hasher.update(PROFILE_HASH_DOMAIN);
+        hasher.update(if self.tools.is_empty() {
+            PROFILE_HASH_DOMAIN
+        } else {
+            PROFILE_HASH_DOMAIN_V2
+        });
         hasher.update(self.canonical_json());
         ProfileHash(hasher.finalize().into())
     }
@@ -327,6 +367,7 @@ impl Profile {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fmt::Write as _;
 
     const FULL: &str = r##"{
         "claude_md": "# hi",
@@ -594,6 +635,105 @@ mod tests {
                 ProfileHash::from_hex(&bad),
                 Err(ProfileError::InvalidHash),
                 "{bad}"
+            );
+        }
+    }
+
+    #[test]
+    fn existing_profile_hash_is_unchanged() {
+        assert_eq!(
+            parse(FULL).hash().to_string(),
+            "953f0c1f80437603baf0fba5868d12631a4e82651140146fa7ab4edd6c165baf"
+        );
+    }
+
+    const TOOLS_TOML: &str = "model = \"opus\"\n[[tools]]\nname = \"node\"\nversion = \"20.11.1\"\n[[tools]]\nname = \"jq\"\nversion = \"1.7.1\"\n";
+
+    fn toml_profile(tools: &[(&str, &str)]) -> Profile {
+        let mut text = String::new();
+        for (name, version) in tools {
+            let _ = write!(
+                text,
+                "[[tools]]\nname = \"{name}\"\nversion = \"{version}\"\n"
+            );
+        }
+        Profile::from_toml(&text).unwrap()
+    }
+
+    #[test]
+    fn empty_tools_keep_v1_hash() {
+        let p = Profile::from_toml("model = \"opus\"\n").unwrap();
+        let mut hasher = Sha256::new();
+        hasher.update(b"fleet-profile-v1\0");
+        hasher.update(p.canonical_json());
+        let expected: [u8; 32] = hasher.finalize().into();
+        assert_eq!(p.hash().as_bytes(), &expected);
+        assert_eq!(p.canonical_json(), br#"{"model":"opus"}"#);
+    }
+
+    #[test]
+    fn tools_use_v2_prefix_and_appear_in_canonical_json() {
+        let p = toml_profile(&[("node", "20.11.1")]);
+        let mut hasher = Sha256::new();
+        hasher.update(b"fleet-profile-v2\0");
+        hasher.update(p.canonical_json());
+        let expected: [u8; 32] = hasher.finalize().into();
+        assert_eq!(p.hash().as_bytes(), &expected);
+        assert_eq!(
+            p.canonical_json(),
+            br#"{"tools":[{"name":"node","version":"20.11.1"}]}"#
+        );
+    }
+
+    #[test]
+    fn tools_change_the_hash() {
+        let none = Profile::default().hash();
+        let one = toml_profile(&[("node", "20.11.1")]).hash();
+        let other_version = toml_profile(&[("node", "20.11.2")]).hash();
+        let other_tool = toml_profile(&[("jq", "20.11.1")]).hash();
+        let both = toml_profile(&[("node", "20.11.1"), ("jq", "1.7.1")]).hash();
+        let all = [none, one, other_version, other_tool, both];
+        for (i, a) in all.iter().enumerate() {
+            for b in &all[i + 1..] {
+                assert_ne!(a, b);
+            }
+        }
+    }
+
+    #[test]
+    fn tool_order_does_not_change_the_hash() {
+        let ab = toml_profile(&[("node", "20.11.1"), ("jq", "1.7.1"), ("uv", "0.4.0")]);
+        let ba = toml_profile(&[("uv", "0.4.0"), ("node", "20.11.1"), ("jq", "1.7.1")]);
+        assert_eq!(ab.hash(), ba.hash());
+        assert_eq!(ab.canonical_json(), ba.canonical_json());
+        assert_eq!(Profile::from_toml(TOOLS_TOML).unwrap().tools.len(), 2);
+    }
+
+    #[test]
+    fn json_input_with_tools_is_rejected() {
+        let text = br#"{"tools":[{"name":"node","version":"20.11.1"}]}"#;
+        assert_eq!(Profile::from_json(text), Err(ProfileError::ToolsNotAllowed));
+        assert_eq!(
+            ProfileError::ToolsNotAllowed.to_string(),
+            "profile tools are accepted only from TOML input"
+        );
+        assert!(Profile::from_json(br#"{"tools":[]}"#).is_ok());
+        assert!(Profile::from_json(br#"{"tools":null}"#).is_err());
+    }
+
+    #[test]
+    fn toml_rejects_unknown_fields_tools_and_versions() {
+        for text in [
+            "claude_version = \"1\"\n",
+            "[[tools]]\nname = \"node\"\nversion = \"20\"\nx = 1\n",
+            "[[tools]]\nname = \"emacs\"\nversion = \"1\"\n",
+            "[[tools]]\nname = \"node\"\nversion = \"latest\"\n",
+            "[[tools]]\nname = \"node\"\n",
+        ] {
+            assert_eq!(
+                Profile::from_toml(text),
+                Err(ProfileError::Malformed),
+                "{text}"
             );
         }
     }

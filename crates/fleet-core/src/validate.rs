@@ -43,6 +43,9 @@ pub const MAX_TURNS: u32 = 1000;
 /// Largest accepted `max_budget_usd`, in whole US cents.
 pub const MAX_BUDGET_CENTS: u64 = 1_000_000;
 
+/// Most entries in `tools`.
+pub const MAX_TOOLS: usize = 8;
+
 /// Environment flag names a Profile may set.
 ///
 /// A choice to confirm: the first two are the flags fleetd and the deploy docs already set for
@@ -107,6 +110,10 @@ pub enum ProfileInvalid {
     ModelMismatch,
     /// A text field looks like it holds a secret.
     SecretLike,
+    /// `tools` holds more than [`MAX_TOOLS`] entries.
+    TooManyTools,
+    /// Two `tools` entries share a name.
+    DuplicateTool,
 }
 
 impl fmt::Display for ProfileInvalid {
@@ -128,6 +135,8 @@ impl fmt::Display for ProfileInvalid {
             Self::EnvName => "a profile env flag name is not allowed",
             Self::ModelMismatch => "profile settings.model differs from model",
             Self::SecretLike => "profile text looks like a secret",
+            Self::TooManyTools => "profile holds too many tools",
+            Self::DuplicateTool => "a profile tool name is repeated",
         })
     }
 }
@@ -290,6 +299,18 @@ impl Profile {
         Ok(())
     }
 
+    fn check_tools(&self) -> Result<(), ProfileInvalid> {
+        if self.tools.len() > MAX_TOOLS {
+            return Err(ProfileInvalid::TooManyTools);
+        }
+        let mut seen = BTreeSet::new();
+        if self.tools.iter().all(|tool| seen.insert(tool.name())) {
+            Ok(())
+        } else {
+            Err(ProfileInvalid::DuplicateTool)
+        }
+    }
+
     fn check_scalars(&self) -> Result<(), ProfileInvalid> {
         if let Some(model) = &self.model
             && !valid_model(model)
@@ -433,6 +454,7 @@ impl Profile {
     /// Returns the first rule that fails as a [`ProfileInvalid`] with a fixed message.
     pub fn validate(&self) -> Result<(), ProfileInvalid> {
         self.check_caps()?;
+        self.check_tools()?;
         self.check_scalars()?;
         self.check_paths()?;
         self.check_rules()?;
@@ -463,6 +485,31 @@ mod tests {
     use serde_json::json;
 
     const MARK: &str = "zqxjmarkerkvw";
+
+    #[test]
+    fn tools_cap_and_duplicates() {
+        let names = ["node", "python", "go", "java", "jq", "just", "uv"];
+        let spec = |name: &str, version: &str| crate::tools::ToolSpec::new(name, version).unwrap();
+        let mut tools: Vec<_> = names.iter().map(|n| spec(n, "1.0.0")).collect();
+        let ok = Profile {
+            tools: tools.clone(),
+            ..Profile::default()
+        };
+        assert_eq!(ok.validate(), Ok(()));
+        tools.push(spec("node", "2.0.0"));
+        assert_eq!(MAX_TOOLS, 8);
+        assert_eq!(tools.len(), MAX_TOOLS);
+        let same_name = Profile {
+            tools: tools.clone(),
+            ..Profile::default()
+        };
+        assert_eq!(same_name.validate(), Err(ProfileInvalid::DuplicateTool));
+        let nine = Profile {
+            tools: tools.iter().cycle().take(MAX_TOOLS + 1).cloned().collect(),
+            ..Profile::default()
+        };
+        assert_eq!(nine.validate(), Err(ProfileInvalid::TooManyTools));
+    }
 
     fn parse(value: &serde_json::Value) -> Profile {
         Profile::from_json(value.to_string().as_bytes()).unwrap()
