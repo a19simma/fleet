@@ -394,3 +394,141 @@ async fn released_credentials_never_print_their_value(pool: PgPool) {
         assert!(text.contains("ReleasedCredential"), "{text}");
     }
 }
+
+const KIMI_M: &str = "sk-kimi-membership-abcdefghijklmnop";
+const KIMI_P: &str = "sk-kimi-platform-abcdefghijklmnopqr";
+
+async fn expire(w: &World, kind: &str) {
+    sqlx::query("UPDATE credentials SET expires_at = now() - interval '1 second' WHERE kind = $1")
+        .bind(kind)
+        .execute(&w.pool)
+        .await
+        .unwrap();
+}
+
+async fn with_future_expiry(w: &World, kind: CredentialKind, value: &str) {
+    w.put(w.alice, kind, value, Some(1_900_000_000_000)).await;
+}
+
+#[sqlx::test]
+async fn only_an_expired_agent_credential_is_refused(pool: PgPool) {
+    let mut w = world(pool).await;
+    with_future_expiry(&w, CredentialKind::AnthropicApiKey, ANT).await;
+    w.put(w.alice, CredentialKind::GithubPat, PAT, None).await;
+    let job = w.running(w.alice, "claude", "k1").await;
+    expire(&w, "anthropic_api_key").await;
+    let status = w.fetch(&job, job.attempt, "box-1").await.unwrap_err();
+    assert_eq!(status.code(), Code::FailedPrecondition);
+    assert_eq!(status.message(), "credential expired");
+    assert_eq!(w.uses().await, 0);
+}
+
+#[sqlx::test]
+async fn an_expired_unneeded_claude_credential_is_skipped(pool: PgPool) {
+    let mut w = world(pool).await;
+    with_future_expiry(&w, CredentialKind::AnthropicApiKey, ANT).await;
+    w.put(w.alice, CredentialKind::ClaudeSubscriptionToken, OAT, None)
+        .await;
+    w.put(w.alice, CredentialKind::GithubPat, PAT, None).await;
+    let job = w.running(w.alice, "claude", "k1").await;
+    expire(&w, "anthropic_api_key").await;
+    let reply = w.fetch(&job, job.attempt, "box-1").await.unwrap();
+    assert_eq!(
+        pairs(&reply),
+        vec![
+            entry("claude_subscription_token", OAT),
+            entry("github_pat", PAT)
+        ]
+    );
+    assert_eq!(w.uses().await, 2);
+    let expired_used: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM credential_use u JOIN credentials c ON c.id = u.credential_id \
+         WHERE c.kind = 'anthropic_api_key'",
+    )
+    .fetch_one(&w.pool)
+    .await
+    .unwrap();
+    assert_eq!(expired_used, 0);
+}
+
+#[sqlx::test]
+async fn a_kimi_job_gets_both_kimi_kinds(pool: PgPool) {
+    let mut w = world(pool).await;
+    w.put(w.alice, CredentialKind::KimiMembershipKey, KIMI_M, None)
+        .await;
+    w.put(w.alice, CredentialKind::KimiPlatformKey, KIMI_P, None)
+        .await;
+    w.put(w.alice, CredentialKind::AnthropicApiKey, ANT, None)
+        .await;
+    w.put(w.alice, CredentialKind::GithubPat, PAT, None).await;
+    let job = w.running(w.alice, "kimi", "k1").await;
+    let reply = w.fetch(&job, job.attempt, "box-1").await.unwrap();
+    assert_eq!(
+        pairs(&reply),
+        vec![
+            entry("github_pat", PAT),
+            entry("kimi_membership_key", KIMI_M),
+            entry("kimi_platform_key", KIMI_P),
+        ]
+    );
+    assert_eq!(w.uses().await, 3);
+}
+
+#[sqlx::test]
+async fn an_unknown_agent_has_no_agent_credential(pool: PgPool) {
+    let mut w = world(pool).await;
+    sqlx::query("ALTER TABLE jobs DROP CONSTRAINT jobs_agent_check")
+        .execute(&w.pool)
+        .await
+        .unwrap();
+    w.put(w.alice, CredentialKind::AnthropicApiKey, ANT, None)
+        .await;
+    w.put(w.alice, CredentialKind::GithubPat, PAT, None).await;
+    let job = w.running(w.alice, "mystery", "k1").await;
+    let status = w.fetch(&job, job.attempt, "box-1").await.unwrap_err();
+    assert_eq!(status.code(), Code::FailedPrecondition);
+    assert_eq!(status.message(), "no agent credential");
+    assert_eq!(w.uses().await, 0);
+}
+
+#[sqlx::test]
+async fn job_writers_wait_while_a_release_is_open(pool: PgPool) {
+    let mut w = world(pool).await;
+    w.put(w.alice, CredentialKind::AnthropicApiKey, ANT, None)
+        .await;
+    w.put(w.alice, CredentialKind::GithubPat, PAT, None).await;
+    let job = w.running(w.alice, "claude", "k1").await;
+
+    let mut hold = w.pool.begin().await.unwrap();
+    sqlx::query("SELECT id FROM credentials WHERE kind = 'anthropic_api_key' FOR UPDATE")
+        .fetch_all(&mut *hold)
+        .await
+        .unwrap();
+
+    let creds = w.creds.clone();
+    let (job_id, attempt) = (job.job_id.clone(), job.attempt);
+    let release =
+        tokio::spawn(async move { creds.release_for_job(&job_id, attempt, "box-1").await });
+    tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
+    assert!(!release.is_finished());
+
+    let mut writer = w.pool.begin().await.unwrap();
+    sqlx::query("SET LOCAL lock_timeout = '300ms'")
+        .execute(&mut *writer)
+        .await
+        .unwrap();
+    let blocked = sqlx::query("UPDATE jobs SET state = 'QUEUED' WHERE job_id = $1")
+        .bind(&job.job_id)
+        .execute(&mut *writer)
+        .await;
+    assert!(blocked.is_err(), "job write did not wait for the release");
+    drop(writer);
+
+    hold.rollback().await.unwrap();
+    let released = tokio::time::timeout(std::time::Duration::from_secs(20), release)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    assert_eq!(released.len(), 2);
+}

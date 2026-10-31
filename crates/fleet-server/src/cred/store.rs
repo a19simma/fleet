@@ -40,7 +40,7 @@ SELECT kind, ciphertext, key_id FROM credentials WHERE id = $1 AND user_id = $2 
 const SELECT_LEASE: &str = "\
 SELECT user_id, agent FROM jobs \
 WHERE job_id = $1 AND attempt = $2 AND box = $3 AND state = 'RUNNING' \
-AND lease_expires_at > now()";
+AND lease_expires_at > now() FOR SHARE";
 
 const SELECT_RELEASABLE: &str = "\
 SELECT id, kind, (expires_at IS NOT NULL AND expires_at <= now()) AS expired \
@@ -357,6 +357,20 @@ impl CredentialStore {
     /// The reply holds every stored credential of a kind the agent accepts, plus the GitHub
     /// token. One use row is written per credential, in the same transaction as the reads.
     ///
+    /// The lease read takes `FOR SHARE` on the job row. A reclaim, a finish or any other write
+    /// to that row waits until this transaction commits or rolls back, so the credentials are
+    /// released against a lease that stays valid for the whole transaction. The lease expiring
+    /// by the clock is not prevented: it is checked once, when the row is read.
+    ///
+    /// Expired credentials of an agent kind are skipped. The release fails with
+    /// [`StoreError::Expired`] only when the GitHub credential is expired or when every
+    /// credential of a kind the agent accepts is expired. Checks run in this order: lease,
+    /// GitHub, agent, expiry.
+    ///
+    /// The opened plaintext is copied into a [`Secret`] and the intermediate buffers are not
+    /// zeroed. This is accepted: the value is also in the reply sent to the Box, so zeroing the
+    /// server copy would not shrink the exposure.
+    ///
     /// # Errors
     ///
     /// Returns [`StoreError::LeaseDenied`] when no job matches the lease,
@@ -410,7 +424,15 @@ impl CredentialStore {
         {
             return Err(StoreError::NoAgentCredential);
         }
-        if found.iter().any(|(_, _, expired)| *expired) {
+        let github_expired = found
+            .iter()
+            .any(|(_, kind, expired)| *kind == CredentialKind::GithubPat && *expired);
+        found.retain(|(_, kind, expired)| *kind == CredentialKind::GithubPat || !*expired);
+        if github_expired
+            || found
+                .iter()
+                .all(|(_, kind, _)| *kind == CredentialKind::GithubPat)
+        {
             return Err(StoreError::Expired);
         }
         let mut released = Vec::with_capacity(found.len());
