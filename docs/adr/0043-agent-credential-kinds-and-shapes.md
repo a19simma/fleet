@@ -58,6 +58,8 @@ The Anthropic legal page says developers "may not collect, store, or intermediat
 - Which hosts the Kimi CLI contacts besides `api.kimi.ai`. `auth.kimi.ai`, `code.kimi.ai` and `cdn.kimi.com` appear in its docs and were not observed by name in the keyed run. fleetd declares `api.kimi.ai` only, so a missing host fails closed.
 - Whether `kimi -p` accepts a prompt that starts with a dash.
 - The 900 s lifetime and single-use refresh of Kimi OAuth tokens.
+- The real Codex flags, the `CODEX_API_KEY` variable name, the host `api.openai.com` and any key prefix. CRED-65 proves the credential path with mock Codex and Kimi CLIs only (`crates/fleetd/tests/agent_probe.rs`), and live proof is deferred to CRED-65L.
+- The real Kimi key prefixes beyond `sk-kimi-`, and any host besides `api.kimi.ai`, until CRED-65L.
 - Whether the Codex CLI honours the `features.hooks` key. No live Codex run has checked it, and the argv `-c features.hooks=false` and the `config.toml` both set it.
 - Whether Anthropic enforces the quoted terms against a `claude setup-token` token stored by a self-hosted service.
 

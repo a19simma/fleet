@@ -32,6 +32,8 @@ v1 takes static secrets only. `refreshing_file` credentials, the Codex `auth.jso
 
 Residual risk: `CODEX_API_KEY` sits in the child environment, so the agent shell can read it from `/proc`, and it could be written into the worktree. `CLAUDE_CODE_OAUTH_TOKEN` has the same exposure. The Codex config sets `features.hooks=false` and no live Codex run has confirmed that CLI honours the key. Tests check the config and argv structure only.
 
+Unverified: the real Codex flags, env names, hosts and key prefixes, and the Kimi key prefixes and hosts beyond `api.kimi.ai`. The probe in `crates/fleetd/tests/agent_probe.rs` runs mock Codex and Kimi shell scripts, shaped from this contract, through the live egress proxy with a stored per-user credential. The key reaches each mock only through its env variable and appears in no feed, report, event or log. Live proof against the real CLIs is deferred to CRED-65L.
+
 ## Consequences
 
 - Adding a runner means one trait implementation and its kind list.
