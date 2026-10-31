@@ -1239,6 +1239,63 @@ fn agent_unit_makes_its_agent_tree_group_writable_as_the_job_user_on_stop() {
     assert!(privileged.is_empty(), "{privileged:?}");
 }
 
+fn deploy_file(rel: &str) -> String {
+    let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../deploy")
+        .join(rel);
+    fs::read_to_string(path).unwrap_or_default()
+}
+
+#[test]
+fn agent_unit_refuses_the_docker_socket() {
+    let lines = unit_directives("fleet-agent@.service");
+    let inaccessible: Vec<String> = lines
+        .iter()
+        .filter_map(|l| l.strip_prefix("InaccessiblePaths="))
+        .flat_map(|v| v.split_whitespace())
+        .map(|p| p.trim_start_matches('-').to_owned())
+        .collect();
+    for want in ["/run/docker.sock", "/var/run/docker.sock", "/etc/swarm"] {
+        assert!(inaccessible.iter().any(|p| p == want), "{want}");
+    }
+}
+
+#[test]
+fn no_deploy_file_adds_fleet_job_to_a_docker_group() {
+    let sysusers = deploy_file("sysusers.d/fleet.conf");
+    assert!(sysusers.contains("fleet-job"));
+    for line in sysusers.lines() {
+        let fields: Vec<&str> = line.split_whitespace().collect();
+        if fields.first() == Some(&"m") {
+            assert_ne!(fields.get(1), Some(&"fleet-job"), "{line}");
+            assert_ne!(fields.get(2), Some(&"docker"), "{line}");
+        }
+        if fields.first() == Some(&"u") && fields.get(1) == Some(&"fleet-job") {
+            assert_eq!(
+                fields.get(2).map(|g| g.split(':').next_back()),
+                Some(Some("fleet-work")),
+                "{line}"
+            );
+        }
+    }
+    for rel in [
+        "fleet-agent@.service",
+        "fleetd.service",
+        "fleetd-systemd.service",
+        "sysusers.d/fleet.conf",
+        "tmpfiles.d/fleet.conf",
+    ] {
+        let text = deploy_file(rel);
+        assert!(!text.is_empty(), "{rel}");
+        for line in text.lines() {
+            let docker_group = line.starts_with("SupplementaryGroups=") && line.contains("docker")
+                || line.starts_with("Group=") && line.contains("docker")
+                || line.starts_with("m ") && line.contains("docker");
+            assert!(!docker_group, "{rel}: {line}");
+        }
+    }
+}
+
 #[test]
 fn managed_settings_use_only_command_hooks() {
     let text = unit_directives("managed-settings.json").join("\n");
