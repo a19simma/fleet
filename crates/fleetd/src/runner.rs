@@ -1229,7 +1229,13 @@ impl<R: Reporter> AgentRunner<R> {
         let bundle = applied
             .as_deref()
             .map_or(&self.config.bundle, |applied| &applied.bundle);
-        let job_dir = match JobDir::create_shared(root, &job.job_id, bundle, self.config.job_gid) {
+        let job_dir = match JobDir::create_shared(
+            root,
+            &job.job_id,
+            bundle,
+            self.config.job_gid,
+            Some(cwd),
+        ) {
             Ok(dir) => dir,
             Err(err) => {
                 tracing::warn!(kind = ?err.kind(), "agent config dir could not be created");

@@ -329,6 +329,22 @@ fn checked_path(path: &Path) -> Result<PathBuf, BundleError> {
     Ok(rel)
 }
 
+fn gitconfig_for(checkout: Option<&Path>) -> io::Result<String> {
+    let Some(checkout) = checkout else {
+        return Ok(GITCONFIG.to_owned());
+    };
+    let text = checkout
+        .to_str()
+        .filter(|_| checkout.is_absolute())
+        .filter(|text| {
+            !text
+                .chars()
+                .any(|c| c.is_control() || c == '"' || c == '\\')
+        })
+        .ok_or_else(|| io::Error::from(io::ErrorKind::InvalidInput))?;
+    Ok(format!("{GITCONFIG}[safe]\n\tdirectory = \"{text}\"\n"))
+}
+
 /// One job's agent directory. Dropping it removes the directory.
 #[derive(Debug)]
 pub struct JobDir {
@@ -343,24 +359,29 @@ impl JobDir {
     ///
     /// Returns the I/O error when the id is invalid or a file cannot be written.
     pub fn create(root: &Path, job_id: &str, bundle: &Bundle) -> io::Result<Self> {
-        Self::create_shared(root, job_id, bundle, None)
+        Self::create_shared(root, job_id, bundle, None, None)
     }
 
     /// Like [`JobDir::create`]. With a `group`, `.agent` and the job directory become
     /// group-writable for it (2770, files 0660 or 0770) before the rename. `None` leaves the
-    /// modes as [`JobDir::create`] sets them.
+    /// modes as [`JobDir::create`] sets them. With a `checkout`, the job `.gitconfig` gets a
+    /// `safe.directory` entry for exactly that path, so git accepts a checkout owned by
+    /// another user.
     ///
     /// # Errors
     ///
-    /// Returns the I/O error when the id is invalid, a file cannot be written or the group
-    /// cannot be applied.
+    /// Returns the I/O error when the id is invalid, a file cannot be written, the group
+    /// cannot be applied or the `checkout` is not an absolute path free of control
+    /// characters, quotes and backslashes.
     pub fn create_shared(
         root: &Path,
         job_id: &str,
         bundle: &Bundle,
         group: Option<u32>,
+        checkout: Option<&Path>,
     ) -> io::Result<Self> {
         validate_job_id(job_id).map_err(|_| io::Error::from(io::ErrorKind::InvalidInput))?;
+        let gitconfig = gitconfig_for(checkout)?;
         let parent = root.join(AGENT_DIR);
         let path = parent.join(job_id);
         let staging = parent.join(format!("{job_id}.tmp"));
@@ -370,7 +391,7 @@ impl JobDir {
             .create(&parent)?;
         remove_if_present(&staging)?;
         remove_if_present(&path)?;
-        let built = Self::fill(&staging, bundle)
+        let built = Self::fill(&staging, bundle, &gitconfig)
             .and_then(|()| {
                 group.map_or(Ok(()), |gid| {
                     share_dir(&parent, gid).and_then(|()| share_tree(&staging, gid))
@@ -384,7 +405,7 @@ impl JobDir {
         Ok(Self { path })
     }
 
-    fn fill(staging: &Path, bundle: &Bundle) -> io::Result<()> {
+    fn fill(staging: &Path, bundle: &Bundle, gitconfig: &str) -> io::Result<()> {
         let home = staging.join(HOME);
         let claude = home.join(CLAUDE_DIR);
         for dir in [
@@ -410,7 +431,7 @@ impl JobDir {
             fs::write(&target, data)?;
             fs::set_permissions(&target, fs::Permissions::from_mode(0o600))?;
         }
-        fs::write(home.join(".gitconfig"), GITCONFIG)
+        fs::write(home.join(".gitconfig"), gitconfig)
     }
 
     /// The job directory.
@@ -521,7 +542,7 @@ mod shared_mode_tests {
     #[test]
     fn without_a_group_the_modes_stay_private() -> TestResult {
         let root = tempfile::tempdir()?;
-        let job = JobDir::create_shared(root.path(), "j1", &Bundle::default(), None)?;
+        let job = JobDir::create_shared(root.path(), "j1", &Bundle::default(), None, None)?;
         assert_eq!(modes(&job)?, [0o700, 0o700, 0o700]);
         let settings = job.home().join(".claude/settings.json");
         assert_eq!(std::fs::metadata(settings)?.mode() & 0o7777, 0o600);
@@ -532,11 +553,91 @@ mod shared_mode_tests {
     fn with_a_group_the_job_dirs_are_group_writable() -> TestResult {
         let root = tempfile::tempdir()?;
         let gid = std::fs::metadata(root.path())?.gid();
-        let job = JobDir::create_shared(root.path(), "j1", &Bundle::default(), Some(gid))?;
+        let job = JobDir::create_shared(root.path(), "j1", &Bundle::default(), Some(gid), None)?;
         assert_eq!(modes(&job)?, [0o2770, 0o2770, 0o2770]);
         let settings = job.home().join(".claude/settings.json");
         let meta = std::fs::metadata(settings)?;
         assert_eq!((meta.mode() & 0o7777, meta.gid()), (0o660, gid));
+        Ok(())
+    }
+
+    fn gitconfig_for(checkout: &std::path::Path) -> Result<String, std::io::Error> {
+        let root = tempfile::tempdir()?;
+        let job =
+            JobDir::create_shared(root.path(), "j1", &Bundle::default(), None, Some(checkout))?;
+        std::fs::read_to_string(job.home().join(".gitconfig"))
+    }
+
+    #[test]
+    fn the_gitconfig_trusts_exactly_the_checkout() -> TestResult {
+        let text = gitconfig_for(std::path::Path::new("/var/lib/fleet/jobs/j1"))?;
+        assert!(text.contains("[safe]\n\tdirectory = \"/var/lib/fleet/jobs/j1\"\n"));
+        assert_eq!(text.matches("directory").count(), 1);
+        assert!(!text.contains('*'));
+        Ok(())
+    }
+
+    #[test]
+    fn without_a_checkout_the_gitconfig_has_no_safe_section() -> TestResult {
+        let root = tempfile::tempdir()?;
+        let job = JobDir::create_shared(root.path(), "j1", &Bundle::default(), None, None)?;
+        let text = std::fs::read_to_string(job.home().join(".gitconfig"))?;
+        assert!(!text.contains("[safe]"));
+        Ok(())
+    }
+
+    #[test]
+    fn unsafe_checkout_paths_are_rejected() {
+        for bad in [
+            "relative/dir",
+            "/a\nb",
+            "/a\"b",
+            "/a\\b",
+            "/a\tb",
+            "/a\u{7f}b",
+            "",
+        ] {
+            let err = gitconfig_for(std::path::Path::new(bad)).err();
+            assert_eq!(
+                err.map(|e| e.kind()),
+                Some(std::io::ErrorKind::InvalidInput),
+                "{bad:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn git_commits_in_a_foreign_owned_checkout_only_with_the_entry() -> TestResult {
+        let repo = tempfile::tempdir()?;
+        let checkout = std::fs::canonicalize(repo.path())?;
+        let git = |config: &std::path::Path, args: &[&str]| {
+            std::process::Command::new("git")
+                .args(args)
+                .current_dir(&checkout)
+                .env_clear()
+                .env("PATH", std::env::var_os("PATH").unwrap_or_default())
+                .env("GIT_CONFIG_GLOBAL", config)
+                .env("GIT_CONFIG_NOSYSTEM", "1")
+                .env("GIT_TEST_ASSUME_DIFFERENT_OWNER", "1")
+                .output()
+        };
+        let none = tempfile::NamedTempFile::new()?;
+        assert!(git(none.path(), &["init", "-q"])?.status.success());
+        let denied = git(none.path(), &["commit", "-q", "--allow-empty", "-m", "x"])?;
+        assert!(!denied.status.success());
+        assert!(String::from_utf8_lossy(&denied.stderr).contains("dubious ownership"));
+        let text = gitconfig_for(&checkout)?;
+        let trusted = tempfile::NamedTempFile::new()?;
+        std::fs::write(trusted.path(), text)?;
+        let ok = git(
+            trusted.path(),
+            &["commit", "-q", "--allow-empty", "-m", "x"],
+        )?;
+        assert!(
+            ok.status.success(),
+            "{}",
+            String::from_utf8_lossy(&ok.stderr)
+        );
         Ok(())
     }
 
