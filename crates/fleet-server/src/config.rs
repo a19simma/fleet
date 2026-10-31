@@ -140,6 +140,9 @@ pub struct Config {
     /// Path of the credential master key file, from `FLEET_MASTER_KEY_FILE`. `None` when
     /// unset or empty.
     pub master_key_file: Option<PathBuf>,
+    /// Path of the signed update manifest, from `FLEET_UPDATE_MANIFEST`. The signature is the
+    /// file of the same name with `.minisig` appended. `None` when unset or empty.
+    pub update_manifest: Option<PathBuf>,
     /// Public origin of the web UI, from `FLEET_WEB_ORIGIN` (for example
     /// `https://fleet.example.com`). `None` when unset or empty, which turns web login off.
     pub web_origin: Option<String>,
@@ -353,6 +356,9 @@ impl Config {
             master_key_file: lookup("FLEET_MASTER_KEY_FILE")
                 .filter(|v| !v.is_empty())
                 .map(PathBuf::from),
+            update_manifest: lookup("FLEET_UPDATE_MANIFEST")
+                .filter(|v| !v.is_empty())
+                .map(PathBuf::from),
             web_origin: lookup("FLEET_WEB_ORIGIN").filter(|v| !v.is_empty()),
             web_rp_id: lookup("FLEET_WEB_RP_ID").filter(|v| !v.is_empty()),
             retention_interval: Duration::from_secs(number(
@@ -403,6 +409,29 @@ mod tests {
 
     fn good_ring() -> String {
         format!("k1:{}\n", "ab".repeat(32))
+    }
+
+    #[test]
+    fn update_manifest_is_read_from_the_environment() {
+        let base = [
+            ("FLEET_DATABASE_URL", "postgres://u:pw@h/db"),
+            ("FLEET_TOKEN", TOKEN),
+        ];
+        let unset = Config::from_lookup(lookup(&base)).unwrap();
+        assert_eq!(unset.update_manifest, None);
+        let empty = Config::from_lookup(lookup(&[base[0], base[1], ("FLEET_UPDATE_MANIFEST", "")]))
+            .unwrap();
+        assert_eq!(empty.update_manifest, None);
+        let set = Config::from_lookup(lookup(&[
+            base[0],
+            base[1],
+            ("FLEET_UPDATE_MANIFEST", "/etc/fleet/manifest.json"),
+        ]))
+        .unwrap();
+        assert_eq!(
+            set.update_manifest,
+            Some(PathBuf::from("/etc/fleet/manifest.json"))
+        );
     }
 
     #[test]

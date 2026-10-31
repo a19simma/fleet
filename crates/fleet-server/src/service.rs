@@ -1,6 +1,7 @@
 //! The `FleetIngest`, `FleetQuery`, `FleetWorker`, `FleetJobs`, `FleetJudge`, `FleetProfiles`,
 //! `FleetBatches` and `FleetCredentials` gRPC handlers.
 
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use fleet_core::Envelope;
@@ -37,6 +38,70 @@ use crate::cred::CredentialService;
 use crate::store::{Store, StoreError};
 use crate::web::{Dispatch, HEADER_READ_TIMEOUT, Web, serve};
 use fleet_proto::MAX_PROFILE_MESSAGE_BYTES;
+
+/// Relays a signed update manifest to boxes in `HeartbeatReply`.
+///
+/// The server holds no key and verifies nothing: it passes two files on, the manifest and the
+/// signature beside it. fleetd checks the signature against its own trust root.
+#[derive(Debug, Clone, Default)]
+pub struct UpdateRelay {
+    manifest: Option<PathBuf>,
+}
+
+impl UpdateRelay {
+    /// Relays the manifest at `manifest` and the signature at `manifest` plus `.minisig`.
+    /// `None` relays nothing.
+    #[must_use]
+    pub fn new(manifest: Option<PathBuf>) -> Self {
+        Self { manifest }
+    }
+
+    /// Reads both files and returns them as `(manifest, signature)`. A missing file, a read
+    /// error, a manifest that is not JSON or a pair over the caps in
+    /// [`fleet_proto::update_within_caps`] gives `None`, so the reply carries neither.
+    async fn load(&self) -> Option<(Vec<u8>, Vec<u8>)> {
+        let path = self.manifest.as_ref()?;
+        let mut sig_path = path.clone().into_os_string();
+        sig_path.push(".minisig");
+        let manifest = read_capped(path, fleet_proto::MAX_MANIFEST_BYTES).await?;
+        let signature =
+            read_capped(&PathBuf::from(sig_path), fleet_proto::MAX_SIGNATURE_BYTES).await?;
+        if serde_json::from_slice::<serde_json::Value>(&manifest).is_err() {
+            tracing::warn!(path = %path.display(), "update manifest is not JSON; not relayed");
+            return None;
+        }
+        let probe = HeartbeatReply {
+            next_in_s: 0,
+            update_manifest: Some(manifest),
+            update_signature: Some(signature),
+        };
+        if !fleet_proto::update_within_caps(&probe) {
+            return None;
+        }
+        Some((probe.update_manifest?, probe.update_signature?))
+    }
+}
+
+async fn read_capped(path: &Path, cap: usize) -> Option<Vec<u8>> {
+    use tokio::io::AsyncReadExt;
+    let read = async {
+        let file = tokio::fs::File::open(path).await?;
+        let mut buf = Vec::new();
+        file.take(cap as u64 + 1).read_to_end(&mut buf).await?;
+        Ok::<_, std::io::Error>(buf)
+    };
+    match read.await {
+        Ok(buf) if buf.len() <= cap => Some(buf),
+        Ok(_) => {
+            tracing::warn!(path = %path.display(), cap, "update file over its cap; not relayed");
+            None
+        }
+        Err(err) => {
+            tracing::warn!(path = %path.display(), %err, "update file unreadable; not relayed");
+            None
+        }
+    }
+}
 
 /// Seconds a box should wait before its next heartbeat.
 pub const HEARTBEAT_INTERVAL_S: u32 = 30;
@@ -97,6 +162,7 @@ fn no_nul(field: &str, value: &str) -> Result<(), Status> {
 pub struct FleetService {
     store: Store,
     credentials: Option<CredentialService>,
+    update: UpdateRelay,
 }
 
 impl FleetService {
@@ -105,7 +171,15 @@ impl FleetService {
         Self {
             store,
             credentials: None,
+            update: UpdateRelay::default(),
         }
+    }
+
+    /// Relays the signed update manifest in `HeartbeatReply`.
+    #[must_use]
+    pub fn with_update(mut self, update: UpdateRelay) -> Self {
+        self.update = update;
+        self
     }
 
     /// Enables the credential RPCs.
@@ -214,10 +288,14 @@ impl FleetIngest for FleetService {
             .heartbeat(&name, &request)
             .await
             .map_err(|err| storage_unavailable(&err))?;
+        let (update_manifest, update_signature) = match self.update.load().await {
+            Some((manifest, signature)) => (Some(manifest), Some(signature)),
+            None => (None, None),
+        };
         Ok(Response::new(HeartbeatReply {
             next_in_s: HEARTBEAT_INTERVAL_S,
-            update_manifest: None,
-            update_signature: None,
+            update_manifest,
+            update_signature,
         }))
     }
 }
@@ -625,7 +703,7 @@ pub fn router_with(
 ) -> Router<Stack<BearerAuth, Identity>> {
     server()
         .layer(auth.clone())
-        .add_routes(routes(store, credentials))
+        .add_routes(routes(store, credentials, UpdateRelay::default()))
 }
 
 fn server() -> Server {
@@ -653,7 +731,16 @@ pub async fn serve_with_web(
     incoming: TcpIncoming,
     shutdown: impl Future<Output = ()>,
 ) -> std::io::Result<()> {
-    serve_with_credentials(store, auth, web, None, incoming, shutdown).await
+    serve_with_credentials(
+        store,
+        auth,
+        web,
+        None,
+        UpdateRelay::default(),
+        incoming,
+        shutdown,
+    )
+    .await
 }
 
 /// Same as [`serve_with_web`] with the credential RPCs backed by `credentials`.
@@ -666,11 +753,12 @@ pub async fn serve_with_credentials(
     auth: &BearerAuth,
     web: Web,
     credentials: Option<CredentialService>,
+    update: UpdateRelay,
     incoming: TcpIncoming,
     shutdown: impl Future<Output = ()>,
 ) -> std::io::Result<()> {
     serve_routes(
-        routes(store, credentials),
+        routes(store, credentials, update),
         auth,
         web,
         incoming,
@@ -694,7 +782,7 @@ pub async fn serve_with_web_timeout(
     header_read_timeout: Duration,
 ) -> std::io::Result<()> {
     serve_routes(
-        routes(store, None),
+        routes(store, None, UpdateRelay::default()),
         auth,
         web,
         incoming,
@@ -722,8 +810,10 @@ async fn serve_routes(
     .await
 }
 
-fn routes(store: &Store, credentials: Option<CredentialService>) -> Routes {
-    let service = FleetService::new(store.clone()).with_credentials(credentials);
+fn routes(store: &Store, credentials: Option<CredentialService>, update: UpdateRelay) -> Routes {
+    let service = FleetService::new(store.clone())
+        .with_credentials(credentials)
+        .with_update(update);
     let ingest =
         FleetIngestServer::new(service.clone()).max_decoding_message_size(MAX_MESSAGE_BYTES);
     let query = FleetQueryServer::new(service.clone()).max_decoding_message_size(MAX_MESSAGE_BYTES);
@@ -754,6 +844,107 @@ mod tests {
 
     use super::*;
     use crate::jobs::JobInvalid;
+
+    fn scratch(tag: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("fleet-upd3-{}-{tag}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    fn relay_at(dir: &Path) -> UpdateRelay {
+        UpdateRelay::new(Some(dir.join("manifest.json")))
+    }
+
+    #[tokio::test]
+    async fn no_manifest_set_relays_nothing() {
+        assert_eq!(UpdateRelay::default().load().await, None);
+        assert_eq!(UpdateRelay::new(None).load().await, None);
+    }
+
+    #[tokio::test]
+    async fn both_files_are_relayed_verbatim() {
+        let dir = scratch("both");
+        std::fs::write(dir.join("manifest.json"), b"{\"seq\":1}").unwrap();
+        std::fs::write(dir.join("manifest.json.minisig"), b"sig-bytes").unwrap();
+        assert_eq!(
+            relay_at(&dir).load().await,
+            Some((b"{\"seq\":1}".to_vec(), b"sig-bytes".to_vec()))
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn one_missing_file_relays_nothing() {
+        let dir = scratch("missing");
+        std::fs::write(dir.join("manifest.json"), b"{}").unwrap();
+        assert_eq!(relay_at(&dir).load().await, None);
+        std::fs::remove_file(dir.join("manifest.json")).unwrap();
+        std::fs::write(dir.join("manifest.json.minisig"), b"sig").unwrap();
+        assert_eq!(relay_at(&dir).load().await, None);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn over_cap_files_relay_nothing() {
+        let dir = scratch("cap");
+        let json = |len: usize| format!("\"{}\"", "a".repeat(len - 2)).into_bytes();
+        std::fs::write(dir.join("manifest.json.minisig"), b"sig").unwrap();
+        std::fs::write(
+            dir.join("manifest.json"),
+            json(fleet_proto::MAX_MANIFEST_BYTES),
+        )
+        .unwrap();
+        assert!(relay_at(&dir).load().await.is_some());
+        std::fs::write(
+            dir.join("manifest.json"),
+            json(fleet_proto::MAX_MANIFEST_BYTES + 1),
+        )
+        .unwrap();
+        assert_eq!(relay_at(&dir).load().await, None);
+        std::fs::write(dir.join("manifest.json"), b"{}").unwrap();
+        std::fs::write(
+            dir.join("manifest.json.minisig"),
+            vec![b'x'; fleet_proto::MAX_SIGNATURE_BYTES],
+        )
+        .unwrap();
+        assert!(relay_at(&dir).load().await.is_some());
+        std::fs::write(
+            dir.join("manifest.json.minisig"),
+            vec![b'x'; fleet_proto::MAX_SIGNATURE_BYTES + 1],
+        )
+        .unwrap();
+        assert_eq!(relay_at(&dir).load().await, None);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn non_json_manifest_relays_nothing() {
+        let dir = scratch("json");
+        std::fs::write(dir.join("manifest.json"), b"not json").unwrap();
+        std::fs::write(dir.join("manifest.json.minisig"), b"sig").unwrap();
+        assert_eq!(relay_at(&dir).load().await, None);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn swapped_files_are_picked_up() {
+        let dir = scratch("swap");
+        let relay = relay_at(&dir);
+        assert_eq!(relay.load().await, None);
+        std::fs::write(dir.join("manifest.json"), b"{\"seq\":1}").unwrap();
+        std::fs::write(dir.join("manifest.json.minisig"), b"one").unwrap();
+        assert_eq!(
+            relay.load().await,
+            Some((b"{\"seq\":1}".to_vec(), b"one".to_vec()))
+        );
+        std::fs::write(dir.join("manifest.json"), b"{\"seq\":2}").unwrap();
+        std::fs::write(dir.join("manifest.json.minisig"), b"two").unwrap();
+        assert_eq!(
+            relay.load().await,
+            Some((b"{\"seq\":2}".to_vec(), b"two".to_vec()))
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
 
     #[test]
     fn jobs_errors_map_to_fixed_statuses() {
