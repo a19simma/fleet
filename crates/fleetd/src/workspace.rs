@@ -242,6 +242,7 @@ pub struct Workspace {
     after_clone: Option<AfterClone>,
     redactor: Redactor,
     job_gid: Option<u32>,
+    owner: String,
     mirror_lock: Arc<tokio::sync::Mutex<()>>,
 }
 
@@ -259,6 +260,7 @@ impl Workspace {
             after_clone: None,
             redactor: Redactor::default(),
             job_gid: None,
+            owner: String::new(),
             mirror_lock: Arc::new(tokio::sync::Mutex::new(())),
         }
     }
@@ -270,6 +272,15 @@ impl Workspace {
     #[must_use]
     pub fn with_job_group(mut self, gid: Option<u32>) -> Self {
         self.job_gid = gid;
+        self
+    }
+
+    /// Keys the mirrors of this workspace to `owner`, the user whose credential fetches them.
+    /// Two owners of one repo get two mirror dirs, so one user's token never fills a mirror
+    /// another user reads (ADR-0046). The default owner is empty.
+    #[must_use]
+    pub fn with_owner(mut self, owner: impl Into<String>) -> Self {
+        self.owner = owner.into();
         self
     }
 
@@ -452,7 +463,7 @@ impl Workspace {
         if let Some(gid) = self.job_gid {
             crate::jobenv::share_dir_read_only(&cache, gid).map_err(WorkspaceError::Io)?;
         }
-        Ok(Self::mirror_dir(&self.root, repo))
+        Ok(Self::mirror_dir_for(&self.root, &self.owner, repo))
     }
 
     /// Refreshes the mirror of `repo` for the credential broker.
@@ -553,10 +564,20 @@ impl Workspace {
         first.map_or(Ok(()), Err)
     }
 
-    /// The bare mirror of `repo` under the jobs `root`.
+    /// The bare mirror of `repo` for the default owner under the jobs `root`.
     pub(crate) fn mirror_dir(root: &Path, repo: &str) -> PathBuf {
+        Self::mirror_dir_for(root, "", repo)
+    }
+
+    /// The bare mirror of `repo` for `owner` under the jobs `root`. The name hashes the owner
+    /// length, the owner and the repo, so no two `(owner, repo)` pairs share input bytes.
+    pub(crate) fn mirror_dir_for(root: &Path, owner: &str, repo: &str) -> PathBuf {
+        let mut hash = Sha256::new();
+        hash.update((owner.len() as u64).to_be_bytes());
+        hash.update(owner.as_bytes());
+        hash.update(repo.as_bytes());
         root.join(CACHE_DIR)
-            .join(format!("{:x}.git", Sha256::digest(repo.as_bytes())))
+            .join(format!("{:x}.git", hash.finalize()))
     }
 
     fn fetch_credential(&self, repo: &str) -> Option<(&Credential, &str)> {
@@ -1087,6 +1108,35 @@ mod tests {
 
     fn mode_of(path: &Path) -> u32 {
         std::fs::symlink_metadata(path).unwrap().mode() & 0o7777
+    }
+
+    #[test]
+    fn the_owner_repo_boundary_cannot_be_shifted() {
+        let root = Path::new("r");
+        assert_ne!(
+            Workspace::mirror_dir_for(root, "ab", "c"),
+            Workspace::mirror_dir_for(root, "a", "bc")
+        );
+        assert_ne!(
+            Workspace::mirror_dir_for(root, "", "x"),
+            Workspace::mirror_dir_for(root, "a", "x")
+        );
+        assert_ne!(
+            Workspace::mirror_dir_for(root, "ab", "x"),
+            Workspace::mirror_dir_for(root, "cd", "x")
+        );
+        assert_ne!(
+            Workspace::mirror_dir_for(root, "a", "x"),
+            Workspace::mirror_dir_for(root, "a", "y")
+        );
+        assert_eq!(
+            Workspace::mirror_dir_for(root, "a", "x"),
+            Workspace::mirror_dir_for(root, "a", "x")
+        );
+        assert_eq!(
+            Workspace::mirror_dir(root, "x"),
+            Workspace::mirror_dir_for(root, "", "x")
+        );
     }
 
     #[test]

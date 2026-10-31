@@ -150,7 +150,7 @@ async fn the_git_dir_pins_equal_the_absolute_mirror_path() -> TestResult {
         let (_dir, root, all) = run(default_run(), REPO).await?;
         let mirror = root
             .join(".cache")
-            .join("bc3fbd4dd8dbadfc9793e2a816228cf8fa84d7954992c487a510aced135fecdf.git");
+            .join("9f9e0b516c2b1acbc8252e5d4f769f43a51baebc5a2de1148004db3909d2cf0e.git");
         let mirror = mirror.to_str().ok_or("path")?;
         let staging = mirror.replace(".git", ".init");
         assert!(Path::new(mirror).is_absolute());
@@ -208,7 +208,7 @@ async fn the_git_dir_pins_are_absolute_for_a_relative_root() -> TestResult {
         let mirror = cwd
             .join(&relative)
             .join(".cache")
-            .join("bc3fbd4dd8dbadfc9793e2a816228cf8fa84d7954992c487a510aced135fecdf.git");
+            .join("9f9e0b516c2b1acbc8252e5d4f769f43a51baebc5a2de1148004db3909d2cf0e.git");
         let mirror = mirror.to_str().ok_or("path")?;
         let staging = mirror.replace(".git", ".init");
         let mut pinned = 0;
@@ -429,7 +429,7 @@ async fn the_mirror_fetches_by_explicit_url_and_configures_no_remote() -> TestRe
 }
 
 #[tokio::test]
-async fn the_mirror_is_named_by_the_sha256_of_the_repo_url() -> TestResult {
+async fn the_mirror_is_named_by_the_sha256_of_the_owner_and_repo_url() -> TestResult {
     common::bounded(Box::pin(async {
         let names = |all: &[Call]| -> Vec<String> {
             all.iter()
@@ -449,7 +449,7 @@ async fn the_mirror_is_named_by_the_sha256_of_the_repo_url() -> TestResult {
         }
         assert_eq!(
             a[0],
-            "bc3fbd4dd8dbadfc9793e2a816228cf8fa84d7954992c487a510aced135fecdf.init"
+            "9f9e0b516c2b1acbc8252e5d4f769f43a51baebc5a2de1148004db3909d2cf0e.init"
         );
         Ok(())
     }))

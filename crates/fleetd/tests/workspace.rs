@@ -547,6 +547,86 @@ async fn the_mirror_dir_is_a_sha256_hex_name() -> TestResult {
     .await
 }
 
+fn mirror_names(root: &Path) -> Result<Vec<String>, Box<dyn std::error::Error>> {
+    let mut names = Vec::new();
+    for entry in std::fs::read_dir(root.join(".cache"))? {
+        let path = entry?.path();
+        if path.extension().is_some_and(|e| e == "git") {
+            names.push(
+                path.file_name()
+                    .ok_or("name")?
+                    .to_string_lossy()
+                    .into_owned(),
+            );
+        }
+    }
+    names.sort();
+    Ok(names)
+}
+
+#[tokio::test]
+async fn two_owners_of_the_same_repo_get_distinct_mirrors() -> TestResult {
+    common::bounded(Box::pin(async {
+        let dir = TempDir::new()?;
+        let repo = fixture(dir.path())?;
+        let root = dir.path().join("jobs");
+        let alice = workspace(&root).with_owner("alice");
+        let bob = workspace(&root).with_owner("bob");
+        alice.prepare("job1", &repo, "main").await?;
+        bob.prepare("job2", &repo, "main").await?;
+        let names = mirror_names(&root)?;
+        assert_eq!(names.len(), 2, "{names:?}");
+        assert_ne!(names[0], names[1]);
+        Ok(())
+    }))
+    .await
+}
+
+#[tokio::test]
+async fn one_owner_keeps_one_mirror_across_jobs() -> TestResult {
+    common::bounded(Box::pin(async {
+        let dir = TempDir::new()?;
+        let repo = fixture(dir.path())?;
+        let root = dir.path().join("jobs");
+        let first = workspace(&root).with_owner("alice");
+        first.prepare("job1", &repo, "main").await?;
+        let before = mirror_names(&root)?;
+        let again = workspace(&root).with_owner("alice");
+        again.prepare("job2", &repo, "main").await?;
+        again.prepare("job3", &repo, "main").await?;
+        assert_eq!(mirror_names(&root)?, before);
+        assert_eq!(before.len(), 1);
+        Ok(())
+    }))
+    .await
+}
+
+#[tokio::test]
+async fn an_owner_mirror_is_a_sha256_hex_name_and_still_trusted() -> TestResult {
+    common::bounded(Box::pin(async {
+        let dir = TempDir::new()?;
+        let repo = fixture(dir.path())?;
+        let root = dir.path().join("jobs");
+        let ws = workspace(&root).with_owner("alice");
+        ws.prepare("job1", &repo, "main").await?;
+        let mirror = only_mirror(&root)?;
+        let stem = mirror
+            .file_name()
+            .ok_or("name")?
+            .to_string_lossy()
+            .strip_suffix(".git")
+            .ok_or("suffix")?
+            .to_owned();
+        assert_eq!(stem.len(), 64, "{stem}");
+        std::fs::write(mirror.join("planted"), "x")?;
+        git(&mirror, &["config", "core.alternateRefsCommand", "x"])?;
+        ws.prepare("job2", &repo, "main").await?;
+        assert!(!only_mirror(&root)?.join("planted").exists());
+        Ok(())
+    }))
+    .await
+}
+
 #[tokio::test]
 async fn remove_deletes_the_worktree_and_scratch_and_keeps_the_mirror() -> TestResult {
     common::bounded(Box::pin(async {
