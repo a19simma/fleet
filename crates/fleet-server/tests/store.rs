@@ -558,6 +558,7 @@ fn heartbeat() -> HeartbeatRequest {
         queue_pending: 3,
         queue_oldest_age_s: 7,
         last_ack_age_s: Some(2),
+        protocol_version: 1,
     }
 }
 

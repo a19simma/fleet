@@ -153,10 +153,13 @@ message HeartbeatRequest {
   uint64 queue_pending = 7;
   uint64 queue_oldest_age_s = 8;
   optional uint64 last_ack_age_s = 9;
+  uint32 protocol_version = 10;
 }
 
 message HeartbeatReply {
   uint32 next_in_s = 1;
+  optional bytes update_manifest = 2;
+  optional bytes update_signature = 3;
 }
 
 message ListFleetRequest {

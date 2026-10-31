@@ -7,6 +7,30 @@ mod convert;
 
 pub use convert::{ConvertError, queued_event, validate_box};
 
+/// Wire protocol version fleetd reports in `HeartbeatRequest.protocol_version`. Changes are
+/// additive only, so a new server serves an old fleetd. An old fleetd sends 0.
+pub const PROTOCOL_VERSION: u32 = 1;
+
+/// Longest signed update manifest, in bytes, in `HeartbeatReply.update_manifest`. The server
+/// relays no more and fleetd reads no more.
+pub const MAX_MANIFEST_BYTES: usize = 16 * 1024;
+
+/// Longest update signature, in bytes, in `HeartbeatReply.update_signature`.
+pub const MAX_SIGNATURE_BYTES: usize = 1024;
+
+/// Whether the update fields of `reply` fit the caps and come as a pair: both set or both
+/// unset. A reply with no update is within the caps.
+#[must_use]
+pub fn update_within_caps(reply: &v1::HeartbeatReply) -> bool {
+    match (&reply.update_manifest, &reply.update_signature) {
+        (None, None) => true,
+        (Some(manifest), Some(signature)) => {
+            manifest.len() <= MAX_MANIFEST_BYTES && signature.len() <= MAX_SIGNATURE_BYTES
+        }
+        _ => false,
+    }
+}
+
 /// Longest accepted profile JSON, in bytes. Escapes make the JSON longer than its text, so
 /// this sits above the 4 MiB text cap of the validator.
 pub const MAX_PROFILE_JSON_BYTES: usize = 8 * 1024 * 1024;
