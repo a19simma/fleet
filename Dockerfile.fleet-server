@@ -1,4 +1,4 @@
-FROM --platform=$BUILDPLATFORM rust:1.94-bookworm AS builder
+FROM --platform=$BUILDPLATFORM rust:1.99-bookworm AS builder
 ARG TARGETARCH
 RUN apt-get update \
     && apt-get install -y --no-install-recommends python3-pip \
