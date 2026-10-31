@@ -39,7 +39,7 @@ Build chains use exact hosts only. `config.rs` rejects wildcard TLDs, and no Pro
 | npm | `registry.npmjs.org` |
 | pip | `pypi.org`, `files.pythonhosted.org` |
 | Docker Hub | `registry-1.docker.io`, `auth.docker.io`, `production.cloudflare.docker.com` |
-| GitHub | `github.com`, `codeload.github.com`, `objects.githubusercontent.com` |
+| GitHub | `github.com`, `api.github.com`, `codeload.github.com`, `objects.githubusercontent.com` |
 
 The list stays under the Box `egress_allow` ceiling. The Box owner adds hosts to the ceiling; a Job only narrows it.
 

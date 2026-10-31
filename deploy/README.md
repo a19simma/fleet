@@ -299,3 +299,40 @@ Record each outcome in `.ralph/progress.md`. Do not mark A28 passed until all si
 Fast, with the units installed: set `agent_launcher = "direct"` (or remove the line) in `/etc/fleetd/config.toml`, then `sudo systemctl restart fleetd`. The new unit runs the agent as the daemon uid, as before. The restart stops running agent units, because `fleet-agent@.service` has `BindsTo=fleetd.service`, so a running job ends.
 
 Full: stop fleetd, restore the legacy `fleetd.service`, run `sudo chown root:agent /etc/swarm/secrets.env && sudo chmod 0640 /etc/swarm/secrets.env`, remove `agent_launcher`, `hook_socket`, `hook_socket_uid`, `hook_socket_group` and `job_group` from `/etc/fleetd/config.toml` (a stale `hook_socket_uid` makes the hook client reject the socket), remove `/etc/polkit-1/rules.d/50-fleet-agent.rules`, remove `/etc/systemd/system/fleet-agent@.service` and any drop-in, run `sudo systemctl daemon-reload`, and start fleetd. The users, groups and directories can stay.
+
+## Self-hosted Box
+
+This section collects the settings a self-hosted Box owner needs. Sources: `crates/fleetd/src/config.rs`, `deploy/box/config.toml`, ADR-0049.
+
+### disposable
+
+`disposable = true` in `/etc/fleetd/config.toml` declares that the Box holds nothing worth protecting from its jobs. It defaults to false. On a disposable Box jobs run with permission checks off. A kimi job starts only on a disposable Box: on any other Box fleetd never starts the binary. Set it only on a Box that holds nothing worth protecting. A Box that runs kimi must be such a Box, because kimi needs it and fleetd refuses the job otherwise. A Box shared between users, or one that holds data you care about, must leave it unset.
+
+### egress_allow
+
+`egress_allow` is the Box ceiling for outbound hosts. List exact hosts only: `config.rs` rejects a wildcard TLD, and a Job can only narrow the list. `deploy/box/config.toml` is the preset for cargo, npm, pip, GitHub (`github.com`, `api.github.com`, `codeload.github.com`, `objects.githubusercontent.com`) and Docker Hub. The host list is unverified. It stays unverified until the observe mode of BOX-3 (`egress_observe`) has captured real traffic on a box. That key is not yet in running boxes, so do not rely on it. Expect to add or drop hosts after the capture.
+
+### Credentials
+
+Use a fine-grained PAT (`github_pat`) scoped to throwaway repos. A bot identity comes later. See [Settings](#settings) for where fleetd reads and scrubs the token.
+
+### Docker mode
+
+Docker in a Job is refused until the spike in [ADR-0049](../docs/adr/0049-job-docker-and-build-egress.md) passes. A Job never gets a root docker socket: `fleet-job` is not in the `docker` group and the agent unit lists the socket paths under `InaccessiblePaths=`. Jobs run without docker meanwhile.
+
+### Warm caches
+
+Warm build caches are planned and not built (TOOL-6, BOX-7). Every job starts cold.
+
+### Config file owner and mode
+
+Any config file that selects a trusted principal must be owned by root, mode 0644, and not writable by `fleetd` or `fleet-job`. Install it with `sudo install -m 0644 -o root -g root <file> /etc/fleetd/config.toml`. The job uid must be able to read it. For `secrets.env` use `fleetd:fleetd` mode 0600 (see [Install order](#install-order)).
+
+### Further variables
+
+`infra/README.md` is to follow with these rows. Until then:
+
+| Variable | Meaning |
+| --- | --- |
+| `FLEET_UPDATE_MANIFEST` | fleet-server setting: path of the signed update manifest. The signature is the file of the same name with `.minisig` appended. Unset or empty means no manifest. |
+| `FLEET_ALLOW_PROFILE_TOOLS` | Unverified: no reader of this name exists in this tree at this base. Do not set it until the task that adds it documents it. |
