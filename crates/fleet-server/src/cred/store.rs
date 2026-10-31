@@ -37,7 +37,50 @@ const DELETE: &str = "DELETE FROM credentials WHERE id = $1 AND user_id = $2";
 const SELECT_FOR_USE: &str = "\
 SELECT kind, ciphertext, key_id FROM credentials WHERE id = $1 AND user_id = $2 FOR SHARE";
 
+const SELECT_LEASE: &str = "\
+SELECT user_id, agent FROM jobs \
+WHERE job_id = $1 AND attempt = $2 AND box = $3 AND state = 'RUNNING' \
+AND lease_expires_at > now()";
+
+const SELECT_RELEASABLE: &str = "\
+SELECT id, kind, (expires_at IS NOT NULL AND expires_at <= now()) AS expired \
+FROM credentials WHERE user_id = $1 AND kind = ANY($2) ORDER BY id";
+
 const INSERT_USE: &str = "INSERT INTO credential_use (credential_id, job_id) VALUES ($1, $2)";
+
+/// One credential released to a Box for a leased Job.
+pub struct ReleasedCredential {
+    /// What the credential authenticates against.
+    pub kind: CredentialKind,
+    /// Storage shape.
+    pub shape: CredentialShape,
+    /// The secret value.
+    pub value: Secret,
+}
+
+impl fmt::Debug for ReleasedCredential {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ReleasedCredential")
+            .field("kind", &self.kind)
+            .field("shape", &self.shape)
+            .finish_non_exhaustive()
+    }
+}
+
+fn agent_kinds(agent: &str) -> &'static [CredentialKind] {
+    match agent {
+        "claude" => &[
+            CredentialKind::AnthropicApiKey,
+            CredentialKind::ClaudeSubscriptionToken,
+        ],
+        "codex" => &[CredentialKind::CodexApiKey],
+        "kimi" => &[
+            CredentialKind::KimiMembershipKey,
+            CredentialKind::KimiPlatformKey,
+        ],
+        _ => &[],
+    }
+}
 
 /// What a user sees of a stored credential. It holds no secret material.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -69,6 +112,15 @@ pub enum StoreError {
     Seal(SealError),
     /// The user already holds the most credentials allowed.
     TooMany,
+    /// No running job holds this lease. Wrong box, wrong attempt, a job that is not `RUNNING`,
+    /// an expired lease and an unknown job all give this.
+    LeaseDenied,
+    /// The job owner stored no GitHub credential.
+    NoGithub,
+    /// The job owner stored no credential of a kind the job agent accepts.
+    NoAgentCredential,
+    /// A credential the job needs is past its expiry.
+    Expired,
     /// The database failed.
     Db(sqlx::Error),
 }
@@ -80,6 +132,10 @@ impl fmt::Display for StoreError {
             Self::InvalidExpiry => f.write_str("invalid expiry"),
             Self::NotFound => f.write_str("credential not found"),
             Self::TooMany => f.write_str("too many credentials"),
+            Self::LeaseDenied => f.write_str("lease does not match"),
+            Self::NoGithub => f.write_str("no github credential"),
+            Self::NoAgentCredential => f.write_str("no agent credential"),
+            Self::Expired => f.write_str("credential expired"),
             Self::Seal(e) => e.fmt(f),
             Self::Db(_) => f.write_str("credential store database error"),
         }
@@ -292,6 +348,87 @@ impl CredentialStore {
         let text = String::from_utf8(std::mem::take(&mut *plain))
             .map_err(|_| StoreError::Seal(SealError::Open))?;
         Ok((kind, Secret::new(text)))
+    }
+
+    /// Releases the credentials of the owner of a leased job and records each use.
+    ///
+    /// The lease must match on job, attempt and box, and the job must be `RUNNING` with an
+    /// unexpired lease. The owner and the agent come from the job row, never from the request.
+    /// The reply holds every stored credential of a kind the agent accepts, plus the GitHub
+    /// token. One use row is written per credential, in the same transaction as the reads.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StoreError::LeaseDenied`] when no job matches the lease,
+    /// [`StoreError::NoGithub`] when the owner has no GitHub credential,
+    /// [`StoreError::Expired`] when a needed credential is past its expiry,
+    /// [`StoreError::NoAgentCredential`] when the owner has none the agent accepts,
+    /// [`StoreError::Seal`] when a value cannot be opened and [`StoreError::Db`] for a
+    /// database failure. No use row is written on any error.
+    pub async fn release_for_job(
+        &self,
+        job_id: &str,
+        attempt: u32,
+        box_name: &str,
+    ) -> Result<Vec<ReleasedCredential>, StoreError> {
+        let attempt = i32::try_from(attempt).map_err(|_| StoreError::LeaseDenied)?;
+        let mut tx = self.pool.begin().await?;
+        let lease = sqlx::query(SELECT_LEASE)
+            .bind(job_id)
+            .bind(attempt)
+            .bind(box_name)
+            .fetch_optional(&mut *tx)
+            .await?
+            .ok_or(StoreError::LeaseDenied)?;
+        let user_id: i64 = lease.try_get("user_id")?;
+        let agent: String = lease.try_get("agent")?;
+        let mut wanted: Vec<&str> = agent_kinds(&agent)
+            .iter()
+            .map(|kind| kind.wire_name())
+            .collect();
+        wanted.push(CredentialKind::GithubPat.wire_name());
+        let rows = sqlx::query(SELECT_RELEASABLE)
+            .bind(user_id)
+            .bind(&wanted)
+            .fetch_all(&mut *tx)
+            .await?;
+        let mut found = Vec::with_capacity(rows.len());
+        for row in &rows {
+            let name: String = row.try_get("kind")?;
+            let expired: bool = row.try_get("expired")?;
+            found.push((row.try_get::<i64, _>("id")?, kind_of(&name)?, expired));
+        }
+        if !found
+            .iter()
+            .any(|(_, kind, _)| *kind == CredentialKind::GithubPat)
+        {
+            return Err(StoreError::NoGithub);
+        }
+        if found
+            .iter()
+            .all(|(_, kind, _)| *kind == CredentialKind::GithubPat)
+        {
+            return Err(StoreError::NoAgentCredential);
+        }
+        if found.iter().any(|(_, _, expired)| *expired) {
+            return Err(StoreError::Expired);
+        }
+        let mut released = Vec::with_capacity(found.len());
+        for (id, _, _) in found {
+            let (kind, value) = self.unseal(&mut tx, user_id, id).await?;
+            sqlx::query(INSERT_USE)
+                .bind(id)
+                .bind(job_id)
+                .execute(&mut *tx)
+                .await?;
+            released.push(ReleasedCredential {
+                kind,
+                shape: CredentialShape::StaticSecret,
+                value,
+            });
+        }
+        tx.commit().await?;
+        Ok(released)
     }
 
     /// Unseals the user's credential for `job_id` and records the use in the same transaction.
