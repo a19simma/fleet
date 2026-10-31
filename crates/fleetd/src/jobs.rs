@@ -139,15 +139,6 @@ impl<R: Reporter> DaemonRunner<R> {
             .with_redactor(self.agent.job_redactor(&job.job_id).as_ref().clone())
     }
 
-    fn has_model_credential(job: &Job, held: &crate::cred::JobCredentials) -> bool {
-        match crate::agent::resolve(&job.agent) {
-            Some(runner) if runner.name() == crate::agent::CLAUDE => {
-                crate::agent::model_env(held).is_some()
-            }
-            _ => true,
-        }
-    }
-
     async fn fetch_credentials(&self, job: &Job, mut shutdown: Shutdown) -> Result<(), RunError> {
         let Some(book) = &self.credentials else {
             return Ok(());
@@ -162,7 +153,7 @@ impl<R: Reporter> DaemonRunner<R> {
         };
         match guarded {
             Ok(Ok(held)) => {
-                if !Self::has_model_credential(job, &held) {
+                if !crate::agent::holds_model_credential(&job.agent, &held) {
                     tracing::warn!(reason = ERR_NO_AGENT, "job credentials refused");
                     self.agent.fail_job(job, ERR_NO_AGENT).await;
                     return Err(RunError);

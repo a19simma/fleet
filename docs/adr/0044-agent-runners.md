@@ -1,6 +1,6 @@
 # Agent runners
 
-Status: Proposed 2026-10-29. Built in fleetd: the `AgentRunner` trait with the `claude`, `codex` and `kimi` runners and per-runner egress hosts under the Box ceiling. Not built: runner-owned command lines (argv for claude still comes from `claude_bin` in the runner config) and the Codex and Kimi output parsers. Builds on ADR-0043 (credential kinds) and ADR-0033 (delivery). Amends ADR-0021, ADR-0029 and ADR-0034.
+Status: Proposed 2026-10-29. Built in fleetd: the `AgentRunner` trait with the `claude`, `codex` and `kimi` runners and per-runner egress hosts under the Box ceiling. The Codex runner is wired: a job whose `agent` is `codex` runs the Codex argv and environment with a per-job `CODEX_HOME` dropped at job end, and needs a held `codex_api_key`. A job naming kimi or an unknown agent fails with `agent is not supported`. Not built: runner-owned command lines for claude (argv still comes from `claude_bin` in the runner config), the Kimi runner wiring and the Codex and Kimi output parsers. Builds on ADR-0043 (credential kinds) and ADR-0033 (delivery). Amends ADR-0021, ADR-0029 and ADR-0034.
 
 fleetd runs Claude Code today. Users hold credentials for other agent CLIs (ADR-0043). This ADR makes the agent a choice per Job.
 

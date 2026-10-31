@@ -16,7 +16,8 @@ use super::AgentRunner;
 use crate::runner::{RunConfig, env_forbidden};
 use crate::workspace::validate_job_id;
 
-pub(super) const NAME: &str = "codex";
+/// The `Job.agent` name of this runner.
+pub const NAME: &str = "codex";
 
 /// The environment variable that carries the Codex credential.
 pub const API_KEY_ENV: &str = "CODEX_API_KEY";
@@ -48,8 +49,10 @@ const ENV_ALLOW: [&str; 9] = [
     "no_proxy",
 ];
 
-/// The Floor in `$CODEX_HOME/config.toml`. It repeats the argv settings so a changed argv alone
-/// cannot loosen the sandbox.
+/// The Floor in `$CODEX_HOME/config.toml`.
+///
+/// The argv overrides the file, so a changed argv can still loosen what the file sets. The file
+/// only covers a flag the argv leaves out.
 pub const CONFIG_TOML: &str = "approval_policy = \"never\"\nsandbox_mode = \"workspace-write\"\n\n[features]\nhooks = false\n\n[sandbox_workspace_write]\nnetwork_access = false\n";
 
 /// Extra `forbidden` command prefixes in `$CODEX_HOME/rules/default.rules`.
@@ -67,8 +70,8 @@ impl AgentRunner for Codex {
         NAME
     }
 
-    fn program<'a>(&self, _config: &'a RunConfig) -> &'a Path {
-        Path::new(DEFAULT_PROGRAM)
+    fn program<'a>(&self, config: &'a RunConfig) -> &'a Path {
+        &config.codex_bin
     }
 
     fn config_dir_env(&self) -> &'static str {

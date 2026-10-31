@@ -54,6 +54,7 @@ The Anthropic legal page says developers "may not collect, store, or intermediat
 
 - The `sk-kimi-` prefix of `kimi_membership_key`.
 - The 900 s lifetime and single-use refresh of Kimi OAuth tokens.
+- Whether the Codex CLI honours the `features.hooks` key. No live Codex run has checked it, and the argv `-c features.hooks=false` and the `config.toml` both set it.
 - Whether Anthropic enforces the quoted terms against a `claude setup-token` token stored by a self-hosted service.
 
 ## Consequences

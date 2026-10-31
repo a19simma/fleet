@@ -50,6 +50,21 @@ pub fn resolve(agent: &str) -> Option<&'static dyn AgentRunner> {
     }
 }
 
+/// True when `held` carries the model credential the runner of `agent` needs.
+///
+/// `claude` needs an Anthropic key or a subscription token and `codex` a `codex_api_key`. Kimi
+/// has no credential check yet.
+#[must_use]
+pub(crate) fn holds_model_credential(agent: &str, held: &crate::cred::JobCredentials) -> bool {
+    match resolve(agent) {
+        Some(runner) if runner.name() == CLAUDE => model_env(held).is_some(),
+        Some(runner) if runner.name() == codex::NAME => held
+            .get(fleet_core::credential::CredentialKind::CodexApiKey)
+            .is_some(),
+        _ => true,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::{AgentRunner, resolve};
