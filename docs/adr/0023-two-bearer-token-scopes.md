@@ -23,6 +23,10 @@ The server holds two static bearer tokens, each with a scope.
 - Inferred, not part of the design: rotating either token is a config change plus a restart, and for the Box token a secrets push or Template rebuild.
 - The per-Box token upgrade path in ADR-0014 stays open and needs only a change in where fleetd reads the token.
 
+## Amendment (ADR-0028)
+
+`FleetWorker.GetJobTranscript` is worker scope. It is authorised against the lease and serves a judge Job only its own target's transcript.
+
 ## Considered and rejected
 
 - **Keep one token.** A leaked Box token would read prompts and submit Jobs.
