@@ -543,19 +543,34 @@ mod tests {
                 "XDG_CONFIG_HOME",
                 "XDG_CACHE_HOME",
                 "GIT_TERMINAL_PROMPT",
-                "KIMI_API_KEY",
+                "KIMI_MODEL_API_KEY",
+                "KIMI_MODEL_NAME",
+                "KIMI_MODEL_PROVIDER_TYPE",
+                "KIMI_MODEL_BASE_URL",
+                "KIMI_DISABLE_TELEMETRY",
+                "KIMI_CODE_NO_AUTO_UPDATE",
             ]
             .into_iter()
             .collect();
             assert_eq!(keys(&env), expected, "{kind}");
-            assert_eq!(value(&env, "KIMI_API_KEY"), Some(AGENT), "{kind}");
+            assert_eq!(value(&env, "KIMI_MODEL_API_KEY"), Some(AGENT), "{kind}");
+            assert_eq!(value(&env, "KIMI_MODEL_NAME"), Some("kimi-for-coding"));
+            let argv = spec
+                .argv
+                .iter()
+                .map(|a| a.to_string_lossy().into_owned())
+                .collect::<Vec<_>>();
+            assert!(argv.iter().all(|a| !a.contains(AGENT)), "{kind}");
             assert!(env.iter().all(|(_, v)| v != BOX_PAT
                 && v != BOX_ENT
                 && v != BOX_OAUTH
                 && v != BOX_KEY
                 && v != HOLDER));
             assert_eq!(spec.argv.first(), Some(&"kimi".into()));
-            assert_eq!(spec.argv.last(), Some(&"--prompt=do it".into()));
+            assert_eq!(
+                argv,
+                ["kimi", "-p", "do it", "--output-format", "stream-json"]
+            );
         }
         Ok(())
     }
@@ -572,7 +587,6 @@ mod tests {
                 .ok_or("KIMI_CODE_HOME")?,
         );
         assert_eq!(home, dir.path().join(".kimi").join("job1"));
-        assert!(home.join("config.toml").is_file());
         assert_eq!(
             std::fs::metadata(&home)?.permissions().mode() & 0o777,
             0o700
@@ -598,6 +612,7 @@ mod tests {
             .push(("KIMI_API_KEY".into(), BOX_KEY.into()));
         let env = spec_pairs(&kimi_spec(&runner, dir.path(), "job2"));
         assert!(value(&env, "KIMI_API_KEY").is_none());
+        assert!(value(&env, "KIMI_MODEL_API_KEY").is_none());
         assert!(env.iter().all(|(_, v)| v != BOX_KEY && v != AGENT));
         Ok(())
     }

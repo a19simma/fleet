@@ -4,10 +4,8 @@
 //! `kimi_membership_key` or `kimi_platform_key` the credential holder gave this job, and its
 //! `KIMI_CODE_HOME` lives in the runner until [`AgentRunner::end_job`] drops it.
 //!
-//! Unverified: whether `--print` implies auto-approve in the Kimi CLI. No Kimi CLI was
-//! available to check, so a Kimi job runs only on a disposable box
-//! ([`crate::agent::kimi::ERR_NOT_DISPOSABLE`] otherwise), the reading that takes `--print` as
-//! auto-approval.
+//! `-p` mode runs under the auto policy and asks for no approval, so a Kimi job runs only on a
+//! disposable box ([`crate::agent::kimi::ERR_NOT_DISPOSABLE`] otherwise).
 
 use std::ffi::OsString;
 use std::io;
@@ -30,12 +28,28 @@ impl<R: Reporter> AgentRunner<R> {
     /// The fixed failure text for a job no runner may start, or `None` when it may start.
     ///
     /// An agent no runner claims is refused with [`crate::agent::ERR_UNKNOWN_AGENT`]. A Kimi job
-    /// on a box that is not disposable is refused with [`kimi::ERR_NOT_DISPOSABLE`].
+    /// on a box that is not disposable is refused with [`kimi::ERR_NOT_DISPOSABLE`], and one
+    /// whose Profile model is not a plain name with [`kimi::ERR_BAD_MODEL`].
     pub(crate) fn agent_refusal(&self, job: &Job) -> Option<&'static str> {
         if crate::agent::resolve(&job.agent).is_none() {
             return Some(crate::agent::ERR_UNKNOWN_AGENT);
         }
-        (Self::is_kimi(job) && !self.config.disposable).then_some(kimi::ERR_NOT_DISPOSABLE)
+        if !Self::is_kimi(job) {
+            return None;
+        }
+        if !self.config.disposable {
+            return Some(kimi::ERR_NOT_DISPOSABLE);
+        }
+        let applied = self.profile_for(job);
+        let model = applied.as_deref().and_then(Self::kimi_model);
+        kimi::resolve_model(model)
+            .is_none()
+            .then_some(kimi::ERR_BAD_MODEL)
+    }
+
+    fn kimi_model(applied: &crate::profile_apply::Applied) -> Option<&str> {
+        let at = applied.argv.iter().position(|arg| arg == "--model")?;
+        applied.argv.get(at + 1).map(String::as_str)
     }
 
     /// Builds the per-job home of a Codex or Kimi job before its spec is made.
@@ -83,20 +97,21 @@ impl<R: Reporter> AgentRunner<R> {
     /// The command line and environment of a Kimi job.
     ///
     /// The environment is [`kimi::env`] over the base environment: no box secret passes, and
-    /// `KIMI_API_KEY` is set from the held Kimi key only. A job with none held, or a runner
+    /// `KIMI_MODEL_API_KEY` is set from the held Kimi key only. A job with none held, or a runner
     /// with no credential book, gets no key.
     pub(crate) fn kimi_spec(&self, job: &Job, cwd: &Path, home: &Path) -> AgentSpec {
         let applied = self.profile_for(job);
         let prompt = applied
             .as_deref()
             .map_or(job.prompt.as_str(), |applied| applied.prompt.as_str());
-        let model = applied.as_deref().and_then(|applied| {
-            let at = applied.argv.iter().position(|arg| arg == "--model")?;
-            applied.argv.get(at + 1).map(String::as_str)
-        });
+        let model = applied.as_deref().and_then(Self::kimi_model);
+        let name = kimi::resolve_model(model).unwrap_or(kimi::DEFAULT_MODEL);
         let argv = kimi::argv(
-            Path::new(kimi::DEFAULT_PROGRAM),
-            &KimiJob { prompt, cwd, model },
+            &self.config.kimi_bin,
+            &KimiJob {
+                prompt,
+                model: model.filter(|model| kimi::resolve_model(Some(model)).is_some()),
+            },
         );
         let kimi_home = self
             .kimi_home(&job.job_id, cwd)
@@ -105,6 +120,7 @@ impl<R: Reporter> AgentRunner<R> {
         let mut env = kimi::env(
             &self.config.base_env,
             key.as_deref().unwrap_or_default(),
+            name,
             &job.job_id,
             home,
             &kimi_home,

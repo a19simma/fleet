@@ -105,6 +105,40 @@ fn codex_script() -> &'static Path {
     path
 }
 
+const KIMI_SCRIPT: &str = r#"#!/bin/sh
+fail() { echo "bad:$1" >&2; exit 9; }
+[ "$#" -eq 4 ] || fail count
+[ "$1" = "-p" ] || fail p
+[ "$3" = "--output-format" ] || fail format
+[ "$4" = "stream-json" ] || fail json
+[ "$KIMI_MODEL_NAME" = "kimi-for-coding" ] || fail name
+[ "$KIMI_MODEL_PROVIDER_TYPE" = "kimi" ] || fail provider
+[ "$KIMI_MODEL_BASE_URL" = "https://api.kimi.ai/coding/v1" ] || fail base
+[ "$KIMI_DISABLE_TELEMETRY" = "1" ] || fail telemetry
+[ "$KIMI_CODE_NO_AUTO_UPDATE" = "1" ] || fail update
+[ -d "$KIMI_CODE_HOME" ] || fail home
+[ -z "${KIMI_MODEL_API_KEY+x}" ] || fail key
+[ -z "${KIMI_API_KEY+x}" ] || fail legacy
+echo '{"role":"meta","type":"system.version","version":"2.4.1"}'
+printf '{"role":"assistant","content":"pong cwd=%s"}\n' "$(pwd -P)"
+echo '{"role":"meta","type":"session.resume_hint","session_id":"session_1","command":"kimi -r session_1","content":"To resume this session: kimi -r session_1"}'
+case "$2" in *fail) exit 3 ;; esac
+exit 0
+"#;
+
+fn kimi_script() -> &'static Path {
+    static DIR: OnceLock<(TempDir, PathBuf)> = OnceLock::new();
+    let (_, path) = DIR.get_or_init(|| {
+        let dir = TempDir::new().unwrap_or_else(|_| std::process::abort());
+        let path = dir.path().join("kimi");
+        std::fs::write(&path, KIMI_SCRIPT).unwrap_or_else(|_| std::process::abort());
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755))
+            .unwrap_or_else(|_| std::process::abort());
+        (dir, path)
+    });
+    path
+}
+
 struct Hung {
     called: mpsc::UnboundedSender<()>,
 }
@@ -1551,6 +1585,75 @@ async fn a_codex_job_ends_with_an_incomplete_summary_and_no_figures() -> TestRes
         assert_eq!(summary.bash_calls, None);
         assert_eq!(summary.denials, None);
         assert_eq!(summary.cost_est_usd, None);
+        Ok(())
+    }))
+    .await
+}
+
+#[tokio::test]
+async fn a_kimi_job_runs_the_real_cli_shape_and_its_feed_survives_the_stream() -> TestResult {
+    common::bounded(Box::pin(async {
+        let dir = TempDir::new()?;
+        let mut cfg = config(true);
+        cfg.kimi_bin = kimi_script().to_path_buf();
+        let (agent, mut rx) = runner(cfg, 0);
+        let (_trigger, shutdown) = Shutdown::channel();
+        let kimi = Job {
+            agent: "kimi".into(),
+            prompt: "Reply with exactly: pong".into(),
+            ..job("")
+        };
+        let outcome = agent.run(&kimi, dir.path(), shutdown.clone()).await?;
+        assert_eq!(outcome, AgentOutcome::Succeeded);
+        let requests = drain(&mut rx);
+        let all = text(&requests);
+        assert!(all.contains("system.version"), "{all}");
+        assert!(all.contains("session.resume_hint"), "{all}");
+        let cwd = std::fs::canonicalize(dir.path())?;
+        assert!(
+            all.contains(&format!("pong cwd={}", cwd.display())),
+            "{all}"
+        );
+        assert_eq!(events(&requests).len(), 0);
+        let failing = Job {
+            prompt: "Reply with exactly: pong fail".into(),
+            ..kimi
+        };
+        let outcome = agent.run(&failing, dir.path(), shutdown).await?;
+        assert!(
+            matches!(outcome, AgentOutcome::Failed { .. }),
+            "{outcome:?}"
+        );
+        let requests = drain(&mut rx);
+        assert_eq!(events(&requests).len(), 0);
+        let summary = terminal(&requests)?.summary.clone().ok_or("no summary")?;
+        assert!(!summary.complete);
+        assert_eq!(summary.missing, ["parser"]);
+        assert_eq!(summary.turns, None);
+        assert_eq!(summary.tokens_in, None);
+        Ok(())
+    }))
+    .await
+}
+
+#[tokio::test]
+async fn a_kimi_job_on_a_box_that_is_not_disposable_never_starts_the_binary() -> TestResult {
+    common::bounded(Box::pin(async {
+        let dir = TempDir::new()?;
+        let mut cfg = config(false);
+        cfg.kimi_bin = kimi_script().to_path_buf();
+        let (agent, mut rx) = runner(cfg, 0);
+        let (_trigger, shutdown) = Shutdown::channel();
+        let kimi = Job {
+            agent: "kimi".into(),
+            ..job("x")
+        };
+        let outcome = agent.run(&kimi, dir.path(), shutdown).await?;
+        assert!(
+            matches!(outcome, AgentOutcome::Failed { .. }),
+            "{outcome:?}"
+        );
+        assert!(!text(&drain(&mut rx)).contains("pong"));
         Ok(())
     }))
     .await

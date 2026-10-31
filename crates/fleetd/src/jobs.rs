@@ -408,6 +408,13 @@ impl<R: Reporter + Send + Sync + 'static> JobRunner for DaemonRunner<R> {
     }
 }
 
+fn agent_binaries(config: &Config) -> RunConfig {
+    let mut run = RunConfig::new(&config.claude_bin, config.disposable);
+    run.gh_bin.clone_from(&config.gh_bin);
+    run.kimi_bin.clone_from(&config.kimi_bin);
+    run
+}
+
 fn job_gid(config: &Config) -> Result<Option<u32>, Error> {
     let Some(spec) = config.job_group.as_deref() else {
         return Ok(None);
@@ -619,8 +626,7 @@ pub(crate) fn build(
         channel.clone(),
         &raw_token,
     )?));
-    let mut run = RunConfig::new(&config.claude_bin, config.disposable);
-    run.gh_bin.clone_from(&config.gh_bin);
+    let mut run = agent_binaries(config);
     run.jobs_dir = Some(config.jobs_dir.clone());
     run.job_gid = job_gid(config)?;
     apply_limits(&mut run, config);
@@ -698,6 +704,19 @@ mod tests {
             let _ = self.0.send(request);
             std::future::ready(Ok(ReportJobReply::default()))
         }
+    }
+
+    #[test]
+    fn the_configured_binaries_reach_the_run_config() -> TestResult {
+        let config = Config::resolve(
+            Some("claude_bin = \"/opt/claude\"\nkimi_bin = \"/opt/kimi\"\ngh_bin = \"/opt/gh\"\n"),
+            &|_| None,
+        )?;
+        let run = agent_binaries(&config);
+        assert_eq!(run.claude_bin, PathBuf::from("/opt/claude"));
+        assert_eq!(run.kimi_bin, PathBuf::from("/opt/kimi"));
+        assert_eq!(run.gh_bin, PathBuf::from("/opt/gh"));
+        Ok(())
     }
 
     #[test]

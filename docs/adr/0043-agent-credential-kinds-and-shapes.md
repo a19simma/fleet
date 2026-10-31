@@ -48,14 +48,15 @@ The Anthropic legal page says developers "may not collect, store, or intermediat
 - Codex PATs (`at-`) exist only for Business and Enterprise plans, with 7 to 90 day windows (https://learn.chatgpt.com/docs/enterprise/access-tokens.md). They do not help a personal plan, so Codex on a personal plan needs `codex_api_key` or the rejected `refreshing_file`.
 - The Codex `auth.json` refreshes after 8 days (source: openai/codex `codex-rs/login/src/auth/manager.rs`).
 - Kimi OAuth access tokens live about 900 s and refresh tokens are single use. The source is a blog and this is unverified.
+- Verified on a live run of Kimi Code 2.4.1 on a test box: `kimi -p <prompt> --output-format stream-json` in the job workdir, with `KIMI_MODEL_API_KEY`, `KIMI_MODEL_NAME`, `KIMI_MODEL_PROVIDER_TYPE=kimi`, `KIMI_MODEL_BASE_URL=https://api.kimi.ai/coding/v1`, `KIMI_DISABLE_TELEMETRY=1`, `KIMI_CODE_NO_AUTO_UPDATE=1` and `KIMI_CODE_HOME` set, exits 0 and prints three stdout lines (`system.version`, one `assistant` line with `content`, `session.resume_hint`), nothing on stderr and no result or usage event. The CLI has no `--print` or `--work-dir`. `KIMI_API_KEY` is not read from the shell. `-p` mode requests no approval and runs under the auto policy.
 - Kimi membership keys are created in the Kimi Code Console (https://www.kimi.com/en/help/kimi-code/membership-guide).
 
 ## Unverified
 
 - The `sk-kimi-` prefix of `kimi_membership_key`.
-- Whether the Kimi CLI `--print` flag implies auto-approve. No Kimi CLI was available, so fleetd takes the stricter reading and runs a Kimi job only on a disposable box.
-- The Kimi model hosts `api.moonshot.ai` and `api.kimi.com`. No source in this ADR or ADR-0044 names them, and the per-job egress narrowing now passes exactly these two names, so a wrong name fails closed. They stay unverified until a live Kimi run.
-- The Kimi flags `--model=<m>`, `--work-dir`, `--output-format stream-json` and the `KIMI_API_KEY` and `KIMI_CODE_HOME` variables.
+- Whether the static deny rules of the Kimi CLI hold under the `-p` auto policy. fleetd takes the stricter reading and runs a Kimi job only on a disposable box.
+- Which hosts the Kimi CLI contacts besides `api.kimi.ai`. `auth.kimi.ai`, `code.kimi.ai` and `cdn.kimi.com` appear in its docs and were not observed by name in the keyed run. fleetd declares `api.kimi.ai` only, so a missing host fails closed.
+- Whether `kimi -p` accepts a prompt that starts with a dash.
 - The 900 s lifetime and single-use refresh of Kimi OAuth tokens.
 - Whether the Codex CLI honours the `features.hooks` key. No live Codex run has checked it, and the argv `-c features.hooks=false` and the `config.toml` both set it.
 - Whether Anthropic enforces the quoted terms against a `claude setup-token` token stored by a self-hosted service.

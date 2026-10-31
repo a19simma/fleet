@@ -1,27 +1,26 @@
 //! The Kimi Code runner (ADR-0044).
 //!
-//! Kimi runs non-interactively with the Floor set by the CLI permission mode: the per-job
-//! config turns auto-approval off and no hooks are configured, so a deny cannot depend on a
-//! hook running. fleetd assumes the CLI fails open when hooks are absent and so places no
-//! trust in them. A per-job config directory holds `config.toml` and is removed when the job
-//! ends. The only secret in the child environment is [`API_KEY_ENV`]; the config names that
-//! variable and never holds the key. fleetd sets no `User-Agent`: traffic reaches the model
-//! host through the `HTTPS_PROXY` CONNECT tunnel only.
+//! The argv and environment match the Kimi Code 2.4.1 CLI as run on a test box:
+//! `kimi -p <prompt> --output-format stream-json [-m model]` in the job workdir. The model
+//! provider comes from the `KIMI_MODEL_*` variables, so no config file is written: the per-job
+//! `KIMI_CODE_HOME` directory is empty at start and is removed when the job ends. The only
+//! secret in the child environment is [`API_KEY_ENV`]. fleetd sets no `User-Agent`: traffic
+//! reaches the model host through the `HTTPS_PROXY` CONNECT tunnel only.
 //!
-//! Unverified: every Kimi CLI flag and config key below was written without a Kimi CLI to
-//! check against. That covers `--print`, `--output-format stream-json`, `--work-dir`,
-//! `--model=`, `--prompt=`, the `KIMI_CODE_HOME` directory variable, the `KIMI_API_KEY`
-//! variable name, the `default_yolo` key, the `[providers.kimi]` table with `type` and
-//! `api_key_env`, the `sk-kimi-` key prefix (ADR-0043) and the model hosts in
-//! [`AgentRunner::model_hosts`], which no source in the ADRs states. Also unverified: whether
-//! `--print` implies auto-approve. The job path takes the stricter reading and runs a Kimi job
-//! only on a disposable box. Confirm each against the installed CLI before relying on it.
+//! `-p` mode asks for no approval and always runs under the auto policy, so a Kimi job runs
+//! only on a disposable box ([`ERR_NOT_DISPOSABLE`]). No hook runs in the Kimi CLI, so a deny
+//! cannot depend on one.
+//!
+//! Unverified: the `sk-kimi-` key prefix (ADR-0043), whether `-p` accepts a prompt that
+//! starts with a dash, whether the static deny rules hold under the auto policy, and which
+//! hosts besides [`AgentRunner::model_hosts`] the CLI contacts (auth, code and cdn hosts were
+//! not observed by name).
 
 use std::collections::BTreeMap;
 use std::ffi::OsString;
 use std::fs;
 use std::io;
-use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
+use std::os::unix::fs::DirBuilderExt;
 use std::path::{Path, PathBuf};
 
 use super::AgentRunner;
@@ -34,17 +33,28 @@ pub const NAME: &str = "kimi";
 /// Fixed failure message for a Kimi job on a box that is not disposable.
 pub const ERR_NOT_DISPOSABLE: &str = "kimi needs a disposable box";
 
-/// The environment variable that carries the Kimi credential. Unverified.
-pub const API_KEY_ENV: &str = "KIMI_API_KEY";
+/// Fixed failure message for a Kimi job whose model name is not a plain identifier.
+pub const ERR_BAD_MODEL: &str = "kimi model is not valid";
 
-/// The environment variable that points Kimi at its per-job directory. Unverified.
+/// The environment variable that carries the Kimi credential.
+pub const API_KEY_ENV: &str = "KIMI_MODEL_API_KEY";
+
+/// The environment variable that points Kimi at its per-job directory.
 pub const HOME_ENV: &str = "KIMI_CODE_HOME";
+
+/// The model used when the Profile sets none.
+pub const DEFAULT_MODEL: &str = "kimi-for-coding";
+
+/// The longest model name accepted.
+pub const MAX_MODEL_LEN: usize = 64;
+
+const PROVIDER_TYPE: &str = "kimi";
+const BASE_URL: &str = "https://api.kimi.ai/coding/v1";
 
 /// The executable name used when no Kimi path is configured.
 pub const DEFAULT_PROGRAM: &str = "kimi";
 
 const KIMI_DIR: &str = ".kimi";
-const CONFIG_FILE: &str = "config.toml";
 
 const ENV_ALLOW: [&str; 9] = [
     "PATH",
@@ -58,14 +68,26 @@ const ENV_ALLOW: [&str; 9] = [
     "no_proxy",
 ];
 
-/// The Floor in `$KIMI_CODE_HOME/config.toml`.
-///
-/// `default_yolo = false` keeps auto-approval off. The provider names [`API_KEY_ENV`] so the
-/// key stays out of the file. There is no hooks table. All keys are unverified.
-pub const CONFIG_TOML: &str =
-    "default_yolo = false\n\n[providers.kimi]\ntype = \"kimi\"\napi_key_env = \"KIMI_API_KEY\"\n";
+const MODEL_HOSTS: &[&str] = &["api.kimi.ai"];
 
-const MODEL_HOSTS: &[&str] = &["api.moonshot.ai", "api.kimi.com"];
+/// The model name to run, or `None` for a name to refuse.
+///
+/// An unset `model` gives [`DEFAULT_MODEL`]. A set one passes when it is 1 to
+/// [`MAX_MODEL_LEN`] ASCII letters, digits, `.`, `_`, `:`, `/` or `-` and does not start with
+/// `-`. A refused name never reaches the argv or the environment.
+#[must_use]
+pub fn resolve_model(model: Option<&str>) -> Option<&str> {
+    let Some(model) = model else {
+        return Some(DEFAULT_MODEL);
+    };
+    let plain = !model.is_empty()
+        && model.len() <= MAX_MODEL_LEN
+        && !model.starts_with('-')
+        && model
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b':' | b'/' | b'-'));
+    plain.then_some(model)
+}
 
 pub(super) struct Kimi;
 
@@ -74,8 +96,8 @@ impl AgentRunner for Kimi {
         NAME
     }
 
-    fn program<'a>(&self, _config: &'a RunConfig) -> &'a Path {
-        Path::new(DEFAULT_PROGRAM)
+    fn program<'a>(&self, config: &'a RunConfig) -> &'a Path {
+        &config.kimi_bin
     }
 
     fn config_dir_env(&self) -> &'static str {
@@ -90,38 +112,39 @@ impl AgentRunner for Kimi {
 /// What one Kimi job runs with.
 #[derive(Debug, Clone, Copy)]
 pub struct KimiJob<'a> {
-    /// The prompt, joined to `--prompt=` so a leading dash is never a flag.
+    /// The prompt, the argument after `-p`.
     pub prompt: &'a str,
-    /// The worktree the agent works in.
-    pub cwd: &'a Path,
     /// The model, when the Profile sets one.
     pub model: Option<&'a str>,
 }
 
-/// The command line for `job`, with `program` first. Flags are unverified.
+/// The command line for `job`, with `program` first.
 ///
-/// Passes no auto-approve flag, so the permission mode in the per-job config applies.
+/// The agent works in the process working directory, so the argv has no directory flag. Pass
+/// a model that [`resolve_model`] accepted.
 #[must_use]
 pub fn argv(program: &Path, job: &KimiJob<'_>) -> Vec<OsString> {
     let mut argv: Vec<OsString> = vec![program.as_os_str().to_owned()];
-    argv.extend(["--print", "--output-format", "stream-json", "--work-dir"].map(OsString::from));
-    argv.push(job.cwd.as_os_str().to_owned());
+    argv.push(OsString::from("-p"));
+    argv.push(OsString::from(job.prompt));
+    argv.extend(["--output-format", "stream-json"].map(OsString::from));
     if let Some(model) = job.model {
-        argv.push(OsString::from(format!("--model={model}")));
+        argv.extend(["-m", model].map(OsString::from));
     }
-    argv.push(OsString::from(format!("--prompt={}", job.prompt)));
     argv
 }
 
 /// The complete child environment.
 ///
 /// `base` is filtered to the allow list and `LC_*`, minus any forbidden name, so no host
-/// secret passes. `api_key` becomes [`API_KEY_ENV`], the one secret. `home` is the per-job
-/// `HOME` and `kimi_home` the per-job [`HOME_ENV`].
+/// secret passes. `api_key` becomes [`API_KEY_ENV`], the one secret, and `model` the model
+/// name; pass one that [`resolve_model`] accepted. `home` is the per-job `HOME` and
+/// `kimi_home` the per-job [`HOME_ENV`].
 #[must_use]
 pub fn env(
     base: &[(OsString, OsString)],
     api_key: &str,
+    model: &str,
     job_id: &str,
     home: &Path,
     kimi_home: &Path,
@@ -135,7 +158,7 @@ pub fn env(
         })
         .cloned()
         .collect();
-    let fixed: [(&str, OsString); 8] = [
+    let fixed: [(&str, OsString); 13] = [
         ("FLEET_JOB_ID", job_id.into()),
         ("SWARM_BOX", "1".into()),
         ("HOME", home.into()),
@@ -144,6 +167,11 @@ pub fn env(
         ("XDG_CACHE_HOME", home.join(".cache").into()),
         ("GIT_TERMINAL_PROMPT", "0".into()),
         (API_KEY_ENV, api_key.into()),
+        ("KIMI_MODEL_NAME", model.into()),
+        ("KIMI_MODEL_PROVIDER_TYPE", PROVIDER_TYPE.into()),
+        ("KIMI_MODEL_BASE_URL", BASE_URL.into()),
+        ("KIMI_DISABLE_TELEMETRY", "1".into()),
+        ("KIMI_CODE_NO_AUTO_UPDATE", "1".into()),
     ];
     env.extend(fixed.map(|(name, value)| (OsString::from(name), value)));
     env
@@ -151,20 +179,18 @@ pub fn env(
 
 /// The per-job Kimi directory, `<root>/.kimi/<job id>`, removed on drop.
 ///
-/// It holds the Floor config and whatever Kimi writes there while it runs.
+/// It starts empty and holds whatever Kimi writes there while it runs.
 #[derive(Debug)]
 pub struct KimiHome {
     path: PathBuf,
 }
 
 impl KimiHome {
-    /// Builds the directory with mode 0700 and its config 0600. A leftover of the same id is
-    /// replaced.
+    /// Builds the empty directory with mode 0700. A leftover of the same id is replaced.
     ///
     /// # Errors
     ///
-    /// Returns the I/O error when the id is invalid or a file cannot be written. A partly
-    /// built directory is removed first.
+    /// Returns the I/O error when the id is invalid or the directory cannot be made.
     pub fn create(root: &Path, job_id: &str) -> io::Result<Self> {
         validate_job_id(job_id).map_err(|_| io::Error::from(io::ErrorKind::InvalidInput))?;
         let parent = root.join(KIMI_DIR);
@@ -174,16 +200,8 @@ impl KimiHome {
             .mode(0o700)
             .create(&parent)?;
         remove_if_present(&path)?;
-        let home = Self { path };
-        home.fill()?;
-        Ok(home)
-    }
-
-    fn fill(&self) -> io::Result<()> {
-        fs::DirBuilder::new().mode(0o700).create(&self.path)?;
-        let target = self.path.join(CONFIG_FILE);
-        fs::write(&target, CONFIG_TOML)?;
-        fs::set_permissions(&target, fs::Permissions::from_mode(0o600))
+        fs::DirBuilder::new().mode(0o700).create(&path)?;
+        Ok(Self { path })
     }
 
     /// The directory, the value of [`HOME_ENV`].

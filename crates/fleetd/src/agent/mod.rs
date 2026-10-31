@@ -79,7 +79,7 @@ mod tests {
         for (name, hosts) in [
             ("claude", &["api.anthropic.com"][..]),
             ("codex", &["api.openai.com"][..]),
-            ("kimi", &["api.moonshot.ai", "api.kimi.com"][..]),
+            ("kimi", &["api.kimi.ai"][..]),
         ] {
             let runner = resolve(name).map(AgentRunner::model_hosts);
             assert_eq!(runner, Some(hosts), "{name}");

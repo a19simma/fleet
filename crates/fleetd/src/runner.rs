@@ -307,6 +307,8 @@ pub struct RunConfig {
     pub claude_bin: PathBuf,
     /// Codex binary, `codex` by default. Only a job whose `agent` is `codex` starts it.
     pub codex_bin: PathBuf,
+    /// Kimi binary, `kimi` by default. Only a job whose `agent` is `kimi` starts it.
+    pub kimi_bin: PathBuf,
     /// GitHub CLI binary that opens the pull request, `gh` by default.
     pub gh_bin: PathBuf,
     /// The fleetd executable the push runs as `<path> askpass`, the current executable by
@@ -368,6 +370,7 @@ impl RunConfig {
         Self {
             claude_bin: claude_bin.into(),
             codex_bin: PathBuf::from(crate::agent::codex::DEFAULT_PROGRAM),
+            kimi_bin: PathBuf::from(crate::agent::kimi::DEFAULT_PROGRAM),
             gh_bin: PathBuf::from("gh"),
             git_bin: PathBuf::from("git"),
             askpass_bin: std::env::current_exe().unwrap_or_else(|_| PathBuf::from("fleetd")),
@@ -1744,7 +1747,7 @@ impl<R: Reporter> AgentRunner<R> {
     /// values, with `home` as `HOME` and `home/.claude` as `CLAUDE_CONFIG_DIR`. A job whose
     /// `agent` is `codex` gets the Codex argv and environment instead, with the one secret
     /// `CODEX_API_KEY` from its held `codex_api_key`. A job whose `agent` is `kimi` gets the
-    /// Kimi argv and environment, with the one secret `KIMI_API_KEY` from its held Kimi key.
+    /// Kimi argv and environment, with the one secret `KIMI_MODEL_API_KEY` from its held Kimi key.
     pub fn agent_spec(&self, job: &Job, cwd: &Path, home: &Path) -> AgentSpec {
         if Self::is_codex(job) {
             self.codex_spec(job, cwd, home)
@@ -3132,6 +3135,7 @@ mod tests {
         let launcher = Arc::new(FakeLauncher::new(ExitStatus::from_raw(0), false));
         let mut config = test_config(dir.path());
         config.disposable = true;
+        config.kimi_bin = PathBuf::from("kimi-fake");
         let runner = AgentRunner::new(config, Replies { cancel: false }, Redactor::default())
             .with_launcher(launcher.clone());
         let (_trigger, shutdown) = Shutdown::channel();
@@ -3146,12 +3150,131 @@ mod tests {
             .lock()
             .unwrap_or_else(PoisonError::into_inner)[0]
             .clone();
-        assert_eq!(spec.argv.first(), Some(&OsString::from("kimi")));
-        assert_eq!(spec.argv.get(1), Some(&OsString::from("--print")));
+        let argv: Vec<_> = spec.argv.iter().map(|a| a.to_string_lossy()).collect();
+        assert_eq!(
+            argv,
+            ["kimi-fake", "-p", "do it", "--output-format", "stream-json"]
+        );
+        assert_eq!(spec.cwd, dir.path());
         let home = dir.path().join(".kimi").join("job1");
         assert!(home.is_dir());
         runner.end_job(&job);
         assert!(!home.exists());
+    }
+
+    fn applied_with_model(model: &str) -> crate::profile_apply::Applied {
+        crate::profile_apply::Applied {
+            bundle: crate::agent_config::Bundle::default(),
+            argv: vec!["--model".into(), model.into()],
+            prompt: "do it".into(),
+            dropped_allows: Vec::new(),
+            permission_mode: "default",
+        }
+    }
+
+    #[tokio::test]
+    async fn a_kimi_profile_model_reaches_the_flag_and_the_model_variable_only() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let launcher = Arc::new(FakeLauncher::new(ExitStatus::from_raw(0), false));
+        let mut config = test_config(dir.path());
+        config.disposable = true;
+        let runner = AgentRunner::new(config, Replies { cancel: false }, Redactor::default())
+            .with_launcher(launcher.clone());
+        let job = Job {
+            agent: "kimi".into(),
+            ..test_job()
+        };
+        runner
+            .profiles
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .insert(
+                AgentRunner::<Replies>::carry_key(&job),
+                Arc::new(applied_with_model("kimi-k2.5")),
+            );
+        let (_trigger, shutdown) = Shutdown::channel();
+        let outcome = runner.run(&job, dir.path(), shutdown).await;
+        assert_eq!(outcome.ok(), Some(AgentOutcome::Succeeded));
+        let spec = launcher
+            .specs
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)[0]
+            .clone();
+        assert_eq!(spec.argv.last(), Some(&OsString::from("kimi-k2.5")));
+        assert_eq!(
+            spec.env.get(&OsString::from("KIMI_MODEL_NAME")),
+            Some(&OsString::from("kimi-k2.5"))
+        );
+    }
+
+    #[tokio::test]
+    async fn a_kimi_job_with_a_hostile_model_fails_and_never_launches() {
+        for model in ["a\nb", "a b", "a=b", "a\0b", "-m", &"a".repeat(65)] {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let launcher = Arc::new(FakeLauncher::new(ExitStatus::from_raw(0), false));
+            let mut config = test_config(dir.path());
+            config.disposable = true;
+            let runner = AgentRunner::new(config, Replies { cancel: false }, Redactor::default())
+                .with_launcher(launcher.clone());
+            let job = Job {
+                agent: "kimi".into(),
+                ..test_job()
+            };
+            runner
+                .profiles
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .insert(
+                    AgentRunner::<Replies>::carry_key(&job),
+                    Arc::new(applied_with_model(model)),
+                );
+            let (_trigger, shutdown) = Shutdown::channel();
+            let outcome = runner.run(&job, dir.path(), shutdown).await;
+            assert_eq!(
+                outcome.ok(),
+                Some(AgentOutcome::Failed {
+                    exit_code: None,
+                    error: crate::agent::kimi::ERR_BAD_MODEL,
+                }),
+                "{model:?}"
+            );
+            assert!(
+                launcher
+                    .specs
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .is_empty()
+            );
+            assert!(!dir.path().join(".kimi").exists());
+        }
+    }
+
+    #[test]
+    fn a_kimi_spec_built_over_a_hostile_model_falls_back_to_the_default() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let runner = AgentRunner::new(
+            test_config(dir.path()),
+            Replies { cancel: false },
+            Redactor::default(),
+        );
+        let job = Job {
+            agent: "kimi".into(),
+            ..test_job()
+        };
+        runner
+            .profiles
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .insert(
+                AgentRunner::<Replies>::carry_key(&job),
+                Arc::new(applied_with_model("a\nb=c")),
+            );
+        let spec = runner.agent_spec(&job, dir.path(), &dir.path().join("home"));
+        assert!(!spec.argv.iter().any(|arg| arg == "-m"));
+        assert_eq!(
+            spec.env.get(&OsString::from("KIMI_MODEL_NAME")),
+            Some(&OsString::from("kimi-for-coding"))
+        );
     }
 
     #[tokio::test]
@@ -3652,7 +3775,7 @@ mod tests {
             ("", &["api.anthropic.com"]),
             ("claude", &["api.anthropic.com"]),
             ("codex", &["api.openai.com"]),
-            ("kimi", &["api.moonshot.ai", "api.kimi.com"]),
+            ("kimi", &["api.kimi.ai"]),
         ];
         for (agent, hosts) in cases {
             let dir = tempfile::tempdir().expect("tempdir");

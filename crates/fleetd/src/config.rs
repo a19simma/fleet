@@ -63,6 +63,7 @@ struct FileConfig {
     box_name: Option<String>,
     dedupe_window_secs: Option<u64>,
     claude_bin: Option<PathBuf>,
+    kimi_bin: Option<PathBuf>,
     gh_bin: Option<PathBuf>,
     disposable: Option<bool>,
     jobs_dir: Option<PathBuf>,
@@ -134,6 +135,9 @@ pub struct Config {
     pub dedupe_window: Duration,
     /// Agent binary that runs jobs.
     pub claude_bin: PathBuf,
+    /// Kimi Code binary that runs `kimi` jobs, `kimi` when unset. Use an absolute path when the
+    /// job user has no `kimi` in its `PATH`.
+    pub kimi_bin: PathBuf,
     /// GitHub CLI binary that opens pull requests. It is an absolute path: a relative value
     /// fails the load. When the key is unset, the first `gh` in `/usr/local/bin`, `/usr/bin`,
     /// `/opt/homebrew/bin` and `/bin` is used, else `/usr/bin/gh`. No job looks `gh` up in `PATH`.
@@ -321,6 +325,9 @@ impl Config {
             claude_bin: file
                 .claude_bin
                 .unwrap_or_else(|| PathBuf::from(DEFAULT_CLAUDE_BIN)),
+            kimi_bin: file
+                .kimi_bin
+                .unwrap_or_else(|| PathBuf::from(crate::agent::kimi::DEFAULT_PROGRAM)),
             gh_bin: resolve_gh_bin(file.gh_bin)?,
             disposable: file.disposable.unwrap_or(false),
             jobs_dir: resolve_jobs_dir(&env, file.jobs_dir),
@@ -983,8 +990,10 @@ mod tests {
         assert_eq!(cfg.claude_bin, PathBuf::from("claude"));
         assert!(cfg.gh_bin.is_absolute());
         assert!(!cfg.disposable);
-        let file = "claude_bin = \"/opt/claude\"\ngh_bin = \"/opt/gh\"\ndisposable = true\n";
+        assert_eq!(cfg.kimi_bin, PathBuf::from("kimi"));
+        let file = "claude_bin = \"/opt/claude\"\nkimi_bin = \"/opt/kimi\"\ngh_bin = \"/opt/gh\"\ndisposable = true\n";
         let cfg = Config::resolve(Some(file), &env_of(&[])).unwrap();
+        assert_eq!(cfg.kimi_bin, PathBuf::from("/opt/kimi"));
         assert_eq!(cfg.claude_bin, PathBuf::from("/opt/claude"));
         assert_eq!(cfg.gh_bin, PathBuf::from("/opt/gh"));
         assert!(cfg.disposable);
