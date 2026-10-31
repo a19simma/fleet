@@ -6,6 +6,7 @@
 //! [`CatchPanic`], then stamps the security headers. [`WebAuth`] holds passkey login and
 //! sessions (ADR 0042).
 
+mod credentials;
 mod dispatch;
 mod pages;
 mod panic;

@@ -232,6 +232,10 @@ impl WebAuth {
         })
     }
 
+    pub(super) const fn pool(&self) -> &PgPool {
+        &self.pool
+    }
+
     /// The serialized origin browsers send in the `Origin` header.
     #[must_use]
     pub fn origin(&self) -> &str {
