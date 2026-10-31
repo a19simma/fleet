@@ -272,15 +272,15 @@ async fn submit_sends_the_agent_flag_and_defaults_to_empty() -> TestResult {
 }
 
 #[tokio::test]
-async fn submit_surfaces_the_server_text_for_an_unknown_agent() -> TestResult {
-    let (url, stub) = serve().await?;
-    let args = [
-        "submit", "--repo", "o/r", "--base", "main", "--agent", "gpt", "a",
-    ];
-    let (res, _) = cli(&url, Some(TOKEN), &args).await;
-    let err = res.err().ok_or("expected failure")?;
-    assert_eq!(err.exit_code(), 1);
-    assert!(err.to_string().contains("invalid agent"), "{err}");
+async fn submit_rejects_an_unknown_agent_before_any_request() -> TestResult {
+    let (_url, stub) = serve().await?;
+    let err = Cli::try_parse_from([
+        "fleet", "submit", "--repo", "o/r", "--base", "main", "--agent", "gpt", "a",
+    ])
+    .err()
+    .ok_or("expected a usage error")?;
+    assert_eq!(err.exit_code(), 2);
+    assert!(err.to_string().contains("gpt"), "{err}");
     assert_eq!(submitted(&stub)?.len(), 0);
     Ok(())
 }

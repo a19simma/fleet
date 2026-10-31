@@ -231,24 +231,6 @@ async fn the_agent_flag_binds_every_job_and_defaults_to_claude(pool: PgPool) {
 }
 
 #[sqlx::test]
-async fn an_unknown_agent_surfaces_the_server_invalid_argument_text(pool: PgPool) {
-    let store = migrated(&pool).await;
-    let addr = serve(&store);
-    let mut args = submit_args("fix it", SHA, "alpha");
-    args.extend(["--agent", "gpt"]);
-    let (result, out) = cli_as(addr, CLIENT, &args).await;
-    let Err(CliError::Rpc(status)) = result else {
-        panic!("expected an rpc error");
-    };
-    assert_eq!(status.code(), tonic::Code::InvalidArgument);
-    assert!(
-        status.message().contains("invalid job request"),
-        "{status:?}"
-    );
-    assert_eq!(out, "");
-}
-
-#[sqlx::test]
 async fn the_same_key_returns_the_stored_batch_and_a_new_key_makes_a_new_one(pool: PgPool) {
     let store = migrated(&pool).await;
     let addr = serve(&store);

@@ -62,6 +62,9 @@ pub struct Cli {
     pub command: Command,
 }
 
+/// Agent names `--agent` accepts.
+const AGENTS: [&str; 3] = ["claude", "codex", "kimi"];
+
 /// A subcommand.
 #[derive(Debug, Subcommand)]
 pub enum Command {
@@ -84,11 +87,11 @@ pub enum Command {
         /// Agent that runs the job: claude, codex or kimi. Empty means claude.
         #[arg(
             long,
-            default_value = "",
             value_name = "AGENT",
+            value_parser = AGENTS,
             help = "Agent that runs the job: claude, codex or kimi [default: claude]"
         )]
-        agent: String,
+        agent: Option<String>,
         /// Task prompt, or `-` to read it from stdin.
         prompt: String,
     },
@@ -185,11 +188,11 @@ pub enum BatchAction {
         /// Agent that runs every job: claude, codex or kimi. Empty means claude.
         #[arg(
             long,
-            default_value = "",
             value_name = "AGENT",
+            value_parser = AGENTS,
             help = "Agent that runs every job: claude, codex or kimi [default: claude]"
         )]
-        agent: String,
+        agent: Option<String>,
     },
 }
 
@@ -573,7 +576,7 @@ async fn run_batch(
                     base,
                     profiles,
                     idempotency_key,
-                    agent,
+                    agent: agent.unwrap_or_default(),
                 },
                 stdin,
             )?;
@@ -673,7 +676,7 @@ pub async fn run_with(
                     repo,
                     base_ref: base,
                     open_pr: !no_pr,
-                    agent,
+                    agent: agent.unwrap_or_default(),
                 })
                 .await?
                 .into_inner();
