@@ -1,6 +1,6 @@
 # Agent credential kinds and shapes
 
-Status: Proposed 2026-10-29. Not built. Builds on ADR-0040 for storage and sealing. Supersedes the standing decision "PAT in `/etc/swarm/secrets.env`" for user Jobs only. Leaves the Gitea and Forgejo path to ADR-0045.
+Status: Proposed 2026-10-29. Built in fleet-server and fleet-core: the kind and shape checks, the sealed store, the GitHub verify call and the credentials page. The page shows no last-used time, because `CredentialSummary` carries none. Builds on ADR-0040 for storage and sealing. Supersedes the standing decision "PAT in `/etc/swarm/secrets.env`" for user Jobs only. Leaves the Gitea and Forgejo path to ADR-0045.
 
 A user stores the credentials their agent and their forge need. This ADR lists the kinds the store accepts, the shapes they take and the risks the user takes on.
 
@@ -10,12 +10,12 @@ A user stores the credentials their agent and their forge need. This ADR lists t
 
 | Kind | Source | Notes |
 |---|---|---|
-| `anthropic_api_key` | Anthropic Console | Static key. |
+| `anthropic_api_key` | Anthropic Console | Static key, sealed by ADR-0040. No prefix check. |
 | `claude_subscription_token` | `claude setup-token` | Valid one year. Passed to the agent as `CLAUDE_CODE_OAUTH_TOKEN`. |
 | `github_pat` | GitHub | Fine-grained `github_pat_` tokens only. |
-| `kimi_membership_key` | Kimi Code Console | `sk-kimi-` prefix. Prefix unverified. |
-| `kimi_platform_key` | Kimi platform | Static key. |
-| `codex_api_key` | OpenAI | Static key. |
+| `kimi_membership_key` | Kimi Code Console | `sk-kimi-` prefix, checked on save. Prefix unverified. |
+| `kimi_platform_key` | Kimi platform | Static key, sealed by ADR-0040. No prefix check. |
+| `codex_api_key` | OpenAI | Static key, sealed by ADR-0040. No prefix check. |
 
 ### Shapes
 
