@@ -1,6 +1,6 @@
 # Web UI
 
-Status: Proposed 2026-10-29. Not built. Amends ADR-0013 (services). Evidence: `spikes/web/RESULT.md`.
+Status: Proposed 2026-10-29. Built in fleet-server: the dispatcher, the Topcoat pages and the passkey routes. Amends ADR-0013 (services). Evidence: `spikes/web/RESULT.md`.
 
 Fleet has had the laptop `fleet` CLI as its only client. A browser UI for fleet view, Jobs and credentials needs a Rust web framework inside `fleet-server`. This ADR picks one and records what the spike showed.
 
@@ -18,7 +18,7 @@ The web UI is embedded in `fleet-server` and built with Topcoat 0.11.0 (tokio-rs
 
 ### Pre-1.0 risk and pin policy
 
-Topcoat has made 23 releases and 11 of them were breaking. Expect breakage on any bump. Pin it as `=0.11.0` in `Cargo.toml`, commit `Cargo.lock`, and treat each upgrade as its own change with the web tests run. Pin webauthn-rs the same way (`=0.5.5`).
+Topcoat is pre-1.0, and the release and breaking-change counts quoted at spike time (23 releases, 11 breaking) have no recorded source, so treat them as unverified. Expect breakage on any bump. Pin it as `=0.11.0` in `Cargo.toml`, commit `Cargo.lock`, and treat each upgrade as its own change with the web tests run. webauthn-rs (`=0.5.5`) and hyper-util (`=0.1.21`) carry exact pins in `crates/fleet-server/Cargo.toml`. tonic is `0.14.6` in the workspace `Cargo.toml`.
 
 ### Fallback
 
@@ -30,6 +30,7 @@ The fallback is axum plus maud. It was not needed and was not built. It is the e
 - A hand-written accept loop and an asset route to maintain, and a shutdown drain to write.
 - Topcoat upgrades are deliberate and may need route changes.
 - Login and sessions are specified in ADR-0042.
+- TLS terminates upstream of the server. The `__Host-` session cookie is `Secure`, so a browser login works only over HTTPS. The server listens in plaintext and sets no HSTS header itself.
 
 ## Considered and rejected
 

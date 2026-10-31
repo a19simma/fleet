@@ -30,12 +30,12 @@ ADRs for fleetd, the Fleet server and the `fleet` CLI. The plan is in `../plan.m
 | [0037](0037-credential-broker.md) | Credential broker | Proposed 2026-10-28, built as library code and not wired, push op built on 0031 P3, builds on 0028 and 0036, amends 0024 and 0031 |
 | [0038](0038-fetch-tool-and-box-egress-policy.md) | Fetch tool and Box egress policy | Proposed 2026-10-28, fetch core, fetch event and fetch service built and wired under the systemd launcher, amends 0029, 0031 and 0034 |
 | [0039](0039-job-socket-service-registration.md) | Job socket service registration | Proposed 2026-10-28, `PerJob` registry built, not wired, supersedes the unspecified service registration in 0036, 0037 and 0038 |
-| [0040](0040-credential-store-and-key-custody.md) | Credential store and key custody | Proposed 2026-10-29, not built, amends 0013, builds on 0043 |
-| [0043](0043-agent-credential-kinds-and-shapes.md) | Agent credential kinds and shapes | Proposed 2026-10-29, not built, builds on 0040, supersedes the box PAT decision for user Jobs |
-| [0041](0041-web-ui.md) | Web UI | Proposed 2026-10-29, not built, spike passed with workarounds, amends 0013 |
-| [0042](0042-users-and-auth.md) | Users and auth | Proposed 2026-10-29, partly built (users, API tokens, auth layer), amends 0013 and 0014, builds on 0041 and 0040 |
-| [0044](0044-agent-runners.md) | Agent runners | Proposed 2026-10-29, not built, builds on 0033 and 0043, amends 0021, 0029, 0034 and 0038 |
-| [0045](0045-forge-trait.md) | Forge trait | Proposed 2026-10-29, not built, builds on 0033 and 0043, amends 0024 and 0037 |
-| [0046](0046-mirror-key.md) | Mirror key | Proposed 2026-10-29, not built, amends 0024 and 0031 |
+| [0040](0040-credential-store-and-key-custody.md) | Credential store and key custody | Proposed 2026-10-29, built except the re-seal pass and live key reload, amends 0013, builds on 0043 |
+| [0041](0041-web-ui.md) | Web UI | Proposed 2026-10-29, built, spike passed with workarounds, amends 0013 |
+| [0042](0042-users-and-auth.md) | Users and auth | Proposed 2026-10-29, built except login rate limiting, includes the `fleet-server admin` recovery commands, amends 0013 and 0014, builds on 0041 and 0040 |
+| [0043](0043-agent-credential-kinds-and-shapes.md) | Agent credential kinds and shapes | Proposed 2026-10-29, built, builds on 0040, supersedes the box PAT decision for user Jobs |
+| [0044](0044-agent-runners.md) | Agent runners | Proposed 2026-10-29, built except runner-owned command lines and the Codex and Kimi parsers, builds on 0033 and 0043, amends 0021, 0029, 0034 and 0038 |
+| [0045](0045-forge-trait.md) | Forge trait | Proposed 2026-10-29, built, builds on 0033 and 0043, amends 0024 and 0037 |
+| [0046](0046-mirror-key.md) | Mirror key | Proposed 2026-10-29, built in the workspace and not wired to the Job owner, amends 0024 and 0031 |
 
 Each ADR has a "Decisions (2026-10-24)" section with the choices made when the docs moved into this repo: Apache-2.0 licence, repo github.com/a19simma/fleet, `fleet watch` as a client poll in v1, job cost deferred, Tailscale not a hard dependency.

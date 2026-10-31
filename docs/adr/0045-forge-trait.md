@@ -1,6 +1,6 @@
 # Forge trait
 
-Status: Proposed 2026-10-29. Not built. Builds on ADR-0043 and ADR-0033. Amends ADR-0037 and ADR-0024.
+Status: Proposed 2026-10-29. Built in fleetd: the `Forge` trait, the GitHub implementation and the `Unsupported` Gitea slot, with CI read through `Forge::ci_result`. Builds on ADR-0043 and ADR-0033. Amends ADR-0037 and ADR-0024.
 
 Fleet pushes a branch, opens a pull request and reads CI state on GitHub through the broker (ADR-0037). This ADR puts those operations behind one interface so another forge can fit later.
 

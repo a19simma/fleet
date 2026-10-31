@@ -1,6 +1,6 @@
 # Credential store and key custody
 
-Status: Proposed 2026-10-29. Not built. Amends ADR-0013 (storage). Refers to ADR-0043 for the credential kinds and shapes this store holds.
+Status: Proposed 2026-10-29. Built in fleet-server: the sealed store, `FileSealer`, the key ring loaded from the master key file at startup, and the insert-only `credential_use` audit (migrations 0017 and 0019). Not built: the re-seal pass (`Sealer::rewrap` exists and no code calls it) and a key ring reload without a restart. Amends ADR-0013 (storage). Refers to ADR-0043 for the credential kinds and shapes this store holds.
 
 Fleet will run Jobs with the user's own agent and forge credentials. The server must keep them between Jobs and hand them to a Box only for the Job that needs them. This ADR fixes where they live, how they are sealed and who holds the key.
 
@@ -9,13 +9,13 @@ Fleet will run Jobs with the user's own agent and forge credentials. The server 
 ### Tables
 
 - `credentials`, one row per stored credential: `user_id`, `kind`, `shape`, `ciphertext`, `key_id`, `fingerprint`, `login`, `expires_at`. `kind` and `shape` are defined in ADR-0043. `fingerprint`, `login` and `expires_at` are plaintext display fields and never hold the secret.
-- `credential_use`, an insert-only audit table: one row each time a credential is read for a Job. The server role has no `UPDATE` or `DELETE` grant on it.
+- `credential_use`, an insert-only audit table: one row each time a credential is read for a Job. A trigger rejects `UPDATE` and `DELETE`. It has no foreign key to `credentials`, so deleting a credential is final and the audit rows stay (migration 0019).
 
 ### Sealing
 
 - Cipher: XChaCha20-Poly1305.
 - AAD: `user_id|credential_id|kind`. A ciphertext copied to another row, user or kind fails to open.
-- Key ring: a set of master keys selected by `key_id`. New writes use the current key. A row opens with the key its `key_id` names, so rotation needs no downtime and re-sealing runs as a background pass.
+- Key ring: a set of master keys selected by `key_id`. New writes use the current key. A row opens with the key its `key_id` names, so rotation needs no downtime. Re-sealing under the new key is meant to run as a background pass and is not built. The server reads the ring once at startup, so a new key needs a restart.
 
 ### Master key
 
