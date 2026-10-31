@@ -3,10 +3,10 @@
 use std::fmt::{self, Write};
 
 use fleet_core::{Profile, ProfileError, ProfileHash, ProfileInvalid};
-use fleet_proto::MAX_PROFILE_JSON_BYTES;
 use fleet_proto::v1::{
     GetProfileBlobReply, ListProfilesReply, ProfileRef, ProfileSummary, ProfileVersion,
 };
+use fleet_proto::{ERR_PROFILE_CONTENT_CHOICE, ERR_PROFILE_TOOLS_DISABLED, MAX_PROFILE_JSON_BYTES};
 use sqlx::{PgPool, Row};
 
 use crate::store::{DEFAULT_LIST_LIMIT, MAX_LIST_LIMIT, StoreError};
@@ -48,6 +48,10 @@ pub enum ProfileFault {
     Malformed(ProfileError),
     /// The Profile breaks a validation rule.
     Invalid(ProfileInvalid),
+    /// The Profile has tools and the server gate is off.
+    ToolsDisabled,
+    /// The request set both or neither of the JSON and TOML content.
+    ContentChoice,
 }
 
 impl fmt::Display for ProfileFault {
@@ -57,11 +61,43 @@ impl fmt::Display for ProfileFault {
             Self::TooLarge => f.write_str("profile json is too large"),
             Self::Malformed(err) => err.fmt(f),
             Self::Invalid(err) => err.fmt(f),
+            Self::ToolsDisabled => f.write_str(ERR_PROFILE_TOOLS_DISABLED),
+            Self::ContentChoice => f.write_str(ERR_PROFILE_CONTENT_CHOICE),
         }
     }
 }
 
 impl std::error::Error for ProfileFault {}
+
+/// The profile text of a create request and the grammar it is read with.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProfileContent<'a> {
+    /// JSON text; `tools` is refused.
+    Json(&'a str),
+    /// TOML text; the only form that accepts `tools`.
+    Toml(&'a str),
+}
+
+impl<'a> ProfileContent<'a> {
+    /// Picks the one non-empty field of a request.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ProfileFault::ContentChoice`] when both or neither are set.
+    pub fn select(json: &'a str, toml: &'a str) -> Result<Self, ProfileFault> {
+        match (json.is_empty(), toml.is_empty()) {
+            (false, true) => Ok(Self::Json(json)),
+            (true, false) => Ok(Self::Toml(toml)),
+            _ => Err(ProfileFault::ContentChoice),
+        }
+    }
+
+    fn text(self) -> &'a str {
+        match self {
+            Self::Json(text) | Self::Toml(text) => text,
+        }
+    }
+}
 
 /// A validated create request: the name and the canonical Profile.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -94,12 +130,23 @@ pub fn validate_name(name: &str) -> Result<(), ProfileFault> {
 /// # Errors
 ///
 /// Returns the [`ProfileFault`] of the first rule that fails. It never carries the input.
-pub fn validate_create(name: &str, content_json: &str) -> Result<NewProfile, ProfileFault> {
+pub fn validate_create(
+    name: &str,
+    content: ProfileContent<'_>,
+    allow_tools: bool,
+) -> Result<NewProfile, ProfileFault> {
     validate_name(name)?;
-    if content_json.len() > MAX_PROFILE_JSON_BYTES {
+    if content.text().len() > MAX_PROFILE_JSON_BYTES {
         return Err(ProfileFault::TooLarge);
     }
-    let profile = Profile::from_json(content_json.as_bytes()).map_err(ProfileFault::Malformed)?;
+    let profile = match content {
+        ProfileContent::Json(text) => Profile::from_json(text.as_bytes()),
+        ProfileContent::Toml(text) => Profile::from_toml(text),
+    }
+    .map_err(ProfileFault::Malformed)?;
+    if !allow_tools && !profile.tools.is_empty() {
+        return Err(ProfileFault::ToolsDisabled);
+    }
     profile.validate().map_err(ProfileFault::Invalid)?;
     Ok(NewProfile {
         name: name.to_owned(),
@@ -127,9 +174,10 @@ fn text_of(bytes: Vec<u8>) -> Result<String, StoreError> {
 pub(crate) async fn create(
     pool: &PgPool,
     name: &str,
-    content_json: &str,
+    content: ProfileContent<'_>,
+    allow_tools: bool,
 ) -> Result<ProfileVersion, StoreError> {
-    let new = validate_create(name, content_json)?;
+    let new = validate_create(name, content, allow_tools)?;
     let size = i32::try_from(new.canonical.len())
         .map_err(|_| StoreError::OutOfRange("profile content"))?;
     let mut tx = pool.begin().await?;
@@ -205,6 +253,7 @@ pub(crate) async fn blob_for_lease(
     job_id: &str,
     attempt: u32,
     box_name: &str,
+    allow_tools: bool,
 ) -> Result<GetProfileBlobReply, StoreError> {
     let attempt = i32::try_from(attempt).map_err(|_| StoreError::LeaseDenied)?;
     let row = sqlx::query(SELECT_LEASED_BLOB)
@@ -233,8 +282,9 @@ pub(crate) async fn blob_for_lease(
     if version_hash != pinned {
         return Err(corrupt());
     }
-    let profile = Profile::from_json(&content).map_err(|_| corrupt())?;
-    if profile.hash().as_bytes().as_slice() != pinned.as_slice()
+    let profile = serde_json::from_slice::<Profile>(&content).map_err(|_| corrupt())?;
+    if (!allow_tools && !profile.tools.is_empty())
+        || profile.hash().as_bytes().as_slice() != pinned.as_slice()
         || profile.canonical_json() != content
     {
         return Err(corrupt());
@@ -280,6 +330,64 @@ pub(crate) async fn list(
 mod tests {
     use super::*;
 
+    const TOOLS_TOML: &str = "[[tools]]\nname = \"node\"\nversion = \"20.11.1\"\n";
+
+    fn json(text: &str) -> ProfileContent<'_> {
+        ProfileContent::Json(text)
+    }
+
+    #[test]
+    fn tools_need_the_gate_and_toml() {
+        let toml = ProfileContent::Toml(TOOLS_TOML);
+        assert_eq!(
+            validate_create("p", toml, false),
+            Err(ProfileFault::ToolsDisabled)
+        );
+        let on = validate_create("p", toml, true).unwrap();
+        assert!(
+            String::from_utf8(on.canonical)
+                .unwrap()
+                .contains("\"tools\"")
+        );
+        let plain = ProfileContent::Toml("model = \"m\"\n");
+        assert!(validate_create("p", plain, false).is_ok());
+        assert!(validate_create("p", plain, true).is_ok());
+        for allow in [false, true] {
+            let err = validate_create(
+                "p",
+                json(r#"{"tools":[{"name":"node","version":"20.11.1"}]}"#),
+                allow,
+            );
+            assert!(matches!(err, Err(ProfileFault::Malformed(_))), "{allow}");
+        }
+        assert_eq!(
+            ProfileFault::ToolsDisabled.to_string(),
+            ERR_PROFILE_TOOLS_DISABLED
+        );
+    }
+
+    #[test]
+    fn exactly_one_content_field_is_chosen() {
+        assert_eq!(
+            ProfileContent::select("{}", ""),
+            Ok(ProfileContent::Json("{}"))
+        );
+        assert_eq!(
+            ProfileContent::select("", "a = 1"),
+            Ok(ProfileContent::Toml("a = 1"))
+        );
+        for (j, t) in [("", ""), ("{}", "a = 1")] {
+            assert_eq!(
+                ProfileContent::select(j, t),
+                Err(ProfileFault::ContentChoice)
+            );
+        }
+        assert_eq!(
+            ProfileFault::ContentChoice.to_string(),
+            ERR_PROFILE_CONTENT_CHOICE
+        );
+    }
+
     #[test]
     fn names_are_bounded_and_charset_limited() {
         assert_eq!(validate_name("a"), Ok(()));
@@ -296,12 +404,15 @@ mod tests {
 
     #[test]
     fn create_canonicalises_and_hashes() {
-        let a = validate_create("p", r#"{"model": "m", "max_turns": 3}"#).unwrap_or_else(|e| {
-            panic!("{e}");
-        });
-        let b = validate_create("p", r#"{"max_turns":3,"model":"m"}"#).unwrap_or_else(|e| {
-            panic!("{e}");
-        });
+        let a = validate_create("p", json(r#"{"model": "m", "max_turns": 3}"#), false)
+            .unwrap_or_else(|e| {
+                panic!("{e}");
+            });
+        let b = validate_create("p", json(r#"{"max_turns":3,"model":"m"}"#), false).unwrap_or_else(
+            |e| {
+                panic!("{e}");
+            },
+        );
         assert_eq!(a.hash, b.hash);
         assert_eq!(a.canonical, b.canonical);
     }
@@ -309,10 +420,15 @@ mod tests {
     #[test]
     fn faults_do_not_echo_input() {
         let secret = "zzz-private-input";
-        let err = validate_create("p", &format!("{{\"{secret}\":1}}")).unwrap_err();
+        let err = validate_create(
+            "p",
+            ProfileContent::Json(&format!("{{\"{secret}\":1}}")),
+            false,
+        )
+        .unwrap_err();
         assert!(!err.to_string().contains(secret));
         let bad_name = "zzz private input";
-        let err = validate_create(bad_name, "{}").unwrap_err();
+        let err = validate_create(bad_name, json("{}"), false).unwrap_err();
         assert!(!err.to_string().contains("private"));
     }
 }

@@ -75,7 +75,119 @@ fn create(name: &str, content: &str) -> CreateProfileRequest {
     CreateProfileRequest {
         name: name.to_owned(),
         content_json: content.to_owned(),
+        content_toml: String::new(),
     }
+}
+
+fn create_toml(name: &str, content: &str) -> CreateProfileRequest {
+    CreateProfileRequest {
+        name: name.to_owned(),
+        content_json: String::new(),
+        content_toml: content.to_owned(),
+    }
+}
+
+const TOOLS_TOML: &str = "[[tools]]\nname = \"node\"\nversion = \"20.11.1\"\n";
+const PLAIN_TOML: &str = "claude_md = \"one\"\nmax_turns = 5\n";
+
+async fn counts(pool: &PgPool) -> (i64, i64) {
+    let blobs = sqlx::query_scalar("SELECT count(*) FROM profile_blob")
+        .fetch_one(pool)
+        .await
+        .unwrap();
+    let versions = sqlx::query_scalar("SELECT count(*) FROM profile_version")
+        .fetch_one(pool)
+        .await
+        .unwrap();
+    (blobs, versions)
+}
+
+#[sqlx::test]
+async fn gate_off_refuses_tools_and_stores_nothing(pool: PgPool) {
+    let store = store(pool.clone()).await;
+    let mut profiles = spawn(&store);
+    let err = profiles
+        .create_profile(create_toml("alpha", TOOLS_TOML))
+        .await
+        .unwrap_err();
+    assert_eq!(err.code(), Code::InvalidArgument);
+    assert_eq!(err.message(), fleet_proto::ERR_PROFILE_TOOLS_DISABLED);
+    assert_eq!(counts(&pool).await, (0, 0));
+    let json = r#"{"tools":[{"name":"node","version":"20.11.1"}]}"#;
+    let err = profiles
+        .create_profile(create("alpha", json))
+        .await
+        .unwrap_err();
+    assert_eq!(err.code(), Code::InvalidArgument);
+    assert_ne!(err.message(), fleet_proto::ERR_PROFILE_TOOLS_DISABLED);
+    assert_eq!(counts(&pool).await, (0, 0));
+}
+
+#[sqlx::test]
+async fn gate_on_accepts_tools_and_the_hash_round_trips(pool: PgPool) {
+    let store = store(pool.clone()).await.with_profile_tools(true);
+    let mut profiles = spawn(&store);
+    let created = profiles
+        .create_profile(create_toml("alpha", TOOLS_TOML))
+        .await
+        .unwrap()
+        .into_inner();
+    assert!(created.created);
+    let expected = fleet_core::Profile::from_toml(TOOLS_TOML).unwrap();
+    assert_eq!(created.hash, expected.hash().to_string());
+    assert_eq!(created.content_json.as_bytes(), expected.canonical_json());
+    let fetched = profiles
+        .get_profile(get("alpha", None))
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(fetched.hash, created.hash);
+    assert_eq!(fetched.content_json, created.content_json);
+    let again = profiles
+        .create_profile(create_toml("alpha", TOOLS_TOML))
+        .await
+        .unwrap()
+        .into_inner();
+    assert!(!again.created);
+    assert_eq!(again.version, created.version);
+}
+
+#[sqlx::test]
+async fn profiles_without_tools_ignore_the_gate(pool: PgPool) {
+    let mut hashes = Vec::new();
+    for allow in [false, true] {
+        let store = store(pool.clone()).await.with_profile_tools(allow);
+        let mut profiles = spawn(&store);
+        for request in [create("alpha", ONE), create_toml("beta", PLAIN_TOML)] {
+            let reply = profiles.create_profile(request).await.unwrap().into_inner();
+            hashes.push(reply.hash);
+        }
+    }
+    assert_eq!(hashes[0], hashes[1]);
+    assert_eq!(hashes[0], hashes[2]);
+    assert_eq!(hashes[0], hashes[3]);
+}
+
+#[sqlx::test]
+async fn exactly_one_content_field_must_be_set(pool: PgPool) {
+    let store = store(pool.clone()).await.with_profile_tools(true);
+    let mut profiles = spawn(&store);
+    let both = CreateProfileRequest {
+        name: "alpha".to_owned(),
+        content_json: ONE.to_owned(),
+        content_toml: PLAIN_TOML.to_owned(),
+    };
+    let neither = CreateProfileRequest {
+        name: "alpha".to_owned(),
+        content_json: String::new(),
+        content_toml: String::new(),
+    };
+    for request in [both, neither] {
+        let err = profiles.create_profile(request).await.unwrap_err();
+        assert_eq!(err.code(), Code::InvalidArgument);
+        assert_eq!(err.message(), fleet_proto::ERR_PROFILE_CONTENT_CHOICE);
+    }
+    assert_eq!(counts(&pool).await, (0, 0));
 }
 
 fn get(name: &str, version: Option<u32>) -> GetProfileRequest {

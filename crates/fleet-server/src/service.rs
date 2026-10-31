@@ -35,6 +35,7 @@ use tower::layer::util::{Identity, Stack};
 
 use crate::auth::{BearerAuth, Caller};
 use crate::cred::CredentialService;
+use crate::profiles::ProfileContent;
 use crate::store::{Store, StoreError};
 use crate::web::{Dispatch, HEADER_READ_TIMEOUT, Web, serve};
 use fleet_proto::MAX_PROFILE_MESSAGE_BYTES;
@@ -541,9 +542,11 @@ impl FleetProfiles for FleetService {
         request: Request<CreateProfileRequest>,
     ) -> Result<Response<ProfileVersion>, Status> {
         let request = request.into_inner();
+        let content = ProfileContent::select(&request.content_json, &request.content_toml)
+            .map_err(|fault| Status::invalid_argument(fault.to_string()))?;
         let reply = self
             .store
-            .create_profile(&request.name, &request.content_json)
+            .create_profile_content(&request.name, content)
             .await
             .map_err(|err| profiles_error(&err))?;
         Ok(Response::new(reply))

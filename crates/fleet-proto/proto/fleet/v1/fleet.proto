@@ -600,6 +600,7 @@ message VerdictStats {
 message CreateProfileRequest {
   string name = 1;
   string content_json = 2;
+  string content_toml = 3;
 }
 
 message GetProfileRequest {

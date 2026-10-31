@@ -12,6 +12,7 @@ use fleet_proto::v1::fleet_worker_client::FleetWorkerClient;
 use fleet_proto::v1::{ClaimJobRequest, GetProfileBlobRequest, Job, SubmitBatchRequest};
 use fleet_server::auth::BearerAuth;
 use fleet_server::config::Token;
+use fleet_server::profiles::ProfileContent;
 use fleet_server::service::router;
 use fleet_server::store::Store;
 use sqlx::PgPool;
@@ -134,6 +135,39 @@ async fn the_lease_holder_reads_the_pinned_blob(pool: PgPool) {
         .into_inner();
     assert_eq!(reply.content, created.content_json.as_bytes());
     assert_eq!(reply.profile.unwrap(), pinned);
+}
+
+const TOOLS_TOML: &str = "[[tools]]\nname = \"node\"\nversion = \"20.11.1\"\n";
+
+#[sqlx::test]
+async fn a_profile_with_tools_is_served_only_while_the_gate_is_on(pool: PgPool) {
+    let on = store(pool).await.with_profile_tools(true);
+    let created = on
+        .create_profile_content("alpha", ProfileContent::Toml(TOOLS_TOML))
+        .await
+        .unwrap();
+    let id = batch_job(&on, "alpha").await;
+    let mut worker = worker(serve(&on), as_box);
+    let job = claim(&mut worker, &name(1)).await;
+    let reply = worker
+        .get_profile_blob(blob(&id, job.attempt, &name(1)))
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(reply.content, created.content_json.as_bytes());
+    assert_eq!(reply.profile.unwrap().hash, created.hash);
+    let off = on.clone().with_profile_tools(false);
+    let mut gated = self::worker(serve(&off), as_box);
+    let err = gated
+        .get_profile_blob(blob(&id, job.attempt, &name(1)))
+        .await
+        .unwrap_err();
+    assert_ne!(err.code(), Code::Ok);
+    assert!(
+        !String::from_utf8_lossy(err.message().as_bytes()).contains("node"),
+        "{}",
+        err.message()
+    );
 }
 
 #[sqlx::test]

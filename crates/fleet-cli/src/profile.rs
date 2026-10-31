@@ -88,7 +88,11 @@ pub(crate) async fn create(
     out: &mut impl Write,
 ) -> Result<(), CliError> {
     let reply = client
-        .create_profile(CreateProfileRequest { name, content_json })
+        .create_profile(CreateProfileRequest {
+            name,
+            content_json,
+            content_toml: String::new(),
+        })
         .await?
         .into_inner();
     write_version(out, &reply)?;

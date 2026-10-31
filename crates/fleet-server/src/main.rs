@@ -98,6 +98,12 @@ async fn credential_service(
     )))
 }
 
+fn configured_store(pool: sqlx::PgPool, config: &Config) -> Store {
+    Store::new(pool)
+        .with_max_ci_retries(config.max_ci_retries)
+        .with_profile_tools(config.allow_profile_tools)
+}
+
 async fn run() -> Result<(), BoxError> {
     let config = Config::from_env()?;
     let options = PgConnectOptions::from_str(config.database_url.expose())?
@@ -107,7 +113,7 @@ async fn run() -> Result<(), BoxError> {
         .acquire_timeout(ACQUIRE_TIMEOUT)
         .connect_with(options)
         .await?;
-    let store = Store::new(pool.clone()).with_max_ci_retries(config.max_ci_retries);
+    let store = configured_store(pool.clone(), &config);
     store.migrate().await?;
 
     let credential_service = credential_service(&config, &pool).await?;

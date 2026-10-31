@@ -148,6 +148,9 @@ pub struct Config {
     pub web_origin: Option<String>,
     /// `WebAuthn` relying party id, from `FLEET_WEB_RP_ID`. `None` means the host of the origin.
     pub web_rp_id: Option<String>,
+    /// Whether profiles with tools are accepted, from `FLEET_ALLOW_PROFILE_TOOLS`: `true` or
+    /// `false`, default `false`.
+    pub allow_profile_tools: bool,
 }
 
 /// Why the credential store cannot start. Messages carry no key bytes.
@@ -276,6 +279,17 @@ fn number(
     }
 }
 
+fn flag(lookup: &impl Fn(&str) -> Option<String>, var: &'static str) -> Result<bool, ConfigError> {
+    match lookup(var).as_deref() {
+        None | Some("" | "false") => Ok(false),
+        Some("true") => Ok(true),
+        Some(_) => Err(ConfigError::Invalid {
+            var,
+            reason: "must be true or false".to_owned(),
+        }),
+    }
+}
+
 fn ci_retries(lookup: &impl Fn(&str) -> Option<String>) -> Result<u32, ConfigError> {
     let value = number(
         lookup,
@@ -361,6 +375,7 @@ impl Config {
                 .map(PathBuf::from),
             web_origin: lookup("FLEET_WEB_ORIGIN").filter(|v| !v.is_empty()),
             web_rp_id: lookup("FLEET_WEB_RP_ID").filter(|v| !v.is_empty()),
+            allow_profile_tools: flag(&lookup, "FLEET_ALLOW_PROFILE_TOOLS")?,
             retention_interval: Duration::from_secs(number(
                 &lookup,
                 "FLEET_RETENTION_INTERVAL_SECS",
@@ -409,6 +424,42 @@ mod tests {
 
     fn good_ring() -> String {
         format!("k1:{}\n", "ab".repeat(32))
+    }
+
+    #[test]
+    fn profile_tools_gate_is_strict_and_defaults_off() {
+        let base = [
+            ("FLEET_DATABASE_URL", "postgres://u:pw@h/db"),
+            ("FLEET_TOKEN", TOKEN),
+        ];
+        assert!(
+            !Config::from_lookup(lookup(&base))
+                .unwrap()
+                .allow_profile_tools
+        );
+        for (text, want) in [("", false), ("false", false), ("true", true)] {
+            let config = Config::from_lookup(lookup(&[
+                base[0],
+                base[1],
+                ("FLEET_ALLOW_PROFILE_TOOLS", text),
+            ]))
+            .unwrap();
+            assert_eq!(config.allow_profile_tools, want, "{text:?}");
+        }
+        for bad in [
+            "1", "0", "yes", "TRUE", "True", " true", "true ", "on", "tru",
+        ] {
+            let err = Config::from_lookup(lookup(&[
+                base[0],
+                base[1],
+                ("FLEET_ALLOW_PROFILE_TOOLS", bad),
+            ]))
+            .unwrap_err();
+            assert!(
+                err.to_string().contains("FLEET_ALLOW_PROFILE_TOOLS"),
+                "{bad:?}"
+            );
+        }
     }
 
     #[test]

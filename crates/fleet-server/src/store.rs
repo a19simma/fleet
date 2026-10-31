@@ -23,7 +23,7 @@ use crate::jobs::{
     MAX_TRANSCRIPT_ROWS, MIN_CHUNK_COST_BYTES, NewJob, validate_ci, validate_job_id,
     validate_judge, validate_submit, validate_terminal, validate_verdict,
 };
-use crate::profiles::{self, ProfileFault};
+use crate::profiles::{self, ProfileContent, ProfileFault};
 use crate::projection::{Projection, State, project};
 use crate::stats;
 use crate::telemetry;
@@ -735,6 +735,7 @@ pub struct Store {
     pool: PgPool,
     lease: Duration,
     max_ci_retries: u32,
+    allow_profile_tools: bool,
     #[cfg(test)]
     snapshot_gate: Option<std::sync::Arc<SnapshotGate>>,
 }
@@ -753,9 +754,18 @@ impl Store {
             pool,
             lease: DEFAULT_LEASE,
             max_ci_retries: DEFAULT_CI_RETRIES,
+            allow_profile_tools: false,
             #[cfg(test)]
             snapshot_gate: None,
         }
+    }
+
+    /// Allows profiles with tools, off otherwise. When off, creating one is refused and a
+    /// stored one is not served to a worker.
+    #[must_use]
+    pub fn with_profile_tools(mut self, allow: bool) -> Self {
+        self.allow_profile_tools = allow;
+        self
     }
 
     /// The lease a claim grants and a report renews.
@@ -1303,7 +1313,29 @@ impl Store {
         name: &str,
         content_json: &str,
     ) -> Result<fleet_proto::v1::ProfileVersion, StoreError> {
-        profiles::create(&self.pool, name, content_json).await
+        profiles::create(
+            &self.pool,
+            name,
+            ProfileContent::Json(content_json),
+            self.allow_profile_tools,
+        )
+        .await
+    }
+
+    /// Stores a profile from either input form, gated like [`Store::create_profile`].
+    ///
+    /// TOML content may carry tools, which [`Store::with_profile_tools`] must allow.
+    ///
+    /// # Errors
+    ///
+    /// Same as [`Store::create_profile`], and [`StoreError::InvalidProfile`] with
+    /// [`ProfileFault::ToolsDisabled`] when tools are present and the gate is off.
+    pub async fn create_profile_content(
+        &self,
+        name: &str,
+        content: ProfileContent<'_>,
+    ) -> Result<fleet_proto::v1::ProfileVersion, StoreError> {
+        profiles::create(&self.pool, name, content, self.allow_profile_tools).await
     }
 
     /// Reads a profile version, or the latest one when `version` is `None`.
@@ -1435,7 +1467,14 @@ impl Store {
         box_name: &BoxName,
     ) -> Result<GetProfileBlobReply, StoreError> {
         validate_job_id(job_id)?;
-        profiles::blob_for_lease(&self.pool, job_id, attempt, box_name.as_str()).await
+        profiles::blob_for_lease(
+            &self.pool,
+            job_id,
+            attempt,
+            box_name.as_str(),
+            self.allow_profile_tools,
+        )
+        .await
     }
 
     /// Reads the whole transcript of the job a running judge job targets, authorised against
