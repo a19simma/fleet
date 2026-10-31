@@ -76,6 +76,7 @@ fn submit_request(key: &str) -> SubmitJobRequest {
         repo: "https://example.com/org/repo.git".to_owned(),
         base_ref: "main".to_owned(),
         open_pr: true,
+        agent: String::new(),
     }
 }
 
@@ -833,4 +834,47 @@ async fn submit_records_the_authenticated_caller_and_the_client_token_is_bootstr
         .unwrap()
         .into_inner();
     assert_eq!(i64::try_from(by_client.user_id), Ok(boot));
+}
+
+#[sqlx::test]
+async fn submit_validates_and_stores_the_agent(pool: PgPool) {
+    let store = store(pool.clone()).await;
+    let mut jobs = spawn(&store);
+    for (key, agent, stored) in [
+        ("k1", "", "claude"),
+        ("k2", "claude", "claude"),
+        ("k3", "codex", "codex"),
+        ("k4", "kimi", "kimi"),
+    ] {
+        let mut request = submit_request(key);
+        request.agent = agent.to_owned();
+        let job = jobs.submit_job(request).await.unwrap().into_inner();
+        assert_eq!(job.agent, stored, "{agent:?}");
+    }
+    for (n, bad) in ["Claude", " codex", "gpt", "kimi\0"]
+        .into_iter()
+        .enumerate()
+    {
+        let mut request = submit_request(&format!("bad{n}"));
+        request.agent = bad.to_owned();
+        let err = jobs.submit_job(request).await.unwrap_err();
+        assert_eq!(err.code(), Code::InvalidArgument, "{bad:?}");
+        assert_eq!(err.message(), "invalid job request");
+    }
+    let rows: i64 = sqlx::query_scalar("SELECT count(*) FROM jobs")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(rows, 4);
+}
+
+#[sqlx::test]
+async fn a_key_resubmitted_with_another_agent_conflicts(pool: PgPool) {
+    let store = store(pool).await;
+    let mut jobs = spawn(&store);
+    let mut first = submit_request("k1");
+    first.agent = "codex".to_owned();
+    jobs.submit_job(first).await.unwrap();
+    let again = jobs.submit_job(submit_request("k1")).await.unwrap_err();
+    assert_eq!(again.code(), Code::AlreadyExists);
 }

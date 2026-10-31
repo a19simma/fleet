@@ -135,6 +135,7 @@ impl Harness {
             repo: REPO.to_owned(),
             base_ref: "main".to_owned(),
             open_pr: false,
+            agent: String::new(),
         };
         self.store
             .submit_job_for(Some(who.user_id), &request)

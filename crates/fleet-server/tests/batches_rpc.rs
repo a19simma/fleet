@@ -86,6 +86,7 @@ fn request(key: &str, profiles: &[&str]) -> SubmitBatchRequest {
         base_sha: SHA.to_owned(),
         repeats: 0,
         profiles: profiles.iter().map(|p| (*p).to_owned()).collect(),
+        agent: String::new(),
     }
 }
 
@@ -479,6 +480,7 @@ async fn plain_jobs_keep_working_beside_batch_jobs(pool: PgPool) {
             repo: REPO.to_owned(),
             base_ref: "main".to_owned(),
             open_pr: true,
+            agent: String::new(),
         })
         .await
         .unwrap()
@@ -752,4 +754,46 @@ async fn a_client_token_batch_stamps_the_bootstrap_user_over_rpc(pool: PgPool) {
         .unwrap();
     let rows = owners(&pool, &reply.batch_id).await;
     assert!(rows.iter().all(|(id, _)| *id == boot));
+}
+
+#[sqlx::test]
+async fn a_batch_names_its_agent_and_an_unknown_one_is_refused(pool: PgPool) {
+    let store = store(pool.clone()).await;
+    two_profiles(&store).await;
+    let addr = serve(&store);
+    let mut client = batches(addr, as_client);
+    for (key, agent, stored) in [("k1", "", "claude"), ("k2", "codex", "codex")] {
+        let mut named = request(key, &["alpha", "beta"]);
+        named.agent = agent.to_owned();
+        let reply = client.submit_batch(named).await.unwrap().into_inner();
+        let rows = owners(&pool, &reply.batch_id).await;
+        assert!(rows.iter().all(|(_, got)| got == stored), "{agent:?}");
+    }
+    let jobs_before = count(&pool, "jobs").await;
+    let batches_before = count(&pool, "batch").await;
+    for (n, bad) in ["Claude", "gpt", "kimi "].into_iter().enumerate() {
+        let mut named = request(&format!("bad{n}"), &["alpha", "beta"]);
+        named.agent = bad.to_owned();
+        let err = client.submit_batch(named).await.unwrap_err();
+        assert_eq!(err.code(), Code::InvalidArgument, "{bad:?}");
+        assert_eq!(err.message(), "invalid job request");
+    }
+    assert_eq!(count(&pool, "jobs").await, jobs_before);
+    assert_eq!(count(&pool, "batch").await, batches_before);
+}
+
+#[sqlx::test]
+async fn a_batch_resubmitted_with_another_agent_conflicts(pool: PgPool) {
+    let store = store(pool).await;
+    two_profiles(&store).await;
+    let mut codex = request("k1", &["alpha", "beta"]);
+    codex.agent = "codex".to_owned();
+    store.submit_batch(&codex).await.unwrap();
+    let same = store.submit_batch(&codex).await.unwrap();
+    assert!(!same.created);
+    let other = store.submit_batch(&request("k1", &["alpha", "beta"])).await;
+    assert!(matches!(
+        other,
+        Err(fleet_server::store::StoreError::KeyConflict)
+    ));
 }

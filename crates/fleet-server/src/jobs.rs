@@ -214,6 +214,8 @@ pub(crate) fn validate_job_id(job_id: &str) -> Result<(), JobInvalid> {
 
 /// Validates a submit request. This is the only check on these fields.
 ///
+/// The agent goes through [`validate_agent`]: empty means [`DEFAULT_AGENT`].
+///
 /// # Errors
 ///
 /// Returns the [`JobInvalid`] variant of the first field that fails. It never carries
@@ -234,13 +236,14 @@ pub fn validate_submit(request: &SubmitJobRequest) -> Result<NewJob, JobInvalid>
     if !bare_token(&request.base_ref, MAX_BASE_REF_BYTES) || request.base_ref.starts_with('-') {
         return Err(JobInvalid::BaseRef);
     }
+    let agent = validate_agent(&request.agent)?;
     Ok(NewJob {
         key: request.idempotency_key.clone(),
         prompt: request.prompt.clone(),
         repo: request.repo.clone(),
         base_ref: request.base_ref.clone(),
         open_pr: request.open_pr,
-        agent: DEFAULT_AGENT,
+        agent,
         target_job_id: None,
     })
 }

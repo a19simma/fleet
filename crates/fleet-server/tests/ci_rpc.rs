@@ -106,6 +106,7 @@ fn submit(key: &str, open_pr: bool) -> SubmitJobRequest {
         repo: REPO.to_owned(),
         base_ref: "main".to_owned(),
         open_pr,
+        agent: String::new(),
     }
 }
 

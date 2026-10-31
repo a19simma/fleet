@@ -35,6 +35,7 @@ fn submit(key: &str, prompt: &str) -> SubmitJobRequest {
         repo: REPO.to_owned(),
         base_ref: "main".to_owned(),
         open_pr: true,
+        agent: String::new(),
     }
 }
 

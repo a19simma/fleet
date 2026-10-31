@@ -88,6 +88,7 @@ async fn batch_job(store: &Store, profile: &str) -> String {
             base_sha: SHA.to_owned(),
             repeats: 0,
             profiles: vec![profile.to_owned()],
+            agent: String::new(),
         })
         .await
         .unwrap();
@@ -145,6 +146,7 @@ async fn a_job_without_a_profile_carries_none_and_has_no_blob(pool: PgPool) {
             repo: REPO.to_owned(),
             base_ref: "main".to_owned(),
             open_pr: false,
+            agent: String::new(),
         })
         .await
         .unwrap();

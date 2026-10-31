@@ -340,6 +340,7 @@ pub(crate) fn prepare(args: Submit, stdin: &mut impl Read) -> Result<SubmitBatch
         base_sha: args.base,
         repeats: 0,
         profiles,
+        agent: String::new(),
     })
 }
 

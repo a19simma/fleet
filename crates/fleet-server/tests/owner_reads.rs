@@ -46,6 +46,7 @@ fn job_request(key: &str) -> SubmitJobRequest {
         repo: REPO.to_owned(),
         base_ref: "main".to_owned(),
         open_pr: false,
+        agent: String::new(),
     }
 }
 
@@ -89,6 +90,7 @@ async fn world(pool: PgPool) -> World {
                 base_sha: SHA.to_owned(),
                 repeats: 0,
                 profiles: vec!["alpha".to_owned()],
+                agent: String::new(),
             },
         )
         .await
@@ -276,6 +278,7 @@ async fn a_batch_lists_only_the_callers_jobs(pool: PgPool) {
                 base_sha: SHA.to_owned(),
                 repeats: 0,
                 profiles: vec!["alpha".to_owned(), "beta".to_owned()],
+                agent: String::new(),
             },
         )
         .await

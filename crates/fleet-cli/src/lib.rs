@@ -654,6 +654,7 @@ pub async fn run_with(
                     repo,
                     base_ref: base,
                     open_pr: !no_pr,
+                    agent: String::new(),
                 })
                 .await?
                 .into_inner();

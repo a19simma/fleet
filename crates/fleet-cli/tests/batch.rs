@@ -84,6 +84,7 @@ async fn submitted(pool: &PgPool) -> (Store, String, Vec<String>) {
             base_sha: SHA.into(),
             repeats: 0,
             profiles: vec!["alpha".into(), "beta".into()],
+            agent: String::new(),
         })
         .await
         .unwrap();

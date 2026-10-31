@@ -7,7 +7,7 @@ use fleet_core::EventId;
 use fleet_proto::v1::{GetBatchReply, SubmitBatchReply, SubmitBatchRequest, SubmitJobRequest};
 use sqlx::{PgPool, Row};
 
-use crate::jobs::{DEFAULT_AGENT, validate_job_id, validate_submit};
+use crate::jobs::{validate_job_id, validate_submit};
 use crate::profiles::validate_name;
 use crate::store::StoreError;
 
@@ -72,6 +72,7 @@ pub struct NewBatch {
     repo: String,
     base_sha: String,
     profiles: Vec<String>,
+    agent: &'static str,
 }
 
 fn is_sha(text: &str) -> bool {
@@ -108,6 +109,7 @@ pub fn validate_batch(request: &SubmitBatchRequest) -> Result<NewBatch, StoreErr
         repo: request.repo.clone(),
         base_ref: request.base_sha.clone(),
         open_pr: false,
+        agent: request.agent.clone(),
     })?;
     Ok(NewBatch {
         key: job.key,
@@ -115,6 +117,7 @@ pub fn validate_batch(request: &SubmitBatchRequest) -> Result<NewBatch, StoreErr
         repo: job.repo,
         base_sha: job.base_ref,
         profiles: request.profiles.clone(),
+        agent: job.agent,
     })
 }
 
@@ -207,7 +210,7 @@ pub(crate) async fn submit(
             names.push(row.try_get::<String, _>("profile_name")?);
             job_ids.push(row.try_get::<String, _>("job_id")?);
             same_owner &= row.try_get::<i64, _>("user_id")? == owner
-                && row.try_get::<String, _>("agent")? == DEFAULT_AGENT;
+                && row.try_get::<String, _>("agent")? == batch.agent;
         }
         if !same || !same_owner || names != batch.profiles {
             return Err(StoreError::KeyConflict);
@@ -242,7 +245,7 @@ pub(crate) async fn submit(
             .bind(pinned.try_get::<i32, _>("version")?)
             .bind(pinned.try_get::<Vec<u8>, _>("hash")?)
             .bind(owner)
-            .bind(DEFAULT_AGENT)
+            .bind(batch.agent)
             .execute(&mut *tx)
             .await?;
         job_ids.push(job_id);
@@ -258,6 +261,7 @@ pub(crate) async fn submit(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::jobs::JobInvalid;
 
     const SHA: &str = "0123456789abcdef0123456789abcdef01234567";
 
@@ -269,6 +273,7 @@ mod tests {
             base_sha: SHA.to_owned(),
             repeats: 0,
             profiles: vec!["a".to_owned(), "b".to_owned()],
+            agent: String::new(),
         }
     }
 
@@ -293,6 +298,30 @@ mod tests {
             let mut bad = request();
             bad.repeats = repeats;
             assert_eq!(invalid(&bad), Some(BatchInvalid::Repeats));
+        }
+    }
+
+    #[test]
+    fn the_agent_is_resolved_and_an_unknown_one_is_refused() {
+        for (given, resolved) in [("", "claude"), ("claude", "claude"), ("codex", "codex")] {
+            let mut req = request();
+            given.clone_into(&mut req.agent);
+            assert_eq!(
+                validate_batch(&req).ok().map(|batch| batch.agent),
+                Some(resolved),
+                "{given:?}"
+            );
+        }
+        for bad in ["Claude", "gpt", " kimi"] {
+            let mut req = request();
+            bad.clone_into(&mut req.agent);
+            assert!(
+                matches!(
+                    validate_batch(&req),
+                    Err(StoreError::InvalidJob(JobInvalid::Agent))
+                ),
+                "{bad:?}"
+            );
         }
     }
 

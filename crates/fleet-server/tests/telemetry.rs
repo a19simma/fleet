@@ -37,6 +37,7 @@ async fn claimed(store: &Store) -> Job {
             repo: "https://example.com/org/repo.git".to_owned(),
             base_ref: "main".to_owned(),
             open_pr: true,
+            agent: String::new(),
         })
         .await
         .unwrap();
