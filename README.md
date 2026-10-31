@@ -6,7 +6,15 @@ Fleet shows what every agent box is doing and whether anything died. It has thre
 - `fleet-server`: the hosted service that stores box state.
 - `fleet`: the command line client.
 
-Status: pre-alpha. `fleetd` accepts Claude Code hooks on loopback and local events on a unix socket, normalizes and redacts them, and queues them in SQLite. A forwarder module (batched send, ack through the reply) is built but fleetd does not run it yet, so nothing leaves the queue. While `FLEET_SERVER_URL` is set it sends a heartbeat to the server every 30 s with `FLEET_TOKEN`. While both are set it also polls `ClaimJob` every 5 s and runs one job at a time: `claude -p` in a git worktree, then it pushes `swarm/<job_id>` and opens the pull request with `gh`, streaming the transcript through `ReportJob`. `fleet` lists boxes and jobs, submits, shows (with the job telemetry summary, and `status --tools` lists its tool calls), watches, follows the logs of and cancels jobs. `fleet-server` serves `FleetIngest` (`PushEvents`, `Heartbeat`), `FleetQuery.ListFleet` and `FleetWorker` (`ClaimJob`, `ReportJob`) and `FleetJobs` (`SubmitJob`, `GetJob`, `ListJobs`, `CancelJob`, `ReadTranscript`, `ReadJobEvents`, `GetStats`) over gRPC on Postgres, with two scoped bearer tokens, and `GET /healthz`. `FLEET_DATABASE_URL` and `FLEET_TOKEN` are required. `FLEET_CLIENT_TOKEN` is optional (an empty value counts as unset): without it `FleetQuery` and `FleetJobs` reject every request. `FLEET_LISTEN` defaults to `127.0.0.1:7070` and `FLEET_HEALTH_LISTEN` to `0.0.0.0:7072`. The server warns at startup when either address is not loopback.
+Status: pre-alpha. `fleetd` accepts Claude Code hooks on loopback and local events on a unix socket, normalizes and redacts them, and queues them in SQLite. A forwarder module (batched send, ack through the reply) is built but fleetd does not run it yet, so nothing leaves the queue. 
+
+While `FLEET_SERVER_URL` is set it sends a heartbeat to the server every 30 s with `FLEET_TOKEN`. While both are set it also polls `ClaimJob` every 5 s and runs one job at a time: `claude -p` in a git worktree, then it pushes `swarm/<job_id>` and opens the pull request with `gh`, streaming the transcript through `ReportJob`. 
+
+`fleet` lists boxes and jobs, submits, shows (with the job telemetry summary, and `status --tools` lists its tool calls), watches, follows the logs of and cancels jobs. 
+
+`fleet-server` serves `FleetIngest` (`PushEvents`, `Heartbeat`), `FleetQuery.ListFleet` and `FleetWorker` (`ClaimJob`, `ReportJob`) and `FleetJobs` (`SubmitJob`, `GetJob`, `ListJobs`, `CancelJob`, `ReadTranscript`, `ReadJobEvents`, `GetStats`) over gRPC on Postgres, with two scoped bearer tokens, and `GET /healthz`. 
+
+`FLEET_DATABASE_URL` and `FLEET_TOKEN` are required. `FLEET_CLIENT_TOKEN` is optional (an empty value counts as unset): without it `FleetQuery` and `FleetJobs` reject every request. `FLEET_MAX_CI_RETRIES` (0 to 5, default 0) caps the automatic CI retry chain and 0 turns it off. `FLEET_LISTEN` defaults to `127.0.0.1:7070` and `FLEET_HEALTH_LISTEN` to `0.0.0.0:7072`. The server warns at startup when either address is not loopback.
 
 ## Install
 

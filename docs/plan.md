@@ -49,7 +49,7 @@ Decided 2026-10-24. The phases below stay as the full map. v1 is the smallest sl
 In v1:
 
 - fleetd: loopback http hook listener, SQLite queue, forwarder, session registry and reconciler (see Recovery and reconcile), workmux watcher using `workmux wait` exit codes, pueue poll plus the finish callback (id and group only), heartbeat. The unix socket stays, because the `fleetd pueue-callback` subcommand writes to it.
-- Server: `FleetIngest` (`PushEvents`, `Heartbeat`), `FleetQuery.ListFleet` and `FleetWorker` (`ClaimJob`, `ReportJob`) and `FleetJobs` (`SubmitJob`, `GetJob`, `ListJobs`, `CancelJob`, `ReadTranscript`, `ReadJobEvents`, `GetStats`) on Postgres, two scoped bearer tokens (see Authorization).
+- Server: `FleetIngest` (`PushEvents`, `Heartbeat`), `FleetQuery.ListFleet` and `FleetWorker` (`ClaimJob`, `ReportJob`) and `FleetJobs` (`SubmitJob`, `GetJob` with the telemetry summary, `ListJobs`, `CancelJob`, `ReadTranscript`, `ReadJobEvents`, `GetStats`) on Postgres, two scoped bearer tokens (see Authorization).
 - CLI: `fleet list` and `fleet watch`. `fleet watch` polls `ListFleet` from the client and prints changes (decision 10).
 
 Out of v1: drain and `SetDrain`, the KEDA seam, `fleet-job`, `GetPreview`, `ListEvents`, the `Watch` rpc, and transcript summaries beyond the last assistant text. v1 has no Job cost, since cost arrives only through `fleet-job` (decision 12, deferred).
@@ -81,7 +81,7 @@ Non-goals:
 - fleetd pushing to git or holding git credentials (superseded in part, see ADR-0020 and ADR-0024). Results leave the Box only through git remotes (see Background).
 - Storing transcripts on the server. They stay on the Box under `transcript_path`. fleetd reads them for derived preview text and a timeline only.
 - Autoscaling Boxes. Scale stays the Box count plus apply. The queue seam only exposes depth.
-- A web UI as a first-class client: see ADR-0041.
+- A web UI is outside the v1 slice. ADR-0041 proposes one embedded in `fleet-server`.
 
 ## Component diagram
 
@@ -188,7 +188,7 @@ Language: Rust, one static musl binary, tokio, tonic, axum for the HTTP listener
 
 ### Listeners
 
-- **HTTP, loopback.** `127.0.0.1:<port>`, fixed port in config (default 7071). Claude Code reaches it with one `type: "http"` hook per recorded event, to `http://127.0.0.1:<port>/hook/<EventName>`. The POST body is the same JSON a command hook gets on stdin, and the event name is only in the path: there is no event header (T3). A `200` returns an empty JSON object so the hook is a no-op for Claude Code. `GET /healthz`. fleetd commits the event to the disk queue before it answers. A Unix socket cannot serve hooks: `unix:` and `http+unix:` URLs fail with `Unsupported protocol` on 2.1.289 (T3).
+- **HTTP, loopback.** `127.0.0.1:<port>`, fixed port in config (default 7071). The route is `http://127.0.0.1:<port>/hook/<EventName>`. The shipped managed settings register one `command` hook per recorded event (`fleetd hook <EventName>`), which posts to the hook socket and falls back to this port (ADR-0031). A `type: "http"` hook to the same URL is the original design. The POST body is the same JSON a command hook gets on stdin, and the event name is only in the path: there is no event header (T3). A `200` returns an empty JSON object so the hook is a no-op for Claude Code. `GET /healthz`. fleetd commits the event to the disk queue before it answers. A Unix socket cannot serve hooks: `unix:` and `http+unix:` URLs fail with `Unsupported protocol` on 2.1.289 (T3).
 - **Unix socket.** `/run/fleetd/fleetd.sock`, mode 0600, owner `agent`. fleetd and `fleet-job` run as the same user. Fixed path from systemd `RuntimeDirectory=fleetd`. It does not use `XDG_RUNTIME_DIR`, which is unset in ssh logins. Today it serves `POST /event` and the hook routes. `POST /job/<event>` for `fleet-job` and `GET /state` for local tools are not built.
 - **Responses.** `200` with `{}` for an accepted or filtered hook, `400` with `{"error": ...}` for a body that is not a JSON object or an unusable path, `500` with `{"error": ...}` when the queue write fails.
 - **Wire names.** The envelope serializes `id` and `kind`, not `event_id` and `type`. `occurred_at`, `captured_at`, `job_id` and `workdir` arrive with the proto in the server step.
@@ -204,7 +204,7 @@ Shape of one entry in the managed file, one per recorded event. The `timeout` va
     "Stop": [
       {
         "hooks": [
-          { "type": "http", "url": "http://127.0.0.1:7071/hook/Stop", "timeout": 5 }
+          { "type": "command", "command": "fleetd hook Stop", "timeout": 5 }
         ]
       }
     ]
