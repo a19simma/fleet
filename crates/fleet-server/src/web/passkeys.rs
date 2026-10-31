@@ -152,6 +152,11 @@ enum Pending {
         state: PasskeyRegistration,
         user_id: i64,
     },
+    Enroll {
+        state: PasskeyRegistration,
+        user_id: i64,
+        code: Secret,
+    },
     Login {
         state: PasskeyAuthentication,
         user_id: i64,
@@ -190,6 +195,7 @@ impl Pending {
             Self::Setup { .. } => 0,
             Self::Add { .. } => 1,
             Self::Login { .. } => 2,
+            Self::Enroll { .. } => 3,
         }
     }
 }
@@ -340,6 +346,78 @@ impl WebAuth {
             return Err(err);
         }
         self.open_session(user_id).await
+    }
+
+    /// Starts passkey registration for the user an admin issued `code` to. The code is
+    /// checked here without being spent, so a bad code stashes no ceremony.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AuthError::Refused`] for an unknown, used or expired code, or
+    /// [`AuthError::Internal`] for a database failure.
+    pub async fn enroll_start(
+        &self,
+        code: &str,
+    ) -> Result<(String, CreationChallengeResponse), AuthError> {
+        let user_id = self.users.check_user_setup(code.as_bytes()).await?;
+        let username: String = sqlx::query_scalar(USERNAME_OF)
+            .bind(user_id)
+            .fetch_optional(&self.pool)
+            .await?
+            .ok_or(AuthError::Refused)?;
+        let existing: Vec<_> = self
+            .keys(user_id)
+            .await?
+            .iter()
+            .map(|key| key.cred_id().clone())
+            .collect();
+        let (challenge, state) = self.webauthn.start_passkey_registration(
+            Uuid::new_v4(),
+            &username,
+            &username,
+            Some(existing),
+        )?;
+        let ceremony = self.stash(Pending::Enroll {
+            state,
+            user_id,
+            code: Secret::new(code.to_owned()),
+        });
+        Ok((ceremony, challenge))
+    }
+
+    /// Finishes enrollment: verifies the passkey, then in one transaction locks the user,
+    /// spends the setup code, stores the passkey and opens a session.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AuthError::Refused`] for an unknown or replayed ceremony, a failed
+    /// verification, or a code that is spent, expired, voided by a reset or no longer
+    /// issued to the user who started the ceremony.
+    pub async fn enroll_finish(
+        &self,
+        ceremony: &str,
+        credential: &RegisterPublicKeyCredential,
+    ) -> Result<NewSession, AuthError> {
+        let Pending::Enroll {
+            state,
+            user_id,
+            code,
+        } = self.take(ceremony)?
+        else {
+            return Err(AuthError::Refused);
+        };
+        let passkey = self
+            .webauthn
+            .finish_passkey_registration(credential, &state)?;
+        let mut tx = self.pool.begin().await?;
+        let redeemed = Users::redeem_user_setup_in(&mut tx, code.expose()).await?;
+        if redeemed != user_id {
+            return Err(AuthError::Refused);
+        }
+        store_key_on(&mut tx, user_id, &passkey).await?;
+        let session = insert_session(&mut tx, user_id, None).await?;
+        tx.commit().await?;
+        Ok(session)
     }
 
     /// Starts adding a passkey to the signed-in user `user_id`.
@@ -526,17 +604,8 @@ impl WebAuth {
     }
 
     async fn store_key(&self, user_id: i64, key: &Passkey) -> Result<(), AuthError> {
-        sqlx::query(INSERT_KEY)
-            .bind(user_id)
-            .bind(key.cred_id().as_ref())
-            .bind(serde_json::to_vec(key)?)
-            .execute(&self.pool)
-            .await
-            .map_err(|e| match &e {
-                sqlx::Error::Database(db) if db.is_unique_violation() => AuthError::Refused,
-                _ => AuthError::from(e),
-            })?;
-        Ok(())
+        let mut conn = self.pool.acquire().await?;
+        store_key_on(&mut conn, user_id, key).await
     }
 
     async fn open_session(&self, user_id: i64) -> Result<NewSession, AuthError> {
@@ -560,6 +629,24 @@ fn stored_counter(blob: &[u8]) -> Result<u32, AuthError> {
         .and_then(serde_json::Value::as_u64)
         .and_then(|n| u32::try_from(n).ok())
         .unwrap_or(0))
+}
+
+async fn store_key_on(
+    conn: &mut sqlx::PgConnection,
+    user_id: i64,
+    key: &Passkey,
+) -> Result<(), AuthError> {
+    sqlx::query(INSERT_KEY)
+        .bind(user_id)
+        .bind(key.cred_id().as_ref())
+        .bind(serde_json::to_vec(key)?)
+        .execute(conn)
+        .await
+        .map_err(|e| match &e {
+            sqlx::Error::Database(db) if db.is_unique_violation() => AuthError::Refused,
+            _ => AuthError::from(e),
+        })?;
+    Ok(())
 }
 
 async fn insert_session(

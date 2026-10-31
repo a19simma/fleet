@@ -187,6 +187,28 @@ async fn setup_page(cx: &Cx) -> Result<impl View> {
     })
 }
 
+#[page("/enroll/{code}")]
+async fn enroll_page(cx: &Cx) -> Result<impl View> {
+    auth(cx)?;
+    Ok(view! {
+        <!DOCTYPE html>
+        <html>
+            <head>
+                <title>"fleet enrollment"</title>
+                <link rel="stylesheet" href=(STYLE_PATH)>
+            </head>
+            <body data-mode="enroll">
+                <h1>"Register a passkey"</h1>
+                <form id="passkey-form">
+                    <button type="submit">"Register a passkey"</button>
+                </form>
+                <p id="status"></p>
+                <script src=(SCRIPT_PATH) defer=""></script>
+            </body>
+        </html>
+    })
+}
+
 #[page("/account")]
 async fn account(cx: &Cx) -> Result<impl View> {
     let auth = auth(cx)?;
@@ -244,6 +266,29 @@ async fn setup_start(cx: &Cx, Json(body): Json<Value>) -> Result<Json<Value>> {
 async fn setup_finish(cx: &Cx, Json(body): Json<Value>) -> Result<Json<Value>> {
     let session = auth(cx)?
         .setup_finish(field(&body, "ceremony")?, &registration(&body)?)
+        .await
+        .map_err(fail)?;
+    set_cookie(
+        cx,
+        &String::from_utf8_lossy(session.id.expose()),
+        SESSION_TTL_SECS,
+    );
+    Ok(Json(json!({ "ok": true })))
+}
+
+#[route(POST "/passkey/enroll/start")]
+async fn enroll_start(cx: &Cx, Json(body): Json<Value>) -> Result<Json<Value>> {
+    let (ceremony, options) = auth(cx)?
+        .enroll_start(field(&body, "code")?)
+        .await
+        .map_err(fail)?;
+    Ok(Json(json!({ "ceremony": ceremony, "options": options })))
+}
+
+#[route(POST "/passkey/enroll/finish")]
+async fn enroll_finish(cx: &Cx, Json(body): Json<Value>) -> Result<Json<Value>> {
+    let session = auth(cx)?
+        .enroll_finish(field(&body, "ceremony")?, &registration(&body)?)
         .await
         .map_err(fail)?;
     set_cookie(
