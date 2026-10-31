@@ -58,7 +58,13 @@ async fn stopped(mut rx: watch::Receiver<bool>) {
     let _ = rx.wait_for(|stop| *stop).await;
 }
 
-fn build_web(config: &Config, pool: &sqlx::PgPool, users: &Users) -> Result<Web, BoxError> {
+fn build_web(
+    config: &Config,
+    pool: &sqlx::PgPool,
+    users: &Users,
+    credentials: Option<CredentialService>,
+    store: Store,
+) -> Result<Web, BoxError> {
     let Some(origin) = config.web_origin.as_deref() else {
         tracing::warn!("FLEET_WEB_ORIGIN is unset: web login is off");
         return Ok(Web::new());
@@ -69,7 +75,7 @@ fn build_web(config: &Config, pool: &sqlx::PgPool, users: &Users) -> Result<Web,
         origin,
         config.web_rp_id.as_deref(),
     )?;
-    Ok(Web::with_auth(auth))
+    Ok(Web::with_console(auth, credentials, store))
 }
 
 async fn credential_service(
@@ -114,7 +120,13 @@ async fn run() -> Result<(), BoxError> {
         );
     }
 
-    let web = build_web(&config, &pool, &users)?;
+    let web = build_web(
+        &config,
+        &pool,
+        &users,
+        credential_service.clone(),
+        store.clone(),
+    )?;
 
     if !is_loopback(&config.listen) {
         tracing::warn!(

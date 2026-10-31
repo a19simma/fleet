@@ -130,6 +130,8 @@ async fn home() -> Result<impl View> {
                 <h1>(HOME_MARKER)</h1>
                 <p><a href="/account">"Account"</a></p>
                 <p><a href="/credentials">"Credentials"</a></p>
+                <p><a href="/jobs">"Jobs"</a></p>
+                <p><a href="/tokens">"Tokens"</a></p>
             </body>
         </html>
     })
@@ -202,6 +204,9 @@ async fn account(cx: &Cx) -> Result<impl View> {
             </head>
             <body data-mode="add" data-csrf=(csrf.as_str())>
                 <h1>(name)</h1>
+                <p><a href="/credentials">"Credentials"</a></p>
+                <p><a href="/jobs">"Jobs"</a></p>
+                <p><a href="/tokens">"Tokens"</a></p>
                 <form id="passkey-form">
                     <button type="submit">"Add a passkey"</button>
                 </form>
@@ -366,24 +371,6 @@ impl Web {
         let origins = [auth.origin().to_owned()];
         Self {
             router: Arc::new(builder(Some(Arc::new(auth)), None, None, &origins)),
-        }
-    }
-
-    /// Builds the router with passkey login and the credentials page over `service`.
-    #[must_use]
-    pub fn with_credentials(auth: WebAuth, service: CredentialService) -> Self {
-        let origins = [auth.origin().to_owned()];
-        let backend = Backend {
-            service,
-            pool: auth.pool().clone(),
-        };
-        Self {
-            router: Arc::new(builder(
-                Some(Arc::new(auth)),
-                Some(Arc::new(backend)),
-                None,
-                &origins,
-            )),
         }
     }
 
