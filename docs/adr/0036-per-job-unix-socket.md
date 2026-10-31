@@ -1,6 +1,6 @@
 # Per-job unix socket
 
-Status: Proposed 2026-10-28. Not built. Amends ADR-0031 (P2 proxy socket).
+Status: Proposed 2026-10-28. The socket is built in `jobsock.rs` and wired for `fetch` and `egress proxy` under the systemd launcher (ADR-0038, ADR-0039). The `broker` service is built as library code and no runtime path registers it (ADR-0037). Mount isolation is unverified. Amends ADR-0031 (P2 proxy socket).
 
 ADR-0037 (credential broker), the fetch tool and the P2 egress proxy each need a channel from the agent to fleetd that carries the identity of one Job. ADR-0031 P2 plans one global `/run/fleet/proxy.sock`, which cannot tell Jobs apart. All agent Jobs share one uid (`fleet-job`), so the peer uid identifies no Job.
 

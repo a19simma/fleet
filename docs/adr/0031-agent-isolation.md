@@ -81,7 +81,7 @@ A probe unit ran as user `fleet-probe`:
 
 - `secrets.env` was unreadable.
 - `/proc/<pid>/environ` of fleetd was unreadable.
-- `ProtectProc=invisible` showed only the unit's own pids.
+- `ProtectProc=invisible` showed only the unit's own pids. This was one unit run as a different uid. Two Jobs under the same `fleet-job` uid were not probed.
 - `$HOME` and `CLAUDE_CONFIG_DIR` were writable. `/etc` was read-only. The agent's home directory was denied.
 - `MemoryMax`, `TasksMax`, `ProtectSystem` and `User` applied as set.
 - A polkit rule scoped to `fleet-probe@*.service` let `agent` start that unit with no prompt. `systemctl start ssh.service` and `systemctl stop fleetd.service` were denied with "Interactive authentication required".
@@ -93,6 +93,7 @@ Three design corrections came out of the run and are binding constraints in P1: 
 
 - Where Claude writes `.claude.json` under `CLAUDE_CONFIG_DIR`. Untestable until the job uid can run `claude`.
 - Whether managed-settings hooks fire under the new uid.
+- Whether a Job can read another Job's mount namespace through `/proc/<pid>/root` as the same uid. `ProtectProc=invisible` does not close that. `PrivatePIDs=yes` (systemd 257) would, and the unit does not set it yet.
 - The bwrap and `RestrictNamespaces` interaction (P4).
 - The egress proxy itself. It is not built, and its behaviour with the Claude client under `NODE_USE_ENV_PROXY=1` is untested.
 - Inferred, not part of the design: the hook client fix in P1 is the only repo change P1 needs besides the unit, the polkit rule and the launcher. Other code paths that assume one uid (the `.finish-<id>` scratch dir, askpass socket checks) were not audited.
@@ -129,4 +130,4 @@ The P2 CONNECT proxy serves the model API only. `egress_allow` is Box config. No
 
 ## Amendment (ADR-0033, ADR-0046)
 
-Job credentials reach fleetd only and stay in broker memory. They are never written into the agent's environment or files (ADR-0033). The P3 mirror is keyed by `(user, repo)` (ADR-0046).
+Job credentials reach fleetd only and stay in broker memory. They are never written into the agent's environment or files (ADR-0033). The Claude token is the exception: the agent still holds it (ADR-0037). The P3 mirror is keyed by `(user, repo)` (ADR-0046).

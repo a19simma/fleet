@@ -29,11 +29,11 @@ Fetch still enforces these limits:
 ### Egress policy is Box-level only
 
 - The egress policy is Box configuration. A Profile has no egress field in v1 and cannot add hosts or widen the policy.
-- ADR-0034 gives a Profile a closed field list with `deny_unknown_fields`, and its Deferred list does not name egress. Checked by search across `docs/adr`: no ADR text claims a Profile egress field. A Profile field would need an amendment to ADR-0034.
+- ADR-0034 gives a Profile a closed field list with `deny_unknown_fields`, and its Deferred list does not name egress. Unverified: a search of `docs/adr` found no ADR text that claims a Profile egress field, and nobody re-ran it after later ADRs. A Profile field would need an amendment to ADR-0034.
 
 ### Telemetry
 
-- A new `EventKind::Fetch` and proto value `JOB_EVENT_KIND_FETCH = 6`. Migration `0016` widens the `job_event` kind CHECK, which holds five values today.
+- A new `EventKind::Fetch` and proto value `JOB_EVENT_KIND_FETCH = 6`. Migration `0016` widens the `job_event` kind CHECK, which held five values before this change.
 - Fetch events count toward the 2000-event cap (ADR-0029). Summary figures do not change.
 - An intent event is recorded before the fetch and an outcome event after it.
 - Fail closed: if the intent event cannot be recorded, the fetch is refused with a fixed error. "Recorded" means the fleetd event feed accepted the event and has not truncated. It does not mean the server confirmed it.
@@ -48,12 +48,16 @@ The agent receives the raw body when it is text-like and under the cap, labelled
 
 ### Floor allow-set
 
-ADR-0034 lets a Profile `allow` list replace the default allow list. A Profile with any allow rule would then lose the permission for `fleetd fetch` without notice. fleetd gains a fixed `FLOOR_ALLOW`, holding `Bash(fleetd fetch *)` and `Bash(fleetd broker *)`. A Profile allow list cannot drop it. The rule for `fleetd broker` belongs to ADR-0037.
+ADR-0034 lets a Profile `allow` list replace the default allow list. A Profile with any allow rule would then lose the permission for `fleetd fetch` without notice. fleetd gains a fixed `FLOOR_ALLOW`, holding `Bash(fleetd fetch *)` and `Bash(fleetd broker *)`. A Profile allow list cannot drop it. No Floor deny covers either entry, so `covers()` cannot match it, and a test in `floor.rs` pins that. The rule for `fleetd broker` belongs to ADR-0037.
 
 ## Findings
 
 - The Box runs with `PrivateNetwork=no` today, and the Floor denies only `curl` and `WebFetch` by pattern. `python3` through Bash reaches any host. Fetch is not a boundary until ADR-0031 P2 ships. Until then it is a logged, address-checked path that a determined agent can bypass.
-- Search of `docs/adr` found no Profile egress field in any ADR.
+- Unverified: a search of `docs/adr` found no Profile egress field in any ADR.
+
+## Rollout
+
+Deploy the server before any fleetd that emits `Fetch`. An older server rejects the whole telemetry report with `InvalidTelemetry` on kind 6.
 
 ## Radiant migration
 
@@ -93,4 +97,4 @@ The Floor bullet "WebFetch: fetches go through the egress proxy (ADR-0031), not 
 
 ## Amendment (ADR-0044)
 
-A non-claude runner calls its own model API. Those hosts must be in the Box `egress_allow` for the P2 proxy to pass them. No Profile can add them.
+A non-claude runner calls its own model API. Inferred, not part of the design: those hosts must be in the Box `egress_allow` for the P2 proxy to pass them. No Profile can add them.
