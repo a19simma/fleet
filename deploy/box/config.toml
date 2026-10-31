@@ -1,0 +1,15 @@
+egress_allow = [
+  "index.crates.io",
+  "static.crates.io",
+  "crates.io",
+  "registry.npmjs.org",
+  "pypi.org",
+  "files.pythonhosted.org",
+  "github.com",
+  "api.github.com",
+  "codeload.github.com",
+  "objects.githubusercontent.com",
+  "registry-1.docker.io",
+  "auth.docker.io",
+  "production.cloudflare.docker.com",
+]

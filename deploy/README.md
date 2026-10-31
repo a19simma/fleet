@@ -199,6 +199,12 @@ To verify on a box:
 3. Run one job. In its unit, `systemctl show fleet-agent@<job id>.service -p PrivateNetwork` prints `PrivateNetwork=yes`, and the hook events for the job arrive in the fleetd queue.
 4. Upgrading a box that has the old `allow-network.conf` drop-in (keep this note until EGRESS-4 passes): delete `/etc/systemd/system/fleet-agent@.service.d/allow-network.conf` and run `sudo systemctl daemon-reload`.
 
+### Build-chain egress preset
+
+`deploy/box/config.toml` is an example Box config. It sets only `egress_allow`, with exact hosts for cargo, npm, pip, GitHub and Docker Hub (ADR-0049). It holds no wildcard, and `config.rs` rejects a wildcard TLD. Copy the list into `/etc/fleetd/config.toml` to enable build chains on a box.
+
+The host list is unverified until the observe-mode task (BOX-3) captures real build traffic on a box. Expect to add or drop hosts then. Only the Box owner edits this list; a Job only narrows it.
+
 ### Claude install
 
 The job uid cannot run `claude` from a per-user mise shim under a mode 0700 home. Install one system-wide copy:

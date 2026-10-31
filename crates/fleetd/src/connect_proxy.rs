@@ -750,6 +750,131 @@ mod tests {
         Ok(())
     }
 
+    const PRESET: &str = include_str!("../../../deploy/box/config.toml");
+    const PRESET_PATH: &str = "../../deploy/box/config.toml";
+
+    const CARGO_HOSTS: &[&str] = &["index.crates.io", "static.crates.io", "crates.io"];
+    const NPM_HOSTS: &[&str] = &["registry.npmjs.org"];
+    const PIP_HOSTS: &[&str] = &["pypi.org", "files.pythonhosted.org"];
+    const GITHUB_HOSTS: &[&str] = &[
+        "github.com",
+        "api.github.com",
+        "codeload.github.com",
+        "objects.githubusercontent.com",
+    ];
+    const DOCKER_HOSTS: &[&str] = &[
+        "registry-1.docker.io",
+        "auth.docker.io",
+        "production.cloudflare.docker.com",
+    ];
+    const OUTSIDER: &str = "unlisted.example";
+
+    fn preset_hosts() -> Vec<&'static str> {
+        [
+            CARGO_HOSTS,
+            NPM_HOSTS,
+            PIP_HOSTS,
+            GITHUB_HOSTS,
+            DOCKER_HOSTS,
+        ]
+        .concat()
+    }
+
+    fn no_env(_: &str) -> Option<String> {
+        None
+    }
+
+    #[test]
+    fn the_box_preset_validates_through_the_config_parser() -> TestResult {
+        let cfg = crate::config::Config::resolve(Some(PRESET), &no_env)?;
+        let mut got: Vec<String> = cfg.egress_allow.iter().map(|p| format!("{p:?}")).collect();
+        let mut want: Vec<String> = preset_hosts()
+            .iter()
+            .map(|h| HostPattern::parse(h).map(|p| format!("{p:?}")))
+            .collect::<Result<_, _>>()?;
+        got.sort();
+        want.sort();
+        assert_eq!(got, want);
+        Ok(())
+    }
+
+    #[test]
+    fn the_box_preset_loads_from_a_relative_path() -> TestResult {
+        let cfg = crate::config::Config::load(Some(std::path::Path::new(PRESET_PATH)))?;
+        assert_eq!(cfg.egress_allow.len(), preset_hosts().len());
+        Ok(())
+    }
+
+    #[test]
+    fn the_box_preset_holds_no_wildcard_entry() {
+        assert!(!PRESET.contains('*'));
+    }
+
+    #[test]
+    fn a_wildcard_tld_entry_is_rejected_by_the_config_parser() {
+        for entry in ["*.com", "*.io", "*.org", "*.dev", "*"] {
+            let text = format!("egress_allow = [\"{entry}\"]\n");
+            assert!(
+                crate::config::Config::resolve(Some(&text), &no_env).is_err(),
+                "{entry} was accepted"
+            );
+        }
+    }
+
+    async fn preset_rig() -> TestResult2<Rig> {
+        let rig = Rig::start(Setup {
+            allow: preset_hosts(),
+            ..Setup::default()
+        })
+        .await?;
+        Ok(rig)
+    }
+
+    async fn class_passes_and_outsider_is_refused(hosts: &[&str]) -> TestResult {
+        for host in hosts {
+            let rig = preset_rig().await?;
+            assert!(connect_status(&rig, host).await?, "{host} was refused");
+            assert!(rig.resolver.queries().contains(&(*host).to_owned()));
+        }
+        let rig = preset_rig().await?;
+        assert!(!connect_status(&rig, OUTSIDER).await?);
+        assert_eq!(rig.dialer.dialed(), Vec::<SocketAddr>::new());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn the_cargo_hosts_pass_and_an_outsider_is_refused() -> TestResult {
+        class_passes_and_outsider_is_refused(CARGO_HOSTS).await
+    }
+
+    #[tokio::test]
+    async fn the_npm_hosts_pass_and_an_outsider_is_refused() -> TestResult {
+        class_passes_and_outsider_is_refused(NPM_HOSTS).await
+    }
+
+    #[tokio::test]
+    async fn the_pip_hosts_pass_and_an_outsider_is_refused() -> TestResult {
+        class_passes_and_outsider_is_refused(PIP_HOSTS).await
+    }
+
+    #[tokio::test]
+    async fn the_github_hosts_pass_and_an_outsider_is_refused() -> TestResult {
+        class_passes_and_outsider_is_refused(GITHUB_HOSTS).await
+    }
+
+    #[tokio::test]
+    async fn the_docker_hub_hosts_pass_and_an_outsider_is_refused() -> TestResult {
+        class_passes_and_outsider_is_refused(DOCKER_HOSTS).await
+    }
+
+    #[tokio::test]
+    async fn a_sibling_subdomain_of_a_preset_host_is_refused() -> TestResult {
+        let rig = preset_rig().await?;
+        assert!(!connect_status(&rig, "evil.github.com").await?);
+        assert!(!connect_status(&rig, "evil.pypi.org").await?);
+        Ok(())
+    }
+
     async fn connect_status(rig: &Rig, host: &str) -> TestResult2<bool> {
         let mut stream = rig.connect().await?;
         stream
