@@ -1,6 +1,6 @@
 # Fleet
 
-Fleet runs coding-agent Jobs on Boxes and records what each Job did. This file defines the terms used by the telemetry and metrics ADRs (0029, 0030) and the profile ADRs (0034, 0035) and the job socket, broker and registration ADRs (0036, 0037, 0039).
+Fleet runs coding-agent Jobs on Boxes and records what each Job did. This file defines the terms used by three groups of ADRs: telemetry and metrics (0029, 0030), profiles (0034, 0035), and the job socket, broker and registration (0036, 0037, 0039).
 
 ## Language
 
@@ -97,7 +97,7 @@ The one call site that runs on every end path of a Job (success, failure, cancel
 _Avoid_: cleanup callback, finalizer
 
 **Fetch policy**:
-The Box-level rule for which hosts `fleetd fetch` may reach. Planned, not built: allow all public hosts first, a radiant allowlist later. A Profile cannot change it (ADR-0038).
+The Box-level rule for which hosts `fleetd fetch` may reach. Set by `fetch_policy` in the Box config file: `allow_all_public` (the default) or `allowlist` with `fetch_allow`. No environment variable and no Profile field changes it (ADR-0038).
 _Avoid_: egress allowlist, proxy policy
 
 **User**:
@@ -117,7 +117,7 @@ How a **Credential** behaves over time: `static_secret` (accepted in v1) or `ref
 _Avoid_: credential format
 
 **Fingerprint**:
-A plaintext display value derived from a **Credential** so the **User** can tell stored credentials apart. It never reveals the secret (ADR-0040).
+A plaintext display value derived from a **Credential** so the **User** can tell stored credentials apart. It is the first 12 hex characters of a SHA-256 over a fixed label and the secret, never a prefix of the secret (ADR-0040).
 _Avoid_: hash, checksum
 
 **Sealer**:

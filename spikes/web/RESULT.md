@@ -1,6 +1,6 @@
 # CRED-00 result: Topcoat, tonic and webauthn-rs in one process
 
-Framework that passed: Topcoat 0.11.0. The plain axum plus maud fallback was not built because Topcoat met all three checks.
+Framework that passed: Topcoat 0.11.0. The plain axum plus maud fallback was not built because Topcoat met all three checks, the asset check with a workaround.
 
 | Check | Result | Notes |
 | --- | --- | --- |
@@ -49,7 +49,7 @@ Workaround that passes: `src/web.rs` serves `include_str!("../assets/style.css")
 - `POST /passkey/register/start` with `content-type: text/plain` returns 4xx.
 - A later `GET /` returns 200 and the server task is still running.
 
-Mutation check: removing the path-prefix condition from `Dispatch::is_grpc` turned this test red (tonic then answered the `application/grpc` request to `/`).
+Mutation check: removing the path-prefix condition from `Dispatch::is_grpc` turned this test red (tonic then answered the `application/grpc` request to `/`). The content-type condition was not mutated, so nothing here shows the test catches its removal.
 
 ## How to run
 
