@@ -32,6 +32,9 @@ const INSERT_TOKEN: &str = "\
 INSERT INTO api_tokens (user_id, hash, label) VALUES ($1, sha256($2::bytea), $3) RETURNING id";
 const FIND_TOKEN: &str = "\
 SELECT user_id FROM api_tokens WHERE hash = sha256($1::bytea) AND revoked_at IS NULL";
+const REDEEM_USER_CODE: &str = "\
+UPDATE setup_codes SET used_at = now() \
+WHERE hash = sha256($1::bytea) AND used_at IS NULL AND expires_at > now() RETURNING user_id";
 const REVOKE_TOKEN: &str = "\
 UPDATE api_tokens SET revoked_at = now() WHERE id = $1 AND user_id = $2 AND revoked_at IS NULL";
 
@@ -96,7 +99,7 @@ pub fn validate_username(name: &str) -> Result<(), UserError> {
     Ok(())
 }
 
-fn random_hex() -> String {
+pub(crate) fn random_hex() -> String {
     use fmt::Write as _;
 
     let mut bytes = [0_u8; RANDOM_BYTES];
@@ -255,6 +258,21 @@ impl Users {
             })
             .await
             .copied()
+    }
+
+    /// Spends an admin-issued setup code and returns the user it was issued for.
+    ///
+    /// The code is stored as a SHA-256. It works once and only before it expires.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`UserError::BadSetupCode`] for an unknown, used or expired code.
+    pub async fn redeem_user_setup(&self, code: &[u8]) -> Result<i64, UserError> {
+        sqlx::query_scalar(REDEEM_USER_CODE)
+            .bind(code)
+            .fetch_optional(&self.pool)
+            .await?
+            .ok_or(UserError::BadSetupCode)
     }
 
     /// Creates an API token for `user_id`. Only its SHA-256 is stored.

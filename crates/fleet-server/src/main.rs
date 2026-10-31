@@ -1,5 +1,6 @@
 //! fleet-server: serves the Fleet gRPC API and a plain health endpoint.
 
+use std::io::Write as _;
 use std::process::ExitCode;
 use std::str::FromStr;
 use std::sync::Arc;
@@ -9,6 +10,7 @@ use axum::Router;
 use axum::routing::get;
 use fleet_server::auth::BearerAuth;
 use fleet_server::config::{Config, CredentialsState, exposed_binds, is_loopback};
+use fleet_server::cred::admin::{AdminError, parse_args, run as run_admin};
 use fleet_server::cred::github::HttpsGithub;
 use fleet_server::cred::store::CredentialStore;
 use fleet_server::cred::{CredentialService, Users};
@@ -190,8 +192,43 @@ async fn run() -> Result<(), BoxError> {
     Ok(())
 }
 
+async fn admin(args: &[String]) -> Result<(), AdminError> {
+    let cmd = parse_args(args)?;
+    let url = std::env::var("FLEET_DATABASE_URL").map_err(|_| AdminError::MissingDatabaseUrl)?;
+    let options = PgConnectOptions::from_str(&url)?;
+    let pool = PgPoolOptions::new()
+        .max_connections(1)
+        .acquire_timeout(ACQUIRE_TIMEOUT)
+        .connect_with(options)
+        .await?;
+    let operator = std::env::var("USER").unwrap_or_else(|_| "unknown".to_owned());
+    let done = run_admin(&pool, &cmd, &operator).await?;
+    let report = format!(
+        "user: {}\npasskeys removed: {}\nsessions revoked: {}\nsetup code: {}\nthe code works once and expires in 24 hours\n",
+        done.username,
+        done.passkeys_removed,
+        done.sessions_revoked,
+        String::from_utf8_lossy(done.setup_code.expose())
+    );
+    std::io::stdout()
+        .write_all(report.as_bytes())
+        .map_err(|_| AdminError::Output)
+}
+
 #[tokio::main]
 async fn main() -> ExitCode {
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    if let Some((first, rest)) = args.split_first()
+        && first == "admin"
+    {
+        return match admin(rest).await {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(err) => {
+                eprintln!("fleet-server admin: {err}");
+                ExitCode::from(err.exit_code())
+            }
+        };
+    }
     let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
     tracing_subscriber::fmt().with_env_filter(filter).init();
     match run().await {
