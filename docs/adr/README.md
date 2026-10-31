@@ -37,5 +37,6 @@ ADRs for fleetd, the Fleet server and the `fleet` CLI. The plan is in `../plan.m
 | [0044](0044-agent-runners.md) | Agent runners | Proposed 2026-10-29, Codex and Kimi wired, not built: runner-owned command lines and the Codex and Kimi parsers, builds on 0033 and 0043, amends 0021, 0029, 0034 and 0038 |
 | [0045](0045-forge-trait.md) | Forge trait | Proposed 2026-10-29, built, builds on 0033 and 0043, amends 0024 and 0037 |
 | [0046](0046-mirror-key.md) | Mirror key | Proposed 2026-10-29, wired to the Job owner, amends 0024 and 0031 |
+| [0049](0049-job-docker-and-build-egress.md) | Job docker and build-chain egress | Proposed 2026-11-01, spike pending, amends 0031 and 0038 |
 
 Each ADR has a "Decisions (2026-10-24)" section with the choices made when the docs moved into this repo: Apache-2.0 licence, repo github.com/a19simma/fleet, `fleet watch` as a client poll in v1, job cost deferred, Tailscale not a hard dependency.
