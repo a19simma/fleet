@@ -92,7 +92,7 @@ Three design corrections came out of the run and are binding constraints in P1: 
 ### Unverified
 
 - Where Claude writes `.claude.json` under `CLAUDE_CONFIG_DIR`. Untestable until the job uid can run `claude`.
-- Whether managed-settings hooks fire under the new uid.
+- Resolved 2026-10-31: managed-settings hooks fire under the job uid. On a test box with server 0.3.2, `fleet status --tools` listed a `Bash` event with exit code, duration and byte count for each command the job ran.
 - Whether a Job can read another Job's mount namespace through `/proc/<pid>/root` as the same uid. `ProtectProc=invisible` does not close that. `PrivatePIDs=yes` (systemd 257) would, and the unit does not set it yet.
 - The bwrap and `RestrictNamespaces` interaction (P4).
 - The egress proxy itself. It is not built, and its behaviour with the Claude client under `NODE_USE_ENV_PROXY=1` is untested.
