@@ -330,14 +330,38 @@ mod tests {
         assert_eq!(idle, Some(std::io::ErrorKind::WouldBlock));
         writer.write_all(b"hi\n")?;
         drop(writer);
-        let mut got = Vec::new();
-        reader.read_to_end(&mut got)?;
-        assert_eq!(got, b"hi\n");
+        assert_eq!(drain(reader)?, b"hi\n");
         let again = create_stdout_fifo(&path, None).err().map(|e| e.kind());
         assert_eq!(again, Some(std::io::ErrorKind::AlreadyExists));
         let plain = dir.path().join("plain");
         create_stdout_fifo(&plain, None)?;
         assert_eq!(std::fs::metadata(&plain)?.mode() & 0o7777, 0o660);
+        Ok(())
+    }
+
+    fn drain(mut reader: std::fs::File) -> std::io::Result<Vec<u8>> {
+        rustix::fs::fcntl_setfl(&reader, rustix::fs::OFlags::empty())?;
+        let mut got = Vec::new();
+        reader.read_to_end(&mut got)?;
+        Ok(got)
+    }
+
+    #[test]
+    fn a_drain_waits_for_a_writer_copy_held_by_a_forked_child() -> TestResult {
+        let dir = tempfile::tempdir()?;
+        let path = dir.path().join("out");
+        create_stdout_fifo(&path, None)?;
+        let reader = open_fifo_reader(&path)?;
+        let mut writer = std::fs::OpenOptions::new().write(true).open(&path)?;
+        let child_copy = writer.try_clone()?;
+        writer.write_all(b"hi\n")?;
+        drop(writer);
+        let child = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(100));
+            drop(child_copy);
+        });
+        assert_eq!(drain(reader)?, b"hi\n");
+        child.join().map_err(|_| "child thread panicked")?;
         Ok(())
     }
 
