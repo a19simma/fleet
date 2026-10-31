@@ -27,7 +27,7 @@
 //! ([`ProxyStats`]), with no per-connection event. One instance serves every Job of the Box, so
 //! counters and caps live in a Job id map: call [`ConnectProxy::forget`] when a Job ends.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::net::{IpAddr, SocketAddr};
 use std::sync::{Arc, Mutex, PoisonError};
@@ -57,6 +57,10 @@ pub const ESTABLISHED: &[u8] = b"HTTP/1.1 200 Connection Established\r\n\r\n";
 
 /// Most header lines after the request line.
 pub const MAX_HEADER_LINES: usize = 16;
+
+/// Most distinct refused hosts observe mode remembers and logs. Later hosts are neither logged
+/// nor stored.
+pub const MAX_OBSERVED_HOSTS: usize = 256;
 
 const COPY_CHUNK: usize = 16 * 1024;
 
@@ -221,6 +225,8 @@ pub struct ConnectProxy<R, D> {
     resolver: R,
     dialer: D,
     jobs: Jobs,
+    observe: bool,
+    observed: Mutex<HashSet<String>>,
 }
 
 impl<R, D> fmt::Debug for ConnectProxy<R, D> {
@@ -243,7 +249,33 @@ impl<R: Resolver, D: Dialer> ConnectProxy<R, D> {
             resolver,
             dialer,
             jobs: Mutex::default(),
+            observe: false,
+            observed: Mutex::default(),
         }
+    }
+
+    /// Turns observe mode on or off. On, the proxy logs each host it refuses against the
+    /// allow list once per process, up to [`MAX_OBSERVED_HOSTS`] hosts, and still refuses.
+    #[must_use]
+    pub fn with_observe(mut self, observe: bool) -> Self {
+        self.observe = observe;
+        self
+    }
+
+    fn note_refused(&self, host: &str) {
+        if !self.observe
+            || !valid_host(host)
+            || host.bytes().any(|b| b.is_ascii_uppercase())
+            || host.parse::<IpAddr>().is_ok()
+        {
+            return;
+        }
+        let mut seen = self.observed.lock().unwrap_or_else(PoisonError::into_inner);
+        if seen.len() >= MAX_OBSERVED_HOSTS || !seen.insert(host.to_owned()) {
+            return;
+        }
+        drop(seen);
+        tracing::warn!(host = %host, "egress host refused");
     }
 
     /// The counters of a Job. A Job with none yet reads all zero.
@@ -389,6 +421,7 @@ impl<R: Resolver, D: Dialer> ConnectProxy<R, D> {
             }
             let host = self.read_head(&mut stream).await?;
             if !self.allowed(job_id, &host) {
+                self.note_refused(&host);
                 return None;
             }
             let tunnel = self.reserve(job_id)?;
@@ -483,6 +516,7 @@ mod tests {
 
     use tempfile::TempDir;
     use tokio::net::TcpListener;
+    use tracing_subscriber::fmt::MakeWriter;
 
     use super::*;
     use crate::jobsock::{
@@ -618,7 +652,7 @@ mod tests {
     }
 
     struct Rig {
-        _dir: TempDir,
+        dir: TempDir,
         socket: JobSocket,
         proxy: Arc<ConnectProxy<Fake, Local>>,
         resolver: Fake,
@@ -665,7 +699,7 @@ mod tests {
                 Limits::default(),
             )?;
             Ok(Self {
-                _dir: dir,
+                dir,
                 socket,
                 proxy,
                 resolver,
@@ -888,6 +922,178 @@ mod tests {
         let mut buf = [0_u8; 12];
         timeout(OUTER, stream.read_exact(&mut buf)).await??;
         Ok(buf.to_vec())
+    }
+
+    #[derive(Clone, Default)]
+    struct Capture(Arc<Mutex<Vec<u8>>>);
+
+    impl io::Write for Capture {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            self.0
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'a> MakeWriter<'a> for Capture {
+        type Writer = Self;
+        fn make_writer(&'a self) -> Self {
+            self.clone()
+        }
+    }
+
+    impl Capture {
+        fn text(&self) -> String {
+            String::from_utf8_lossy(&self.0.lock().unwrap_or_else(PoisonError::into_inner))
+                .into_owned()
+        }
+        fn lines(&self) -> usize {
+            self.text().lines().count()
+        }
+    }
+
+    fn capture() -> (tracing::subscriber::DefaultGuard, Capture) {
+        let sink = Capture::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(sink.clone())
+            .with_ansi(false)
+            .finish();
+        (tracing::subscriber::set_default(subscriber), sink)
+    }
+
+    fn observer(observe: bool) -> ConnectProxy<Fake, Local> {
+        let resolver = Fake::default();
+        let dialer = Local(Arc::new(LocalInner {
+            port: 1,
+            delay: Duration::ZERO,
+            dialed: Mutex::default(),
+        }));
+        ConnectProxy::new(Vec::new(), ProxyLimits::default(), resolver, dialer)
+            .with_observe(observe)
+    }
+
+    fn hostile_names() -> Vec<(&'static str, String)> {
+        vec![
+            ("cr", "evil\r.example".to_owned()),
+            ("crlf", "evil\r\nInjected: 1.example".to_owned()),
+            ("nel", "evil\u{85}.example".to_owned()),
+            ("u2028", "evil\u{2028}.example".to_owned()),
+            ("backslash", "evil\\.example".to_owned()),
+            ("userinfo", "user:pw@evil.example".to_owned()),
+            ("ipv6", "[2606:4700::1111]".to_owned()),
+            ("ipv6 bare", "2606:4700::1111".to_owned()),
+            ("ipv4", "8.8.8.8".to_owned()),
+            ("empty label", "evil..example".to_owned()),
+            ("empty", String::new()),
+            ("over long", format!("{}.example", "a".repeat(250))),
+            ("space", "evil .example".to_owned()),
+            ("tab", "evil\t.example".to_owned()),
+            ("non ascii", "\u{e9}vil.example".to_owned()),
+            ("path", "evil.example/path".to_owned()),
+            ("uppercase", "Evil.Example".to_owned()),
+        ]
+    }
+
+    #[test]
+    fn observe_never_logs_a_hostile_host_name() {
+        let (_guard, sink) = capture();
+        let proxy = observer(true);
+        for (name, host) in hostile_names() {
+            proxy.note_refused(&host);
+            assert_eq!(sink.lines(), 0, "{name}: {}", sink.text());
+        }
+        assert!(proxy.observed.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn observe_logs_a_clean_host_once_with_the_host_field_only() {
+        let (_guard, sink) = capture();
+        let proxy = observer(true);
+        proxy.note_refused("evil.example");
+        proxy.note_refused("evil.example");
+        assert_eq!(sink.lines(), 1, "{}", sink.text());
+        assert!(sink.text().contains("host=evil.example"), "{}", sink.text());
+        proxy.note_refused("other.example");
+        assert_eq!(sink.lines(), 2);
+    }
+
+    #[test]
+    fn observe_stops_logging_and_storing_at_the_cap() {
+        let (_guard, sink) = capture();
+        let proxy = observer(true);
+        for n in 0..MAX_OBSERVED_HOSTS + 5 {
+            proxy.note_refused(&format!("h{n}.example"));
+        }
+        assert_eq!(sink.lines(), MAX_OBSERVED_HOSTS);
+        assert_eq!(proxy.observed.lock().unwrap().len(), MAX_OBSERVED_HOSTS);
+        proxy.note_refused("h0.example");
+        assert_eq!(sink.lines(), MAX_OBSERVED_HOSTS);
+    }
+
+    #[test]
+    fn observe_off_logs_nothing_and_stores_nothing() {
+        let (_guard, sink) = capture();
+        let proxy = observer(false);
+        proxy.note_refused("evil.example");
+        assert_eq!(sink.lines(), 0);
+        assert!(proxy.observed.lock().unwrap().is_empty());
+    }
+
+    async fn observing_rig() -> TestResult2<Rig> {
+        let mut rig = Rig::start(Setup::default()).await?;
+        rig.proxy = Arc::new(observer(true));
+        let mut services = Services::new();
+        services.insert(ServiceName::EgressProxy, Arc::new(Arc::clone(&rig.proxy)));
+        rig.socket = JobSocket::bind(
+            &rig.dir.path().join("observe.sock"),
+            "job1",
+            services,
+            Arc::new(Cgroup),
+            Limits::default(),
+        )?;
+        Ok(rig)
+    }
+
+    #[tokio::test]
+    async fn a_refused_host_is_logged_normalised_and_still_refused_with_observe_on() -> TestResult {
+        let (_guard, sink) = capture();
+        let rig = observing_rig().await?;
+        assert!(!connect_status(&rig, "Evil.Example.").await?);
+        assert!(!connect_status(&rig, "evil.example").await?);
+        assert_eq!(sink.lines(), 1, "{}", sink.text());
+        assert!(sink.text().contains("host=evil.example"), "{}", sink.text());
+        assert!(!sink.text().contains("443"), "{}", sink.text());
+        assert_eq!(rig.dialer.dialed(), Vec::<SocketAddr>::new());
+        assert_eq!(rig.proxy.stats("job1").refusals, 2);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn hostile_requests_with_observe_on_log_nothing_and_are_refused() -> TestResult {
+        let (_guard, sink) = capture();
+        let rig = observing_rig().await?;
+        let cases = hostile();
+        for (name, bytes) in &cases {
+            let mut stream = rig.connect().await?;
+            stream.write_all(bytes).await?;
+            assert_eq!(read_until_closed(&mut stream).await?, FORBIDDEN, "{name}");
+        }
+        let text = sink.text();
+        for line in text.lines() {
+            let host = line.rsplit_once("host=").map(|(_, host)| host);
+            assert!(
+                host.is_some_and(|h| valid_host(h) && h == h.to_ascii_lowercase()),
+                "{line}"
+            );
+        }
+        assert!(!text.contains('\r') && !text.contains("Injected"), "{text}");
+        assert_eq!(rig.proxy.stats("job1").refusals, cases.len() as u64);
+        Ok(())
     }
 
     #[tokio::test]
