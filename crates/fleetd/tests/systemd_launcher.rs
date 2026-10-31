@@ -426,6 +426,37 @@ async fn files_stdout_and_a_finished_wait_behave() -> TestResult {
 }
 
 #[tokio::test]
+async fn a_model_secret_reaches_the_0600_env_file_only_and_leaves_with_the_dir() -> TestResult {
+    const KEY: &str = "sk-ant-model-secret-0123456789";
+    const TOKEN: &str = "oauth-model-secret-0123456789";
+    let case = Case::new("t_model_secret")?;
+    case.last(&show("inactive", "success", 1, 0))?;
+    let mut spec = case.spec();
+    spec.env.insert("ANTHROPIC_API_KEY".into(), KEY.into());
+    spec.env
+        .insert("CLAUDE_CODE_OAUTH_TOKEN".into(), TOKEN.into());
+    let mut launched = case.launcher().launch(spec)?;
+    let dir = case.dir();
+    assert_eq!(fs::metadata(dir.join("env"))?.mode() & 0o7777, 0o600);
+    let env = fs::read_to_string(dir.join("env"))?;
+    assert!(env.contains(&format!("ANTHROPIC_API_KEY=\"{KEY}\"")));
+    assert!(env.contains(&format!("CLAUDE_CODE_OAUTH_TOKEN=\"{TOKEN}\"")));
+    for entry in fs::read_dir(&dir)? {
+        let path = entry?.path();
+        if path.file_name().is_some_and(|name| name == "env") || !path.is_file() {
+            continue;
+        }
+        let text = fs::read_to_string(&path).unwrap_or_default();
+        assert!(!text.contains(KEY) && !text.contains(TOKEN), "{path:?}");
+    }
+    assert_eq!(waited(launched.proc.as_mut()).await?.code(), Some(0));
+    assert!(!dir.join("env").exists());
+    drop(launched);
+    assert!(!dir.exists());
+    Ok(())
+}
+
+#[tokio::test]
 async fn a_failed_start_leaves_nothing_behind() -> TestResult {
     let case = Case::new("t_startfail")?;
     case.put("start.rc", "1")?;

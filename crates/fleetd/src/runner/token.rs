@@ -57,6 +57,37 @@ impl<R: Reporter> AgentRunner<R> {
         }
     }
 
+    /// Puts the holder's model credential into `env` and drops every model secret the box
+    /// environment passed.
+    ///
+    /// With a book attached, a job gets `ANTHROPIC_API_KEY` or `CLAUDE_CODE_OAUTH_TOKEN` from
+    /// its held credentials only. A job with none held gets neither, and the box values never
+    /// stand in. Judge jobs fetch no credentials and keep the base environment. Without a book
+    /// `env` is left as it is.
+    pub(crate) fn apply_model_env(
+        &self,
+        env: &mut std::collections::BTreeMap<std::ffi::OsString, std::ffi::OsString>,
+        job: &fleet_proto::v1::Job,
+    ) {
+        let Some(book) = &self.credentials else {
+            return;
+        };
+        if job.kind() == fleet_proto::v1::JobKind::Judge {
+            return;
+        }
+        for name in [crate::agent::API_KEY_ENV, crate::agent::OAUTH_TOKEN_ENV] {
+            env.remove(std::ffi::OsStr::new(name));
+        }
+        let Some(held) = book.get(&job.job_id) else {
+            return;
+        };
+        if let Some((name, secret)) = crate::agent::model_env(&held)
+            && let Ok(value) = std::str::from_utf8(secret.expose())
+        {
+            env.insert(name.into(), value.into());
+        }
+    }
+
     /// Merges the redactor of `held` into the job's redactor until [`AgentRunner::end_job`].
     pub(crate) fn adopt_credentials(&self, job_id: &str, held: &JobCredentials) {
         let merged = Arc::new(self.redactor.merged(&held.redactor()));
@@ -96,7 +127,7 @@ mod tests {
     use fleet_proto::v1::{
         ClaimJobReply, ClaimJobRequest, GetJobCredentialsReply, GetJobCredentialsRequest,
         GetJobTranscriptReply, GetJobTranscriptRequest, GetProfileBlobReply, GetProfileBlobRequest,
-        Job, JobCredential, ReportJobReply, ReportJobRequest,
+        Job, JobCredential, JobKind, ReportJobReply, ReportJobRequest,
     };
     use tokio::net::TcpListener;
     use tokio_stream::wrappers::TcpListenerStream;
@@ -110,6 +141,8 @@ mod tests {
     const AGENT: &str = "agent-key-0123456789abcdef";
     const BOX_PAT: &str = "box-pat-0123456789abcdef";
     const BOX_ENT: &str = "box-ent-0123456789abcdef";
+    const BOX_OAUTH: &str = "box-oauth-0123456789abcdef";
+    const BOX_KEY: &str = "box-key-0123456789abcdef";
 
     struct Quiet;
 
@@ -122,7 +155,7 @@ mod tests {
         }
     }
 
-    struct Stub;
+    struct Stub(&'static str);
 
     #[tonic::async_trait]
     impl FleetWorker for Stub {
@@ -157,7 +190,7 @@ mod tests {
                 value: value.into(),
             };
             Ok(Response::new(GetJobCredentialsReply {
-                credentials: vec![wire("github_pat", HOLDER), wire("anthropic_api_key", AGENT)],
+                credentials: vec![wire("github_pat", HOLDER), wire(self.0, AGENT)],
             }))
         }
 
@@ -172,11 +205,18 @@ mod tests {
     type Fixture = (AgentRunner<Quiet>, Arc<CredentialBook>, tempfile::TempDir);
 
     async fn fixture(attach: bool) -> Result<Fixture, Box<dyn std::error::Error>> {
+        fixture_kind(attach, "anthropic_api_key").await
+    }
+
+    async fn fixture_kind(
+        attach: bool,
+        kind: &'static str,
+    ) -> Result<Fixture, Box<dyn std::error::Error>> {
         let listener = TcpListener::bind(("127.0.0.1", 0)).await?;
         let url = format!("http://{}", listener.local_addr()?);
         tokio::spawn(
             tonic::transport::Server::builder()
-                .add_service(FleetWorkerServer::new(Stub))
+                .add_service(FleetWorkerServer::new(Stub(kind)))
                 .serve_with_incoming(TcpListenerStream::new(listener)),
         );
         let book = Arc::new(CredentialBook::new(CredentialClient::new(
@@ -190,7 +230,10 @@ mod tests {
             ("PATH".into(), std::env::var_os("PATH").unwrap_or_default()),
             ("GH_TOKEN".into(), BOX_PAT.into()),
             ("GH_ENTERPRISE_TOKEN".into(), BOX_ENT.into()),
+            ("CLAUDE_CODE_OAUTH_TOKEN".into(), BOX_OAUTH.into()),
+            ("ANTHROPIC_API_KEY".into(), BOX_KEY.into()),
         ];
+        config.env_passthrough = vec!["ANTHROPIC_API_KEY".into()];
         let mut runner = AgentRunner::new(config, Quiet, Redactor::new([BOX_PAT]));
         if attach {
             runner = runner.with_credentials(Arc::clone(&book));
@@ -283,6 +326,78 @@ mod tests {
         }
         assert!(runner.github_token("job2").is_none());
         assert_eq!(runner.github_token("job1").as_deref(), Some(HOLDER));
+        Ok(())
+    }
+
+    fn spec_env(runner: &AgentRunner<Quiet>, job_id: &str, kind: JobKind) -> Vec<(String, String)> {
+        let job = Job {
+            job_id: job_id.into(),
+            kind: kind as i32,
+            ..Job::default()
+        };
+        let dir = Path::new("/tmp");
+        runner
+            .agent_spec(&job, dir, dir)
+            .env
+            .iter()
+            .filter_map(|(k, v)| Some((k.to_str()?.to_owned(), v.to_str()?.to_owned())))
+            .collect()
+    }
+
+    fn no_box_model_secret(env: &[(String, String)]) {
+        assert!(env.iter().all(|(_, v)| v != BOX_OAUTH && v != BOX_KEY));
+    }
+
+    #[tokio::test]
+    async fn the_agent_env_takes_the_holder_api_key_and_never_the_box_values()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (runner, _book, _dir) = fixture_kind(true, "anthropic_api_key").await?;
+        let env = spec_env(&runner, "job1", JobKind::Agent);
+        assert_eq!(value(&env, "ANTHROPIC_API_KEY"), Some(AGENT));
+        assert!(value(&env, "CLAUDE_CODE_OAUTH_TOKEN").is_none());
+        assert!(value(&env, "GH_TOKEN").is_none());
+        no_box_model_secret(&env);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn the_agent_env_takes_the_holder_oauth_token_and_never_the_box_values()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (runner, _book, _dir) = fixture_kind(true, "claude_subscription_token").await?;
+        let env = spec_env(&runner, "job1", JobKind::Agent);
+        assert_eq!(value(&env, "CLAUDE_CODE_OAUTH_TOKEN"), Some(AGENT));
+        assert!(value(&env, "ANTHROPIC_API_KEY").is_none());
+        no_box_model_secret(&env);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_job_with_no_held_credential_gets_no_model_secret_and_no_box_fallback()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (runner, _book, _dir) = fixture(true).await?;
+        let env = spec_env(&runner, "job2", JobKind::Agent);
+        assert!(value(&env, "ANTHROPIC_API_KEY").is_none());
+        assert!(value(&env, "CLAUDE_CODE_OAUTH_TOKEN").is_none());
+        no_box_model_secret(&env);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_runner_with_no_book_keeps_the_box_oauth_token_in_the_agent_env()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (runner, _book, _dir) = fixture(false).await?;
+        let env = spec_env(&runner, "job1", JobKind::Agent);
+        assert_eq!(value(&env, "CLAUDE_CODE_OAUTH_TOKEN"), Some(BOX_OAUTH));
+        assert_eq!(value(&env, "ANTHROPIC_API_KEY"), Some(BOX_KEY));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_judge_job_keeps_its_base_env_model_token() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let (runner, _book, _dir) = fixture(true).await?;
+        let env = spec_env(&runner, "job1", JobKind::Judge);
+        assert_eq!(value(&env, "CLAUDE_CODE_OAUTH_TOKEN"), Some(BOX_OAUTH));
         Ok(())
     }
 

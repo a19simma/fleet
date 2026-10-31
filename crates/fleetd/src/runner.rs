@@ -1784,6 +1784,7 @@ impl<R: Reporter> AgentRunner<R> {
             ("GIT_COMMITTER_EMAIL", JOB_EMAIL.into()),
         ];
         env.extend(fixed.map(|(name, value)| (OsString::from(name), value)));
+        self.apply_model_env(&mut env, job);
         AgentSpec {
             argv,
             env,
