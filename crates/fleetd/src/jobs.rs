@@ -550,12 +550,15 @@ where
         fetcher,
         BookRecorder(Arc::clone(feeds)),
     ));
-    let proxy = Arc::new(ConnectProxy::new(
-        config.egress_allow.clone(),
-        ProxyLimits::default(),
-        resolver,
-        dialer,
-    ));
+    let proxy = Arc::new(
+        ConnectProxy::new(
+            config.egress_allow.clone(),
+            ProxyLimits::default(),
+            resolver,
+            dialer,
+        )
+        .with_observe(config.egress_observe),
+    );
     let mut services = Services::new();
     let end = JobEnd::new()
         .on_hosts({
