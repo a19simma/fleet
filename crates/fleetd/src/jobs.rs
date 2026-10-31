@@ -20,6 +20,7 @@ use crate::agent_config::Bundle;
 use crate::broker::{Broker, GhCli, MirrorGit};
 use crate::config::Config;
 use crate::connect_proxy::{ConnectProxy, ProxyLimits};
+use crate::cred::CredentialBook;
 use crate::fetch::{Dialer, Fetcher, Resolver, SystemResolver, TcpDialer, webpki_tls_config};
 use crate::fetch_service::{FeedBook, FetchRecorder, FetchService, MAX_CONCURRENT_FETCHES};
 use crate::jobenv::group_id;
@@ -49,6 +50,7 @@ pub struct DaemonRunner<R> {
     agent: Arc<AgentRunner<R>>,
     box_name: String,
     broker: Option<BrokerWiring>,
+    credentials: Option<Arc<CredentialBook>>,
 }
 
 /// A [`Broker`] with its executor types erased, so one [`PerJob`] registry holds them all.
@@ -102,6 +104,44 @@ impl<R: Reporter> DaemonRunner<R> {
             agent: Arc::new(agent),
             box_name: box_name.to_owned(),
             broker: None,
+            credentials: None,
+        }
+    }
+
+    /// Fetches the credentials of each job into `book` once its profile is loaded and before
+    /// its workspace is prepared, and fails the job with the fixed reason when the fetch fails.
+    /// The caller also adds [`CredentialBook::end_hook`] to the runner's job end hooks, so the
+    /// credentials drop on every end path.
+    #[must_use]
+    pub fn with_credentials(mut self, book: Arc<CredentialBook>) -> Self {
+        self.credentials = Some(book);
+        self
+    }
+
+    async fn fetch_credentials(&self, job: &Job, mut shutdown: Shutdown) -> Result<(), RunError> {
+        let Some(book) = &self.credentials else {
+            return Ok(());
+        };
+        let work = book.fetch(&job.job_id, job.attempt, &self.box_name);
+        let guarded = tokio::select! {
+            guarded = self.agent.keep_alive(job, work) => guarded,
+            () = shutdown.requested() => {
+                self.agent.fail_job(job, ERR_SHUTDOWN).await;
+                return Err(RunError);
+            }
+        };
+        match guarded {
+            Ok(Ok(_)) => Ok(()),
+            Ok(Err(failure)) => {
+                tracing::warn!(reason = failure.reason(), "job credentials refused");
+                self.agent.fail_job(job, failure.reason()).await;
+                Err(RunError)
+            }
+            Err(Interrupt::Cancelled) => {
+                self.agent.cancel_job(job).await;
+                Err(RunError)
+            }
+            Err(_) => Err(RunError),
         }
     }
 
@@ -306,6 +346,10 @@ impl<R: Reporter + Send + Sync + 'static> JobRunner for DaemonRunner<R> {
             return self.run_judge(&job, shutdown).await;
         }
         if let Err(stop) = self.load_profile(&job, shutdown.clone()).await {
+            self.agent.clear_profile(&job);
+            return Err(stop);
+        }
+        if let Err(stop) = self.fetch_credentials(&job, shutdown.clone()).await {
             self.agent.clear_profile(&job);
             return Err(stop);
         }

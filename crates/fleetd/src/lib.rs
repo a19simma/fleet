@@ -18,6 +18,7 @@ pub mod backoff;
 pub mod broker;
 mod config;
 pub mod connect_proxy;
+pub mod cred;
 mod dump;
 mod error;
 pub mod events;
