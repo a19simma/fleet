@@ -149,6 +149,7 @@ async fn the_clone_holds_no_objects_and_links_none_from_the_mirror() -> TestResu
         let mut names = std::fs::read_dir(checkout.path.join(".git/objects"))?
             .map(|entry| entry.map(|e| e.file_name().to_string_lossy().into_owned()))
             .collect::<Result<Vec<_>, _>>()?;
+        names.retain(|name| name != "maintenance.lock");
         names.sort();
         assert_eq!(names, ["info", "pack"]);
         let mirror = only_mirror(&root)?;

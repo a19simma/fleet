@@ -36,7 +36,7 @@ jobs:
           cache-on-failure: true
       - run: cargo fmt --check
       - run: cargo clippy --workspace --all-targets -- -D warnings
-      - run: cargo test --workspace
+      - run: cargo test --workspace --no-fail-fast
 
   infra:
     runs-on: ubuntu-latest
