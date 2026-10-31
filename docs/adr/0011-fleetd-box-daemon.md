@@ -18,7 +18,7 @@ A daemon `fleetd` runs on every Box and is the only Box component that talks to 
 - **Event list.** The recorded hook events are a config list in fleetd, not hardcoded. The default is provisional (plan, decision 6).
 - **Hook config.** Managed settings, baked into the Template as `/etc/claude-code/managed-settings.json` or a `managed-settings.d/10-fleetd.json` drop-in. T4 settled it: hooks merge across managed, user and `--settings` sources, so a Job cannot suppress the managed hook. The loopback hook appears only there. Each hook sets a `timeout`, and `onFailure` is not used.
 - **Bake.** The binary and its config join the Template at a pinned, checksummed version. An upgrade is a Template rebuild.
-- **No git.** Superseded in part, see ADR-0024 and ADR-0020. fleetd never pushes and holds no git credential: a Box pushes only its own `swarm/` branch, and fleetd is not the pusher. It runs read-only git commands to count unpushed commits.
+- **No git.** Superseded in part, see ADR-0024 and ADR-0020. fleetd now runs the push for a Job's `swarm/<job_id>` branch and holds the job credential (ADR-0024). It pushes no other branch. It runs read-only git commands to count unpushed commits.
 
 ## Phase 0 results
 

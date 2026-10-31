@@ -1,6 +1,6 @@
 # Fleet server stack
 
-Status: Accepted. Service layout and the "No transcripts" bullet amended by ADR-0021 and ADR-0022 (built in the server). The monthly partitioning of `events` and its partition-drop retention are superseded by ADR-0019. "The deploy target is not fixed" amended by ADR-0025: the manifests live in `infra/`.
+Status: Accepted. Service layout and the "No transcripts" bullet amended by ADR-0021 and ADR-0022 (built in the server). The credentials bullet is amended by ADR-0040. The monthly partitioning of `events` and its partition-drop retention are superseded by ADR-0019. "The deploy target is not fixed" amended by ADR-0025: the manifests live in `infra/`.
 
 Fleet state must outlive the laptop's sleep and any single Box. The deployment stack is Rust with tonic, Kubernetes and Argo CD.
 
@@ -32,7 +32,7 @@ The Fleet server is a long-running service in Rust, with gRPC through tonic and 
 
 - **Services (ADR-0021), built.** Claim and lease move off `FleetIngest` to a new box-scope service, `FleetWorker` (`ClaimJob`, `ReportJob`). `FleetIngest` keeps events and heartbeat. `FleetJobs` gains `GetJob`, `ListJobs` and `ReadTranscript`. `QueueDepth` and drain are not part of the first job system.
 - **Transcripts (ADR-0022), built.** "No transcripts" now holds only for the session transcripts fleetd reads for previews. The server stores the stream-json output of Jobs in `job_transcript`, capped at 4 MiB per Job.
-- **Credentials (ADR-0040), not built.** Postgres also holds `credentials` and `credential_use`, sealed with XChaCha20-Poly1305 under a master key file. It protects DB backups and read-only SQL, not a compromised server pod.
+- **Credentials (ADR-0040), not built.** Postgres also holds `credentials` and `credential_use`, sealed with XChaCha20-Poly1305 under a master key file. The sealing protects DB backups and read-only SQL, not a compromised server pod.
 - **Web UI (ADR-0041), not built.** `fleet-server` also serves a browser UI on the gRPC port, dispatched by content type and path prefix.
 - **Users and auth (ADR-0042), not built.** Postgres also holds users, passkeys, sessions and API tokens.
 - **Retention.** `job_attempts` is not created in the first job system, so only `jobs` and `job_transcript` exist. The one year retention of `jobs` stands. No transcript retention job is designed.

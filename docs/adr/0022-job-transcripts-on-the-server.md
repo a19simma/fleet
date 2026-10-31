@@ -12,7 +12,7 @@ The server stores the stream-json output of a Job in Postgres, and `FleetJobs.Re
 - **Source.** fleetd sends chunks through `ReportJob` (ADR-0021). The stream-json stdout is the transcript. Claude's session `.jsonl` is not read.
 - **Redaction.** fleetd redacts each line with the existing redactor before it leaves the Box.
 - **Idempotence.** A repeated `seq` is a no-op.
-- **Cap.** 4 MiB per Job, tracked in `jobs.transcript_bytes`. Chunks past the cap are dropped and one `truncated` marker row is written.
+- **Cap.** 4 MiB per Job, tracked in `jobs.transcript_bytes`. Chunks past the cap are dropped and one `truncated` marker row is written. A Job also holds at most 50,000 transcript rows, each chunk is charged the larger of its text length and 64 bytes against the cap, and one report carries at most 256 chunks. The reply's `acked_through_seq` is the end of the contiguous stored prefix starting at 1.
 - **Read.** `ReadTranscript{job_id, after_seq, limit}` returns chunks and `done`. `fleet logs -f` polls it every 1 s.
 - **Sensitivity.** The database is treated as sensitive. Transcripts hold prompts, code and shell output. The redactor matches exact values only (ADR-0014), so secrets in other forms can reach the table.
 - **Scope.** Only Jobs. The session transcripts that fleetd reads for previews (ADR-0011) still stay on the Box.
