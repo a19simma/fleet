@@ -124,7 +124,7 @@ impl FleetService {
         let service = self
             .credentials
             .as_ref()
-            .ok_or_else(|| Status::failed_precondition("credentials are not configured"))?;
+            .ok_or_else(|| Status::failed_precondition(fleet_proto::PRECONDITION_NOT_CONFIGURED))?;
         Ok((service, user_id))
     }
 }
@@ -317,7 +317,7 @@ impl FleetWorker for FleetService {
         let service = self
             .credentials
             .as_ref()
-            .ok_or_else(|| Status::failed_precondition("credentials are not configured"))?;
+            .ok_or_else(|| Status::failed_precondition(fleet_proto::PRECONDITION_NOT_CONFIGURED))?;
         let request = request.into_inner();
         let name = validate_box(&request.r#box)
             .map_err(|err| Status::invalid_argument(err.to_string()))?;

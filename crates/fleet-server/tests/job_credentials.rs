@@ -330,7 +330,7 @@ async fn an_owner_without_github_fails_with_a_fixed_error(pool: PgPool) {
     let job = w.running(w.alice, "claude", "k1").await;
     let status = w.fetch(&job, job.attempt, &box_a()).await.unwrap_err();
     assert_eq!(status.code(), Code::FailedPrecondition);
-    assert_eq!(status.message(), "no github credential");
+    assert_eq!(status.message(), fleet_proto::PRECONDITION_NO_GITHUB);
     assert_eq!(w.uses().await, 0);
 }
 
@@ -343,7 +343,7 @@ async fn an_owner_without_an_agent_credential_fails_with_a_fixed_error(pool: PgP
     let job = w.running(w.alice, "claude", "k1").await;
     let status = w.fetch(&job, job.attempt, &box_a()).await.unwrap_err();
     assert_eq!(status.code(), Code::FailedPrecondition);
-    assert_eq!(status.message(), "no agent credential");
+    assert_eq!(status.message(), fleet_proto::PRECONDITION_NO_AGENT);
     assert_eq!(w.uses().await, 0);
 }
 
@@ -368,7 +368,7 @@ async fn an_expired_credential_is_refused_with_a_fixed_error(pool: PgPool) {
     .unwrap();
     let status = w.fetch(&job, job.attempt, &box_a()).await.unwrap_err();
     assert_eq!(status.code(), Code::FailedPrecondition);
-    assert_eq!(status.message(), "credential expired");
+    assert_eq!(status.message(), fleet_proto::PRECONDITION_EXPIRED);
     assert!(!status.message().contains(PAT));
     assert_eq!(w.uses().await, 0);
 }
@@ -379,7 +379,7 @@ async fn a_server_without_credentials_configured_refuses(pool: PgPool) {
     let job = w.running(w.alice, "claude", "k1").await;
     let status = w.fetch(&job, job.attempt, &box_a()).await.unwrap_err();
     assert_eq!(status.code(), Code::FailedPrecondition);
-    assert_eq!(status.message(), "credentials are not configured");
+    assert_eq!(status.message(), fleet_proto::PRECONDITION_NOT_CONFIGURED);
 }
 
 #[sqlx::test]
@@ -425,7 +425,7 @@ async fn only_an_expired_agent_credential_is_refused(pool: PgPool) {
     expire(&w, "anthropic_api_key").await;
     let status = w.fetch(&job, job.attempt, &box_a()).await.unwrap_err();
     assert_eq!(status.code(), Code::FailedPrecondition);
-    assert_eq!(status.message(), "credential expired");
+    assert_eq!(status.message(), fleet_proto::PRECONDITION_EXPIRED);
     assert_eq!(w.uses().await, 0);
 }
 
@@ -493,7 +493,7 @@ async fn an_unknown_agent_has_no_agent_credential(pool: PgPool) {
     let job = w.running(w.alice, "mystery", "k1").await;
     let status = w.fetch(&job, job.attempt, &box_a()).await.unwrap_err();
     assert_eq!(status.code(), Code::FailedPrecondition);
-    assert_eq!(status.message(), "no agent credential");
+    assert_eq!(status.message(), fleet_proto::PRECONDITION_NO_AGENT);
     assert_eq!(w.uses().await, 0);
 }
 

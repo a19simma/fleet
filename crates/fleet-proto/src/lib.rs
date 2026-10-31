@@ -80,6 +80,18 @@ pub const MAX_CREDENTIAL_LOGIN_BYTES: usize = 256;
 /// Most credentials one user may store, and so the most one list or job reply carries.
 pub const MAX_CREDENTIALS_PER_USER: usize = 64;
 
+/// `FAILED_PRECONDITION` message: the job owner stored no GitHub credential.
+pub const PRECONDITION_NO_GITHUB: &str = "no github credential";
+
+/// `FAILED_PRECONDITION` message: the job owner stored no credential for the job's agent.
+pub const PRECONDITION_NO_AGENT: &str = "no agent credential";
+
+/// `FAILED_PRECONDITION` message: a credential the job needs has expired.
+pub const PRECONDITION_EXPIRED: &str = "credential expired";
+
+/// `FAILED_PRECONDITION` message: the server runs without a credential store.
+pub const PRECONDITION_NOT_CONFIGURED: &str = "credentials are not configured";
+
 /// Most transcript chunks one report may carry. The server rejects more.
 pub const MAX_CHUNKS_PER_REPORT: usize = 256;
 

@@ -37,9 +37,11 @@ fn store_status(err: &StoreError) -> Status {
         StoreError::NotFound => Status::not_found("credential not found"),
         StoreError::TooMany => Status::resource_exhausted("too many credentials"),
         StoreError::LeaseDenied => Status::permission_denied("lease does not match"),
-        StoreError::NoGithub => Status::failed_precondition("no github credential"),
-        StoreError::NoAgentCredential => Status::failed_precondition("no agent credential"),
-        StoreError::Expired => Status::failed_precondition("credential expired"),
+        StoreError::NoGithub => Status::failed_precondition(fleet_proto::PRECONDITION_NO_GITHUB),
+        StoreError::NoAgentCredential => {
+            Status::failed_precondition(fleet_proto::PRECONDITION_NO_AGENT)
+        }
+        StoreError::Expired => Status::failed_precondition(fleet_proto::PRECONDITION_EXPIRED),
         StoreError::Seal(_) => {
             tracing::error!(%err, "credential sealing failed");
             Status::internal("credential store error")

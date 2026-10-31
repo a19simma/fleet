@@ -3,7 +3,9 @@
 
 use std::future::Future;
 use std::panic::{AssertUnwindSafe, catch_unwind};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
+use std::time::Duration;
 
 use fleet_core::Redactor;
 use std::fmt::Write as _;
@@ -13,7 +15,11 @@ use fleet_proto::v1::fleet_worker_server::{FleetWorker, FleetWorkerServer};
 use fleet_proto::v1::{
     ClaimJobReply, ClaimJobRequest, GetJobCredentialsReply, GetJobCredentialsRequest,
     GetJobTranscriptReply, GetJobTranscriptRequest, GetProfileBlobReply, GetProfileBlobRequest,
-    Job, JobCredential, JobState, ReportJobReply, ReportJobRequest,
+    Job, JobCredential, JobState, ProfileRef, ReportJobReply, ReportJobRequest,
+};
+use fleet_proto::{
+    PRECONDITION_EXPIRED, PRECONDITION_NO_AGENT, PRECONDITION_NO_GITHUB,
+    PRECONDITION_NOT_CONFIGURED,
 };
 use fleetd::DaemonRunner;
 use fleetd::cred::{
@@ -24,7 +30,7 @@ use fleetd::poller::{JobRunner, Shutdown, channel};
 use fleetd::runner::{AgentRunner, JobEnd, Reporter, RunConfig};
 use fleetd::workspace::Workspace;
 use tokio::net::TcpListener;
-use tokio::sync::mpsc;
+use tokio::sync::{Notify, mpsc};
 use tokio_stream::wrappers::TcpListenerStream;
 use tonic::{Request, Response, Status};
 
@@ -38,6 +44,25 @@ const AGENT: &str = "agent-key-value-0123456789abcdef";
 struct Fake {
     reply: Mutex<Option<Result<GetJobCredentialsReply, Status>>>,
     seen: Mutex<Vec<(String, GetJobCredentialsRequest)>>,
+    hang: AtomicBool,
+    started: Notify,
+    order: Mutex<Vec<&'static str>>,
+}
+
+impl Fake {
+    fn mark(&self, step: &'static str) {
+        self.order
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .push(step);
+    }
+
+    fn steps(&self) -> Vec<&'static str> {
+        self.order
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()
+    }
 }
 
 struct Stub(Arc<Fake>);
@@ -80,6 +105,11 @@ impl FleetWorker for Stub {
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .push((auth, request.into_inner()));
+        self.0.mark("credentials");
+        self.0.started.notify_one();
+        if self.0.hang.load(Ordering::SeqCst) {
+            std::future::pending::<()>().await;
+        }
         self.0
             .reply
             .lock()
@@ -118,9 +148,9 @@ fn box_name() -> String {
     format!("box-{}", 7)
 }
 
-async fn serve(
+async fn spawn_fake(
     reply: Result<GetJobCredentialsReply, Status>,
-) -> Result<(Arc<CredentialBook>, Arc<Fake>), Box<dyn std::error::Error>> {
+) -> Result<(String, Arc<Fake>), Box<dyn std::error::Error>> {
     let fake = Arc::new(Fake::default());
     *fake.reply.lock().unwrap_or_else(PoisonError::into_inner) = Some(reply);
     let listener = TcpListener::bind(("127.0.0.1", 0)).await?;
@@ -130,6 +160,13 @@ async fn serve(
             .add_service(FleetWorkerServer::new(Stub(Arc::clone(&fake))))
             .serve_with_incoming(TcpListenerStream::new(listener)),
     );
+    Ok((url, fake))
+}
+
+async fn serve(
+    reply: Result<GetJobCredentialsReply, Status>,
+) -> Result<(Arc<CredentialBook>, Arc<Fake>), Box<dyn std::error::Error>> {
+    let (url, fake) = spawn_fake(reply).await?;
     let client = CredentialClient::new(channel(&url)?, TOKEN)?;
     Ok((Arc::new(CredentialBook::new(client)), fake))
 }
@@ -166,22 +203,22 @@ async fn each_fixed_server_error_maps_to_its_own_failure_and_holds_nothing() -> 
             ERR_LEASE,
         ),
         (
-            Status::failed_precondition("no github credential"),
+            Status::failed_precondition(PRECONDITION_NO_GITHUB),
             CredentialFailure::NoGithub,
             ERR_NO_GITHUB,
         ),
         (
-            Status::failed_precondition("no agent credential"),
+            Status::failed_precondition(PRECONDITION_NO_AGENT),
             CredentialFailure::NoAgent,
             ERR_NO_AGENT,
         ),
         (
-            Status::failed_precondition("credential expired"),
+            Status::failed_precondition(PRECONDITION_EXPIRED),
             CredentialFailure::Expired,
             ERR_EXPIRED,
         ),
         (
-            Status::failed_precondition("credentials are not configured"),
+            Status::failed_precondition(PRECONDITION_NOT_CONFIGURED),
             CredentialFailure::NotConfigured,
             ERR_NOT_CONFIGURED,
         ),
@@ -464,54 +501,292 @@ async fn the_credentials_drop_when_the_job_panics() -> TestResult {
     Ok(())
 }
 
-struct Recording(mpsc::UnboundedSender<ReportJobRequest>);
+#[tokio::test]
+async fn a_failed_fetch_leaves_nothing_readable_from_an_earlier_one() -> TestResult {
+    let (book, fake) = serve(Ok(good())).await?;
+    book.fetch("job1", 1, &box_name()).await?;
+    assert!(book.get("job1").is_some());
+    *fake.reply.lock().unwrap_or_else(PoisonError::into_inner) =
+        Some(Err(Status::permission_denied("lease does not match")));
+    let got = book.fetch("job1", 2, &box_name()).await;
+    assert_eq!(got.err(), Some(CredentialFailure::LeaseMismatch));
+    assert!(book.get("job1").is_none());
+    Ok(())
+}
 
-impl Reporter for Recording {
+#[tokio::test]
+async fn the_reply_debug_text_carries_no_value() -> TestResult {
+    let reply = good();
+    for text in [format!("{reply:?}"), format!("{reply:#?}")] {
+        assert!(!text.contains(GITHUB), "{text}");
+        assert!(!text.contains(AGENT), "{text}");
+        assert!(text.contains("<redacted>"), "{text}");
+    }
+    Ok(())
+}
+
+#[test]
+fn the_precondition_messages_are_distinct_and_the_client_maps_each_one() {
+    let messages = [
+        (PRECONDITION_NO_GITHUB, CredentialFailure::NoGithub),
+        (PRECONDITION_NO_AGENT, CredentialFailure::NoAgent),
+        (PRECONDITION_EXPIRED, CredentialFailure::Expired),
+        (
+            PRECONDITION_NOT_CONFIGURED,
+            CredentialFailure::NotConfigured,
+        ),
+    ];
+    let distinct: std::collections::HashSet<_> = messages.iter().map(|(m, _)| m).collect();
+    assert_eq!(distinct.len(), messages.len());
+}
+
+enum Renew {
+    Quiet,
+    Cancel,
+    Lost,
+}
+
+struct Scripted {
+    reports: mpsc::UnboundedSender<ReportJobRequest>,
+    renew: Renew,
+    fake: Arc<Fake>,
+}
+
+impl Reporter for Scripted {
     fn report(
         &self,
         request: ReportJobRequest,
     ) -> impl Future<Output = Result<ReportJobReply, Status>> + Send {
-        let _ = self.0.send(request);
-        std::future::ready(Ok(ReportJobReply::default()))
+        let renewal = request.terminal_state.is_none();
+        let _ = self.reports.send(request);
+        let reply = match (&self.renew, renewal) {
+            (Renew::Cancel, true) => Ok(ReportJobReply {
+                cancel_requested: true,
+                ..ReportJobReply::default()
+            }),
+            (Renew::Lost, true) => Err(Status::failed_precondition("stale")),
+            _ => Ok(ReportJobReply::default()),
+        };
+        std::future::ready(reply)
+    }
+
+    fn profile_blob(
+        &self,
+        _: GetProfileBlobRequest,
+    ) -> impl Future<Output = Result<GetProfileBlobReply, Status>> + Send {
+        self.fake.mark("profile");
+        std::future::ready(Err(Status::unavailable("no blob")))
     }
 }
 
-#[tokio::test]
-async fn a_refused_fetch_fails_the_job_with_the_fixed_reason_before_any_clone() -> TestResult {
-    let (book, fake) = serve(Err(Status::failed_precondition("no github credential"))).await?;
+struct Lane {
+    runner: DaemonRunner<Scripted>,
+    book: Arc<CredentialBook>,
+    fake: Arc<Fake>,
+    reports: mpsc::UnboundedReceiver<ReportJobRequest>,
+    jobs: std::path::PathBuf,
+    _dir: tempfile::TempDir,
+}
+
+async fn lane(
+    reply: Result<GetJobCredentialsReply, Status>,
+    renew: Renew,
+    backstop: Option<Duration>,
+) -> Result<Lane, Box<dyn std::error::Error>> {
+    let (url, fake) = spawn_fake(reply).await?;
+    let mut client = CredentialClient::new(channel(&url)?, TOKEN)?;
+    if let Some(backstop) = backstop {
+        client = client.with_backstop(backstop);
+    }
+    let book = Arc::new(CredentialBook::new(client));
     let dir = tempfile::tempdir()?;
     let jobs = dir.path().join("jobs");
-    let (tx, mut reports) = mpsc::unbounded_channel();
+    let (tx, reports) = mpsc::unbounded_channel();
+    let mut config = RunConfig::new("claude-fake", false);
+    config.report_interval = Duration::from_millis(50);
     let agent = AgentRunner::new(
-        RunConfig::new("claude-fake", false),
-        Recording(tx),
+        config,
+        Scripted {
+            reports: tx,
+            renew,
+            fake: Arc::clone(&fake),
+        },
         Redactor::default(),
     )
     .with_job_end(JobEnd::new().on_end(book.end_hook()));
     let runner = DaemonRunner::new(Workspace::new(jobs.clone()), agent, &box_name())
         .with_credentials(Arc::clone(&book));
-    let (_trigger, shutdown) = Shutdown::channel();
-    let result = runner
-        .run(
-            Job {
-                repo: "file:///nonexistent".into(),
-                attempt: 4,
-                ..job()
-            },
-            shutdown,
-        )
-        .await;
-    assert!(result.is_err());
-    let mut last = None;
-    while let Ok(report) = reports.try_recv() {
-        last = Some(report);
+    Ok(Lane {
+        runner,
+        book,
+        fake,
+        reports,
+        jobs,
+        _dir: dir,
+    })
+}
+
+fn repo_job() -> Job {
+    Job {
+        repo: "file:///nonexistent".into(),
+        ..job()
     }
-    let last = last.ok_or("no report")?;
+}
+
+fn drain(reports: &mut mpsc::UnboundedReceiver<ReportJobRequest>) -> Vec<ReportJobRequest> {
+    let mut all = Vec::new();
+    while let Ok(report) = reports.try_recv() {
+        all.push(report);
+    }
+    all
+}
+
+fn terminal(all: &[ReportJobRequest]) -> Option<&ReportJobRequest> {
+    all.iter().rev().find(|r| r.terminal_state.is_some())
+}
+
+async fn bounded<T>(work: impl Future<Output = T>) -> Result<T, Box<dyn std::error::Error>> {
+    Ok(tokio::time::timeout(Duration::from_secs(8), work).await?)
+}
+
+#[tokio::test]
+async fn run_drops_the_credentials_after_a_fetch_that_succeeded() -> TestResult {
+    let mut lane = lane(Ok(good()), Renew::Quiet, None).await?;
+    let (_trigger, shutdown) = Shutdown::channel();
+    let result = bounded(Box::pin(lane.runner.run(repo_job(), shutdown))).await?;
+    assert!(result.is_err());
+    assert_eq!(lane.fake.steps(), ["credentials"]);
+    let all = drain(&mut lane.reports);
+    let last = terminal(&all).ok_or("no terminal report")?;
+    assert_eq!(last.terminal_state, Some(JobState::Failed as i32));
+    assert!(last.error.as_deref().is_some_and(|e| e != ERR_UNAVAILABLE));
+    assert!(lane.book.get("job1").is_none());
+    Ok(())
+}
+
+#[tokio::test]
+async fn run_cancels_the_job_when_cancel_arrives_during_the_fetch() -> TestResult {
+    let mut lane = lane(Ok(good()), Renew::Cancel, None).await?;
+    lane.fake.hang.store(true, Ordering::SeqCst);
+    let (_trigger, shutdown) = Shutdown::channel();
+    let result = bounded(Box::pin(lane.runner.run(repo_job(), shutdown))).await?;
+    assert!(result.is_err());
+    let all = drain(&mut lane.reports);
+    let last = terminal(&all).ok_or("no terminal report")?;
+    assert_eq!(last.terminal_state, Some(JobState::Cancelled as i32));
+    assert!(lane.book.get("job1").is_none());
+    assert!(!lane.jobs.exists() || std::fs::read_dir(&lane.jobs)?.next().is_none());
+    Ok(())
+}
+
+#[tokio::test]
+async fn run_stops_without_a_terminal_report_when_the_lease_is_lost_during_the_fetch() -> TestResult
+{
+    let mut lane = lane(Ok(good()), Renew::Lost, None).await?;
+    lane.fake.hang.store(true, Ordering::SeqCst);
+    let (_trigger, shutdown) = Shutdown::channel();
+    let result = bounded(Box::pin(lane.runner.run(repo_job(), shutdown))).await?;
+    assert!(result.is_err());
+    let all = drain(&mut lane.reports);
+    assert!(terminal(&all).is_none());
+    assert!(lane.book.get("job1").is_none());
+    Ok(())
+}
+
+#[tokio::test]
+async fn run_fails_the_job_when_shutdown_arrives_during_the_fetch() -> TestResult {
+    let mut lane = lane(Ok(good()), Renew::Quiet, None).await?;
+    lane.fake.hang.store(true, Ordering::SeqCst);
+    let (trigger, shutdown) = Shutdown::channel();
+    let fake = Arc::clone(&lane.fake);
+    let stopper = tokio::spawn(async move {
+        fake.started.notified().await;
+        let _ = trigger.send(true);
+    });
+    let result = bounded(Box::pin(lane.runner.run(repo_job(), shutdown))).await?;
+    stopper.abort();
+    assert!(result.is_err());
+    let all = drain(&mut lane.reports);
+    let last = terminal(&all).ok_or("no terminal report")?;
+    assert_eq!(last.terminal_state, Some(JobState::Failed as i32));
+    assert_eq!(
+        last.error.as_deref(),
+        Some("agent stopped by daemon shutdown")
+    );
+    assert!(lane.book.get("job1").is_none());
+    Ok(())
+}
+
+#[tokio::test]
+async fn run_fails_the_job_when_a_fetch_hangs_past_the_backstop() -> TestResult {
+    let mut lane = lane(Ok(good()), Renew::Quiet, Some(Duration::from_millis(100))).await?;
+    lane.fake.hang.store(true, Ordering::SeqCst);
+    let (_trigger, shutdown) = Shutdown::channel();
+    let result = bounded(Box::pin(lane.runner.run(repo_job(), shutdown))).await?;
+    assert!(result.is_err());
+    let all = drain(&mut lane.reports);
+    let last = terminal(&all).ok_or("no terminal report")?;
+    assert_eq!(last.terminal_state, Some(JobState::Failed as i32));
+    assert_eq!(last.error.as_deref(), Some(ERR_UNAVAILABLE));
+    assert!(lane.book.get("job1").is_none());
+    Ok(())
+}
+
+#[tokio::test]
+async fn run_loads_the_profile_before_it_fetches_credentials() -> TestResult {
+    let mut lane = lane(Ok(good()), Renew::Quiet, None).await?;
+    let (_trigger, shutdown) = Shutdown::channel();
+    let job = Job {
+        profile: Some(ProfileRef::default()),
+        ..repo_job()
+    };
+    let result = bounded(Box::pin(lane.runner.run(job, shutdown))).await?;
+    assert!(result.is_err());
+    assert_eq!(lane.fake.steps(), ["profile"]);
+    drain(&mut lane.reports);
+    assert!(lane.book.get("job1").is_none());
+    Ok(())
+}
+
+#[tokio::test]
+async fn run_fetches_credentials_before_it_prepares_the_workspace() -> TestResult {
+    let lane = lane(Ok(good()), Renew::Quiet, None).await?;
+    let (_trigger, shutdown) = Shutdown::channel();
+    let result = bounded(Box::pin(lane.runner.run(repo_job(), shutdown))).await?;
+    assert!(result.is_err());
+    assert_eq!(lane.fake.steps(), ["credentials"]);
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_refused_fetch_fails_the_job_with_the_fixed_reason_before_any_clone() -> TestResult {
+    let mut lane = lane(
+        Err(Status::failed_precondition(PRECONDITION_NO_GITHUB)),
+        Renew::Quiet,
+        None,
+    )
+    .await?;
+    let (_trigger, shutdown) = Shutdown::channel();
+    let result = bounded(Box::pin(lane.runner.run(
+        Job {
+            attempt: 4,
+            ..repo_job()
+        },
+        shutdown,
+    )))
+    .await?;
+    assert!(result.is_err());
+    let all = drain(&mut lane.reports);
+    let last = terminal(&all).ok_or("no terminal report")?;
     assert_eq!(last.terminal_state, Some(JobState::Failed as i32));
     assert_eq!(last.error.as_deref(), Some(ERR_NO_GITHUB));
-    assert!(!jobs.exists() || std::fs::read_dir(&jobs)?.next().is_none());
-    assert!(book.get("job1").is_none());
-    let seen = fake.seen.lock().unwrap_or_else(PoisonError::into_inner);
+    assert!(!lane.jobs.exists() || std::fs::read_dir(&lane.jobs)?.next().is_none());
+    assert!(lane.book.get("job1").is_none());
+    let seen = lane
+        .fake
+        .seen
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner);
     assert_eq!(seen.len(), 1);
     assert_eq!(seen[0].1.r#box, box_name());
     assert_eq!(seen[0].1.attempt, 4);

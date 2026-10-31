@@ -13,6 +13,7 @@
 use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::sync::{Arc, Mutex, PoisonError};
+use std::time::Duration;
 
 use fleet_core::Redactor;
 use fleet_core::credential::{
@@ -20,11 +21,16 @@ use fleet_core::credential::{
 };
 use fleet_proto::v1::fleet_worker_client::FleetWorkerClient;
 use fleet_proto::v1::{GetJobCredentialsReply, GetJobCredentialsRequest};
-use fleet_proto::{MAX_CREDENTIAL_VALUE_BYTES, MAX_CREDENTIALS_PER_USER};
+use fleet_proto::{
+    MAX_CREDENTIAL_VALUE_BYTES, MAX_CREDENTIALS_PER_USER, PRECONDITION_EXPIRED,
+    PRECONDITION_NO_AGENT, PRECONDITION_NO_GITHUB, PRECONDITION_NOT_CONFIGURED,
+};
 use tonic::metadata::MetadataValue;
+use tonic::service::Interceptor;
 use tonic::service::interceptor::InterceptedService;
 use tonic::transport::Channel;
 use tonic::{Code, Request, Status};
+use zeroize::Zeroizing;
 
 use crate::Error;
 use crate::poller::{CALL_BACKSTOP, TOKEN_ENV};
@@ -95,10 +101,10 @@ impl CredentialFailure {
     fn from_status(status: &Status) -> Self {
         match (status.code(), status.message()) {
             (Code::PermissionDenied, _) => Self::LeaseMismatch,
-            (Code::FailedPrecondition, ERR_NO_GITHUB) => Self::NoGithub,
-            (Code::FailedPrecondition, ERR_NO_AGENT) => Self::NoAgent,
-            (Code::FailedPrecondition, ERR_EXPIRED) => Self::Expired,
-            (Code::FailedPrecondition, ERR_NOT_CONFIGURED) => Self::NotConfigured,
+            (Code::FailedPrecondition, PRECONDITION_NO_GITHUB) => Self::NoGithub,
+            (Code::FailedPrecondition, PRECONDITION_NO_AGENT) => Self::NoAgent,
+            (Code::FailedPrecondition, PRECONDITION_EXPIRED) => Self::Expired,
+            (Code::FailedPrecondition, PRECONDITION_NOT_CONFIGURED) => Self::NotConfigured,
             _ => Self::Unavailable,
         }
     }
@@ -141,20 +147,24 @@ pub struct JobCredentials {
 
 impl JobCredentials {
     fn from_reply(reply: GetJobCredentialsReply) -> Result<Self, CredentialFailure> {
+        let mut wires: Vec<(String, String, Zeroizing<String>)> = reply
+            .credentials
+            .into_iter()
+            .map(|wire| (wire.kind, wire.shape, Zeroizing::new(wire.value)))
+            .collect();
         let mut seen = HashSet::new();
-        let mut items = Vec::with_capacity(reply.credentials.len());
-        for wire in reply.credentials {
-            let kind =
-                CredentialKind::from_wire_name(&wire.kind).ok_or(CredentialFailure::Malformed)?;
-            if wire.shape != CredentialShape::StaticSecret.wire_name()
-                || !(MIN_CREDENTIAL_LEN..=MAX_CREDENTIAL_LEN).contains(&wire.value.len())
+        let mut items = Vec::with_capacity(wires.len());
+        for (kind, shape, value) in &mut wires {
+            let kind = CredentialKind::from_wire_name(kind).ok_or(CredentialFailure::Malformed)?;
+            if shape != CredentialShape::StaticSecret.wire_name()
+                || !(MIN_CREDENTIAL_LEN..=MAX_CREDENTIAL_LEN).contains(&value.len())
                 || !seen.insert(kind.wire_name())
             {
                 return Err(CredentialFailure::Malformed);
             }
             items.push(Credential {
                 kind,
-                value: Secret::new(wire.value),
+                value: Secret::new(std::mem::take(&mut **value)),
             });
         }
         if !items.iter().any(|c| c.kind == CredentialKind::GithubPat) {
@@ -190,6 +200,9 @@ impl JobCredentials {
     ///
     /// The values that are valid UTF-8 are registered. Values the server accepted are plain
     /// text, so none is skipped in practice.
+    ///
+    /// The [`Redactor`] keeps its own plain `String` copies, which are not zeroed when it
+    /// drops. The copies live as long as the redactor, so drop it when the job ends.
     #[must_use]
     pub fn redactor(&self) -> Redactor {
         Redactor::new(self.items.iter().filter_map(|c| {
@@ -210,24 +223,37 @@ impl<'a> IntoIterator for &'a JobCredentials {
 }
 
 fn bearer_header(token: &str) -> Result<MetadataValue<tonic::metadata::Ascii>, Error> {
-    let mut header: MetadataValue<_> =
-        format!("Bearer {token}")
-            .parse()
-            .map_err(|_| Error::InvalidValue {
-                name: TOKEN_ENV,
-                value: String::from("<redacted>"),
-            })?;
+    let text = Zeroizing::new(format!("Bearer {token}"));
+    let mut header: MetadataValue<_> = text.as_str().parse().map_err(|_| Error::InvalidValue {
+        name: TOKEN_ENV,
+        value: String::from("<redacted>"),
+    })?;
     header.set_sensitive(true);
     Ok(header)
 }
 
-type Attach = Box<dyn FnMut(Request<()>) -> Result<Request<()>, Status> + Send>;
+#[derive(Clone)]
+struct Attach(MetadataValue<tonic::metadata::Ascii>);
+
+impl Interceptor for Attach {
+    fn call(&mut self, mut request: Request<()>) -> Result<Request<()>, Status> {
+        request
+            .metadata_mut()
+            .insert("authorization", self.0.clone());
+        Ok(request)
+    }
+}
 
 type Client = FleetWorkerClient<InterceptedService<Channel, Attach>>;
 
 /// The `GetJobCredentials` caller, with the bearer token attached.
+///
+/// Each call builds its own client over a clone of the channel, so concurrent calls never
+/// queue behind one another and the backstop covers the whole call.
 pub struct CredentialClient {
-    client: tokio::sync::Mutex<Client>,
+    channel: Channel,
+    attach: Attach,
+    backstop: Duration,
 }
 
 impl fmt::Debug for CredentialClient {
@@ -243,18 +269,23 @@ impl CredentialClient {
     ///
     /// Fails when the token is not a valid header value. The error never contains it.
     pub fn new(channel: Channel, token: &str) -> Result<Self, Error> {
-        let header = bearer_header(token)?;
-        let attach: Attach = Box::new(move |mut request| {
-            request
-                .metadata_mut()
-                .insert("authorization", header.clone());
-            Ok(request)
-        });
-        let client = FleetWorkerClient::with_interceptor(channel, attach)
-            .max_decoding_message_size(MAX_REPLY_BYTES);
         Ok(Self {
-            client: tokio::sync::Mutex::new(client),
+            channel,
+            attach: Attach(bearer_header(token)?),
+            backstop: CALL_BACKSTOP,
         })
+    }
+
+    /// Replaces the longest time one call may take, [`CALL_BACKSTOP`] by default.
+    #[must_use]
+    pub const fn with_backstop(mut self, backstop: Duration) -> Self {
+        self.backstop = backstop;
+        self
+    }
+
+    fn client(&self) -> Client {
+        FleetWorkerClient::with_interceptor(self.channel.clone(), self.attach.clone())
+            .max_decoding_message_size(MAX_REPLY_BYTES)
     }
 
     async fn fetch(
@@ -268,9 +299,8 @@ impl CredentialClient {
             attempt,
             r#box: box_name.to_owned(),
         };
-        let mut client = self.client.lock().await;
-        let call = tokio::time::timeout(CALL_BACKSTOP, client.get_job_credentials(request)).await;
-        drop(client);
+        let mut client = self.client();
+        let call = tokio::time::timeout(self.backstop, client.get_job_credentials(request)).await;
         let reply = call
             .map_err(|_| CredentialFailure::Unavailable)?
             .map_err(|status| CredentialFailure::from_status(&status))?
@@ -298,19 +328,21 @@ impl CredentialBook {
 
     /// Fetches the credentials of a claimed job and holds them under its id.
     ///
-    /// Call it once the lease is held and before the agent starts. A second fetch for the
-    /// same id replaces the first.
+    /// Call it once the lease is held and before the agent starts. A fetch first drops any
+    /// entry held for the same id, so a second fetch replaces the first and a failed one
+    /// leaves nothing readable.
     ///
     /// # Errors
     ///
     /// Returns the failure whose [`CredentialFailure::reason`] the job reports. Nothing is
-    /// held after an error.
+    /// held for `job_id` after an error.
     pub async fn fetch(
         &self,
         job_id: &str,
         attempt: u32,
         box_name: &str,
     ) -> Result<Arc<JobCredentials>, CredentialFailure> {
+        self.forget(job_id);
         let credentials = Arc::new(self.client.fetch(job_id, attempt, box_name).await?);
         self.held
             .lock()
