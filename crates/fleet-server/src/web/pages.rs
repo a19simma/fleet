@@ -3,6 +3,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
+use crate::cred::CredentialService;
 use fleet_core::constant_time_eq;
 use serde_json::{Value, json};
 use topcoat::{
@@ -21,6 +22,7 @@ use topcoat::{
 };
 use webauthn_rs::prelude::{PublicKeyCredential, RegisterPublicKeyCredential};
 
+use super::credentials::{Backend, CredentialSlot};
 use super::passkeys::{AuthError, SESSION_COOKIE, SESSION_TTL_SECS, SessionInfo, WebAuth};
 
 /// Stylesheet compiled into the binary, since Topcoat's `asset!` writes beside the binary.
@@ -46,14 +48,14 @@ const SESSION_ID_LEN: usize = 64;
 
 struct AuthSlot(Option<Arc<WebAuth>>);
 
-fn auth(cx: &Cx) -> Result<&WebAuth> {
+pub(super) fn auth(cx: &Cx) -> Result<&WebAuth> {
     app_context::<AuthSlot>(cx)
         .0
         .as_deref()
         .ok_or_else(|| not_found().into())
 }
 
-fn fail(err: AuthError) -> topcoat::Error {
+pub(super) fn fail(err: AuthError) -> topcoat::Error {
     match err {
         AuthError::Refused => bad_request("request refused").into(),
         AuthError::Internal => internal_server_error(err).into(),
@@ -88,18 +90,18 @@ fn session_cookie(map: &HeaderMap) -> Option<&str> {
         .filter(|id| id.len() == SESSION_ID_LEN && id.bytes().all(|b| b.is_ascii_hexdigit()))
 }
 
-async fn current(cx: &Cx, auth: &WebAuth) -> Result<Option<SessionInfo>> {
+pub(super) async fn current(cx: &Cx, auth: &WebAuth) -> Result<Option<SessionInfo>> {
     match session_cookie(headers(cx)) {
         Some(id) => auth.session(id.as_bytes()).await.map_err(fail),
         None => Ok(None),
     }
 }
 
-async fn signed_in(cx: &Cx, auth: &WebAuth) -> Result<SessionInfo> {
+pub(super) async fn signed_in(cx: &Cx, auth: &WebAuth) -> Result<SessionInfo> {
     current(cx, auth).await?.ok_or_else(|| forbidden().into())
 }
 
-fn csrf_matches(expected: &SessionInfo, presented: Option<&str>) -> bool {
+pub(super) fn csrf_matches(expected: &SessionInfo, presented: Option<&str>) -> bool {
     presented.is_some_and(|token| constant_time_eq(expected.csrf.expose(), token.as_bytes()))
 }
 
@@ -124,6 +126,7 @@ async fn home() -> Result<impl View> {
             <body>
                 <h1>(HOME_MARKER)</h1>
                 <p><a href="/account">"Account"</a></p>
+                <p><a href="/credentials">"Credentials"</a></p>
             </body>
         </html>
     })
@@ -327,12 +330,17 @@ pub struct Web {
     router: Arc<Router>,
 }
 
-fn builder(auth: Option<Arc<WebAuth>>, origins: &[String]) -> Router {
+fn builder(
+    auth: Option<Arc<WebAuth>>,
+    credentials: Option<Arc<Backend>>,
+    origins: &[String],
+) -> Router {
     Router::builder()
         .discover()
         .origin_policy(OriginPolicy::new().trust_origins(origins.iter().cloned()))
         .layer(BodyLimit::max(MAX_BODY_BYTES))
         .app_context(AuthSlot(auth))
+        .app_context(CredentialSlot(credentials))
         .build()
 }
 
@@ -341,7 +349,7 @@ impl Web {
     #[must_use]
     pub fn new() -> Self {
         Self {
-            router: Arc::new(builder(None, &[])),
+            router: Arc::new(builder(None, None, &[])),
         }
     }
 
@@ -350,7 +358,24 @@ impl Web {
     pub fn with_auth(auth: WebAuth) -> Self {
         let origins = [auth.origin().to_owned()];
         Self {
-            router: Arc::new(builder(Some(Arc::new(auth)), &origins)),
+            router: Arc::new(builder(Some(Arc::new(auth)), None, &origins)),
+        }
+    }
+
+    /// Builds the router with passkey login and the credentials page over `service`.
+    #[must_use]
+    pub fn with_credentials(auth: WebAuth, service: CredentialService) -> Self {
+        let origins = [auth.origin().to_owned()];
+        let backend = Backend {
+            service,
+            pool: auth.pool().clone(),
+        };
+        Self {
+            router: Arc::new(builder(
+                Some(Arc::new(auth)),
+                Some(Arc::new(backend)),
+                &origins,
+            )),
         }
     }
 
