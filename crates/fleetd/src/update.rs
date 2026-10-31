@@ -10,15 +10,17 @@ use std::collections::BTreeMap;
 use std::fmt;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Write};
-use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 
+use crate::fetch_policy::HostPattern;
 use fleet_core::tools::Version;
 use fleet_proto::{MAX_MANIFEST_BYTES, MAX_SIGNATURE_BYTES};
 use minisign_verify::{PublicKey, Signature};
 use rustix::fs::OFlags;
 use serde::de::{MapAccess, Visitor};
 use serde::{Deserialize, Deserializer};
+use sha2::{Digest, Sha256};
 
 /// Default path of the trust-root public key (ADR-0047).
 pub const DEFAULT_TRUST_ROOT: &str = "/etc/fleetd/update.pub";
@@ -570,6 +572,294 @@ impl SeqStore {
         File::open(&self.dir)
             .and_then(|dir| dir.sync_all())
             .map_err(seq_err)
+    }
+}
+
+/// Longest staged version directory name, in bytes.
+const MAX_STAGE_VERSION_BYTES: usize = 64;
+
+/// File name of a staged archive inside its version directory.
+pub const STAGED_FILE: &str = "fleetd.tar.gz";
+
+const STAGE_TEMP_FILE: &str = ".fleetd.tar.gz.tmp";
+const STAGE_CHUNK_BYTES: usize = 64 * 1024;
+const HTTPS_PORT: &str = "443";
+
+/// Why a download or a stage was refused.
+#[derive(Debug)]
+#[non_exhaustive]
+pub enum StageError {
+    /// The version is not a safe directory name.
+    Version,
+    /// The target carries no asset URL.
+    NoUrl,
+    /// The URL is not a plain `https` URL with a valid host.
+    Url(&'static str),
+    /// The URL host, or the host a redirect ended on, is not on the allow-list.
+    HostNotAllowed,
+    /// The declared size is above [`MAX_ARCHIVE_BYTES`], or the body is longer than declared.
+    TooLarge,
+    /// The body is shorter than the declared size.
+    SizeMismatch {
+        /// Bytes received.
+        received: u64,
+        /// Bytes declared.
+        declared: u64,
+    },
+    /// The body hash differs from the manifest hash.
+    HashMismatch,
+    /// A staging directory is a symlink, not a directory, or has loose mode or owner.
+    UnsafeDir(PathBuf),
+    /// The version is already staged.
+    AlreadyStaged,
+    /// The fetcher failed.
+    Fetch(io::Error),
+    /// Writing the staged file failed.
+    Io(io::Error),
+}
+
+impl fmt::Display for StageError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Version => f.write_str("version is not a safe directory name"),
+            Self::NoUrl => f.write_str("target has no asset url"),
+            Self::Url(why) => write!(f, "asset url refused: {why}"),
+            Self::HostNotAllowed => f.write_str("asset host is not on the allow-list"),
+            Self::TooLarge => f.write_str("archive exceeds the size cap"),
+            Self::SizeMismatch { received, declared } => {
+                write!(f, "received {received} bytes, manifest declares {declared}")
+            }
+            Self::HashMismatch => f.write_str("archive sha256 differs from the manifest"),
+            Self::UnsafeDir(path) => write!(f, "unsafe staging directory {}", path.display()),
+            Self::AlreadyStaged => f.write_str("version is already staged"),
+            Self::Fetch(err) => write!(f, "fetch failed: {err}"),
+            Self::Io(err) => write!(f, "staging failed: {err}"),
+        }
+    }
+}
+
+impl std::error::Error for StageError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Fetch(err) | Self::Io(err) => Some(err),
+            _ => None,
+        }
+    }
+}
+
+/// An open archive download.
+pub struct ArchiveResponse {
+    /// The URL the body came from after any redirects. The stager checks it against the
+    /// allow-list again.
+    pub final_url: String,
+    /// The response body.
+    pub body: Box<dyn Read + Send>,
+}
+
+/// The HTTP client behind [`Stager`]. The production implementation runs through the egress
+/// policy; tests inject a fake.
+pub trait ArchiveFetcher {
+    /// Opens `url` and returns the final URL and the body.
+    ///
+    /// # Errors
+    ///
+    /// Returns the transport error.
+    fn get(&self, url: &str) -> io::Result<ArchiveResponse>;
+}
+
+/// Checks that `ver` is safe as one directory name: the semver charset, no separators, no
+/// dots-only name, no control bytes.
+///
+/// # Errors
+///
+/// Returns [`StageError::Version`].
+pub fn validate_stage_version(ver: &str) -> Result<(), StageError> {
+    Version::new(ver).map_err(|_| StageError::Version)?;
+    let ok = !ver.is_empty()
+        && ver.len() <= MAX_STAGE_VERSION_BYTES
+        && ver.bytes().any(|b| b.is_ascii_digit())
+        && ver
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'.' || b == b'-');
+    if ok { Ok(()) } else { Err(StageError::Version) }
+}
+
+fn url_host(url: &str) -> Result<String, StageError> {
+    if url.len() > MAX_URL_BYTES {
+        return Err(StageError::Url("too long"));
+    }
+    let rest = url
+        .strip_prefix("https://")
+        .ok_or(StageError::Url("scheme is not https"))?;
+    if !rest
+        .bytes()
+        .all(|b| b.is_ascii_graphic() && b != b'\\' && b != b'@')
+    {
+        return Err(StageError::Url("forbidden byte"));
+    }
+    let end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
+    let authority = rest.get(..end).unwrap_or_default();
+    let host = match authority.split_once(':') {
+        Some((host, port)) if port == HTTPS_PORT => host,
+        Some(_) => return Err(StageError::Url("port")),
+        None => authority,
+    };
+    match HostPattern::parse(host) {
+        Ok(HostPattern::Exact(name)) => Ok(name),
+        _ => Err(StageError::Url("host")),
+    }
+}
+
+fn ct_eq(a: &[u8], b: &[u8]) -> bool {
+    a.len() == b.len() && a.iter().zip(b).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
+}
+
+fn hex_lower(bytes: &[u8]) -> String {
+    use fmt::Write as _;
+    bytes.iter().fold(String::new(), |mut out, b| {
+        let _ = write!(out, "{b:02x}");
+        out
+    })
+}
+
+/// Downloads a verified target and stages it under `<bin_root>/<version>/`.
+///
+/// Unverified bytes sit in a 0600 temp file. Only a matching sha256 turns the file 0700 and
+/// renames it into place. Nothing is swapped or restarted here.
+pub struct Stager<'a, F> {
+    bin_root: PathBuf,
+    allow: Vec<HostPattern>,
+    fetcher: &'a F,
+}
+
+impl<'a, F: ArchiveFetcher> Stager<'a, F> {
+    /// A stager writing under `bin_root` (`/var/lib/fleet/bin` in production) that fetches
+    /// only from hosts matching `allow`.
+    pub fn new(bin_root: impl Into<PathBuf>, allow: Vec<HostPattern>, fetcher: &'a F) -> Self {
+        Self {
+            bin_root: bin_root.into(),
+            allow,
+            fetcher,
+        }
+    }
+
+    fn check_url(&self, url: &str) -> Result<(), StageError> {
+        let host = url_host(url)?;
+        if self.allow.iter().any(|pattern| pattern.matches(&host)) {
+            Ok(())
+        } else {
+            Err(StageError::HostNotAllowed)
+        }
+    }
+
+    fn require_dir(path: &Path, mode: Option<u32>) -> Result<(), StageError> {
+        let meta = fs::symlink_metadata(path).map_err(StageError::Io)?;
+        let uid = rustix::process::geteuid().as_raw();
+        let loose = mode.is_some_and(|want| meta.mode() & 0o7777 != want);
+        if !meta.file_type().is_dir() || meta.uid() != uid || loose {
+            return Err(StageError::UnsafeDir(path.to_path_buf()));
+        }
+        Ok(())
+    }
+
+    fn version_dir(&self, version: &Version) -> Result<PathBuf, StageError> {
+        Self::require_dir(&self.bin_root, None)?;
+        let dir = self.bin_root.join(version.as_str());
+        match fs::symlink_metadata(&dir) {
+            Ok(_) => Self::require_dir(&dir, Some(0o700))?,
+            Err(err) if err.kind() == io::ErrorKind::NotFound => {
+                fs::DirBuilder::new()
+                    .mode(0o700)
+                    .create(&dir)
+                    .map_err(StageError::Io)?;
+                Self::require_dir(&dir, Some(0o700))?;
+            }
+            Err(err) => return Err(StageError::Io(err)),
+        }
+        Ok(dir)
+    }
+
+    /// Fetches, checks and stages `target` as `version`, returning the staged path.
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`StageError`]. On any error after the temp file exists, the temp file is
+    /// removed.
+    pub fn stage(&self, version: &Version, target: &Target) -> Result<PathBuf, StageError> {
+        validate_stage_version(version.as_str())?;
+        if target.size > MAX_ARCHIVE_BYTES {
+            return Err(StageError::TooLarge);
+        }
+        let url = target.url.as_deref().ok_or(StageError::NoUrl)?;
+        self.check_url(url)?;
+        let dir = self.version_dir(version)?;
+        let final_path = dir.join(STAGED_FILE);
+        if fs::symlink_metadata(&final_path).is_ok() {
+            return Err(StageError::AlreadyStaged);
+        }
+        let response = self.fetcher.get(url).map_err(StageError::Fetch)?;
+        self.check_url(&response.final_url)?;
+        let temp = dir.join(STAGE_TEMP_FILE);
+        match fs::symlink_metadata(&temp) {
+            Ok(_) => fs::remove_file(&temp).map_err(StageError::Io)?,
+            Err(err) if err.kind() == io::ErrorKind::NotFound => {}
+            Err(err) => return Err(StageError::Io(err)),
+        }
+        let outcome = Self::receive(&temp, response.body, target)
+            .and_then(|()| Self::publish(&temp, &final_path, &dir));
+        if outcome.is_err() {
+            let _ = fs::remove_file(&temp);
+        }
+        outcome.map(|()| final_path)
+    }
+
+    fn receive(temp: &Path, body: Box<dyn Read + Send>, target: &Target) -> Result<(), StageError> {
+        let mut file = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .custom_flags(OFlags::NOFOLLOW.bits().cast_signed())
+            .open(temp)
+            .map_err(StageError::Io)?;
+        let mut limited = body.take(target.size.saturating_add(1));
+        let mut hasher = Sha256::new();
+        let mut buf = vec![0u8; STAGE_CHUNK_BYTES];
+        let mut received: u64 = 0;
+        loop {
+            let n = limited.read(&mut buf).map_err(StageError::Fetch)?;
+            if n == 0 {
+                break;
+            }
+            let chunk = buf.get(..n).unwrap_or_default();
+            received = received.saturating_add(n as u64);
+            if received > target.size {
+                return Err(StageError::TooLarge);
+            }
+            hasher.update(chunk);
+            file.write_all(chunk).map_err(StageError::Io)?;
+        }
+        if received != target.size {
+            return Err(StageError::SizeMismatch {
+                received,
+                declared: target.size,
+            });
+        }
+        let digest = hex_lower(&hasher.finalize());
+        if !ct_eq(digest.as_bytes(), target.sha256.as_bytes()) {
+            return Err(StageError::HashMismatch);
+        }
+        file.sync_all().map_err(StageError::Io)
+    }
+
+    fn publish(temp: &Path, final_path: &Path, dir: &Path) -> Result<(), StageError> {
+        fs::set_permissions(temp, fs::Permissions::from_mode(0o700)).map_err(StageError::Io)?;
+        if fs::symlink_metadata(final_path).is_ok() {
+            return Err(StageError::AlreadyStaged);
+        }
+        fs::rename(temp, final_path).map_err(StageError::Io)?;
+        File::open(dir)
+            .and_then(|handle| handle.sync_all())
+            .map_err(StageError::Io)
     }
 }
 
