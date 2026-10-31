@@ -218,6 +218,7 @@ Install `managed-settings.json` as in the legacy steps, with two checks:
 - The canary must check that the managed hooks fired under the job uid: run one job and confirm the hook events arrived for it. Whether they fire under the new uid is unverified until then.
 
 The hand-installed `/etc/claude-code/managed-settings.json` is a copy and does not follow the repo. Copy it again after every upgrade. A stale copy from before the command hooks held four dead `http` hooks. After the copy, `grep -c '"type": "http"' /etc/claude-code/managed-settings.json` must print 0.
+At startup fleetd parses that file and logs a warning with the count when it finds `http` hooks, and a separate line when the file is missing, unreadable or invalid JSON. None of these blocks startup.
 
 ### Secrets
 

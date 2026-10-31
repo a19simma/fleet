@@ -36,6 +36,7 @@ pub mod http1;
 pub mod jobenv;
 mod jobs;
 pub mod jobsock;
+pub mod managed_settings;
 pub mod netguard;
 pub mod phase;
 pub mod poller;

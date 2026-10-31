@@ -22,6 +22,7 @@ use crate::heartbeat::Heartbeat;
 use crate::http1::{Failure, roundtrip};
 use crate::jobenv::group_id;
 use crate::jobs::{self, JobPoller};
+use crate::managed_settings;
 use crate::store::Store;
 use crate::system::read_identity;
 use crate::systemd;
@@ -383,6 +384,7 @@ pub async fn run_with_env(
         jobs,
         hub,
         Path::new(systemd::DEFAULT_RUN_DIR),
+        Path::new(managed_settings::DEFAULT_PATH),
         shutdown,
     )
     .await
@@ -429,6 +431,7 @@ async fn run_with_store(
         jobs,
         HookHub::new(),
         Path::new(systemd::DEFAULT_RUN_DIR),
+        Path::new(managed_settings::DEFAULT_PATH),
         shutdown,
     )
     .await
@@ -447,6 +450,7 @@ async fn run_with_hub(
     jobs: Option<JobPoller>,
     hub: Arc<HookHub>,
     run_root: &Path,
+    managed_settings: &Path,
     shutdown: impl Future<Output = ()>,
 ) -> Result<(), Error> {
     let (tcp, tcp_addr, socket, hook_socket) = match bind_all(&config).await {
@@ -459,6 +463,7 @@ async fn run_with_hub(
         }
     };
     systemd::sweep_stale_runs(&config, run_root).await;
+    managed_settings::audit(managed_settings);
     let heartbeat_identity = identity.clone();
     let state = AppState::with_hub(
         store.clone(),
@@ -904,12 +909,71 @@ mod tests {
             None,
             HookHub::new(),
             &run_root,
+            Path::new(managed_settings::DEFAULT_PATH),
             std::future::pending(),
         )
         .await;
         assert!(matches!(result, Err(Error::Runtime(_))), "{result:?}");
         assert!(stale.exists());
         assert!(!ctl.join("calls.log").exists());
+        Ok(())
+    }
+
+    #[derive(Clone, Default)]
+    struct LogSink(Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl std::io::Write for LogSink {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0
+                .lock()
+                .map_err(|_| std::io::Error::other("poisoned"))?
+                .extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for LogSink {
+        type Writer = Self;
+        fn make_writer(&'a self) -> Self {
+            self.clone()
+        }
+    }
+
+    #[tokio::test]
+    async fn startup_warns_when_the_managed_settings_hold_http_hooks()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let dir = TempDir::new()?;
+        let settings = dir.path().join("managed-settings.json");
+        std::fs::write(
+            &settings,
+            r#"{"hooks":{"Stop":[{"hooks":[{"type":"http","url":"http://127.0.0.1:7071/x"}]}]}}"#,
+        )?;
+        let sink = LogSink::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(sink.clone())
+            .with_ansi(false)
+            .finish();
+        let _guard = tracing::subscriber::set_default(subscriber);
+        let store = open_store(&dir).await?;
+        let result = run_with_hub(
+            test_config(&dir, 0)?,
+            store,
+            test_identity(),
+            Redactor::default(),
+            None,
+            None,
+            HookHub::new(),
+            &dir.path().join("run"),
+            &settings,
+            tokio::time::sleep(Duration::from_millis(200)),
+        )
+        .await;
+        assert!(result.is_ok(), "{result:?}");
+        let out = String::from_utf8(sink.0.lock().unwrap().clone())?;
+        assert!(out.contains("WARN") && out.contains("http hooks"), "{out}");
         Ok(())
     }
 
