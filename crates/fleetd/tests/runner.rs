@@ -86,6 +86,25 @@ orphan) perl -e 'use POSIX; POSIX::setsid(); open(F, ">", $ARGV[0]); print F $$;
 esac
 "#;
 
+const CODEX_SCRIPT: &str = r#"#!/bin/sh
+for last; do :; done
+cat "${last#*:}"
+exit 3
+"#;
+
+fn codex_script() -> &'static Path {
+    static DIR: OnceLock<(TempDir, PathBuf)> = OnceLock::new();
+    let (_, path) = DIR.get_or_init(|| {
+        let dir = TempDir::new().unwrap_or_else(|_| std::process::abort());
+        let path = dir.path().join("codex");
+        std::fs::write(&path, CODEX_SCRIPT).unwrap_or_else(|_| std::process::abort());
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755))
+            .unwrap_or_else(|_| std::process::abort());
+        (dir, path)
+    });
+    path
+}
+
 struct Hung {
     called: mpsc::UnboundedSender<()>,
 }
@@ -1496,6 +1515,42 @@ async fn telemetry_events_and_summary_reach_a_failed_run_redacted() -> TestResul
                 .filter(|r| r.terminal_state.is_none())
                 .all(|r| r.summary.is_none())
         );
+        Ok(())
+    }))
+    .await
+}
+
+#[tokio::test]
+async fn a_codex_job_ends_with_an_incomplete_summary_and_no_figures() -> TestResult {
+    common::bounded(Box::pin(async {
+        let dir = TempDir::new()?;
+        let file = fixture(dir.path(), "run.jsonl", &secret_run())?;
+        let mut cfg = config(false);
+        cfg.codex_bin = codex_script().to_path_buf();
+        let (agent, mut rx) = runner(cfg, 0);
+        let (_trigger, shutdown) = Shutdown::channel();
+        let codex = Job {
+            agent: "codex".into(),
+            prompt: format!("cat:{}", file.display()),
+            ..job("")
+        };
+        let outcome = agent.run(&codex, dir.path(), shutdown).await?;
+        assert!(
+            matches!(outcome, AgentOutcome::Failed { .. }),
+            "{outcome:?}"
+        );
+        let requests = drain(&mut rx);
+        let summary = terminal(&requests)?.summary.clone().ok_or("no summary")?;
+        assert!(!summary.complete);
+        assert_eq!(summary.missing, ["parser"]);
+        assert_eq!(summary.turns, None);
+        assert_eq!(summary.duration_ms, None);
+        assert_eq!(summary.tokens_in, None);
+        assert_eq!(summary.tokens_out, None);
+        assert_eq!(summary.tool_calls, None);
+        assert_eq!(summary.bash_calls, None);
+        assert_eq!(summary.denials, None);
+        assert_eq!(summary.cost_est_usd, None);
         Ok(())
     }))
     .await

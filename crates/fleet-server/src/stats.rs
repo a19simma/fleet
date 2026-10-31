@@ -37,10 +37,24 @@ WITH scoped AS ( \
             WHEN 'model' THEN s.model \
             ELSE '' \
         END AS grp, \
-        j.state, j.error, s.job_id AS summarized, s.complete, s.turns, s.duration_ms, \
-        s.cost_est_usd, s.tokens_in, s.tokens_out, s.tokens_cache_read, \
-        s.tokens_cache_write, s.tool_calls, s.tool_errors, s.bash_calls, s.bash_nonzero, \
-        s.denials, s.api_retries, s.first_edit_ms, s.clone_ms, s.push_ms, s.pr_ms, \
+        j.state, j.error, s.job_id AS summarized, s.complete, \
+        CASE WHEN j.agent = 'claude' OR s.complete THEN s.turns END AS turns, \
+        CASE WHEN j.agent = 'claude' OR s.complete THEN s.duration_ms END AS duration_ms, \
+        CASE WHEN j.agent = 'claude' OR s.complete THEN s.cost_est_usd END AS cost_est_usd, \
+        CASE WHEN j.agent = 'claude' OR s.complete THEN s.tokens_in END AS tokens_in, \
+        CASE WHEN j.agent = 'claude' OR s.complete THEN s.tokens_out END AS tokens_out, \
+        CASE WHEN j.agent = 'claude' OR s.complete THEN s.tokens_cache_read END \
+            AS tokens_cache_read, \
+        CASE WHEN j.agent = 'claude' OR s.complete THEN s.tokens_cache_write END \
+            AS tokens_cache_write, \
+        CASE WHEN j.agent = 'claude' OR s.complete THEN s.tool_calls END AS tool_calls, \
+        CASE WHEN j.agent = 'claude' OR s.complete THEN s.tool_errors END AS tool_errors, \
+        CASE WHEN j.agent = 'claude' OR s.complete THEN s.bash_calls END AS bash_calls, \
+        CASE WHEN j.agent = 'claude' OR s.complete THEN s.bash_nonzero END AS bash_nonzero, \
+        CASE WHEN j.agent = 'claude' OR s.complete THEN s.denials END AS denials, \
+        CASE WHEN j.agent = 'claude' OR s.complete THEN s.api_retries END AS api_retries, \
+        CASE WHEN j.agent = 'claude' OR s.complete THEN s.first_edit_ms END AS first_edit_ms, \
+        s.clone_ms, s.push_ms, s.pr_ms, \
         s.queue_wait_ms, s.stuck_rule, v.score AS verdict_score \
     FROM jobs j LEFT JOIN job_summary s ON s.job_id = j.job_id \
     LEFT JOIN LATERAL (SELECT avg(score)::double precision AS score FROM job_verdict \

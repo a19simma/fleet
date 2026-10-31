@@ -375,6 +375,99 @@ async fn terminal_states_are_split_and_unfinished_jobs_are_other(pool: PgPool) {
 }
 
 #[sqlx::test(migrations = false)]
+async fn incomplete_non_claude_summaries_stay_out_of_every_runner_figure(pool: PgPool) {
+    let store = store(pool.clone()).await;
+    for (id, agent) in [("cl", "claude"), ("co", "codex"), ("ki", "kimi")] {
+        insert(&pool, &seed(id, "SUCCEEDED")).await;
+        sqlx::query("UPDATE jobs SET agent = $2 WHERE job_id = $1")
+            .bind(id)
+            .bind(agent)
+            .execute(&pool)
+            .await
+            .unwrap();
+    }
+    let figures = Fig {
+        turns: Some(0),
+        duration_ms: Some(0),
+        cost: Some(0.0),
+        tokens_in: Some(0),
+        tokens_out: Some(0),
+        tool_calls: Some(0),
+        first_edit_ms: Some(0),
+        ..Fig::default()
+    };
+    summarize(&pool, "co", &figures).await;
+    summarize(&pool, "ki", &figures).await;
+    summarize(
+        &pool,
+        "cl",
+        &Fig {
+            turns: Some(4),
+            duration_ms: Some(1000),
+            cost: Some(0.5),
+            tokens_in: Some(100),
+            tokens_out: Some(50),
+            tool_calls: Some(10),
+            first_edit_ms: Some(300),
+            complete: true,
+            ..Fig::default()
+        },
+    )
+    .await;
+    sqlx::query("UPDATE job_summary SET clone_ms = 40 WHERE job_id = 'co'")
+        .execute(&pool)
+        .await
+        .unwrap();
+    let group = one(&store).await;
+    assert_eq!(group.jobs, 3);
+    assert_eq!(group.with_summary, 3);
+    assert_eq!(group.complete, 1);
+    let duration = group.duration_ms.unwrap();
+    assert_eq!(duration.n, 1);
+    close(duration.p50, 1000.0);
+    assert_eq!(group.turns.unwrap().n, 1);
+    assert_eq!(group.first_edit_ms.unwrap().n, 1);
+    let cost = group.cost_est_usd.unwrap();
+    assert_eq!(cost.n, 1);
+    close(cost.sum, 0.5);
+    let tokens_in = group.tokens_in.unwrap();
+    assert_eq!((tokens_in.n, tokens_in.sum), (1, 100));
+    let tokens_out = group.tokens_out.unwrap();
+    assert_eq!((tokens_out.n, tokens_out.sum), (1, 50));
+    let calls = group.tool_calls.unwrap();
+    assert_eq!((calls.n, calls.sum), (1, 10));
+    assert_eq!(group.clone_ms.unwrap().n, 1);
+}
+
+#[sqlx::test(migrations = false)]
+async fn only_non_claude_summaries_leave_the_figures_absent_not_zero(pool: PgPool) {
+    let store = store(pool.clone()).await;
+    insert(&pool, &seed("co", "SUCCEEDED")).await;
+    sqlx::query("UPDATE jobs SET agent = 'codex' WHERE job_id = 'co'")
+        .execute(&pool)
+        .await
+        .unwrap();
+    summarize(
+        &pool,
+        "co",
+        &Fig {
+            turns: Some(0),
+            duration_ms: Some(0),
+            cost: Some(0.0),
+            ..Fig::default()
+        },
+    )
+    .await;
+    let group = one(&store).await;
+    assert_eq!(group.with_summary, 1);
+    assert_eq!(group.complete, 0);
+    assert!(group.turns.is_none());
+    assert!(group.duration_ms.is_none());
+    assert!(group.cost_est_usd.is_none());
+    assert!(group.tokens_in.is_none());
+}
+
+#[sqlx::test(migrations = false)]
 async fn percentiles_of_one_two_and_many_rows(pool: PgPool) {
     let store = store(pool.clone()).await;
     insert(&pool, &seed("a", "SUCCEEDED")).await;

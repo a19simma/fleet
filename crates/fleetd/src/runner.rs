@@ -2056,6 +2056,14 @@ struct Stream<'a, R> {
     model: Option<String>,
 }
 
+/// True when `job` runs under a runner whose output the telemetry parser reads: Claude, and every
+/// judge job. An unknown agent counts as having none.
+fn has_output_parser(job: &Job) -> bool {
+    job.kind() == JobKind::Judge
+        || crate::agent::resolve(&job.agent)
+            .is_some_and(|runner| runner.name() == crate::agent::CLAUDE)
+}
+
 fn fresh_feed() -> Arc<Mutex<Feed>> {
     Arc::new(Mutex::new(Feed::new(Instant::now())))
 }
@@ -2084,6 +2092,9 @@ impl<'a, R: Reporter> Stream<'a, R> {
             hub.register(&job.job_id);
         }
         let feed = carry.feed.unwrap_or_else(fresh_feed);
+        feed.lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .set_unparsed(!has_output_parser(job));
         let book = feeds.map(|(book, redactor)| {
             book.register(&job.job_id, Arc::clone(&feed), redactor);
             book

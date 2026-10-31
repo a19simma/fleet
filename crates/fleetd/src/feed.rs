@@ -62,6 +62,7 @@ pub(crate) struct Feed {
     stamp: VersionStamp,
     phases: Phases,
     fetch_outcome_lost: bool,
+    unparsed: bool,
 }
 
 impl Feed {
@@ -82,7 +83,16 @@ impl Feed {
             stamp: VersionStamp::default(),
             phases: Phases::default(),
             fetch_outcome_lost: false,
+            unparsed: false,
         }
+    }
+
+    /// Marks the feed as belonging to a runner with no output parser (Codex and Kimi).
+    ///
+    /// Such a feed reads none of the agent's lines, and its summary carries no figure, is
+    /// incomplete and lists `parser` as missing (ADR-0044). Fetch events still reach it.
+    pub(crate) fn set_unparsed(&mut self, unparsed: bool) {
+        self.unparsed = unparsed;
     }
 
     pub(crate) fn record(&mut self, phases: Phases) {
@@ -106,6 +116,9 @@ impl Feed {
         let len = u64::try_from(clean.len()).unwrap_or(u64::MAX);
         if self.fed_bytes.saturating_add(len) > MAX_FED_BYTES {
             self.counters.over_budget += 1;
+            return;
+        }
+        if self.unparsed {
             return;
         }
         let Some(parser) = self.parser.as_mut() else {
@@ -290,7 +303,8 @@ impl Feed {
         );
         let stamp = self.stamp.clone();
         let phases = self.phases;
-        let Some(parser) = self.parser.take() else {
+        let parser = self.parser.take().filter(|_| !self.unparsed);
+        let Some(parser) = parser else {
             let mut missing = pb::JobSummary {
                 missing: vec![PARSER_MISSING.to_owned()],
                 ..pb::JobSummary::default()
@@ -465,6 +479,69 @@ mod tests {
 
     fn boom(_: &mut Telemetry, _: &str, _: u64, _: &dyn Fn(&str) -> String) -> Vec<JobEvent> {
         panic!("boom");
+    }
+
+    #[test]
+    fn an_unparsed_feed_summarizes_nothing_and_names_the_parser() {
+        let (mut feed, start) = fresh();
+        feed.set_unparsed(true);
+        let redactor = redactor();
+        for line in [
+            json!({"type":"system","subtype":"init","model":"m"}).to_string(),
+            bash("t1", "ls"),
+            done("t1"),
+            json!({"type":"result","subtype":"success","num_turns":3,"duration_ms":10,
+                "usage":{"input_tokens":7,"output_tokens":8}})
+            .to_string(),
+        ] {
+            feed.line(&redactor, &line, start);
+        }
+        feed.record(Phases {
+            checkout: Some(5),
+            ..Phases::default()
+        });
+        let summary = feed.finish(Terminal::Succeeded);
+        assert!(!summary.complete);
+        assert_eq!(summary.missing, [PARSER_MISSING]);
+        assert_eq!(summary.turns, None);
+        assert_eq!(summary.duration_ms, None);
+        assert_eq!(summary.tokens_in, None);
+        assert_eq!(summary.tokens_out, None);
+        assert_eq!(summary.tool_calls, None);
+        assert_eq!(summary.bash_calls, None);
+        assert_eq!(summary.denials, None);
+        assert_eq!(summary.api_retries, None);
+        assert_eq!(summary.cost_est_usd, None);
+        assert_eq!(summary.result_subtype, None);
+        assert_eq!(summary.clone_ms, Some(5));
+    }
+
+    #[test]
+    fn an_unparsed_feed_with_a_lost_fetch_outcome_lists_both_names() {
+        let (mut feed, start) = fresh();
+        feed.set_unparsed(true);
+        feed.fetch_outcome_lost = true;
+        let _ = start;
+        let summary = feed.finish(Terminal::Succeeded);
+        assert_eq!(summary.missing, [PARSER_MISSING, FETCH_OUTCOME_MISSING]);
+        assert!(!summary.complete);
+    }
+
+    #[test]
+    fn a_parsed_feed_still_counts_zero_as_zero() {
+        let (mut feed, start) = fresh();
+        let redactor = redactor();
+        feed.line(
+            &redactor,
+            &json!({"type":"result","subtype":"success","num_turns":0,"duration_ms":0,
+                "usage":{"input_tokens":0,"output_tokens":0}})
+            .to_string(),
+            start,
+        );
+        let summary = feed.finish(Terminal::Succeeded);
+        assert!(summary.complete);
+        assert_eq!(summary.turns, Some(0));
+        assert_eq!(summary.tokens_in, Some(0));
     }
 
     #[test]
