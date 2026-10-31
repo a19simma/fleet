@@ -12,6 +12,7 @@ mod id;
 mod normalize;
 mod profile;
 mod redact;
+pub mod tools;
 mod validate;
 
 pub use box_name::BoxName;
