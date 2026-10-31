@@ -132,7 +132,7 @@ impl Harness {
         );
         let auth = WebAuth::new(pool.clone(), users, ORIGIN, Some("example.com")).unwrap();
         let web = if configured {
-            Web::with_credentials(auth, service)
+            Web::with_console(auth, Some(service), store.clone())
         } else {
             Web::with_auth(auth)
         };
