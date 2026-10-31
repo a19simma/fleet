@@ -177,6 +177,41 @@ pub fn share_dir_read_only(path: &Path, gid: u32) -> io::Result<()> {
     fs::set_permissions(path, fs::Permissions::from_mode(0o2750))
 }
 
+/// Gives `path` to `gid` with mode 2710: the group searches but cannot list or write.
+///
+/// # Errors
+///
+/// Returns the chown or chmod error.
+pub fn share_dir_search_only(path: &Path, gid: u32) -> io::Result<()> {
+    std::os::unix::fs::chown(path, None, Some(gid))?;
+    fs::set_permissions(path, fs::Permissions::from_mode(0o2710))
+}
+
+/// Gives the tree at `path` to `gid` read-only: directories become 2750 and a file keeps its
+/// owner bits, gains the group read and execute bits the owner has, and loses every other
+/// bit. Symlinks are skipped.
+///
+/// # Errors
+///
+/// Returns the first I/O error.
+pub fn share_tree_read_only(path: &Path, gid: u32) -> io::Result<()> {
+    let meta = fs::symlink_metadata(path)?;
+    if meta.is_dir() {
+        share_dir_read_only(path, gid)?;
+        for entry in fs::read_dir(path)? {
+            share_tree_read_only(&entry?.path(), gid)?;
+        }
+    } else if meta.is_file() {
+        std::os::unix::fs::chown(path, None, Some(gid))?;
+        let owner = meta.permissions().mode() & 0o700;
+        fs::set_permissions(
+            path,
+            fs::Permissions::from_mode(owner | ((owner >> 3) & 0o050)),
+        )?;
+    }
+    Ok(())
+}
+
 /// Gives the tree at `path` to `gid`: directories become 2770 and a file gets its owner bits
 /// copied to the group. Symlinks are skipped.
 ///

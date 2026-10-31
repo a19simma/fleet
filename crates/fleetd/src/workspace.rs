@@ -265,8 +265,9 @@ impl Workspace {
         }
     }
 
-    /// Gives the cache dir to `gid` read-only (2750) and makes each job clone group-writable
-    /// (2770), so the job group can read the mirror but never write it. `None`, the default,
+    /// Gives the cache dir to `gid` search-only (2710), the mirror a clone borrows read-only
+    /// (dirs 2750), and makes each job clone group-writable (2770), so the job group can read
+    /// that mirror but never write it. `None`, the default,
     /// leaves the modes git and `create_dir_all` set. `.git-home` and `.finish-<id>` stay
     /// private either way.
     #[must_use]
@@ -418,6 +419,7 @@ impl Workspace {
         let _held = self.mirror_lock.lock().await;
         let mirror = self.prepare_cache(repo).await?;
         self.sync_mirror(&mirror, repo).await?;
+        self.share_mirror(&mirror).await?;
 
         let path = self.root.join(job_id);
         match tokio::fs::remove_dir_all(&path).await {
@@ -461,7 +463,7 @@ impl Workspace {
             .await
             .map_err(WorkspaceError::Io)?;
         if let Some(gid) = self.job_gid {
-            crate::jobenv::share_dir_read_only(&cache, gid).map_err(WorkspaceError::Io)?;
+            crate::jobenv::share_dir_search_only(&cache, gid).map_err(WorkspaceError::Io)?;
         }
         Ok(Self::mirror_dir_for(&self.root, &self.owner, repo))
     }
@@ -486,7 +488,19 @@ impl Workspace {
         validate_repo(repo, &self.policy)?;
         let _held = self.mirror_lock.lock().await;
         let mirror = self.prepare_cache(repo).await?;
-        self.sync_mirror(&mirror, repo).await
+        self.sync_mirror(&mirror, repo).await?;
+        self.share_mirror(&mirror).await
+    }
+
+    async fn share_mirror(&self, mirror: &Path) -> Result<(), WorkspaceError> {
+        let Some(gid) = self.job_gid else {
+            return Ok(());
+        };
+        let mirror = mirror.to_path_buf();
+        tokio::task::spawn_blocking(move || crate::jobenv::share_tree_read_only(&mirror, gid))
+            .await
+            .map_err(|_| WorkspaceError::Io(std::io::Error::other("share task failed")))?
+            .map_err(WorkspaceError::Io)
     }
 
     async fn clone_checkout(

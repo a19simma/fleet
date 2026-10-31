@@ -201,16 +201,85 @@ async fn a_job_group_shares_the_cache_and_worktree_and_unset_does_not() -> TestR
             .with_job_group(Some(gid))
             .prepare("j1", &repo, "main")
             .await?;
-        assert_eq!(mode(&shared.join(".cache"))?, 0o2750);
+        assert_eq!(mode(&shared.join(".cache"))?, 0o2710);
         let mirror = only_mirror(&shared)?;
-        assert_eq!(mode(&mirror)? & 0o022, 0);
-        assert_eq!(mode(&mirror.join("objects"))? & 0o022, 0);
+        assert_eq!(mode(&mirror)?, 0o2750);
+        assert_eq!(mode(&mirror.join("objects"))?, 0o2750);
+        assert_eq!(mode(&mirror.join("HEAD"))?, 0o640);
         assert_eq!(mode(&checkout.path)?, 0o2770);
         assert_eq!(mode(&checkout.path.join("a.txt"))? & 0o070, 0o060);
         assert_eq!(mode(&shared.join(".git-home"))? & 0o2020, 0);
         Ok(())
     }))
     .await
+}
+
+#[tokio::test]
+async fn the_job_group_reads_only_the_mirror_its_checkout_borrows() -> TestResult {
+    use std::os::unix::fs::MetadataExt;
+    common::bounded(Box::pin(async {
+        let dir = TempDir::new()?;
+        let repo = fixture(dir.path())?;
+        let gid = std::fs::metadata(dir.path())?.gid();
+        let mode = |p: &Path| std::fs::metadata(p).map(|m| m.mode() & 0o7777);
+        let root = dir.path().join("jobs");
+        let other = root.join(".cache/decoy");
+        std::fs::create_dir_all(other.join("objects"))?;
+        std::fs::write(other.join("objects/f"), "x")?;
+        std::fs::set_permissions(
+            other.join("objects/f"),
+            std::fs::Permissions::from_mode(0o600),
+        )?;
+        std::fs::set_permissions(&other, std::fs::Permissions::from_mode(0o700))?;
+        std::fs::set_permissions(
+            other.join("objects"),
+            std::fs::Permissions::from_mode(0o700),
+        )?;
+        let ws = workspace(&root).with_job_group(Some(gid));
+        let checkout = ws.prepare("j1", &repo, "main").await?;
+        let alternates =
+            std::fs::read_to_string(checkout.path.join(".git/objects/info/alternates"))?;
+        let mirror = only_mirror(&root)?;
+        let borrowed = std::fs::canonicalize(mirror.join("objects"))?;
+        assert_eq!(Path::new(alternates.trim()), borrowed);
+        assert_eq!(mode(&root.join(".cache"))?, 0o2710);
+        assert_eq!(mode(&mirror)?, 0o2750);
+        assert_eq!(mode(&mirror.join("objects"))?, 0o2750);
+        assert_eq!(mode(&other)?, 0o700);
+        assert_eq!(mode(&other.join("objects"))?, 0o700);
+        assert_eq!(mode(&other.join("objects/f"))?, 0o600);
+        advance(dir.path(), "b.txt")?;
+        ws.fetch_mirror(&repo).await?;
+        let objects = std::fs::canonicalize(mirror.join("objects"))?;
+        for entry in walk(&objects)? {
+            let meta = std::fs::symlink_metadata(&entry)?;
+            let bits = meta.mode() & 0o7777;
+            assert_eq!(bits & 0o022, 0, "{entry:?}");
+            assert_eq!(meta.gid(), gid, "{entry:?}");
+            if meta.is_dir() {
+                assert_eq!(bits, 0o2750, "{entry:?}");
+            } else {
+                assert_eq!(bits & 0o070, 0o040, "{entry:?}");
+            }
+        }
+        git(
+            &checkout.path,
+            &["commit", "--quiet", "--allow-empty", "-m", "c"],
+        )?;
+        git(&checkout.path, &["log", "--oneline", "origin/main"])?;
+        Ok(())
+    }))
+    .await
+}
+
+fn walk(path: &Path) -> Result<Vec<PathBuf>, Box<dyn std::error::Error>> {
+    let mut all = vec![path.to_path_buf()];
+    if std::fs::symlink_metadata(path)?.is_dir() {
+        for entry in std::fs::read_dir(path)? {
+            all.extend(walk(&entry?.path())?);
+        }
+    }
+    Ok(all)
 }
 
 fn only_mirror(root: &Path) -> Result<PathBuf, Box<dyn std::error::Error>> {
