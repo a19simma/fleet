@@ -758,11 +758,29 @@ mod tests {
         )?)
     }
 
+    fn closed_without_reply(read: std::io::Result<usize>) -> std::io::Result<()> {
+        match read {
+            Ok(_) => Ok(()),
+            Err(e) if e.kind() == std::io::ErrorKind::ConnectionReset => Ok(()),
+            Err(e) => Err(e),
+        }
+    }
+
     async fn assert_closed_silently(stream: &mut UnixStream) -> TestResult {
         let mut seen = Vec::new();
-        tokio::time::timeout(WAIT, stream.read_to_end(&mut seen)).await??;
+        let read = tokio::time::timeout(WAIT, stream.read_to_end(&mut seen)).await?;
+        closed_without_reply(read)?;
         assert_eq!(seen, [0u8; 0]);
         Ok(())
+    }
+
+    #[test]
+    fn a_reset_or_an_eof_both_count_as_closed_without_a_reply() {
+        let reset = std::io::Error::from(std::io::ErrorKind::ConnectionReset);
+        assert!(closed_without_reply(Err(reset)).is_ok());
+        assert!(closed_without_reply(Ok(0)).is_ok());
+        let other = std::io::Error::from(std::io::ErrorKind::BrokenPipe);
+        assert!(closed_without_reply(Err(other)).is_err());
     }
 
     #[test]
