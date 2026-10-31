@@ -45,6 +45,9 @@ impl FleetJobs for Stub {
     ) -> Result<Response<Job>, Status> {
         check(&request)?;
         let r = request.into_inner();
+        if !["", "claude", "codex", "kimi"].contains(&r.agent.as_str()) {
+            return Err(Status::invalid_argument("invalid agent"));
+        }
         self.submitted
             .lock()
             .map_err(|_| Status::internal("poisoned"))?
@@ -239,6 +242,59 @@ async fn submit_opens_a_pr_by_default_and_not_with_no_pr() -> TestResult {
     assert!(!sent[1].open_pr);
     assert_eq!(sent[0].base_ref, "main");
     assert_eq!(sent[0].repo, "o/r");
+    Ok(())
+}
+
+#[tokio::test]
+async fn submit_sends_the_agent_flag_and_defaults_to_empty() -> TestResult {
+    let (url, stub) = serve().await?;
+    let base = ["submit", "--repo", "o/r", "--base", "main"];
+    let (res, _) = cli(
+        &url,
+        Some(TOKEN),
+        &base.iter().chain(&["a"]).copied().collect::<Vec<_>>(),
+    )
+    .await;
+    res?;
+    for agent in ["codex", "kimi"] {
+        let args: Vec<&str> = base
+            .iter()
+            .copied()
+            .chain(["--agent", agent, "b"])
+            .collect();
+        let (res, _) = cli(&url, Some(TOKEN), &args).await;
+        res?;
+    }
+    let sent = submitted(&stub)?;
+    let agents: Vec<&str> = sent.iter().map(|r| r.agent.as_str()).collect();
+    assert_eq!(agents, ["", "codex", "kimi"]);
+    Ok(())
+}
+
+#[tokio::test]
+async fn submit_surfaces_the_server_text_for_an_unknown_agent() -> TestResult {
+    let (url, stub) = serve().await?;
+    let args = [
+        "submit", "--repo", "o/r", "--base", "main", "--agent", "gpt", "a",
+    ];
+    let (res, _) = cli(&url, Some(TOKEN), &args).await;
+    let err = res.err().ok_or("expected failure")?;
+    assert_eq!(err.exit_code(), 1);
+    assert!(err.to_string().contains("invalid agent"), "{err}");
+    assert_eq!(submitted(&stub)?.len(), 0);
+    Ok(())
+}
+
+#[tokio::test]
+async fn submit_help_lists_the_agents() -> TestResult {
+    let err = Cli::try_parse_from(["fleet", "submit", "--help"])
+        .err()
+        .ok_or("help")?;
+    let text = err.to_string();
+    assert!(text.contains("--agent"), "{text}");
+    for name in ["claude", "codex", "kimi"] {
+        assert!(text.contains(name), "{text}");
+    }
     Ok(())
 }
 

@@ -1360,9 +1360,9 @@ impl Store {
 
     /// Submits a batch owned by `owner`, like [`Store::submit_batch`].
     ///
-    /// Every job of the batch binds `owner` as `jobs.user_id` and the default agent. `None` is
-    /// the legacy path and stamps the `bootstrap` user. A key already stored for another owner
-    /// is a [`StoreError::KeyConflict`].
+    /// Every job of the batch binds `owner` as `jobs.user_id` and the agent of the request;
+    /// an empty agent means claude. `None` is the legacy path and stamps the `bootstrap` user.
+    /// A key already stored for another owner or another agent is a [`StoreError::KeyConflict`].
     ///
     /// # Errors
     ///

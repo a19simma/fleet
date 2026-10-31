@@ -208,6 +208,47 @@ async fn submit_prints_the_batch_and_one_job_per_profile_pinned_at_the_sha(pool:
 }
 
 #[sqlx::test]
+async fn the_agent_flag_binds_every_job_and_defaults_to_claude(pool: PgPool) {
+    let store = migrated(&pool).await;
+    let addr = serve(&store);
+    let mut args = submit_args("fix it", SHA, "alpha,beta");
+    args.extend(["--agent", "codex"]);
+    let (result, _) = cli_as(addr, CLIENT, &args).await;
+    result.unwrap();
+    let stored: Vec<(String,)> = sqlx::query_as("SELECT agent FROM jobs")
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+    assert_eq!(stored.len(), 2);
+    assert!(stored.iter().all(|(a,)| a == "codex"), "{stored:?}");
+    let (result, _) = cli_as(addr, CLIENT, &submit_args("other", SHA, "alpha")).await;
+    result.unwrap();
+    let claude: (i64,) = sqlx::query_as("SELECT count(*) FROM jobs WHERE agent = 'claude'")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(claude.0, 1);
+}
+
+#[sqlx::test]
+async fn an_unknown_agent_surfaces_the_server_invalid_argument_text(pool: PgPool) {
+    let store = migrated(&pool).await;
+    let addr = serve(&store);
+    let mut args = submit_args("fix it", SHA, "alpha");
+    args.extend(["--agent", "gpt"]);
+    let (result, out) = cli_as(addr, CLIENT, &args).await;
+    let Err(CliError::Rpc(status)) = result else {
+        panic!("expected an rpc error");
+    };
+    assert_eq!(status.code(), tonic::Code::InvalidArgument);
+    assert!(
+        status.message().contains("invalid job request"),
+        "{status:?}"
+    );
+    assert_eq!(out, "");
+}
+
+#[sqlx::test]
 async fn the_same_key_returns_the_stored_batch_and_a_new_key_makes_a_new_one(pool: PgPool) {
     let store = migrated(&pool).await;
     let addr = serve(&store);

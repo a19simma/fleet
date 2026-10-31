@@ -326,6 +326,7 @@ pub(crate) struct Submit {
     pub(crate) base: String,
     pub(crate) profiles: String,
     pub(crate) idempotency_key: Option<String>,
+    pub(crate) agent: String,
 }
 
 /// Checks the flags of `fleet batch submit` before any connection is opened.
@@ -340,7 +341,7 @@ pub(crate) fn prepare(args: Submit, stdin: &mut impl Read) -> Result<SubmitBatch
         base_sha: args.base,
         repeats: 0,
         profiles,
-        agent: String::new(),
+        agent: args.agent,
     })
 }
 

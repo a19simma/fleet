@@ -81,6 +81,14 @@ pub enum Command {
         /// Key that makes a repeated submit return the same job.
         #[arg(long)]
         idempotency_key: Option<String>,
+        /// Agent that runs the job: claude, codex or kimi. Empty means claude.
+        #[arg(
+            long,
+            default_value = "",
+            value_name = "AGENT",
+            help = "Agent that runs the job: claude, codex or kimi [default: claude]"
+        )]
+        agent: String,
         /// Task prompt, or `-` to read it from stdin.
         prompt: String,
     },
@@ -174,6 +182,14 @@ pub enum BatchAction {
         /// when it is absent.
         #[arg(long)]
         idempotency_key: Option<String>,
+        /// Agent that runs every job: claude, codex or kimi. Empty means claude.
+        #[arg(
+            long,
+            default_value = "",
+            value_name = "AGENT",
+            help = "Agent that runs every job: claude, codex or kimi [default: claude]"
+        )]
+        agent: String,
     },
 }
 
@@ -548,6 +564,7 @@ async fn run_batch(
             base,
             profiles,
             idempotency_key,
+            agent,
         } => {
             let request = batch::prepare(
                 batch::Submit {
@@ -556,6 +573,7 @@ async fn run_batch(
                     base,
                     profiles,
                     idempotency_key,
+                    agent,
                 },
                 stdin,
             )?;
@@ -643,6 +661,7 @@ pub async fn run_with(
             base,
             no_pr,
             idempotency_key,
+            agent,
             prompt,
         } => {
             let prompt = read_prompt(prompt, stdin)?;
@@ -654,7 +673,7 @@ pub async fn run_with(
                     repo,
                     base_ref: base,
                     open_pr: !no_pr,
-                    agent: String::new(),
+                    agent,
                 })
                 .await?
                 .into_inner();
