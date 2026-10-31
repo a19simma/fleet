@@ -84,6 +84,7 @@ use crate::telemetry::Terminal as Ending;
 use crate::toolhook::HookHub;
 mod ci;
 mod codex;
+mod kimi;
 mod token;
 
 use crate::workspace::{RepoPolicy, validate_job_id};
@@ -709,6 +710,7 @@ pub struct AgentRunner<R> {
     pub(crate) credentials: Option<Arc<CredentialBook>>,
     pub(crate) job_redactors: Mutex<HashMap<String, Arc<Redactor>>>,
     codex_homes: Mutex<HashMap<String, crate::agent::codex::CodexHome>>,
+    kimi_homes: Mutex<HashMap<String, crate::agent::kimi::KimiHome>>,
     carries: Mutex<HashMap<String, Carry>>,
     phases: Mutex<HashMap<String, Phases>>,
     profiles: Mutex<HashMap<String, Arc<Applied>>>,
@@ -742,6 +744,7 @@ impl<R: Reporter> AgentRunner<R> {
             credentials: None,
             job_redactors: Mutex::new(HashMap::new()),
             codex_homes: Mutex::new(HashMap::new()),
+            kimi_homes: Mutex::new(HashMap::new()),
             carries: Mutex::new(HashMap::new()),
             phases: Mutex::new(HashMap::new()),
             profiles: Mutex::new(HashMap::new()),
@@ -1053,6 +1056,7 @@ impl<R: Reporter> AgentRunner<R> {
         self.forget_publish(&job.job_id);
         self.forget_job_redactor(&job.job_id);
         self.forget_codex_home(&job.job_id);
+        self.forget_kimi_home(&job.job_id);
         if let Some(feeds) = &self.feeds {
             feeds.forget(&job.job_id);
         }
@@ -1233,13 +1237,8 @@ impl<R: Reporter> AgentRunner<R> {
         stream: &mut Stream<'_, R>,
         launch: impl FnOnce(AgentSpec) -> io::Result<Launched> + Send,
     ) -> Result<AgentOutcome, RunError> {
-        if !crate::agent::resolve(&job.agent).is_some_and(|runner| {
-            matches!(
-                runner.name(),
-                crate::agent::CLAUDE | crate::agent::codex::NAME
-            )
-        }) {
-            return Ok(stream.fail(None, crate::agent::ERR_UNKNOWN_AGENT).await);
+        if let Some(refusal) = self.agent_refusal(job) {
+            return Ok(stream.fail(None, refusal).await);
         }
         let root = self.jobs_root(cwd);
         let applied = self.profile_for(job);
@@ -1259,13 +1258,15 @@ impl<R: Reporter> AgentRunner<R> {
                 return Ok(stream.fail(None, ERR_START).await);
             }
         };
-        let codex = Self::is_codex(job);
-        if codex && let Err(err) = self.codex_home(&job.job_id, cwd) {
-            tracing::warn!(kind = ?err.kind(), "codex home could not be created");
+        if let Err(err) = self.agent_home(job, cwd) {
+            tracing::warn!(kind = ?err.kind(), "agent home could not be created");
             return Ok(stream.fail(None, ERR_START).await);
         }
         let mut spec = self.agent_spec(job, cwd, &job_dir.home());
-        if !codex && let Some(version) = self.claude_version(cwd, &job_dir.home()).await {
+        if !Self::is_codex(job)
+            && !Self::is_kimi(job)
+            && let Some(version) = self.claude_version(cwd, &job_dir.home()).await
+        {
             spec.stamp.claude_version = version;
         }
         stream.feed().set_stamp(spec.stamp.clone());
@@ -1719,10 +1720,13 @@ impl<R: Reporter> AgentRunner<R> {
     /// The environment is the allowlisted part of [`RunConfig::base_env`] plus the per-job
     /// values, with `home` as `HOME` and `home/.claude` as `CLAUDE_CONFIG_DIR`. A job whose
     /// `agent` is `codex` gets the Codex argv and environment instead, with the one secret
-    /// `CODEX_API_KEY` from its held `codex_api_key`.
+    /// `CODEX_API_KEY` from its held `codex_api_key`. A job whose `agent` is `kimi` gets the
+    /// Kimi argv and environment, with the one secret `KIMI_API_KEY` from its held Kimi key.
     pub fn agent_spec(&self, job: &Job, cwd: &Path, home: &Path) -> AgentSpec {
         if Self::is_codex(job) {
             self.codex_spec(job, cwd, home)
+        } else if Self::is_kimi(job) {
+            self.kimi_spec(job, cwd, home)
         } else {
             self.claude_spec(job, cwd, home)
         }
@@ -2995,7 +2999,7 @@ mod tests {
 
     #[tokio::test]
     async fn an_unsupported_agent_fails_with_the_fixed_message_and_never_launches() {
-        for agent in ["gemini", "Claude", "kimi"] {
+        for agent in ["gemini", "Claude", "Kimi"] {
             let dir = tempfile::tempdir().expect("tempdir");
             let launcher = Arc::new(FakeLauncher::new(ExitStatus::from_raw(0), false));
             let runner = AgentRunner::new(
@@ -3069,6 +3073,98 @@ mod tests {
         let (_trigger, shutdown) = Shutdown::channel();
         let job = Job {
             agent: "codex".into(),
+            ..test_job()
+        };
+        let outcome = runner.run(&job, dir.path(), shutdown).await;
+        assert_eq!(
+            outcome.ok(),
+            Some(AgentOutcome::Failed {
+                exit_code: None,
+                error: ERR_START,
+            })
+        );
+        assert!(
+            launcher
+                .specs
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .is_empty()
+        );
+    }
+
+    #[tokio::test]
+    async fn a_kimi_job_on_a_disposable_box_launches_the_kimi_argv_and_drops_its_home() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let launcher = Arc::new(FakeLauncher::new(ExitStatus::from_raw(0), false));
+        let mut config = test_config(dir.path());
+        config.disposable = true;
+        let runner = AgentRunner::new(config, Replies { cancel: false }, Redactor::default())
+            .with_launcher(launcher.clone());
+        let (_trigger, shutdown) = Shutdown::channel();
+        let job = Job {
+            agent: "kimi".into(),
+            ..test_job()
+        };
+        let outcome = runner.run(&job, dir.path(), shutdown).await;
+        assert_eq!(outcome.ok(), Some(AgentOutcome::Succeeded));
+        let spec = launcher
+            .specs
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)[0]
+            .clone();
+        assert_eq!(spec.argv.first(), Some(&OsString::from("kimi")));
+        assert_eq!(spec.argv.get(1), Some(&OsString::from("--print")));
+        let home = dir.path().join(".kimi").join("job1");
+        assert!(home.is_dir());
+        runner.end_job(&job);
+        assert!(!home.exists());
+    }
+
+    #[tokio::test]
+    async fn a_kimi_job_on_a_box_that_is_not_disposable_fails_and_never_launches() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let launcher = Arc::new(FakeLauncher::new(ExitStatus::from_raw(0), false));
+        let runner = AgentRunner::new(
+            test_config(dir.path()),
+            Replies { cancel: false },
+            Redactor::default(),
+        )
+        .with_launcher(launcher.clone());
+        let (_trigger, shutdown) = Shutdown::channel();
+        let job = Job {
+            agent: "kimi".into(),
+            ..test_job()
+        };
+        let outcome = runner.run(&job, dir.path(), shutdown).await;
+        assert_eq!(
+            outcome.ok(),
+            Some(AgentOutcome::Failed {
+                exit_code: None,
+                error: crate::agent::kimi::ERR_NOT_DISPOSABLE,
+            })
+        );
+        assert!(
+            launcher
+                .specs
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .is_empty()
+        );
+        assert!(!dir.path().join(".kimi").exists());
+    }
+
+    #[tokio::test]
+    async fn a_kimi_job_whose_home_cannot_be_built_fails_with_the_start_error() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::write(dir.path().join(".kimi"), b"x").expect("write");
+        let launcher = Arc::new(FakeLauncher::new(ExitStatus::from_raw(0), false));
+        let mut config = test_config(dir.path());
+        config.disposable = true;
+        let runner = AgentRunner::new(config, Replies { cancel: false }, Redactor::default())
+            .with_launcher(launcher.clone());
+        let (_trigger, shutdown) = Shutdown::channel();
+        let job = Job {
+            agent: "kimi".into(),
             ..test_job()
         };
         let outcome = runner.run(&job, dir.path(), shutdown).await;

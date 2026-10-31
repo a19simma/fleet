@@ -505,6 +505,124 @@ mod tests {
         Ok(())
     }
 
+    fn kimi_spec(
+        runner: &AgentRunner<Quiet>,
+        dir: &Path,
+        job_id: &str,
+    ) -> crate::runner::AgentSpec {
+        let job = Job {
+            job_id: job_id.into(),
+            agent: "kimi".into(),
+            prompt: "do it".into(),
+            ..Job::default()
+        };
+        runner.agent_spec(&job, &dir.join("work"), &dir.join("home"))
+    }
+
+    #[tokio::test]
+    async fn the_kimi_env_holds_the_holder_key_and_no_other_secret()
+    -> Result<(), Box<dyn std::error::Error>> {
+        for kind in ["kimi_membership_key", "kimi_platform_key"] {
+            let (mut runner, _book, dir) = fixture_kind(true, kind).await?;
+            runner
+                .config
+                .base_env
+                .push(("KIMI_API_KEY".into(), BOX_KEY.into()));
+            runner
+                .config
+                .base_env
+                .push(("CODEX_API_KEY".into(), BOX_KEY.into()));
+            let spec = kimi_spec(&runner, dir.path(), "job1");
+            let env = spec_pairs(&spec);
+            let expected: BTreeSet<&str> = [
+                "PATH",
+                "FLEET_JOB_ID",
+                "SWARM_BOX",
+                "HOME",
+                "KIMI_CODE_HOME",
+                "XDG_CONFIG_HOME",
+                "XDG_CACHE_HOME",
+                "GIT_TERMINAL_PROMPT",
+                "KIMI_API_KEY",
+            ]
+            .into_iter()
+            .collect();
+            assert_eq!(keys(&env), expected, "{kind}");
+            assert_eq!(value(&env, "KIMI_API_KEY"), Some(AGENT), "{kind}");
+            assert!(env.iter().all(|(_, v)| v != BOX_PAT
+                && v != BOX_ENT
+                && v != BOX_OAUTH
+                && v != BOX_KEY
+                && v != HOLDER));
+            assert_eq!(spec.argv.first(), Some(&"kimi".into()));
+            assert_eq!(spec.argv.last(), Some(&"--prompt=do it".into()));
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn the_kimi_home_exists_for_the_job_and_end_job_removes_it()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use std::os::unix::fs::PermissionsExt;
+        let (runner, _book, dir) = fixture_kind(true, "kimi_platform_key").await?;
+        let spec = kimi_spec(&runner, dir.path(), "job1");
+        let home = std::path::PathBuf::from(
+            spec.env
+                .get(std::ffi::OsStr::new("KIMI_CODE_HOME"))
+                .ok_or("KIMI_CODE_HOME")?,
+        );
+        assert_eq!(home, dir.path().join(".kimi").join("job1"));
+        assert!(home.join("config.toml").is_file());
+        assert_eq!(
+            std::fs::metadata(&home)?.permissions().mode() & 0o777,
+            0o700
+        );
+        assert_eq!(kimi_spec(&runner, dir.path(), "job1"), spec);
+        let job = Job {
+            job_id: "job1".into(),
+            agent: "kimi".into(),
+            ..Job::default()
+        };
+        runner.end_job(&job);
+        assert!(!home.exists());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_kimi_job_with_no_held_key_gets_no_key_and_no_box_fallback()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (mut runner, _book, dir) = fixture_kind(true, "kimi_platform_key").await?;
+        runner
+            .config
+            .base_env
+            .push(("KIMI_API_KEY".into(), BOX_KEY.into()));
+        let env = spec_pairs(&kimi_spec(&runner, dir.path(), "job2"));
+        assert!(value(&env, "KIMI_API_KEY").is_none());
+        assert!(env.iter().all(|(_, v)| v != BOX_KEY && v != AGENT));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_kimi_job_needs_a_held_kimi_key() -> Result<(), Box<dyn std::error::Error>> {
+        for (kind, agent, expected) in [
+            ("kimi_membership_key", "kimi", true),
+            ("kimi_platform_key", "kimi", true),
+            ("codex_api_key", "kimi", false),
+            ("anthropic_api_key", "kimi", false),
+            ("kimi_platform_key", "claude", false),
+            ("kimi_platform_key", "codex", false),
+        ] {
+            let (_runner, book, _dir) = fixture_kind(true, kind).await?;
+            let held = book.get("job1").ok_or("held")?;
+            assert_eq!(
+                crate::agent::holds_model_credential(agent, &held),
+                expected,
+                "{kind} for {agent}"
+            );
+        }
+        Ok(())
+    }
+
     #[tokio::test]
     async fn a_judge_job_keeps_its_base_env_model_token() -> Result<(), Box<dyn std::error::Error>>
     {

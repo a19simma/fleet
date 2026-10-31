@@ -10,10 +10,12 @@
 //!
 //! Unverified: every Kimi CLI flag and config key below was written without a Kimi CLI to
 //! check against. That covers `--print`, `--output-format stream-json`, `--work-dir`,
-//! `--model`, `--prompt=`, the `KIMI_CODE_HOME` directory variable, the `KIMI_API_KEY`
+//! `--model=`, `--prompt=`, the `KIMI_CODE_HOME` directory variable, the `KIMI_API_KEY`
 //! variable name, the `default_yolo` key, the `[providers.kimi]` table with `type` and
-//! `api_key_env`, and the `sk-kimi-` key prefix (ADR-0043). Confirm each against the installed
-//! CLI before the runner is wired into the job path.
+//! `api_key_env`, the `sk-kimi-` key prefix (ADR-0043) and the model hosts in
+//! [`AgentRunner::model_hosts`], which no source in the ADRs states. Also unverified: whether
+//! `--print` implies auto-approve. The job path takes the stricter reading and runs a Kimi job
+//! only on a disposable box. Confirm each against the installed CLI before relying on it.
 
 use std::collections::BTreeMap;
 use std::ffi::OsString;
@@ -26,7 +28,11 @@ use super::AgentRunner;
 use crate::runner::{RunConfig, env_forbidden};
 use crate::workspace::validate_job_id;
 
-pub(super) const NAME: &str = "kimi";
+/// The `Job.agent` name of this runner.
+pub const NAME: &str = "kimi";
+
+/// Fixed failure message for a Kimi job on a box that is not disposable.
+pub const ERR_NOT_DISPOSABLE: &str = "kimi needs a disposable box";
 
 /// The environment variable that carries the Kimi credential. Unverified.
 pub const API_KEY_ENV: &str = "KIMI_API_KEY";
@@ -101,7 +107,7 @@ pub fn argv(program: &Path, job: &KimiJob<'_>) -> Vec<OsString> {
     argv.extend(["--print", "--output-format", "stream-json", "--work-dir"].map(OsString::from));
     argv.push(job.cwd.as_os_str().to_owned());
     if let Some(model) = job.model {
-        argv.extend(["--model", model].map(OsString::from));
+        argv.push(OsString::from(format!("--model={model}")));
     }
     argv.push(OsString::from(format!("--prompt={}", job.prompt)));
     argv

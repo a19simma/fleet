@@ -52,8 +52,8 @@ pub fn resolve(agent: &str) -> Option<&'static dyn AgentRunner> {
 
 /// True when `held` carries the model credential the runner of `agent` needs.
 ///
-/// `claude` needs an Anthropic key or a subscription token and `codex` a `codex_api_key`. Kimi
-/// has no credential check yet.
+/// `claude` needs an Anthropic key or a subscription token, `codex` a `codex_api_key` and `kimi`
+/// a `kimi_membership_key` or a `kimi_platform_key`.
 #[must_use]
 pub(crate) fn holds_model_credential(agent: &str, held: &crate::cred::JobCredentials) -> bool {
     match resolve(agent) {
@@ -61,6 +61,11 @@ pub(crate) fn holds_model_credential(agent: &str, held: &crate::cred::JobCredent
         Some(runner) if runner.name() == codex::NAME => held
             .get(fleet_core::credential::CredentialKind::CodexApiKey)
             .is_some(),
+        Some(runner) if runner.name() == kimi::NAME => {
+            use fleet_core::credential::CredentialKind;
+            held.get(CredentialKind::KimiMembershipKey).is_some()
+                || held.get(CredentialKind::KimiPlatformKey).is_some()
+        }
         _ => true,
     }
 }

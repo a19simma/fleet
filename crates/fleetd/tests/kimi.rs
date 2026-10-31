@@ -53,8 +53,7 @@ fn the_kimi_argv_is_golden() {
             "stream-json",
             "--work-dir",
             "/work",
-            "--model",
-            "k2",
+            "--model=k2",
             "--prompt=-fix it",
         ]
     );
@@ -63,7 +62,7 @@ fn the_kimi_argv_is_golden() {
 #[test]
 fn the_kimi_argv_omits_the_model_when_unset() {
     let argv = strings(&kimi::argv(Path::new("kimi"), &job(Path::new("/w"), None)));
-    assert!(!argv.contains(&"--model".to_owned()));
+    assert!(!argv.iter().any(|arg| arg.starts_with("--model")));
 }
 
 #[test]
