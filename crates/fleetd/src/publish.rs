@@ -840,7 +840,8 @@ mod tests {
             .args(args)
             .output()?;
         if !out.status.success() {
-            return Err(format!("git {args:?} failed").into());
+            let stderr = String::from_utf8_lossy(&out.stderr);
+            return Err(format!("git {args:?} failed: {stderr}").into());
         }
         Ok(String::from_utf8(out.stdout)?.trim().to_owned())
     }
@@ -859,7 +860,10 @@ mod tests {
         let mirror = dir.join("mirror.git");
         let seed = dir.join("seed");
         std::fs::create_dir_all(&seed)?;
-        git(dir, &["init", "--bare", "--quiet", "mirror.git"])?;
+        git(
+            dir,
+            &["init", "--bare", "--quiet", "-b", "main", "mirror.git"],
+        )?;
         git(&seed, &["init", "--quiet", "-b", "main"])?;
         std::fs::write(seed.join("a.txt"), "one")?;
         git(&seed, &["add", "."])?;
@@ -874,7 +878,10 @@ mod tests {
         let dir = tempfile::TempDir::new()?;
         let (mirror, sha) = mirror_with_commit(dir.path())?;
         let scratch = dir.path().join("scratch");
-        git(dir.path(), &["init", "--bare", "--quiet", "scratch"])?;
+        git(
+            dir.path(),
+            &["init", "--bare", "--quiet", "-b", "main", "scratch"],
+        )?;
         assert!(git(&scratch, &["cat-file", "-e", &sha]).is_err());
         link_mirror(&scratch, &relative_to_cwd(&mirror)?)?;
         git(&scratch, &["cat-file", "-e", &sha])?;
@@ -897,7 +904,10 @@ mod tests {
         git(&job, &["add", "."])?;
         git(&job, &["commit", "--quiet", "-m", "two"])?;
         let scratch = dir.path().join("scratch");
-        git(dir.path(), &["init", "--bare", "--quiet", "scratch"])?;
+        git(
+            dir.path(),
+            &["init", "--bare", "--quiet", "-b", "main", "scratch"],
+        )?;
         link_mirror(&scratch, &mirror)?;
         let worktree = job.to_str().ok_or("path")?;
         git(
@@ -928,7 +938,10 @@ mod tests {
     fn a_mirror_without_an_object_store_is_skipped() -> TestResult {
         let dir = tempfile::TempDir::new()?;
         let scratch = dir.path().join("scratch");
-        git(dir.path(), &["init", "--bare", "--quiet", "scratch"])?;
+        git(
+            dir.path(),
+            &["init", "--bare", "--quiet", "-b", "main", "scratch"],
+        )?;
         link_mirror(&scratch, &dir.path().join("absent.git"))?;
         assert!(!scratch.join("objects/info/alternates").exists());
         Ok(())
