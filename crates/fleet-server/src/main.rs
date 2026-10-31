@@ -16,7 +16,7 @@ use fleet_server::cred::store::CredentialStore;
 use fleet_server::cred::{CredentialService, Users};
 use fleet_server::reaper::{DEFAULT_REAP_PERIOD, run_reaper};
 use fleet_server::retention::run_retention;
-use fleet_server::service::serve_with_credentials;
+use fleet_server::service::{UpdateRelay, serve_with_credentials};
 use fleet_server::store::Store;
 use fleet_server::supervise::{BoxError, supervise};
 use fleet_server::web::{Web, WebAuth};
@@ -181,6 +181,7 @@ async fn run() -> Result<(), BoxError> {
             &auth,
             web,
             credential_service,
+            UpdateRelay::new(config.update_manifest.clone()),
             grpc,
             stopped(stop_rx.clone()),
         )
