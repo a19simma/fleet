@@ -11,7 +11,7 @@ Two files configure a box: a systemd unit for the daemon and a Claude Code manag
 
    Claude Code state that used to sit in `~/.claude.json` now goes to the per-job home. Whether `~/.claude.json` moves with `CLAUDE_CONFIG_DIR` is unverified, so check on a live box that a job leaves nothing in the real home.
 
-   This path set is unverified on a live box and `systemd-analyze verify` was not run (not available where this was written).
+   This path set is unverified on a live box. The `systemd-analyze verify` result for the systemd-launcher units is under [Files](#files).
 3. Copy `managed-settings.json` to `/etc/claude-code/managed-settings.json`. The file must be root-owned and read-only to the agent uid, so the agent cannot drop the tool hooks. Or copy it to `/etc/claude-code/managed-settings.d/10-fleetd.json` to keep it apart from other managed policy. If you change the port, change it in the URLs too.
 4. Start it:
 
@@ -52,7 +52,7 @@ Config file keys: `http_port`, `socket_path`, `db_path`, `queue_max_bytes`, `que
 
 `claude` and `gh` must be real binaries on the `PATH` of the unit, or set by absolute path in `claude_bin` and `gh_bin`. For broker `pr` operations `gh` must exist at an absolute `gh_bin` (default `/usr/bin/gh`). On the test box `gh` exists only as a mise shim, so install the distro package or set `gh_bin`. A version manager shim (a mise or asdf shim) resolves its tool from the home directory and the working directory, and the agent no longer has the operator home, so the shim fails or picks another version.
 
-Each job runs `claude` with `HOME` set to `<jobs_dir>/.agent/<job id>/home`, outside the worktree. `CLAUDE_CONFIG_DIR` is `home/.claude`, the four `XDG_*_HOME` variables point under `home`, `GIT_CONFIG_GLOBAL` is `home/.gitconfig` (author `Fleet Job`, no commit signing), and `XDG_RUNTIME_DIR` and the real `HOME` are not passed. fleetd builds the directory as `<job id>.tmp`, renames it, and removes it when the agent ends. The workspace cleanup also removes it after a crash. claude creates `home/.claude/sessions` with mode 0700 owned by `fleet-job`, and fleetd cannot delete that directory otherwise. The unit therefore sets `ExecStopPost=-/bin/chmod -R g+rwX /var/lib/fleet/jobs/.agent/%i`, which makes the tree group-writable for `fleet-work`, so fleetd can remove it. The command runs as `fleet-job` inside the unit sandbox, with no `+` or `!` prefix. The `-` prefix makes systemd ignore any non-zero exit of the chmod, not only a missing path. A real chmod failure no longer fails the unit and shows only as fleetd's `job workspace could not be removed` warning, with credentials left on disk. Live finding on a test box: with the unit lacking `-`, `.agent/<id>` was removed correctly, but the chmod exited 1 on every job (`No such file or directory` for a missing path), systemd logged `Failed with result 'exit-code'`, and the unit ended `failed`. By the timestamps, fleetd removes `.agent/<id>` while the agent exits, so the chmod loses a race. The race is inferred from timing; the chmod stderr is unverified because the unit has no `StandardError=` routing to the journal; `StandardOutput=file:/run/fleet/%i/stdout` is the only output routing. The chmod is cleanup that makes entries listable for fleetd's removal, so a vanished path is expected. The command must never run as root. The agent controls what `.agent/<job id>` points at, and a root chmod on a path the agent can write could be redirected by a symlink swap. GNU `chmod -R` does not follow symlinks without `-H` or `-L`, which narrows that risk. As `fleet-job` the command reaches only files `fleet-job` can already change. `ReadWritePaths=/var/lib/fleet/jobs` covers the path. Beyond the finding above, whether the chmod works as intended on a live box is unverified. Recommendation: give `/var/lib/fleet/jobs/.agent` the sticky bit, so the agent cannot swap another job's entry; the mode is set in `agent_config.rs`, which this change does not touch. After the stop, the `fleet-work` members can read the job home, credential files included. `fleet-job` is the only member besides `fleetd` (`deploy/sysusers.d`). A `job workspace could not be removed` warning means `.agent/<job id>` stays behind. Remove it with `sudo -u fleetd rm -r /var/lib/fleet/jobs/.agent/<job id>`.
+Each job runs `claude` with `HOME` set to `<jobs_dir>/.agent/<job id>/home`, outside the worktree. `CLAUDE_CONFIG_DIR` is `home/.claude`, the four `XDG_*_HOME` variables point under `home`, `GIT_CONFIG_GLOBAL` is `home/.gitconfig` (author `Fleet Job`, no commit signing), and `XDG_RUNTIME_DIR` and the real `HOME` are not passed. fleetd builds the directory as `<job id>.tmp`, renames it, and removes it when the agent ends. The workspace cleanup also removes it after a crash. claude creates `home/.claude/sessions` with mode 0700 owned by `fleet-job`, and fleetd cannot delete that directory otherwise. The unit therefore sets `ExecStopPost=-/bin/chmod -R g+rwX /var/lib/fleet/jobs/.agent/%i`, which makes the tree group-writable for `fleet-work`, so fleetd can remove it. The command runs as `fleet-job` inside the unit sandbox, with no `+` or `!` prefix. The `-` prefix makes systemd ignore any non-zero exit of the chmod, not only a missing path. A real chmod failure no longer fails the unit and shows only as fleetd's `job workspace could not be removed` warning, with credentials left on disk. The live finding behind the `-` prefix is under [Job home cleanup finding](#job-home-cleanup-finding). The chmod is cleanup that makes entries listable for fleetd's removal, so a vanished path is expected. The command must never run as root. The agent controls what `.agent/<job id>` points at, and a root chmod on a path the agent can write could be redirected by a symlink swap. GNU `chmod -R` follows no symlink, whether named on the command line or met during traversal, unless `-H` or `-L` is given, which narrows that risk. This is GNU behaviour and unverified on other chmod builds. As `fleet-job` the command reaches only files `fleet-job` can already change. `ReadWritePaths=/var/lib/fleet/jobs` covers the path. Beyond the finding above, whether the chmod works as intended on a live box is unverified. Recommendation: give `/var/lib/fleet/jobs/.agent` the sticky bit, so the agent cannot swap another job's entry; the mode is set in `agent_config.rs`, which this change does not touch. After the stop, the `fleet-work` members can read the job home, credential files included. `fleet-job` is the only member besides `fleetd` (`deploy/sysusers.d`). A `job workspace could not be removed` warning means `.agent/<job id>` stays behind. Remove it with `sudo -u fleetd rm -r /var/lib/fleet/jobs/.agent/<job id>`.
 
 The agent environment is an allowlist: `PATH`, `LANG`, `LC_*`, `TERM`, `CLAUDE_CODE_OAUTH_TOKEN`, `HTTP_PROXY`, `HTTPS_PROXY`, `NO_PROXY` (and the lowercase forms), `CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC` and `DISABLE_TELEMETRY`, plus `FLEET_JOB_ID` and `SWARM_BOX=1`. `agent_env_passthrough` adds names to the list, for example `["ANTHROPIC_BASE_URL"]`. fleetd refuses to start when an entry is not a plain variable name, holds a credential name (`GH_TOKEN`, `FLEET_TOKEN` and the rest of `STRIPPED_ENV`) or starts with `FLEETD_`.
 
@@ -61,6 +61,10 @@ The default `home/.claude` holds a short `CLAUDE.md` and a `settings.json` with 
 The agent runs with `--setting-sources user`, `--permission-mode dontAsk` (only `--dangerously-skip-permissions` on a disposable box), an appended protocol prompt, and `--disallowedTools "Bash(git push *)" "Bash(gh *)" Edit Write NotebookEdit MultiEdit` as a floor no settings file can lift. The managed settings file denies the same four edit tools, so a job changes files through Bash (a quoted `python3` heredoc) and the stored command holds every edit. The managed settings file still applies.
 
 After a clean agent exit fleetd commits what the agent left uncommitted, as `chore: uncommitted job changes (fleet job <id>)` on the job branch. It runs with no tokens, a scratch home, no hooks, no fsmonitor and no clean or smudge filter, and it fails the job without committing when the staged diff holds a value from the secrets file. A job that changed nothing still ends `SUCCEEDED`, with a `fleet: no_changes` line in the transcript and no branch.
+
+## Job home cleanup finding
+
+Live finding on a test box, with the unit lacking the `-` prefix on `ExecStopPost=`: `.agent/<id>` was removed correctly, but the chmod exited 1 on every job (`No such file or directory` for a missing path), systemd logged `Failed with result 'exit-code'`, and the unit ended `failed`. By the timestamps, fleetd removes `.agent/<id>` while the agent exits, so the chmod loses a race. The race is inferred from timing. The chmod stderr is unverified, because the unit has no `StandardError=` routing to the journal and `StandardOutput=file:/run/fleet/%i/stdout` is the only output routing. The chmod is cleanup that makes entries listable for fleetd's removal, so a vanished path is expected, and the `-` prefix makes the unit ignore it.
 
 ## Hooks
 
@@ -105,7 +109,7 @@ The units and `sysusers.d` file were installed live on systemd 257. `systemd-ana
 - `fleetd` owns the daemon, its state under `/var/lib/fleetd` and `/etc/swarm/secrets.env`.
 - `fleet-job` runs agents. Its primary group is `fleet-work`.
 - `fleet-work` is the shared group. `fleetd` is a member, through `sysusers.d` and `SupplementaryGroups=fleet-work`. A non-root daemon can only chown to a group it belongs to.
-- `/var/lib/fleet/jobs` is mode 3770 `fleetd:fleet-work`: group-writable, setgid and sticky. Each job has its clone there, plus `.agent/<job id>` (the per-job home) and the `.cache` mirror, which `fleetd` owns and the job group reads but never writes. The daemon unit's `ReadWritePaths=` covers only this directory. The agent unit reopens it too, then `ReadOnlyPaths=-/var/lib/fleet/jobs/.cache` makes the mirror read-only inside the agent's mount namespace, on top of the file modes.
+- `/var/lib/fleet/jobs` is mode 3770 `fleetd:fleet-work`: group-writable, setgid and sticky. Others have no access, so `fleet-job` reaches the jobs dir only as a member of `fleet-work`. Each job has its clone there, plus `.agent/<job id>` (the per-job home) and the `.cache` mirror, which `fleetd` owns and the job group reads but never writes. The daemon unit's `ReadWritePaths=` covers only this directory. The agent unit reopens it too, then `ReadOnlyPaths=-/var/lib/fleet/jobs/.cache` makes the mirror read-only inside the agent's mount namespace, on top of the file modes.
 - The broker scratch check (`scratch_is_private`) accepts the jobs root only when it is owned by the daemon uid or root, has no world write, and has group write only with the sticky bit. Mode 3770 passes; 2770 or 0775 without the sticky bit and any mode with world write make every job fail with `job broker could not be set up`. The `.broker` dir and each scratch dir must be mode 0700 owned by the daemon.
 - `/run/fleet` is mode 0750 `fleetd:fleet-work` and holds the per-job run dirs. `/run/fleet/hook` holds the hook socket, mode 0750 `fleetd:fleet-work`.
 
@@ -164,7 +168,7 @@ A hook socket under `/run/fleetd` is unreachable by the job uid, because that di
 
 ### Run dir and unit contract
 
-For each job the launcher creates `/run/fleet/<job id>/` (the job id matches `[A-Za-z0-9_]{1,64}`), mode 0750 with the job group, holding:
+For each job the launcher creates `/run/fleet/<job id>/` (the job id matches `[A-Za-z0-9_-]{1,64}`), mode 0750 with the job group, holding:
 
 - `env`, mode 0600, the agent environment as an `EnvironmentFile`. systemd reads it as root, so the job uid never needs it.
 - `spec.json`, `argv` and `cwd` only, written by the launcher and read by `fleetd agent-exec <job id>` as the job uid. Mode 0640 with the job group. It never holds the environment.
@@ -212,6 +216,8 @@ Install `managed-settings.json` as in the legacy steps, with two checks:
 - Validate before install: `python3 -m json.tool managed-settings.json`. An unparsable managed file stops the CLI from starting, for every job.
 - Managed sources are first-wins by default. A server-managed settings source would replace this file and drop the hooks unless `managedSourcesBehavior` is `"merge"`. Set it if the account uses server-managed settings.
 - The canary must check that the managed hooks fired under the job uid: run one job and confirm the hook events arrived for it. Whether they fire under the new uid is unverified until then.
+
+The hand-installed `/etc/claude-code/managed-settings.json` is a copy and does not follow the repo. Copy it again after every upgrade. A stale copy from before the command hooks held four dead `http` hooks. After the copy, `grep -c '"type": "http"' /etc/claude-code/managed-settings.json` must print 0.
 
 ### Secrets
 
@@ -268,10 +274,10 @@ Status: not run. Set `BOX` to the test box host name and `SERVER` to the fleet s
 
    ```sh
    fleet submit --server $SERVER --repo <test repo url> --prompt 'run: fleetd broker push refs/heads/main; fleetd broker push --branch main'
-   ssh agent@$BOX 'git ls-remote --heads <test repo url> | grep -c " refs/heads/main$"'
+   ssh agent@$BOX 'git ls-remote --heads <test repo url> refs/heads/main | cut -f1'
    ```
 
-   Compare the `main` count before and after the job. Expect no change.
+   Compare the `main` sha before and after the job. Expect no change. `git ls-remote` separates the sha and the ref with a tab, so a `grep -c " refs/heads/main$"` with a space always counts 0 and proves nothing.
 
 Record each outcome in `.ralph/progress.md`. Do not mark A28 passed until all six hold on the box.
 

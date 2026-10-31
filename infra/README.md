@@ -6,7 +6,7 @@ Kubernetes manifests for fleet-server. An Argo CD Application in the cluster ope
 
 - `deployment.yaml`: the fleet-server Deployment in namespace `fleet-server`.
 - `service.yaml`: a ClusterIP Service for the gRPC port (7070) and the health port (7072).
-- `kustomization.yaml`: lists both and pins the image `ghcr.io/a19simma/fleet-server` to tag 0.2.1. That tag is a baseline floor.
+- `kustomization.yaml`: lists both and pins the image `ghcr.io/a19simma/fleet-server` to tag 0.2.5. That tag is a baseline floor.
 - `master-key-generator.yaml` and `master-key-externalsecret.yaml`: an external-secrets Password generator and an ExternalSecret that create Secret `fleet-master-key` once. See Master key.
 - `httproute.yaml`: HTTPRoute `fleet-server` on one host. It sends every path to Service port 7070 (pages under `/` and `/static/style.css`, gRPC under `/fleet.v1.`), sets `Strict-Transport-Security: max-age=31536000` on responses, and disables the route request timeout so gRPC streams survive. The host is the placeholder `fleet.example.com`.
 - `check-web-route.sh`: renders the kustomization and fails unless the HTTPRoute sets HSTS, targets port 7070, and `FLEET_WEB_RP_ID` and `FLEET_WEB_ORIGIN` equal the route host and `https://` plus the host.
@@ -33,6 +33,7 @@ The operator owns everything this directory leaves out.
 - A Postgres 17 database and a role for the server exist, and `FLEET_DATABASE_URL` points at them.
 - A Gateway named `fleet` in namespace `fleet-server` with an HTTPS listener named `https` and its certificate exist. The Gateway belongs to the operator, and so does the Argo CD project permission for `HTTPRoute`.
 - The operator sets the real host in its own Application with a kustomize patch of `/spec/hostnames/0` on HTTPRoute `fleet-server`. The kustomization copies that value into `FLEET_WEB_RP_ID` (the bare host) and `FLEET_WEB_ORIGIN` (`https://` plus the host) after patches apply, so the three always match. The repo keeps only the placeholder host.
+- The gateway must redirect HTTP to HTTPS. Browsers honour `Strict-Transport-Security` only when it arrives over HTTPS, so the header does not protect a first plain HTTP request.
 - Header and idle timeouts for the shared HTTP/1.1 and h2c port (SEC-001) are not HTTPRoute fields. The operator sets them in the gateway implementation's policy, for example a client traffic policy with a client request header timeout and an idle timeout, and keeps them short enough to bound slow clients.
 
 ## Master key
