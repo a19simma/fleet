@@ -18,7 +18,7 @@ ADR-0034 defines the Profile. The server holds Profiles and fleetd applies them,
 - `Job.profile = 22` and `Job.batch_id = 23`.
 - Client scope gains `FleetProfiles` and `FleetBatches`.
 - Worker scope gains `FleetWorker.GetProfileBlob{job_id, attempt, box}`, authorised against the lease like the other worker calls.
-- Inferred, not part of the design: `GetProfileBlob` returns `PERMISSION_DENIED` with a fixed message for a wrong box, a wrong attempt, a job that is not `RUNNING`, an expired lease and a job that does not exist, so a Box learns nothing about other jobs. A leased job with no Profile gets `NOT_FOUND`. The server checks that the job's hash column equals the hash of its version row and of the canonical bytes before it replies, and fails closed otherwise. There is no lookup by hash or by name.
+- Inferred, not part of the design: `GetProfileBlob` returns `PERMISSION_DENIED` with a fixed message for a wrong box, a wrong attempt, a job that is not `RUNNING`, an expired lease and a job that does not exist, so a Box learns nothing about other jobs. A leased job with no Profile gets `NOT_FOUND`. The server checks that the job's hash column equals the hash of its version row and of the canonical bytes before it replies, and fails closed otherwise. There is no lookup by hash or by name. A stored blob that fails these checks returns `UNAVAILABLE` with the fixed message `storage unavailable`, not a distinct code.
 - Inferred, not part of the design: the reply carries up to `MAX_PROFILE_MESSAGE_BYTES` (`fleet-proto`). The `FleetWorker` server sets its encode limit to it and fleetd's `FleetWorker` client sets its decode limit to it, because the tonic client default is 4 MiB.
 
 ### Materialisation
@@ -38,6 +38,8 @@ fleetd fails closed with `profile invalid: <reason>`. The Job fails before the c
 - fleetd does not trust the server: a bad blob, hash or content stops the Job before the agent starts.
 - The lease authorises the blob read, so a Box reads only the Profile of a Job it holds.
 - ADR-0033 stays reserved for `GetJobCredential` and bundle distribution of Phase E. This ADR does not use it.
+
+- The insert-only triggers stop the application role. A table owner or superuser can still disable them or drop the tables.
 
 ## Considered and rejected
 

@@ -16,7 +16,7 @@ A **Profile** is typed JSON with `deny_unknown_fields`. Its content fields are:
 - `prompt_template`: only the `{prompt}` placeholder is allowed
 - `skills`: a list of `{name, files[{path, text}]}`, inline
 - `allow` and `deny`: permission rule lists
-- `model`, `max_turns` and `max_budget_usd`
+- `model`, `max_turns` and `max_budget_usd` (the budget is whole US cents under that name)
 - `env_flags`: a map from name to `"0"` or `"1"`
 - `settings`: permissions, model and attribution
 
@@ -46,18 +46,18 @@ The Box ceilings for max turns, budget and timeout win over the Profile values (
 
 An `allow` entry matches a Floor deny, and is dropped, when `covers(deny, allow)` holds. Identical strings cover. A bare tool name covers that name and that name followed by `(`. `Tool(prefix*)` covers `Tool(arg)` when `arg` starts with `prefix`, and `Tool(prefix2*)` when `prefix2` starts with `prefix`. Tool names are matched exactly, with case and whitespace significant. `Bash(git push*)` therefore also covers `Bash(git pushd*)`: when in doubt the allow is dropped. fleetd reports each dropped allow. The effective deny list is the Floor set, then the Profile extras in sorted order, with no repeats. Max turns and budget use the Box default when the Profile sets none, then the lower of that value and the Box ceiling.
 
-Whether deny beats allow in the real claude is unverified: the probe on the dev box (claude 2.1.289) stopped at "Not logged in", so neither the allow-and-deny run nor the allow-only control ran. Dropping the allow is correct either way.
+A wider allow such as `Bash` or `Bash(*)` is not covered by any Floor deny, so it is kept and relies on deny beating allow at claude. Whether deny beats allow in the real claude is unverified: the probe on the dev box (claude 2.1.289) stopped at "Not logged in", so neither the allow-and-deny run nor the allow-only control ran. Dropping the allow is correct either way.
 
 ### Validation
 
 `fleet-core` checks these rules on every Floor. Each failure is a fixed error that never echoes the input.
 
-- Caps: at most 64 files (context files plus skill files), 4 MiB of text in total, 256 KiB per file.
+- Caps: at most 64 files (context files plus skill files), 256 KiB per file for `claude_md` and each file, and 4 MiB of text in total over `claude_md`, `prompt_prefix`, `prompt_template` and the files. Attribution text is scanned for secrets but counts toward neither cap.
 - Paths: relative, `/` separated, no empty, `.` or `..` component, no component starting with `.`, at most 256 bytes. Skill names are one component of `[A-Za-z0-9_-]`. No duplicate paths or skill names. Symlinks are refused when fleetd writes the files.
 - `prompt_template` holds `{prompt}` once and no other brace.
 - `settings.model` equals `model` when set. Settings hold no `defaultMode`, hooks or MCP, and permission rules name no MCP tool.
 - `env_flags` names come from a fixed allowlist in `fleet-core`.
-- Paths and allow rules naming credential locations are rejected, and text that looks like a secret is rejected. Both checks are best-effort lints.
+- Paths and allow rules naming credential locations are rejected, and text that looks like a secret is rejected. Both checks are best-effort lints. The credential-location check covers paths, skill names and allow rules, in `allow` and in `settings.permissions`. `deny` rules are exempt, since a deny can only tighten.
 - `max_budget_usd` is whole US cents.
 
 ### Overlay
@@ -83,7 +83,7 @@ A Job whose base ref is 40 lowercase hex characters names a commit. `Workspace::
 
 ### Scope
 
-This task set builds structure only: Profile storage and application, a batch table and the CLI view.
+This ADR covers structure only: Profile storage and application, a batch table and the CLI view. It adds no scheduler, judge or metric.
 
 ## Deferred
 

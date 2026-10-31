@@ -25,11 +25,11 @@ Not exposed: arbitrary `git` or `gh`, `gh api`, merge, other repos, branch names
 
 ### Push target
 
-fleetd derives a `PushTarget` from the claimed Job on the server side: `Own(job id)` or `Chain(root job id)`. The agent never supplies it. Fix Jobs (ADR-0028) push to the chain root's branch `swarm/<root id>`. The server validates the target at `INSERT_FIX` and in `validate_terminal` against `^swarm/[A-Za-z0-9]{1,64}$`. This closes TEL-J3 SEC-001.
+fleetd derives a `PushTarget` from the claimed Job on the server side: `Own(job id)` or `Chain(root job id)`. The agent never supplies it. Fix Jobs (ADR-0028) push to the chain root's branch `swarm/<root id>`. The server validates the target at `INSERT_FIX` and in `validate_terminal` against `^swarm/[A-Za-z0-9]{1,64}$`. This closes a finding from the review of the CI retry (TEL-J3 SEC-001). The pattern is a lint over the branch text, and the server also requires the branch to equal `swarm/` plus the chain root job id.
 
 ### Ordering
 
-A mid-run push is raceable until ADR-0031 P3 ships: an agent-owned clone made with `git clone --reference`, from which fleetd fetches with hooks and fsmonitor off and `GIT_ALLOW_PROTOCOL=file`, then pushes from the mirror. The `push` op depends on P3. The read ops (`pr_checks`, mirror `fetch`, `pr_create`) ship first. The finish step stays as fallback and is idempotent with a broker push through the shared Published state.
+A mid-run push is raceable until ADR-0031 P3 ships: an agent-owned clone made with `git clone --reference`, from which fleetd fetches with hooks and fsmonitor off and `GIT_ALLOW_PROTOCOL=file`, then pushes from the mirror. The `push` op depends on P3. The read ops (`pr_checks` and mirror `fetch`) ship first. `pr_create` is a write op and ships with `push`. The finish step stays as fallback and is idempotent with a broker push through the shared Published state.
 
 ### Push and pr_create implementation
 
