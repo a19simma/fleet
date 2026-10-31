@@ -3,7 +3,8 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use crate::cred::CredentialService;
+use crate::cred::{CredentialService, Users};
+use crate::store::Store;
 use fleet_core::constant_time_eq;
 use serde_json::{Value, json};
 use topcoat::{
@@ -23,7 +24,9 @@ use topcoat::{
 use webauthn_rs::prelude::{PublicKeyCredential, RegisterPublicKeyCredential};
 
 use super::credentials::{Backend, CredentialSlot};
+use super::jobs::ConsoleSlot;
 use super::passkeys::{AuthError, SESSION_COOKIE, SESSION_TTL_SECS, SessionInfo, WebAuth};
+use super::tokens::{TokenSlot, Tokens};
 
 /// Stylesheet compiled into the binary, since Topcoat's `asset!` writes beside the binary.
 pub const STYLE_CSS: &str = include_str!("../../assets/style.css");
@@ -333,14 +336,18 @@ pub struct Web {
 fn builder(
     auth: Option<Arc<WebAuth>>,
     credentials: Option<Arc<Backend>>,
+    console: Option<(Arc<Store>, Arc<Tokens>)>,
     origins: &[String],
 ) -> Router {
+    let (store, tokens) = console.unzip();
     Router::builder()
         .discover()
         .origin_policy(OriginPolicy::new().trust_origins(origins.iter().cloned()))
         .layer(BodyLimit::max(MAX_BODY_BYTES))
         .app_context(AuthSlot(auth))
         .app_context(CredentialSlot(credentials))
+        .app_context(ConsoleSlot(store))
+        .app_context(TokenSlot(tokens))
         .build()
 }
 
@@ -349,7 +356,7 @@ impl Web {
     #[must_use]
     pub fn new() -> Self {
         Self {
-            router: Arc::new(builder(None, None, &[])),
+            router: Arc::new(builder(None, None, None, &[])),
         }
     }
 
@@ -358,7 +365,7 @@ impl Web {
     pub fn with_auth(auth: WebAuth) -> Self {
         let origins = [auth.origin().to_owned()];
         Self {
-            router: Arc::new(builder(Some(Arc::new(auth)), None, &origins)),
+            router: Arc::new(builder(Some(Arc::new(auth)), None, None, &origins)),
         }
     }
 
@@ -374,6 +381,37 @@ impl Web {
             router: Arc::new(builder(
                 Some(Arc::new(auth)),
                 Some(Arc::new(backend)),
+                None,
+                &origins,
+            )),
+        }
+    }
+
+    /// Builds the router with passkey login, the jobs and API token pages over `store`, and
+    /// the credentials page when `credentials` is set.
+    #[must_use]
+    pub fn with_console(
+        auth: WebAuth,
+        credentials: Option<CredentialService>,
+        store: Store,
+    ) -> Self {
+        let origins = [auth.origin().to_owned()];
+        let pool = auth.pool().clone();
+        let backend = credentials.map(|service| {
+            Arc::new(Backend {
+                service,
+                pool: pool.clone(),
+            })
+        });
+        let tokens = Tokens {
+            users: Users::new(pool.clone()),
+            pool,
+        };
+        Self {
+            router: Arc::new(builder(
+                Some(Arc::new(auth)),
+                backend,
+                Some((Arc::new(store), Arc::new(tokens))),
                 &origins,
             )),
         }
