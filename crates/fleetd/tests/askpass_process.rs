@@ -138,6 +138,7 @@ fn credential_fill(askpass: &str, marker: bool) -> Result<Output, std::io::Error
     let mut command = Command::new("git");
     command
         .args(["credential", "fill"])
+        .current_dir(std::env::temp_dir())
         .env_clear()
         .env("PATH", std::env::var_os("PATH").unwrap_or_default())
         .env("GIT_ASKPASS", askpass)
