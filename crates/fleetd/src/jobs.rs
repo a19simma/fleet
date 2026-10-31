@@ -12,6 +12,7 @@ use fleet_core::Redactor;
 use fleet_proto::v1::{Job, JobKind};
 use rustls::ClientConfig;
 use tokio::net::UnixStream;
+use tonic::codegen::http::Uri;
 use tonic::transport::Channel;
 
 use crate::AgentLauncher;
@@ -20,7 +21,7 @@ use crate::agent_config::Bundle;
 use crate::broker::{Broker, GhCli, MirrorGit};
 use crate::config::Config;
 use crate::connect_proxy::{ConnectProxy, ProxyLimits};
-use crate::cred::CredentialBook;
+use crate::cred::{CredentialBook, CredentialClient};
 use crate::fetch::{Dialer, Fetcher, Resolver, SystemResolver, TcpDialer, webpki_tls_config};
 use crate::fetch_service::{FeedBook, FetchRecorder, FetchService, MAX_CONCURRENT_FETCHES};
 use crate::jobenv::group_id;
@@ -34,7 +35,7 @@ use crate::runner::{AgentOutcome, AgentRunner, Interrupt, JobEnd, Reporter, RunC
 use crate::systemd::select_launcher;
 use crate::telemetry::{FetchPhase, FetchRecordError};
 use crate::toolhook::HookHub;
-use crate::workspace::{RepoPolicy, Workspace, broker_scratch_path};
+use crate::workspace::{RepoPolicy, Workspace, broker_scratch_path, job_owner};
 
 const ERR_WORKSPACE: &str = "workspace could not be prepared";
 const ERR_PREPARE_TIMEOUT: &str = "workspace preparation timed out";
@@ -68,6 +69,8 @@ pub struct BrokerWiring {
     launcher: AgentLauncher,
     gh_bin: PathBuf,
     host: String,
+    /// Used only by a runner with no credential book. With a book, each job's token is its
+    /// owner's held GitHub credential and this value is ignored.
     token: String,
     redactor: Redactor,
 }
@@ -114,8 +117,26 @@ impl<R: Reporter> DaemonRunner<R> {
     /// credentials drop on every end path.
     #[must_use]
     pub fn with_credentials(mut self, book: Arc<CredentialBook>) -> Self {
+        if let Some(agent) = Arc::get_mut(&mut self.agent) {
+            agent.credentials = Some(Arc::clone(&book));
+        }
         self.credentials = Some(book);
         self
+    }
+
+    /// The workspace of `job`: this runner's, keyed to the job's user so two users of one repo
+    /// never share a mirror. With a credential book, its mirror fetch carries the job
+    /// owner's GitHub token and its git output scrubs the job's credentials. Without one, the
+    /// workspace keeps the credential it was built with.
+    fn workspace_for(&self, job: &Job) -> Workspace {
+        let workspace = self.workspace.clone().with_owner(job_owner(job));
+        if self.credentials.is_none() {
+            return workspace;
+        }
+        let token = self.agent.github_token(&job.job_id).unwrap_or_default();
+        workspace
+            .with_credential(self.agent.config.askpass_bin.clone(), token)
+            .with_redactor(self.agent.job_redactor(&job.job_id).as_ref().clone())
     }
 
     async fn fetch_credentials(&self, job: &Job, mut shutdown: Shutdown) -> Result<(), RunError> {
@@ -131,7 +152,10 @@ impl<R: Reporter> DaemonRunner<R> {
             }
         };
         match guarded {
-            Ok(Ok(_)) => Ok(()),
+            Ok(Ok(held)) => {
+                self.agent.adopt_credentials(&job.job_id, &held);
+                Ok(())
+            }
             Ok(Err(failure)) => {
                 tracing::warn!(reason = failure.reason(), "job credentials refused");
                 self.agent.fail_job(job, failure.reason()).await;
@@ -225,12 +249,12 @@ impl<R: Reporter> DaemonRunner<R> {
     }
 
     async fn prepare(&self, job: &Job, mut shutdown: Shutdown) -> Result<PathBuf, RunError> {
+        let workspace = self.workspace_for(job);
         let work = self.agent.timed_clone(
             job,
             tokio::time::timeout(
                 self.agent.prepare_timeout(),
-                self.workspace
-                    .prepare(&job.job_id, &job.repo, &job.base_ref),
+                workspace.prepare(&job.job_id, &job.repo, &job.base_ref),
             ),
         );
         let guarded = tokio::select! {
@@ -299,6 +323,14 @@ impl<R: Reporter + Send + Sync + 'static> DaemonRunner<R> {
         }
     }
 
+    fn broker_token(&self, wiring: &BrokerWiring, job: &Job) -> String {
+        if self.credentials.is_some() {
+            self.agent.github_token(&job.job_id).unwrap_or_default()
+        } else {
+            wiring.token.clone()
+        }
+    }
+
     fn build_broker(&self, wiring: &BrokerWiring, job: &Job, cwd: &Path) -> Result<(), String> {
         let scratch = self
             .workspace
@@ -308,12 +340,12 @@ impl<R: Reporter + Send + Sync + 'static> DaemonRunner<R> {
             Arc::clone(&self.agent),
             job.clone(),
             cwd.to_path_buf(),
-            MirrorGit::new(self.workspace.clone(), job),
+            MirrorGit::new(self.workspace_for(job), job),
         );
         let checks = GhCli::new(
             wiring.gh_bin.clone(),
             wiring.host.clone(),
-            wiring.token.clone(),
+            self.broker_token(wiring, job),
             scratch,
         )
         .map_err(|err| err.to_string())?;
@@ -323,8 +355,11 @@ impl<R: Reporter + Send + Sync + 'static> DaemonRunner<R> {
             cwd.to_path_buf(),
             checks,
         );
-        let broker = Broker::new(wiring.launcher, job, git, gh, wiring.redactor.clone())
-            .map_err(|err| err.to_string())?;
+        let redactor = wiring
+            .redactor
+            .merged(&self.agent.job_redactor(&job.job_id));
+        let broker =
+            Broker::new(wiring.launcher, job, git, gh, redactor).map_err(|err| err.to_string())?;
         wiring
             .registry
             .register(&job.job_id, Arc::new(DynBroker(Box::new(broker))))
@@ -388,24 +423,42 @@ fn apply_limits(run: &mut RunConfig, config: &Config) {
     run.ci_deadline = config.ci_deadline;
 }
 
-fn job_workspace(
-    config: &Config,
-    run: &mut RunConfig,
-    env: &dyn Fn(&str) -> Option<String>,
-) -> Workspace {
+fn job_workspace(config: &Config, run: &mut RunConfig) -> Workspace {
     let mut policy = RepoPolicy::new(config.repo_hosts.iter().cloned())
         .with_token_host(config.token_host.clone());
     if config.allow_file_repos {
         policy = policy.with_file_repos();
     }
     run.repo_policy = policy.clone();
-    let mut workspace = Workspace::new(PathBuf::from(&config.jobs_dir))
+    Workspace::new(PathBuf::from(&config.jobs_dir))
         .with_policy(policy)
-        .with_job_group(run.job_gid);
-    if let Some(token) = env("GH_TOKEN") {
-        workspace = workspace.with_credential(run.askpass_bin.clone(), token);
+        .with_job_group(run.job_gid)
+}
+
+/// Env var that allows a plain `http` `FLEET_SERVER_URL` off loopback. Set it to `1`.
+pub(crate) const ALLOW_PLAINTEXT_ENV: &str = "FLEETD_ALLOW_PLAINTEXT_CREDENTIALS";
+
+fn is_loopback_host(host: &str) -> bool {
+    host.eq_ignore_ascii_case("localhost")
+        || host
+            .trim_start_matches('[')
+            .trim_end_matches(']')
+            .parse::<std::net::IpAddr>()
+            .is_ok_and(|ip| ip.is_loopback())
+}
+
+/// Whether the credential channel may use `url`: `https`, or `http` to a loopback host, or
+/// `http` with `opt_in`. The host is the URI authority host, so userinfo, a path or a
+/// lookalike label never counts as loopback. Anything that does not parse is refused.
+fn credential_channel_allowed(url: &str, opt_in: bool) -> bool {
+    let Ok(uri) = url.parse::<Uri>() else {
+        return false;
+    };
+    match uri.scheme_str() {
+        Some("https") => true,
+        Some("http") => opt_in || uri.host().is_some_and(is_loopback_host),
+        _ => false,
     }
-    workspace
 }
 
 struct BookRecorder(Arc<FeedBook>);
@@ -533,15 +586,27 @@ pub(crate) fn build(
     let Some(url) = env(SERVER_URL_ENV).filter(|url| !url.is_empty()) else {
         return Ok(None);
     };
-    let token = env(TOKEN_ENV)
-        .filter(|token| !token.is_empty())
-        .map(Token::new)
-        .ok_or(Error::InvalidValue {
-            name: TOKEN_ENV,
+    let opt_in = env(ALLOW_PLAINTEXT_ENV).is_some_and(|value| value == "1");
+    if !credential_channel_allowed(&url, opt_in) {
+        return Err(Error::InvalidValue {
+            name: SERVER_URL_ENV,
             value: String::from("<redacted>"),
-        })?;
+        });
+    }
+    let raw_token =
+        env(TOKEN_ENV)
+            .filter(|token| !token.is_empty())
+            .ok_or(Error::InvalidValue {
+                name: TOKEN_ENV,
+                value: String::from("<redacted>"),
+            })?;
+    let token = Token::new(raw_token.clone());
     let channel: Channel = channel(&url)?;
     let reporter = GrpcReporter::new(channel.clone(), &token)?;
+    let book = Arc::new(CredentialBook::new(CredentialClient::new(
+        channel.clone(),
+        &raw_token,
+    )?));
     let mut run = RunConfig::new(&config.claude_bin, config.disposable);
     run.gh_bin.clone_from(&config.gh_bin);
     run.jobs_dir = Some(config.jobs_dir.clone());
@@ -555,7 +620,7 @@ pub(crate) fn build(
             value: err.to_string(),
         })?;
     }
-    let workspace = job_workspace(config, &mut run, env).with_redactor(redactor.clone());
+    let workspace = job_workspace(config, &mut run).with_redactor(redactor.clone());
     let feeds = Arc::new(FeedBook::default());
     let wired = job_services(config, &feeds);
     let launcher = select_launcher(config, run.job_gid, wired.services);
@@ -568,7 +633,7 @@ pub(crate) fn build(
             .token_host()
             .unwrap_or("github.com")
             .to_owned(),
-        token: env("GH_TOKEN").unwrap_or_default(),
+        token: String::new(),
         redactor: redactor.clone(),
     };
     let runner = DaemonRunner::new(
@@ -577,9 +642,10 @@ pub(crate) fn build(
             .with_hook_hub(hub)
             .with_launcher(launcher)
             .with_feed_book(feeds)
-            .with_job_end(wired.end),
+            .with_job_end(wired.end.on_end(book.end_hook())),
         box_name,
     )
+    .with_credentials(book)
     .with_broker(wiring);
     Poller::with_channel(
         channel,
@@ -641,7 +707,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn the_gh_token_env_value_reaches_the_mirror_fetch() -> TestResult {
+    async fn the_box_gh_token_env_value_never_reaches_the_mirror_fetch() -> TestResult {
         let dir = tempfile::TempDir::new()?;
         let git = dir.path().join("rec-git");
         std::fs::write(
@@ -653,13 +719,70 @@ mod tests {
         let mut config = Config::resolve(None, &|_| None)?;
         config.jobs_dir.clone_from(&jobs);
         let mut run = RunConfig::new("claude", false);
-        let env = |name: &str| (name == "GH_TOKEN").then(|| String::from("tok-wired"));
-        let workspace =
-            job_workspace(&config, &mut run, &env).with_git(&git, Duration::from_secs(10));
+        let workspace = job_workspace(&config, &mut run).with_git(&git, Duration::from_secs(10));
         workspace
             .prepare("job1", "https://github.com/o/r.git", "main")
             .await?;
-        assert_eq!(std::fs::read_to_string(jobs.join("tok"))?, "tok-wired");
+        assert!(!jobs.join("tok").exists());
+        Ok(())
+    }
+
+    fn build_with(
+        url: &str,
+        extra: Option<(&'static str, &'static str)>,
+    ) -> Result<bool, Box<dyn std::error::Error>> {
+        let dir = tempfile::TempDir::new()?;
+        let mut config = Config::resolve(None, &|_| None)?;
+        config.jobs_dir = dir.path().join("jobs");
+        let url = url.to_owned();
+        let env = move |name: &str| match name {
+            "FLEET_SERVER_URL" => Some(url.clone()),
+            "FLEET_TOKEN" => Some(String::from("tok-wired-0123456789")),
+            other => extra.and_then(|(key, value)| (key == other).then(|| value.to_owned())),
+        };
+        Ok(build(&config, &env, "box", Redactor::default(), HookHub::new()).is_ok())
+    }
+
+    #[tokio::test]
+    async fn plaintext_http_off_loopback_is_refused_for_the_credential_channel() -> TestResult {
+        let hostile = [
+            "http://203.0.113.9:7071",
+            "http://server.example:7071",
+            "http://0.0.0.0:7071",
+            "http://127.0.0.1.evil.example:7071",
+            "http://localhost.evil.example:7071",
+            "http://127.0.0.1@evil.example:7071",
+            "http://user:pw@evil.example:7071",
+            "http://evil.example:7071/@127.0.0.1",
+            "http://evil.example:7071?127.0.0.1",
+            "http://evil.example:7071#127.0.0.1",
+            "http://LOCALHOST.example:7071",
+        ];
+        for url in hostile {
+            assert!(!build_with(url, None)?, "{url}");
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn loopback_http_https_and_an_explicit_opt_in_are_accepted() -> TestResult {
+        for url in [
+            "http://127.0.0.1:7071",
+            "http://127.1.2.3:7071",
+            "http://[::1]:7071",
+            "http://localhost:7071",
+            "http://LocalHost:7071",
+            "https://server.example:7071",
+            "HTTPS://server.example:7071",
+        ] {
+            assert!(build_with(url, None)?, "{url}");
+        }
+        let opt_in = Some(("FLEETD_ALLOW_PLAINTEXT_CREDENTIALS", "1"));
+        assert!(build_with("http://203.0.113.9:7071", opt_in)?);
+        for off in ["0", "", "yes", "true"] {
+            let opt_in = Some(("FLEETD_ALLOW_PLAINTEXT_CREDENTIALS", off));
+            assert!(!build_with("http://203.0.113.9:7071", opt_in)?, "{off}");
+        }
         Ok(())
     }
 
@@ -1856,7 +1979,7 @@ mod tests {
                 let config = config_of("")?;
                 let mut run = RunConfig::new("claude", false);
                 run.job_gid = Some(4242);
-                let workspace = job_workspace(&config, &mut run, &|_| None);
+                let workspace = job_workspace(&config, &mut run);
                 assert_eq!(workspace.job_group(), Some(4242));
                 Ok(())
             }

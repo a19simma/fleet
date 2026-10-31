@@ -1,6 +1,6 @@
 # Mirror key
 
-Status: Proposed 2026-10-29. Built in the fleetd workspace (`mirror_dir_for` hashes the owner and the repo, tested). Not wired: no caller sets the owner from the Job, so every mirror still uses the empty owner. Amends ADR-0024 and ADR-0031.
+Status: Proposed 2026-10-29. Built in the fleetd workspace (`mirror_dir_for` hashes the owner and the repo, tested). Wired in CRED-41: the daemon and the broker set the owner to the Job `user_id`, and the publish step reads the same keyed mirror. Amends ADR-0024 and ADR-0031.
 
 fleetd keeps a git mirror per repository (ADR-0024) and clones Jobs from it (ADR-0031 P3). The mirror is fetched with a user's credential. A mirror shared across users would let one user's token pull content that another user's token could not.
 

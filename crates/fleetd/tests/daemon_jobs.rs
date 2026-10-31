@@ -152,7 +152,19 @@ impl FleetWorker for Stub {
         &self,
         _request: Request<fleet_proto::v1::GetJobCredentialsRequest>,
     ) -> Result<Response<fleet_proto::v1::GetJobCredentialsReply>, Status> {
-        Err(Status::unimplemented("get_job_credentials"))
+        Ok(Response::new(fleet_proto::v1::GetJobCredentialsReply {
+            credentials: [
+                ("github_pat", "holder-pat-0123456789abcdef"),
+                ("anthropic_api_key", "agent-key-0123456789abcdef"),
+            ]
+            .into_iter()
+            .map(|(kind, value)| fleet_proto::v1::JobCredential {
+                kind: kind.into(),
+                shape: "static_secret".into(),
+                value: value.into(),
+            })
+            .collect(),
+        }))
     }
 
     async fn report_job(

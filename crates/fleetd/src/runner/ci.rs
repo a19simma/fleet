@@ -296,7 +296,7 @@ impl<R: Reporter> AgentRunner<R> {
                 &self.config.gh_bin,
                 dir,
                 &["pr", "checks", pr_url, "--json", "bucket,link"],
-                Scope::Gh,
+                Scope::Gh(&job.job_id),
             )
             .await;
         match checked {
@@ -320,12 +320,12 @@ impl<R: Reporter> AgentRunner<R> {
                     &job.repo,
                     "--log-failed",
                 ],
-                Scope::Gh,
+                Scope::Gh(&job.job_id),
             )
             .await
             .ok()?;
         out.success
-            .then(|| clean_log(&out.stdout, &self.redactor))
+            .then(|| clean_log(&out.stdout, &self.job_redactor(&job.job_id)))
             .flatten()
     }
 }

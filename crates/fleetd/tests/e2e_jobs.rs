@@ -9,11 +9,17 @@ use std::path::Path;
 use std::process::Command;
 use std::time::Duration;
 
+use std::sync::Arc;
+
 use clap::Parser;
 use fleet_cli::{Cli, CliError, run};
+use fleet_core::credential::{CredentialKind, CredentialShape, Secret};
 use fleet_server::auth::BearerAuth;
 use fleet_server::config::Token;
-use fleet_server::service::router;
+use fleet_server::cred::github::{GithubApi, GithubError, GithubUser};
+use fleet_server::cred::store::CredentialStore;
+use fleet_server::cred::{CredentialService, FileSealer};
+use fleet_server::service::router_with;
 use fleet_server::store::Store;
 use fleetd::{Config, run_with_env};
 use sqlx::PgPool;
@@ -24,6 +30,15 @@ use tonic::transport::server::TcpIncoming;
 
 #[path = "common/bounded.rs"]
 mod common;
+
+struct NoGithub;
+
+#[tonic::async_trait]
+impl GithubApi for NoGithub {
+    async fn user(&self, _token: &Secret) -> Result<GithubUser, GithubError> {
+        Err(GithubError::Unavailable)
+    }
+}
 
 type TestResult = Result<(), Box<dyn std::error::Error>>;
 
@@ -117,9 +132,15 @@ async fn a_submitted_job_runs_to_a_pushed_branch_and_a_pull_request(pool: PgPool
         &Token::new(BOX_TOKEN.to_owned())?,
         Some(&Token::new(CLIENT_TOKEN.to_owned())?),
     );
+    let keys = dir.path().join("sealer.keys");
+    std::fs::write(&keys, format!("k1:{}\n", "ab".repeat(32)))?;
+    let sealer = FileSealer::load(&keys)?;
+    let creds = CredentialStore::new(pool.clone(), Arc::new(sealer));
+    let service = CredentialService::new(creds.clone(), Arc::new(NoGithub));
     let incoming = TcpIncoming::bind("127.0.0.1:0".parse()?)?;
     let url = format!("http://{}", incoming.local_addr()?);
-    let server = tokio::spawn(router(&store, &auth).serve_with_incoming(incoming));
+    let server =
+        tokio::spawn(router_with(&store, &auth, Some(service)).serve_with_incoming(incoming));
 
     let (submitted, out) = fleet(
         &url,
@@ -143,6 +164,26 @@ async fn a_submitted_job_runs_to_a_pushed_branch_and_a_pull_request(pool: PgPool
         .bind(&job_id)
         .execute(&pool)
         .await?;
+
+    let owner: i64 = sqlx::query_scalar("SELECT user_id FROM jobs WHERE job_id = $1")
+        .bind(&job_id)
+        .fetch_one(&pool)
+        .await?;
+    for (kind, value) in [
+        (CredentialKind::GithubPat, "github_pat_11ABCDEFG0abcdefghijklmnop"),
+        (CredentialKind::AnthropicApiKey, "sk-ant-api03-abcdefghijklmnopqrstuv"),
+    ] {
+        creds
+            .put(
+                owner,
+                kind,
+                CredentialShape::StaticSecret,
+                Secret::new(value.into()),
+                None,
+                None,
+            )
+            .await?;
+    }
 
     let box_name = format!("box-{}", 7);
     let file = format!(

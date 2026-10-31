@@ -578,11 +578,6 @@ impl Workspace {
         first.map_or(Ok(()), Err)
     }
 
-    /// The bare mirror of `repo` for the default owner under the jobs `root`.
-    pub(crate) fn mirror_dir(root: &Path, repo: &str) -> PathBuf {
-        Self::mirror_dir_for(root, "", repo)
-    }
-
     /// The bare mirror of `repo` for `owner` under the jobs `root`. The name hashes the owner
     /// length, the owner and the repo, so no two `(owner, repo)` pairs share input bytes.
     pub(crate) fn mirror_dir_for(root: &Path, owner: &str, repo: &str) -> PathBuf {
@@ -1040,6 +1035,12 @@ async fn read_tail(mut pipe: tokio::process::ChildStderr) -> Vec<u8> {
     kept
 }
 
+/// The mirror owner of `job`: its user id in decimal. Every caller that builds a mirror path
+/// for a job uses it, so the clone, the broker fetch and the push all name the same mirror.
+pub(crate) fn job_owner(job: &fleet_proto::v1::Job) -> String {
+    job.user_id.to_string()
+}
+
 pub(crate) fn validate_job_id(id: &str) -> Result<(), WorkspaceError> {
     let ok = !id.is_empty()
         && id.len() <= MAX_JOB_ID_LEN
@@ -1124,6 +1125,13 @@ mod tests {
         std::fs::symlink_metadata(path).unwrap().mode() & 0o7777
     }
 
+    fn job_of(user_id: u64) -> fleet_proto::v1::Job {
+        fleet_proto::v1::Job {
+            user_id,
+            ..fleet_proto::v1::Job::default()
+        }
+    }
+
     #[test]
     fn the_owner_repo_boundary_cannot_be_shifted() {
         let root = Path::new("r");
@@ -1147,10 +1155,8 @@ mod tests {
             Workspace::mirror_dir_for(root, "a", "x"),
             Workspace::mirror_dir_for(root, "a", "x")
         );
-        assert_eq!(
-            Workspace::mirror_dir(root, "x"),
-            Workspace::mirror_dir_for(root, "", "x")
-        );
+        assert_ne!(job_owner(&job_of(1)), job_owner(&job_of(2)));
+        assert_eq!(job_owner(&job_of(1)), job_owner(&job_of(1)));
     }
 
     #[test]

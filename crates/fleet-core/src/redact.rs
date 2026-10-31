@@ -90,6 +90,19 @@ impl Redactor {
         Self::from_entries(text.lines().filter_map(parse_env_line))
     }
 
+    /// A redactor over the secrets of both, so one pass masks every value of either.
+    ///
+    /// The skipped key names of both are kept. Neither input changes.
+    #[must_use]
+    pub fn merged(&self, other: &Self) -> Self {
+        let mut secrets: Vec<String> = self.secrets.iter().chain(&other.secrets).cloned().collect();
+        secrets.sort_by(|a, b| b.len().cmp(&a.len()).then_with(|| a.cmp(b)));
+        secrets.dedup();
+        let mut skipped = self.skipped.clone();
+        skipped.extend(other.skipped.iter().cloned());
+        Self { secrets, skipped }
+    }
+
     /// Names of env file keys whose values were skipped as too short or trivial.
     ///
     /// Holds key names only, never values, so callers can log it.
@@ -255,6 +268,20 @@ mod tests {
     use serde_json::json;
 
     use super::*;
+
+    #[test]
+    fn a_merged_redactor_masks_both_sets_and_overlaps_in_one_pass() {
+        let a = Redactor::new(["alpha-secret-aaaa", "shared-secret-1"]);
+        let b = Redactor::new(["shared-secret-1", "beta-secret-bbbb"]);
+        let both = a.merged(&b);
+        assert_eq!(both.len(), 3);
+        let out = both.redact_str("alpha-secret-aaaa beta-secret-bbbb shared-secret-1");
+        assert_eq!(out, format!("{PLACEHOLDER} {PLACEHOLDER} {PLACEHOLDER}"));
+        let overlap = Redactor::new(["abcdefgh-one"]).merged(&Redactor::new(["gh-one-ijklmn"]));
+        assert_eq!(overlap.redact_str("abcdefgh-one-ijklmn"), PLACEHOLDER);
+        assert_eq!(a.len(), 2);
+        assert!(Redactor::default().merged(&Redactor::default()).is_empty());
+    }
 
     #[test]
     fn debug_prints_the_count_and_skipped_keys_only() {

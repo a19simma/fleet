@@ -15,7 +15,9 @@ use crate::broker::{ExecError, GhCli, GhExecutor, GitExecutor, MirrorGit};
 use crate::phase::{Phases, elapsed_ms};
 use crate::proc::{CAPTURE_BYTES, CaptureError, Captured};
 use crate::runner::{AgentRunner, Failure, IntoFailure, Reporter, Scope};
-use crate::workspace::{Workspace, is_commit_sha, validate_job_id, validate_ref, validate_repo};
+use crate::workspace::{
+    Workspace, is_commit_sha, job_owner, validate_job_id, validate_ref, validate_repo,
+};
 
 const MAX_TITLE_CHARS: usize = 256;
 const MAX_PR_URL_BYTES: usize = 2048;
@@ -155,7 +157,7 @@ impl<R: Reporter> AgentRunner<R> {
                     &job.repo,
                     &refspec,
                 ],
-                Scope::Push,
+                Scope::Push(&job.job_id),
             )
             .await
             .map_err(|e| e.failure(ERR_PUSH))?;
@@ -287,7 +289,7 @@ impl<R: Reporter> AgentRunner<R> {
                     "pr", "list", "--repo", &job.repo, "--head", branch, "--state", "open",
                     "--limit", "1", "--json", "url", "--jq", ".[].url",
                 ],
-                Scope::Gh,
+                Scope::Gh(&job.job_id),
             )
             .await
             .ok()?;
@@ -296,6 +298,10 @@ impl<R: Reporter> AgentRunner<R> {
         } else {
             None
         }
+    }
+
+    fn holds_secret(&self, job_id: &str, text: &str) -> bool {
+        matches!(self.job_redactor(job_id).redact_str(text), Cow::Owned(_))
     }
 
     async fn commit_leftovers(&self, job: &Job, cwd: &Path, dir: &Path) -> Result<(), Failure> {
@@ -367,7 +373,7 @@ impl<R: Reporter> AgentRunner<R> {
         if !staged.success || staged.truncated {
             return Err(Failure::bare(ERR_COMMITS));
         }
-        if matches!(self.redactor.redact_str(&staged.stdout), Cow::Owned(_)) {
+        if self.holds_secret(&job.job_id, &staged.stdout) {
             return Err(Failure::bare(ERR_SECRET));
         }
         if staged.stdout.is_empty() {
@@ -428,8 +434,11 @@ impl<R: Reporter> AgentRunner<R> {
         .await
         .map_err(|e| e.failure(ERR_COMMITS))?;
         let root = cwd.parent().ok_or_else(|| Failure::bare(ERR_COMMITS))?;
-        link_mirror(dir, &Workspace::mirror_dir(root, &job.repo))
-            .map_err(|_| Failure::bare(ERR_COMMITS))?;
+        link_mirror(
+            dir,
+            &Workspace::mirror_dir_for(root, &job_owner(job), &job.repo),
+        )
+        .map_err(|_| Failure::bare(ERR_COMMITS))?;
         let worktree = cwd.to_str().ok_or_else(|| Failure::bare(ERR_COMMITS))?;
         let head = format!("+refs/heads/{branch}:refs/heads/{branch}");
         let pinned = is_commit_sha(&job.base_ref);
@@ -540,7 +549,7 @@ impl<R: Reporter> AgentRunner<R> {
                     "--body",
                     body,
                 ],
-                Scope::Gh,
+                Scope::Gh(&job.job_id),
             )
             .await
             .map_err(|e| e.failure(ERR_PR))?;
@@ -955,6 +964,7 @@ mod tests {
         let root = dir.path().join("jobs");
         let checkout = Workspace::new(&root)
             .with_policy(RepoPolicy::new(Vec::<String>::new()).with_file_repos())
+            .with_owner("7")
             .prepare("job1", &url, "main")
             .await?;
         std::fs::write(checkout.path.join("b.txt"), "two")?;
@@ -967,6 +977,7 @@ mod tests {
             job_id: "job1".into(),
             repo: url.clone(),
             base_ref: "main".into(),
+            user_id: 7,
             ..Job::default()
         };
         let scratch = Scratch::create(&checkout.path, "job1").map_err(|()| "scratch")?;
@@ -976,7 +987,7 @@ mod tests {
             .map_err(|_| "ahead")?;
         assert!(ahead);
         let alternates = std::fs::read_to_string(scratch.path().join("objects/info/alternates"))?;
-        let mirror = Workspace::mirror_dir(&root, &url);
+        let mirror = Workspace::mirror_dir_for(&root, "7", &url);
         assert_eq!(
             Path::new(alternates.trim()),
             std::path::absolute(mirror)?.join("objects")

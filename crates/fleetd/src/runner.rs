@@ -68,6 +68,7 @@ use tonic::{Code, Status};
 
 use crate::agent_config::{Bundle, JOB_EMAIL, JOB_NAME, JUDGE_PROTOCOL, JobDir, protocol_for};
 use crate::askpass;
+use crate::cred::CredentialBook;
 use crate::feed::Feed;
 use crate::fetch_service::FeedBook;
 use crate::floor::{BoxCeilings, PERMISSION_MODE};
@@ -82,6 +83,7 @@ use crate::publish::{GH_CONFIG_DIR, HOME_DIR, JobPublish, Published};
 use crate::telemetry::Terminal as Ending;
 use crate::toolhook::HookHub;
 mod ci;
+mod token;
 
 use crate::workspace::{RepoPolicy, validate_job_id};
 
@@ -700,6 +702,8 @@ pub struct AgentRunner<R> {
     launcher: Arc<dyn Launcher>,
     reporter: R,
     pub(crate) redactor: Redactor,
+    pub(crate) credentials: Option<Arc<CredentialBook>>,
+    pub(crate) job_redactors: Mutex<HashMap<String, Arc<Redactor>>>,
     carries: Mutex<HashMap<String, Carry>>,
     phases: Mutex<HashMap<String, Phases>>,
     profiles: Mutex<HashMap<String, Arc<Applied>>>,
@@ -730,6 +734,8 @@ impl<R: Reporter> AgentRunner<R> {
             launcher: Arc::new(DirectLauncher),
             reporter,
             redactor,
+            credentials: None,
+            job_redactors: Mutex::new(HashMap::new()),
             carries: Mutex::new(HashMap::new()),
             phases: Mutex::new(HashMap::new()),
             profiles: Mutex::new(HashMap::new()),
@@ -942,7 +948,7 @@ impl<R: Reporter> AgentRunner<R> {
             parse_verdict(
                 text,
                 stream.model.as_deref().unwrap_or_default(),
-                &self.redactor,
+                &self.job_redactor(&job.job_id),
             )
         });
         let sent = verdict.is_some();
@@ -1039,16 +1045,17 @@ impl<R: Reporter> AgentRunner<R> {
             .unwrap_or_else(PoisonError::into_inner)
             .remove(&key);
         self.forget_publish(&job.job_id);
+        self.forget_job_redactor(&job.job_id);
         if let Some(feeds) = &self.feeds {
             feeds.forget(&job.job_id);
         }
         self.end.fire(&job.job_id);
     }
 
-    fn feed_book(&self) -> Option<(Arc<FeedBook>, Redactor)> {
+    fn feed_book(&self, job_id: &str) -> Option<(Arc<FeedBook>, Redactor)> {
         self.feeds
             .clone()
-            .map(|feeds| (feeds, self.redactor.clone()))
+            .map(|feeds| (feeds, Redactor::clone(&self.job_redactor(job_id))))
     }
 
     fn carry_key(job: &Job) -> String {
@@ -1075,7 +1082,7 @@ impl<R: Reporter> AgentRunner<R> {
             self.config.terminal_report_timeout,
             carry,
             self.hub.clone(),
-            self.feed_book(),
+            self.feed_book(&job.job_id),
         );
         stream.feed().record(self.take_phases(job));
         stream
@@ -1199,7 +1206,7 @@ impl<R: Reporter> AgentRunner<R> {
             self.config.terminal_report_timeout,
             Carry::default(),
             self.hub.clone(),
-            self.feed_book(),
+            self.feed_book(&job.job_id),
         );
         stream.feed().record(self.take_phases(job));
         let result = self
@@ -1355,6 +1362,7 @@ impl<R: Reporter> AgentRunner<R> {
         shutdown: Shutdown,
     ) -> Result<FinishOutcome, RunError> {
         let mut stream = self.resume(job);
+        let redactor = self.job_redactor(&job.job_id);
         let mut ctl = Ctl {
             deadline: Box::pin(tokio::time::sleep(self.config.finish_timeout)),
             shutdown,
@@ -1401,7 +1409,7 @@ impl<R: Reporter> AgentRunner<R> {
                 };
                 if published.branch.is_none() {
                     tracing::info!("job ended with no changes");
-                    stream.push(&self.redactor, NO_CHANGES_NOTE);
+                    stream.push(&redactor, NO_CHANGES_NOTE);
                 }
                 stream
                     .terminal(Terminal {
@@ -1422,11 +1430,11 @@ impl<R: Reporter> AgentRunner<R> {
             Ok(Ok(Err(failure))) => {
                 tracing::warn!(
                     error = failure.error,
-                    stderr_tail = %self.log_tail(&failure.tail),
+                    stderr_tail = %Self::log_tail(&redactor, &failure.tail),
                     "job publish step failed"
                 );
                 for line in failure.tail.lines() {
-                    stream.push(&self.redactor, line);
+                    stream.push(&redactor, line);
                 }
                 stream.fail(None, failure.error).await;
                 Ok(FinishOutcome::Failed {
@@ -1453,8 +1461,8 @@ impl<R: Reporter> AgentRunner<R> {
         stream.fail(None, error).await;
     }
 
-    fn log_tail(&self, stderr: &str) -> String {
-        let redacted = self.redactor.redact_str(stderr);
+    fn log_tail(redactor: &Redactor, stderr: &str) -> String {
+        let redacted = redactor.redact_str(stderr);
         let mut start = redacted.len().saturating_sub(LOG_TAIL_BYTES);
         while !redacted.is_char_boundary(start) {
             start += 1;
@@ -1523,13 +1531,15 @@ impl<R: Reporter> AgentRunner<R> {
             .env("GH_PROMPT_DISABLED", "1");
         let allowed: &[&str] = match scope {
             Scope::Clean | Scope::Tree(_) => &CLEAN_ENV,
-            Scope::Push => &PUSH_ENV,
-            Scope::Gh => &GH_ENV,
+            Scope::Push(_) => &PUSH_ENV,
+            Scope::Gh(_) => &GH_ENV,
         };
         let token_host = self.config.repo_policy.token_host();
+        let holder = self.credentials.is_some();
         let kept = |name: &OsString| {
             allowed.iter().any(|keep| name == keep)
                 && match name.to_str() {
+                    Some("GH_TOKEN" | "GH_ENTERPRISE_TOKEN") if holder => false,
                     Some("GH_TOKEN") => token_host.is_some(),
                     Some("GH_ENTERPRISE_TOKEN") => {
                         token_host.is_some_and(|host| !host.eq_ignore_ascii_case("github.com"))
@@ -1546,14 +1556,14 @@ impl<R: Reporter> AgentRunner<R> {
         );
         match scope {
             Scope::Clean | Scope::Tree(_) => command.env("GIT_ALLOW_PROTOCOL", "file"),
-            Scope::Push => command
+            Scope::Push(_) => command
                 .env("GIT_ALLOW_PROTOCOL", self.config.repo_policy.protocols())
                 .envs(askpass::env(&self.config.askpass_bin))
                 .env(
                     askpass::HOST_ENV,
                     self.config.repo_policy.token_host().unwrap_or_default(),
                 ),
-            Scope::Gh => command
+            Scope::Gh(_) => command
                 .envs(token_host.map(|host| ("GH_HOST", host)))
                 .env("GH_CONFIG_DIR", dir.join(GH_CONFIG_DIR))
                 .env("GH_NO_UPDATE_NOTIFIER", "1")
@@ -1562,6 +1572,9 @@ impl<R: Reporter> AgentRunner<R> {
                 .env("GH_PAGER", "cat")
                 .env("PAGER", "cat"),
         };
+        if let Scope::Push(id) | Scope::Gh(id) = scope {
+            self.apply_github_token(&mut command, id, matches!(scope, Scope::Gh(_)));
+        }
         if let Scope::Tree(work) = scope {
             command
                 .current_dir(work)
@@ -1582,6 +1595,7 @@ impl<R: Reporter> AgentRunner<R> {
         stream: &mut Stream<'_, R>,
         ctl: &mut Ctl,
     ) -> Result<ExitStatus, End> {
+        let redactor = self.job_redactor(&stream.job.job_id);
         let mut lines = LineReader::new(BufReader::new(stdout), MAX_CHUNK_BYTES);
         let mut open = true;
         let mut status = None;
@@ -1600,7 +1614,7 @@ impl<R: Reporter> AgentRunner<R> {
                     if !lines.line.is_empty() {
                         let line = lines.line.strip_suffix(b"\n").unwrap_or(&lines.line);
                         let line = line.strip_suffix(b"\r").unwrap_or(line);
-                        stream.push(&self.redactor, &String::from_utf8_lossy(line));
+                        stream.push(&redactor, &String::from_utf8_lossy(line));
                         lines.line.clear();
                     }
                     if !matches!(read, Ok(true)) {
@@ -2387,8 +2401,8 @@ struct Terminal {
 #[derive(Clone, Copy)]
 pub(crate) enum Scope<'a> {
     Clean,
-    Push,
-    Gh,
+    Push(&'a str),
+    Gh(&'a str),
     Tree(&'a Path),
 }
 
