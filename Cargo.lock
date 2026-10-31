@@ -959,6 +959,7 @@ dependencies = [
  "tracing-subscriber",
  "unicode-general-category",
  "webpki-roots",
+ "zeroize",
 ]
 
 [[package]]
