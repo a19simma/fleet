@@ -10,3 +10,6 @@
 - **Wide row asserts.** Tuples above 12 fields lack `Debug` and trip `clippy::type_complexity`. Read wide rows in tests as `SELECT (to_jsonb(t) - 'job_id')::text` and compare with `serde_json::json!`.
 - **Job owner default.** `jobs.user_id` is NOT NULL with `DEFAULT bootstrap_user_id()` (migration 0018), so `INSERT INTO jobs` without a user id lands on the `bootstrap` user. The function creates the `bootstrap` user on first use, so a fresh DB has no users until a job lands. Bind `user_id` explicitly once ownership is wired, then drop the default.
 - **Migration backfill tests.** Use `#[sqlx::test(migrations = false)]`, run a `Migrator` filtered to versions below the new one, insert old-shape rows, then run the full `sqlx::migrate!`.
+- **Authority row lock.** A check-then-act inside a transaction (lease-authorised release) takes `FOR SHARE` or `FOR UPDATE` on the authority row, not only on the secret rows. A task that says "a needed credential is expired" must define needed, not any matching row.
+- **Ownership tasks.** List every RPC in the proto and classify each as scoped, global by design, or leaking, in a table in the report. Cancel and stats hid leaks behind a "reads only" brief.
+- **Recovery and reset tasks.** Enumerate every credential class of the user (passkeys, sessions, api tokens, setup codes) and test that each is revoked.
