@@ -50,7 +50,10 @@ impl FleetIngest for Stub {
             .and_then(|value| value.to_str().ok())
             .map(str::to_owned);
         let _ = self.seen.send((Instant::now(), auth, request.into_inner()));
-        Ok(Response::new(HeartbeatReply { next_in_s: 30 }))
+        Ok(Response::new(HeartbeatReply {
+            next_in_s: 30,
+            ..HeartbeatReply::default()
+        }))
     }
 }
 

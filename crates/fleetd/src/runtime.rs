@@ -1044,7 +1044,10 @@ mod tests {
             _request: tonic::Request<HeartbeatRequest>,
         ) -> Result<tonic::Response<HeartbeatReply>, tonic::Status> {
             let _ = self.0.send(());
-            Ok(tonic::Response::new(HeartbeatReply { next_in_s: 30 }))
+            Ok(tonic::Response::new(HeartbeatReply {
+                next_in_s: 30,
+                ..HeartbeatReply::default()
+            }))
         }
     }
 

@@ -216,6 +216,8 @@ impl FleetIngest for FleetService {
             .map_err(|err| storage_unavailable(&err))?;
         Ok(Response::new(HeartbeatReply {
             next_in_s: HEARTBEAT_INTERVAL_S,
+            update_manifest: None,
+            update_signature: None,
         }))
     }
 }

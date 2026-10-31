@@ -110,7 +110,10 @@ impl FleetIngest for Stub {
         request: Request<HeartbeatRequest>,
     ) -> Result<Response<HeartbeatReply>, Status> {
         self.record(&request);
-        Ok(Response::new(HeartbeatReply { next_in_s: 30 }))
+        Ok(Response::new(HeartbeatReply {
+            next_in_s: 30,
+            ..HeartbeatReply::default()
+        }))
     }
 }
 

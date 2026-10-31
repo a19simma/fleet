@@ -209,5 +209,6 @@ fn request(identity: &Identity, uptime: Duration, queue: QueueSnapshot) -> Heart
         queue_pending: queue.pending,
         queue_oldest_age_s: queue.oldest_age_s,
         last_ack_age_s: None,
+        protocol_version: fleet_proto::PROTOCOL_VERSION,
     }
 }
