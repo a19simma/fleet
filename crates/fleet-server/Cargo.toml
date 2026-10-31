@@ -25,6 +25,7 @@ tracing.workspace = true
 tracing-subscriber.workspace = true
 topcoat = "=0.11.0"
 webauthn-rs = "=0.5.5"
+openssl = { version = "0.10", features = ["vendored"] }
 http-body-util = "0.1.5"
 hyper = { version = "1.12.0", default-features = false, features = ["client", "http1"] }
 rustls = { version = "0.23.45", default-features = false, features = ["ring", "std", "tls12"] }
