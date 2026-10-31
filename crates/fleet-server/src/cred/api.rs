@@ -7,8 +7,9 @@ use std::sync::Arc;
 
 use fleet_core::credential::{CredentialKind, CredentialShape, Secret, validate};
 use fleet_proto::v1::{
-    CredentialInfo, DeleteCredentialReply, DeleteCredentialRequest, ListCredentialsReply,
-    PutCredentialRequest, VerifyCredentialReply, VerifyCredentialRequest,
+    CredentialInfo, DeleteCredentialReply, DeleteCredentialRequest, GetJobCredentialsReply,
+    JobCredential, ListCredentialsReply, PutCredentialRequest, VerifyCredentialReply,
+    VerifyCredentialRequest,
 };
 use fleet_proto::{MAX_CREDENTIAL_VALUE_BYTES, MAX_CREDENTIALS_PER_USER};
 use tonic::Status;
@@ -35,6 +36,10 @@ fn store_status(err: &StoreError) -> Status {
         StoreError::InvalidExpiry => Status::invalid_argument("invalid expiry"),
         StoreError::NotFound => Status::not_found("credential not found"),
         StoreError::TooMany => Status::resource_exhausted("too many credentials"),
+        StoreError::LeaseDenied => Status::permission_denied("lease does not match"),
+        StoreError::NoGithub => Status::failed_precondition("no github credential"),
+        StoreError::NoAgentCredential => Status::failed_precondition("no agent credential"),
+        StoreError::Expired => Status::failed_precondition("credential expired"),
         StoreError::Seal(_) => {
             tracing::error!(%err, "credential sealing failed");
             Status::internal("credential store error")
@@ -172,6 +177,39 @@ impl CredentialService {
             .await
             .map_err(|e| store_status(&e))?;
         Ok(DeleteCredentialReply {})
+    }
+
+    /// Releases the credentials of the owner of the job a Box holds the lease for.
+    ///
+    /// # Errors
+    ///
+    /// `PERMISSION_DENIED` with one fixed message for any lease mismatch, `FAILED_PRECONDITION`
+    /// when the owner has no GitHub credential, no credential the agent accepts, or a needed
+    /// credential is expired, `UNAVAILABLE` when storage fails. Nothing is recorded on error.
+    pub async fn job_credentials(
+        &self,
+        job_id: &str,
+        attempt: u32,
+        box_name: &str,
+    ) -> Result<GetJobCredentialsReply, Status> {
+        let released = self
+            .store
+            .release_for_job(job_id, attempt, box_name)
+            .await
+            .map_err(|e| store_status(&e))?;
+        let mut credentials = Vec::with_capacity(released.len());
+        for item in released {
+            let value = String::from_utf8(item.value.expose().to_vec()).map_err(|_| {
+                tracing::error!("released credential is not text");
+                Status::internal("credential store error")
+            })?;
+            credentials.push(JobCredential {
+                kind: item.kind.wire_name().to_owned(),
+                shape: item.shape.wire_name().to_owned(),
+                value,
+            });
+        }
+        Ok(GetJobCredentialsReply { credentials })
     }
 
     /// Checks a stored GitHub token against GitHub. No use row is written.

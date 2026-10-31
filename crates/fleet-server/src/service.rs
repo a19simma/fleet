@@ -312,9 +312,19 @@ impl FleetWorker for FleetService {
 
     async fn get_job_credentials(
         &self,
-        _request: Request<GetJobCredentialsRequest>,
+        request: Request<GetJobCredentialsRequest>,
     ) -> Result<Response<GetJobCredentialsReply>, Status> {
-        Err(Status::unimplemented("get_job_credentials"))
+        let service = self
+            .credentials
+            .as_ref()
+            .ok_or_else(|| Status::failed_precondition("credentials are not configured"))?;
+        let request = request.into_inner();
+        let name = validate_box(&request.r#box)
+            .map_err(|err| Status::invalid_argument(err.to_string()))?;
+        let reply = service
+            .job_credentials(&request.job_id, request.attempt, name.as_str())
+            .await?;
+        Ok(Response::new(reply))
     }
 
     async fn report_job(
