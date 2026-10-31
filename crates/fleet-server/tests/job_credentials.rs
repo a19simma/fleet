@@ -27,6 +27,14 @@ use tonic::transport::{Channel, Endpoint};
 use tonic::{Code, Request, Status};
 
 const BOX: &str = "box-token-0123456789abcdef0123456789";
+
+fn box_a() -> String {
+    format!("box-{}", 1)
+}
+
+fn box_b() -> String {
+    format!("box-{}", 2)
+}
 const CLIENT: &str = "client-token-0123456789abcdef012345";
 const REPO: &str = "https://example.com/org/repo.git";
 const PAT: &str = "github_pat_11ABCDEFG0abcdefghijklmnop";
@@ -152,9 +160,7 @@ impl World {
             .await
             .unwrap();
         self.worker
-            .claim_job(ClaimJobRequest {
-                r#box: "box-1".to_owned(),
-            })
+            .claim_job(ClaimJobRequest { r#box: box_a() })
             .await
             .unwrap()
             .into_inner()
@@ -216,7 +222,7 @@ async fn the_lease_holder_gets_the_owner_agent_and_github_credentials(pool: PgPo
         .await;
     w.put(w.bob, CredentialKind::GithubPat, BOB_PAT, None).await;
     let job = w.running(w.alice, "claude", "k1").await;
-    let reply = w.fetch(&job, job.attempt, "box-1").await.unwrap();
+    let reply = w.fetch(&job, job.attempt, &box_a()).await.unwrap();
     assert_eq!(
         pairs(&reply),
         vec![
@@ -242,7 +248,7 @@ async fn a_codex_job_gets_only_codex_and_github(pool: PgPool) {
         .await;
     w.put(w.alice, CredentialKind::GithubPat, PAT, None).await;
     let job = w.running(w.alice, "codex", "k1").await;
-    let reply = w.fetch(&job, job.attempt, "box-1").await.unwrap();
+    let reply = w.fetch(&job, job.attempt, &box_a()).await.unwrap();
     assert_eq!(
         pairs(&reply),
         vec![entry("codex_api_key", CODEX), entry("github_pat", PAT)]
@@ -259,21 +265,21 @@ async fn every_lease_mismatch_gets_the_same_denial(pool: PgPool) {
     let job = w.running(w.alice, "claude", "k1").await;
     let attempt = job.attempt;
 
-    let wrong_box = w.fetch(&job, attempt, "box-2").await.unwrap_err();
-    let wrong_attempt = w.fetch(&job, attempt + 1, "box-1").await.unwrap_err();
+    let wrong_box = w.fetch(&job, attempt, &box_b()).await.unwrap_err();
+    let wrong_attempt = w.fetch(&job, attempt + 1, &box_a()).await.unwrap_err();
     let mut missing = job.clone();
     missing.job_id = "01ARZ3NDEKTSV4RRFFQ69G5FAV".to_owned();
-    let unknown = w.fetch(&missing, attempt, "box-1").await.unwrap_err();
+    let unknown = w.fetch(&missing, attempt, &box_a()).await.unwrap_err();
     let mut malformed = job.clone();
     malformed.job_id = "not a job".to_owned();
-    let bad_id = w.fetch(&malformed, attempt, "box-1").await.unwrap_err();
-    let huge_attempt = w.fetch(&job, u32::MAX, "box-1").await.unwrap_err();
+    let bad_id = w.fetch(&malformed, attempt, &box_a()).await.unwrap_err();
+    let huge_attempt = w.fetch(&job, u32::MAX, &box_a()).await.unwrap_err();
 
     sqlx::query("UPDATE jobs SET lease_expires_at = now() - interval '1 second'")
         .execute(&w.pool)
         .await
         .unwrap();
-    let expired = w.fetch(&job, attempt, "box-1").await.unwrap_err();
+    let expired = w.fetch(&job, attempt, &box_a()).await.unwrap_err();
 
     sqlx::query(
         "UPDATE jobs SET lease_expires_at = now() + interval '1 hour', state = 'SUCCEEDED'",
@@ -281,7 +287,7 @@ async fn every_lease_mismatch_gets_the_same_denial(pool: PgPool) {
     .execute(&w.pool)
     .await
     .unwrap();
-    let finished = w.fetch(&job, attempt, "box-1").await.unwrap_err();
+    let finished = w.fetch(&job, attempt, &box_a()).await.unwrap_err();
 
     for status in [
         wrong_box,
@@ -309,7 +315,7 @@ async fn a_queued_job_has_no_lease(pool: PgPool) {
         .execute(&w.pool)
         .await
         .unwrap();
-    let status = w.fetch(&job, job.attempt, "box-1").await.unwrap_err();
+    let status = w.fetch(&job, job.attempt, &box_a()).await.unwrap_err();
     assert_eq!(status.code(), Code::PermissionDenied);
     assert_eq!(status.message(), DENIED);
     assert_eq!(w.uses().await, 0);
@@ -322,7 +328,7 @@ async fn an_owner_without_github_fails_with_a_fixed_error(pool: PgPool) {
         .await;
     w.put(w.bob, CredentialKind::GithubPat, BOB_PAT, None).await;
     let job = w.running(w.alice, "claude", "k1").await;
-    let status = w.fetch(&job, job.attempt, "box-1").await.unwrap_err();
+    let status = w.fetch(&job, job.attempt, &box_a()).await.unwrap_err();
     assert_eq!(status.code(), Code::FailedPrecondition);
     assert_eq!(status.message(), "no github credential");
     assert_eq!(w.uses().await, 0);
@@ -335,7 +341,7 @@ async fn an_owner_without_an_agent_credential_fails_with_a_fixed_error(pool: PgP
     w.put(w.alice, CredentialKind::CodexApiKey, CODEX, None)
         .await;
     let job = w.running(w.alice, "claude", "k1").await;
-    let status = w.fetch(&job, job.attempt, "box-1").await.unwrap_err();
+    let status = w.fetch(&job, job.attempt, &box_a()).await.unwrap_err();
     assert_eq!(status.code(), Code::FailedPrecondition);
     assert_eq!(status.message(), "no agent credential");
     assert_eq!(w.uses().await, 0);
@@ -360,7 +366,7 @@ async fn an_expired_credential_is_refused_with_a_fixed_error(pool: PgPool) {
     .execute(&w.pool)
     .await
     .unwrap();
-    let status = w.fetch(&job, job.attempt, "box-1").await.unwrap_err();
+    let status = w.fetch(&job, job.attempt, &box_a()).await.unwrap_err();
     assert_eq!(status.code(), Code::FailedPrecondition);
     assert_eq!(status.message(), "credential expired");
     assert!(!status.message().contains(PAT));
@@ -371,7 +377,7 @@ async fn an_expired_credential_is_refused_with_a_fixed_error(pool: PgPool) {
 async fn a_server_without_credentials_configured_refuses(pool: PgPool) {
     let mut w = world_with(pool, false).await;
     let job = w.running(w.alice, "claude", "k1").await;
-    let status = w.fetch(&job, job.attempt, "box-1").await.unwrap_err();
+    let status = w.fetch(&job, job.attempt, &box_a()).await.unwrap_err();
     assert_eq!(status.code(), Code::FailedPrecondition);
     assert_eq!(status.message(), "credentials are not configured");
 }
@@ -385,7 +391,7 @@ async fn released_credentials_never_print_their_value(pool: PgPool) {
     let job = w.running(w.alice, "claude", "k1").await;
     let released = w
         .creds
-        .release_for_job(&job.job_id, job.attempt, "box-1")
+        .release_for_job(&job.job_id, job.attempt, &box_a())
         .await
         .unwrap();
     assert_eq!(released.len(), 2);
@@ -417,7 +423,7 @@ async fn only_an_expired_agent_credential_is_refused(pool: PgPool) {
     w.put(w.alice, CredentialKind::GithubPat, PAT, None).await;
     let job = w.running(w.alice, "claude", "k1").await;
     expire(&w, "anthropic_api_key").await;
-    let status = w.fetch(&job, job.attempt, "box-1").await.unwrap_err();
+    let status = w.fetch(&job, job.attempt, &box_a()).await.unwrap_err();
     assert_eq!(status.code(), Code::FailedPrecondition);
     assert_eq!(status.message(), "credential expired");
     assert_eq!(w.uses().await, 0);
@@ -432,7 +438,7 @@ async fn an_expired_unneeded_claude_credential_is_skipped(pool: PgPool) {
     w.put(w.alice, CredentialKind::GithubPat, PAT, None).await;
     let job = w.running(w.alice, "claude", "k1").await;
     expire(&w, "anthropic_api_key").await;
-    let reply = w.fetch(&job, job.attempt, "box-1").await.unwrap();
+    let reply = w.fetch(&job, job.attempt, &box_a()).await.unwrap();
     assert_eq!(
         pairs(&reply),
         vec![
@@ -462,7 +468,7 @@ async fn a_kimi_job_gets_both_kimi_kinds(pool: PgPool) {
         .await;
     w.put(w.alice, CredentialKind::GithubPat, PAT, None).await;
     let job = w.running(w.alice, "kimi", "k1").await;
-    let reply = w.fetch(&job, job.attempt, "box-1").await.unwrap();
+    let reply = w.fetch(&job, job.attempt, &box_a()).await.unwrap();
     assert_eq!(
         pairs(&reply),
         vec![
@@ -485,7 +491,7 @@ async fn an_unknown_agent_has_no_agent_credential(pool: PgPool) {
         .await;
     w.put(w.alice, CredentialKind::GithubPat, PAT, None).await;
     let job = w.running(w.alice, "mystery", "k1").await;
-    let status = w.fetch(&job, job.attempt, "box-1").await.unwrap_err();
+    let status = w.fetch(&job, job.attempt, &box_a()).await.unwrap_err();
     assert_eq!(status.code(), Code::FailedPrecondition);
     assert_eq!(status.message(), "no agent credential");
     assert_eq!(w.uses().await, 0);
@@ -508,7 +514,7 @@ async fn job_writers_wait_while_a_release_is_open(pool: PgPool) {
     let creds = w.creds.clone();
     let (job_id, attempt) = (job.job_id.clone(), job.attempt);
     let release =
-        tokio::spawn(async move { creds.release_for_job(&job_id, attempt, "box-1").await });
+        tokio::spawn(async move { creds.release_for_job(&job_id, attempt, &box_a()).await });
     tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
     assert!(!release.is_finished());
 
