@@ -490,10 +490,11 @@ pub struct JobServices<R = SystemResolver, D = TcpDialer> {
 ///
 /// `Fetch` is a [`FetchService`] over the config's policy and caps, system DNS and plain TCP,
 /// recording through `feeds`. `EgressProxy` is a [`ConnectProxy`] over the config's
-/// `egress_allow` list (the model API host is always allowed) with the system resolver and
+/// `egress_allow` list (the model API host is allowed to a job never narrowed) with the system resolver and
 /// dialer, so every dial is pinned to an address that passed `netguard::is_public_address`.
 /// Both key their per-job state by the job id of the socket, never by the client. The `end`
-/// hook of the result calls [`FetchService::forget`] and [`ConnectProxy::forget`], so the
+/// hook of the result calls [`ConnectProxy::set_job_hosts`] before the agent starts and
+/// [`FetchService::forget`] and [`ConnectProxy::forget`] when the job ends, so the
 /// runner passes it to [`AgentRunner::with_job_end`] and a job id reused later starts at zero.
 /// `Broker` is a [`PerJob`] registry the runner fills at claim time ([`DaemonRunner`]); the
 /// `end` hook unregisters the job id from it and removes the job's broker scratch dir, so a
@@ -550,6 +551,12 @@ where
     ));
     let mut services = Services::new();
     let end = JobEnd::new()
+        .on_hosts({
+            let proxy = Arc::clone(&proxy);
+            move |job_id, hosts| {
+                proxy.set_job_hosts(job_id, hosts);
+            }
+        })
         .on_end({
             let fetch = Arc::clone(&fetch);
             move |job_id| fetch.forget(job_id)

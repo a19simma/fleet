@@ -642,14 +642,18 @@ fn spawn_direct<W: ChildWait + 'static>(
 #[derive(Clone, Default)]
 pub struct JobEnd {
     hooks: Vec<EndHook>,
+    host_hooks: Vec<HostsHook>,
 }
 
 type EndHook = Arc<dyn Fn(&str) + Send + Sync>;
+
+type HostsHook = Arc<dyn Fn(&str, &[&str]) + Send + Sync>;
 
 impl std::fmt::Debug for JobEnd {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("JobEnd")
             .field("hooks", &self.hooks.len())
+            .field("host_hooks", &self.host_hooks.len())
             .finish()
     }
 }
@@ -668,6 +672,15 @@ impl JobEnd {
         self
     }
 
+    /// Adds a hook that receives the job id and the model hosts of its runner just before the
+    /// agent starts. The hook must replace what an earlier call for the same id set. The
+    /// matching [`JobEnd::on_end`] hook clears it.
+    #[must_use]
+    pub fn on_hosts(mut self, hook: impl Fn(&str, &[&str]) + Send + Sync + 'static) -> Self {
+        self.host_hooks.push(Arc::new(hook));
+        self
+    }
+
     /// Adds a hook that unregisters the job id from `registry`, the registry of
     /// [`PerJob`] services the runner registers a broker in. Unregistering an id that is not
     /// there does nothing.
@@ -676,6 +689,13 @@ impl JobEnd {
         self.on_end(move |job_id| {
             registry.unregister(job_id);
         })
+    }
+
+    /// Runs every [`JobEnd::on_hosts`] hook for `job_id`.
+    pub fn set_hosts(&self, job_id: &str, hosts: &[&str]) {
+        for hook in &self.host_hooks {
+            let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| hook(job_id, hosts)));
+        }
     }
 
     /// Runs every hook for `job_id`.
@@ -1270,6 +1290,9 @@ impl<R: Reporter> AgentRunner<R> {
             spec.stamp.claude_version = version;
         }
         stream.feed().set_stamp(spec.stamp.clone());
+        if let Some(runner) = crate::agent::resolve(&job.agent) {
+            self.end.set_hosts(&job.job_id, runner.model_hosts());
+        }
         let program = spec.argv.first().cloned().unwrap_or_default();
         let Launched { stdout, mut proc } = match launch(spec) {
             Ok(launched) => launched,
@@ -3610,6 +3633,76 @@ mod tests {
         assert_eq!(held(&runner), 0);
         runner.end_job(&test_job());
         assert_eq!(held(&runner), 0);
+    }
+
+    #[tokio::test]
+    async fn each_runner_narrows_its_job_to_its_model_hosts_before_the_agent_starts() {
+        let cases: [(&str, &[&str]); 4] = [
+            ("", &["api.anthropic.com"]),
+            ("claude", &["api.anthropic.com"]),
+            ("codex", &["api.openai.com"]),
+            ("kimi", &["api.moonshot.ai", "api.kimi.com"]),
+        ];
+        for (agent, hosts) in cases {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let launcher = Arc::new(FakeLauncher::new(ExitStatus::from_raw(0), false));
+            let seen = Arc::new(Mutex::new(Vec::<(String, Vec<String>, usize)>::new()));
+            let end = super::JobEnd::new().on_hosts({
+                let seen = Arc::clone(&seen);
+                let specs = Arc::clone(&launcher.specs);
+                move |id, hosts| {
+                    let started = specs.lock().unwrap_or_else(PoisonError::into_inner).len();
+                    seen.lock().unwrap_or_else(PoisonError::into_inner).push((
+                        id.to_owned(),
+                        hosts.iter().map(|host| (*host).to_owned()).collect(),
+                        started,
+                    ));
+                }
+            });
+            let mut config = test_config(dir.path());
+            config.disposable = true;
+            let runner = AgentRunner::new(config, Replies { cancel: false }, Redactor::default())
+                .with_launcher(launcher.clone())
+                .with_job_end(end);
+            let (_trigger, shutdown) = Shutdown::channel();
+            let job = Job {
+                agent: agent.into(),
+                ..test_job()
+            };
+            let outcome = runner.run(&job, dir.path(), shutdown).await;
+            assert_eq!(outcome.ok(), Some(AgentOutcome::Succeeded), "{agent}");
+            let want: Vec<String> = hosts.iter().map(|host| (*host).to_owned()).collect();
+            assert_eq!(
+                *seen.lock().unwrap_or_else(PoisonError::into_inner),
+                [("job1".to_owned(), want, 0)],
+                "{agent}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn an_unsupported_agent_narrows_nothing() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let launcher = Arc::new(FakeLauncher::new(ExitStatus::from_raw(0), false));
+        let calls = Arc::new(Mutex::new(0_usize));
+        let end = super::JobEnd::new().on_hosts({
+            let calls = Arc::clone(&calls);
+            move |_, _| *calls.lock().unwrap_or_else(PoisonError::into_inner) += 1
+        });
+        let runner = AgentRunner::new(
+            test_config(dir.path()),
+            Replies { cancel: false },
+            Redactor::default(),
+        )
+        .with_launcher(launcher)
+        .with_job_end(end);
+        let (_trigger, shutdown) = Shutdown::channel();
+        let job = Job {
+            agent: "gemini".into(),
+            ..test_job()
+        };
+        let _ = runner.run(&job, dir.path(), shutdown).await;
+        assert_eq!(*calls.lock().unwrap_or_else(PoisonError::into_inner), 0);
     }
 
     #[test]

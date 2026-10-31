@@ -10,8 +10,10 @@
 //! version, an absolute URI, userinfo, an IP literal, a port other than 443, a bare CR or LF,
 //! folded headers, `Content-Length`, `Transfer-Encoding`, or bytes after the empty line before
 //! the `200` is a refusal. The host is lowercased and loses one trailing dot, then must equal
-//! [`MODEL_API_HOST`] or match a pattern of the Box config `egress_allow` list. No Profile or
-//! bundle input reaches this list.
+//! [`MODEL_API_HOST`] or match a pattern of the Box config `egress_allow` list. A Job the runner
+//! narrowed with [`ConnectProxy::set_job_hosts`] gets only the hosts its runner declares, so
+//! [`MODEL_API_HOST`] is no longer implied for it. No Profile or bundle input reaches this
+//! list.
 //!
 //! The service resolves the host itself. If any answer fails [`is_public_address`] (the one
 //! predicate of fetch, shared from [`crate::netguard`]) it refuses. It dials only the checked
@@ -40,7 +42,7 @@ use crate::fetch_policy::HostPattern;
 use crate::jobsock::{JobContext, ServeFuture, Service};
 use crate::netguard::is_public_address;
 
-/// The model API host, always allowed.
+/// The model API host of the claude runner, allowed to a Job that was never narrowed.
 pub const MODEL_API_HOST: &str = "api.anthropic.com";
 
 /// The only port a tunnel may target.
@@ -232,7 +234,7 @@ impl<R, D> fmt::Debug for ConnectProxy<R, D> {
 
 impl<R: Resolver, D: Dialer> ConnectProxy<R, D> {
     /// A proxy that allows [`MODEL_API_HOST`] and the hosts matching `allow`, the Box config
-    /// `egress_allow` list.
+    /// `egress_allow` list, to a Job that was never narrowed.
     #[must_use]
     pub fn new(allow: Vec<HostPattern>, limits: ProxyLimits, resolver: R, dialer: D) -> Self {
         Self {
@@ -264,9 +266,11 @@ impl<R: Resolver, D: Dialer> ConnectProxy<R, D> {
     }
 
     /// Narrows a Job to the hosts its runner declares, keeping only those inside the Box
-    /// `egress_allow` ceiling. [`MODEL_API_HOST`] is always kept. A declared host outside the
-    /// ceiling, or one that is not an exact host name, is dropped and never widens the
-    /// ceiling. Returns how many declared hosts were admitted.
+    /// `egress_allow` ceiling. The narrowing is strict: [`MODEL_API_HOST`] is kept only when
+    /// the runner declares it, so a codex or kimi Job never reaches the Anthropic host. A
+    /// declared host outside the ceiling, or one that is not an exact host name, is dropped and
+    /// never widens the narrowing. A second call for the same Job replaces the first. Returns
+    /// how many declared hosts were admitted.
     ///
     /// A Job never narrowed keeps the whole ceiling. [`ConnectProxy::forget`] clears the
     /// narrowing.
@@ -277,10 +281,7 @@ impl<R: Resolver, D: Dialer> ConnectProxy<R, D> {
                 Ok(pattern @ HostPattern::Exact(_)) => Some(pattern),
                 _ => None,
             })
-            .filter(|pattern| match pattern {
-                HostPattern::Exact(name) => self.in_ceiling(name),
-                HostPattern::Subdomain(_) => false,
-            })
+            .filter(|pattern| matches!(pattern, HostPattern::Exact(name) if self.in_ceiling(name)))
             .collect();
         let count = admitted.len();
         self.jobs
@@ -297,9 +298,6 @@ impl<R: Resolver, D: Dialer> ConnectProxy<R, D> {
     }
 
     fn allowed(&self, job_id: &str, host: &str) -> bool {
-        if host == MODEL_API_HOST {
-            return true;
-        }
         let jobs = self.jobs.lock().unwrap_or_else(PoisonError::into_inner);
         jobs.get(job_id)
             .and_then(|counts| counts.hosts.as_ref())
@@ -776,7 +774,7 @@ mod tests {
         .await?;
         assert_eq!(rig.proxy.set_job_hosts("job1", &["api.openai.com"]), 1);
         assert!(connect_status(&rig, "api.openai.com").await?);
-        assert!(connect_status(&rig, "api.anthropic.com").await?);
+        assert!(!connect_status(&rig, "api.anthropic.com").await?);
         assert!(!connect_status(&rig, "other.example").await?);
         Ok(())
     }
@@ -1353,6 +1351,128 @@ mod tests {
         read_until_closed(&mut stream).await?;
         assert_eq!(rig.proxy.stats("job1").refusals, 1);
         assert_eq!(rig.proxy.stats("job2"), ProxyStats::default());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_narrowed_job_never_reaches_the_anthropic_host_even_when_the_ceiling_lists_it()
+    -> TestResult {
+        let rig = Rig::start(Setup {
+            allow: vec!["api.openai.com", "api.anthropic.com"],
+            ..Setup::default()
+        })
+        .await?;
+        assert_eq!(rig.proxy.set_job_hosts("job1", &["api.openai.com"]), 1);
+        assert!(rig.proxy.allowed("job1", "api.openai.com"));
+        assert!(!rig.proxy.allowed("job1", "api.anthropic.com"));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_job_never_narrowed_keeps_the_whole_ceiling_and_the_model_host() -> TestResult {
+        let rig = Rig::start(Setup {
+            allow: vec!["pkg.example", "*.models.example"],
+            ..Setup::default()
+        })
+        .await?;
+        assert!(rig.proxy.allowed("job1", "pkg.example"));
+        assert!(rig.proxy.allowed("job1", "x.models.example"));
+        assert!(rig.proxy.allowed("job1", MODEL_API_HOST));
+        assert!(!rig.proxy.allowed("job1", "other.example"));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn forget_clears_the_narrowing_of_a_job() -> TestResult {
+        let rig = Rig::start(Setup {
+            allow: vec!["api.openai.com", "pkg.example"],
+            ..Setup::default()
+        })
+        .await?;
+        rig.proxy.set_job_hosts("job1", &["api.openai.com"]);
+        assert!(!rig.proxy.allowed("job1", "pkg.example"));
+        rig.proxy.forget("job1");
+        assert!(rig.proxy.allowed("job1", "pkg.example"));
+        assert!(rig.proxy.allowed("job1", MODEL_API_HOST));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_second_set_job_hosts_replaces_the_first() -> TestResult {
+        let rig = Rig::start(Setup {
+            allow: vec!["api.openai.com", "api.moonshot.ai"],
+            ..Setup::default()
+        })
+        .await?;
+        rig.proxy.set_job_hosts("job1", &["api.openai.com"]);
+        assert_eq!(rig.proxy.set_job_hosts("job1", &["api.moonshot.ai"]), 1);
+        assert!(rig.proxy.allowed("job1", "api.moonshot.ai"));
+        assert!(!rig.proxy.allowed("job1", "api.openai.com"));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_narrowing_never_leaks_to_another_job() -> TestResult {
+        let rig = Rig::start(Setup {
+            allow: vec!["api.openai.com", "pkg.example"],
+            ..Setup::default()
+        })
+        .await?;
+        rig.proxy.set_job_hosts("job1", &["api.openai.com"]);
+        assert!(rig.proxy.allowed("job2", "pkg.example"));
+        assert!(!rig.proxy.allowed("job1", "pkg.example"));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_hostile_declared_host_is_rejected_and_never_widens_the_narrowing() -> TestResult {
+        let long = format!("{}.openai.com", "a".repeat(300));
+        let hostile = [
+            "",
+            ".",
+            "api.openai.com.",
+            "api..openai.com",
+            "user@api.openai.com",
+            "api.openai.com:443",
+            "[::1]",
+            "::1",
+            "127.0.0.1",
+            " api.openai.com",
+            "api.openai.com ",
+            "api.openai.com\r\n",
+            "api.openai.com/x",
+            "\u{ff41}pi.openai.com",
+            "*.openai.com",
+            long.as_str(),
+        ];
+        for raw in hostile {
+            let rig = Rig::start(Setup {
+                allow: vec!["api.openai.com", "*.openai.com", "pkg.example"],
+                ..Setup::default()
+            })
+            .await?;
+            assert_eq!(rig.proxy.set_job_hosts("job1", &[raw]), 0, "{raw:?}");
+            for host in [
+                "api.openai.com",
+                "x.openai.com",
+                "pkg.example",
+                MODEL_API_HOST,
+            ] {
+                assert!(!rig.proxy.allowed("job1", host), "{raw:?} widened {host}");
+            }
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn an_uppercase_declared_host_is_normalised_to_the_exact_host() -> TestResult {
+        let rig = Rig::start(Setup {
+            allow: vec!["api.openai.com"],
+            ..Setup::default()
+        })
+        .await?;
+        assert_eq!(rig.proxy.set_job_hosts("job1", &["API.OpenAI.com"]), 1);
+        assert!(rig.proxy.allowed("job1", "api.openai.com"));
         Ok(())
     }
 }

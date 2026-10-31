@@ -54,7 +54,7 @@ The Anthropic legal page says developers "may not collect, store, or intermediat
 
 - The `sk-kimi-` prefix of `kimi_membership_key`.
 - Whether the Kimi CLI `--print` flag implies auto-approve. No Kimi CLI was available, so fleetd takes the stricter reading and runs a Kimi job only on a disposable box.
-- The Kimi model hosts `api.moonshot.ai` and `api.kimi.com`. No source in this ADR or ADR-0044 names them.
+- The Kimi model hosts `api.moonshot.ai` and `api.kimi.com`. No source in this ADR or ADR-0044 names them, and the per-job egress narrowing now passes exactly these two names, so a wrong name fails closed. They stay unverified until a live Kimi run.
 - The Kimi flags `--model=<m>`, `--work-dir`, `--output-format stream-json` and the `KIMI_API_KEY` and `KIMI_CODE_HOME` variables.
 - The 900 s lifetime and single-use refresh of Kimi OAuth tokens.
 - Whether the Codex CLI honours the `features.hooks` key. No live Codex run has checked it, and the argv `-c features.hooks=false` and the `config.toml` both set it.
