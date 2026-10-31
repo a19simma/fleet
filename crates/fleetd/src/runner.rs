@@ -83,6 +83,7 @@ use crate::publish::{GH_CONFIG_DIR, HOME_DIR, JobPublish, Published};
 use crate::telemetry::Terminal as Ending;
 use crate::toolhook::HookHub;
 mod ci;
+mod codex;
 mod token;
 
 use crate::workspace::{RepoPolicy, validate_job_id};
@@ -303,6 +304,8 @@ pub trait Reporter: Send + Sync {
 pub struct RunConfig {
     /// Agent binary, `claude` by default.
     pub claude_bin: PathBuf,
+    /// Codex binary, `codex` by default. Only a job whose `agent` is `codex` starts it.
+    pub codex_bin: PathBuf,
     /// GitHub CLI binary that opens the pull request, `gh` by default.
     pub gh_bin: PathBuf,
     /// The fleetd executable the push runs as `<path> askpass`, the current executable by
@@ -363,6 +366,7 @@ impl RunConfig {
     pub fn new(claude_bin: impl Into<PathBuf>, disposable: bool) -> Self {
         Self {
             claude_bin: claude_bin.into(),
+            codex_bin: PathBuf::from(crate::agent::codex::DEFAULT_PROGRAM),
             gh_bin: PathBuf::from("gh"),
             git_bin: PathBuf::from("git"),
             askpass_bin: std::env::current_exe().unwrap_or_else(|_| PathBuf::from("fleetd")),
@@ -704,6 +708,7 @@ pub struct AgentRunner<R> {
     pub(crate) redactor: Redactor,
     pub(crate) credentials: Option<Arc<CredentialBook>>,
     pub(crate) job_redactors: Mutex<HashMap<String, Arc<Redactor>>>,
+    codex_homes: Mutex<HashMap<String, crate::agent::codex::CodexHome>>,
     carries: Mutex<HashMap<String, Carry>>,
     phases: Mutex<HashMap<String, Phases>>,
     profiles: Mutex<HashMap<String, Arc<Applied>>>,
@@ -736,6 +741,7 @@ impl<R: Reporter> AgentRunner<R> {
             redactor,
             credentials: None,
             job_redactors: Mutex::new(HashMap::new()),
+            codex_homes: Mutex::new(HashMap::new()),
             carries: Mutex::new(HashMap::new()),
             phases: Mutex::new(HashMap::new()),
             profiles: Mutex::new(HashMap::new()),
@@ -1046,6 +1052,7 @@ impl<R: Reporter> AgentRunner<R> {
             .remove(&key);
         self.forget_publish(&job.job_id);
         self.forget_job_redactor(&job.job_id);
+        self.forget_codex_home(&job.job_id);
         if let Some(feeds) = &self.feeds {
             feeds.forget(&job.job_id);
         }
@@ -1226,12 +1233,15 @@ impl<R: Reporter> AgentRunner<R> {
         stream: &mut Stream<'_, R>,
         launch: impl FnOnce(AgentSpec) -> io::Result<Launched> + Send,
     ) -> Result<AgentOutcome, RunError> {
-        let root = self
-            .config
-            .jobs_dir
-            .as_deref()
-            .or_else(|| cwd.parent())
-            .unwrap_or(cwd);
+        if !crate::agent::resolve(&job.agent).is_some_and(|runner| {
+            matches!(
+                runner.name(),
+                crate::agent::CLAUDE | crate::agent::codex::NAME
+            )
+        }) {
+            return Ok(stream.fail(None, crate::agent::ERR_UNKNOWN_AGENT).await);
+        }
+        let root = self.jobs_root(cwd);
         let applied = self.profile_for(job);
         let bundle = applied
             .as_deref()
@@ -1249,16 +1259,22 @@ impl<R: Reporter> AgentRunner<R> {
                 return Ok(stream.fail(None, ERR_START).await);
             }
         };
+        let codex = Self::is_codex(job);
+        if codex && let Err(err) = self.codex_home(&job.job_id, cwd) {
+            tracing::warn!(kind = ?err.kind(), "codex home could not be created");
+            return Ok(stream.fail(None, ERR_START).await);
+        }
         let mut spec = self.agent_spec(job, cwd, &job_dir.home());
-        if let Some(version) = self.claude_version(cwd, &job_dir.home()).await {
+        if !codex && let Some(version) = self.claude_version(cwd, &job_dir.home()).await {
             spec.stamp.claude_version = version;
         }
         stream.feed().set_stamp(spec.stamp.clone());
+        let program = spec.argv.first().cloned().unwrap_or_default();
         let Launched { stdout, mut proc } = match launch(spec) {
             Ok(launched) => launched,
             Err(err) => {
                 tracing::warn!(
-                    program = %self.config.claude_bin.display(),
+                    program = %Path::new(&program).display(),
                     kind = ?err.kind(),
                     "agent could not be spawned"
                 );
@@ -1640,6 +1656,14 @@ impl<R: Reporter> AgentRunner<R> {
         Ok(status)
     }
 
+    fn jobs_root<'a>(&'a self, cwd: &'a Path) -> &'a Path {
+        self.config
+            .jobs_dir
+            .as_deref()
+            .or_else(|| cwd.parent())
+            .unwrap_or(cwd)
+    }
+
     fn agent_env_kept(&self, name: &OsString) -> bool {
         let Some(name) = name.to_str() else {
             return false;
@@ -1693,8 +1717,18 @@ impl<R: Reporter> AgentRunner<R> {
     /// The command line, environment and working directory for `job`'s agent.
     ///
     /// The environment is the allowlisted part of [`RunConfig::base_env`] plus the per-job
-    /// values, with `home` as `HOME` and `home/.claude` as `CLAUDE_CONFIG_DIR`.
+    /// values, with `home` as `HOME` and `home/.claude` as `CLAUDE_CONFIG_DIR`. A job whose
+    /// `agent` is `codex` gets the Codex argv and environment instead, with the one secret
+    /// `CODEX_API_KEY` from its held `codex_api_key`.
     pub fn agent_spec(&self, job: &Job, cwd: &Path, home: &Path) -> AgentSpec {
+        if Self::is_codex(job) {
+            self.codex_spec(job, cwd, home)
+        } else {
+            self.claude_spec(job, cwd, home)
+        }
+    }
+
+    fn claude_spec(&self, job: &Job, cwd: &Path, home: &Path) -> AgentSpec {
         let applied = self.profile_for(job);
         let judge = job.kind() == JobKind::Judge;
         let prompt = applied
@@ -2481,9 +2515,9 @@ fn cut(text: &mut String, max: usize) -> bool {
 mod tests {
     use super::{
         AgentOutcome, AgentProc, AgentRunner, AgentSpec, DENIED_TOOLS, DirectLauncher, ERR_EXIT,
-        ERR_FINISH_TIMEOUT, ERR_SIGNAL, ERR_TIMEOUT, Ending, Job, JobState, Launched, Launcher,
-        LineReader, Reporter, RunConfig, STRIPPED_ENV, UNKNOWN_STAMP, VERSION_CHARS, VersionStamp,
-        ending, parse_version,
+        ERR_FINISH_TIMEOUT, ERR_SIGNAL, ERR_START, ERR_TIMEOUT, Ending, Job, JobState, Launched,
+        Launcher, LineReader, Reporter, RunConfig, STRIPPED_ENV, UNKNOWN_STAMP, VERSION_CHARS,
+        VersionStamp, ending, parse_version, spawn_direct,
     };
     use crate::agent_config::protocol_for;
     use crate::fetch_service::{FeedBook, FetchRecorder};
@@ -2957,6 +2991,125 @@ mod tests {
             let home = dir.path().join(".agent").join("job1").join("home");
             assert_eq!(*specs, vec![runner.agent_spec(&job, dir.path(), &home)]);
         }
+    }
+
+    #[tokio::test]
+    async fn an_unsupported_agent_fails_with_the_fixed_message_and_never_launches() {
+        for agent in ["gemini", "Claude", "kimi"] {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let launcher = Arc::new(FakeLauncher::new(ExitStatus::from_raw(0), false));
+            let runner = AgentRunner::new(
+                test_config(dir.path()),
+                Replies { cancel: false },
+                Redactor::default(),
+            )
+            .with_launcher(launcher.clone());
+            let (_trigger, shutdown) = Shutdown::channel();
+            let job = Job {
+                agent: agent.into(),
+                ..test_job()
+            };
+            let outcome = runner.run(&job, dir.path(), shutdown).await;
+            assert_eq!(
+                outcome.ok(),
+                Some(AgentOutcome::Failed {
+                    exit_code: None,
+                    error: crate::agent::ERR_UNKNOWN_AGENT,
+                }),
+                "{agent}"
+            );
+            let count = launcher
+                .specs
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .len();
+            assert_eq!(count, 0, "{agent}");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_codex_job_launches_the_codex_argv_and_drops_its_home_when_the_job_ends() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let launcher = Arc::new(FakeLauncher::new(ExitStatus::from_raw(0), false));
+        let mut config = test_config(dir.path());
+        config.codex_bin = PathBuf::from("codex-fake");
+        let runner = AgentRunner::new(config, Replies { cancel: false }, Redactor::default())
+            .with_launcher(launcher.clone());
+        let (_trigger, shutdown) = Shutdown::channel();
+        let job = Job {
+            agent: "codex".into(),
+            ..test_job()
+        };
+        let outcome = runner.run(&job, dir.path(), shutdown).await;
+        assert_eq!(outcome.ok(), Some(AgentOutcome::Succeeded));
+        let spec = launcher
+            .specs
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)[0]
+            .clone();
+        assert_eq!(spec.argv.first(), Some(&OsString::from("codex-fake")));
+        assert_eq!(spec.argv.get(1), Some(&OsString::from("exec")));
+        let home = dir.path().join(".codex").join("job1");
+        assert!(home.is_dir());
+        runner.end_job(&job);
+        assert!(!home.exists());
+    }
+
+    #[tokio::test]
+    async fn a_codex_job_whose_home_cannot_be_built_fails_with_the_start_error() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::write(dir.path().join(".codex"), b"x").expect("write");
+        let launcher = Arc::new(FakeLauncher::new(ExitStatus::from_raw(0), false));
+        let runner = AgentRunner::new(
+            test_config(dir.path()),
+            Replies { cancel: false },
+            Redactor::default(),
+        )
+        .with_launcher(launcher.clone());
+        let (_trigger, shutdown) = Shutdown::channel();
+        let job = Job {
+            agent: "codex".into(),
+            ..test_job()
+        };
+        let outcome = runner.run(&job, dir.path(), shutdown).await;
+        assert_eq!(
+            outcome.ok(),
+            Some(AgentOutcome::Failed {
+                exit_code: None,
+                error: ERR_START,
+            })
+        );
+        assert!(
+            launcher
+                .specs
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .is_empty()
+        );
+    }
+
+    #[tokio::test]
+    async fn the_direct_spawn_clears_the_env_and_gives_the_child_no_stdin() {
+        use tokio::io::AsyncReadExt;
+        let spec = AgentSpec {
+            argv: vec![
+                "/bin/sh".into(),
+                "-c".into(),
+                "if read -r line; then echo stdin=open; else echo stdin=null; fi; echo A=$A; echo H=${HOME-unset}".into(),
+            ],
+            env: std::collections::BTreeMap::from([(OsString::from("A"), OsString::from("1"))]),
+            cwd: PathBuf::from("/"),
+            stamp: VersionStamp::default(),
+        };
+        let mut launched = spawn_direct(&spec, std::convert::identity).expect("spawn");
+        let mut out = String::new();
+        launched
+            .stdout
+            .read_to_string(&mut out)
+            .await
+            .expect("read");
+        let _ = launched.proc.wait().await;
+        assert_eq!(out, "stdin=null\nA=1\nH=unset\n");
     }
 
     fn version_script(mode: &str) -> PathBuf {

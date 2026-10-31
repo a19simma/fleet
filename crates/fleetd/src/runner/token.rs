@@ -392,6 +392,119 @@ mod tests {
         Ok(())
     }
 
+    fn codex_job(job_id: &str) -> Job {
+        Job {
+            job_id: job_id.into(),
+            agent: "codex".into(),
+            prompt: "do it".into(),
+            ..Job::default()
+        }
+    }
+
+    fn codex_spec(
+        runner: &AgentRunner<Quiet>,
+        dir: &Path,
+        job_id: &str,
+    ) -> crate::runner::AgentSpec {
+        runner.agent_spec(&codex_job(job_id), &dir.join("work"), &dir.join("home"))
+    }
+
+    fn spec_pairs(spec: &crate::runner::AgentSpec) -> Vec<(String, String)> {
+        spec.env
+            .iter()
+            .filter_map(|(k, v)| Some((k.to_str()?.to_owned(), v.to_str()?.to_owned())))
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn the_codex_env_holds_the_holder_key_and_no_other_secret()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (mut runner, _book, dir) = fixture_kind(true, "codex_api_key").await?;
+        runner.config.codex_bin = "codex-fake".into();
+        runner
+            .config
+            .base_env
+            .push(("CODEX_API_KEY".into(), BOX_KEY.into()));
+        let spec = codex_spec(&runner, dir.path(), "job1");
+        let env = spec_pairs(&spec);
+        let expected: BTreeSet<&str> = [
+            "PATH",
+            "FLEET_JOB_ID",
+            "SWARM_BOX",
+            "HOME",
+            "CODEX_HOME",
+            "XDG_CONFIG_HOME",
+            "XDG_CACHE_HOME",
+            "GIT_TERMINAL_PROMPT",
+            "CODEX_API_KEY",
+        ]
+        .into_iter()
+        .collect();
+        assert_eq!(keys(&env), expected);
+        assert_eq!(value(&env, "CODEX_API_KEY"), Some(AGENT));
+        assert!(env.iter().all(|(_, v)| v != BOX_PAT
+            && v != BOX_ENT
+            && v != BOX_OAUTH
+            && v != BOX_KEY
+            && v != HOLDER));
+        assert_eq!(spec.argv.first(), Some(&"codex-fake".into()));
+        assert_eq!(spec.argv.get(1), Some(&"exec".into()));
+        assert_eq!(spec.argv.last(), Some(&"do it".into()));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn the_codex_home_exists_for_the_job_and_end_job_removes_it()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (runner, _book, dir) = fixture_kind(true, "codex_api_key").await?;
+        let spec = codex_spec(&runner, dir.path(), "job1");
+        let home = std::path::PathBuf::from(
+            spec.env
+                .get(std::ffi::OsStr::new("CODEX_HOME"))
+                .ok_or("CODEX_HOME")?,
+        );
+        assert_eq!(home, dir.path().join(".codex").join("job1"));
+        assert!(home.join("config.toml").is_file());
+        assert_eq!(codex_spec(&runner, dir.path(), "job1"), spec);
+        runner.end_job(&codex_job("job1"));
+        assert!(!home.exists());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_codex_job_with_no_held_key_gets_no_key_and_no_box_fallback()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (mut runner, _book, dir) = fixture_kind(true, "codex_api_key").await?;
+        runner
+            .config
+            .base_env
+            .push(("CODEX_API_KEY".into(), BOX_KEY.into()));
+        let env = spec_pairs(&codex_spec(&runner, dir.path(), "job2"));
+        assert!(value(&env, "CODEX_API_KEY").is_none());
+        assert!(env.iter().all(|(_, v)| v != BOX_KEY && v != AGENT));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_codex_job_needs_a_held_codex_key() -> Result<(), Box<dyn std::error::Error>> {
+        for (kind, agent, expected) in [
+            ("codex_api_key", "codex", true),
+            ("anthropic_api_key", "codex", false),
+            ("codex_api_key", "claude", false),
+            ("codex_api_key", "", false),
+            ("anthropic_api_key", "claude", true),
+        ] {
+            let (_runner, book, _dir) = fixture_kind(true, kind).await?;
+            let held = book.get("job1").ok_or("held")?;
+            assert_eq!(
+                crate::agent::holds_model_credential(agent, &held),
+                expected,
+                "{kind} for {agent}"
+            );
+        }
+        Ok(())
+    }
+
     #[tokio::test]
     async fn a_judge_job_keeps_its_base_env_model_token() -> Result<(), Box<dyn std::error::Error>>
     {
