@@ -32,6 +32,10 @@ const INSERT_TOKEN: &str = "\
 INSERT INTO api_tokens (user_id, hash, label) VALUES ($1, sha256($2::bytea), $3) RETURNING id";
 const FIND_TOKEN: &str = "\
 SELECT user_id FROM api_tokens WHERE hash = sha256($1::bytea) AND revoked_at IS NULL";
+const FIND_USER_CODE: &str = "\
+SELECT user_id FROM setup_codes \
+WHERE hash = sha256($1::bytea) AND used_at IS NULL AND expires_at > now()";
+const LOCK_USER: &str = "SELECT id FROM users WHERE id = $1 FOR UPDATE";
 const REDEEM_USER_CODE: &str = "\
 UPDATE setup_codes SET used_at = now() \
 WHERE hash = sha256($1::bytea) AND used_at IS NULL AND expires_at > now() RETURNING user_id";
@@ -268,9 +272,51 @@ impl Users {
     ///
     /// Returns [`UserError::BadSetupCode`] for an unknown, used or expired code.
     pub async fn redeem_user_setup(&self, code: &[u8]) -> Result<i64, UserError> {
-        sqlx::query_scalar(REDEEM_USER_CODE)
+        let mut tx = self.pool.begin().await?;
+        let user_id = Self::redeem_user_setup_in(&mut tx, code).await?;
+        tx.commit().await?;
+        Ok(user_id)
+    }
+
+    /// Checks an admin-issued setup code without spending it and returns its user.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`UserError::BadSetupCode`] for an unknown, used or expired code.
+    pub async fn check_user_setup(&self, code: &[u8]) -> Result<i64, UserError> {
+        sqlx::query_scalar(FIND_USER_CODE)
             .bind(code)
             .fetch_optional(&self.pool)
+            .await?
+            .ok_or(UserError::BadSetupCode)
+    }
+
+    /// Spends an admin-issued setup code inside the caller's transaction.
+    ///
+    /// The user row is locked with `FOR UPDATE` before the code is spent, so a concurrent
+    /// passkey reset either finishes first and voids the code, or waits for the caller's
+    /// commit. The caller stores the passkey in the same transaction before committing.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`UserError::BadSetupCode`] for an unknown, used or expired code.
+    pub async fn redeem_user_setup_in(
+        conn: &mut sqlx::PgConnection,
+        code: &[u8],
+    ) -> Result<i64, UserError> {
+        let user_id: i64 = sqlx::query_scalar(FIND_USER_CODE)
+            .bind(code)
+            .fetch_optional(&mut *conn)
+            .await?
+            .ok_or(UserError::BadSetupCode)?;
+        sqlx::query(LOCK_USER)
+            .bind(user_id)
+            .fetch_optional(&mut *conn)
+            .await?
+            .ok_or(UserError::BadSetupCode)?;
+        sqlx::query_scalar(REDEEM_USER_CODE)
+            .bind(code)
+            .fetch_optional(&mut *conn)
             .await?
             .ok_or(UserError::BadSetupCode)
     }

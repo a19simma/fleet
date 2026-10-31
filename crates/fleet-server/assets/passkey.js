@@ -98,6 +98,10 @@ async function run() {
     const code = decodeURIComponent(location.pathname.split("/").pop());
     await register("/passkey/setup/start", "/passkey/setup/finish", { code, username: username.value });
     location.assign("/account");
+  } else if (mode === "enroll") {
+    const code = decodeURIComponent(location.pathname.split("/").pop());
+    await register("/passkey/enroll/start", "/passkey/enroll/finish", { code });
+    location.assign("/account");
   } else if (mode === "login") {
     const started = await post("/passkey/login/start", { username: username.value });
     const got = await navigator.credentials.get(requestOptions(started.options));
