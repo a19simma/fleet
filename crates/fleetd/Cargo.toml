@@ -36,8 +36,10 @@ tracing.workspace = true
 tracing-subscriber.workspace = true
 webpki-roots = "1.0.9"
 zeroize.workspace = true
+minisign-verify = "0.3.0"
 
 [dev-dependencies]
+ring = "0.17.14"
 rcgen = { version = "0.14.10", default-features = false, features = ["pem", "ring"] }
 fleet-cli = { path = "../fleet-cli" }
 fleet-server = { path = "../fleet-server" }

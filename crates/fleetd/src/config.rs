@@ -90,6 +90,7 @@ struct FileConfig {
     fetch_max_redirects: Option<i64>,
     fetch_max_per_job: Option<i64>,
     egress_allow: Option<Vec<String>>,
+    egress_observe: Option<bool>,
 }
 
 /// How agents are started.
@@ -214,6 +215,9 @@ pub struct Config {
     /// Hosts the egress proxy may `CONNECT` to, `host.example` or `*.example`, empty by
     /// default. Config file only: no Profile or bundle can add hosts (ADR-0038).
     pub egress_allow: Vec<HostPattern>,
+    /// When true, the egress proxy logs each refused host name once per process, host only,
+    /// and still refuses. Default false. Config file only.
+    pub egress_observe: bool,
 }
 
 impl Config {
@@ -349,6 +353,7 @@ impl Config {
             fetch_policy,
             fetch_caps,
             egress_allow,
+            egress_observe: file.egress_observe.unwrap_or(false),
         })
     }
 }
@@ -1032,6 +1037,16 @@ mod tests {
         assert_eq!(cfg.fetch_policy, FetchPolicy::AllowAllPublicHosts);
         assert_eq!(cfg.fetch_caps, FetchCaps::default());
         assert_eq!(cfg.egress_allow, Vec::new());
+        assert!(!cfg.egress_observe);
+    }
+
+    #[test]
+    fn egress_observe_reads_a_boolean_and_rejects_other_types() {
+        let on = Config::resolve(Some("egress_observe = true\n"), &env_of(&[])).unwrap();
+        assert!(on.egress_observe);
+        let off = Config::resolve(Some("egress_observe = false\n"), &env_of(&[])).unwrap();
+        assert!(!off.egress_observe);
+        assert!(Config::resolve(Some("egress_observe = \"yes\"\n"), &env_of(&[])).is_err());
     }
 
     #[test]

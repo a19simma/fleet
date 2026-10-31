@@ -52,6 +52,7 @@ pub mod systemd;
 pub mod telemetry;
 pub mod toolhook;
 pub mod transport;
+pub mod update;
 pub mod workspace;
 
 pub use app::{AppState, hook_router, hook_socket_router, socket_router};
