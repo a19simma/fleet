@@ -1,5 +1,6 @@
 //! Credential storage support: sealing of secrets at rest (ADR-0040).
 
+pub mod admin;
 pub mod api;
 pub mod github;
 pub mod seal;
