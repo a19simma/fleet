@@ -51,6 +51,8 @@ cargo test --workspace
 docker compose -f compose.test.yaml down
 ```
 
+Each test opens up to five pooled connections plus one setup connection, and a Postgres default `max_connections` of 100 runs out at about 16 parallel tests, which fails with `sorry, too many clients already` or a 30 s `PoolTimedOut`. `.cargo/config.toml` caps `RUST_TEST_THREADS` at 8 for `cargo test`. Passing `--test-threads` or running the test binaries directly bypasses that cap, so start Postgres with `-c max_connections=300` when you do. Only one process per test binary may use a Postgres at a time, because `sqlx::test` derives database names from the test path.
+
 The `docker compose` plugin may be missing. This `docker run` starts the same database, published on loopback only:
 
 ```sh
