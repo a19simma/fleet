@@ -1,12 +1,14 @@
 //! The Topcoat router: pages, the embedded assets and the passkey routes.
 
 use std::collections::HashMap;
+use std::net::IpAddr;
 use std::sync::Arc;
 
 use crate::cred::{CredentialService, Users};
 use crate::store::Store;
 use fleet_core::constant_time_eq;
 use serde_json::{Value, json};
+use tonic::transport::server::TcpConnectInfo;
 use topcoat::{
     Result,
     context::{Cx, app_context},
@@ -15,7 +17,7 @@ use topcoat::{
         content::{Form, Json},
         error::{bad_request, forbidden, internal_server_error, not_found, see_other},
         header, page,
-        request::headers,
+        request::{extensions, headers},
         response::response_headers,
         route,
     },
@@ -23,6 +25,7 @@ use topcoat::{
 };
 use webauthn_rs::prelude::{PublicKeyCredential, RegisterPublicKeyCredential};
 
+use super::clientip::client_ip;
 use super::credentials::{Backend, CredentialSlot};
 use super::jobs::ConsoleSlot;
 use super::passkeys::{AuthError, SESSION_COOKIE, SESSION_TTL_SECS, SessionInfo, WebAuth};
@@ -81,6 +84,19 @@ fn assertion(body: &Value) -> Result<PublicKeyCredential> {
     body.get("credential")
         .and_then(|value| serde_json::from_value(value.clone()).ok())
         .ok_or_else(|| bad_request("invalid request").into())
+}
+
+fn client(cx: &Cx, auth: &WebAuth) -> IpAddr {
+    let peer = extensions(cx)
+        .get::<TcpConnectInfo>()
+        .and_then(TcpConnectInfo::remote_addr)
+        .map(|addr| addr.ip());
+    let forwarded: Vec<&str> = headers(cx)
+        .get_all("x-forwarded-for")
+        .iter()
+        .filter_map(|value| value.to_str().ok())
+        .collect();
+    client_ip(peer, &forwarded, auth.trusted_hops())
 }
 
 fn session_cookie(map: &HeaderMap) -> Option<&str> {
@@ -153,7 +169,7 @@ async fn login_page(cx: &Cx) -> Result<impl View> {
                     <label>"Username"
                         <input id="username" name="username" autocomplete="username webauthn" required="">
                     </label>
-                    <button type="submit">"Sign in with a passkey"</button>
+                    <button type="submit">"Sign in"</button>
                 </form>
                 <p id="status"></p>
                 <script src=(SCRIPT_PATH) defer=""></script>
@@ -178,7 +194,35 @@ async fn setup_page(cx: &Cx) -> Result<impl View> {
                     <label>"Username"
                         <input id="username" name="username" autocomplete="username" required="">
                     </label>
-                    <button type="submit">"Register a passkey"</button>
+                    <button type="submit">"Create a passkey"</button>
+                </form>
+                <p id="status"></p>
+                <script src=(SCRIPT_PATH) defer=""></script>
+            </body>
+        </html>
+    })
+}
+
+#[page("/setup")]
+async fn setup_password_page(cx: &Cx) -> Result<impl View> {
+    auth(cx)?;
+    Ok(view! {
+        <!DOCTYPE html>
+        <html>
+            <head>
+                <title>"fleet setup"</title>
+                <link rel="stylesheet" href=(STYLE_PATH)>
+            </head>
+            <body data-mode="setup-password">
+                <h1>"Create the admin"</h1>
+                <form id="passkey-form" autocomplete="off">
+                    <label>"Username"
+                        <input id="username" name="username" autocomplete="username" required="">
+                    </label>
+                    <label>"Setup password"
+                        <input id="password" name="password" type="password" autocomplete="off" required="">
+                    </label>
+                    <button type="submit">"Create a passkey"</button>
                 </form>
                 <p id="status"></p>
                 <script src=(SCRIPT_PATH) defer=""></script>
@@ -198,9 +242,9 @@ async fn enroll_page(cx: &Cx) -> Result<impl View> {
                 <link rel="stylesheet" href=(STYLE_PATH)>
             </head>
             <body data-mode="enroll">
-                <h1>"Register a passkey"</h1>
+                <h1>"Create a passkey"</h1>
                 <form id="passkey-form">
-                    <button type="submit">"Register a passkey"</button>
+                    <button type="submit">"Create a passkey"</button>
                 </form>
                 <p id="status"></p>
                 <script src=(SCRIPT_PATH) defer=""></script>
@@ -217,6 +261,19 @@ async fn account(cx: &Cx) -> Result<impl View> {
     };
     let csrf = String::from_utf8_lossy(session.csrf.expose()).into_owned();
     let name = session.username;
+    let rows: Vec<PasskeyView> = auth
+        .list_passkeys(session.user_id)
+        .await
+        .map_err(fail)?
+        .into_iter()
+        .enumerate()
+        .map(|(index, row)| PasskeyView {
+            label: format!("Passkey {}", index + 1),
+            id: row.id.to_string(),
+            created: row.created,
+            last_used: row.last_used.unwrap_or_else(|| "never".to_owned()),
+        })
+        .collect();
     Ok(view! {
         <!DOCTYPE html>
         <html>
@@ -229,15 +286,109 @@ async fn account(cx: &Cx) -> Result<impl View> {
                 <p><a href="/credentials">"Credentials"</a></p>
                 <p><a href="/jobs">"Jobs"</a></p>
                 <p><a href="/tokens">"Tokens"</a></p>
+                <h2>"Passkeys"</h2>
+                <table>
+                    <thead>
+                        <tr>
+                            <th>"Name"</th>
+                            <th>"Created"</th>
+                            <th>"Last used"</th>
+                            <th>"Actions"</th>
+                        </tr>
+                    </thead>
+                    <tbody>
+                        for row in rows {
+                            <tr>
+                                <td>(row.label)</td>
+                                <td>(row.created)</td>
+                                <td>(row.last_used)</td>
+                                <td>
+                                    <form method="post" action="/account/passkeys/delete">
+                                        <input type="hidden" name="csrf" value=(csrf.as_str())>
+                                        <input type="hidden" name="id" value=(row.id)>
+                                        <button type="submit">"Delete"</button>
+                                    </form>
+                                </td>
+                            </tr>
+                        }
+                    </tbody>
+                </table>
                 <form id="passkey-form">
-                    <button type="submit">"Add a passkey"</button>
+                    <button type="submit">"Create a passkey"</button>
                 </form>
                 <p id="status"></p>
+                <form method="post" action="/account/device-code">
+                    <input type="hidden" name="csrf" value=(csrf.as_str())>
+                    <button type="submit">"Create a code for a new device"</button>
+                </form>
                 <form method="post" action="/logout">
                     <input type="hidden" name="csrf" value=(csrf.as_str())>
                     <button type="submit">"Sign out"</button>
                 </form>
                 <script src=(SCRIPT_PATH) defer=""></script>
+            </body>
+        </html>
+    })
+}
+
+struct PasskeyView {
+    label: String,
+    id: String,
+    created: String,
+    last_used: String,
+}
+
+#[route(POST "/account/passkeys/delete")]
+async fn delete_passkey(
+    cx: &Cx,
+    Form(form): Form<HashMap<String, String>>,
+) -> Result<topcoat::router::error::SeeOther> {
+    let auth = auth(cx)?;
+    let session = signed_in(cx, auth).await?;
+    if !csrf_matches(&session, form.get("csrf").map(String::as_str)) {
+        return Err(forbidden().into());
+    }
+    let id = form
+        .get("id")
+        .and_then(|id| id.parse::<i64>().ok())
+        .ok_or_else(|| fail(AuthError::Refused))?;
+    auth.delete_passkey(session.user_id, id)
+        .await
+        .map_err(fail)?;
+    Ok(see_other("/account"))
+}
+
+#[page(POST "/account/device-code")]
+async fn device_code(cx: &Cx, Form(form): Form<HashMap<String, String>>) -> Result<impl View> {
+    let auth = auth(cx)?;
+    let session = signed_in(cx, auth).await?;
+    if !csrf_matches(&session, form.get("csrf").map(String::as_str)) {
+        return Err(forbidden().into());
+    }
+    let Some(cookie) = session_cookie(headers(cx)) else {
+        return Err(forbidden().into());
+    };
+    let code = auth
+        .new_device_code(session.user_id, cookie.as_bytes())
+        .await
+        .map_err(fail)?;
+    let url = format!(
+        "{}/enroll/{}",
+        auth.origin(),
+        String::from_utf8_lossy(code.expose())
+    );
+    Ok(view! {
+        <!DOCTYPE html>
+        <html>
+            <head>
+                <title>"fleet new device"</title>
+                <link rel="stylesheet" href=(STYLE_PATH)>
+            </head>
+            <body>
+                <h1>"New device code"</h1>
+                <p>"Open this address on the new device. It works once and expires in 10 minutes."</p>
+                <pre id="enroll-url">(url.as_str())</pre>
+                <p><a href="/account">"Account"</a></p>
             </body>
         </html>
     })
@@ -255,17 +406,27 @@ async fn script() -> Result<([(header::HeaderName, &'static str); 1], &'static s
 
 #[route(POST "/passkey/setup/start")]
 async fn setup_start(cx: &Cx, Json(body): Json<Value>) -> Result<Json<Value>> {
-    let (ceremony, options) = auth(cx)?
-        .setup_start(field(&body, "code")?, field(&body, "username")?)
-        .await
-        .map_err(fail)?;
+    let auth = auth(cx)?;
+    let username = field(&body, "username")?;
+    let (ceremony, options) = if body.get("password").is_some() {
+        auth.setup_password_start(field(&body, "password")?, username, client(cx, auth))
+            .await
+    } else {
+        auth.setup_start(field(&body, "code")?, username).await
+    }
+    .map_err(fail)?;
     Ok(Json(json!({ "ceremony": ceremony, "options": options })))
 }
 
 #[route(POST "/passkey/setup/finish")]
 async fn setup_finish(cx: &Cx, Json(body): Json<Value>) -> Result<Json<Value>> {
-    let session = auth(cx)?
-        .setup_finish(field(&body, "ceremony")?, &registration(&body)?)
+    let auth = auth(cx)?;
+    let session = auth
+        .setup_finish(
+            field(&body, "ceremony")?,
+            &registration(&body)?,
+            client(cx, auth),
+        )
         .await
         .map_err(fail)?;
     set_cookie(

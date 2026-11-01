@@ -5,6 +5,8 @@ resources:
   - service.yaml
   - master-key-generator.yaml
   - master-key-externalsecret.yaml
+  - bootstrap-password-generator.yaml
+  - bootstrap-password-externalsecret.yaml
 images:
   - name: ghcr.io/a19simma/fleet-server
     newTag: 0.3.2

@@ -7,7 +7,8 @@
 
 use std::collections::HashMap;
 use std::fmt;
-use std::sync::Mutex;
+use std::net::IpAddr;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use chacha20poly1305::aead::OsRng;
@@ -21,7 +22,9 @@ use webauthn_rs::prelude::{
 };
 use webauthn_rs::{Webauthn, WebauthnBuilder};
 
-use crate::cred::users::{UserError, Users, validate_username};
+use crate::cred::limiter::Limiter;
+use crate::cred::password::BootstrapPassword;
+use crate::cred::users::{UserError, Users, random_hex as code_hex, validate_username};
 
 /// Name of the session cookie. The `__Host-` prefix pins it to the host, `Path=/` and HTTPS.
 pub const SESSION_COOKIE: &str = "__Host-fleet_session";
@@ -36,6 +39,9 @@ const CEREMONY_TTL: Duration = Duration::from_secs(300);
 const MAX_PENDING_PER_KIND: usize = 256;
 const RANDOM_BYTES: usize = 32;
 
+/// How long a code made on the account page stays valid, in minutes.
+pub(super) const NEW_DEVICE_CODE_TTL_MINUTES: i32 = 10;
+
 const USER_BY_NAME: &str = "SELECT id FROM users WHERE lower(username) = $1";
 const KEYS_FOR_USER: &str = "SELECT public_key FROM passkeys WHERE user_id = $1 ORDER BY id";
 const KEYS_LOCKED: &str =
@@ -43,6 +49,17 @@ const KEYS_LOCKED: &str =
 const UPDATE_KEY: &str = "UPDATE passkeys SET public_key = $2 WHERE credential_id = $1";
 const INSERT_KEY: &str =
     "INSERT INTO passkeys (user_id, credential_id, public_key) VALUES ($1, $2, $3)";
+const LIST_KEYS: &str = "\
+SELECT id, to_char(created_at AT TIME ZONE 'UTC', 'YYYY-MM-DD HH24:MI \"UTC\"'), \
+to_char(last_used_at AT TIME ZONE 'UTC', 'YYYY-MM-DD HH24:MI \"UTC\"') \
+FROM passkeys WHERE user_id = $1 ORDER BY id";
+const COUNT_KEYS: &str = "SELECT count(*) FROM passkeys WHERE user_id = $1";
+const DELETE_KEY: &str = "DELETE FROM passkeys WHERE id = $1 AND user_id = $2";
+const MARK_USED: &str = "UPDATE passkeys SET last_used_at = now() WHERE credential_id = $1";
+const DELETE_OPEN_CODES: &str = "DELETE FROM setup_codes WHERE user_id = $1 AND used_at IS NULL";
+const INSERT_CODE: &str = "\
+INSERT INTO setup_codes (user_id, hash, expires_at) \
+VALUES ($1, sha256($2::bytea), now() + make_interval(mins => $3))";
 const LOCK_USER: &str = "SELECT id FROM users WHERE id = $1 FOR UPDATE";
 const LIVE_SESSION: &str = "\
 SELECT 1 FROM web_sessions WHERE id_hash = sha256($1::bytea) AND user_id = $2 \
@@ -151,6 +168,11 @@ enum Pending {
         username: String,
         code: Secret,
     },
+    SetupPassword {
+        state: PasskeyRegistration,
+        username: String,
+        password: Secret,
+    },
     Add {
         state: PasskeyRegistration,
         user_id: i64,
@@ -189,7 +211,25 @@ pub struct WebAuth {
     pool: PgPool,
     users: Users,
     origin: String,
+    bootstrap: Bootstrap,
     pending: Mutex<HashMap<String, (Instant, Pending)>>,
+}
+
+struct Bootstrap {
+    password: BootstrapPassword,
+    limiter: Arc<Limiter>,
+    hops: usize,
+}
+
+/// One passkey as listed on the account page.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PasskeyRow {
+    /// Row id, used to delete.
+    pub id: i64,
+    /// When it was created, in UTC.
+    pub created: String,
+    /// When it last signed in, in UTC, or `None` when it never has.
+    pub last_used: Option<String>,
 }
 
 impl Pending {
@@ -199,6 +239,7 @@ impl Pending {
             Self::Add { .. } => 1,
             Self::Login { .. } => 2,
             Self::Enroll { .. } => 3,
+            Self::SetupPassword { .. } => 4,
         }
     }
 }
@@ -237,8 +278,175 @@ impl WebAuth {
             pool,
             users,
             origin: origin.origin().ascii_serialization(),
+            bootstrap: Bootstrap {
+                password: BootstrapPassword::disarmed(),
+                limiter: Arc::new(Limiter::system()),
+                hops: 0,
+            },
             pending: Mutex::new(HashMap::new()),
         })
+    }
+
+    /// Turns on the bootstrap password for the first admin's setup.
+    ///
+    /// `hops` is the number of trusted proxies in front of the server, see
+    /// [`client_ip`](super::client_ip). `limiter` counts failed password attempts.
+    #[must_use]
+    pub fn with_bootstrap(
+        mut self,
+        password: BootstrapPassword,
+        limiter: Arc<Limiter>,
+        hops: usize,
+    ) -> Self {
+        self.bootstrap = Bootstrap {
+            password,
+            limiter,
+            hops,
+        };
+        self
+    }
+
+    /// The trusted proxy hop count that [`client_ip`](super::client_ip) takes.
+    #[must_use]
+    pub const fn trusted_hops(&self) -> usize {
+        self.bootstrap.hops
+    }
+
+    async fn password_gate(&self, candidate: &str, ip: IpAddr) -> Result<(), AuthError> {
+        let Some(reservation) = self.bootstrap.limiter.reserve(ip) else {
+            return Err(AuthError::Refused);
+        };
+        let armed = match self.users.bootstrap_password_armed().await {
+            Ok(armed) => armed,
+            Err(error) => {
+                self.bootstrap.limiter.release(reservation);
+                return Err(error.into());
+            }
+        };
+        if self.bootstrap.password.verify(candidate, armed).await {
+            self.bootstrap.limiter.release(reservation);
+            Ok(())
+        } else {
+            Err(AuthError::Refused)
+        }
+    }
+
+    /// Starts the first-admin registration with the bootstrap password. Wrong, revoked and
+    /// rate-limited attempts all answer [`AuthError::Refused`], and a refused attempt costs
+    /// the same hashing work as a wrong one.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AuthError::Refused`] for a refused password or a bad or reserved username,
+    /// and [`AuthError::Internal`] for a database failure.
+    pub async fn setup_password_start(
+        &self,
+        password: &str,
+        username: &str,
+        ip: IpAddr,
+    ) -> Result<(String, CreationChallengeResponse), AuthError> {
+        self.password_gate(password, ip).await?;
+        let username = fold(username)?;
+        let (challenge, state) =
+            self.webauthn
+                .start_passkey_registration(Uuid::new_v4(), &username, &username, None)?;
+        let ceremony = self.stash(Pending::SetupPassword {
+            state,
+            username,
+            password: Secret::new(password.to_owned()),
+        });
+        Ok((ceremony, challenge))
+    }
+
+    /// Lists the user's passkeys in creation order.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AuthError::Internal`] for a database failure.
+    pub async fn list_passkeys(&self, user_id: i64) -> Result<Vec<PasskeyRow>, AuthError> {
+        let rows: Vec<(i64, Option<String>, Option<String>)> = sqlx::query_as(LIST_KEYS)
+            .bind(user_id)
+            .fetch_all(&self.pool)
+            .await?;
+        Ok(rows
+            .into_iter()
+            .map(|(id, created, last_used)| PasskeyRow {
+                id,
+                created: created.unwrap_or_default(),
+                last_used,
+            })
+            .collect())
+    }
+
+    /// Deletes one of the user's passkeys, never the last one.
+    ///
+    /// The user row is locked first, so two concurrent deletes cannot leave the user with
+    /// none.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AuthError::Refused`] for an unknown id, another user's passkey, or the
+    /// user's only passkey.
+    pub async fn delete_passkey(&self, user_id: i64, passkey_id: i64) -> Result<(), AuthError> {
+        let mut tx = self.pool.begin().await?;
+        sqlx::query(LOCK_USER)
+            .bind(user_id)
+            .fetch_optional(&mut *tx)
+            .await?
+            .ok_or(AuthError::Refused)?;
+        let held: i64 = sqlx::query_scalar(COUNT_KEYS)
+            .bind(user_id)
+            .fetch_one(&mut *tx)
+            .await?;
+        if held <= 1 {
+            return Err(AuthError::Refused);
+        }
+        let done = sqlx::query(DELETE_KEY)
+            .bind(passkey_id)
+            .bind(user_id)
+            .execute(&mut *tx)
+            .await?;
+        if done.rows_affected() == 0 {
+            return Err(AuthError::Refused);
+        }
+        tx.commit().await?;
+        Ok(())
+    }
+
+    /// Issues a single-use code for registering a passkey on a new device. It expires after
+    /// [`NEW_DEVICE_CODE_TTL_MINUTES`] and replaces the user's other open codes. `cookie`
+    /// must still name a live session of `user_id` under the user lock.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AuthError::Refused`] for a missing user or an ended session.
+    pub async fn new_device_code(&self, user_id: i64, cookie: &[u8]) -> Result<Secret, AuthError> {
+        let mut tx = self.pool.begin().await?;
+        sqlx::query(LOCK_USER)
+            .bind(user_id)
+            .fetch_optional(&mut *tx)
+            .await?
+            .ok_or(AuthError::Refused)?;
+        sqlx::query(LIVE_SESSION)
+            .bind(cookie)
+            .bind(user_id)
+            .bind(SESSION_IDLE_SECS)
+            .fetch_optional(&mut *tx)
+            .await?
+            .ok_or(AuthError::Refused)?;
+        sqlx::query(DELETE_OPEN_CODES)
+            .bind(user_id)
+            .execute(&mut *tx)
+            .await?;
+        let code = Secret::new(code_hex());
+        sqlx::query(INSERT_CODE)
+            .bind(user_id)
+            .bind(code.expose())
+            .bind(NEW_DEVICE_CODE_TTL_MINUTES)
+            .execute(&mut *tx)
+            .await?;
+        tx.commit().await?;
+        Ok(code)
     }
 
     pub(super) const fn pool(&self) -> &PgPool {
@@ -317,6 +525,10 @@ impl WebAuth {
     /// Finishes the first-admin registration: verifies the passkey, spends the setup code,
     /// creates the admin and stores the passkey, then opens a session.
     ///
+    /// A ceremony started with the bootstrap password checks the password again, then in
+    /// one transaction takes the setup lock, creates the admin, stores the passkey,
+    /// revokes the password and opens the session. `ip` keys the failure limiter.
+    ///
     /// # Errors
     ///
     /// Returns [`AuthError::Refused`] when the ceremony is unknown or replayed, verification
@@ -329,14 +541,24 @@ impl WebAuth {
         &self,
         ceremony: &str,
         credential: &RegisterPublicKeyCredential,
+        ip: IpAddr,
     ) -> Result<NewSession, AuthError> {
-        let Pending::Setup {
-            state,
-            username,
-            code,
-        } = self.take(ceremony)?
-        else {
-            return Err(AuthError::Refused);
+        let (state, username, code) = match self.take(ceremony)? {
+            Pending::Setup {
+                state,
+                username,
+                code,
+            } => (state, username, code),
+            Pending::SetupPassword {
+                state,
+                username,
+                password,
+            } => {
+                return self
+                    .setup_password_finish(&state, &username, &password, credential, ip)
+                    .await;
+            }
+            _ => return Err(AuthError::Refused),
         };
         let passkey = self
             .webauthn
@@ -347,6 +569,39 @@ impl WebAuth {
             .await?;
         let user_id = redemption.user_id();
         store_key_on(redemption.conn(), user_id, &passkey).await?;
+        let session = insert_session(redemption.conn(), user_id, None).await?;
+        redemption.commit().await?;
+        Ok(session)
+    }
+
+    async fn setup_password_finish(
+        &self,
+        state: &PasskeyRegistration,
+        username: &str,
+        password: &Secret,
+        credential: &RegisterPublicKeyCredential,
+        ip: IpAddr,
+    ) -> Result<NewSession, AuthError> {
+        let passkey = self
+            .webauthn
+            .finish_passkey_registration(credential, state)?;
+        self.password_gate(&String::from_utf8_lossy(password.expose()), ip)
+            .await?;
+        self.redeem_password(username, &passkey).await
+    }
+
+    #[expect(
+        clippy::significant_drop_tightening,
+        reason = "commit consumes the redemption; the lint cannot see the move"
+    )]
+    async fn redeem_password(
+        &self,
+        username: &str,
+        passkey: &Passkey,
+    ) -> Result<NewSession, AuthError> {
+        let mut redemption = self.users.begin_redeem_password(username).await?;
+        let user_id = redemption.user_id();
+        store_key_on(redemption.conn(), user_id, passkey).await?;
         let session = insert_session(redemption.conn(), user_id, None).await?;
         redemption.commit().await?;
         Ok(session)
@@ -563,6 +818,10 @@ impl WebAuth {
                 if counter_regressed(result.counter(), stored) {
                     return Err(AuthError::Refused);
                 }
+                sqlx::query(MARK_USED)
+                    .bind(&credential_id)
+                    .execute(&mut *tx)
+                    .await?;
             }
             match key.update_credential(&result) {
                 Some(true) => {

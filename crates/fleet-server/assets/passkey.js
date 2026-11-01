@@ -98,6 +98,13 @@ async function run() {
     const code = decodeURIComponent(location.pathname.split("/").pop());
     await register("/passkey/setup/start", "/passkey/setup/finish", { code, username: username.value });
     location.assign("/account");
+  } else if (mode === "setup-password") {
+    const password = document.getElementById("password");
+    await register("/passkey/setup/start", "/passkey/setup/finish", {
+      password: password.value,
+      username: username.value,
+    });
+    location.assign("/account");
   } else if (mode === "enroll") {
     const code = decodeURIComponent(location.pathname.split("/").pop());
     await register("/passkey/enroll/start", "/passkey/enroll/finish", { code });
@@ -110,7 +117,7 @@ async function run() {
   } else if (mode === "add") {
     const csrf = document.body.dataset.csrf;
     await register("/passkey/add/start", "/passkey/add/finish", {}, csrf);
-    say("Passkey added.");
+    say("Passkey created.");
   }
 }
 

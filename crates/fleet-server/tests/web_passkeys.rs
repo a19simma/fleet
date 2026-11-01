@@ -8,7 +8,7 @@
 )]
 
 use std::fmt::Write as _;
-use std::net::SocketAddr;
+use std::net::{Ipv4Addr, SocketAddr};
 use std::time::Duration;
 
 use fleet_server::auth::BearerAuth;
@@ -709,7 +709,9 @@ async fn every_state_changing_route_refuses_a_foreign_origin(pool: PgPool) {
         ("X-CSRF-Token", csrf.as_str()),
         evil,
     ];
-    let cases: [(&str, &[(&str, &str)]); 6] = [
+    let cases: [(&str, &[(&str, &str)]); 8] = [
+        ("/account/passkeys/delete", &session),
+        ("/account/device-code", &session),
         ("/passkey/setup/start", &[evil]),
         ("/passkey/setup/finish", &[evil]),
         ("/passkey/login/start", &[evil]),
@@ -755,6 +757,16 @@ async fn every_session_route_refuses_a_missing_csrf_token(pool: PgPool) {
             .await;
         assert_eq!(wrong.status, 403, "{path}");
     }
+    for path in ["/account/passkeys/delete", "/account/device-code"] {
+        for body in [&b""[..], &b"csrf=nope&id=1"[..]] {
+            let refused = h
+                .send("POST", path, &[("Cookie", &cookie), FORM], body)
+                .await;
+            assert_eq!(refused.status, 403, "{path}: {}", refused.head);
+        }
+    }
+    assert_eq!(count(&h.pool, "SELECT count(*) FROM passkeys").await, 1);
+    assert_eq!(count(&h.pool, "SELECT count(*) FROM setup_codes").await, 0);
     let empty = h
         .send("POST", "/logout", &[("Cookie", &cookie), FORM], b"")
         .await;
@@ -911,7 +923,10 @@ async fn direct_admin(
     let credential = authn
         .do_registration(Url::parse(ORIGIN).unwrap(), options)
         .unwrap();
-    let session = auth.setup_finish(&ceremony, &credential).await.unwrap();
+    let session = auth
+        .setup_finish(&ceremony, &credential, Ipv4Addr::LOCALHOST.into())
+        .await
+        .unwrap();
     let alice: i64 = sqlx::query_scalar("SELECT id FROM users WHERE username = 'alice'")
         .fetch_one(pool)
         .await
@@ -1028,7 +1043,9 @@ async fn a_failing_passkey_insert_during_setup_leaves_no_admin_and_no_delete(poo
     .execute(&pool)
     .await
     .unwrap();
-    let outcome = auth.setup_finish(&ceremony, &credential).await;
+    let outcome = auth
+        .setup_finish(&ceremony, &credential, Ipv4Addr::LOCALHOST.into())
+        .await;
     assert!(outcome.is_err());
     assert_eq!(
         count(
@@ -1039,4 +1056,324 @@ async fn a_failing_passkey_insert_during_setup_leaves_no_admin_and_no_delete(poo
         0
     );
     assert!(!users.has_real_users().await.unwrap());
+}
+
+async fn extra_passkey(pool: &PgPool, user_id: i64, tag: u8) -> i64 {
+    sqlx::query_scalar(
+        "INSERT INTO passkeys (user_id, credential_id, public_key) VALUES ($1, $2, $3) RETURNING id",
+    )
+    .bind(user_id)
+    .bind(vec![tag; 16])
+    .bind(b"x".as_slice())
+    .fetch_one(pool)
+    .await
+    .unwrap()
+}
+
+async fn user_id(pool: &PgPool, name: &str) -> i64 {
+    sqlx::query_scalar("SELECT id FROM users WHERE username = $1")
+        .bind(name)
+        .fetch_one(pool)
+        .await
+        .unwrap()
+}
+
+fn form_body(csrf: &str, id: i64) -> String {
+    format!("csrf={csrf}&id={id}")
+}
+
+#[sqlx::test]
+async fn the_account_page_lists_numbered_passkeys_and_a_create_button(pool: PgPool) {
+    let h = Harness::start(pool).await;
+    let mut authn = authenticator();
+    h.setup(&mut authn, "alice").await;
+    let alice = user_id(&h.pool, "alice").await;
+    let login = h.login_at(&mut authn, "alice", ORIGIN).await;
+    assert_eq!(login.status, 200, "{}", login.body);
+    let used: i64 = count(
+        &h.pool,
+        "SELECT count(*) FROM passkeys WHERE last_used_at IS NOT NULL",
+    )
+    .await;
+    assert_eq!(used, 1);
+    let cookie = cookie_header(&login);
+    extra_passkey(&h.pool, alice, 7).await;
+    let page = h.get("/account", &[("Cookie", &cookie)]).await;
+    assert_eq!(page.status, 200);
+    for text in [
+        "Passkey 1",
+        "Passkey 2",
+        "never",
+        "Create a passkey",
+        "Delete",
+        "Created",
+        "Last used",
+        "Create a code for a new device",
+    ] {
+        assert!(page.body.contains(text), "{text}: {}", page.body);
+    }
+    assert!(!page.body.contains("Add a passkey"));
+    let page = h.get("/account", &[("Cookie", &cookie)]).await;
+    assert!(page.body.contains(" UTC"), "{}", page.body);
+    h.finish().await;
+}
+
+#[sqlx::test]
+async fn deleting_the_last_passkey_is_refused_and_another_is_deleted(pool: PgPool) {
+    let h = Harness::start(pool).await;
+    let mut authn = authenticator();
+    let cookie = cookie_header(&h.setup(&mut authn, "alice").await);
+    let csrf = session_csrf(&h.pool).await;
+    let alice = user_id(&h.pool, "alice").await;
+    let only: i64 = sqlx::query_scalar("SELECT id FROM passkeys WHERE user_id = $1")
+        .bind(alice)
+        .fetch_one(&h.pool)
+        .await
+        .unwrap();
+
+    let body = form_body(&csrf, only);
+    let refused = h
+        .send(
+            "POST",
+            "/account/passkeys/delete",
+            &[("Cookie", &cookie), FORM],
+            body.as_bytes(),
+        )
+        .await;
+    assert_eq!(refused.status, 400, "{}", refused.head);
+    assert!(refused.body.contains("request refused"));
+    assert_eq!(count(&h.pool, "SELECT count(*) FROM passkeys").await, 1);
+
+    let second = extra_passkey(&h.pool, alice, 9).await;
+    let body = form_body(&csrf, second);
+    let done = h
+        .send(
+            "POST",
+            "/account/passkeys/delete",
+            &[("Cookie", &cookie), FORM],
+            body.as_bytes(),
+        )
+        .await;
+    assert_eq!(done.status, 303, "{}", done.head);
+    assert_eq!(count(&h.pool, "SELECT count(*) FROM passkeys").await, 1);
+    let again = h
+        .send(
+            "POST",
+            "/account/passkeys/delete",
+            &[("Cookie", &cookie), FORM],
+            body.as_bytes(),
+        )
+        .await;
+    assert_eq!(again.status, 400);
+    h.finish().await;
+}
+
+#[sqlx::test]
+async fn a_user_cannot_delete_another_users_passkey(pool: PgPool) {
+    let h = Harness::start(pool).await;
+    let mut authn = authenticator();
+    let cookie = cookie_header(&h.setup(&mut authn, "alice").await);
+    let csrf = session_csrf(&h.pool).await;
+    let alice = user_id(&h.pool, "alice").await;
+    extra_passkey(&h.pool, alice, 3).await;
+    let bob: i64 = sqlx::query_scalar("INSERT INTO users (username) VALUES ('bob') RETURNING id")
+        .fetch_one(&h.pool)
+        .await
+        .unwrap();
+    let theirs = extra_passkey(&h.pool, bob, 4).await;
+    let body = form_body(&csrf, theirs);
+    let refused = h
+        .send(
+            "POST",
+            "/account/passkeys/delete",
+            &[("Cookie", &cookie), FORM],
+            body.as_bytes(),
+        )
+        .await;
+    assert_eq!(refused.status, 400, "{}", refused.head);
+    assert_eq!(
+        count(&h.pool, "SELECT count(*) FROM passkeys WHERE user_id = (SELECT id FROM users WHERE username = 'bob')").await,
+        1
+    );
+    h.finish().await;
+}
+
+fn enroll_code(reply: &Reply) -> String {
+    let marker = format!("{ORIGIN}/enroll/");
+    let start = reply.body.find(&marker).unwrap() + marker.len();
+    reply.body[start..start + 64].to_owned()
+}
+
+#[sqlx::test]
+async fn a_new_device_code_is_self_service_short_lived_and_single_use(pool: PgPool) {
+    let h = Harness::start(pool).await;
+    let mut authn = authenticator();
+    let cookie = cookie_header(&h.setup(&mut authn, "alice").await);
+    let csrf = session_csrf(&h.pool).await;
+    let body = format!("csrf={csrf}");
+    let made = h
+        .send(
+            "POST",
+            "/account/device-code",
+            &[("Cookie", &cookie), FORM],
+            body.as_bytes(),
+        )
+        .await;
+    assert_eq!(made.status, 200, "{}", made.body);
+    let code = enroll_code(&made);
+    assert!(code.bytes().all(|b| b.is_ascii_hexdigit()));
+
+    let minutes: f64 = sqlx::query_scalar(
+        "SELECT (extract(epoch FROM expires_at - now()) / 60)::float8 FROM setup_codes",
+    )
+    .fetch_one(&h.pool)
+    .await
+    .unwrap();
+    assert!(minutes > 9.0 && minutes <= 10.0, "{minutes}");
+
+    let mut phone = authenticator();
+    let first = h.enroll_with(&mut phone, &code).await;
+    assert_eq!(first.status, 200, "{}", first.body);
+    assert_eq!(count(&h.pool, "SELECT count(*) FROM passkeys").await, 2);
+    let mut spare = authenticator();
+    let second = h.enroll_with(&mut spare, &code).await;
+    assert_ne!(second.status, 200);
+    assert_eq!(count(&h.pool, "SELECT count(*) FROM passkeys").await, 2);
+    h.finish().await;
+}
+
+#[sqlx::test]
+async fn an_expired_new_device_code_is_refused(pool: PgPool) {
+    let h = Harness::start(pool).await;
+    let mut authn = authenticator();
+    let cookie = cookie_header(&h.setup(&mut authn, "alice").await);
+    let csrf = session_csrf(&h.pool).await;
+    let body = format!("csrf={csrf}");
+    let made = h
+        .send(
+            "POST",
+            "/account/device-code",
+            &[("Cookie", &cookie), FORM],
+            body.as_bytes(),
+        )
+        .await;
+    let code = enroll_code(&made);
+    sqlx::query("UPDATE setup_codes SET expires_at = now() - interval '1 second'")
+        .execute(&h.pool)
+        .await
+        .unwrap();
+    let mut phone = authenticator();
+    let refused = h.enroll_with(&mut phone, &code).await;
+    assert_eq!(refused.status, 400);
+    assert_eq!(count(&h.pool, "SELECT count(*) FROM passkeys").await, 1);
+    h.finish().await;
+}
+
+#[sqlx::test]
+async fn a_new_code_replaces_the_previous_open_code(pool: PgPool) {
+    let h = Harness::start(pool).await;
+    let mut authn = authenticator();
+    let cookie = cookie_header(&h.setup(&mut authn, "alice").await);
+    let csrf = session_csrf(&h.pool).await;
+    let body = format!("csrf={csrf}");
+    let mut codes = Vec::new();
+    for _ in 0..2 {
+        let made = h
+            .send(
+                "POST",
+                "/account/device-code",
+                &[("Cookie", &cookie), FORM],
+                body.as_bytes(),
+            )
+            .await;
+        codes.push(enroll_code(&made));
+    }
+    assert_eq!(
+        count(
+            &h.pool,
+            "SELECT count(*) FROM setup_codes WHERE used_at IS NULL"
+        )
+        .await,
+        1
+    );
+    let mut phone = authenticator();
+    assert_eq!(h.enroll_with(&mut phone, &codes[0]).await.status, 400);
+    assert_eq!(h.enroll_with(&mut phone, &codes[1]).await.status, 200);
+    h.finish().await;
+}
+
+#[sqlx::test]
+async fn a_code_moved_to_another_user_cannot_finish_the_ceremony(pool: PgPool) {
+    let h = Harness::start(pool).await;
+    let mut authn = authenticator();
+    let cookie = cookie_header(&h.setup(&mut authn, "alice").await);
+    let csrf = session_csrf(&h.pool).await;
+    let body = format!("csrf={csrf}");
+    let made = h
+        .send(
+            "POST",
+            "/account/device-code",
+            &[("Cookie", &cookie), FORM],
+            body.as_bytes(),
+        )
+        .await;
+    let code = enroll_code(&made);
+    let start = h
+        .post("/passkey/enroll/start", &[], &json!({ "code": code }))
+        .await;
+    assert_eq!(start.status, 200, "{}", start.body);
+    let start = start.json();
+    let bob: i64 = sqlx::query_scalar("INSERT INTO users (username) VALUES ('bob') RETURNING id")
+        .fetch_one(&h.pool)
+        .await
+        .unwrap();
+    sqlx::query("UPDATE setup_codes SET user_id = $1")
+        .bind(bob)
+        .execute(&h.pool)
+        .await
+        .unwrap();
+    let options = serde_json::from_value(start["options"].clone()).unwrap();
+    let credential = authenticator()
+        .do_registration(Url::parse(ORIGIN).unwrap(), options)
+        .unwrap();
+    let finish = h
+        .post(
+            "/passkey/enroll/finish",
+            &[],
+            &json!({ "ceremony": start["ceremony"], "credential": credential }),
+        )
+        .await;
+    assert_eq!(finish.status, 400, "{}", finish.body);
+    assert_eq!(count(&h.pool, "SELECT count(*) FROM passkeys").await, 1);
+    assert_eq!(
+        count(
+            &h.pool,
+            "SELECT count(*) FROM setup_codes WHERE used_at IS NOT NULL"
+        )
+        .await,
+        0
+    );
+    h.finish().await;
+}
+
+impl Harness {
+    async fn enroll_with(&self, authn: &mut Authenticator, code: &str) -> Reply {
+        let start = self
+            .post("/passkey/enroll/start", &[], &json!({ "code": code }))
+            .await;
+        if start.status != 200 {
+            return start;
+        }
+        let start = start.json();
+        let options = serde_json::from_value(start["options"].clone()).unwrap();
+        let credential = authn
+            .do_registration(Url::parse(ORIGIN).unwrap(), options)
+            .unwrap();
+        self.post(
+            "/passkey/enroll/finish",
+            &[],
+            &json!({ "ceremony": start["ceremony"], "credential": credential }),
+        )
+        .await
+    }
 }

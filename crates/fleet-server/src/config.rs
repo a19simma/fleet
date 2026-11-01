@@ -43,6 +43,8 @@ impl fmt::Display for ConfigError {
 
 impl std::error::Error for ConfigError {}
 
+use crate::web::MAX_TRUSTED_HOPS;
+
 /// Shortest accepted bearer token, in characters.
 pub const MIN_TOKEN_LEN: usize = 32;
 
@@ -151,6 +153,12 @@ pub struct Config {
     /// Whether profiles with tools are accepted, from `FLEET_ALLOW_PROFILE_TOOLS`: `true` or
     /// `false`, default `false`.
     pub allow_profile_tools: bool,
+    /// Bootstrap password for the first admin, from `FLEET_BOOTSTRAP_PASSWORD`. `None` when
+    /// unset or empty. The server hashes it at startup and ignores it once a user exists.
+    pub bootstrap_password: Option<Secret>,
+    /// Trusted proxies in front of the server, from `FLEET_TRUSTED_PROXY_HOPS`: 0 to
+    /// [`MAX_TRUSTED_HOPS`], default 0, which ignores `X-Forwarded-For`.
+    pub trusted_proxy_hops: usize,
 }
 
 /// Why the credential store cannot start. Messages carry no key bytes.
@@ -376,6 +384,16 @@ impl Config {
             web_origin: lookup("FLEET_WEB_ORIGIN").filter(|v| !v.is_empty()),
             web_rp_id: lookup("FLEET_WEB_RP_ID").filter(|v| !v.is_empty()),
             allow_profile_tools: flag(&lookup, "FLEET_ALLOW_PROFILE_TOOLS")?,
+            bootstrap_password: lookup("FLEET_BOOTSTRAP_PASSWORD")
+                .filter(|v| !v.is_empty())
+                .map(Secret::new),
+            trusted_proxy_hops: usize::try_from(number(
+                &lookup,
+                "FLEET_TRUSTED_PROXY_HOPS",
+                0,
+                0..=MAX_TRUSTED_HOPS as u64,
+            )?)
+            .unwrap_or(0),
             retention_interval: Duration::from_secs(number(
                 &lookup,
                 "FLEET_RETENTION_INTERVAL_SECS",

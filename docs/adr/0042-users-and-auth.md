@@ -1,6 +1,6 @@
 # Users and auth
 
-Status: Proposed 2026-10-29. Built in fleet-server: users, hashed API tokens, passkey login, server-side sessions, the first-admin setup code, the `fleet-server admin` recovery subcommand, `jobs.user_id` and owner-scoped reads. Not built: login rate limiting and a decoy challenge for unknown usernames. Amends ADR-0013 and ADR-0014. Builds on ADR-0041 (web UI) and ADR-0040 (credential store).
+Status: Proposed 2026-10-29. Built in fleet-server: users, hashed API tokens, passkey login, server-side sessions, the first-admin setup code, the `fleet-server admin` recovery subcommand, `jobs.user_id` and owner-scoped reads. Bootstrap password and passkey management are built. Not built: login rate limiting and a decoy challenge for unknown usernames. Amends ADR-0013 and ADR-0014. Builds on ADR-0041 (web UI) and ADR-0040 (credential store).
 
 Credentials and the web UI make Fleet multi-user. The shared client token cannot say whose a Job or a credential is. This ADR adds users, browser login, per-user API tokens and Job ownership.
 
@@ -16,7 +16,15 @@ Credentials and the web UI make Fleet multi-user. The shared client token cannot
 
 ### Bootstrap admin
 
-On first start with no users, the server logs a one-time setup URL containing a random token and holds it in memory until used. Opening it lets the visitor pick a username and register a passkey, which creates the admin. The token dies on use or on restart: a URL logged before a restart stops working, and a restart with still no users logs a new one. The server logs the URL at `warn`, so it sits in shipped logs until someone redeems it. No startup secret in config. The cost: whoever reads the pod log first can claim the admin, so the log is the trust boundary.
+On first start with no users, the server logs a one-time setup URL containing a random token and holds it in memory until used. Opening it lets the visitor pick a username and register a passkey, which creates the admin. The token dies on use or on restart: a URL logged before a restart stops working, and a restart with still no users logs a new one. The server logs the URL at `warn`, so it sits in shipped logs until someone redeems it. The logged URL stays as the fallback when no bootstrap password is configured. The cost: whoever reads the pod log first can claim the admin, so the log is the trust boundary.
+
+With `FLEET_BOOTSTRAP_PASSWORD` set, the setup page also accepts that password in place of the URL token. Infra generates it once with an external-secrets Password generator. The server hashes it with argon2id at startup, keeps only the hash in memory and never logs it. The password works on the setup route pair only (start and finish). It cannot log in, reach `/account` or call the API. The first passkey revokes it in the same transaction that creates the admin and writes an `admin_audit` row, action `bootstrap_password_revoked`. Migration 0021 records the revocation in `bootstrap_password`, so a restart, a regenerated Secret or `reset-passkeys` never re-arms it.
+
+A wrong, revoked or rate-limited attempt answers 400 `request refused`, so the three cannot be told apart. A global limiter (20 per 15 minutes) and a per-IP limiter (5 per 15 minutes) run before any hashing. The client IP is the Nth entry from the right of `X-Forwarded-For`, where N is `FLEET_TRUSTED_PROXY_HOPS`; `0` uses the TCP peer, and a missing or short header fails closed. A decoy hash keeps the work equal for unknown input. Hashing runs in `spawn_blocking` behind a two-permit semaphore, and the candidate is capped at 128 printable ASCII bytes. The cost: until the first passkey exists, anyone who guesses the password within the limits can claim the admin, so the Secret is the trust boundary and the operator deletes it after setup.
+
+### Passkey management
+
+`/account` lists the user's passkeys, numbered, with created and last-used times (migration 0021 adds `passkeys.last_used_at`). "Create a passkey" adds one to the signed-in user. "Delete" removes one behind the CSRF token and refuses the last passkey, so a user cannot lock themselves out. "Create a code for a new device" issues a setup code for the user's own account that expires in 10 minutes, works once and replaces any open code; the page renders the `/enroll/{code}` URL.
 
 ### Admin recovery
 
@@ -55,10 +63,10 @@ Boxes and sessions have no user owner. `ListFleet` therefore returns every box t
 
 ## Considered and rejected
 
-- **Passwords.** Adds hashing, reset and breach handling that passkeys avoid.
+- **Passwords for login.** Adds hashing, reset and breach handling that passkeys avoid. The one exception is the bootstrap password, which only opens first-admin setup and dies with the first passkey.
 - **An external IdP (OIDC) in v1.** A hard dependency for a tool that runs on a private network.
 - **Signed stateless cookies.** No revocation and no server-side logout.
-- **A startup secret for the admin.** A secret in config or the environment outlives setup. A one-time URL does not.
+- **A startup secret that outlives setup.** The bootstrap password is revoked in the transaction that creates the admin, and a revoked password stays revoked.
 
 ## Unverified
 

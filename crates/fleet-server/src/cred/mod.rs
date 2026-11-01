@@ -3,6 +3,8 @@
 pub mod admin;
 pub mod api;
 pub mod github;
+pub mod limiter;
+pub mod password;
 pub mod seal;
 pub mod store;
 pub mod users;

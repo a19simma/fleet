@@ -10,12 +10,12 @@ failures=0
 fresh() {
   d="$scratch/$1"
   mkdir -p "$d"
-  cp "$here/kustomization.yaml" "$here/deployment.yaml" "$here/service.yaml" "$here/master-key-generator.yaml" "$here/master-key-externalsecret.yaml" "$d/"
+  cp "$here/kustomization.yaml" "$here/deployment.yaml" "$here/service.yaml" "$here/master-key-generator.yaml" "$here/master-key-externalsecret.yaml" "$here/bootstrap-password-generator.yaml" "$here/bootstrap-password-externalsecret.yaml" "$d/"
   printf '%s\n' "$d"
 }
 
 add_resource() {
-  insert_after '^  - master-key-externalsecret.yaml$' '  - extra.yaml' "$1/kustomization.yaml" >"$1/kustomization.next"
+  insert_after '^  - bootstrap-password-externalsecret.yaml$' '  - extra.yaml' "$1/kustomization.yaml" >"$1/kustomization.next"
   cp "$1/kustomization.next" "$1/kustomization.yaml"
 }
 

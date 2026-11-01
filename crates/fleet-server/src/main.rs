@@ -12,6 +12,8 @@ use fleet_server::auth::BearerAuth;
 use fleet_server::config::{Config, CredentialsState, exposed_binds, is_loopback};
 use fleet_server::cred::admin::{AdminError, SETUP_CODE_TTL_HOURS, parse_args, run as run_admin};
 use fleet_server::cred::github::HttpsGithub;
+use fleet_server::cred::limiter::Limiter;
+use fleet_server::cred::password::BootstrapPassword;
 use fleet_server::cred::store::CredentialStore;
 use fleet_server::cred::{CredentialService, Users};
 use fleet_server::reaper::{DEFAULT_REAP_PERIOD, run_reaper};
@@ -64,6 +66,7 @@ fn build_web(
     users: &Users,
     credentials: Option<CredentialService>,
     store: Store,
+    password: BootstrapPassword,
 ) -> Result<Web, BoxError> {
     let Some(origin) = config.web_origin.as_deref() else {
         tracing::warn!("FLEET_WEB_ORIGIN is unset: web login is off");
@@ -74,8 +77,26 @@ fn build_web(
         users.clone(),
         origin,
         config.web_rp_id.as_deref(),
-    )?;
+    )?
+    .with_bootstrap(
+        password,
+        Arc::new(Limiter::system()),
+        config.trusted_proxy_hops,
+    );
     Ok(Web::with_console(auth, credentials, store))
+}
+
+async fn bootstrap_password(config: &Config, users: &Users) -> Result<BootstrapPassword, BoxError> {
+    let Some(plain) = config.bootstrap_password.as_ref() else {
+        return Ok(BootstrapPassword::disarmed());
+    };
+    if !users.bootstrap_password_armed().await? {
+        tracing::info!("FLEET_BOOTSTRAP_PASSWORD is ignored: setup is already closed");
+        return Ok(BootstrapPassword::disarmed());
+    }
+    let password = BootstrapPassword::from_plaintext(plain.expose().to_owned()).await?;
+    tracing::info!("the bootstrap password is armed for the first admin");
+    Ok(password)
 }
 
 async fn credential_service(
@@ -104,6 +125,16 @@ fn configured_store(pool: sqlx::PgPool, config: &Config) -> Store {
         .with_profile_tools(config.allow_profile_tools)
 }
 
+async fn log_setup_path(users: &Users) -> Result<(), BoxError> {
+    if let Some(code) = users.issue_setup_code().await? {
+        tracing::warn!(
+            setup_path = %format!("/setup/{}", String::from_utf8_lossy(code.expose())),
+            "no users exist: open this path on the server's public address to create the admin; it works once and changes on restart"
+        );
+    }
+    Ok(())
+}
+
 async fn run() -> Result<(), BoxError> {
     let config = Config::from_env()?;
     let options = PgConnectOptions::from_str(config.database_url.expose())?
@@ -119,19 +150,16 @@ async fn run() -> Result<(), BoxError> {
     let credential_service = credential_service(&config, &pool).await?;
 
     let users = Users::new(pool.clone());
-    if let Some(code) = users.issue_setup_code().await? {
-        tracing::warn!(
-            setup_path = %format!("/setup/{}", String::from_utf8_lossy(code.expose())),
-            "no users exist: open this path on the server's public address to create the admin; it works once and changes on restart"
-        );
-    }
+    log_setup_path(&users).await?;
 
+    let password = bootstrap_password(&config, &users).await?;
     let web = build_web(
         &config,
         &pool,
         &users,
         credential_service.clone(),
         store.clone(),
+        password,
     )?;
 
     if !is_loopback(&config.listen) {

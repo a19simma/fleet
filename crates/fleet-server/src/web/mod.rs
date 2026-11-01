@@ -6,6 +6,7 @@
 //! [`CatchPanic`], then stamps the security headers. [`WebAuth`] holds passkey login and
 //! sessions (ADR 0042).
 
+mod clientip;
 mod credentials;
 mod dispatch;
 mod jobs;
@@ -15,6 +16,7 @@ mod passkeys;
 mod serve;
 mod tokens;
 
+pub use clientip::{MAX_FORWARDED_BYTES, MAX_TRUSTED_HOPS, UNKNOWN, client_ip};
 pub use dispatch::{Dispatch, GRPC_PREFIX, harden};
 pub use jobs::MAX_RENDER_BYTES;
 pub use pages::{HOME_MARKER, MAX_BODY_BYTES, PASSKEY_JS, SCRIPT_PATH, STYLE_CSS, STYLE_PATH, Web};

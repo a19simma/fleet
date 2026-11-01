@@ -7,7 +7,7 @@ Kubernetes manifests for fleet-server. An Argo CD Application in the cluster ope
 - `deployment.yaml`: the fleet-server Deployment in namespace `fleet-server`.
 - `service.yaml`: a ClusterIP Service for the gRPC port (7070) and the health port (7072).
 - `kustomization.yaml`: lists the manifests and pins the image `ghcr.io/a19simma/fleet-server` to tag 0.3.2. That tag is a baseline floor.
-- `master-key-generator.yaml` and `master-key-externalsecret.yaml`: an external-secrets Password generator and an ExternalSecret that create Secret `fleet-master-key` once. See Master key.
+- `master-key-generator.yaml` and `master-key-externalsecret.yaml`: an external-secrets Password generator and an ExternalSecret that create Secret `fleet-master-key` once. See Master key. `bootstrap-password-generator.yaml` and `bootstrap-password-externalsecret.yaml` do the same for the bootstrap password. See Bootstrap password.
 - `check-master-key-kind.sh`: creates a uniquely named kind cluster, installs external-secrets, applies both objects, and proves a restricted pod reads the key ring file, the mount is read-only, and the key survives a forced sync, a controller restart and an ExternalSecret recreate. It deletes only its own cluster. Needs `kind`, `kubectl`, `helm` and network access.
 - `check-kinds.sh`: renders the kustomization and fails on any kind outside Deployment, Service, ExternalSecret, Password, and on any container or initContainer in a Deployment that lacks requests for cpu, memory and ephemeral-storage or limits for memory and ephemeral-storage. A cpu limit is allowed but not required.
 - `test-check-kinds.sh`: proves the check rejects a Role, Namespace, HTTPRoute, GRPCRoute, Secret, non-ClusterIP Service, other namespace, `hostNetwork`, `hostPID`, `hostIPC`, `hostPath`, privileged containers and containers missing a cpu, memory or ephemeral-storage request or a memory or ephemeral-storage limit. It also proves a container with or without a cpu limit is accepted.
@@ -51,6 +51,12 @@ Verified in kind with `check-master-key-kind.sh` against chart `external-secrets
 Rotation, backup and restore steps are in [docs/credential-key-runbook.md](../docs/credential-key-runbook.md).
 
 If the Secret `fleet-master-key` is deleted outside the generator flow, the ExternalSecret (`CreatedOnce`) mints a new key and every stored credential becomes unreadable. Back the key up first. The runbook covers Back up, Rotate, and Restore with and without the key. The key is the sha256 of a 32 character generator password, so its entropy is that of the password. With about 66 symbols that is roughly 190 bits, and the generator charset is unverified.
+
+## Bootstrap password
+
+ADR-0042 lets the first admin enroll a passkey with a one-time bootstrap password. `bootstrap-password-generator.yaml` and `bootstrap-password-externalsecret.yaml` create Secret `fleet-bootstrap-password` (key `password`, 32 generator characters) once, with the same `CreatedOnce` and `Orphan` settings as the master key. The Deployment passes it as `FLEET_BOOTSTRAP_PASSWORD` (optional, so a missing Secret falls back to the logged setup URL). The server hashes it with argon2id at startup and never stores the plaintext. The first passkey revokes it in the same transaction; a revoked password stays revoked, so a restart or a regenerated Secret does not re-arm it. Read it once with `kubectl -n fleet-server get secret fleet-bootstrap-password -o jsonpath='{.data.password}'` and delete the Secret after setup.
+
+`FLEET_TRUSTED_PROXY_HOPS=1` makes the server take the client address from the last `X-Forwarded-For` entry, which the gateway appends. Set it to the number of trusted proxies in front of the server; `0` uses the TCP peer. Unverified: that the live gateway appends the peer to `X-Forwarded-For` in this form.
 
 The operator must enable etcd encryption at rest. Without it the Secret sits in etcd in the clear (ADR-0040).
 

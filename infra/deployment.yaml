@@ -63,6 +63,14 @@ spec:
               value: https://fleet.example.com
             - name: FLEET_MASTER_KEY_FILE
               value: /etc/fleet/master-key/keyring
+            - name: FLEET_BOOTSTRAP_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: fleet-bootstrap-password
+                  key: password
+                  optional: true
+            - name: FLEET_TRUSTED_PROXY_HOPS
+              value: "1"
           volumeMounts:
             - name: master-key
               mountPath: /etc/fleet/master-key

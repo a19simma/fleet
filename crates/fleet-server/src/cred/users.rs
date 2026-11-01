@@ -39,6 +39,14 @@ const LOCK_USER: &str = "SELECT id FROM users WHERE id = $1 FOR UPDATE";
 const REDEEM_USER_CODE: &str = "\
 UPDATE setup_codes SET used_at = now() \
 WHERE hash = sha256($1::bytea) AND used_at IS NULL AND expires_at > now() RETURNING user_id";
+const PASSWORD_CLOSED: &str = "\
+SELECT EXISTS (SELECT 1 FROM users WHERE lower(username) <> 'bootstrap') \
+OR EXISTS (SELECT 1 FROM bootstrap_password)";
+const REVOKE_PASSWORD: &str = "\
+INSERT INTO bootstrap_password (user_id, hash, revoked_at) VALUES ($1, '', now())";
+const AUDIT_PASSWORD_REVOKED: &str = "\
+INSERT INTO admin_audit (action, user_id, username, operator) \
+VALUES ('bootstrap_password_revoked', $1, $2, 'server')";
 const REVOKE_TOKEN: &str = "\
 UPDATE api_tokens SET revoked_at = now() WHERE id = $1 AND user_id = $2 AND revoked_at IS NULL";
 
@@ -135,8 +143,10 @@ impl fmt::Debug for NewApiToken {
 /// An admin user created in an open transaction, with the setup code still held.
 pub struct SetupRedemption {
     tx: sqlx::Transaction<'static, sqlx::Postgres>,
-    slot: OwnedMutexGuard<Option<Secret>>,
+    slot: Option<OwnedMutexGuard<Option<Secret>>>,
     user_id: i64,
+    username: String,
+    revokes_password: bool,
 }
 
 impl SetupRedemption {
@@ -150,15 +160,36 @@ impl SetupRedemption {
         &mut self.tx
     }
 
-    /// Commits the transaction and spends the setup code.
+    /// Commits the transaction and spends the setup code. A redemption by the bootstrap
+    /// password first records the revocation and its audit row in the same transaction.
     ///
     /// # Errors
     ///
-    /// Returns [`UserError::Db`] when the commit fails; the code stays in place.
+    /// Returns [`UserError::Db`] when a write or the commit fails; the code stays in place
+    /// and the password stays unrevoked.
     pub async fn commit(self) -> Result<(), UserError> {
-        let Self { tx, mut slot, .. } = self;
+        let Self {
+            mut tx,
+            slot,
+            user_id,
+            username,
+            revokes_password,
+        } = self;
+        if revokes_password {
+            sqlx::query(REVOKE_PASSWORD)
+                .bind(user_id)
+                .execute(&mut *tx)
+                .await?;
+            sqlx::query(AUDIT_PASSWORD_REVOKED)
+                .bind(user_id)
+                .bind(&username)
+                .execute(&mut *tx)
+                .await?;
+        }
         tx.commit().await?;
-        *slot = None;
+        if let Some(mut slot) = slot {
+            *slot = None;
+        }
         Ok(())
     }
 }
@@ -297,8 +328,65 @@ impl Users {
             })?;
         Ok(SetupRedemption {
             tx,
-            slot,
+            slot: Some(slot),
             user_id: id,
+            username: username.to_owned(),
+            revokes_password: false,
+        })
+    }
+
+    /// True while the bootstrap password may still be used: no real user exists and no
+    /// revocation row exists. A reset never clears a revocation row.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`UserError::Db`] for a database failure.
+    pub async fn bootstrap_password_armed(&self) -> Result<bool, UserError> {
+        let closed: bool = sqlx::query_scalar(PASSWORD_CLOSED)
+            .fetch_one(&self.pool)
+            .await?;
+        Ok(!closed)
+    }
+
+    /// Creates the admin user inside an open transaction for a caller that already verified
+    /// the bootstrap password. The setup lock is taken first and the closed state is checked
+    /// under it, so of two concurrent callers exactly one gets a redemption.
+    ///
+    /// The caller stores the first passkey through [`SetupRedemption::conn`] and then calls
+    /// [`SetupRedemption::commit`], which revokes the password in the same transaction.
+    /// Dropping the redemption rolls everything back and leaves the password unrevoked.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`UserError::SetupClosed`] once a user or a revocation exists, a username
+    /// error (the reserved `bootstrap` name included) or [`UserError::Db`].
+    pub async fn begin_redeem_password(
+        &self,
+        username: &str,
+    ) -> Result<SetupRedemption, UserError> {
+        validate_username(username)?;
+        let mut tx = self.pool.begin().await?;
+        sqlx::query(LOCK).bind(SETUP_LOCK).execute(&mut *tx).await?;
+        let closed: bool = sqlx::query_scalar(PASSWORD_CLOSED)
+            .fetch_one(&mut *tx)
+            .await?;
+        if closed {
+            return Err(UserError::SetupClosed);
+        }
+        let id: i64 = sqlx::query_scalar(INSERT_USER)
+            .bind(username)
+            .fetch_one(&mut *tx)
+            .await
+            .map_err(|e| match &e {
+                sqlx::Error::Database(db) if db.is_unique_violation() => UserError::Taken,
+                _ => UserError::Db(e),
+            })?;
+        Ok(SetupRedemption {
+            tx,
+            slot: None,
+            user_id: id,
+            username: username.to_owned(),
+            revokes_password: true,
         })
     }
 
