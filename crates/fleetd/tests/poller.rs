@@ -18,10 +18,11 @@ use fleet_proto::v1::{
 };
 use fleetd::backoff::Random;
 use fleetd::poller::{
-    CLAIM_GRACE, Claimed, GrpcReporter, JobRunner, MAX_IDLE_WAIT, PollRandom, Poller,
+    CLAIM_GRACE, ClaimGate, Claimed, GrpcReporter, JobRunner, MAX_IDLE_WAIT, PollRandom, Poller,
     REQUEST_TIMEOUT, RunError, SHUTDOWN_GRACE, Shutdown, Token,
 };
 use fleetd::runner::Reporter;
+use fleetd::update::{DrainController, DrainOutcome};
 use hyper_util::rt::TokioIo;
 use tokio::io::DuplexStream;
 use tokio::net::TcpListener;
@@ -243,6 +244,7 @@ enum Mode {
     Fail,
     Panic,
     Stubborn,
+    Lease,
 }
 
 #[derive(Clone)]
@@ -252,6 +254,7 @@ struct Double {
     began: Arc<Notify>,
     gate: Arc<Notify>,
     saw_shutdown: Arc<AtomicBool>,
+    leased: Arc<AtomicBool>,
 }
 
 impl Double {
@@ -262,6 +265,7 @@ impl Double {
             began: Arc::default(),
             gate: Arc::default(),
             saw_shutdown: Arc::default(),
+            leased: Arc::default(),
         }
     }
 
@@ -289,6 +293,13 @@ impl JobRunner for Double {
             Mode::Fail => Err(RunError),
             Mode::Panic => panic!("runner double panic"),
             Mode::Stubborn => std::future::pending().await,
+            Mode::Lease => {
+                pause(5).await;
+                self.leased.store(true, Ordering::SeqCst);
+                pause(5).await;
+                self.leased.store(false, Ordering::SeqCst);
+                Ok(())
+            }
             Mode::Gate => {
                 tokio::select! {
                     () = self.gate.notified() => {}
@@ -727,4 +738,58 @@ async fn grpc_reporter_sends_report_job_with_the_bearer_token() -> Test {
         .clone();
     assert_eq!(seen, [format!("Bearer {SECRET}")]);
     Ok(())
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_paused_gate_stops_claims_and_resuming_restarts_them() -> Test {
+    let rig = rig(vec![]);
+    let gate = ClaimGate::new();
+    gate.pause();
+    let running = start(poller(&rig, Double::new(Mode::Ok), 0.5)?.with_gate(gate.clone()));
+
+    pause(120).await;
+    assert_eq!(rig.claims(), 0);
+
+    gate.resume();
+    pause(10).await;
+    assert!(rig.claims() >= 1);
+    running.stop_within(Duration::from_secs(1)).await
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_drain_does_not_finish_while_a_claimed_job_is_not_yet_leased() -> Test {
+    let rig = rig(vec![Step::Job("job-a")]);
+    let gate = ClaimGate::new();
+    let runner = Double::new(Mode::Lease);
+    let running = start(poller(&rig, runner.clone(), 0.5)?.with_gate(gate.clone()));
+    runner.began.notified().await;
+    let control = DrainController::new(
+        gate.clone(),
+        Duration::from_secs(60),
+        Duration::from_secs(1),
+    );
+    let mut drain = control.begin_drain()?;
+    let began = Instant::now();
+    let leased = Arc::clone(&runner.leased);
+    let outcome = drain.wait(|| !leased.load(Ordering::SeqCst)).await;
+    assert_eq!(outcome, DrainOutcome::Drained);
+    assert!(began.elapsed() >= Duration::from_secs(10));
+    assert!(!runner.leased.load(Ordering::SeqCst));
+    drop(drain);
+    running.stop_within(Duration::from_secs(1)).await
+}
+
+#[tokio::test(start_paused = true)]
+async fn pausing_the_gate_mid_run_stops_new_claims() -> Test {
+    let rig = rig(vec![]);
+    let gate = ClaimGate::new();
+    let running = start(poller(&rig, Double::new(Mode::Ok), 0.5)?.with_gate(gate.clone()));
+
+    pause(20).await;
+    gate.pause();
+    pause(10).await;
+    let seen = rig.claims();
+    pause(300).await;
+    assert_eq!(rig.claims(), seen);
+    running.stop_within(Duration::from_secs(1)).await
 }

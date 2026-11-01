@@ -17,6 +17,7 @@ use std::fmt;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
 use fleet_proto::MAX_PROFILE_MESSAGE_BYTES;
@@ -86,6 +87,79 @@ impl Shutdown {
     /// Completes once shutdown has been requested or the poller is gone.
     pub async fn requested(&mut self) {
         let _ = self.0.wait_for(|requested| *requested).await;
+    }
+}
+
+/// A clone-able switch that pauses claiming without stopping the poller.
+///
+/// While paused the poller issues no `ClaimJob` call. A job already running is untouched. The
+/// update drain (ADR-0047) pauses it and resumes it when the attempt ends.
+#[derive(Debug, Clone)]
+pub struct ClaimGate(Arc<GateInner>);
+
+#[derive(Debug)]
+struct GateInner {
+    paused: watch::Sender<bool>,
+    claiming: AtomicUsize,
+}
+
+impl Default for ClaimGate {
+    fn default() -> Self {
+        Self(Arc::new(GateInner {
+            paused: watch::channel(false).0,
+            claiming: AtomicUsize::new(0),
+        }))
+    }
+}
+
+impl ClaimGate {
+    /// An open gate.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Stops new claims.
+    pub fn pause(&self) {
+        self.0.paused.send_replace(true);
+    }
+
+    /// Allows claims again.
+    pub fn resume(&self) {
+        self.0.paused.send_replace(false);
+    }
+
+    /// Whether claims are stopped.
+    #[must_use]
+    pub fn is_paused(&self) -> bool {
+        *self.0.paused.borrow()
+    }
+
+    /// Whether the poller is between the start of a claim and the end of the job that claim
+    /// returned, so a job may exist that no lease tracking sees yet.
+    ///
+    /// [`Poller::run`] holds this from before each claim until the job's runner returns.
+    /// [`Poller::claim`] called directly holds it only for the call.
+    #[must_use]
+    pub fn claim_in_flight(&self) -> bool {
+        self.0.claiming.load(Ordering::SeqCst) > 0
+    }
+
+    fn hold(&self) -> InFlight {
+        self.0.claiming.fetch_add(1, Ordering::SeqCst);
+        InFlight(Arc::clone(&self.0))
+    }
+
+    async fn opened(&self) {
+        let _ = self.0.paused.subscribe().wait_for(|paused| !*paused).await;
+    }
+}
+
+struct InFlight(Arc<GateInner>);
+
+impl Drop for InFlight {
+    fn drop(&mut self) {
+        self.0.claiming.fetch_sub(1, Ordering::SeqCst);
     }
 }
 
@@ -274,6 +348,7 @@ pub struct Poller<R, G = SystemRandom> {
     runner: Arc<R>,
     backoff: Backoff<G>,
     jitter: G,
+    gate: ClaimGate,
 }
 
 impl<R: JobRunner> Poller<R> {
@@ -351,7 +426,15 @@ impl<R: JobRunner, G: Random> Poller<R, G> {
             runner: Arc::new(runner),
             backoff: Backoff::standard(random.backoff),
             jitter: random.jitter,
+            gate: ClaimGate::new(),
         })
+    }
+
+    /// Uses `gate` to pause and resume claiming.
+    #[must_use]
+    pub fn with_gate(mut self, gate: ClaimGate) -> Self {
+        self.gate = gate;
+        self
     }
 
     /// Issues one `ClaimJob` call.
@@ -360,6 +443,10 @@ impl<R: JobRunner, G: Random> Poller<R, G> {
     ///
     /// Fails with the gRPC status code when the call fails.
     pub async fn claim(&mut self) -> Result<Claimed, ClaimError> {
+        let _in_flight = self.gate.hold();
+        if self.gate.is_paused() {
+            return Ok(Claimed::Idle(Duration::ZERO));
+        }
         let reply = backstop(self.client.claim_job(ClaimJobRequest {
             r#box: self.box_name.clone(),
         }))
@@ -396,6 +483,11 @@ impl<R: JobRunner, G: Random> Poller<R, G> {
         };
         let (trigger, signal) = watch::channel(false);
         loop {
+            tokio::select! {
+                () = stop.fired() => return,
+                () = self.gate.opened() => {}
+            }
+            let busy = self.gate.hold();
             let wait = match self.claim_or_stop(&mut stop).await {
                 None => return,
                 Some(Ok(Claimed::Job(job))) => {
@@ -414,6 +506,7 @@ impl<R: JobRunner, G: Random> Poller<R, G> {
                     wait
                 }
             };
+            drop(busy);
             tokio::select! {
                 () = stop.fired() => return,
                 () = tokio::time::sleep(wait) => {}
