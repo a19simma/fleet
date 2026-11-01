@@ -35,6 +35,7 @@ use crate::runner::{AgentOutcome, AgentRunner, Interrupt, JobEnd, Reporter, RunC
 use crate::systemd::select_launcher;
 use crate::telemetry::{FetchPhase, FetchRecordError};
 use crate::toolhook::HookHub;
+use crate::update::{TrackedRunner, UpdateWiring};
 use crate::workspace::{RepoPolicy, Workspace, broker_scratch_path, job_owner};
 
 const ERR_WORKSPACE: &str = "workspace could not be prepared";
@@ -43,7 +44,7 @@ const ERR_SHUTDOWN: &str = "agent stopped by daemon shutdown";
 const ERR_BROKER: &str = "job broker could not be set up";
 
 /// The poller the daemon runs.
-pub(crate) type JobPoller = Poller<DaemonRunner<GrpcReporter>>;
+pub(crate) type JobPoller = Poller<TrackedRunner<DaemonRunner<GrpcReporter>>>;
 
 /// Runs one claimed job from checkout to terminal report.
 pub struct DaemonRunner<R> {
@@ -604,6 +605,7 @@ pub(crate) fn build(
     box_name: &str,
     redactor: Redactor,
     hub: Arc<HookHub>,
+    update: &UpdateWiring,
 ) -> Result<Option<JobPoller>, Error> {
     let Some(url) = env(SERVER_URL_ENV).filter(|url| !url.is_empty()) else {
         return Ok(None);
@@ -663,7 +665,10 @@ pub(crate) fn build(
             .with_hook_hub(hub)
             .with_launcher(launcher)
             .with_feed_book(feeds)
-            .with_job_end(wired.end.on_end(book.end_hook())),
+            .with_job_end(wired.end.on_end(book.end_hook()).on_end({
+                let tracker = update.tracker.clone();
+                move |job_id| tracker.end(job_id)
+            })),
         box_name,
     )
     .with_credentials(book)
@@ -672,10 +677,10 @@ pub(crate) fn build(
         channel,
         &token,
         box_name.to_owned(),
-        runner,
+        TrackedRunner::new(runner, update.tracker.clone()),
         PollRandom::system(),
     )
-    .map(Some)
+    .map(|poller| Some(poller.with_gate(update.gate.clone())))
 }
 
 #[cfg(test)]
@@ -774,7 +779,46 @@ mod tests {
             "FLEET_TOKEN" => Some(String::from("tok-wired-0123456789")),
             other => extra.and_then(|(key, value)| (key == other).then(|| value.to_owned())),
         };
-        Ok(build(&config, &env, "box", Redactor::default(), HookHub::new()).is_ok())
+        Ok(build(
+            &config,
+            &env,
+            "box",
+            Redactor::default(),
+            HookHub::new(),
+            &UpdateWiring::default(),
+        )
+        .is_ok())
+    }
+
+    #[tokio::test]
+    async fn the_built_poller_claims_through_the_update_gate() -> TestResult {
+        let dir = tempfile::TempDir::new()?;
+        let mut config = Config::resolve(None, &|_| None)?;
+        config.jobs_dir = dir.path().join("jobs");
+        let env = |name: &str| match name {
+            "FLEET_SERVER_URL" => Some(String::from("http://127.0.0.1:1")),
+            "FLEET_TOKEN" => Some(String::from("tok-wired-0123456789")),
+            _ => None,
+        };
+        let wiring = UpdateWiring::default();
+        let mut poller = build(
+            &config,
+            &env,
+            "box",
+            Redactor::default(),
+            HookHub::new(),
+            &wiring,
+        )?
+        .ok_or("no poller")?;
+        wiring.gate.pause();
+        let paused = poller.claim().await;
+        assert!(matches!(
+            paused,
+            Ok(crate::poller::Claimed::Idle(wait)) if wait.is_zero()
+        ));
+        wiring.gate.resume();
+        assert!(poller.claim().await.is_err());
+        Ok(())
     }
 
     #[tokio::test]

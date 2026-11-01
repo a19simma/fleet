@@ -2,6 +2,7 @@
 
 use std::fmt;
 use std::future::Future;
+use std::sync::Arc;
 
 use std::time::Duration;
 
@@ -88,6 +89,7 @@ pub struct Heartbeat {
     channel: Channel,
     authorization: MetadataValue<Ascii>,
     period: Duration,
+    on_success: Option<Arc<dyn Fn() + Send + Sync>>,
 }
 
 impl fmt::Debug for Heartbeat {
@@ -129,6 +131,7 @@ impl Heartbeat {
             channel: endpoint.connect_lazy(),
             authorization,
             period: HEARTBEAT_PERIOD,
+            on_success: None,
         })
     }
 
@@ -136,6 +139,13 @@ impl Heartbeat {
     #[must_use]
     pub const fn with_period(mut self, period: Duration) -> Self {
         self.period = period;
+        self
+    }
+
+    /// Runs `hook` after every heartbeat the server accepts.
+    #[must_use]
+    pub fn with_on_success(mut self, hook: impl Fn() + Send + Sync + 'static) -> Self {
+        self.on_success = Some(Arc::new(hook));
         self
     }
 
@@ -189,7 +199,11 @@ impl Heartbeat {
             .metadata_mut()
             .insert("authorization", self.authorization.clone());
         match tokio::time::timeout(REQUEST_TIMEOUT, client.heartbeat(request)).await {
-            Ok(Ok(_)) => {}
+            Ok(Ok(_)) => {
+                if let Some(hook) = &self.on_success {
+                    hook();
+                }
+            }
             Ok(Err(status)) => {
                 tracing::warn!(code = ?status.code(), "heartbeat failed");
             }

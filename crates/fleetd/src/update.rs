@@ -18,6 +18,8 @@ use crate::fetch_policy::HostPattern;
 
 mod drain;
 mod fetcher;
+mod guard;
+mod restart;
 mod swap;
 mod unpack;
 pub use drain::{
@@ -29,7 +31,14 @@ pub use fetcher::{
 };
 use fleet_core::tools::Version;
 use fleet_proto::{MAX_MANIFEST_BYTES, MAX_SIGNATURE_BYTES};
+pub use guard::{
+    BAD_VERSIONS_FILE, Guard, GuardOutcome, HEALTH_FILE, MAX_UNHEALTHY_STARTS, STARTS_FILE,
+    is_bad_version, write_health_marker,
+};
 use minisign_verify::{PublicKey, Signature};
+pub use restart::{
+    ApplyOutcome, HealthGate, LeaseTracker, RestartSignal, TrackedRunner, UpdateWiring, Updater,
+};
 use rustix::fs::OFlags;
 use serde::de::{MapAccess, Visitor};
 use serde::{Deserialize, Deserializer};
@@ -38,6 +47,9 @@ pub use swap::{
     CURRENT_LINK, MAX_BINARY_BYTES, MAX_UNPACKED_BYTES, PREVIOUS_LINK, SwapError, Swapper,
 };
 pub use unpack::{BINARY_FILE, MAX_TAR_ENTRIES};
+
+/// Default bin root: the versioned binaries, `current`, `previous` and the guard files.
+pub const DEFAULT_BIN_ROOT: &str = "/var/lib/fleet/bin";
 
 /// Default path of the trust-root public key (ADR-0047).
 pub const DEFAULT_TRUST_ROOT: &str = "/etc/fleetd/update.pub";
