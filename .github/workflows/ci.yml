@@ -61,6 +61,14 @@ jobs:
       - uses: jdx/mise-action@v5
       - run: mise run it:linux
 
+  css:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: jdx/mise-action@v5
+      - run: mise run css
+      - run: test -z "$(git status --porcelain)"
+
   infra:
     runs-on: ubuntu-latest
     steps:

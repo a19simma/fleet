@@ -1,5 +1,6 @@
 [tools]
 "github:nextest-rs/nextest" = { version = "0.9.150", version_prefix = "cargo-nextest-" }
+"github:tailwindlabs/tailwindcss" = "4.3.3"
 
 [tools.rust]
 version = "1.99"
@@ -8,3 +9,20 @@ components = "rustfmt,clippy"
 [tasks."it:linux"]
 description = "Run the fleetd uid and directory suite in a Linux container (needs docker or colima)"
 run = "cargo nextest run -p fleetd --test linux_uid --run-ignored only"
+
+[tasks.css]
+description = "Build the web UI stylesheet"
+run = "tailwindcss -i crates/fleet-server/ui/input.css -o crates/fleet-server/assets/ui.css --minify"
+
+[tasks."css:check"]
+description = "Fail when assets/ui.css is stale"
+run = """
+tmp=$(mktemp)
+tailwindcss -i crates/fleet-server/ui/input.css -o "$tmp" --minify
+if ! cmp -s "$tmp" crates/fleet-server/assets/ui.css; then
+  rm -f "$tmp"
+  echo "assets/ui.css is stale: run 'mise run css' and commit the result" >&2
+  exit 1
+fi
+rm -f "$tmp"
+"""
