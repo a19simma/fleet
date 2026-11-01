@@ -1,0 +1,38 @@
+#!/bin/sh
+if [ "$1" = "--version" ]; then
+  echo '2.1.289 (Claude Code)'
+  exit 0
+fi
+rc=0
+probe() {
+  name=$1
+  shift
+  if err=$("$@" 2>&1); then
+    echo "ok:$name"
+  else
+    echo "fail:$name:$err"
+    rc=1
+  fi
+}
+if [ -n "$KIMI_CODE_HOME" ]; then
+  config_dir=$KIMI_CODE_HOME
+else
+  config_dir=$CLAUDE_CONFIG_DIR
+fi
+echo "who=$(id -u):$(id -g)"
+echo "groups=$(id -G)"
+echo "home=$HOME"
+echo "config_dir=$config_dir"
+echo "cwd=$(pwd -P)"
+echo "config_mode=$(stat -c '%a:%u:%g' "$config_dir")"
+echo "config_parent_mode=$(stat -c '%a:%u:%g' "$(dirname "$config_dir")")"
+if cat "/run/fleet/$FLEET_JOB_ID/env" > /dev/null 2>&1; then
+  echo "env_file=readable"
+else
+  echo "env_file=denied"
+fi
+probe home sh -c ': > "$HOME/probe"'
+probe config sh -c ': > "$1/config.toml"' sh "$config_dir"
+probe cache sh -c 'mkdir -p "$XDG_CACHE_HOME/fleet-it" && : > "$XDG_CACHE_HOME/fleet-it/probe"'
+probe workdir sh -c ': > ./probe'
+exit $rc

@@ -1,0 +1,61 @@
+#!/bin/sh
+state_root=/run/fleet-it
+run_dir=/run/fleet
+unit=
+for arg in "$@"; do
+  case "$arg" in
+    fleet-agent@*.service) unit=$arg ;;
+  esac
+done
+id=${unit#fleet-agent@}
+id=${id%.service}
+st=$state_root/$id
+mkdir -p "$st"
+echo "$*" >> "$st/log"
+verb=$1
+case "$verb" in
+  start)
+    set --
+    while IFS= read -r line; do
+      key=${line%%=*}
+      val=${line#*=}
+      val=${val#\"}
+      val=${val%\"}
+      set -- "$@" "$key=$val"
+    done < "$run_dir/$id/env"
+    (
+      sudo -n setpriv --reuid=985 --regid=987 --clear-groups \
+        env -i "$@" /opt/fleet-it/fleetd agent-exec "$id" \
+        > "$run_dir/$id/stdout" 2> "$st/err"
+      echo $? > "$st/rc.tmp"
+      mv "$st/rc.tmp" "$st/rc"
+    ) < /dev/null > /dev/null 2>&1 &
+    echo $! > "$st/pid"
+    exit 0
+    ;;
+  show)
+    if [ -f "$st/rc" ]; then
+      rc=$(cat "$st/rc")
+      if [ "$rc" = 0 ]; then
+        printf 'ActiveState=inactive\nSubState=dead\nResult=success\nExecMainCode=1\nExecMainStatus=0\n'
+      else
+        printf 'ActiveState=failed\nSubState=failed\nResult=exit-code\nExecMainCode=1\nExecMainStatus=%s\n' "$rc"
+      fi
+    elif [ -f "$st/pid" ]; then
+      printf 'ActiveState=active\nSubState=running\nResult=success\nExecMainCode=0\nExecMainStatus=0\n'
+    else
+      printf 'ActiveState=inactive\nSubState=dead\nResult=success\nExecMainCode=0\nExecMainStatus=0\n'
+    fi
+    exit 0
+    ;;
+  kill)
+    if [ -f "$st/pid" ]; then
+      kill -9 "$(cat "$st/pid")" 2>/dev/null
+    fi
+    echo 137 > "$st/rc"
+    exit 0
+    ;;
+  *)
+    exit 0
+    ;;
+esac

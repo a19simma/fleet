@@ -4,3 +4,7 @@
 [tools.rust]
 version = "1.99"
 components = "rustfmt,clippy"
+
+[tasks."it:linux"]
+description = "Run the fleetd uid and directory suite in a Linux container (needs docker or colima)"
+run = "cargo nextest run -p fleetd --test linux_uid --run-ignored only"

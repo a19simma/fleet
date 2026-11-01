@@ -11,5 +11,5 @@ filter = 'binary_id(fleetd::e2e_jobs)'
 test-group = 'pg-e2e'
 
 [[profile.default.overrides]]
-filter = 'binary_id(/^fleetd::(hook_process|askpass_process|systemd_launcher|tool_install_exec|runner)$/)'
+filter = 'binary_id(/^fleetd::(hook_process|askpass_process|systemd_launcher|tool_install_exec|runner|linux_uid)$/)'
 test-group = 'spawn-children'
