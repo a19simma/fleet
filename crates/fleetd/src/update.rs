@@ -3,7 +3,8 @@
 //! The server relays `{version, min_protocol, seq, targets}` plus a minisign signature. This
 //! module checks the signature against the trust-root key file, bounds and validates every
 //! field, and refuses a manifest that is not strictly newer than the running version and the
-//! last accepted `seq` (ADR-0047). It downloads and swaps nothing.
+//! last accepted `seq` (ADR-0047). The `swap` submodule unpacks a staged archive and flips the
+//! `current` and `previous` links. Nothing here restarts fleetd.
 
 use std::cmp::Ordering;
 use std::collections::BTreeMap;
@@ -17,6 +18,8 @@ use crate::fetch_policy::HostPattern;
 
 mod drain;
 mod fetcher;
+mod swap;
+mod unpack;
 pub use drain::{
     DRAIN_CAP, DRAIN_POLL, DrainController, DrainOutcome, DrainRefused, DrainState, Draining,
 };
@@ -31,6 +34,10 @@ use rustix::fs::OFlags;
 use serde::de::{MapAccess, Visitor};
 use serde::{Deserialize, Deserializer};
 use sha2::{Digest, Sha256};
+pub use swap::{
+    CURRENT_LINK, MAX_BINARY_BYTES, MAX_UNPACKED_BYTES, PREVIOUS_LINK, SwapError, Swapper,
+};
+pub use unpack::{BINARY_FILE, MAX_TAR_ENTRIES};
 
 /// Default path of the trust-root public key (ADR-0047).
 pub const DEFAULT_TRUST_ROOT: &str = "/etc/fleetd/update.pub";

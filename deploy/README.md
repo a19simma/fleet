@@ -129,6 +129,16 @@ Unverified:
 
 `tmpfiles.d` creates `/run/fleet` and `/run/fleet/hook` instead of a second `RuntimeDirectory=` in the unit, because `RuntimeDirectoryMode=` applies to every name in the unit and `/run/fleetd` must stay 0700.
 
+### Self-update layout
+
+`fleetd-systemd.service` runs `ExecStart=/var/lib/fleet/bin/current/fleetd serve`. `tmpfiles.d/fleet.conf` creates `/var/lib/fleet/bin` (0755, `fleetd:fleet-work`) and seeds `current` as a symlink to `/usr/local/bin`, so a box that never updated runs the baked binary through the same path. The unit lists `-/var/lib/fleet/bin` in `ReadWritePaths=`, because `ProtectSystem=strict` otherwise keeps the swap read-only. The `-` prefix follows the rule in `deploy/CLAUDE.md`. The job units (`fleet-agent@.service`, `fleet-tool-install@.service`) are unchanged: they run the baked `/usr/local/bin/fleetd` and gain no path. The legacy `fleetd.service` (`User=agent`) is unchanged and stays on `/usr/local/bin/fleetd`: its user does not own the bin dir.
+
+`fleetd::update::Swapper` unpacks `<ver>/fleetd.tar.gz` into `<ver>/fleetd` (0755, the version dir opens to 0755 so `fleet-job` can run it) and flips the links with `rename(2)` over a temp symlink: `previous` takes the old `current` target first, then `current` flips. Entries that are links, absolute paths, `..` paths or non-regular files refuse the archive, and the binary and total unpacked sizes are capped. Covered by `crates/fleetd/tests/update_swap.rs` against temp dirs and a relative root.
+
+Wired: the unit, tmpfiles and the swap module. Not wired: nothing calls `Swapper` yet, and nothing restarts fleetd after a swap (UPD-7). The rollback guard that moves `current` back to `previous` does not exist (ADR-0047 `ExecStartPre`). A swap off the `/usr/local/bin` seed records no `previous`, so the first update has no rollback target until the guard defines one.
+
+Unverified, no live run: `systemd-analyze verify` on the changed unit; that `ReadWritePaths=-/var/lib/fleet/bin` makes the path writable for `fleetd`; that systemd-tmpfiles `L` leaves an existing `current` alone after a swap; `rename(2)` over a symlink on the target host; the unpacked layout against a real cargo-dist archive (the reader takes the single entry named `fleetd` at any depth and rejects pax headers).
+
 ### Install order
 
 1. Install a system-wide Claude (see [Claude install](#claude-install)).
