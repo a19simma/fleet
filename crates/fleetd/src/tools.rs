@@ -4,14 +4,19 @@
 //! the minisign signature of the binary with the key the UPD-2 loader accepts
 //! ([`crate::update::load_trust_root`]), and only then returns a [`VerifiedMise`]. Nothing here
 //! runs mise or installs a tool.
+//!
+//! [`tool_hosts`] derives the exact hosts an install may reach from the closed tool registry,
+//! [`check_tool_hosts`] requires the Box egress ceiling to cover them, and [`write_tool_env`]
+//! writes the proxy variables the install unit reads from `tool-env`.
 
 use std::fmt;
+use std::fmt::Write as _;
 use std::fs::{self, File, OpenOptions};
-use std::io::Read;
+use std::io::{Read, Write};
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 
-use fleet_core::tools::Version;
+use fleet_core::tools::{ToolName, Version};
 use fleet_proto::MAX_SIGNATURE_BYTES;
 use minisign_verify::Signature;
 use rustix::fs::OFlags;
@@ -72,6 +77,14 @@ pub enum ToolsError {
     Key(UpdateError),
     /// A file could not be opened or read.
     Io(std::io::Error),
+    /// The job id is not `[A-Za-z0-9_]{1,64}`.
+    InvalidId,
+    /// The proxy port is zero.
+    InvalidProxy,
+    /// A host list entry is not a plain lowercase DNS name.
+    InvalidHost,
+    /// A host the install needs is not in the host list.
+    HostNotAllowed,
 }
 
 impl fmt::Display for ToolsError {
@@ -92,6 +105,12 @@ impl fmt::Display for ToolsError {
             Self::Signature(why) => write!(f, "mise signature refused: {why}"),
             Self::Key(err) => write!(f, "mise public key refused: {err}"),
             Self::Io(err) => write!(f, "mise verification io: {err}"),
+            Self::InvalidId => f.write_str("tool-env job id is invalid"),
+            Self::InvalidProxy => f.write_str("tool-env proxy port is invalid"),
+            Self::InvalidHost => f.write_str("egress host entry is not a plain DNS name"),
+            Self::HostNotAllowed => {
+                f.write_str("egress ceiling lacks a host the tool install needs")
+            }
         }
     }
 }
@@ -289,4 +308,135 @@ fn read_signature(path: &Path) -> Result<Signature, ToolsError> {
     let text =
         std::str::from_utf8(&raw).map_err(|_| ToolsError::Signature("not UTF-8".to_owned()))?;
     Signature::decode(text).map_err(|err| ToolsError::Signature(err.to_string()))
+}
+
+/// File name of the install unit's environment file inside a job's run directory.
+pub const TOOL_ENV_FILE: &str = "tool-env";
+
+const TOOL_ENV_MODE: u32 = 0o600;
+const PROXY_ENV: [&str; 4] = ["HTTPS_PROXY", "https_proxy", "HTTP_PROXY", "http_proxy"];
+const MAX_HOST_BYTES: usize = 253;
+const MAX_LABEL_BYTES: usize = 63;
+
+const COMMON_HOSTS: [&str; 2] = ["api.github.com", "mise-versions.jdx.dev"];
+const GITHUB_HOSTS: [&str; 3] = [
+    "github.com",
+    "objects.githubusercontent.com",
+    "release-assets.githubusercontent.com",
+];
+
+const fn source_hosts(tool: ToolName) -> &'static [&'static str] {
+    match tool {
+        ToolName::Node => &["nodejs.org"],
+        ToolName::Go => &["dl.google.com", "go.dev"],
+        ToolName::Java => &["api.adoptium.net", "github.com"],
+        ToolName::Python | ToolName::Jq | ToolName::Just | ToolName::Uv => &[],
+    }
+}
+
+/// The exact hosts an install of `tools` may reach, sorted and without duplicates.
+///
+/// The set is the common mise and GitHub hosts plus the release hosts of each tool in the
+/// closed registry. It is empty for no tools. No entry is a wildcard. The per-tool hosts are
+/// unverified until a live install captures real traffic.
+#[must_use]
+pub fn tool_hosts(tools: &[ToolName]) -> Vec<&'static str> {
+    if tools.is_empty() {
+        return Vec::new();
+    }
+    let mut hosts: Vec<&'static str> = COMMON_HOSTS.to_vec();
+    for tool in tools {
+        hosts.extend_from_slice(source_hosts(*tool));
+        if !matches!(tool, ToolName::Node | ToolName::Go) {
+            hosts.extend_from_slice(&GITHUB_HOSTS);
+        }
+    }
+    hosts.sort_unstable();
+    hosts.dedup();
+    hosts
+}
+
+fn plain_dns_name(host: &str) -> bool {
+    !host.is_empty()
+        && host.len() <= MAX_HOST_BYTES
+        && host.split('.').all(|label| {
+            !label.is_empty()
+                && label.len() <= MAX_LABEL_BYTES
+                && !label.starts_with('-')
+                && !label.ends_with('-')
+                && label
+                    .bytes()
+                    .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
+        })
+}
+
+/// Requires `ceiling`, the Box egress host list, to hold every host [`tool_hosts`] names for
+/// `tools`, by exact match.
+///
+/// # Errors
+///
+/// Returns [`ToolsError::InvalidHost`] when any entry of `ceiling` is not a plain lowercase
+/// DNS name (wildcards, ports, userinfo, line breaks, whitespace, non-ASCII and empty labels
+/// are all refused), and [`ToolsError::HostNotAllowed`] when a needed host is absent.
+pub fn check_tool_hosts(ceiling: &[String], tools: &[ToolName]) -> Result<(), ToolsError> {
+    if !ceiling.iter().all(|host| plain_dns_name(host)) {
+        return Err(ToolsError::InvalidHost);
+    }
+    let covered = tool_hosts(tools)
+        .iter()
+        .all(|need| ceiling.iter().any(|host| host == need));
+    if covered {
+        Ok(())
+    } else {
+        Err(ToolsError::HostNotAllowed)
+    }
+}
+
+/// Writes `run_dir/<id>/tool-env` for the install unit and returns its path, or `None` when
+/// `tools` is empty and no file is written.
+///
+/// The file holds the four proxy variables, each naming `http://127.0.0.1:<proxy_port>`, and
+/// nothing else. It is created with mode 0600 and must not already exist. Call it before the
+/// install unit starts.
+///
+/// # Errors
+///
+/// Returns [`ToolsError::InvalidId`] for a bad job id, [`ToolsError::InvalidProxy`] for port
+/// zero and [`ToolsError::Io`] when the file cannot be created or written; a partial file is
+/// removed.
+pub fn write_tool_env(
+    run_dir: &Path,
+    id: &str,
+    proxy_port: u16,
+    tools: &[ToolName],
+) -> Result<Option<PathBuf>, ToolsError> {
+    let valid_id = !id.is_empty()
+        && id.len() <= 64
+        && id.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_');
+    if !valid_id {
+        return Err(ToolsError::InvalidId);
+    }
+    if proxy_port == 0 {
+        return Err(ToolsError::InvalidProxy);
+    }
+    if tools.is_empty() {
+        return Ok(None);
+    }
+    let proxy = format!("http://127.0.0.1:{proxy_port}");
+    let body = PROXY_ENV.iter().fold(String::new(), |mut out, name| {
+        let _ = writeln!(out, "{name}={proxy}");
+        out
+    });
+    let path = run_dir.join(id).join(TOOL_ENV_FILE);
+    let mut file = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(TOOL_ENV_MODE)
+        .open(&path)
+        .map_err(ToolsError::Io)?;
+    if let Err(err) = file.write_all(body.as_bytes()) {
+        let _ = fs::remove_file(&path);
+        return Err(ToolsError::Io(err));
+    }
+    Ok(Some(path))
 }

@@ -15,8 +15,12 @@ use std::fs;
 use std::os::unix::fs::{MetadataExt, PermissionsExt, symlink};
 use std::path::{Path, PathBuf};
 
+use fleet_core::tools::ToolName;
 use fleet_proto::MAX_SIGNATURE_BYTES;
-use fleetd::tools::{MisePins, MisePinsConfig, ToolsError, verify_mise, verify_mise_capped};
+use fleetd::tools::{
+    MisePins, MisePinsConfig, TOOL_ENV_FILE, ToolsError, check_tool_hosts, tool_hosts, verify_mise,
+    verify_mise_capped, write_tool_env,
+};
 use ring::signature::{Ed25519KeyPair, KeyPair};
 use sha2::{Digest, Sha256};
 use tempfile::TempDir;
@@ -507,4 +511,138 @@ fn a_relative_binary_path_verifies() {
     fs::set_permissions(dir.path(), fs::Permissions::from_mode(0o755)).unwrap();
     let verified = verify_mise(&rel, &fx.pins(), owner_of(dir.path())).unwrap();
     assert_eq!(verified.path(), rel);
+}
+
+const PROXY_PORT: u16 = 43_127;
+
+fn tool_env_dir() -> TempDir {
+    let dir = TempDir::new().unwrap();
+    fs::create_dir(dir.path().join("job_1")).unwrap();
+    dir
+}
+
+#[test]
+fn tool_env_content_and_mode_are_exact() {
+    let dir = tool_env_dir();
+    let path = write_tool_env(dir.path(), "job_1", PROXY_PORT, &[ToolName::Node])
+        .unwrap()
+        .unwrap();
+    assert_eq!(path, dir.path().join("job_1").join(TOOL_ENV_FILE));
+    let p = PROXY_PORT;
+    let want = format!(
+        "HTTPS_PROXY=http://127.0.0.1:{p}\nhttps_proxy=http://127.0.0.1:{p}\nHTTP_PROXY=http://127.0.0.1:{p}\nhttp_proxy=http://127.0.0.1:{p}\n"
+    );
+    assert_eq!(fs::read_to_string(&path).unwrap(), want);
+    assert_eq!(
+        fs::metadata(&path).unwrap().permissions().mode() & 0o7777,
+        0o600
+    );
+}
+
+#[test]
+fn tool_env_is_absent_without_tools() {
+    let dir = tool_env_dir();
+    assert!(
+        write_tool_env(dir.path(), "job_1", PROXY_PORT, &[])
+            .unwrap()
+            .is_none()
+    );
+    assert!(!dir.path().join("job_1").join(TOOL_ENV_FILE).exists());
+}
+
+#[test]
+fn tool_env_refuses_bad_instance_ids() {
+    let dir = tool_env_dir();
+    let long = "a".repeat(65);
+    for id in ["", "..", "a/b", "a-b", "a b", "job\n1", "job\0", "é", &long] {
+        let err = write_tool_env(dir.path(), id, PROXY_PORT, &[ToolName::Jq]).unwrap_err();
+        assert!(matches!(err, ToolsError::InvalidId), "{id:?}");
+    }
+}
+
+#[test]
+fn tool_env_refuses_port_zero_and_existing_file() {
+    let dir = tool_env_dir();
+    let err = write_tool_env(dir.path(), "job_1", 0, &[ToolName::Jq]).unwrap_err();
+    assert!(matches!(err, ToolsError::InvalidProxy));
+    write_tool_env(dir.path(), "job_1", PROXY_PORT, &[ToolName::Jq]).unwrap();
+    let err = write_tool_env(dir.path(), "job_1", PROXY_PORT, &[ToolName::Jq]).unwrap_err();
+    assert!(matches!(err, ToolsError::Io(_)));
+}
+
+#[test]
+fn tool_hosts_are_exact_sorted_and_cover_every_tool() {
+    for tool in ToolName::ALL {
+        let hosts = tool_hosts(&[tool]);
+        assert!(!hosts.is_empty(), "{tool}");
+        for host in &hosts {
+            assert!(
+                host.bytes().all(|b| b.is_ascii_lowercase()
+                    || b.is_ascii_digit()
+                    || b == b'.'
+                    || b == b'-'),
+                "{host}"
+            );
+            assert!(!host.contains('*') && !host.starts_with('.') && host.contains('.'));
+        }
+        assert!(hosts.windows(2).all(|w| w[0] < w[1]));
+    }
+    assert_eq!(tool_hosts(&[]).len(), 0);
+    assert!(tool_hosts(&[ToolName::Node]).contains(&"nodejs.org"));
+    assert!(!tool_hosts(&[ToolName::Jq]).contains(&"nodejs.org"));
+}
+
+#[test]
+fn check_tool_hosts_accepts_a_ceiling_that_covers_the_need() {
+    let mut ceiling: Vec<String> = tool_hosts(&[ToolName::Go])
+        .iter()
+        .map(|h| (*h).to_owned())
+        .collect();
+    ceiling.push("example.org".to_owned());
+    check_tool_hosts(&ceiling, &[ToolName::Go]).unwrap();
+}
+
+#[test]
+fn check_tool_hosts_refuses_a_missing_host() {
+    let ceiling = vec!["github.com".to_owned()];
+    let err = check_tool_hosts(&ceiling, &[ToolName::Node]).unwrap_err();
+    assert!(matches!(err, ToolsError::HostNotAllowed));
+}
+
+#[test]
+fn check_tool_hosts_refuses_hostile_entries() {
+    let mut good: Vec<String> = tool_hosts(&[ToolName::Jq])
+        .iter()
+        .map(|h| (*h).to_owned())
+        .collect();
+    let rows = [
+        "*.github.com",
+        "*",
+        ".github.com",
+        "github.com\r\n",
+        "github.com\n",
+        "github.com\u{85}",
+        "github.com\u{2028}",
+        "user@github.com",
+        "github.com:443",
+        "github.com\\evil.com",
+        "[::1]",
+        "GITHUB.COM",
+        " github.com",
+        "github..com",
+        "gíthub.com",
+        "",
+    ];
+    for row in rows {
+        good.push(row.to_owned());
+        let err = check_tool_hosts(&good, &[ToolName::Jq]).unwrap_err();
+        assert!(matches!(err, ToolsError::InvalidHost), "{row:?}");
+        good.pop();
+    }
+    let long = format!("{}.com", "a".repeat(260));
+    good.push(long);
+    assert!(matches!(
+        check_tool_hosts(&good, &[ToolName::Jq]),
+        Err(ToolsError::InvalidHost)
+    ));
 }
