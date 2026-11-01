@@ -370,6 +370,7 @@ pub async fn run_with_env(
             };
             match start_production(
                 &config.update_trust_root,
+                config.update_trust_source,
                 Path::new(DEFAULT_BIN_ROOT),
                 config.update_hosts.clone(),
                 &update,

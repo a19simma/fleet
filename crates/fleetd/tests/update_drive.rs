@@ -30,7 +30,7 @@ use fleetd::heartbeat::{Heartbeat, QueueSnapshot, QueueSource};
 use fleetd::update::{
     ArchiveFetcher, ArchiveResponse, DrainController, DriverConfig, DriverOutcome,
     MAX_ATTEMPTS_PER_VERSION, Offer, OfferSink, RestartSignal, SeqStore, Swapper, TrustRoot,
-    UpdateDriver, UpdateWiring, Updater, load_trust_root, start_production,
+    TrustSource, UpdateDriver, UpdateWiring, Updater, load_trust_root, start_production,
 };
 use sha2::{Digest, Sha256};
 use tempfile::TempDir;
@@ -622,7 +622,7 @@ fn hosts() -> Vec<HostPattern> {
 }
 
 #[tokio::test]
-async fn a_missing_or_unsafe_trust_root_disables_updating_with_one_warning() {
+async fn a_missing_explicit_or_unsafe_trust_root_disables_updating_with_one_warning() {
     let rig = rig();
     let capture = Capture(Arc::default());
     let _guard = tracing::subscriber::set_default(
@@ -633,7 +633,16 @@ async fn a_missing_or_unsafe_trust_root_disables_updating_with_one_warning() {
     );
     let before = rig.snapshot();
     let missing = rig.root.join("absent.pub");
-    assert!(start_production(&missing, &rig.root, hosts(), &rig.wiring).is_none());
+    assert!(
+        start_production(
+            &missing,
+            TrustSource::Explicit,
+            &rig.root,
+            hosts(),
+            &rig.wiring
+        )
+        .is_none()
+    );
     let text = String::from_utf8(capture.0.lock().unwrap().clone()).unwrap();
     assert_eq!(text.matches("self-update disabled").count(), 1, "{text}");
     assert_eq!(text.matches("WARN").count(), 1, "{text}");
@@ -642,9 +651,78 @@ async fn a_missing_or_unsafe_trust_root_disables_updating_with_one_warning() {
     let loose = rig.root.join("loose.pub");
     fs::write(&loose, rig.signer.public_text()).unwrap();
     fs::set_permissions(&loose, fs::Permissions::from_mode(0o666)).unwrap();
-    assert!(start_production(&loose, &rig.root, hosts(), &rig.wiring).is_none());
+    assert!(
+        start_production(
+            &loose,
+            TrustSource::Default,
+            &rig.root,
+            hosts(),
+            &rig.wiring
+        )
+        .is_none()
+    );
     let mut with_loose = before;
     with_loose.push(("loose.pub".to_owned(), "100666".to_owned()));
     with_loose.sort();
     assert_eq!(rig.snapshot(), with_loose);
+}
+
+#[tokio::test]
+async fn a_bad_default_trust_file_disables_updating_and_never_uses_the_baked_key() {
+    let rig = rig();
+    let capture = Capture(Arc::default());
+    let _guard = tracing::subscriber::set_default(
+        tracing_subscriber::fmt()
+            .with_writer(capture.clone())
+            .with_ansi(false)
+            .finish(),
+    );
+    let before = rig.snapshot();
+    let garbage = rig.root.join("garbage.pub");
+    fs::write(&garbage, "not a key\n").unwrap();
+    fs::set_permissions(&garbage, fs::Permissions::from_mode(0o644)).unwrap();
+    let mut with_garbage = before;
+    with_garbage.push(("garbage.pub".to_owned(), "100644".to_owned()));
+    with_garbage.sort();
+    assert!(
+        start_production(
+            &garbage,
+            TrustSource::Default,
+            &rig.root,
+            hosts(),
+            &rig.wiring
+        )
+        .is_none()
+    );
+    let text = String::from_utf8(capture.0.lock().unwrap().clone()).unwrap();
+    assert_eq!(text.matches("self-update disabled").count(), 1, "{text}");
+    assert_eq!(text.matches("baked key not used").count(), 1, "{text}");
+    assert!(!text.contains("update trust root selected"), "{text}");
+    assert_eq!(rig.snapshot(), with_garbage);
+}
+
+#[tokio::test]
+async fn an_absent_default_trust_file_starts_the_driver_on_the_baked_key() {
+    let rig = rig();
+    let capture = Capture(Arc::default());
+    let _guard = tracing::subscriber::set_default(
+        tracing_subscriber::fmt()
+            .with_writer(capture.clone())
+            .with_ansi(false)
+            .finish(),
+    );
+    let absent = rig.root.join("absent.pub");
+    let (_sink, task) = start_production(
+        &absent,
+        TrustSource::Default,
+        &rig.root,
+        hosts(),
+        &rig.wiring,
+    )
+    .unwrap();
+    task.abort();
+    let text = String::from_utf8(capture.0.lock().unwrap().clone()).unwrap();
+    assert!(text.contains("update trust root selected"), "{text}");
+    assert!(text.contains("baked"), "{text}");
+    assert!(!text.contains("self-update disabled"), "{text}");
 }

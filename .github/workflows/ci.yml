@@ -38,6 +38,21 @@ jobs:
       - run: cargo clippy --workspace --all-targets -- -D warnings
       - run: cargo test --workspace --no-fail-fast
 
+  update-key:
+    runs-on: ubuntu-latest
+    env:
+      UPDATE_PUBLIC_KEY: ${{ vars.FLEET_UPDATE_PUBLIC_KEY }}
+    steps:
+      - uses: actions/checkout@v7
+      - name: embedded update key matches the release variable
+        if: ${{ vars.FLEET_UPDATE_PUBLIC_KEY != '' }}
+        run: |
+          baked=$(sed -n 2p crates/fleetd/trust/update.pub)
+          if [ "$baked" != "$UPDATE_PUBLIC_KEY" ]; then
+            echo "line 2 of crates/fleetd/trust/update.pub differs from variable FLEET_UPDATE_PUBLIC_KEY"
+            exit 1
+          fi
+
   linux-it:
     runs-on: ubuntu-latest
     timeout-minutes: 30

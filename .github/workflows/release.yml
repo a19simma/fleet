@@ -61,6 +61,24 @@ jobs:
         with:
           persist-credentials: false
           submodules: recursive
+      - name: Check the embedded update key
+        env:
+          UPDATE_PUBLIC_KEY: ${{ vars.FLEET_UPDATE_PUBLIC_KEY }}
+          IS_TAG: ${{ github.ref_type == 'tag' }}
+        run: |
+          if [ -z "$UPDATE_PUBLIC_KEY" ]; then
+            if [ "$IS_TAG" = "true" ]; then
+              echo "::error::variable FLEET_UPDATE_PUBLIC_KEY is empty, so the embedded update key cannot be checked"
+              exit 1
+            fi
+            echo "::notice::variable FLEET_UPDATE_PUBLIC_KEY is not set, so the embedded update key was not checked"
+            exit 0
+          fi
+          baked=$(sed -n 2p crates/fleetd/trust/update.pub)
+          if [ "$baked" != "$UPDATE_PUBLIC_KEY" ]; then
+            echo "::error::line 2 of crates/fleetd/trust/update.pub differs from variable FLEET_UPDATE_PUBLIC_KEY"
+            exit 1
+          fi
       - name: Install dist
         # we specify bash to get pipefail; it guards against the `curl` command
         # failing. otherwise `sh` won't catch that `curl` returned non-0

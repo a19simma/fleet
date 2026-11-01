@@ -9,6 +9,7 @@ use crate::runner::{
     DEFAULT_CI_DEADLINE, DEFAULT_MAX_BUDGET_USD, DEFAULT_MAX_TURNS, DEFAULT_TIMEOUT,
 };
 use crate::tools::{MisePins, MisePinsConfig, ToolsError};
+use crate::update::TrustSource;
 
 /// Config file read when `--config` is not given and the file exists.
 pub const DEFAULT_CONFIG_PATH: &str = "/etc/fleetd/config.toml";
@@ -228,10 +229,14 @@ pub struct Config {
     /// When true, the egress proxy logs each refused host name once per process, host only,
     /// and still refuses. Default false. Config file only.
     pub egress_observe: bool,
-    /// Path of the minisign public key every update manifest is verified against,
-    /// `/etc/fleetd/update.pub` by default. A missing or unsafe file disables self-update.
-    /// Config file only.
+    /// Path of the minisign public key file that replaces the embedded update key,
+    /// `/etc/fleetd/update.pub` by default. An unsafe or invalid file disables self-update,
+    /// and so does a missing file when the path is set. Config file only.
     pub update_trust_root: PathBuf,
+    /// [`TrustSource::Explicit`] when the config file sets `update_trust_root`, which makes
+    /// the file required, else [`TrustSource::Default`], where a missing file selects the
+    /// embedded key.
+    pub update_trust_source: TrustSource,
     /// Hosts an update archive may be fetched from, the first URL and every redirect hop,
     /// `host.example` or `*.example`. Defaults to the GitHub release hosts. Config file only.
     pub update_hosts: Vec<HostPattern>,
@@ -305,6 +310,10 @@ impl Config {
     /// or equals `socket_path`, an unparsable `hook_socket_uid`, or a `hook_socket_group` that
     /// is not a plain name or has no `hook_socket`. An empty environment value
     /// counts as unset.
+    #[expect(
+        clippy::too_many_lines,
+        reason = "one flat field-by-field assembly of the resolved config"
+    )]
     pub fn resolve(
         file: Option<&str>,
         env: &dyn Fn(&str) -> Option<String>,
@@ -315,7 +324,7 @@ impl Config {
             None => FileConfig::default(),
         };
         let (fetch_policy, fetch_caps, egress_allow) = resolve_fetch(&file)?;
-        let (update_trust_root, update_hosts) = resolve_update(&file)?;
+        let (update_trust_root, update_trust_source, update_hosts) = resolve_update(&file)?;
         let http_port = match env("FLEETD_PORT") {
             Some(raw) => raw.parse().map_err(|_| Error::InvalidValue {
                 name: "FLEETD_PORT",
@@ -406,6 +415,7 @@ impl Config {
             egress_allow,
             egress_observe: file.egress_observe.unwrap_or(false),
             update_trust_root,
+            update_trust_source,
             update_hosts,
             mise: file.mise,
         })
@@ -456,17 +466,22 @@ fn patterns(name: &'static str, raw: &[String]) -> Result<Vec<HostPattern>, Erro
         .collect()
 }
 
-fn resolve_update(file: &FileConfig) -> Result<(PathBuf, Vec<HostPattern>), Error> {
-    let root = file
-        .update_trust_root
-        .clone()
-        .unwrap_or_else(|| PathBuf::from(crate::update::DEFAULT_TRUST_ROOT));
+fn resolve_update(file: &FileConfig) -> Result<(PathBuf, TrustSource, Vec<HostPattern>), Error> {
+    let (root, source) = file.update_trust_root.clone().map_or_else(
+        || {
+            (
+                PathBuf::from(crate::update::DEFAULT_TRUST_ROOT),
+                TrustSource::Default,
+            )
+        },
+        |path| (path, TrustSource::Explicit),
+    );
     let defaults = DEFAULT_UPDATE_HOSTS.map(str::to_owned);
     let hosts = patterns(
         "update_hosts",
         file.update_hosts.as_deref().unwrap_or(&defaults),
     )?;
-    Ok((root, hosts))
+    Ok((root, source, hosts))
 }
 
 fn resolve_fetch(file: &FileConfig) -> Result<(FetchPolicy, FetchCaps, Vec<HostPattern>), Error> {
@@ -1140,6 +1155,7 @@ mod tests {
     fn update_keys_default_to_the_adr_trust_root_and_the_release_hosts() {
         let cfg = Config::resolve(None, &env_of(&[])).unwrap();
         assert_eq!(cfg.update_trust_root, Path::new("/etc/fleetd/update.pub"));
+        assert_eq!(cfg.update_trust_source, TrustSource::Default);
         assert_eq!(cfg.update_hosts.len(), 3);
         let set = Config::resolve(
             Some("update_trust_root = \"/srv/k.pub\"\nupdate_hosts = [\"*.example.org\"]\n"),
@@ -1147,6 +1163,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(set.update_trust_root, Path::new("/srv/k.pub"));
+        assert_eq!(set.update_trust_source, TrustSource::Explicit);
         assert_eq!(
             set.update_hosts,
             vec![HostPattern::parse("*.example.org").unwrap()]

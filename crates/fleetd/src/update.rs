@@ -1,7 +1,7 @@
 //! Verification of a signed update manifest.
 //!
 //! The server relays `{version, min_protocol, seq, targets}` plus a minisign signature. This
-//! module checks the signature against the trust-root key file, bounds and validates every
+//! module checks the signature against the trust root, an override key file or the embedded key, bounds and validates every
 //! field, and refuses a manifest that is not strictly newer than the running version and the
 //! last accepted `seq` (ADR-0047). The `swap` submodule unpacks a staged archive and flips the
 //! `current` and `previous` links. Nothing here restarts fleetd.
@@ -57,8 +57,11 @@ pub use unpack::{BINARY_FILE, MAX_TAR_ENTRIES};
 /// Default bin root: the versioned binaries, `current`, `previous` and the guard files.
 pub const DEFAULT_BIN_ROOT: &str = "/var/lib/fleet/bin";
 
-/// Default path of the trust-root public key (ADR-0047).
+/// Default path of the optional trust-root override file (ADR-0047).
 pub const DEFAULT_TRUST_ROOT: &str = "/etc/fleetd/update.pub";
+
+/// The default update public key, embedded at build time from `trust/update.pub`.
+pub const BAKED_TRUST_KEY: &str = include_str!("../trust/update.pub");
 
 /// The uid that must own the trust root in production.
 pub const ROOT_UID: u32 = 0;
@@ -107,6 +110,8 @@ pub enum UpdateError {
     TrustRootInvalid(String),
     /// The trust root could not be opened or read.
     TrustRootIo(io::Error),
+    /// The config names a trust root file and it does not exist.
+    TrustRootMissing,
     /// The manifest is larger than `fleet_proto::MAX_MANIFEST_BYTES`.
     ManifestTooLarge,
     /// The signature is larger than `fleet_proto::MAX_SIGNATURE_BYTES`.
@@ -155,6 +160,7 @@ impl fmt::Display for UpdateError {
             Self::TrustRootTooLarge => f.write_str("trust root file is too large"),
             Self::TrustRootInvalid(why) => write!(f, "trust root is not a minisign key: {why}"),
             Self::TrustRootIo(err) => write!(f, "trust root unreadable: {err}"),
+            Self::TrustRootMissing => f.write_str("trust root file is required and missing"),
             Self::ManifestTooLarge => f.write_str("manifest exceeds the size cap"),
             Self::SignatureTooLarge => f.write_str("signature exceeds the size cap"),
             Self::Signature(why) => write!(f, "signature refused: {why}"),
@@ -194,6 +200,24 @@ impl std::error::Error for UpdateError {
 #[derive(Debug, Clone)]
 pub struct TrustRoot {
     pub(crate) key: PublicKey,
+    baked: bool,
+}
+
+impl TrustRoot {
+    /// True when this is the key embedded in the binary, not one read from a file.
+    #[must_use]
+    pub const fn is_baked(&self) -> bool {
+        self.baked
+    }
+}
+
+/// Where the trust-root path came from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TrustSource {
+    /// The built-in default path. A missing file selects the embedded key.
+    Default,
+    /// A path named in the config file. A missing file is an error.
+    Explicit,
 }
 
 /// What a manifest must beat to be accepted.
@@ -268,18 +292,55 @@ fn is_wrong_owner_or_writable(meta: &fs::Metadata, expected_owner: u32) -> Resul
 ///
 /// Returns the [`UpdateError`] for whichever check failed.
 pub fn load_trust_root(path: &Path, expected_owner: u32) -> Result<TrustRoot, UpdateError> {
+    let file = open_trust_file(path)?
+        .ok_or_else(|| UpdateError::TrustRootIo(io::Error::from(io::ErrorKind::NotFound)))?;
+    check_and_parse(path, file, expected_owner)
+}
+
+/// Picks the trust root: the file at `path` when it exists, else the embedded key.
+///
+/// The file replaces the embedded key and goes through every check [`load_trust_root`] makes.
+/// Only a file that does not exist at the open step selects the embedded key, and only for
+/// [`TrustSource::Default`]. Every other failure is returned as is and never falls back.
+///
+/// # Errors
+///
+/// Returns [`UpdateError::TrustRootMissing`] for a missing explicit file, the check's error
+/// for a present file that fails, and [`UpdateError::TrustRootInvalid`] with `baked` when the
+/// embedded key does not decode.
+pub fn resolve_trust_root(
+    path: &Path,
+    source: TrustSource,
+    expected_owner: u32,
+) -> Result<TrustRoot, UpdateError> {
+    let Some(file) = open_trust_file(path)? else {
+        return baked_trust_root(source);
+    };
+    check_and_parse(path, file, expected_owner)
+}
+
+fn baked_trust_root(source: TrustSource) -> Result<TrustRoot, UpdateError> {
+    match source {
+        TrustSource::Explicit => Err(UpdateError::TrustRootMissing),
+        TrustSource::Default => PublicKey::decode(BAKED_TRUST_KEY)
+            .map(|key| TrustRoot { key, baked: true })
+            .map_err(|_| UpdateError::TrustRootInvalid("baked".to_owned())),
+    }
+}
+
+fn open_trust_file(path: &Path) -> Result<Option<File>, UpdateError> {
     let flags = i32::try_from((OFlags::NOFOLLOW | OFlags::NONBLOCK).bits()).unwrap_or(0);
-    let file = OpenOptions::new()
-        .read(true)
-        .custom_flags(flags)
-        .open(path)
-        .map_err(|err| {
-            if err.raw_os_error() == Some(rustix::io::Errno::LOOP.raw_os_error()) {
-                UpdateError::TrustRootNotRegular
-            } else {
-                UpdateError::TrustRootIo(err)
-            }
-        })?;
+    match OpenOptions::new().read(true).custom_flags(flags).open(path) {
+        Ok(file) => Ok(Some(file)),
+        Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(None),
+        Err(err) if err.raw_os_error() == Some(rustix::io::Errno::LOOP.raw_os_error()) => {
+            Err(UpdateError::TrustRootNotRegular)
+        }
+        Err(err) => Err(UpdateError::TrustRootIo(err)),
+    }
+}
+
+fn check_and_parse(path: &Path, file: File, expected_owner: u32) -> Result<TrustRoot, UpdateError> {
     let meta = file.metadata().map_err(UpdateError::TrustRootIo)?;
     if !meta.is_file() {
         return Err(UpdateError::TrustRootNotRegular);
@@ -298,7 +359,7 @@ pub fn load_trust_root(path: &Path, expected_owner: u32) -> Result<TrustRoot, Up
         .map_err(|_| UpdateError::TrustRootInvalid("not UTF-8".to_owned()))?;
     let key =
         PublicKey::decode(text).map_err(|err| UpdateError::TrustRootInvalid(err.to_string()))?;
-    Ok(TrustRoot { key })
+    Ok(TrustRoot { key, baked: false })
 }
 
 fn parent_dir(path: &Path) -> &Path {

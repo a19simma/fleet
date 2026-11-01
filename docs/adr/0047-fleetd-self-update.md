@@ -10,8 +10,7 @@ ADR-0017 makes a fleetd upgrade a Template rebuild: the Template pins a version 
 
 - Releases are signed with minisign. The signing key is held outside the server, offline or in a CI-protected environment. The server never holds it.
 - The server only relays a signed manifest: `{version, min_protocol, seq, per-target sha256, size}`. A compromised server can withhold or replay a manifest. It cannot forge one.
-- The trust root is the public key in `/etc/fleetd/update.pub`, a root-owned 0644 file. fleetd refuses the file when it is writable by anyone but root, including through a group or a writable parent directory.
-- The `fleetd` user cannot write the trust root, so a compromised fleetd cannot widen what it trusts.
+- The trust root is a minisign public key. fleetd embeds a default key at build time (`crates/fleetd/trust/update.pub`). If `/etc/fleetd/update.pub` exists it replaces the default and must be root-owned with no group or other write bit. If it exists and fails any check, updating is disabled. fleetd never falls back to the embedded key. `update_trust_root` set in config makes that path required.
 
 ### Release assets
 
@@ -20,7 +19,7 @@ ADR-0017 fixes the cargo-dist assets as `fleetd-<target>.tar.gz` plus a `.sha256
 ### On-disk layout
 
 - `/var/lib/fleet/bin` is a new 0755 directory owned by fleetd. It is not under `/var/lib/fleetd`: the unit sets `StateDirectory=fleetd` with `StateDirectoryMode=0700` (`deploy/fleetd-systemd.service:19-20`), so the job uid `fleet-job` could not read a binary placed there.
-- fleetd downloads the archive, checks the sha256 and the minisign signature against `/etc/fleetd/update.pub`, then stages the binary at `/var/lib/fleet/bin/<ver>/fleetd`.
+- fleetd downloads the archive, checks the sha256 and the minisign signature against the trust root, then stages the binary at `/var/lib/fleet/bin/<ver>/fleetd`.
 - A `current` symlink points at the active version. fleetd swaps it by creating a new link and `rename(2)` over `current`, so a reader sees the old target or the new one, never a gap.
 - A `previous` symlink keeps the last good version.
 - The unit's `ExecStart` points at the symlink. It is `/var/lib/fleet/bin/current/fleetd serve` (`deploy/fleetd-systemd.service:14`). The baked binary stays at `/usr/local/bin/fleetd`, root-owned, as the fallback and the source of the rollback guard.
