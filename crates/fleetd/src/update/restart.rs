@@ -56,9 +56,9 @@ impl LeaseTracker {
 
 /// A [`JobRunner`] that records each job in a [`LeaseTracker`] while it runs.
 ///
-/// The entry ends when the inner runner returns, `Ok` or `Err`. A runner future that is dropped
-/// early, by the poller's abort or a panic, leaves the entry, because its agent may still run
-/// under the lease. The job-end hook clears it.
+/// The entry ends when the inner runner returns, `Ok` or `Err`, and when it panics, so one panic
+/// never wedges the drain. A runner future that is dropped early by the poller's abort leaves
+/// the entry, because its agent may still run under the lease. The job-end hook clears it.
 pub struct TrackedRunner<R> {
     inner: R,
     tracker: LeaseTracker,
@@ -76,11 +76,29 @@ impl<R> TrackedRunner<R> {
     }
 }
 
+struct PanicEnd<'a> {
+    tracker: &'a LeaseTracker,
+    id: &'a str,
+}
+
+impl Drop for PanicEnd<'_> {
+    fn drop(&mut self) {
+        if std::thread::panicking() {
+            self.tracker.end(self.id);
+        }
+    }
+}
+
 impl<R: JobRunner> JobRunner for TrackedRunner<R> {
     async fn run(&self, job: Job, shutdown: Shutdown) -> Result<(), RunError> {
         let id = job.job_id.clone();
         self.tracker.begin(&id);
+        let panic_end = PanicEnd {
+            tracker: &self.tracker,
+            id: &id,
+        };
         let outcome = self.inner.run(job, shutdown).await;
+        drop(panic_end);
         self.tracker.end(&id);
         outcome
     }
@@ -140,19 +158,23 @@ impl HealthGate {
     }
 
     /// A gate whose sink writes the health marker for the version `current` names under
-    /// `bin_root`. With no version link it writes nothing.
+    /// `bin_root` at the time of this call. Call it once at startup, so a swap that happens
+    /// later in this process never marks the new version healthy. With no version link it
+    /// writes nothing.
     pub fn for_bin_root(bin_root: impl Into<PathBuf>) -> Self {
         let root = bin_root.into();
+        let running = match Swapper::new(&root).current_version() {
+            Ok(version) => version,
+            Err(err) => {
+                tracing::warn!(%err, "running version unreadable, health marker disabled");
+                None
+            }
+        };
         Self::new(move || {
-            let current = Swapper::new(&root).current_version();
-            match current {
-                Ok(Some(version)) => {
-                    if let Err(err) = write_health_marker(&root, &version) {
-                        tracing::warn!(%err, "health marker not written");
-                    }
-                }
-                Ok(None) => {}
-                Err(err) => tracing::warn!(%err, "health marker not written"),
+            if let Some(version) = &running
+                && let Err(err) = write_health_marker(&root, version)
+            {
+                tracing::warn!(%err, "health marker not written");
             }
         })
     }

@@ -17,6 +17,7 @@ use std::path::{Path, PathBuf};
 use crate::fetch_policy::HostPattern;
 
 mod drain;
+mod driver;
 mod fetcher;
 mod guard;
 mod restart;
@@ -24,6 +25,10 @@ mod swap;
 mod unpack;
 pub use drain::{
     DRAIN_CAP, DRAIN_POLL, DrainController, DrainOutcome, DrainRefused, DrainState, Draining,
+};
+pub use driver::{
+    DriverConfig, DriverOutcome, MAX_ATTEMPTS_PER_VERSION, Offer, OfferSink, UpdateDriver,
+    host_target, start_production,
 };
 pub use fetcher::{
     ARCHIVE_CONNECT_TIMEOUT, ARCHIVE_TOTAL_TIMEOUT, MAX_ARCHIVE_REDIRECTS, PolicyArchiveFetcher,

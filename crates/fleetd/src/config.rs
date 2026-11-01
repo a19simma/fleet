@@ -41,6 +41,11 @@ const MAX_FETCH_CONNECT_SECS: u64 = 60;
 const MAX_FETCH_TOTAL_SECS: u64 = 300;
 const MAX_FETCH_REDIRECTS: u64 = 10;
 const MAX_FETCH_PER_JOB: u64 = 1000;
+const DEFAULT_UPDATE_HOSTS: [&str; 3] = [
+    "github.com",
+    "objects.githubusercontent.com",
+    "release-assets.githubusercontent.com",
+];
 const DEFAULT_HOOK_EVENTS: [&str; 7] = [
     "SessionStart",
     "UserPromptSubmit",
@@ -92,6 +97,8 @@ struct FileConfig {
     fetch_max_per_job: Option<i64>,
     egress_allow: Option<Vec<String>>,
     egress_observe: Option<bool>,
+    update_trust_root: Option<PathBuf>,
+    update_hosts: Option<Vec<String>>,
     mise: Option<MisePinsConfig>,
 }
 
@@ -220,6 +227,13 @@ pub struct Config {
     /// When true, the egress proxy logs each refused host name once per process, host only,
     /// and still refuses. Default false. Config file only.
     pub egress_observe: bool,
+    /// Path of the minisign public key every update manifest is verified against,
+    /// `/etc/fleetd/update.pub` by default. A missing or unsafe file disables self-update.
+    /// Config file only.
+    pub update_trust_root: PathBuf,
+    /// Hosts an update archive may be fetched from, the first URL and every redirect hop,
+    /// `host.example` or `*.example`. Defaults to the GitHub release hosts. Config file only.
+    pub update_hosts: Vec<HostPattern>,
     /// Pins for the bundled mise binary, the `[mise]` table. Config file only, unknown keys
     /// refused. Use [`Config::mise_pins`] to validate them.
     pub mise: Option<MisePinsConfig>,
@@ -275,6 +289,7 @@ impl Config {
             None => FileConfig::default(),
         };
         let (fetch_policy, fetch_caps, egress_allow) = resolve_fetch(&file)?;
+        let (update_trust_root, update_hosts) = resolve_update(&file)?;
         let http_port = match env("FLEETD_PORT") {
             Some(raw) => raw.parse().map_err(|_| Error::InvalidValue {
                 name: "FLEETD_PORT",
@@ -363,6 +378,8 @@ impl Config {
             fetch_caps,
             egress_allow,
             egress_observe: file.egress_observe.unwrap_or(false),
+            update_trust_root,
+            update_hosts,
             mise: file.mise,
         })
     }
@@ -410,6 +427,19 @@ fn patterns(name: &'static str, raw: &[String]) -> Result<Vec<HostPattern>, Erro
     raw.iter()
         .map(|text| HostPattern::parse(text).map_err(|_| bad_key(name)))
         .collect()
+}
+
+fn resolve_update(file: &FileConfig) -> Result<(PathBuf, Vec<HostPattern>), Error> {
+    let root = file
+        .update_trust_root
+        .clone()
+        .unwrap_or_else(|| PathBuf::from(crate::update::DEFAULT_TRUST_ROOT));
+    let defaults = DEFAULT_UPDATE_HOSTS.map(str::to_owned);
+    let hosts = patterns(
+        "update_hosts",
+        file.update_hosts.as_deref().unwrap_or(&defaults),
+    )?;
+    Ok((root, hosts))
 }
 
 fn resolve_fetch(file: &FileConfig) -> Result<(FetchPolicy, FetchCaps, Vec<HostPattern>), Error> {
@@ -1055,6 +1085,25 @@ mod tests {
         assert_eq!(cfg.fetch_caps, FetchCaps::default());
         assert_eq!(cfg.egress_allow, Vec::new());
         assert!(!cfg.egress_observe);
+    }
+
+    #[test]
+    fn update_keys_default_to_the_adr_trust_root_and_the_release_hosts() {
+        let cfg = Config::resolve(None, &env_of(&[])).unwrap();
+        assert_eq!(cfg.update_trust_root, Path::new("/etc/fleetd/update.pub"));
+        assert_eq!(cfg.update_hosts.len(), 3);
+        let set = Config::resolve(
+            Some("update_trust_root = \"/srv/k.pub\"\nupdate_hosts = [\"*.example.org\"]\n"),
+            &env_of(&[]),
+        )
+        .unwrap();
+        assert_eq!(set.update_trust_root, Path::new("/srv/k.pub"));
+        assert_eq!(
+            set.update_hosts,
+            vec![HostPattern::parse("*.example.org").unwrap()]
+        );
+        let bad = Config::resolve(Some("update_hosts = [\"a b\"]\n"), &env_of(&[]));
+        assert!(bad.is_err());
     }
 
     #[test]

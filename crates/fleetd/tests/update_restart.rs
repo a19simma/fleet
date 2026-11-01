@@ -273,3 +273,42 @@ fn the_bin_root_gate_writes_nothing_without_a_version_link() {
     gate.mark_heartbeat_ok();
     assert_eq!(fs::read_dir(dir.path()).unwrap().count(), 0);
 }
+
+struct Panicking;
+
+impl JobRunner for Panicking {
+    #[expect(clippy::panic, reason = "the test needs a runner that panics")]
+    async fn run(&self, _job: Job, _shutdown: Shutdown) -> Result<(), RunError> {
+        panic!("runner panic");
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_panicking_runner_ends_its_lease_so_the_drain_is_not_wedged() {
+    let rig = rig();
+    let runner = Arc::new(TrackedRunner::new(Panicking, rig.tracker.clone()));
+    let task = tokio::spawn({
+        let runner = Arc::clone(&runner);
+        async move { runner.run(job("job-a"), shutdown()).await }
+    });
+    assert!(task.await.unwrap_err().is_panic());
+    assert!(rig.tracker.is_idle());
+    assert_eq!(
+        rig.updater.apply(&version("1.1.0")).await,
+        ApplyOutcome::Restarting
+    );
+}
+
+#[test]
+fn the_bin_root_gate_marks_the_version_running_at_construction_not_a_later_swap() {
+    let rig = rig();
+    let gate = HealthGate::for_bin_root(&rig.root);
+    Swapper::new(&rig.root).activate(&version("1.1.0")).unwrap();
+    assert_eq!(current(&rig), "1.1.0");
+    gate.mark_ready();
+    gate.mark_heartbeat_ok();
+    assert_eq!(
+        fs::read_to_string(rig.root.join("health")).unwrap(),
+        "1.0.0\n"
+    );
+}

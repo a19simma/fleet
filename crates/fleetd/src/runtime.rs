@@ -27,7 +27,7 @@ use crate::store::Store;
 use crate::system::read_identity;
 use crate::systemd;
 use crate::toolhook::HookHub;
-use crate::update::{DEFAULT_BIN_ROOT, RestartSignal, UpdateWiring};
+use crate::update::{DEFAULT_BIN_ROOT, RestartSignal, UpdateWiring, start_production};
 
 const DEFAULT_WATCHDOG_PERIOD: Duration = Duration::from_secs(20);
 const MIN_WATCHDOG_PERIOD: Duration = Duration::from_millis(1);
@@ -361,10 +361,25 @@ pub async fn run_with_env(
     )
     .await?;
     let update = UpdateWiring::for_bin_root(DEFAULT_BIN_ROOT);
+    let mut updater_task = None;
     let heartbeat = match Heartbeat::from_env(env) {
-        Ok(target) => target.map(|target| match update.health.clone() {
-            Some(health) => target.with_on_success(move || health.mark_heartbeat_ok()),
-            None => target,
+        Ok(target) => target.map(|target| {
+            let target = match update.health.clone() {
+                Some(health) => target.with_on_success(move || health.mark_heartbeat_ok()),
+                None => target,
+            };
+            match start_production(
+                &config.update_trust_root,
+                Path::new(DEFAULT_BIN_ROOT),
+                config.update_hosts.clone(),
+                &update,
+            ) {
+                Some((sink, task)) => {
+                    updater_task = Some(task);
+                    target.with_on_reply(move |reply| sink.offer(reply))
+                }
+                None => target,
+            }
         }),
         Err(err) => {
             tracing::warn!(%err, "heartbeat disabled");
@@ -386,7 +401,7 @@ pub async fn run_with_env(
             None
         }
     };
-    run_with_hub(
+    let outcome = run_with_hub(
         config,
         store,
         identity,
@@ -399,7 +414,11 @@ pub async fn run_with_env(
         Path::new(managed_settings::DEFAULT_PATH),
         shutdown,
     )
-    .await
+    .await;
+    if let Some(task) = updater_task {
+        task.abort();
+    }
+    outcome
 }
 
 type Bound = (TcpListener, SocketAddr, UnixListener, Option<UnixListener>);

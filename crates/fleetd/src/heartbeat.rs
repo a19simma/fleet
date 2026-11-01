@@ -7,8 +7,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use fleet_core::Identity;
-use fleet_proto::v1::HeartbeatRequest;
 use fleet_proto::v1::fleet_ingest_client::FleetIngestClient;
+use fleet_proto::v1::{HeartbeatReply, HeartbeatRequest};
 use tokio::time::{Instant, MissedTickBehavior};
 use tonic::Request;
 use tonic::metadata::{Ascii, MetadataValue};
@@ -90,7 +90,10 @@ pub struct Heartbeat {
     authorization: MetadataValue<Ascii>,
     period: Duration,
     on_success: Option<Arc<dyn Fn() + Send + Sync>>,
+    on_reply: Option<ReplyHook>,
 }
+
+type ReplyHook = Arc<dyn Fn(&HeartbeatReply) + Send + Sync>;
 
 impl fmt::Debug for Heartbeat {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -132,6 +135,7 @@ impl Heartbeat {
             authorization,
             period: HEARTBEAT_PERIOD,
             on_success: None,
+            on_reply: None,
         })
     }
 
@@ -146,6 +150,14 @@ impl Heartbeat {
     #[must_use]
     pub fn with_on_success(mut self, hook: impl Fn() + Send + Sync + 'static) -> Self {
         self.on_success = Some(Arc::new(hook));
+        self
+    }
+
+    /// Runs `hook` with the reply of every heartbeat the server accepts, after the success
+    /// hook.
+    #[must_use]
+    pub fn with_on_reply(mut self, hook: impl Fn(&HeartbeatReply) + Send + Sync + 'static) -> Self {
+        self.on_reply = Some(Arc::new(hook));
         self
     }
 
@@ -199,9 +211,12 @@ impl Heartbeat {
             .metadata_mut()
             .insert("authorization", self.authorization.clone());
         match tokio::time::timeout(REQUEST_TIMEOUT, client.heartbeat(request)).await {
-            Ok(Ok(_)) => {
+            Ok(Ok(reply)) => {
                 if let Some(hook) = &self.on_success {
                     hook();
+                }
+                if let Some(hook) = &self.on_reply {
+                    hook(reply.get_ref());
                 }
             }
             Ok(Err(status)) => {
