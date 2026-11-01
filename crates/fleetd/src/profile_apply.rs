@@ -9,6 +9,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::path::PathBuf;
 
+use fleet_core::tools::ToolSpec;
 use fleet_core::{Profile, ProfileHash, ProfileInvalid};
 use fleet_proto::MAX_PROFILE_JSON_BYTES;
 use fleet_proto::v1::{GetProfileBlobReply, ProfileRef};
@@ -68,6 +69,15 @@ pub struct Applied {
     pub dropped_allows: Vec<String>,
     /// The permission mode of the Effective settings, always [`floor::PERMISSION_MODE`].
     pub permission_mode: &'static str,
+    /// The validated tool pins in canonical order, empty when the Profile has none. Nothing
+    /// from the tool section reaches the settings, the overlay or the argv.
+    pub tools: Vec<ToolSpec>,
+}
+
+fn sorted_tools(tools: &[ToolSpec]) -> Vec<ToolSpec> {
+    let mut sorted = tools.to_vec();
+    sorted.sort_by(|a, b| (a.name(), a.version().as_str()).cmp(&(b.name(), b.version().as_str())));
+    sorted
 }
 
 fn dollars(cents: u64) -> String {
@@ -242,6 +252,7 @@ pub fn apply_profile(
         prompt,
         dropped_allows: effective.dropped_allows,
         permission_mode: effective.permission_mode,
+        tools: sorted_tools(&profile.tools),
     })
 }
 
@@ -258,6 +269,9 @@ pub enum LoadError {
     RefHash,
     /// The blob is longer than [`MAX_PROFILE_JSON_BYTES`].
     TooLarge,
+    /// A `tools` entry names a tool outside the registry, has a version that is not an exact
+    /// pin, or is not a `{name, version}` pair.
+    ToolEntry,
     /// The blob is not Profile JSON.
     Malformed,
     /// The blob is not the canonical JSON of its Profile.
@@ -268,6 +282,22 @@ pub enum LoadError {
     Invalid(ProfileInvalid),
     /// The Profile could not be laid over the bundle.
     Apply(ApplyError),
+}
+
+const TOOL_ENTRY_REASON: &str =
+    "profile invalid: a profile tool is not in the registry or its version is not an exact pin";
+const TOO_MANY_TOOLS_REASON: &str = "profile invalid: a profile holds too many tools";
+const DUPLICATE_TOOL_REASON: &str = "profile invalid: a profile names a tool twice";
+
+fn tool_entry_refused(content: &[u8]) -> bool {
+    serde_json::from_slice::<Value>(content)
+        .ok()
+        .and_then(|v| v.get("tools").and_then(|t| t.as_array().cloned()))
+        .is_some_and(|entries| {
+            entries
+                .into_iter()
+                .any(|e| serde_json::from_value::<ToolSpec>(e).is_err())
+        })
 }
 
 fn invalid_reason(err: ProfileInvalid) -> &'static str {
@@ -292,6 +322,8 @@ fn invalid_reason(err: ProfileInvalid) -> &'static str {
             "profile invalid: profile settings.model differs from model"
         }
         ProfileInvalid::SecretLike => "profile invalid: profile text looks like a secret",
+        ProfileInvalid::TooManyTools => TOO_MANY_TOOLS_REASON,
+        ProfileInvalid::DuplicateTool => DUPLICATE_TOOL_REASON,
         _ => "profile invalid: profile failed validation",
     }
 }
@@ -305,6 +337,7 @@ impl LoadError {
             Self::Mismatch => "profile invalid: server sent another profile than the job names",
             Self::RefHash => "profile invalid: job profile hash is malformed",
             Self::TooLarge => "profile invalid: profile blob is too large",
+            Self::ToolEntry => TOOL_ENTRY_REASON,
             Self::Malformed => "profile invalid: profile blob is not profile JSON",
             Self::NotCanonical => "profile invalid: profile blob is not canonical",
             Self::HashMismatch => "profile invalid: profile hash does not match the job",
@@ -352,7 +385,13 @@ pub fn load(
     if reply.content.len() > MAX_PROFILE_JSON_BYTES {
         return Err(LoadError::TooLarge);
     }
-    let profile = Profile::from_json(&reply.content).map_err(|_| LoadError::Malformed)?;
+    let profile = Profile::from_stored_json(&reply.content).map_err(|_| {
+        if tool_entry_refused(&reply.content) {
+            LoadError::ToolEntry
+        } else {
+            LoadError::Malformed
+        }
+    })?;
     if profile.canonical_json() != reply.content {
         return Err(LoadError::NotCanonical);
     }
@@ -741,6 +780,173 @@ mod tests {
         let (reference, mut reply) = blob(&full());
         reply.content = serde_json::to_vec_pretty(&full()).unwrap_or_default();
         assert_eq!(loaded(&reference, &reply), Err(LoadError::NotCanonical));
+    }
+
+    fn tool_profile(tools: &[(&str, &str)]) -> Profile {
+        Profile {
+            model: Some("opus".to_owned()),
+            tools: tools
+                .iter()
+                .map(|(n, v)| ToolSpec::new(n, v).expect("spec"))
+                .collect(),
+            ..Profile::default()
+        }
+    }
+
+    fn tool_blob(tools_json: &str) -> (ProfileRef, GetProfileBlobReply) {
+        let content = format!("{{\"model\":\"opus\",\"tools\":{tools_json}}}").into_bytes();
+        let reference = ProfileRef {
+            name: "p".to_owned(),
+            version: 1,
+            hash: "0".repeat(64),
+        };
+        let reply = GetProfileBlobReply {
+            profile: Some(reference.clone()),
+            content,
+        };
+        (reference, reply)
+    }
+
+    fn pairs(applied: &Applied) -> Vec<(String, String)> {
+        applied
+            .tools
+            .iter()
+            .map(|t| {
+                (
+                    t.name().as_str().to_owned(),
+                    t.version().as_str().to_owned(),
+                )
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_profile_with_tools_surfaces_the_validated_list() -> Result<(), LoadError> {
+        let profile = tool_profile(&[("node", "20.11.1"), ("jq", "1.7.1")]);
+        let (reference, reply) = blob(&profile);
+        let applied = loaded(&reference, &reply)?;
+        assert_eq!(
+            pairs(&applied),
+            vec![
+                ("node".to_owned(), "20.11.1".to_owned()),
+                ("jq".to_owned(), "1.7.1".to_owned())
+            ]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn a_profile_without_tools_has_an_empty_list() -> Result<(), LoadError> {
+        let (reference, reply) = blob(&full());
+        assert_eq!(loaded(&reference, &reply)?.tools, Vec::<ToolSpec>::new());
+        Ok(())
+    }
+
+    #[test]
+    fn tools_never_reach_the_settings_or_the_overlay() -> Result<(), LoadError> {
+        let plain = Profile {
+            model: Some("opus".to_owned()),
+            ..Profile::default()
+        };
+        let with = tool_profile(&[("node", "20.11.1")]);
+        let (r1, b1) = blob(&plain);
+        let (r2, b2) = blob(&with);
+        let a = loaded(&r1, &b1)?;
+        let b = loaded(&r2, &b2)?;
+        assert_eq!(a.bundle, b.bundle);
+        assert_eq!(a.argv, b.argv);
+        assert_eq!(a.prompt, b.prompt);
+        assert_eq!(
+            body(&a, ".claude/settings.json"),
+            body(&b, ".claude/settings.json")
+        );
+        for raw in b.bundle.files().values() {
+            assert!(!String::from_utf8_lossy(raw).contains("20.11.1"));
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn a_hostile_tool_entry_is_a_fixed_error() {
+        let long = "1".repeat(300);
+        let over_name = "n".repeat(300);
+        let versions = [
+            "",
+            "latest",
+            "1/2",
+            "1..2",
+            "1\\u0000",
+            "1\\n",
+            "1.0\\u00e9",
+            "1 ",
+            "v1",
+            "x",
+            &long,
+        ];
+        let names = [
+            "",
+            "emacs",
+            "NODE",
+            "Node",
+            "no/de",
+            "..",
+            "node\\u0000",
+            "node\\n",
+            "n\\u00f6de",
+            &over_name,
+        ];
+        let mut rows: Vec<String> = Vec::new();
+        for v in versions {
+            rows.push(format!(r#"[{{"name":"node","version":"{v}"}}]"#));
+        }
+        for n in names {
+            rows.push(format!(r#"[{{"name":"{n}","version":"1.0.0"}}]"#));
+        }
+        rows.push(r#"[{"name":"node"}]"#.to_owned());
+        rows.push(r#"[{"name":"node","version":"1","x":1}]"#.to_owned());
+        rows.push(r#"[{"name":"node","version":1}]"#.to_owned());
+        for row in rows {
+            let (reference, reply) = tool_blob(&row);
+            assert_eq!(
+                loaded(&reference, &reply),
+                Err(LoadError::ToolEntry),
+                "{row}"
+            );
+        }
+        assert_eq!(
+            LoadError::ToolEntry.reason(),
+            "profile invalid: a profile tool is not in the registry or its version is not an exact pin"
+        );
+    }
+
+    #[test]
+    fn duplicate_and_excess_tools_are_fixed_errors() {
+        let dup = tool_profile(&[("node", "20.11.1"), ("node", "18.0.0")]);
+        let (reference, reply) = blob(&dup);
+        assert_eq!(
+            loaded(&reference, &reply),
+            Err(LoadError::Invalid(ProfileInvalid::DuplicateTool))
+        );
+        assert_eq!(
+            LoadError::Invalid(ProfileInvalid::DuplicateTool).reason(),
+            "profile invalid: a profile names a tool twice"
+        );
+        let names = fleet_core::tools::ToolName::ALL;
+        let many = Profile {
+            tools: (0..=fleet_core::MAX_TOOLS)
+                .map(|i| ToolSpec::new(names[i % names.len()].as_str(), "1.0.0").expect("spec"))
+                .collect(),
+            ..Profile::default()
+        };
+        let (reference, reply) = blob(&many);
+        assert_eq!(
+            loaded(&reference, &reply),
+            Err(LoadError::Invalid(ProfileInvalid::TooManyTools))
+        );
+        assert_eq!(
+            LoadError::Invalid(ProfileInvalid::TooManyTools).reason(),
+            "profile invalid: a profile holds too many tools"
+        );
     }
 
     #[test]

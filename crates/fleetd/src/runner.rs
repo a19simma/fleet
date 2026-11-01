@@ -3169,6 +3169,7 @@ mod tests {
             prompt: "do it".into(),
             dropped_allows: Vec::new(),
             permission_mode: "default",
+            tools: Vec::new(),
         }
     }
 
