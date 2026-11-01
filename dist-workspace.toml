@@ -10,3 +10,6 @@ unix-archive = ".tar.gz"
 checksum = "sha256"
 pr-run-mode = "plan"
 allow-dirty = ["ci"]
+
+[dist.github-custom-runners]
+aarch64-apple-darwin = "macos-15"
