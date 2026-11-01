@@ -299,6 +299,10 @@ pub(crate) async fn blob_for_lease(
     })
 }
 
+/// Lists profiles after `after_name`. A zero `limit` means the default and a larger one is cut.
+///
+/// `after_name` is passed to the query as is: a NUL byte fails in Postgres and surfaces as
+/// `UNAVAILABLE`, and a long value is accepted up to the message cap.
 pub(crate) async fn list(
     pool: &PgPool,
     limit: u32,

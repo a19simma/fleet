@@ -1,4 +1,8 @@
 //! Shutdown sequencing for the server binary: servers, the lease reaper and the stop flag.
+//!
+//! Only the reaper is supervised here. `main` spawns the retention task beside it and joins
+//! it after shutdown. If the retention task dies, `main` logs it and the server keeps running
+//! without pruning, so an operator should watch for the `retention task died` log line.
 
 use std::error::Error;
 use std::fmt;

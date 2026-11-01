@@ -21,6 +21,10 @@ pub const MAX_WINDOW_S: i64 = 90 * DAY_S;
 pub const MAX_GROUPS: usize = 200;
 /// Error text a box reports for a job its agent timeout ended. Matches the text `fleetd`
 /// sends, and splits `FAILED` jobs into failed and timed out.
+///
+/// A `FAILED` job with the finish
+/// step timeout text (`fleetd` `ERR_FINISH_TIMEOUT`) counts as failed, not timed out. The two
+/// copies of this text are kept equal by hand.
 pub const TIMED_OUT_ERROR: &str = "agent timed out";
 
 macro_rules! scoped {
@@ -144,6 +148,8 @@ ORDER BY CASE WHEN $5::text = 'day' THEN 0 ELSE -count(*) END, grp \
 LIMIT $8"
 );
 
+/// Stuck-rule split of the scoped jobs that have a summary. Its `failed` column counts every
+/// `FAILED` job, agent timeouts included, where the main query reports those as timed out.
 const STUCK_STATS: &str = concat!(
     scoped!(),
     "\
@@ -347,9 +353,13 @@ fn group(row: &PgRow) -> Result<StatsGroup, StoreError> {
 ///
 /// The window is half open on `jobs.created_at`: `since` is included, `until` is not. A
 /// missing `until` is the database clock rounded up to a whole second, so a job created in
-/// the current second is inside, and a missing `since` is seven days before `until`. A window longer than 90 days keeps its `until` and sets `clamped`. The grouping
-/// column comes from a fixed match on the enum, and every other request value is a bound
-/// parameter.
+/// the current second is inside, and a missing `since` is seven days before `until`. A window
+/// longer than 90 days keeps its `until` and sets `clamped`. The grouping column comes from a
+/// fixed match on the enum, and every other request value is a bound parameter.
+///
+/// The stuck-rule query runs as a separate statement outside a transaction, so a job that
+/// finishes between the two queries can make the two tables disagree. In the stuck-rule table
+/// `failed` counts every `FAILED` job, including those the main table counts as timed out.
 ///
 /// # Errors
 /// Returns [`StoreError::InvalidJob`] for a bad window, filter or grouping and
