@@ -41,5 +41,6 @@ ADRs for fleetd, the Fleet server and the `fleet` CLI. The plan is in `../plan.m
 | [0048](0048-profile-tools-and-bundled-mise.md) | Profile tools and bundled mise | Proposed 2026-11-01, built, no live run, amends 0034 and 0035, builds on 0038 and 0031 |
 | [0049](0049-job-docker-and-build-egress.md) | Job docker and build-chain egress | Proposed 2026-11-01, spike pending, amends 0031 and 0038 |
 | [0050](0050-baked-default-update-trust-root.md) | Baked default update trust root | Proposed 2026-11-01, built, no live run, amends 0047 |
+| [0051](0051-web-ui-styling-tailwind-daisyui.md) | Web UI styling: Tailwind and daisyUI, generated CSS committed | Accepted 2026-11-01, built, extends 0041 |
 
 Each ADR has a "Decisions (2026-10-24)" section with the choices made when the docs moved into this repo: Apache-2.0 licence, repo github.com/a19simma/fleet, `fleet watch` as a client poll in v1, job cost deferred, Tailscale not a hard dependency.

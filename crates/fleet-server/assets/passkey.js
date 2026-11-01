@@ -2,7 +2,8 @@
 
 const status = document.getElementById("status");
 const form = document.getElementById("passkey-form");
-const mode = document.body.dataset.mode;
+const app = document.getElementById("app");
+const mode = app.dataset.mode;
 
 function decode(value) {
   const padded = value.replace(/-/g, "+").replace(/_/g, "/").padEnd(Math.ceil(value.length / 4) * 4, "=");
@@ -115,7 +116,7 @@ async function run() {
     await post("/passkey/login/finish", { ceremony: started.ceremony, credential: assertion(got) });
     location.assign("/account");
   } else if (mode === "add") {
-    const csrf = document.body.dataset.csrf;
+    const csrf = app.dataset.csrf;
     await register("/passkey/add/start", "/passkey/add/finish", {}, csrf);
     say("Passkey created.");
   }

@@ -10,6 +10,7 @@ mod clientip;
 mod credentials;
 mod dispatch;
 mod jobs;
+mod layout;
 mod pages;
 mod panic;
 mod passkeys;

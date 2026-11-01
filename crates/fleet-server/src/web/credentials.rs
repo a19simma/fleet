@@ -25,7 +25,8 @@ use topcoat::{
     view::{View, view},
 };
 
-use super::pages::{STYLE_PATH, auth, csrf_matches, current, fail, signed_in};
+use super::layout::{Nav, shell};
+use super::pages::{auth, csrf_matches, current, fail, signed_in};
 use super::passkeys::AuthError;
 use crate::cred::CredentialService;
 
@@ -154,13 +155,7 @@ async fn credentials_page(cx: &Cx) -> Result<impl View> {
     let notice = notice_code(cx).and_then(notice_text);
     let csrf = String::from_utf8_lossy(session.csrf.expose()).into_owned();
     Ok(view! {
-        <!DOCTYPE html>
-        <html>
-            <head>
-                <title>"fleet credentials"</title>
-                <link rel="stylesheet" href=(STYLE_PATH)>
-            </head>
-            <body>
+        shell(title: "fleet credentials", active: Nav::Credentials, user: session.username.as_str(), csrf: csrf.as_str(), mode: "",
                 <h1>"Credentials"</h1>
                 <p><a href="/account">"Account"</a></p>
                 if let Some(text) = notice {
@@ -229,8 +224,7 @@ async fn credentials_page(cx: &Cx) -> Result<impl View> {
                     </label>
                     <button type="submit">"Save"</button>
                 </form>
-            </body>
-        </html>
+            )
     })
 }
 

@@ -1,6 +1,6 @@
 # Web UI
 
-Status: Proposed 2026-10-29. Built in fleet-server: the dispatcher, the Topcoat pages and the passkey routes. Amends ADR-0013 (services). Evidence: `spikes/web/RESULT.md`.
+Status: Proposed 2026-10-29. Built in fleet-server: the dispatcher, the Topcoat pages and the passkey routes. Amends ADR-0013 (services). Evidence: `spikes/web/RESULT.md`. Styling is governed by [ADR-0051](0051-web-ui-styling-tailwind-daisyui.md).
 
 Fleet has had the laptop `fleet` CLI as its only client. A browser UI for fleet view, Jobs and credentials needs a Rust web framework inside `fleet-server`. This ADR picks one and records what the spike showed.
 

@@ -200,6 +200,14 @@ _Avoid_: trust anchor, signing key
 The default minisign public key embedded in the fleetd binary from `crates/fleetd/trust/update.pub` (`BAKED_TRUST_KEY`). Only a new fleetd build changes it (ADR-0050).
 _Avoid_: update.pub, signing key
 
+**Console theme**:
+The dark, dense daisyUI theme named `console`, defined in `crates/fleet-server/ui/input.css` and described in `DESIGN.md`. Every web page renders through the shared shell in `src/web/layout.rs` (ADR-0051).
+_Avoid_: skin, dark mode
+
+**Generated stylesheet**:
+`crates/fleet-server/assets/ui.css`, built from `ui/input.css` by `mise run css` and committed. CI rebuilds it and fails on any diff (ADR-0051).
+_Avoid_: style.css, build output
+
 ## Relationships
 
 - A **Job** has many **Job Events** and at most one **Job Summary**.

@@ -28,11 +28,12 @@ use webauthn_rs::prelude::{PublicKeyCredential, RegisterPublicKeyCredential};
 use super::clientip::client_ip;
 use super::credentials::{Backend, CredentialSlot};
 use super::jobs::ConsoleSlot;
+use super::layout::{Nav, bare, shell};
 use super::passkeys::{AuthError, SESSION_COOKIE, SESSION_TTL_SECS, SessionInfo, WebAuth};
 use super::tokens::{TokenSlot, Tokens};
 
 /// Stylesheet compiled into the binary, since Topcoat's `asset!` writes beside the binary.
-pub const STYLE_CSS: &str = include_str!("../../assets/style.css");
+pub const STYLE_CSS: &str = include_str!("../../assets/ui.css");
 
 /// URL path of the embedded stylesheet.
 pub const STYLE_PATH: &str = "/static/style.css";
@@ -136,20 +137,15 @@ fn set_cookie(cx: &Cx, value: &str, max_age: i64) {
 #[page("/")]
 async fn home() -> Result<impl View> {
     Ok(view! {
-        <!DOCTYPE html>
-        <html>
-            <head>
-                <title>"fleet"</title>
-                <link rel="stylesheet" href=(STYLE_PATH)>
-            </head>
-            <body>
-                <h1>(HOME_MARKER)</h1>
-                <p><a href="/account">"Account"</a></p>
-                <p><a href="/credentials">"Credentials"</a></p>
-                <p><a href="/jobs">"Jobs"</a></p>
-                <p><a href="/tokens">"Tokens"</a></p>
-            </body>
-        </html>
+        bare(title: "fleet", mode: "home",
+            <h1 class="mb-3 text-sm font-bold"><span class="text-primary">"$"</span> " "(HOME_MARKER)</h1>
+            <ul class="menu menu-sm w-full">
+                <li><a href="/account">"Account"</a></li>
+                <li><a href="/credentials">"Credentials"</a></li>
+                <li><a href="/jobs">"Jobs"</a></li>
+                <li><a href="/tokens">"Tokens"</a></li>
+            </ul>
+        )
     })
 }
 
@@ -157,24 +153,18 @@ async fn home() -> Result<impl View> {
 async fn login_page(cx: &Cx) -> Result<impl View> {
     auth(cx)?;
     Ok(view! {
-        <!DOCTYPE html>
-        <html>
-            <head>
-                <title>"fleet sign in"</title>
-                <link rel="stylesheet" href=(STYLE_PATH)>
-            </head>
-            <body data-mode="login">
-                <h1>"Sign in"</h1>
-                <form id="passkey-form">
-                    <label>"Username"
-                        <input id="username" name="username" autocomplete="username webauthn" required="">
-                    </label>
-                    <button type="submit">"Sign in"</button>
-                </form>
-                <p id="status"></p>
-                <script src=(SCRIPT_PATH) defer=""></script>
-            </body>
-        </html>
+        bare(title: "fleet sign in", mode: "login",
+            <h1 class="mb-3 text-sm font-bold"><span class="text-primary">"$"</span> " Sign in"</h1>
+            <form class="flex flex-col gap-3" id="passkey-form">
+                <fieldset class="fieldset">
+                    <label class="label" for="username">"Username"</label>
+                    <input class="input input-sm w-full" id="username" name="username" autocomplete="username webauthn" required="">
+                </fieldset>
+                <button class="btn btn-primary btn-sm" type="submit">"Sign in"</button>
+            </form>
+            <p class="mt-3 text-xs" id="status" role="status"></p>
+            <script src=(SCRIPT_PATH) defer=""></script>
+        )
     })
 }
 
@@ -182,24 +172,18 @@ async fn login_page(cx: &Cx) -> Result<impl View> {
 async fn setup_page(cx: &Cx) -> Result<impl View> {
     auth(cx)?;
     Ok(view! {
-        <!DOCTYPE html>
-        <html>
-            <head>
-                <title>"fleet setup"</title>
-                <link rel="stylesheet" href=(STYLE_PATH)>
-            </head>
-            <body data-mode="setup">
-                <h1>"Create the admin"</h1>
-                <form id="passkey-form">
-                    <label>"Username"
-                        <input id="username" name="username" autocomplete="username" required="">
-                    </label>
-                    <button type="submit">"Create a passkey"</button>
-                </form>
-                <p id="status"></p>
-                <script src=(SCRIPT_PATH) defer=""></script>
-            </body>
-        </html>
+        bare(title: "fleet setup", mode: "setup",
+            <h1 class="mb-3 text-sm font-bold"><span class="text-primary">"$"</span> " Create the admin"</h1>
+            <form class="flex flex-col gap-3" id="passkey-form">
+                <fieldset class="fieldset">
+                    <label class="label" for="username">"Username"</label>
+                    <input class="input input-sm w-full" id="username" name="username" autocomplete="username" required="">
+                </fieldset>
+                <button class="btn btn-primary btn-sm" type="submit">"Create a passkey"</button>
+            </form>
+            <p class="mt-3 text-xs" id="status" role="status"></p>
+            <script src=(SCRIPT_PATH) defer=""></script>
+        )
     })
 }
 
@@ -207,27 +191,22 @@ async fn setup_page(cx: &Cx) -> Result<impl View> {
 async fn setup_password_page(cx: &Cx) -> Result<impl View> {
     auth(cx)?;
     Ok(view! {
-        <!DOCTYPE html>
-        <html>
-            <head>
-                <title>"fleet setup"</title>
-                <link rel="stylesheet" href=(STYLE_PATH)>
-            </head>
-            <body data-mode="setup-password">
-                <h1>"Create the admin"</h1>
-                <form id="passkey-form" autocomplete="off">
-                    <label>"Username"
-                        <input id="username" name="username" autocomplete="username" required="">
-                    </label>
-                    <label>"Setup password"
-                        <input id="password" name="password" type="password" autocomplete="off" required="">
-                    </label>
-                    <button type="submit">"Create a passkey"</button>
-                </form>
-                <p id="status"></p>
-                <script src=(SCRIPT_PATH) defer=""></script>
-            </body>
-        </html>
+        bare(title: "fleet setup", mode: "setup-password",
+            <h1 class="mb-3 text-sm font-bold"><span class="text-primary">"$"</span> " Create the admin"</h1>
+            <form class="flex flex-col gap-3" id="passkey-form" autocomplete="off">
+                <fieldset class="fieldset">
+                    <label class="label" for="username">"Username"</label>
+                    <input class="input input-sm w-full" id="username" name="username" autocomplete="username" required="">
+                </fieldset>
+                <fieldset class="fieldset">
+                    <label class="label" for="password">"Setup password"</label>
+                    <input class="input input-sm w-full" id="password" name="password" type="password" autocomplete="off" required="">
+                </fieldset>
+                <button class="btn btn-primary btn-sm" type="submit">"Create a passkey"</button>
+            </form>
+            <p class="mt-3 text-xs" id="status" role="status"></p>
+            <script src=(SCRIPT_PATH) defer=""></script>
+        )
     })
 }
 
@@ -235,21 +214,14 @@ async fn setup_password_page(cx: &Cx) -> Result<impl View> {
 async fn enroll_page(cx: &Cx) -> Result<impl View> {
     auth(cx)?;
     Ok(view! {
-        <!DOCTYPE html>
-        <html>
-            <head>
-                <title>"fleet enrollment"</title>
-                <link rel="stylesheet" href=(STYLE_PATH)>
-            </head>
-            <body data-mode="enroll">
-                <h1>"Create a passkey"</h1>
-                <form id="passkey-form">
-                    <button type="submit">"Create a passkey"</button>
-                </form>
-                <p id="status"></p>
-                <script src=(SCRIPT_PATH) defer=""></script>
-            </body>
-        </html>
+        bare(title: "fleet enrollment", mode: "enroll",
+            <h1 class="mb-3 text-sm font-bold"><span class="text-primary">"$"</span> " Create a passkey"</h1>
+            <form class="flex flex-col gap-3" id="passkey-form">
+                <button class="btn btn-primary btn-sm" type="submit">"Create a passkey"</button>
+            </form>
+            <p class="mt-3 text-xs" id="status" role="status"></p>
+            <script src=(SCRIPT_PATH) defer=""></script>
+        )
     })
 }
 
@@ -275,19 +247,11 @@ async fn account(cx: &Cx) -> Result<impl View> {
         })
         .collect();
     Ok(view! {
-        <!DOCTYPE html>
-        <html>
-            <head>
-                <title>"fleet account"</title>
-                <link rel="stylesheet" href=(STYLE_PATH)>
-            </head>
-            <body data-mode="add" data-csrf=(csrf.as_str())>
-                <h1>(name)</h1>
-                <p><a href="/credentials">"Credentials"</a></p>
-                <p><a href="/jobs">"Jobs"</a></p>
-                <p><a href="/tokens">"Tokens"</a></p>
-                <h2>"Passkeys"</h2>
-                <table>
+        shell(title: "fleet account", active: Nav::Account, user: name.as_str(), csrf: csrf.as_str(), mode: "add",
+            <h1 class="mb-3 border-b border-base-300 pb-2 text-sm font-bold"><span class="text-primary">"$"</span> " "(name.as_str())</h1>
+            <h2 class="mb-1 text-xs font-bold uppercase text-base-content/60">"Passkeys"</h2>
+            <div class="overflow-x-auto">
+                <table class="table table-zebra table-xs">
                     <thead>
                         <tr>
                             <th>"Name"</th>
@@ -306,28 +270,26 @@ async fn account(cx: &Cx) -> Result<impl View> {
                                     <form method="post" action="/account/passkeys/delete">
                                         <input type="hidden" name="csrf" value=(csrf.as_str())>
                                         <input type="hidden" name="id" value=(row.id)>
-                                        <button type="submit">"Delete"</button>
+                                        <button class="btn btn-outline btn-error btn-xs" type="submit">"Delete"</button>
                                     </form>
                                 </td>
                             </tr>
                         }
                     </tbody>
                 </table>
+            </div>
+            <div class="mt-3 flex flex-wrap items-center gap-2">
                 <form id="passkey-form">
-                    <button type="submit">"Create a passkey"</button>
+                    <button class="btn btn-secondary btn-sm" type="submit">"Create a passkey"</button>
                 </form>
-                <p id="status"></p>
                 <form method="post" action="/account/device-code">
                     <input type="hidden" name="csrf" value=(csrf.as_str())>
-                    <button type="submit">"Create a code for a new device"</button>
+                    <button class="btn btn-outline btn-sm" type="submit">"Create a code for a new device"</button>
                 </form>
-                <form method="post" action="/logout">
-                    <input type="hidden" name="csrf" value=(csrf.as_str())>
-                    <button type="submit">"Sign out"</button>
-                </form>
-                <script src=(SCRIPT_PATH) defer=""></script>
-            </body>
-        </html>
+            </div>
+            <p class="mt-3 text-xs" id="status" role="status"></p>
+            <script src=(SCRIPT_PATH) defer=""></script>
+        )
     })
 }
 
@@ -377,20 +339,14 @@ async fn device_code(cx: &Cx, Form(form): Form<HashMap<String, String>>) -> Resu
         auth.origin(),
         String::from_utf8_lossy(code.expose())
     );
+    let csrf = String::from_utf8_lossy(session.csrf.expose()).into_owned();
     Ok(view! {
-        <!DOCTYPE html>
-        <html>
-            <head>
-                <title>"fleet new device"</title>
-                <link rel="stylesheet" href=(STYLE_PATH)>
-            </head>
-            <body>
-                <h1>"New device code"</h1>
-                <p>"Open this address on the new device. It works once and expires in 10 minutes."</p>
-                <pre id="enroll-url">(url.as_str())</pre>
-                <p><a href="/account">"Account"</a></p>
-            </body>
-        </html>
+        shell(title: "fleet new device", active: Nav::Account, user: session.username.as_str(), csrf: csrf.as_str(), mode: "device",
+            <h1 class="mb-3 border-b border-base-300 pb-2 text-sm font-bold"><span class="text-primary">"$"</span> " New device code"</h1>
+            <p class="mb-3 text-xs">"Open this address on the new device. It works once and expires in 10 minutes."</p>
+            <pre class="overflow-x-auto border border-base-300 bg-base-200 p-2 text-xs" id="enroll-url">(url.as_str())</pre>
+            <p class="mt-3 text-xs"><a class="link link-primary" href="/account">"Account"</a></p>
+        )
     })
 }
 

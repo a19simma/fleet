@@ -18,7 +18,8 @@ use topcoat::{
     view::{View, view},
 };
 
-use super::pages::{STYLE_PATH, auth, current, fail};
+use super::layout::{Nav, shell};
+use super::pages::{auth, current, fail};
 use super::passkeys::AuthError;
 use crate::store::{Store, StoreError};
 
@@ -125,14 +126,9 @@ async fn jobs_page(cx: &Cx) -> Result<impl View> {
         .await
         .map_err(|err| internal(&err))?;
     let rows: Vec<Row> = jobs.iter().map(row).collect();
+    let csrf = String::from_utf8_lossy(session.csrf.expose()).into_owned();
     Ok(view! {
-        <!DOCTYPE html>
-        <html>
-            <head>
-                <title>"fleet jobs"</title>
-                <link rel="stylesheet" href=(STYLE_PATH)>
-            </head>
-            <body>
+        shell(title: "fleet jobs", active: Nav::Jobs, user: session.username.as_str(), csrf: csrf.as_str(), mode: "",
                 <h1>"Jobs"</h1>
                 <p><a href="/account">"Account"</a></p>
                 <table>
@@ -155,8 +151,7 @@ async fn jobs_page(cx: &Cx) -> Result<impl View> {
                         }
                     </tbody>
                 </table>
-            </body>
-        </html>
+            )
     })
 }
 
@@ -187,14 +182,9 @@ async fn job_page(cx: &Cx) -> Result<impl View> {
     let error = job.error.clone().unwrap_or_default();
     let pr_url = job.pr_url.clone().unwrap_or_default();
     let pr_link = pr_url.starts_with("https://");
+    let csrf = String::from_utf8_lossy(session.csrf.expose()).into_owned();
     Ok(view! {
-        <!DOCTYPE html>
-        <html>
-            <head>
-                <title>"fleet job"</title>
-                <link rel="stylesheet" href=(STYLE_PATH)>
-            </head>
-            <body>
+        shell(title: "fleet job", active: Nav::Jobs, user: session.username.as_str(), csrf: csrf.as_str(), mode: "",
                 <h1>(job.job_id.as_str())</h1>
                 <p><a href="/jobs">"Jobs"</a></p>
                 <dl>
@@ -222,7 +212,6 @@ async fn job_page(cx: &Cx) -> Result<impl View> {
                 if transcript.cut {
                     <p id="cut">"transcript cut: the rest is not shown here."</p>
                 }
-            </body>
-        </html>
+            )
     })
 }

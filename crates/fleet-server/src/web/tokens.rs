@@ -21,8 +21,9 @@ use topcoat::{
     view::{View, view},
 };
 
-use super::pages::{STYLE_PATH, auth, csrf_matches, current, fail, signed_in};
-use super::passkeys::AuthError;
+use super::layout::{Nav, shell};
+use super::pages::{auth, csrf_matches, current, fail, signed_in};
+use super::passkeys::{AuthError, SessionInfo};
 use crate::cred::{UserError, Users};
 
 const MAX_LABEL_CHARS: usize = 64;
@@ -77,14 +78,14 @@ fn label_ok(label: &str) -> bool {
     label.chars().count() <= MAX_LABEL_CHARS && !label.chars().any(char::is_control)
 }
 
-async fn gate<'a>(cx: &'a Cx, form: &HashMap<String, String>) -> Result<(i64, &'a Tokens)> {
+async fn gate<'a>(cx: &'a Cx, form: &HashMap<String, String>) -> Result<(SessionInfo, &'a Tokens)> {
     let auth = auth(cx)?;
     let tokens = tokens(cx)?;
     let session = signed_in(cx, auth).await?;
     if !csrf_matches(&session, form.get("csrf").map(String::as_str)) {
         return Err(forbidden().into());
     }
-    Ok((session.user_id, tokens))
+    Ok((session, tokens))
 }
 
 #[page("/tokens")]
@@ -111,13 +112,7 @@ async fn tokens_page(cx: &Cx) -> Result<impl View> {
     let notice = notice_code(cx).and_then(notice_text);
     let csrf = String::from_utf8_lossy(session.csrf.expose()).into_owned();
     Ok(view! {
-        <!DOCTYPE html>
-        <html>
-            <head>
-                <title>"fleet API tokens"</title>
-                <link rel="stylesheet" href=(STYLE_PATH)>
-            </head>
-            <body>
+        shell(title: "fleet API tokens", active: Nav::Tokens, user: session.username.as_str(), csrf: csrf.as_str(), mode: "",
                 <h1>"API tokens"</h1>
                 <p><a href="/account">"Account"</a></p>
                 if let Some(text) = notice {
@@ -162,44 +157,38 @@ async fn tokens_page(cx: &Cx) -> Result<impl View> {
                     </label>
                     <button type="submit">"Create"</button>
                 </form>
-            </body>
-        </html>
+            )
     })
 }
 
 #[page(POST "/tokens/create")]
 async fn create(cx: &Cx, Form(form): Form<HashMap<String, String>>) -> Result<impl View> {
-    let (user_id, tokens) = gate(cx, &form).await?;
+    let (session, tokens) = gate(cx, &form).await?;
     let label = form.get("label").map_or("", |label| label.trim());
     if !label_ok(label) {
         return Err(back("invalid").into());
     }
     let made = tokens
         .users
-        .create_api_token(user_id, label)
+        .create_api_token(session.user_id, label)
         .await
         .map_err(|_| fail(AuthError::Internal))?;
     let token = String::from_utf8_lossy(made.token.expose()).into_owned();
+    let csrf = String::from_utf8_lossy(session.csrf.expose()).into_owned();
     Ok(view! {
-        <!DOCTYPE html>
-        <html>
-            <head>
-                <title>"fleet API token"</title>
-                <link rel="stylesheet" href=(STYLE_PATH)>
-            </head>
-            <body>
+        shell(title: "fleet API token", active: Nav::Tokens, user: session.username.as_str(), csrf: csrf.as_str(), mode: "",
                 <h1>"API token created"</h1>
                 <p>"Copy it now. It is not shown again."</p>
                 <pre id="token">(token.as_str())</pre>
                 <p><a href="/tokens">"API tokens"</a></p>
-            </body>
-        </html>
+            )
     })
 }
 
 #[route(POST "/tokens/revoke")]
 async fn revoke(cx: &Cx, Form(form): Form<HashMap<String, String>>) -> Result<SeeOther> {
-    let (user_id, tokens) = gate(cx, &form).await?;
+    let (session, tokens) = gate(cx, &form).await?;
+    let user_id = session.user_id;
     let Some(id) = form.get("id").and_then(|id| id.parse::<i64>().ok()) else {
         return Ok(back("not_found"));
     };

@@ -19,7 +19,8 @@ use super::panic::CatchPanic;
 /// Path prefix shared by every gRPC service the server registers.
 pub const GRPC_PREFIX: &str = "/fleet.v1.";
 
-const CSP: &str = "default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self'; \
+/// The `Content-Security-Policy` every web response carries.
+pub(super) const CSP: &str = "default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self'; \
 object-src 'none'; base-uri 'none'; form-action 'self'; frame-ancestors 'none'";
 
 const HEADERS: [(HeaderName, &str); 5] = [
@@ -126,5 +127,18 @@ where
             harden(&mut response);
             Ok(response)
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::CSP;
+
+    #[test]
+    fn the_csp_allows_no_inline_or_eval() {
+        assert!(!CSP.contains("'unsafe-inline'"));
+        assert!(!CSP.contains("'unsafe-eval'"));
+        assert!(CSP.contains("script-src 'self'"));
+        assert!(CSP.contains("style-src 'self'"));
     }
 }
