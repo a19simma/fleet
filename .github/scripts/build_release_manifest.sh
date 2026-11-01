@@ -22,6 +22,6 @@ exec python3 "$here/update_manifest.py" \
   --version "$version" \
   --seq "$seq" \
   --base-url "https://github.com/${repo}/releases/download/${tag}" \
-  --target "x86_64-unknown-linux-gnu=${dir}/fleetd-x86_64-unknown-linux-musl.tar.gz" \
-  --target "aarch64-unknown-linux-gnu=${dir}/fleetd-aarch64-unknown-linux-musl.tar.gz" \
+  --target "x86_64-unknown-linux-musl=${dir}/fleetd-x86_64-unknown-linux-musl.tar.gz" \
+  --target "aarch64-unknown-linux-musl=${dir}/fleetd-aarch64-unknown-linux-musl.tar.gz" \
   --out "$out"

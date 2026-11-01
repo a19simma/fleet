@@ -277,7 +277,7 @@ jobs:
           # Write and read notes from a file to avoid quoting breaking things
           echo "$ANNOUNCEMENT_BODY" > $RUNNER_TEMP/notes.txt
 
-          gh release create "${{ needs.plan.outputs.tag }}" --target "$RELEASE_COMMIT" $PRERELEASE_FLAG --title "$ANNOUNCEMENT_TITLE" --notes-file "$RUNNER_TEMP/notes.txt" artifacts/*
+          gh release create "${{ needs.plan.outputs.tag }}" --draft --target "$RELEASE_COMMIT" $PRERELEASE_FLAG --title "$ANNOUNCEMENT_TITLE" --notes-file "$RUNNER_TEMP/notes.txt" artifacts/*
 
   update-manifest-dry-run:
     if: ${{ github.event_name == 'pull_request' || github.event_name == 'workflow_dispatch' }}
@@ -292,16 +292,19 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y minisign
       - name: Test the manifest script
         run: python3 -m unittest discover -s .github/scripts -p 'test_*.py'
-      - name: Build fixture archives
+      - name: Build fixture dist archives
         run: |
           mkdir fixture
           for target in x86_64-unknown-linux-musl aarch64-unknown-linux-musl; do
             work=$(mktemp -d)
-            head -c 4096 /dev/urandom > "$work/fleetd"
-            tar -czf "fixture/fleetd-$target.tar.gz" -C "$work" fleetd
+            mkdir "$work/fleetd-$target"
+            head -c 4096 /dev/urandom > "$work/fleetd-$target/fleetd"
+            tar -czf "fixture/fleetd-$target.tar.gz" -C "$work" "fleetd-$target"
           done
+      - name: Repack the fixture archives
+        run: .github/scripts/repack_release_archives.sh fixture repacked
       - name: Write the manifest
-        run: .github/scripts/build_release_manifest.sh fixture v0.0.0-dryrun.1 1 "$GITHUB_REPOSITORY" manifest.json
+        run: .github/scripts/build_release_manifest.sh repacked v0.0.0-dryrun.1 1 "$GITHUB_REPOSITORY" manifest.json
       - name: Sign with a throwaway key and verify
         run: |
           echo "::notice::dry run: signing with a key generated for this run, not the release key"
@@ -326,19 +329,11 @@ jobs:
     env:
       GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       TAG: ${{ needs.plan.outputs.tag }}
-      SIGNING_KEY: ${{ secrets.FLEET_UPDATE_SIGNING_KEY }}
-      SIGNING_PASSWORD: ${{ secrets.FLEET_UPDATE_SIGNING_PASSWORD }}
       UPDATE_PUBLIC_KEY: ${{ vars.FLEET_UPDATE_PUBLIC_KEY }}
     steps:
       - uses: actions/checkout@v6
         with:
           persist-credentials: false
-      - name: Require the signing key
-        run: |
-          if [ -z "$SIGNING_KEY" ]; then
-            echo "::error::secret FLEET_UPDATE_SIGNING_KEY is not set, so no update manifest was signed. The release exists without a manifest and no Box will update from it."
-            exit 1
-          fi
       - name: Install minisign
         run: sudo apt-get update && sudo apt-get install -y minisign
       - name: Fetch archives
@@ -347,10 +342,19 @@ jobs:
           pattern: artifacts-*
           path: artifacts
           merge-multiple: true
+      - name: Repack the archives
+        run: .github/scripts/repack_release_archives.sh artifacts repacked
       - name: Write the manifest
-        run: .github/scripts/build_release_manifest.sh artifacts "$TAG" "$GITHUB_RUN_NUMBER" "$GITHUB_REPOSITORY" manifest.json
+        run: .github/scripts/build_release_manifest.sh repacked "$TAG" "$GITHUB_RUN_NUMBER" "$GITHUB_REPOSITORY" manifest.json
       - name: Sign
+        env:
+          SIGNING_KEY: ${{ secrets.FLEET_UPDATE_SIGNING_KEY }}
+          SIGNING_PASSWORD: ${{ secrets.FLEET_UPDATE_SIGNING_PASSWORD }}
         run: |
+          if [ -z "$SIGNING_KEY" ]; then
+            echo "::error::secret FLEET_UPDATE_SIGNING_KEY is not set, so no update manifest was signed. The release stays a draft and no Box will update from it."
+            exit 1
+          fi
           umask 077
           key=$(mktemp)
           trap 'rm -f "$key"' EXIT
@@ -369,8 +373,30 @@ jobs:
           fi
           printf '%s\n' "$UPDATE_PUBLIC_KEY" > release.pub
           minisign -V -p release.pub -m manifest.json
-      - name: Upload manifest and signature
-        run: gh release upload "$TAG" manifest.json manifest.json.minisig
+      - name: Upload repacked archives, manifest and signature
+        run: |
+          names=$(gh release view "$TAG" --json assets --jq '.assets[].name')
+          for stale in $(printf '%s\n' "$names" | grep -E '^(sha256\.sum|fleetd-.*-linux-musl\.tar\.gz\.sha256)$' || true); do
+            gh release delete-asset "$TAG" "$stale" --yes
+          done
+          gh release upload "$TAG" --clobber repacked/*.tar.gz manifest.json manifest.json.minisig
+
+  publish-release:
+    needs:
+      - plan
+      - host
+      - sign-update-manifest
+    if: ${{ needs.sign-update-manifest.result == 'success' && needs.plan.outputs.publishing == 'true' && github.event_name == 'push' && github.ref_type == 'tag' }}
+    permissions:
+      contents: write
+    runs-on: "ubuntu-22.04"
+    env:
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      GH_REPO: ${{ github.repository }}
+      TAG: ${{ needs.plan.outputs.tag }}
+    steps:
+      - name: Publish the signed release
+        run: gh release edit "$TAG" --draft=false
 
   announce:
     needs:

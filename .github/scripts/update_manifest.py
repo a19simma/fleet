@@ -26,7 +26,7 @@ TARGET_NAME = re.compile(r"[a-z0-9_.-]+")
 ARCHIVE_NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]*")
 SEMVER = re.compile(
     r"(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)"
-    r"(-[0-9A-Za-z.-]+)?(\+[0-9A-Za-z.-]+)?"
+    r"(-[0-9A-Za-z.-]+)?"
 )
 
 
@@ -45,7 +45,7 @@ def check_base_url(base_url):
     rest = base_url.removeprefix("https://")
     if rest == base_url or not rest:
         raise ManifestError("base url must start with https:// and name a host")
-    if not all(33 <= ord(c) <= 126 and c not in "\\@" for c in base_url):
+    if not all(33 <= ord(c) <= 126 and c not in "\\@#?%" for c in base_url):
         raise ManifestError("base url holds a character fleetd refuses")
     if base_url.endswith("/"):
         raise ManifestError("base url must not end with a slash")

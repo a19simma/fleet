@@ -328,10 +328,29 @@ impl<F: ArchiveFetcher + Send + Sync + 'static> UpdateDriver<F> {
     }
 }
 
-/// The manifest target name of this box: its CPU architecture with `-unknown-linux-gnu`.
+/// The manifest target name for CPU architecture `arch` and C library `env`.
+///
+/// `env` is `musl` for a static musl build and anything else maps to `gnu`.
+#[must_use]
+pub fn target_name(arch: &str, env: &str) -> String {
+    let libc = if env == "musl" { "musl" } else { "gnu" };
+    format!("{arch}-unknown-linux-{libc}")
+}
+
+/// The manifest target name of the target this binary was built for.
+///
+/// The release ships the cargo-dist musl build, so a shipped fleetd looks up
+/// `<arch>-unknown-linux-musl`, the name the release manifest carries. A gnu build looks up
+/// `-gnu` and finds nothing in a release manifest, so a development build never updates
+/// itself from a release.
 #[must_use]
 pub fn host_target() -> String {
-    format!("{}-unknown-linux-gnu", std::env::consts::ARCH)
+    let env = if cfg!(target_env = "musl") {
+        "musl"
+    } else {
+        "gnu"
+    };
+    target_name(std::env::consts::ARCH, env)
 }
 
 /// Starts the production driver, or returns `None` with one warning.
