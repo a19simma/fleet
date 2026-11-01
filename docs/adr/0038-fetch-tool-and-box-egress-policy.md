@@ -52,7 +52,7 @@ ADR-0034 lets a Profile `allow` list replace the default allow list. A Profile w
 
 ## Findings
 
-- The Box runs with `PrivateNetwork=no` today, and the Floor denies only `curl` and `WebFetch` by pattern. `python3` through Bash reaches any host. Fetch is not a boundary until ADR-0031 P2 ships. Until then it is a logged, address-checked path that a determined agent can bypass.
+- The unit now sets `PrivateNetwork=yes`. The Azure wireserver 168.63.129.16 is not in the `NON_PUBLIC_V4` block list in `netguard.rs`, so the fetch tool would reach it: a known gap. `egress_observe` (config, default false) is the observe-only switch. The Floor denies only `curl` and `WebFetch` by pattern. `python3` through Bash reaches any host. Fetch is not a boundary until ADR-0031 P2 ships. Until then it is a logged, address-checked path that a determined agent can bypass.
 - Unverified: a search of `docs/adr` found no Profile egress field in any ADR.
 
 ## Rollout

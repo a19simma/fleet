@@ -1,6 +1,6 @@
 # Job socket service registration
 
-Status: Proposed 2026-10-28. `PerJob<S>` is built in `jobsock.rs`. The runner registers the `fetch` feed and the `egress proxy` under the systemd launcher (ADR-0038). No runtime path registers the broker yet (ADR-0037). Clarifies the static `Services` map assumption in ADR-0036, ADR-0037 and ADR-0038, which each say a service is "registered" without saying where or when. Refers to ADR-0036 for the per-job unix socket, ADR-0037 for the credential broker and ADR-0038 for the fetch service.
+Status: Proposed 2026-10-28. `PerJob<S>` is built in `jobsock.rs`. The runner registers the `fetch` feed and the `egress proxy` under the systemd launcher (ADR-0038). The broker is registered the same way (ADR-0037). Clarifies the static `Services` map assumption in ADR-0036, ADR-0037 and ADR-0038, which each say a service is "registered" without saying where or when. Refers to ADR-0036 for the per-job unix socket, ADR-0037 for the credential broker and ADR-0038 for the fetch service.
 
 ADR-0036 binds one socket per Job and hands it a `Services` map, a fixed map from handshake name to `Arc<dyn Service>`. The credential broker (ADR-0037) and the fetch service (ADR-0038) both hold per-Job state: a push target, a fetch cap, a recorded intent. A single instance cannot be built before the Job exists, and a map built once cannot grow when a Job starts. Nothing in the three ADRs says who adds an entry or removes it.
 

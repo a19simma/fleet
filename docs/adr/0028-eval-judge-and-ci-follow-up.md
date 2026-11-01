@@ -1,6 +1,6 @@
 # Eval, judge and CI follow-up
 
-Status: Accepted 2026-10-27. The CI retry is built (migration 0015, `FLEET_MAX_CI_RETRIES`); the rest is not built. Builds on ADR-0029 and ADR-0030, amends ADR-0021 and ADR-0023.
+Status: Accepted 2026-10-27. The judge Job (`FleetJudge.SubmitJudge`), the CI status check and the CI retry are built (migration 0015, `FLEET_MAX_CI_RETRIES`). Builds on ADR-0029 and ADR-0030, amends ADR-0021 and ADR-0023.
 
 ADR-0029 and ADR-0030 record what a Job did, not whether it was good. Two signals are missing: a model's grade of the transcript, and the CI conclusion of the pull request the Job opened. A failed CI run also needs a bounded way to try again. This ADR fixes the design for three tasks: the judge Job, the CI status and the CI retry.
 

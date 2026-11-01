@@ -1,6 +1,6 @@
 # Agent isolation
 
-Status: Accepted 2026-10-26. P1 is built behind `agent_launcher = "systemd"` and cut over live on the first Box; P2 is not built. P3 clone and publish are built, the rest of P3 is not. Supersedes the Known limit paragraph of ADR-0024. Amends the credential and mirror-hardening sections of ADR-0024.
+Status: Accepted 2026-10-26. P1 is built behind `agent_launcher = "systemd"` and cut over live on the first Box; P2 is built: the unit sets `PrivateNetwork=yes` and the runner registers the connect and egress proxies under the systemd launcher. `PrivatePIDs` is not set. P3 clone and publish are built, the rest of P3 is not. Supersedes the Known limit paragraph of ADR-0024. Amends the credential and mirror-hardening sections of ADR-0024.
 
 Supersedes: the "Known limit" paragraph of ADR-0024.
 Amends: the "Credential", "Who sees it", "Mirror hardening" and "Fetch credential" sections of ADR-0024, and the unit and hook sections of ADR-0011.
@@ -34,7 +34,7 @@ Isolate the agent in phases with systemd and a second uid. Each phase ships alon
 
 ### P3: workspace and limits
 
-- **Clone.** Replace the shared worktree with `git clone --reference <mirror>` (alternates) into a directory owned by the job uid. The mirror is read-only to the job uid.
+- **Clone.** Built (`crates/fleetd/src/workspace.rs`): replace the shared worktree with `git clone --reference <mirror>` (alternates) into a directory owned by the job uid. The mirror is read-only to the job uid.
 - **Publish.** fleetd fetches `swarm/<job_id>` from the job directory under its own uid, with hooks and fsmonitor off and `GIT_ALLOW_PROTOCOL=file`, then pushes from a scratch bare repo that borrows the mirror's objects through alternates. Inferred, not part of the design: the scratch repo keeps the push's `GIT_DIR` and scratch `HOME` apart from the mirror, so the push runs in no directory the job group can read for config. The push and `gh pr create` steps of ADR-0020 and ADR-0024 are unchanged in what they publish.
 - **Retires** the mirror-hardening window of ADR-0024: the agent no longer writes the mirror, so the `commondir` and `config.worktree` deletion and the config rewrite are removed. The mirror is built in a sibling directory with its gc settings and renamed into place. Before each fetch fleetd checks an existing mirror structurally (owner uid, no group or other write bit, no symlinks, no alternates, `commondir` or `config.worktree`, a `config` holding only the init keys and the gc settings) and deletes and rebuilds one that fails, so a mirror made before P3 needs no manual delete. The lock cleanup stays, because a killed fleetd fetch leaves `*.lock` files in the mirror. The pins on the workspace git calls stay as defense in depth.
 - **Limits.** `MemoryMax`, `TasksMax`, `CPUQuota` and a job-directory quota.
@@ -62,7 +62,7 @@ Jobs run with `--disallowedTools Edit Write NotebookEdit MultiEdit`, and `deploy
 
 ## Amendment (ADR-0036 and ADR-0037)
 
-ADR-0036 replaces the global `/run/fleet/proxy.sock` of P2 with a per-job service on a per-job socket, so the proxy carries job identity. ADR-0037 adds a credential broker on that socket and reconciles the "A credential broker only" rejection below. Neither is built.
+ADR-0036 replaces the global `/run/fleet/proxy.sock` of P2 with a per-job service on a per-job socket, so the proxy carries job identity. ADR-0037 adds a credential broker on that socket and reconciles the "A credential broker only" rejection below. Both are built: the per-job socket and the credential broker are in fleetd (`crates/fleetd/src/jobsock.rs`, `crates/fleetd/src/broker.rs`).
 
 ## Decisions (2026-10-26)
 
@@ -95,14 +95,14 @@ Three design corrections came out of the run and are binding constraints in P1: 
 - Resolved 2026-10-31: managed-settings hooks fire under the job uid. On a test box with server 0.3.2, `fleet status --tools` listed a `Bash` event with exit code, duration and byte count for each command the job ran.
 - Whether a Job can read another Job's mount namespace through `/proc/<pid>/root` as the same uid. `ProtectProc=invisible` does not close that. `PrivatePIDs=yes` (systemd 257) would, and the unit does not set it yet.
 - The bwrap and `RestrictNamespaces` interaction (P4).
-- The egress proxy itself. It is not built, and its behaviour with the Claude client under `NODE_USE_ENV_PROXY=1` is untested.
+- The egress proxy is built (`crates/fleetd/src/connect_proxy.rs`), but its behaviour with the Claude client under `NODE_USE_ENV_PROXY=1` is untested here.
 - Inferred, not part of the design: the hook client fix in P1 is the only repo change P1 needs besides the unit, the polkit rule and the launcher. Other code paths that assume one uid (the `.finish-<id>` scratch dir, askpass socket checks) were not audited.
 
 ## Open items
 
 - The startup sweep runs only after the daemon holds its sockets, so a second instance cannot sweep a running one. It removes stale run dirs and resets their failed units only. The job worktree and `.agent/<id>` of a crashed job stay, because `Workspace::remove` needs the repo, which a crash no longer records.
 - On a `systemctl show` error the launcher runs `reset-failed` but not `kill`, so a still-running unit could outlive its removed run dir.
-- The unit side of P2 is built: the template sets `PrivateNetwork=yes`, the `PrivateNetwork=no` drop-in is removed, and all hooks are `command` hooks. The runner does not yet register the egress proxy on the Job socket, so a real agent has no route to the model API until it does.
+- The unit side of P2 is built: the template sets `PrivateNetwork=yes`, the `PrivateNetwork=no` drop-in is removed, and all hooks are `command` hooks. The daemon registers the egress proxy on the Job socket under the systemd launcher (`crates/fleetd/src/jobs.rs`), so a real agent reaches the model API through it.
 - A Firecracker microVM per job stays the escalation path if third-party repos or public prompt sources are ever run.
 
 ## Consequences

@@ -1,6 +1,6 @@
 # Credential broker
 
-Status: Proposed 2026-10-28. Built as library code, not wired: no runtime path builds a broker or serves the broker socket. Builds on ADR-0028 and ADR-0036. Amends ADR-0024 (push and `gh` sections) and the "A credential broker only" rejection in ADR-0031.
+Status: Proposed 2026-10-28. Built and wired under the systemd launcher: `BrokerWiring` in `jobs.rs` builds the broker and the runner registers it on the job socket. Builds on ADR-0028 and ADR-0036. Amends ADR-0024 (push and `gh` sections) and the "A credential broker only" rejection in ADR-0031.
 
 Decision by the user: the agent never holds `GH_TOKEN` or `FLEET_TOKEN`. fleetd performs `git push` and `gh` calls on its behalf over the per-job socket of ADR-0036.
 
@@ -29,7 +29,7 @@ fleetd derives a `PushTarget` from the claimed Job on the server side: `Own(job 
 
 ### Ordering
 
-A mid-run push is raceable until ADR-0031 P3 ships: an agent-owned clone made with `git clone --reference`, from which fleetd fetches with hooks and fsmonitor off and `GIT_ALLOW_PROTOCOL=file`, then pushes from the mirror. The `push` op depends on P3. The read ops (`pr_checks` and mirror `fetch`) ship first. `pr_create` is a write op and ships with `push`. The finish step stays as fallback and is idempotent with a broker push through the shared Published state.
+A mid-run push was raceable before ADR-0031 P3: an agent-owned clone made with `git clone --reference`, from which fleetd fetches with hooks and fsmonitor off and `GIT_ALLOW_PROTOCOL=file`, then pushes from the mirror. The `push` op depends on P3, whose clone and publish are built. The read ops (`pr_checks` and mirror `fetch`) ship first. `pr_create` is a write op and ships with `push`. The finish step stays as fallback and is idempotent with a broker push through the shared Published state.
 
 ### Push and pr_create implementation
 

@@ -24,7 +24,7 @@ fleetd gets an `AgentRunner` trait. It owns what differs between agent CLIs: the
 
 ### Summaries
 
-The output parsers for Codex and Kimi do not exist yet. fleetd reads none of a non-claude job's lines, so its Job Summary has `complete = false`, `missing = ["parser"]` and every runner figure `NULL`, never 0. Phase timings fleetd measures itself (`clone_ms`, `push_ms`, `pr_ms`, `queue_wait_ms`) stay. The server stats query also reads a runner figure as `NULL` for a job whose agent is not `claude` and whose summary is incomplete, so an older fleetd that sent zeros cannot enter a percentile, sum or `n`. Claude summaries are unaffected, complete or not.
+The output parsers for Codex and Kimi do not exist yet: no Kimi stream-json parser exists in fleetd, and the telemetry parser reads Claude and Judge output only. A Judge job whose `agent` is `codex` runs under the Claude runner (`is_codex` excludes Judge jobs), so it uses the Claude argv, the judge protocol and the Claude parser. fleetd reads none of a non-claude job's lines, so its Job Summary has `complete = false`, `missing = ["parser"]` and every runner figure `NULL`, never 0. Phase timings fleetd measures itself (`clone_ms`, `push_ms`, `pr_ms`, `queue_wait_ms`) stay. The server stats query also reads a runner figure as `NULL` for a job whose agent is not `claude` and whose summary is incomplete, so an older fleetd that sent zeros cannot enter a percentile, sum or `n`. Claude summaries are unaffected, complete or not.
 
 ### Credentials
 
@@ -40,7 +40,7 @@ Unverified: the real Codex flags, env names, hosts and key prefixes, and the Kim
 - A Job whose owner holds no credential of an accepted kind fails with a fixed error before the agent starts.
 - Stuck detection and cost figures for Codex and Kimi stay absent until their parsers land.
 - The model API hosts of a new runner must be in the Box `egress_allow` (ADR-0038).
-- The runner calls `set_job_hosts(job_id, runner.model_hosts())` on the egress proxy just before the agent starts, and the job end hook forgets it on every exit path. A job gets its own runner's hosts and nothing else, so the Anthropic host is not reachable from a codex or kimi job. The narrowed hosts are the runner's declared hosts that the Box `egress_allow` also lists.
+- The runner calls `set_job_hosts(job_id, runner.model_hosts())` on the egress proxy just before the agent starts, and the job end hook forgets it on every exit path. A job gets its own runner's hosts and nothing else, so the Anthropic host is not reachable from a codex or kimi job. The narrowed hosts are the runner's declared hosts that the proxy's `in_ceiling` admits. `in_ceiling` admits a host that the Box `egress_allow` lists and also `api.anthropic.com` (`MODEL_API_HOST`), which needs no listing.
 
 ## Considered and rejected
 

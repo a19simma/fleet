@@ -1,6 +1,6 @@
 # Fleet
 
-Fleet runs coding-agent Jobs on Boxes and records what each Job did. This file defines the terms used by three groups of ADRs: telemetry and metrics (0029, 0030), profiles (0034, 0035), and the job socket, broker and registration (0036, 0037, 0039).
+Fleet runs coding-agent Jobs on Boxes and records what each Job did. This file defines the terms of the ADRs on telemetry and metrics (0029, 0030), profiles (0034, 0035), the job socket, broker and registration (0036, 0037, 0039), fetch policy (0038), credentials and users (0040, 0042, 0043), agent runners and forges (0044, 0045) and the mirror key (0046).
 
 ## Language
 
@@ -49,7 +49,7 @@ Planned, not built: a release channel for the agent config bundle a Box loads, m
 _Avoid_: config version
 
 **Egress proxy**:
-Planned, not built: a proxy that would restrict the hosts a Job's agent can reach.
+The fleetd service on the **Job socket** that tunnels `CONNECT` requests for a Job's agent, only to hosts inside the Box `egress_allow` ceiling and the model host (ADR-0031, ADR-0038, ADR-0044). Built in `crates/fleetd/src/connect_proxy.rs`.
 _Avoid_: firewall
 
 **Agent unit**:
@@ -101,7 +101,7 @@ The Box-level rule for which hosts `fleetd fetch` may reach. Set by `fetch_polic
 _Avoid_: egress allowlist, proxy policy
 
 **User**:
-A person who owns **Credentials** and submits Jobs. Planned, not built (ADR-0040, ADR-0043).
+A person who owns **Credentials** and submits Jobs. Built in fleet-server (ADR-0042). Jobs without an owner still default to the bootstrap user.
 _Avoid_: account, tenant
 
 **Credential**:
@@ -133,23 +133,23 @@ The set of **Master keys** selected by `key_id`, so rotation needs no downtime (
 _Avoid_: key store
 
 **API token**:
-Planned, not built: a bearer token a **User** uses with the API or CLI, in place of the shared client token.
+A hashed bearer token a **User** uses with the API or CLI, in place of the shared client token. Built in fleet-server (ADR-0042).
 _Avoid_: token, client token
 
 **Web session**:
-Planned, not built: the browser login state of a **User**.
+The server-side browser login state of a **User**, created by passkey login. Built in fleet-server (ADR-0042).
 _Avoid_: login token, cookie
 
 **Credential holder**:
-The server component that opens a **Credential** for one claimed Job and records the read in `credential_use`. Planned, not built (ADR-0040).
+The server component that opens a **Credential** for one claimed Job and records the read in `credential_use`. Built in `crates/fleet-server/src/cred/store.rs` (ADR-0040).
 _Avoid_: vault, secret manager
 
 **Job credentials**:
-The **Credentials** the server releases to a Box for one Job and no other. Planned, not built (ADR-0043).
+The **Credentials** the server releases to a Box for one Job and no other (`release_for_job` in `crates/fleet-server/src/cred/store.rs`, ADR-0043).
 _Avoid_: job secrets, job tokens
 
 **Agent runner**:
-The agent CLI a Job runs, such as Claude Code, Codex or Kimi, which a **Credential kind** feeds. Planned, not built.
+The agent CLI a Job runs, such as Claude Code, Codex or Kimi, which a **Credential kind** feeds. The `claude`, `codex` and `kimi` runners are built in fleetd (ADR-0044).
 _Avoid_: agent, model
 
 **Forge**:
@@ -161,11 +161,11 @@ The pass or fail outcome of a forge check on a Job's pull request, read through 
 _Avoid_: build status
 
 **Mirror key**:
-The `(user, repo)` pair that names a repository mirror, so each user fetches into a separate mirror (ADR-0046). Planned, not built.
+The `(user, repo)` pair that names a repository mirror, so each user fetches into a separate mirror (ADR-0046). Built in fleetd (`Workspace::mirror_dir_for`).
 _Avoid_: deploy key
 
 **Owner**:
-The **User** a **Credential** or Job belongs to. Planned, not built.
+The **User** a **Credential** or Job belongs to (`jobs.user_id`, ADR-0042).
 _Avoid_: creator, tenant
 
 **Box token**:
