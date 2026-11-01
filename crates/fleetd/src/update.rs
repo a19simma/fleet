@@ -14,6 +14,12 @@ use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsE
 use std::path::{Path, PathBuf};
 
 use crate::fetch_policy::HostPattern;
+
+mod fetcher;
+pub use fetcher::{
+    ARCHIVE_CONNECT_TIMEOUT, ARCHIVE_TOTAL_TIMEOUT, MAX_ARCHIVE_REDIRECTS, PolicyArchiveFetcher,
+    archive_caps,
+};
 use fleet_core::tools::Version;
 use fleet_proto::{MAX_MANIFEST_BYTES, MAX_SIGNATURE_BYTES};
 use minisign_verify::{PublicKey, Signature};

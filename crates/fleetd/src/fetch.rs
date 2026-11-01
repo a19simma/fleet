@@ -29,7 +29,7 @@ use rustls::pki_types::ServerName;
 use rustls::{ClientConfig, RootCertStore};
 use tokio::net::TcpStream;
 use tokio::task::JoinHandle;
-use tokio::time::timeout;
+use tokio::time::{Instant, timeout, timeout_at};
 use tokio_rustls::TlsConnector;
 use tokio_rustls::client::TlsStream;
 
@@ -259,8 +259,74 @@ impl Drop for AbortOnDrop {
 }
 
 enum Hop {
-    Done(Fetched),
+    Done(Landed),
     Redirect(String),
+}
+
+enum Landed {
+    Text(Fetched),
+    Stream(FetchStream),
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Mode {
+    Text,
+    Stream,
+}
+
+/// An open response body from [`Fetcher::open`].
+///
+/// The headers are in and the status is 2xx. The body is raw bytes, so the content type is not
+/// checked. The size cap and the total deadline of the fetch apply to every chunk. Dropping the
+/// stream closes the connection.
+pub struct FetchStream {
+    body: hyper::body::Incoming,
+    deadline: Instant,
+    max_bytes: u64,
+    total: u64,
+    host: String,
+    redirects: u8,
+    driver: Option<AbortOnDrop>,
+}
+
+impl FetchStream {
+    /// Host of the final hop.
+    #[must_use]
+    pub fn host(&self) -> &str {
+        &self.host
+    }
+
+    /// Redirects followed.
+    #[must_use]
+    pub const fn redirects(&self) -> u8 {
+        self.redirects
+    }
+
+    /// The next body chunk, or `None` at the end of the body.
+    ///
+    /// # Errors
+    /// Returns [`FetchError::Timeout`] past the fetch deadline, [`FetchError::BodyTooLarge`]
+    /// when the body passes the size cap, and [`FetchError::Protocol`] when the body breaks.
+    pub async fn next_chunk(&mut self) -> Result<Option<Bytes>, FetchError> {
+        loop {
+            let frame = timeout_at(self.deadline, self.body.frame())
+                .await
+                .map_err(|_| FetchError::Timeout)?;
+            let Some(frame) = frame else {
+                return Ok(None);
+            };
+            let frame = frame.map_err(|_| FetchError::Protocol)?;
+            if let Ok(data) = frame.into_data() {
+                self.total = self.total.saturating_add(data.len() as u64);
+                if self.total > self.max_bytes {
+                    return Err(FetchError::BodyTooLarge);
+                }
+                if !data.is_empty() {
+                    return Ok(Some(data));
+                }
+            }
+        }
+    }
 }
 
 const fn is_redirect(status: u16) -> bool {
@@ -410,22 +476,49 @@ impl<R: Resolver, D: Dialer> Fetcher<R, D> {
     /// # Errors
     /// Returns the [`FetchError`] for the first rule the fetch breaks.
     pub async fn fetch(&self, url: &str) -> Result<Fetched, FetchError> {
-        timeout(self.caps.total_timeout, self.follow(url))
+        let landed = timeout(self.caps.total_timeout, self.follow(url, Mode::Text))
             .await
-            .map_err(|_| FetchError::Timeout)?
+            .map_err(|_| FetchError::Timeout)??;
+        match landed {
+            Landed::Text(fetched) => Ok(fetched),
+            Landed::Stream(_) => Err(FetchError::Protocol),
+        }
     }
 
-    async fn follow(&self, url: &str) -> Result<Fetched, FetchError> {
+    /// Open `url` and return its body as a byte stream. Redirects, the host policy, address
+    /// checks and caps are the same as for [`Fetcher::fetch`]; only the text checks are
+    /// skipped. The stream ends at the same deadline as a fetch would.
+    ///
+    /// # Errors
+    /// Returns the [`FetchError`] for the first rule the open breaks.
+    pub async fn open(&self, url: &str) -> Result<FetchStream, FetchError> {
+        let deadline = Instant::now() + self.caps.total_timeout;
+        let landed = timeout_at(deadline, self.follow(url, Mode::Stream))
+            .await
+            .map_err(|_| FetchError::Timeout)??;
+        match landed {
+            Landed::Stream(mut stream) => {
+                stream.deadline = deadline;
+                Ok(stream)
+            }
+            Landed::Text(_) => Err(FetchError::Protocol),
+        }
+    }
+
+    async fn follow(&self, url: &str, mode: Mode) -> Result<Landed, FetchError> {
         if !self.caps.url_within_cap(url) {
             return Err(FetchError::Refused(UrlRefusal::TooLong));
         }
         let mut target = precheck_url(url).map_err(FetchError::Refused)?;
         let mut redirects = 0_u8;
         loop {
-            match self.hop(&target).await? {
-                Hop::Done(mut fetched) => {
-                    fetched.redirects = redirects;
-                    return Ok(fetched);
+            match self.hop(&target, mode).await? {
+                Hop::Done(mut landed) => {
+                    match &mut landed {
+                        Landed::Text(fetched) => fetched.redirects = redirects,
+                        Landed::Stream(stream) => stream.redirects = redirects,
+                    }
+                    return Ok(landed);
                 }
                 Hop::Redirect(location) => {
                     if redirects >= self.caps.max_redirects {
@@ -438,7 +531,7 @@ impl<R: Resolver, D: Dialer> Fetcher<R, D> {
         }
     }
 
-    async fn hop(&self, target: &ParsedTarget) -> Result<Hop, FetchError> {
+    async fn hop(&self, target: &ParsedTarget, mode: Mode) -> Result<Hop, FetchError> {
         if !self.policy.permits_host(&target.host) {
             return Err(FetchError::HostNotPermitted);
         }
@@ -451,7 +544,7 @@ impl<R: Resolver, D: Dialer> Fetcher<R, D> {
             .handshake::<_, Empty<Bytes>>(TokioIo::new(stream))
             .await
             .map_err(|_| FetchError::Protocol)?;
-        let _driver = AbortOnDrop(tokio::spawn(async move {
+        let driver = AbortOnDrop(tokio::spawn(async move {
             let _ = connection.await;
         }));
         let request = Request::builder()
@@ -468,7 +561,14 @@ impl<R: Resolver, D: Dialer> Fetcher<R, D> {
             .send_request(request)
             .await
             .map_err(|_| FetchError::Protocol)?;
-        self.read_response(target, response).await
+        let hop = self.read_response(target, response, mode).await?;
+        Ok(match hop {
+            Hop::Done(Landed::Stream(mut stream)) => {
+                stream.driver = Some(driver);
+                Hop::Done(Landed::Stream(stream))
+            }
+            other => other,
+        })
     }
 
     async fn checked_addresses(&self, host: &str) -> Result<Vec<IpAddr>, FetchError> {
@@ -513,6 +613,7 @@ impl<R: Resolver, D: Dialer> Fetcher<R, D> {
         &self,
         target: &ParsedTarget,
         response: Response<hyper::body::Incoming>,
+        mode: Mode,
     ) -> Result<Hop, FetchError> {
         let status = response.status().as_u16();
         let headers = response.headers();
@@ -533,6 +634,21 @@ impl<R: Resolver, D: Dialer> Fetcher<R, D> {
             .any(|value| !value.as_bytes().eq_ignore_ascii_case(b"identity"))
         {
             return Err(FetchError::Encoded);
+        }
+        if mode == Mode::Stream {
+            let body = response.into_body();
+            if let Some(declared) = body.size_hint().exact() {
+                self.check_size(declared)?;
+            }
+            return Ok(Hop::Done(Landed::Stream(FetchStream {
+                body,
+                deadline: Instant::now() + self.caps.total_timeout,
+                max_bytes: self.caps.max_body_bytes.min(self.caps.max_decoded_bytes),
+                total: 0,
+                host: target.host.clone(),
+                redirects: 0,
+                driver: None,
+            })));
         }
         let mut content_types = headers.get_all(CONTENT_TYPE).iter();
         let content_type = match (content_types.next(), content_types.next()) {
@@ -557,14 +673,14 @@ impl<R: Resolver, D: Dialer> Fetcher<R, D> {
         if body.chars().any(is_hidden_char) {
             return Err(FetchError::NotText);
         }
-        Ok(Hop::Done(Fetched {
+        Ok(Hop::Done(Landed::Text(Fetched {
             status,
             host: target.host.clone(),
             content_type,
             bytes: total,
             body,
             redirects: 0,
-        }))
+        })))
     }
 
     fn check_size(&self, size: u64) -> Result<(), FetchError> {
