@@ -16,10 +16,10 @@
 
 use std::fmt;
 use std::fmt::Write as _;
-use std::fs::{self, File, OpenOptions};
+use std::fs::{self, DirBuilder, File, OpenOptions};
 use std::io::{Read, Write};
 use std::os::fd::OwnedFd;
-use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 
 use fleet_core::tools::{ToolError, ToolName, Version};
@@ -95,6 +95,8 @@ pub enum ToolsError {
     InvalidTool,
     /// The cache holds no usable entry for the tool and version.
     NotCached,
+    /// A seed tree or cache env value was refused, with the reason.
+    Seed(&'static str),
 }
 
 impl fmt::Display for ToolsError {
@@ -123,6 +125,7 @@ impl fmt::Display for ToolsError {
             }
             Self::InvalidTool => f.write_str("tool name or version is invalid"),
             Self::NotCached => f.write_str("tool is not in the cache"),
+            Self::Seed(why) => write!(f, "cache seed refused: {why}"),
         }
     }
 }
@@ -843,4 +846,307 @@ impl ToolCache {
             remaining_bytes: total,
         })
     }
+}
+
+/// Directory under the seed root that holds the `CARGO_HOME` seed (registry and git checkouts).
+pub const CARGO_SUBDIR: &str = "cargo";
+
+/// Directory under the seed root that holds the npm cache seed.
+pub const NPM_SUBDIR: &str = "npm";
+
+/// Name of the per-job `CARGO_HOME` copy inside the job directory.
+pub const CARGO_HOME_DIR: &str = "cargo-home";
+
+/// Name of the per-job npm cache copy inside the job directory.
+pub const NPM_CACHE_DIR: &str = "npm-cache";
+
+/// Default total byte cap over both seed trees.
+pub const MAX_SEED_BYTES: u64 = 2 * 1024 * 1024 * 1024;
+
+/// Default cap on one seed file.
+pub const MAX_SEED_FILE_BYTES: u64 = 256 * 1024 * 1024;
+
+/// Default cap on directory entries and files over both seed trees.
+pub const MAX_SEED_ENTRIES: usize = 200_000;
+
+/// Default cap on directory nesting below a seed subdirectory.
+pub const MAX_SEED_DEPTH: usize = 32;
+
+/// Caps applied while copying a seed tree.
+#[derive(Debug, Clone, Copy)]
+pub struct SeedLimits {
+    /// Total file bytes over both trees.
+    pub max_bytes: u64,
+    /// Bytes in one file.
+    pub max_file_bytes: u64,
+    /// Entries (directories and files, subdirectory roots included) over both trees.
+    pub max_entries: usize,
+    /// Nesting depth below a subdirectory root; its children sit at depth 1.
+    pub max_depth: usize,
+}
+
+impl Default for SeedLimits {
+    fn default() -> Self {
+        Self {
+            max_bytes: MAX_SEED_BYTES,
+            max_file_bytes: MAX_SEED_FILE_BYTES,
+            max_entries: MAX_SEED_ENTRIES,
+            max_depth: MAX_SEED_DEPTH,
+        }
+    }
+}
+
+/// The per-job writable cache directories made by [`warm_job_caches`].
+#[derive(Debug, Clone)]
+pub struct WarmCaches {
+    cargo_home: PathBuf,
+    npm_cache: PathBuf,
+}
+
+impl WarmCaches {
+    /// The job's own `CARGO_HOME`.
+    #[must_use]
+    pub fn cargo_home(&self) -> &Path {
+        &self.cargo_home
+    }
+
+    /// The job's own npm cache directory.
+    #[must_use]
+    pub fn npm_cache(&self) -> &Path {
+        &self.npm_cache
+    }
+
+    /// The job env pairs naming the copies, never the seed.
+    ///
+    /// # Errors
+    ///
+    /// See [`cache_env`].
+    pub fn env(&self) -> Result<[(&'static str, String); 2], ToolsError> {
+        cache_env(&self.cargo_home, &self.npm_cache)
+    }
+}
+
+/// The `CARGO_HOME` and `npm_config_cache` pairs for a job env, in that order.
+///
+/// Pure: it only validates and formats. Both paths must be absolute, valid UTF-8 and free of
+/// NUL, CR and LF, so the pairs are safe in an environment file.
+///
+/// # Errors
+///
+/// Returns [`ToolsError::Seed`] for a path that fails those checks.
+pub fn cache_env(
+    cargo_home: &Path,
+    npm_cache: &Path,
+) -> Result<[(&'static str, String); 2], ToolsError> {
+    let value = |path: &Path| -> Result<String, ToolsError> {
+        let text = path
+            .to_str()
+            .ok_or(ToolsError::Seed("cache path is not UTF-8"))?;
+        if !path.is_absolute() || text.bytes().any(|b| matches!(b, 0 | b'\n' | b'\r')) {
+            return Err(ToolsError::Seed(
+                "cache path is relative or has a control byte",
+            ));
+        }
+        Ok(text.to_owned())
+    };
+    Ok([
+        ("CARGO_HOME", value(cargo_home)?),
+        ("npm_config_cache", value(npm_cache)?),
+    ])
+}
+
+struct CopyState {
+    limits: SeedLimits,
+    entries: usize,
+    bytes: u64,
+}
+
+impl CopyState {
+    fn entry(&mut self) -> Result<(), ToolsError> {
+        self.entries += 1;
+        if self.entries > self.limits.max_entries {
+            return Err(ToolsError::Seed("seed has too many entries"));
+        }
+        Ok(())
+    }
+}
+
+/// Copies the read-only seed into the job's own writable cache directories.
+///
+/// `seed_root/cargo` becomes `job_dir/cargo-home` and `seed_root/npm` becomes
+/// `job_dir/npm-cache`. Files are byte copies, never hardlinks or reflinks: each copy is a new
+/// inode with `nlink` 1, mode 0600 (0700 when the seed file has an execute bit) in 0700
+/// directories, so a write or delete in the copy cannot reach the seed. A missing seed root or
+/// subdirectory yields an empty cache directory. Everything is refused, and the partial copy
+/// removed, when the seed holds a symlink (including a symlinked root or subdirectory), a file
+/// with `nlink` above 1, a fifo, socket or device, a file over `max_file_bytes`, more than
+/// `max_bytes` in total, more than `max_entries` entries, or nesting deeper than `max_depth`.
+/// Files are opened with `O_NOFOLLOW | O_NONBLOCK` and checked again on the open handle.
+///
+/// `job_dir` must exist and must not already hold the two destination names. It is made
+/// absolute first, so the returned paths are absolute for a relative root. The seed is populated
+/// by an operator or install step as the fleetd uid and is never written here. Nothing calls
+/// this from the runner yet.
+///
+/// # Errors
+///
+/// Returns [`ToolsError::Seed`] for a refused seed and [`ToolsError::Io`] for an io failure,
+/// including an existing destination.
+pub fn warm_job_caches(
+    seed_root: &Path,
+    job_dir: &Path,
+    limits: SeedLimits,
+) -> Result<WarmCaches, ToolsError> {
+    let job_dir = std::path::absolute(job_dir).map_err(ToolsError::Io)?;
+    let caches = WarmCaches {
+        cargo_home: job_dir.join(CARGO_HOME_DIR),
+        npm_cache: job_dir.join(NPM_CACHE_DIR),
+    };
+    match fs::symlink_metadata(seed_root) {
+        Ok(meta) if meta.is_dir() => {}
+        Ok(_) => return Err(ToolsError::Seed("seed root is not a real directory")),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+            let mut created = Vec::new();
+            let result = make_owned_dir(&caches.cargo_home, &mut created)
+                .and_then(|()| make_owned_dir(&caches.npm_cache, &mut created));
+            if let Err(err) = result {
+                remove_created(&created);
+                return Err(err);
+            }
+            return Ok(caches);
+        }
+        Err(err) => return Err(ToolsError::Io(err)),
+    }
+    let mut state = CopyState {
+        limits,
+        entries: 0,
+        bytes: 0,
+    };
+    let mut created = Vec::new();
+    let result = copy_subdir(
+        &seed_root.join(CARGO_SUBDIR),
+        &caches.cargo_home,
+        &mut state,
+        &mut created,
+    )
+    .and_then(|()| {
+        copy_subdir(
+            &seed_root.join(NPM_SUBDIR),
+            &caches.npm_cache,
+            &mut state,
+            &mut created,
+        )
+    });
+    if let Err(err) = result {
+        remove_created(&created);
+        return Err(err);
+    }
+    Ok(caches)
+}
+
+fn make_owned_dir(dst: &Path, created: &mut Vec<PathBuf>) -> Result<(), ToolsError> {
+    make_dir(dst)?;
+    created.push(dst.to_path_buf());
+    Ok(())
+}
+
+fn remove_created(created: &[PathBuf]) {
+    for path in created {
+        let _ = fs::remove_dir_all(path);
+    }
+}
+
+fn make_dir(path: &Path) -> Result<(), ToolsError> {
+    DirBuilder::new()
+        .mode(0o700)
+        .create(path)
+        .map_err(ToolsError::Io)
+}
+
+fn copy_subdir(
+    src: &Path,
+    dst: &Path,
+    state: &mut CopyState,
+    created: &mut Vec<PathBuf>,
+) -> Result<(), ToolsError> {
+    match fs::symlink_metadata(src) {
+        Ok(meta) if meta.is_dir() => {
+            state.entry()?;
+            make_owned_dir(dst, created)?;
+            copy_dir(src, dst, 0, state)
+        }
+        Ok(_) => Err(ToolsError::Seed(
+            "seed subdirectory is not a real directory",
+        )),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => make_owned_dir(dst, created),
+        Err(err) => Err(ToolsError::Io(err)),
+    }
+}
+
+fn copy_dir(src: &Path, dst: &Path, depth: usize, state: &mut CopyState) -> Result<(), ToolsError> {
+    for entry in fs::read_dir(src).map_err(ToolsError::Io)? {
+        let entry = entry.map_err(ToolsError::Io)?;
+        state.entry()?;
+        let from = entry.path();
+        let to = dst.join(entry.file_name());
+        let kind = fs::symlink_metadata(&from)
+            .map_err(ToolsError::Io)?
+            .file_type();
+        if kind.is_dir() {
+            if depth + 1 > state.limits.max_depth {
+                return Err(ToolsError::Seed("seed nesting is too deep"));
+            }
+            make_dir(&to)?;
+            copy_dir(&from, &to, depth + 1, state)?;
+        } else if kind.is_file() {
+            copy_file(&from, &to, state)?;
+        } else {
+            return Err(ToolsError::Seed("seed holds a symlink or special file"));
+        }
+    }
+    Ok(())
+}
+
+fn copy_file(from: &Path, to: &Path, state: &mut CopyState) -> Result<(), ToolsError> {
+    let mut src = OpenOptions::new()
+        .read(true)
+        .custom_flags(
+            (OFlags::NOFOLLOW | OFlags::NONBLOCK | OFlags::CLOEXEC)
+                .bits()
+                .cast_signed(),
+        )
+        .open(from)
+        .map_err(ToolsError::Io)?;
+    let meta = src.metadata().map_err(ToolsError::Io)?;
+    if !meta.is_file() {
+        return Err(ToolsError::Seed("seed holds a symlink or special file"));
+    }
+    if meta.nlink() > 1 {
+        return Err(ToolsError::Seed("seed file has more than one hardlink"));
+    }
+    let len = meta.len();
+    if len > state.limits.max_file_bytes {
+        return Err(ToolsError::Seed("seed file is over the size cap"));
+    }
+    state.bytes = state.bytes.saturating_add(len);
+    if state.bytes > state.limits.max_bytes {
+        return Err(ToolsError::Seed("seed is over the total size cap"));
+    }
+    let mode = if meta.mode() & 0o111 == 0 {
+        0o600
+    } else {
+        0o700
+    };
+    let mut dst = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(mode)
+        .custom_flags((OFlags::NOFOLLOW | OFlags::CLOEXEC).bits().cast_signed())
+        .open(to)
+        .map_err(ToolsError::Io)?;
+    let copied = std::io::copy(&mut (&mut src).take(len), &mut dst).map_err(ToolsError::Io)?;
+    if copied != len {
+        return Err(ToolsError::Seed("seed file changed while copying"));
+    }
+    Ok(())
 }
