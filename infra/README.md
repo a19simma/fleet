@@ -51,7 +51,18 @@ Verified in kind with `check-master-key-kind.sh` against chart `external-secrets
 
 Rotation, backup and restore steps are in [docs/credential-key-runbook.md](../docs/credential-key-runbook.md).
 
+If the Secret `fleet-master-key` is deleted outside the generator flow, the ExternalSecret (`CreatedOnce`) mints a new key and every stored credential becomes unreadable. Back the key up first. The runbook covers Back up, Rotate, and Restore with and without the key. The key is the sha256 of a 32 character generator password, so its entropy is that of the password. With about 66 symbols that is roughly 190 bits, and the generator charset is unverified.
+
 The operator must enable etcd encryption at rest. Without it the Secret sits in etcd in the clear (ADR-0040).
+
+## Server variables
+
+The Deployment sets `FLEET_LISTEN`, `FLEET_HEALTH_LISTEN`, `FLEET_DATABASE_URL`, `FLEET_TOKEN`, `FLEET_CLIENT_TOKEN`, `FLEET_WEB_RP_ID`, `FLEET_WEB_ORIGIN` and `FLEET_MASTER_KEY_FILE`. Its only volume is the master key. These fleet-server variables are not set by default:
+
+| Variable | Meaning |
+| --- | --- |
+| `FLEET_UPDATE_MANIFEST` | path of the signed update manifest. The signature is the file of the same name with `.minisig` appended. Unset or empty means no manifest. The Deployment mounts no manifest file, and ConfigMap and Secret are outside the allowed kinds, so delivering the manifest to the pod is an open item for the operator. |
+| `FLEET_ALLOW_PROFILE_TOOLS` | `true` or `false`, default `false`, empty counts as `false`, anything else stops startup. While `false` the server refuses a Profile with `tools`. Tools are accepted only in TOML Profile content. A Box also needs the `[mise]` section, see [deploy/README.md](../deploy/README.md#bundled-mise-and-the-mise-section). |
 
 ## Image tag
 
