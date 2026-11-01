@@ -47,6 +47,9 @@ impl std::error::Error for ForgeError {}
 impl CiResult {
     /// Folds the check runs of a GitHub check-runs response into one result.
     ///
+    /// It reads one response body and does not follow pagination. GitHub returns 30 runs per
+    /// page by default, so a caller must page itself.
+    ///
     /// A failing conclusion wins over everything, then a running check, then a queued one.
     /// A finished set is `Success` when any check succeeded and `Neutral` otherwise.
     ///

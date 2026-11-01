@@ -32,6 +32,10 @@ mod ci_retry;
 
 use ci_retry::{ROOT_ID, decide_ci_retry};
 
+/// The column list of a `jobs` row as one string literal, for `concat!` in each statement.
+///
+/// A macro because `concat!` cannot take a `const`. It holds the timestamps as epoch
+/// milliseconds and the profile hash as hex.
 macro_rules! job_columns {
     () => {
         "job_id, idempotency_key, prompt, repo, base_ref, open_pr, state, box, attempt, \
@@ -353,10 +357,10 @@ pub enum StoreError {
     /// A batch request failed validation. No input is kept.
     InvalidBatch(BatchInvalid),
     /// A batch named a profile that has no version. The handler maps this to gRPC
-    /// `NOT_FOUND`. No input is kept.
+    /// `NOT_FOUND`. The error carries no data.
     UnknownProfile,
     /// A profile blob read did not match a live lease, or no such job exists. The handler
-    /// maps this to gRPC `PERMISSION_DENIED`. No input is kept.
+    /// maps this to gRPC `PERMISSION_DENIED`. The error carries no data.
     LeaseDenied,
 }
 
@@ -1763,6 +1767,9 @@ impl Store {
     }
 
     /// Deletes up to `limit` event rows of terminal jobs finished more than `days` days ago.
+    ///
+    /// `days` and `limit` are not range checked here: the caller (`retention::Policy`) holds
+    /// the validated bounds.
     ///
     /// The cutoff is `now()` in the database minus `days`, measured from `finished_at` and
     /// from `created_at` when that is null. Rows another transaction holds are skipped.

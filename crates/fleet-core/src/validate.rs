@@ -232,6 +232,8 @@ fn has_jwt(text: &str) -> bool {
     false
 }
 
+/// True when `text` looks like a secret. `github_pat_` and `-----BEGIN` match on the prefix
+/// alone, which is stricter than the length-checked `ghp_`, `sk-` and `AKIA` forms.
 fn secret_like(text: &str) -> bool {
     text.contains("github_pat_")
         || text.contains("-----BEGIN")
@@ -418,7 +420,9 @@ impl Profile {
     ///
     /// - Caps: at most [`MAX_ENTRIES`] entries (a context file or a skill file), at most
     ///   [`MAX_TOTAL_BYTES`] text bytes over `claude_md`, `prompt_prefix`, `prompt_template` and
-    ///   every file, and at most [`MAX_FILE_BYTES`] for `claude_md` and each file.
+    ///   every file, and at most [`MAX_FILE_BYTES`] for `claude_md` and each file. The
+    ///   attribution text is scanned for secrets but counts toward neither cap, so the
+    ///   effective total can exceed ADR-0034's 4 MiB by the attribution length.
     /// - Scalars: `model` is non-empty, at most [`MAX_MODEL_BYTES`] bytes, with no control
     ///   character; `max_turns` is 1 to [`MAX_TURNS`]; `max_budget_usd` (whole US cents) is at
     ///   most [`MAX_BUDGET_CENTS`].
@@ -427,6 +431,8 @@ impl Profile {
     ///   no `..`), at most [`MAX_PATH_BYTES`] bytes and [`MAX_COMPONENT_BYTES`] per component. A
     ///   skill name is one component of `[A-Za-z0-9_-]` up to [`MAX_SKILL_NAME_LEN`] characters.
     ///   Paths are unique among context files and within one skill, and skill names are unique.
+    ///   Uniqueness compares bytes, so paths that differ only by case are distinct, which
+    ///   matters on a case-insensitive filesystem.
     ///   Only syntax is checked here: refusing symlinks is the job of the code that writes the
     ///   files to disk.
     /// - Rules: allow and deny lists, top level and in `settings.permissions`, hold at most
@@ -438,7 +444,7 @@ impl Profile {
     /// - Credentials: no path, skill name or allow rule contains, ignoring ASCII case, one of
     ///   `.credentials`, `.claude/.credentials.json`, `oauth`, `.ssh`, `.aws`, `.netrc`,
     ///   `.gnupg`, `.config/gh`, `id_rsa` or `id_ed25519`. This is a best-effort lint, not a
-    ///   guarantee.
+    ///   guarantee. A skill name has no `.`, so only `oauth` can match it.
     /// - Env: every `env_flags` name is in [`ENV_FLAG_ALLOWLIST`]. Values are `"0"` or `"1"` by
     ///   type.
     /// - Template: `prompt_template` holds `{prompt}` once and no other `{` or `}`.
