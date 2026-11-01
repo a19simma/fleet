@@ -1,0 +1,510 @@
+//! Bundled mise verification: pins, sha256, minisign, owner and mode checks, symlinks and the
+//! size cap, against minisign signatures made in the test with a ring Ed25519 key.
+
+#![expect(
+    clippy::unwrap_used,
+    clippy::indexing_slicing,
+    clippy::cast_possible_truncation,
+    clippy::many_single_char_names,
+    clippy::trivially_copy_pass_by_ref,
+    clippy::format_collect,
+    reason = "test code asserts by panicking, and the reference blake2b is long"
+)]
+
+use std::fs;
+use std::os::unix::fs::{MetadataExt, PermissionsExt, symlink};
+use std::path::{Path, PathBuf};
+
+use fleet_proto::MAX_SIGNATURE_BYTES;
+use fleetd::tools::{MisePins, MisePinsConfig, ToolsError, verify_mise, verify_mise_capped};
+use ring::signature::{Ed25519KeyPair, KeyPair};
+use sha2::{Digest, Sha256};
+use tempfile::TempDir;
+
+const B64: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+
+fn b64(data: &[u8]) -> String {
+    let mut out = String::new();
+    for chunk in data.chunks(3) {
+        let n = chunk
+            .iter()
+            .enumerate()
+            .fold(0u32, |acc, (i, b)| acc | (u32::from(*b) << (16 - 8 * i)));
+        for i in 0..4 {
+            if i <= chunk.len() {
+                out.push(char::from(B64[((n >> (18 - 6 * i)) & 63) as usize]));
+            } else {
+                out.push('=');
+            }
+        }
+    }
+    out
+}
+
+const IV: [u64; 8] = [
+    0x6a09_e667_f3bc_c908,
+    0xbb67_ae85_84ca_a73b,
+    0x3c6e_f372_fe94_f82b,
+    0xa54f_f53a_5f1d_36f1,
+    0x510e_527f_ade6_82d1,
+    0x9b05_688c_2b3e_6c1f,
+    0x1f83_d9ab_fb41_bd6b,
+    0x5be0_cd19_137e_2179,
+];
+
+const SIGMA: [[usize; 16]; 10] = [
+    [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15],
+    [14, 10, 4, 8, 9, 15, 13, 6, 1, 12, 0, 2, 11, 7, 5, 3],
+    [11, 8, 12, 0, 5, 2, 15, 13, 10, 14, 3, 6, 7, 1, 9, 4],
+    [7, 9, 3, 1, 13, 12, 11, 14, 2, 6, 5, 10, 4, 0, 15, 8],
+    [9, 0, 5, 7, 2, 4, 10, 15, 14, 1, 11, 12, 6, 8, 3, 13],
+    [2, 12, 6, 10, 0, 11, 8, 3, 4, 13, 7, 5, 15, 14, 1, 9],
+    [12, 5, 1, 15, 14, 13, 4, 10, 0, 7, 6, 3, 9, 2, 8, 11],
+    [13, 11, 7, 14, 12, 1, 3, 9, 5, 0, 15, 4, 8, 6, 2, 10],
+    [6, 15, 14, 9, 11, 3, 0, 8, 12, 2, 13, 7, 1, 4, 10, 5],
+    [10, 2, 8, 4, 7, 6, 1, 5, 15, 11, 9, 14, 3, 12, 13, 0],
+];
+
+fn compress(h: &mut [u64; 8], block: &[u8], t: u128, last: bool) {
+    let mut m = [0u64; 16];
+    for (i, w) in m.iter_mut().enumerate() {
+        let mut b = [0u8; 8];
+        b.copy_from_slice(&block[i * 8..i * 8 + 8]);
+        *w = u64::from_le_bytes(b);
+    }
+    let mut v = [0u64; 16];
+    v[..8].copy_from_slice(h);
+    v[8..].copy_from_slice(&IV);
+    v[12] ^= t as u64;
+    v[13] ^= (t >> 64) as u64;
+    if last {
+        v[14] = !v[14];
+    }
+    let g = |v: &mut [u64; 16], a: usize, b: usize, c: usize, d: usize, x: u64, y: u64| {
+        v[a] = v[a].wrapping_add(v[b]).wrapping_add(x);
+        v[d] = (v[d] ^ v[a]).rotate_right(32);
+        v[c] = v[c].wrapping_add(v[d]);
+        v[b] = (v[b] ^ v[c]).rotate_right(24);
+        v[a] = v[a].wrapping_add(v[b]).wrapping_add(y);
+        v[d] = (v[d] ^ v[a]).rotate_right(16);
+        v[c] = v[c].wrapping_add(v[d]);
+        v[b] = (v[b] ^ v[c]).rotate_right(63);
+    };
+    for r in 0..12 {
+        let s = &SIGMA[r % 10];
+        g(&mut v, 0, 4, 8, 12, m[s[0]], m[s[1]]);
+        g(&mut v, 1, 5, 9, 13, m[s[2]], m[s[3]]);
+        g(&mut v, 2, 6, 10, 14, m[s[4]], m[s[5]]);
+        g(&mut v, 3, 7, 11, 15, m[s[6]], m[s[7]]);
+        g(&mut v, 0, 5, 10, 15, m[s[8]], m[s[9]]);
+        g(&mut v, 1, 6, 11, 12, m[s[10]], m[s[11]]);
+        g(&mut v, 2, 7, 8, 13, m[s[12]], m[s[13]]);
+        g(&mut v, 3, 4, 9, 14, m[s[14]], m[s[15]]);
+    }
+    for i in 0..8 {
+        h[i] ^= v[i] ^ v[i + 8];
+    }
+}
+
+fn blake2b(data: &[u8]) -> Vec<u8> {
+    let mut h = IV;
+    h[0] ^= 0x0101_0000 ^ 64;
+    let mut offset = 0usize;
+    while data.len() - offset > 128 {
+        compress(
+            &mut h,
+            &data[offset..offset + 128],
+            (offset + 128) as u128,
+            false,
+        );
+        offset += 128;
+    }
+    let mut block = [0u8; 128];
+    let rest = &data[offset..];
+    block[..rest.len()].copy_from_slice(rest);
+    compress(&mut h, &block, data.len() as u128, true);
+    h.iter().flat_map(|w| w.to_le_bytes()).collect()
+}
+
+struct Signer {
+    pair: Ed25519KeyPair,
+    key_id: [u8; 8],
+}
+
+impl Signer {
+    fn new(seed: u8) -> Self {
+        let pair = Ed25519KeyPair::from_seed_unchecked(&[seed; 32]).unwrap();
+        Self {
+            pair,
+            key_id: [seed; 8],
+        }
+    }
+
+    fn public_text(&self) -> String {
+        let mut raw = b"Ed".to_vec();
+        raw.extend_from_slice(&self.key_id);
+        raw.extend_from_slice(self.pair.public_key().as_ref());
+        format!("untrusted comment: minisign public key\n{}\n", b64(&raw))
+    }
+
+    fn sign_with(&self, message: &[u8], algorithm: &[u8; 2]) -> Vec<u8> {
+        let payload = if algorithm == b"ED" {
+            blake2b(message)
+        } else {
+            message.to_vec()
+        };
+        let sig = self.pair.sign(&payload);
+        let mut raw = algorithm.to_vec();
+        raw.extend_from_slice(&self.key_id);
+        raw.extend_from_slice(sig.as_ref());
+        let comment = "t";
+        let mut global = sig.as_ref().to_vec();
+        global.extend_from_slice(comment.as_bytes());
+        let gsig = self.pair.sign(&global);
+        format!(
+            "untrusted comment: signature\n{}\ntrusted comment: {comment}\n{}\n",
+            b64(&raw),
+            b64(gsig.as_ref())
+        )
+        .into_bytes()
+    }
+
+    fn sign(&self, message: &[u8]) -> Vec<u8> {
+        self.sign_with(message, b"ED")
+    }
+}
+
+fn owner_of(path: &Path) -> u32 {
+    fs::metadata(path).unwrap().uid()
+}
+
+fn hex(bytes: &[u8]) -> String {
+    bytes.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+const BODY: &[u8] = b"\x7fELF pretend mise build";
+
+struct Fixture {
+    dir: TempDir,
+    signer: Signer,
+    binary: PathBuf,
+    sig: PathBuf,
+    key: PathBuf,
+}
+
+impl Fixture {
+    fn new() -> Self {
+        let dir = tempfile::tempdir().unwrap();
+        let signer = Signer::new(7);
+        let binary = dir.path().join("mise");
+        let sig = dir.path().join("mise.minisig");
+        let key = dir.path().join("mise.pub");
+        fs::write(&binary, BODY).unwrap();
+        fs::write(&sig, signer.sign(BODY)).unwrap();
+        fs::write(&key, signer.public_text()).unwrap();
+        for path in [&binary, &sig, &key] {
+            fs::set_permissions(path, fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        Self {
+            dir,
+            signer,
+            binary,
+            sig,
+            key,
+        }
+    }
+
+    fn owner(&self) -> u32 {
+        owner_of(self.dir.path())
+    }
+
+    fn config(&self) -> MisePinsConfig {
+        MisePinsConfig {
+            version: Some("2025.1.2".to_owned()),
+            sha256: Some(hex(&Sha256::digest(BODY))),
+            signature_path: Some(self.sig.clone()),
+            public_key_path: Some(self.key.clone()),
+        }
+    }
+
+    fn pins(&self) -> MisePins {
+        MisePins::new(self.config()).unwrap()
+    }
+
+    fn verify(&self) -> Result<fleetd::tools::VerifiedMise, ToolsError> {
+        verify_mise(&self.binary, &self.pins(), self.owner())
+    }
+}
+
+#[test]
+fn a_pinned_signed_binary_is_accepted_and_the_handle_carries_the_path() {
+    let fx = Fixture::new();
+    let verified = fx.verify().unwrap();
+    assert_eq!(verified.path(), fx.binary);
+    assert_eq!(verified.version().as_str(), "2025.1.2");
+}
+
+type Strip = fn(&mut MisePinsConfig);
+
+#[test]
+fn each_missing_pin_is_refused_by_name() {
+    let fx = Fixture::new();
+    let cases: [(&str, Strip); 4] = [
+        ("version", |c| c.version = None),
+        ("sha256", |c| c.sha256 = None),
+        ("signature_path", |c| c.signature_path = None),
+        ("public_key_path", |c| c.public_key_path = None),
+    ];
+    for (name, strip) in cases {
+        let mut config = fx.config();
+        strip(&mut config);
+        match MisePins::new(config) {
+            Err(ToolsError::MissingPin(got)) => assert_eq!(got, name),
+            other => panic!("{name}: {other:?}"),
+        }
+    }
+    assert!(matches!(
+        MisePins::new(MisePinsConfig::default()),
+        Err(ToolsError::MissingPin(_))
+    ));
+}
+
+#[test]
+fn hostile_pin_values_are_refused() {
+    let fx = Fixture::new();
+    let good = hex(&Sha256::digest(BODY));
+    let shas = [
+        good.to_uppercase(),
+        good[..63].to_owned(),
+        format!("{good}0"),
+        format!("{}g", &good[..63]),
+        format!("{good}\n"),
+        format!("{good}\r\n"),
+        format!(" {good}"),
+        String::new(),
+        "\u{ff10}".repeat(64),
+    ];
+    for sha in shas {
+        let mut config = fx.config();
+        config.sha256 = Some(sha.clone());
+        assert!(
+            matches!(MisePins::new(config), Err(ToolsError::InvalidPin("sha256"))),
+            "{sha:?}"
+        );
+    }
+    for version in [
+        "latest",
+        "^1.0",
+        "1.*",
+        "",
+        "1.0 ",
+        "1.0\n",
+        "v1.0",
+        "\u{661}.0",
+    ] {
+        let mut config = fx.config();
+        config.version = Some(version.to_owned());
+        assert!(
+            matches!(
+                MisePins::new(config),
+                Err(ToolsError::InvalidPin("version"))
+            ),
+            "{version:?}"
+        );
+    }
+}
+
+#[test]
+fn a_config_with_an_unknown_key_does_not_parse() {
+    let raw = r#"version = "1.0"
+sha256 = "x"
+extra = 1"#;
+    assert!(toml::from_str::<MisePinsConfig>(raw).is_err());
+}
+
+#[test]
+fn a_wrong_sha_is_refused() {
+    let fx = Fixture::new();
+    let mut config = fx.config();
+    config.sha256 = Some("0".repeat(64));
+    let pins = MisePins::new(config).unwrap();
+    assert!(matches!(
+        verify_mise(&fx.binary, &pins, fx.owner()),
+        Err(ToolsError::ShaMismatch)
+    ));
+}
+
+#[test]
+fn a_tampered_binary_with_a_matching_sha_fails_the_signature() {
+    let fx = Fixture::new();
+    let evil = b"\x7fELF evil";
+    fs::write(&fx.binary, evil).unwrap();
+    let mut config = fx.config();
+    config.sha256 = Some(hex(&Sha256::digest(evil)));
+    let pins = MisePins::new(config).unwrap();
+    assert!(matches!(
+        verify_mise(&fx.binary, &pins, fx.owner()),
+        Err(ToolsError::Signature(_))
+    ));
+}
+
+#[test]
+fn a_signature_from_another_key_is_refused() {
+    let fx = Fixture::new();
+    fs::write(&fx.sig, Signer::new(9).sign(BODY)).unwrap();
+    assert!(matches!(fx.verify(), Err(ToolsError::Signature(_))));
+}
+
+#[test]
+fn a_legacy_non_prehashed_signature_is_refused() {
+    let fx = Fixture::new();
+    fs::write(&fx.sig, fx.signer.sign_with(BODY, b"Ed")).unwrap();
+    assert!(matches!(fx.verify(), Err(ToolsError::Signature(_))));
+}
+
+#[test]
+fn hostile_signature_files_are_refused() {
+    let fx = Fixture::new();
+    let good = fx.signer.sign(BODY);
+    let mut bad_utf8 = good.clone();
+    bad_utf8[0] = 0xff;
+    let cases: Vec<Vec<u8>> = vec![
+        Vec::new(),
+        b"garbage".to_vec(),
+        bad_utf8,
+        vec![b'a'; MAX_SIGNATURE_BYTES + 1],
+        [good, vec![b'\n'; MAX_SIGNATURE_BYTES]].concat(),
+    ];
+    for case in cases {
+        fs::write(&fx.sig, &case).unwrap();
+        assert!(
+            matches!(fx.verify(), Err(ToolsError::Signature(_))),
+            "{} bytes",
+            case.len()
+        );
+    }
+}
+
+#[test]
+fn a_missing_signature_file_is_an_io_error() {
+    let fx = Fixture::new();
+    fs::remove_file(&fx.sig).unwrap();
+    assert!(matches!(fx.verify(), Err(ToolsError::Io(_))));
+}
+
+#[test]
+fn a_missing_binary_is_an_io_error() {
+    let fx = Fixture::new();
+    fs::remove_file(&fx.binary).unwrap();
+    assert!(matches!(fx.verify(), Err(ToolsError::Io(_))));
+}
+
+#[test]
+fn a_symlinked_binary_is_refused() {
+    let fx = Fixture::new();
+    let real = fx.dir.path().join("real");
+    fs::rename(&fx.binary, &real).unwrap();
+    symlink(&real, &fx.binary).unwrap();
+    assert!(matches!(fx.verify(), Err(ToolsError::NotRegular)));
+}
+
+#[test]
+fn a_directory_and_a_fifo_are_refused() {
+    let fx = Fixture::new();
+    fs::remove_file(&fx.binary).unwrap();
+    fs::create_dir(&fx.binary).unwrap();
+    assert!(matches!(fx.verify(), Err(ToolsError::NotRegular)));
+    fs::remove_dir(&fx.binary).unwrap();
+    let status = std::process::Command::new("mkfifo")
+        .arg(&fx.binary)
+        .status()
+        .unwrap();
+    assert!(status.success());
+    assert!(matches!(fx.verify(), Err(ToolsError::NotRegular)));
+}
+
+#[test]
+fn a_binary_writable_by_group_or_other_is_refused() {
+    let fx = Fixture::new();
+    for mode in [0o775, 0o757, 0o777, 0o772, 0o755 | 0o020] {
+        fs::set_permissions(&fx.binary, fs::Permissions::from_mode(mode)).unwrap();
+        assert!(
+            matches!(fx.verify(), Err(ToolsError::Writable { .. })),
+            "{mode:o}"
+        );
+    }
+}
+
+#[test]
+fn a_binary_directory_writable_by_group_or_other_is_refused() {
+    let fx = Fixture::new();
+    for mode in [0o775, 0o757, 0o777] {
+        fs::set_permissions(fx.dir.path(), fs::Permissions::from_mode(mode)).unwrap();
+        assert!(
+            matches!(fx.verify(), Err(ToolsError::Writable { .. })),
+            "{mode:o}"
+        );
+    }
+    fs::set_permissions(fx.dir.path(), fs::Permissions::from_mode(0o755)).unwrap();
+    fx.verify().unwrap();
+}
+
+#[test]
+fn a_wrong_owner_is_refused() {
+    let fx = Fixture::new();
+    let found = fx.owner();
+    let pins = fx.pins();
+    match verify_mise(&fx.binary, &pins, found + 1) {
+        Err(ToolsError::Owner {
+            found: f,
+            expected: e,
+        }) => {
+            assert_eq!(f, found);
+            assert_eq!(e, found + 1);
+        }
+        other => panic!("{other:?}"),
+    }
+}
+
+#[test]
+fn a_key_file_the_loader_refuses_is_refused() {
+    let fx = Fixture::new();
+    fs::set_permissions(&fx.key, fs::Permissions::from_mode(0o666)).unwrap();
+    assert!(matches!(fx.verify(), Err(ToolsError::Key(_))));
+    fs::set_permissions(&fx.key, fs::Permissions::from_mode(0o644)).unwrap();
+    let real = fx.dir.path().join("real.pub");
+    fs::rename(&fx.key, &real).unwrap();
+    symlink(&real, &fx.key).unwrap();
+    assert!(matches!(fx.verify(), Err(ToolsError::Key(_))));
+}
+
+#[test]
+fn a_key_that_is_not_minisign_is_refused() {
+    let fx = Fixture::new();
+    fs::write(&fx.key, "not a key").unwrap();
+    assert!(matches!(fx.verify(), Err(ToolsError::Key(_))));
+}
+
+#[test]
+fn the_size_cap_admits_exactly_the_cap_and_refuses_one_over() {
+    let fx = Fixture::new();
+    let pins = fx.pins();
+    let len = BODY.len() as u64;
+    verify_mise_capped(&fx.binary, &pins, fx.owner(), len).unwrap();
+    assert!(matches!(
+        verify_mise_capped(&fx.binary, &pins, fx.owner(), len - 1),
+        Err(ToolsError::TooLarge)
+    ));
+}
+
+#[test]
+fn a_relative_binary_path_verifies() {
+    let dir = tempfile::tempdir_in(".").unwrap();
+    let fx = Fixture::new();
+    let rel = dir.path().join("mise");
+    fs::copy(&fx.binary, &rel).unwrap();
+    fs::set_permissions(&rel, fs::Permissions::from_mode(0o755)).unwrap();
+    fs::set_permissions(dir.path(), fs::Permissions::from_mode(0o755)).unwrap();
+    let verified = verify_mise(&rel, &fx.pins(), owner_of(dir.path())).unwrap();
+    assert_eq!(verified.path(), rel);
+}

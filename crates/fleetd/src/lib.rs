@@ -51,6 +51,7 @@ mod system;
 pub mod systemd;
 pub mod telemetry;
 pub mod toolhook;
+pub mod tools;
 pub mod transport;
 pub mod update;
 pub mod workspace;

@@ -156,7 +156,7 @@ impl std::error::Error for UpdateError {
 /// The public key every update is verified against.
 #[derive(Debug, Clone)]
 pub struct TrustRoot {
-    key: PublicKey,
+    pub(crate) key: PublicKey,
 }
 
 /// What a manifest must beat to be accepted.
