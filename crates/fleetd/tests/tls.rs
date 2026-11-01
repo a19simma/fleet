@@ -247,7 +247,7 @@ async fn https_heartbeat_reaches_the_server_with_the_ca() -> Test {
     Ok(())
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn a_server_that_never_answers_the_handshake_fails_at_the_call_backstop() -> Test {
     let listener = TcpListener::bind("127.0.0.1:0").await?;
     let url = format!("https://{}", listener.local_addr()?);
@@ -259,7 +259,7 @@ async fn a_server_that_never_answers_the_handshake_fails_at_the_call_backstop() 
             });
         }
     });
-    let started = std::time::Instant::now();
+    let started = tokio::time::Instant::now();
     let reporter = GrpcReporter::new(channel(&url)?, &Token::new(TOKEN))?;
     let outcome = tokio::time::timeout(
         CALL_BACKSTOP + Duration::from_secs(2),
