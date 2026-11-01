@@ -2,8 +2,7 @@
 //!
 //! Two tokens, scoped by gRPC path: the box token covers `FleetIngest` and `FleetWorker`,
 //! the client token covers `FleetQuery`, `FleetJobs`, `FleetProfiles`, `FleetBatches` and
-//! `FleetCredentials`. Any other path
-//! is denied.
+//! `FleetCredentials`. Any other path is denied.
 //!
 //! With a [`Users`] store the layer also resolves the caller: a per-user API token maps to its
 //! user, `FLEET_CLIENT_TOKEN` maps to the `bootstrap` user, and the result rides the request

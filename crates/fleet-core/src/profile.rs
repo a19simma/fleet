@@ -159,8 +159,11 @@ pub struct Settings {
 /// The agent config of one Job, as typed JSON (ADR-0034).
 ///
 /// Every field is optional: `{}` is a valid Profile. Unknown fields are rejected at every depth,
-/// so `claude_version` is not accepted. In the canonical form an absent field, a `null` and an
-/// empty list or map are the same, and all are omitted.
+/// so `claude_version` is not accepted. In the canonical form an absent field and an empty
+/// list or map are the same, and both are omitted. A `null` equals an absent field only for
+/// the `Option` fields (text, `model`, `max_turns`, `max_budget_usd`, `settings`); `null` for
+/// `allow`, `deny`, `skills`, `context_files` or `env_flags` fails as
+/// [`ProfileError::Malformed`].
 ///
 /// `max_budget_usd` is a whole number of US cents, never a float, so each budget has one text form.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -301,8 +304,9 @@ impl Profile {
     ///
     /// # Errors
     ///
-    /// Returns [`ProfileError::Malformed`] for bad JSON, a top level that is not an object, unknown fields, wrong types or an env
-    /// flag other than `"0"` or `"1"`, and [`ProfileError::ToolsNotAllowed`] for a non-empty `tools`.
+    /// Returns [`ProfileError::Malformed`] for bad JSON, a top level that is not an object,
+    /// unknown fields, wrong types or an env flag other than `"0"` or `"1"`, and
+    /// [`ProfileError::ToolsNotAllowed`] for a non-empty `tools`.
     pub fn from_json(bytes: &[u8]) -> Result<Self, ProfileError> {
         if bytes.trim_ascii_start().first() != Some(&b'{') {
             return Err(ProfileError::Malformed);

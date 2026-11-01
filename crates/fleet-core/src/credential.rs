@@ -14,7 +14,8 @@ pub const MIN_CREDENTIAL_LEN: usize = 20;
 /// Longest accepted credential, in bytes.
 pub const MAX_CREDENTIAL_LEN: usize = 512;
 
-/// Number of hex characters in a fingerprint.
+/// Number of hex characters in a fingerprint. It must be even: an odd value would cut off
+/// its last half byte without warning.
 pub const FINGERPRINT_HEX_LEN: usize = 12;
 
 const FINGERPRINT_LABEL: &[u8] = b"fleet.credential.fingerprint.v1\0";
@@ -37,7 +38,7 @@ pub enum CredentialKind {
 }
 
 impl CredentialKind {
-    /// Every kind, in wire-name order of declaration.
+    /// Every kind, in declaration order.
     pub const ALL: [Self; 6] = [
         Self::AnthropicApiKey,
         Self::ClaudeSubscriptionToken,
@@ -97,6 +98,9 @@ pub struct Secret(Zeroizing<Vec<u8>>);
 
 impl Secret {
     /// Takes ownership of the bytes of `value`.
+    ///
+    /// Only this buffer is zeroed on drop. A copy the caller made of the text is the
+    /// caller's to wipe.
     pub fn new(value: String) -> Self {
         Self(Zeroizing::new(value.into_bytes()))
     }
@@ -186,6 +190,9 @@ pub struct Validated {
 ///
 /// Returns a [`CredentialError`] for an unsupported shape, an empty, short, long or
 /// whitespace-containing value, or a GitHub token that is not fine-grained.
+///
+/// The whitespace check uses Unicode whitespace and control characters, so zero-width
+/// characters pass. Length bounds count bytes.
 pub fn validate(
     kind: CredentialKind,
     shape: CredentialShape,
@@ -224,6 +231,9 @@ pub fn validate(
 /// A short, stable identifier of a secret that reveals no part of it.
 ///
 /// It is the first 12 hex characters of SHA-256 over a fixed label and the secret.
+///
+/// The hash is unsalted and the label is the same everywhere, so a weak secret can be
+/// guessed offline from its fingerprint, and one secret has one fingerprint across tenants.
 pub fn fingerprint(secret: &Secret) -> String {
     use fmt::Write as _;
 

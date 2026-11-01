@@ -126,7 +126,8 @@ pub const PRECONDITION_NOT_CONFIGURED: &str = "credentials are not configured";
 /// Most transcript chunks one report may carry. The server rejects more.
 pub const MAX_CHUNKS_PER_REPORT: usize = 256;
 
-/// Most telemetry events one report may carry. The server rejects more.
+/// Most telemetry events one report may carry. The server rejects a larger report whole
+/// as gRPC `INVALID_ARGUMENT` (`StoreError::TelemetryTooLarge`) and stores none of it.
 pub const MAX_EVENTS_PER_REPORT: usize = 256;
 
 /// Telemetry events stored per job. The server drops events with a `seq` at or above this.
@@ -211,8 +212,9 @@ pub fn is_ci_log(text: &str) -> bool {
 
 /// True when `url` is a CI check link the server may store.
 ///
-/// It must be `https` with a host and no userinfo or backslash, hold only ASCII graphic
-/// characters and be at most [`MAX_CI_URL_BYTES`] bytes. fleetd and the server both call it,
+/// It must be `https` with a non-empty authority and no userinfo or backslash, hold only ASCII
+/// graphic characters and be at most [`MAX_CI_URL_BYTES`] bytes. The host is not parsed, so an
+/// authority with no host such as `https://:443/` passes. fleetd and the server both call it,
 /// so a link one side keeps the other accepts.
 #[must_use]
 pub fn is_ci_url(url: &str) -> bool {
