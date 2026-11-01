@@ -34,6 +34,7 @@ CapabilityBoundingSet=
 ReadWritePaths=/var/lib/fleet/jobs
 ReadOnlyPaths=-/var/lib/fleet/jobs/.cache
 ReadOnlyPaths=/var/lib/fleet/tools
+ReadOnlyPaths=-/var/lib/fleet/seed
 InaccessiblePaths=/etc/swarm
 InaccessiblePaths=-/run/docker.sock
 InaccessiblePaths=-/var/run/docker.sock
