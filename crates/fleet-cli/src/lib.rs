@@ -199,7 +199,8 @@ pub enum BatchAction {
 /// A `fleet profile` action.
 #[derive(Debug, Subcommand)]
 pub enum ProfileAction {
-    /// Store a profile from a JSON file; the same content keeps its version.
+    /// Store a profile from a JSON file or stdin; the same content keeps its version. The
+    /// input may hold at most `MAX_PROFILE_JSON_BYTES` bytes.
     Create {
         /// Profile name: 1 to 64 characters of letters, digits, `_` and `-`.
         name: String,

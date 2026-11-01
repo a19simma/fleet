@@ -22,6 +22,9 @@ const KEY_LEN: usize = 32;
 const NONCE_LEN: usize = 24;
 
 /// Associated data for one sealed credential: `user_id|credential_id|kind`.
+///
+/// The parts are joined with a raw `|` and not escaped, so ids that contain `|` can collide.
+/// Callers pass generated ids that never do.
 #[derive(Clone, PartialEq, Eq)]
 pub struct Aad(Vec<u8>);
 
@@ -201,6 +204,8 @@ fn valid_key_id(id: &str) -> bool {
 
 impl FileSealer {
     /// Loads the key ring at `path`.
+    ///
+    /// The file mode is not checked: the operator must keep the file private to the server.
     ///
     /// # Errors
     ///

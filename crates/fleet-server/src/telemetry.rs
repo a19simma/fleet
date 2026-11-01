@@ -313,7 +313,8 @@ pub(crate) fn check(
 ///
 /// `queue_wait_ms` is never read from the report. The row derives it from the job: the time
 /// from `created_at` to `claimed_at`, which is the latest claim and equals the first lease
-/// for a job on its first attempt. It is NULL while `claimed_at` is unset.
+/// for a job on its first attempt. It is NULL while `claimed_at` is unset. A negative gap
+/// from clock skew is stored as 0, not NULL.
 pub(crate) async fn persist(
     tx: &mut Transaction<'_, Postgres>,
     job_id: &str,

@@ -22,6 +22,7 @@ pub const MAX_BASE_REF_BYTES: usize = 255;
 pub const MAX_BRANCH_BYTES: usize = 128;
 /// Longest accepted job id, in bytes.
 pub const MAX_JOB_ID_BYTES: usize = 64;
+/// Most transcript chunks one report may carry, re-exported from `fleet_proto`.
 pub use fleet_proto::MAX_CHUNKS_PER_REPORT;
 /// Transcript rows stored per job. The first chunk past this becomes the marker row.
 pub const MAX_TRANSCRIPT_ROWS: i64 = 50_000;

@@ -102,6 +102,8 @@ impl Policy {
     }
 
     /// The same ages with other batch bounds. The ages stay as validated.
+    ///
+    /// The bounds are not checked: a zero bound makes a sweep delete nothing.
     #[must_use]
     pub fn with_batches(self, batch_rows: u32, max_batches: u32) -> Self {
         Self {
