@@ -30,7 +30,7 @@ spec:
             defaultMode: 0440
       containers:
         - name: fleet-server
-          image: ghcr.io/a19simma/fleet-server:0.3.2
+          image: ghcr.io/a19simma/fleet-server:0.3.3
           ports:
             - name: grpc
               containerPort: 7070
