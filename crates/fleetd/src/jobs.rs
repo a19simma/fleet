@@ -206,6 +206,29 @@ impl<R: Reporter> DaemonRunner<R> {
         }
     }
 
+    async fn preflight_tools(&self, job: &Job, mut shutdown: Shutdown) -> Result<(), RunError> {
+        let work = self.agent.preflight_tools(job);
+        let guarded = tokio::select! {
+            guarded = self.agent.keep_alive(job, work) => guarded,
+            () = shutdown.requested() => {
+                self.agent.fail_job(job, ERR_SHUTDOWN).await;
+                return Err(RunError);
+            }
+        };
+        match guarded {
+            Ok(Ok(())) => Ok(()),
+            Ok(Err(reason)) => {
+                self.agent.fail_job(job, reason).await;
+                Err(RunError)
+            }
+            Err(Interrupt::Cancelled) => {
+                self.agent.cancel_job(job).await;
+                Err(RunError)
+            }
+            Err(_) => Err(RunError),
+        }
+    }
+
     async fn load_judge(&self, job: &Job, mut shutdown: Shutdown) -> Result<PathBuf, RunError> {
         let work = self.agent.load_judge(job, &self.box_name);
         let guarded = tokio::select! {
@@ -387,6 +410,10 @@ impl<R: Reporter + Send + Sync + 'static> JobRunner for DaemonRunner<R> {
             return self.run_judge(&job, shutdown).await;
         }
         if let Err(stop) = self.load_profile(&job, shutdown.clone()).await {
+            self.agent.clear_profile(&job);
+            return Err(stop);
+        }
+        if let Err(stop) = self.preflight_tools(&job, shutdown.clone()).await {
             self.agent.clear_profile(&job);
             return Err(stop);
         }
@@ -610,6 +637,10 @@ pub(crate) fn build(
     let Some(url) = env(SERVER_URL_ENV).filter(|url| !url.is_empty()) else {
         return Ok(None);
     };
+    config.mise_pins().map_err(|err| Error::InvalidValue {
+        name: "mise",
+        value: err.to_string(),
+    })?;
     let opt_in = env(ALLOW_PLAINTEXT_ENV).is_some_and(|value| value == "1");
     if !credential_channel_allowed(&url, opt_in) {
         return Err(Error::InvalidValue {
@@ -788,6 +819,35 @@ mod tests {
             &UpdateWiring::default(),
         )
         .is_ok())
+    }
+
+    fn build_with_mise(text: &str) -> Result<bool, Box<dyn std::error::Error>> {
+        let dir = tempfile::TempDir::new()?;
+        let mut config = Config::resolve(Some(text), &|_| None)?;
+        config.jobs_dir = dir.path().join("jobs");
+        let env = |name: &str| match name {
+            "FLEET_SERVER_URL" => Some(String::from("http://127.0.0.1:1")),
+            "FLEET_TOKEN" => Some(String::from("tok-wired-0123456789")),
+            _ => None,
+        };
+        Ok(build(
+            &config,
+            &env,
+            "box",
+            Redactor::default(),
+            HookHub::new(),
+            &UpdateWiring::default(),
+        )
+        .is_ok())
+    }
+
+    #[tokio::test]
+    async fn startup_validates_the_mise_pins_and_refuses_a_partial_section() -> TestResult {
+        let full = "[mise]\nversion = \"2024.11.3\"\nsha256 = \"0000000000000000000000000000000000000000000000000000000000000000\"\nsignature_path = \"/etc/mise.minisig\"\npublic_key_path = \"/etc/mise.pub\"\n";
+        assert!(build_with_mise(full)?);
+        assert!(!build_with_mise("[mise]\nversion = \"2024.11.3\"\n")?);
+        assert!(build_with_mise("")?);
+        Ok(())
     }
 
     #[tokio::test]
@@ -1181,6 +1241,78 @@ mod tests {
         assert_eq!(
             errors(&mut fx.reports),
             vec!["profile invalid: profile hash does not match the job".to_owned()]
+        );
+        assert!(!fx.marker.exists());
+        Ok(())
+    }
+
+    fn tool_profile() -> Result<Profile, fleet_core::tools::ToolError> {
+        Ok(Profile {
+            model: Some("opus".into()),
+            tools: vec![fleet_core::tools::ToolSpec::new("jq", "1.7.1")?],
+            ..Profile::default()
+        })
+    }
+
+    #[derive(Debug)]
+    struct Refusing;
+
+    impl crate::runner::ToolInstaller for Refusing {
+        fn install<'a>(
+            &'a self,
+            _: &'a str,
+            _: &'a [fleet_core::tools::ToolSpec],
+        ) -> crate::runner::InstallFuture<'a> {
+            Box::pin(std::future::ready(Err(std::io::Error::other(
+                "secret-stderr /opt/tool/path",
+            ))))
+        }
+    }
+
+    #[tokio::test]
+    async fn a_tool_profile_on_a_box_without_a_preflight_fails_before_the_clone() -> TestResult {
+        let profile = tool_profile()?;
+        let job = profile_job(&profile);
+        let mut fx = fixture(Ok(reply_for(&job, profile.canonical_json())))?;
+        let (_trigger, shutdown) = Shutdown::channel();
+        assert!(fx.runner.run(job, shutdown).await.is_err());
+        assert_eq!(
+            errors(&mut fx.reports),
+            vec![crate::runner::TOOL_PREFLIGHT_FAILED.to_owned()]
+        );
+        assert!(!fx.marker.exists());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_failed_install_gives_the_fixed_message_and_no_clone() -> TestResult {
+        let profile = tool_profile()?;
+        let job = profile_job(&profile);
+        let mut fx = fixture(Ok(reply_for(&job, profile.canonical_json())))?;
+        let cache = crate::tools::ToolCache::new(fx.dir.path().join("tools"), 0);
+        let (tx, reports) = mpsc::unbounded_channel();
+        let blob = Blob {
+            reports: tx,
+            reply: Ok(reply_for(&job, profile.canonical_json())),
+            asked: Arc::clone(&fx.asked),
+        };
+        let git = fx.dir.path().join("git");
+        fx.runner = DaemonRunner::new(
+            workspace(fx.dir.path(), &git),
+            AgentRunner::new(RunConfig::new("claude", false), blob, Redactor::default())
+                .with_tool_preflight(
+                    crate::runner::ToolPreflight::new(cache).with_installer(Arc::new(Refusing)),
+                ),
+            "the-box",
+        );
+        fx.reports = reports;
+        let (_trigger, shutdown) = Shutdown::channel();
+        assert!(fx.runner.run(job, shutdown).await.is_err());
+        let seen = errors(&mut fx.reports);
+        assert_eq!(seen, vec![crate::runner::TOOL_PREFLIGHT_FAILED.to_owned()]);
+        assert!(
+            seen.iter()
+                .all(|e| !e.contains("secret") && !e.contains("jq"))
         );
         assert!(!fx.marker.exists());
         Ok(())
