@@ -75,7 +75,7 @@ jobs:
             exit 0
           fi
           baked=$(sed -n 2p crates/fleetd/trust/update.pub)
-          if [ "$baked" != "$UPDATE_PUBLIC_KEY" ]; then
+          if [ "$baked" != "$(printf '%s\n' "$UPDATE_PUBLIC_KEY" | tail -n 1)" ]; then
             echo "::error::line 2 of crates/fleetd/trust/update.pub differs from variable FLEET_UPDATE_PUBLIC_KEY"
             exit 1
           fi
