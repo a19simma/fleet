@@ -19,7 +19,7 @@ use std::path::{Path, PathBuf};
 use fleet_core::tools::{ToolName, Version};
 use fleet_proto::MAX_SIGNATURE_BYTES;
 use minisign_verify::Signature;
-use rustix::fs::OFlags;
+use rustix::fs::{Mode, OFlags};
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
 
@@ -313,7 +313,6 @@ fn read_signature(path: &Path) -> Result<Signature, ToolsError> {
 /// File name of the install unit's environment file inside a job's run directory.
 pub const TOOL_ENV_FILE: &str = "tool-env";
 
-const TOOL_ENV_MODE: u32 = 0o600;
 const PROXY_ENV: [&str; 4] = ["HTTPS_PROXY", "https_proxy", "HTTP_PROXY", "http_proxy"];
 const MAX_HOST_BYTES: usize = 253;
 const MAX_LABEL_BYTES: usize = 63;
@@ -397,7 +396,8 @@ pub fn check_tool_hosts(ceiling: &[String], tools: &[ToolName]) -> Result<(), To
 ///
 /// The file holds the four proxy variables, each naming `http://127.0.0.1:<proxy_port>`, and
 /// nothing else. It is created with mode 0600 and must not already exist. Call it before the
-/// install unit starts.
+/// install unit starts. `run_dir/<id>` is opened with `O_DIRECTORY | O_NOFOLLOW` and the file is
+/// created beneath that handle with `O_EXCL | O_NOFOLLOW`, so a symlink at either name is refused.
 ///
 /// # Errors
 ///
@@ -428,14 +428,29 @@ pub fn write_tool_env(
         out
     });
     let path = run_dir.join(id).join(TOOL_ENV_FILE);
-    let mut file = OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .mode(TOOL_ENV_MODE)
-        .open(&path)
-        .map_err(ToolsError::Io)?;
+    let root = rustix::fs::open(
+        run_dir,
+        OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC,
+        Mode::empty(),
+    )
+    .map_err(|errno| ToolsError::Io(errno.into()))?;
+    let job_dir = rustix::fs::openat(
+        &root,
+        id,
+        OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+        Mode::empty(),
+    )
+    .map_err(|errno| ToolsError::Io(errno.into()))?;
+    let fd = rustix::fs::openat(
+        &job_dir,
+        TOOL_ENV_FILE,
+        OFlags::WRONLY | OFlags::CREATE | OFlags::EXCL | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+        Mode::RUSR | Mode::WUSR,
+    )
+    .map_err(|errno| ToolsError::Io(errno.into()))?;
+    let mut file = File::from(fd);
     if let Err(err) = file.write_all(body.as_bytes()) {
-        let _ = fs::remove_file(&path);
+        let _ = rustix::fs::unlinkat(&job_dir, TOOL_ENV_FILE, rustix::fs::AtFlags::empty());
         return Err(ToolsError::Io(err));
     }
     Ok(Some(path))

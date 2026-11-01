@@ -10,13 +10,18 @@ use std::process::{Command, Stdio};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
+use fleet_core::tools::ToolName;
 use fleetd::agent_exec::write_spec;
 use fleetd::jobsock::{
     AGENT_SLICE, JobContext, Limits, Peer, PeerId, ServeFuture, Service, ServiceName, Services,
     connect,
 };
 use fleetd::runner::{AgentProc, AgentSpec, Launched, Launcher};
-use fleetd::systemd::{JobSocketSetup, SystemdLauncher, select_launcher, sweep_stale_runs};
+use fleetd::systemd::{
+    JobSocketSetup, SystemdLauncher, TOOL_HOSTS_REFUSED, ToolInstallSetup, select_launcher,
+    sweep_stale_runs,
+};
+use fleetd::tools::{TOOL_ENV_FILE, tool_hosts};
 use fleetd::{AgentLauncher, Config, Error};
 use tempfile::TempDir;
 use tokio::io::AsyncReadExt;
@@ -40,6 +45,8 @@ echo "$*" >> "$st/log"
 if [ -f "$st/rundir" ]; then
   if [ -S "$(cat "$st/rundir")/$id/job.sock" ]; then s=sock; else s=nosock; fi
   echo "$1 $s" >> "$st/seen"
+  if [ -f "$(cat "$st/rundir")/$id/tool-env" ]; then te=tool-env; else te=no-tool-env; fi
+  echo "$1 $te" >> "$st/seen_env"
 fi
 case "$1" in
   stop)
@@ -127,6 +134,14 @@ impl Case {
         })
     }
 
+    fn seen_env(&self) -> Vec<String> {
+        fs::read_to_string(self.state.join("seen_env"))
+            .unwrap_or_default()
+            .lines()
+            .map(str::to_owned)
+            .collect()
+    }
+
     fn put(&self, name: &str, text: &str) -> io::Result<()> {
         fs::write(self.state.join(name), text)
     }
@@ -173,6 +188,110 @@ impl Case {
     fn unit(&self) -> String {
         format!("fleet-agent@{}.service", self.id)
     }
+}
+
+fn tool_setup(tools: &[ToolName], ceiling: &[String]) -> ToolInstallSetup {
+    let tools = tools.to_vec();
+    ToolInstallSetup::new(Arc::new(move |_| tools.clone()), ceiling.to_vec())
+}
+
+fn covering(tools: &[ToolName]) -> Vec<String> {
+    tool_hosts(tools).into_iter().map(str::to_owned).collect()
+}
+
+#[tokio::test]
+async fn tool_env_is_written_before_the_unit_starts() -> TestResult {
+    let case = Case::new("t_toolenv_ok")?;
+    case.last(&show("active", "success", 0, 0))?;
+    let tools = [ToolName::Node];
+    let launcher = case
+        .launcher()
+        .with_tool_install(tool_setup(&tools, &covering(&tools)));
+    let _launched = launcher.launch(case.spec())?;
+    let env = fs::read_to_string(case.dir().join(TOOL_ENV_FILE))?;
+    assert!(env.starts_with("HTTPS_PROXY=http://127.0.0.1:"), "{env}");
+    assert_eq!(
+        fs::metadata(case.dir().join(TOOL_ENV_FILE))?
+            .permissions()
+            .mode()
+            & 0o7777,
+        0o600
+    );
+    assert_eq!(case.seen_env(), ["start tool-env"]);
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_refused_host_set_fails_before_any_directory_or_unit() -> TestResult {
+    let tools = [ToolName::Node];
+    let mut short = covering(&tools);
+    short.pop();
+    let wild = vec!["*.github.com".to_owned()];
+    let upper = vec!["GITHUB.com".to_owned()];
+    for (n, ceiling) in [short, wild, upper, Vec::new()].into_iter().enumerate() {
+        let case = Case::new(&format!("t_toolenv_refused_{n}"))?;
+        case.last(&show("active", "success", 0, 0))?;
+        let launcher = case
+            .launcher()
+            .with_tool_install(tool_setup(&tools, &ceiling));
+        let err = launcher.launch(case.spec()).err();
+        assert_eq!(
+            err.as_ref().map(io::Error::kind),
+            Some(io::ErrorKind::PermissionDenied),
+            "{ceiling:?}"
+        );
+        assert_eq!(
+            err.map(|e| e.to_string()).as_deref(),
+            Some(TOOL_HOSTS_REFUSED)
+        );
+        assert_eq!(fs::read_dir(case.run.path())?.count(), 0, "{ceiling:?}");
+        assert!(case.log().is_empty(), "{ceiling:?}");
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_job_without_tools_writes_no_tool_env_and_still_starts() -> TestResult {
+    let case = Case::new("t_toolenv_none")?;
+    case.last(&show("active", "success", 0, 0))?;
+    let launcher = case.launcher().with_tool_install(tool_setup(&[], &[]));
+    let _launched = launcher.launch(case.spec())?;
+    assert!(!case.dir().join(TOOL_ENV_FILE).exists());
+    assert_eq!(case.seen_env(), ["start no-tool-env"]);
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_launcher_without_tool_install_writes_no_tool_env() -> TestResult {
+    let case = Case::new("t_toolenv_unset")?;
+    case.last(&show("active", "success", 0, 0))?;
+    let _launched = case.launch()?;
+    assert!(!case.dir().join(TOOL_ENV_FILE).exists());
+    Ok(())
+}
+
+#[tokio::test]
+async fn the_tool_lookup_is_asked_with_the_job_id() -> TestResult {
+    let case = Case::new("t_toolenv_id")?;
+    case.last(&show("active", "success", 0, 0))?;
+    let asked = Arc::new(Mutex::new(Vec::new()));
+    let sink = Arc::clone(&asked);
+    let setup = ToolInstallSetup::new(
+        Arc::new(move |id| {
+            if let Ok(mut seen) = sink.lock() {
+                seen.push(id.to_owned());
+            }
+            Vec::new()
+        }),
+        Vec::new(),
+    );
+    let _launched = case
+        .launcher()
+        .with_tool_install(setup)
+        .launch(case.spec())?;
+    let seen = asked.lock().map_err(|_| "poisoned")?.clone();
+    assert_eq!(seen, ["t_toolenv_id"]);
+    Ok(())
 }
 
 async fn waited(proc: &mut dyn AgentProc) -> io::Result<std::process::ExitStatus> {
@@ -1351,7 +1470,7 @@ fn install_unit_runs_the_locked_bundled_mise_as_fleet_job_with_safe_mode() {
         "Group=fleet-work",
         "Environment=MISE_SAFE=1",
         "Environment=MISE_CONFIG_FILE=/run/fleet/%i/mise.toml",
-        "ExecStart=/usr/local/libexec/fleet/mise install --locked",
+        "ExecStart=/usr/local/bin/fleetd tool-install-exec %i",
         "ConditionPathExists=/run/fleet/%i/mise.toml",
     ] {
         assert!(has_line(&lines, want), "{want}");
@@ -1359,6 +1478,45 @@ fn install_unit_runs_the_locked_bundled_mise_as_fleet_job_with_safe_mode() {
     let starts = lines.iter().filter(|l| l.starts_with("ExecStart=")).count();
     assert_eq!(starts, 1);
     assert_eq!(privileged_exec_lines(&lines).len(), 0);
+    assert!(!has_line(
+        &lines,
+        "ExecStart=/usr/local/libexec/fleet/mise install --locked"
+    ));
+}
+
+#[test]
+fn install_unit_runs_the_same_fleetd_binary_as_the_agent_unit_with_its_own_subcommand() {
+    let install = unit_directives(INSTALL_UNIT);
+    let agent = unit_directives("fleet-agent@.service");
+    let exec_of = |lines: &[String]| {
+        lines
+            .iter()
+            .find_map(|l| l.strip_prefix("ExecStart="))
+            .map(str::to_owned)
+    };
+    let install_exec = exec_of(&install).unwrap_or_default();
+    let agent_exec = exec_of(&agent).unwrap_or_default();
+    assert_eq!(install_exec.split(' ').next(), agent_exec.split(' ').next());
+    assert_eq!(agent_exec, "/usr/local/bin/fleetd agent-exec %i");
+    assert_eq!(install_exec, "/usr/local/bin/fleetd tool-install-exec %i");
+}
+
+#[test]
+fn install_unit_stays_private_network_and_gets_no_extra_reach() {
+    let install = unit_directives(INSTALL_UNIT);
+    for want in [
+        "PrivateNetwork=yes",
+        "InaccessiblePaths=/etc/swarm",
+        "InaccessiblePaths=-/run/docker.sock",
+        "InaccessiblePaths=-/var/run/docker.sock",
+        "BindReadOnlyPaths=/run/fleet/%i",
+        "ReadWritePaths=/var/lib/fleet/tools",
+        "RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6",
+    ] {
+        assert!(has_line(&install, want), "{want}");
+    }
+    assert!(!install.iter().any(|l| l.starts_with("BindPaths=")));
+    assert!(!install.iter().any(|l| l.starts_with("Slice=")));
 }
 
 #[test]

@@ -1,5 +1,5 @@
-//! fleetd binary: `serve` (default), `dump`, `hook`, `askpass`, `fetch`, `broker`, `agent-exec`
-//! and `pueue-callback`.
+//! fleetd binary: `serve` (default), `dump`, `hook`, `askpass`, `fetch`, `broker`, `agent-exec`,
+//! `tool-install-exec` and `pueue-callback`.
 
 use std::ffi::{OsStr, OsString};
 use std::fmt;
@@ -10,7 +10,7 @@ use std::process::ExitCode;
 use std::time::Duration;
 
 use clap::{Parser, Subcommand};
-use fleetd::agent_exec::exec_job;
+use fleetd::agent_exec::{MISE_BINARY, MISE_OWNER_UID, exec_job, exec_tool_install};
 use fleetd::broker::Denial;
 use fleetd::fetch_policy::MAX_URL_BYTES;
 use fleetd::jobsock::{ServiceName, connect, read_frame, socket_path, write_frame};
@@ -74,6 +74,16 @@ enum Command {
     /// Run the agent for a job from its spec file, as the unit does. Replaces this process.
     /// Exits 2 when the spec is missing, mismatched or empty.
     AgentExec {
+        /// Job id.
+        id: String,
+        /// Parent of the per-job run directories.
+        #[arg(long, default_value = DEFAULT_RUN_DIR)]
+        run_dir: PathBuf,
+    },
+    /// Verify the bundled mise and run `mise install --locked` for a job next to the egress
+    /// forwarder, as the install unit does. Exits 2 when the pins are missing, the binary does
+    /// not verify or the install cannot start.
+    ToolInstallExec {
         /// Job id.
         id: String,
         /// Parent of the per-job run directories.
@@ -147,6 +157,24 @@ async fn execute(cli: Cli) -> Result<ExitCode, Error> {
         }
         Command::AgentExec { id, run_dir } => {
             eprintln!("fleetd agent-exec: {}", exec_job(&run_dir, &id));
+            Ok(ExitCode::from(2))
+        }
+        Command::ToolInstallExec { id, run_dir } => {
+            let pins = Config::load(cli.config.as_deref())
+                .map_err(|_| "config could not be loaded".to_owned())
+                .and_then(|config| config.mise_pins().map_err(|err| err.to_string()));
+            let message = match pins {
+                Ok(pins) => exec_tool_install(
+                    &run_dir,
+                    &id,
+                    Path::new(MISE_BINARY),
+                    pins.as_ref(),
+                    MISE_OWNER_UID,
+                )
+                .to_string(),
+                Err(message) => message,
+            };
+            eprintln!("fleetd tool-install-exec: {message}");
             Ok(ExitCode::from(2))
         }
         Command::PueueCallback { id, group } => {

@@ -17,7 +17,7 @@ Environment=MISE_CACHE_DIR=/var/lib/fleet/tools/cache
 Environment=MISE_STATE_DIR=/var/lib/fleet/tools/state
 Environment=MISE_CONFIG_FILE=/run/fleet/%i/mise.toml
 EnvironmentFile=-/run/fleet/%i/tool-env
-ExecStart=/usr/local/libexec/fleet/mise install --locked
+ExecStart=/usr/local/bin/fleetd tool-install-exec %i
 Restart=no
 RuntimeMaxSec=15min
 TimeoutStopSec=10
