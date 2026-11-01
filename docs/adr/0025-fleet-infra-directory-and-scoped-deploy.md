@@ -1,6 +1,6 @@
 # Fleet infra directory and scoped deploy
 
-Status: Accepted. Built: `infra/` holds the manifests and CI checks the allowed kinds. Amends ADR-0013.
+Status: Accepted. Built: `infra/` holds the manifests and CI checks the allowed kinds. Amends ADR-0013. Amended 2026-11-01: routes are not in `infra/`.
 
 ADR-0013 names Kubernetes and Argo CD as the deployment stack and leaves the deploy target open. The manifests lived in a private homelab repo, so every server change needed a commit there. A public repo can ship its own manifests if the cluster limits what they may create.
 
@@ -12,6 +12,7 @@ ADR-0013 names Kubernetes and Argo CD as the deployment stack and leaves the dep
 - **Image tag.** Argo CD Image Updater with the `argocd` write-back method overrides the kustomize image tag. It needs no git write access to this repo.
 - **Tracking.** The Application tracks `main`.
 - **GRPCRoute.** It stays out of this repo because it holds a private hostname and gateway.
+- **Amendment 2026-11-01.** This repo ships no routes. The operator owns the HTTPRoute and the GRPCRoute in a separate Argo project, `routes`, in its own repo. `infra/httproute.yaml`, `check-web-route.sh` and `check-web-kind.sh` are removed, and the kustomization no longer copies a route host into the Deployment. The Deployment keeps `FLEET_WEB_RP_ID` and `FLEET_WEB_ORIGIN` as placeholders (`fleet.example.com`), and the operator patches both. `check-kinds.sh` rejects HTTPRoute and GRPCRoute. Any earlier text that places a route in `infra/` is superseded.
 
 ## Consequences
 

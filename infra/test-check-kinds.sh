@@ -10,7 +10,7 @@ failures=0
 fresh() {
   d="$scratch/$1"
   mkdir -p "$d"
-  cp "$here/kustomization.yaml" "$here/deployment.yaml" "$here/service.yaml" "$here/master-key-generator.yaml" "$here/master-key-externalsecret.yaml" "$here/httproute.yaml" "$d/"
+  cp "$here/kustomization.yaml" "$here/deployment.yaml" "$here/service.yaml" "$here/master-key-generator.yaml" "$here/master-key-externalsecret.yaml" "$d/"
   printf '%s\n' "$d"
 }
 
@@ -54,6 +54,30 @@ rules: []
 YAML
 add_resource "$d"
 expect_fail "$d" "Role" "kind Role"
+
+d=$(fresh httproute)
+cat >"$d/extra.yaml" <<'YAML'
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata:
+  name: x
+  namespace: fleet-server
+spec: {}
+YAML
+add_resource "$d"
+expect_fail "$d" "HTTPRoute" "kind HTTPRoute"
+
+d=$(fresh grpcroute)
+cat >"$d/extra.yaml" <<'YAML'
+apiVersion: gateway.networking.k8s.io/v1
+kind: GRPCRoute
+metadata:
+  name: x
+  namespace: fleet-server
+spec: {}
+YAML
+add_resource "$d"
+expect_fail "$d" "GRPCRoute" "kind GRPCRoute"
 
 d=$(fresh namespace)
 cat >"$d/extra.yaml" <<'YAML'
