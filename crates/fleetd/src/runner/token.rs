@@ -520,6 +520,44 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn the_kimi_home_is_shared_with_the_job_group_like_the_claude_home()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        let (mut runner, _book, dir) = fixture_kind(true, "kimi_membership_key").await?;
+        let gid = std::fs::metadata(dir.path())?.gid();
+        runner.config.job_gid = Some(gid);
+        let home = runner.kimi_home("job1", &dir.path().join("work"))?;
+        for path in [home.parent().ok_or("parent")?, home.as_path()] {
+            let meta = std::fs::metadata(path)?;
+            assert_eq!(
+                (meta.mode() & 0o7777, meta.gid()),
+                (0o2770, gid),
+                "{}",
+                path.display()
+            );
+        }
+        std::fs::write(home.join("config.toml"), b"")?;
+        assert_eq!(
+            std::fs::metadata(&home)?.permissions().mode() & 0o070,
+            0o070
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn the_kimi_home_stays_private_without_a_job_group()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use std::os::unix::fs::PermissionsExt;
+        let (runner, _book, dir) = fixture_kind(true, "kimi_membership_key").await?;
+        let home = runner.kimi_home("job1", &dir.path().join("work"))?;
+        assert_eq!(
+            std::fs::metadata(&home)?.permissions().mode() & 0o777,
+            0o700
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn the_kimi_env_holds_the_holder_key_and_no_other_secret()
     -> Result<(), Box<dyn std::error::Error>> {
         for kind in ["kimi_membership_key", "kimi_platform_key"] {

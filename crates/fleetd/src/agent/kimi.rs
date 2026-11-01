@@ -24,6 +24,7 @@ use std::os::unix::fs::DirBuilderExt;
 use std::path::{Path, PathBuf};
 
 use super::AgentRunner;
+use crate::jobenv::share_dir;
 use crate::runner::{RunConfig, env_forbidden};
 use crate::workspace::validate_job_id;
 
@@ -192,6 +193,18 @@ impl KimiHome {
     ///
     /// Returns the I/O error when the id is invalid or the directory cannot be made.
     pub fn create(root: &Path, job_id: &str) -> io::Result<Self> {
+        Self::create_shared(root, job_id, None)
+    }
+
+    /// Like [`KimiHome::create`]. With a `group`, `.kimi` and the job directory become
+    /// group-writable for it (2770), as the Claude job directory does, so a job uid in that
+    /// group can write config and cache there. `None` leaves mode 0700.
+    ///
+    /// # Errors
+    ///
+    /// Returns the I/O error when the id is invalid, the directory cannot be made or the
+    /// group cannot be applied.
+    pub fn create_shared(root: &Path, job_id: &str, group: Option<u32>) -> io::Result<Self> {
         validate_job_id(job_id).map_err(|_| io::Error::from(io::ErrorKind::InvalidInput))?;
         let parent = root.join(KIMI_DIR);
         let path = parent.join(job_id);
@@ -201,7 +214,12 @@ impl KimiHome {
             .create(&parent)?;
         remove_if_present(&path)?;
         fs::DirBuilder::new().mode(0o700).create(&path)?;
-        Ok(Self { path })
+        let home = Self { path };
+        if let Some(gid) = group {
+            share_dir(&parent, gid)?;
+            share_dir(&home.path, gid)?;
+        }
+        Ok(home)
     }
 
     /// The directory, the value of [`HOME_ENV`].

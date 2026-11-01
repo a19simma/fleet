@@ -72,7 +72,7 @@ impl<R: Reporter> AgentRunner<R> {
         if let Some(home) = homes.get(job_id) {
             return Ok(home.path().to_path_buf());
         }
-        let home = KimiHome::create(self.jobs_root(cwd), job_id)?;
+        let home = KimiHome::create_shared(self.jobs_root(cwd), job_id, self.config.job_gid)?;
         let path = home.path().to_path_buf();
         homes.insert(job_id.to_owned(), home);
         drop(homes);
