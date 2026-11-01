@@ -257,10 +257,20 @@ fn relative_jobs_root(dir: &Path) -> Result<PathBuf, Box<dyn std::error::Error>>
     Ok(relative)
 }
 
-async fn rig_at(mode: &str, relative: bool) -> Result<Rig, Box<dyn std::error::Error>> {
-    let dir = TempDir::new()?;
-    let origin = dir.path().join("origin.git");
-    let seed = dir.path().join("seed");
+fn template() -> &'static Path {
+    static DIR: OnceLock<(TempDir, PathBuf)> = OnceLock::new();
+    let (_, path) = DIR.get_or_init(|| {
+        let dir = TempDir::new().unwrap_or_else(|_| std::process::abort());
+        let root = dir.path().to_path_buf();
+        seed_template(&root).unwrap_or_else(|_| std::process::abort());
+        (dir, root)
+    });
+    path
+}
+
+fn seed_template(root: &Path) -> TestResult {
+    let origin = root.join("origin.git");
+    let seed = root.join("seed");
     std::fs::create_dir(&origin)?;
     std::fs::create_dir(&seed)?;
     git(&origin, &["init", "--bare", "--quiet", "-b", "main"])?;
@@ -272,6 +282,28 @@ async fn rig_at(mode: &str, relative: bool) -> Result<Rig, Box<dyn std::error::E
         &seed,
         &["push", "--quiet", &origin.to_string_lossy(), "main"],
     )?;
+    Ok(())
+}
+
+fn copy_tree(from: &Path, to: &Path) -> TestResult {
+    std::fs::create_dir(to)?;
+    for entry in std::fs::read_dir(from)? {
+        let entry = entry?;
+        let target = to.join(entry.file_name());
+        if entry.file_type()?.is_dir() {
+            copy_tree(&entry.path(), &target)?;
+        } else {
+            std::fs::copy(entry.path(), &target)?;
+        }
+    }
+    Ok(())
+}
+
+async fn rig_at(mode: &str, relative: bool) -> Result<Rig, Box<dyn std::error::Error>> {
+    let dir = TempDir::new()?;
+    let origin = dir.path().join("origin.git");
+    copy_tree(&template().join("origin.git"), &origin)?;
+    copy_tree(&template().join("seed"), &dir.path().join("seed"))?;
     std::fs::write(dir.path().join("mode"), mode)?;
     let root = if relative {
         let raw = relative_jobs_root(dir.path())?
@@ -1161,6 +1193,8 @@ fn claude_agent(
     std::fs::create_dir_all(&marks)?;
     let (tx, rx) = mpsc::unbounded_channel();
     let mut config = RunConfig::new(claude(), false);
+    config.ci_poll_initial = Duration::from_millis(20);
+    config.ci_poll_cap = Duration::from_millis(50);
     config.repo_policy = test_policy();
     gh().clone_into(&mut config.gh_bin);
     git_wrapper().clone_into(&mut config.git_bin);
@@ -1891,8 +1925,14 @@ async fn a_pending_check_blocks_success_until_the_deadline() -> TestResult {
 #[tokio::test]
 async fn no_checks_at_the_deadline_end_timeout_without_a_url() -> TestResult {
     common::bounded(Box::pin(async {
-        for mode in ["none", "empty", "junk"] {
-            let (rig, _, reports) = finished_with(mode, Duration::from_millis(300)).await?;
+        let wait = Duration::from_millis(300);
+        let (none, empty, junk) = tokio::join!(
+            finished_with("none", wait),
+            finished_with("empty", wait),
+            finished_with("junk", wait)
+        );
+        for (mode, run) in [("none", none), ("empty", empty), ("junk", junk)] {
+            let (rig, _, reports) = run?;
             let last = terminal(&reports)?;
             assert_eq!(ci_of(last), Some((CiState::Timeout as i32, None)), "{mode}");
             assert!(polls(&rig) >= 2, "{mode}");
