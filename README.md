@@ -6,7 +6,7 @@ Fleet shows what every agent box is doing and whether anything died. It has thre
 - `fleet-server`: the hosted service that stores box state.
 - `fleet`: the command line client.
 
-Status: pre-alpha. `fleetd` accepts Claude Code hooks on loopback and local events on a unix socket, normalizes and redacts them, and queues them in SQLite. A forwarder module (batched send, ack through the reply) is built but fleetd does not run it yet, so nothing leaves the queue. 
+Status: pre-alpha. `fleetd` accepts Claude Code hooks on loopback and local events on a unix socket, normalizes and redacts them, and queues them in SQLite. A forwarder module (batched send, ack through the reply) is built and tested, but the daemon does not start it, so queued events do not leave the Box. 
 
 While `FLEET_SERVER_URL` is set it sends a heartbeat to the server every 30 s with `FLEET_TOKEN`. While both are set it also polls `ClaimJob` every 5 s and runs one job at a time: `claude -p` in a git worktree, then it pushes `swarm/<job_id>` and opens the pull request with `gh`, streaming the transcript through `ReportJob`. 
 
@@ -59,7 +59,7 @@ cargo test --workspace
 docker compose -f compose.test.yaml down
 ```
 
-Each test opens up to five pooled connections plus one setup connection, and a Postgres default `max_connections` of 100 runs out at about 16 parallel tests, which fails with `sorry, too many clients already` or a 30 s `PoolTimedOut`. `.cargo/config.toml` caps `RUST_TEST_THREADS` at 8 for `cargo test`. Passing `--test-threads` or running the test binaries directly bypasses that cap, so start Postgres with `-c max_connections=300` when you do. Only one process per test binary may use a Postgres at a time, because `sqlx::test` derives database names from the test path.
+Each test opens up to five pooled connections plus one setup connection, and a Postgres default `max_connections` of 100 runs out at about 16 parallel tests, which fails with `sorry, too many clients already` or a 30 s `PoolTimedOut`. `.cargo/config.toml` caps `RUST_TEST_THREADS` at 8 for `cargo test`. `.config/nextest.toml` sets the same 8 threads and puts the Postgres and child-spawning tests in groups that cap their parallelism. nextest is pinned in `mise.toml` and is required for the in-container `linux_uid` run (`cargo nextest run -p fleetd --test linux_uid --run-ignored only`). CI runs `cargo test --workspace --no-fail-fast`, not nextest. Passing `--test-threads` or running the test binaries directly bypasses that cap, so start Postgres with `-c max_connections=300` when you do. Only one process per test binary may use a Postgres at a time, because `sqlx::test` derives database names from the test path.
 
 The `docker compose` plugin may be missing. This `docker run` starts the same database, published on loopback only:
 
@@ -82,7 +82,7 @@ target/release/fleetd dump
 
 Telemetry retention: `fleet-server` deletes job events 90 days and job summaries 365 days after the job finished (`finished_at`, else `created_at`), and only for jobs in `SUCCEEDED`, `FAILED`, `CANCELLED` or `LOST`. `QUEUED` and `RUNNING` jobs are never pruned. Job rows and transcripts are kept. `GetJob` still returns a pruned job without its summary, and `ReadJobEvents` returns an empty page. `FLEET_EVENTS_RETENTION_DAYS` (default 90) and `FLEET_SUMMARIES_RETENTION_DAYS` (default 365) accept 1 to 3650, and the summaries value must not be below the events value. `FLEET_RETENTION_INTERVAL_SECS` (default 3600, minimum 60) sets the pause between sweeps. Each sweep deletes in statements of 5000 rows, at most 20 statements per table, so a backlog drains over several sweeps. An invalid value stops startup with an error that names the variable. The log shows counts only.
 
-fleetd binds 127.0.0.1 only and listens on the unix socket for `POST /event`. The four http hooks send no job header. The `SessionStart` command hook, `fleetd hook SessionStart`, sends `X-Fleet-Job` from `FLEET_JOB_ID` when set. Settings, the systemd unit and the Claude Code hook config are in `deploy/README.md`.
+fleetd binds 127.0.0.1 only and listens on the unix socket for `POST /event`. All seven managed hooks are command hooks that run `fleetd hook <Event>`. Each one sends `X-Fleet-Job` from `FLEET_JOB_ID` when set. Settings, the systemd unit and the Claude Code hook config are in `deploy/README.md`.
 
 ## Licence
 

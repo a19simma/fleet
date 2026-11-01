@@ -81,7 +81,7 @@ Non-goals:
 - fleetd pushing to git or holding git credentials (superseded in part, see ADR-0020 and ADR-0024). Results leave the Box only through git remotes (see Background).
 - Storing transcripts on the server. They stay on the Box under `transcript_path`. fleetd reads them for derived preview text and a timeline only.
 - Autoscaling Boxes. Scale stays the Box count plus apply. The queue seam only exposes depth.
-- A web UI is outside the v1 slice. ADR-0041 proposes one embedded in `fleet-server`.
+- A web UI is outside the v1 slice. ADR-0041 adds one embedded in `fleet-server`, and it is built.
 
 ## Component diagram
 
@@ -192,7 +192,7 @@ Language: Rust, one static musl binary, tokio, tonic, axum for the HTTP listener
 - **Unix socket.** `/run/fleetd/fleetd.sock`, mode 0600, owner `agent`. fleetd and `fleet-job` run as the same user. Fixed path from systemd `RuntimeDirectory=fleetd`. It does not use `XDG_RUNTIME_DIR`, which is unset in ssh logins. Today it serves `POST /event` and the hook routes. `POST /job/<event>` for `fleet-job` and `GET /state` for local tools are not built.
 - **Responses.** `200` with `{}` for an accepted or filtered hook, `400` with `{"error": ...}` for a body that is not a JSON object or an unusable path, `500` with `{"error": ...}` when the queue write fails.
 - **Wire names.** The envelope serializes `id` and `kind`, not `event_id` and `type`. `occurred_at`, `captured_at`, `job_id` and `workdir` arrive with the proto in the server step.
-- **Hook headers.** Only the `SessionStart` command hook sends `X-Fleet-Job`, read from `FLEET_JOB_ID` by `fleetd hook` (ADR-0012). The four http hooks send no job header and the managed settings set no `allowedEnvVars`. Interactive sessions have no job id.
+- **Hook headers.** Every managed hook is a command hook, and `fleetd hook` sends `X-Fleet-Job` from `FLEET_JOB_ID` when set, for any event (ADR-0012). The managed settings ship no http hooks and set no `allowedEnvVars`. Interactive sessions have no job id.
 - **Failure behaviour.** Verified (T8): with nothing listening, a hook costs about 2 ms and the run exits 0 with the normal result. Mean wall time over three runs was 1.58 s with a closed-port hook and 1.61 s without, inside the 0.2 s noise. Claude Code logs the failure at ERROR in the debug log and nowhere else. Every hook sets an explicit `timeout`. A listener that accepts a connection and never answers was not tested, so the effect of the timeout is a Phase 1 pre-check. `onFailure` is dropped from the hook config: 2.1.289 accepts it without a warning and it changes nothing, including on a refused connection (T3, T8). The docs tie it to 2.1.295, which the pin does not reach.
 - **Where hooks are configured.** Decided and verified (T4): the loopback http hooks live in the Template at `/etc/claude-code/managed-settings.json`, or in a drop-in `/etc/claude-code/managed-settings.d/10-fleetd.json` that keeps fleetd's file apart from other managed policy. Both load on 2.1.289 (the drop-in was tested alone, not together with the main file). Hooks merge across managed, user and `--settings` sources: a managed hook does not replace a user hook, both fire, and a Job's `--settings` cannot suppress the managed hook. The loopback hook therefore appears only in managed settings, never in the laptop's user `settings.json` or in a Job's `--settings`, or fleetd sees each event twice. A managed file that fails to parse stops Claude Code from starting (docs), so the Template build validates the JSON. Do not set `allowManagedHooksOnly`: the docs say it restricts which hooks run, which could silence the user hooks workers load (see Background), and it was not tested. Not yet run: the `http` hook type inside a managed file (T4 used command hooks) and interactive sessions. Both are Phase 1 pre-checks.
 
@@ -240,7 +240,7 @@ SQLite in WAL mode at `/var/lib/fleetd/queue.db` (systemd `StateDirectory=fleetd
 
 - Unary `PushEvents` calls (ADR-0018). Batches of up to 100 events or 256 KiB or 500 ms, one box per batch. fleetd reads the batch with a read-only head peek and keeps no per-row delivery state in the queue.
 - A reply acks the batch through `acked_through_seq`. fleetd deletes every queued event with `seq` up to that value in one range delete, including any listed in `rejected`, which would never succeed.
-- Retry with exponential backoff, 1 s doubling to a 5 min cap, full jitter. Reset on first ack. The backoff is the forwarder's own in-memory state, not a column in the queue. `InvalidArgument` never deletes rows: the batch stays queued and is retried on the same schedule.
+- Retry with exponential backoff, 1 s doubling to a 5 min cap, full jitter. Reset only after a drain finishes without error. The backoff is the forwarder's own in-memory state, not a column in the queue. `InvalidArgument` never deletes rows: the batch stays queued and is retried on the same schedule.
 - No `Hello` and no server high-water mark. After a gap fleetd resends from its queue and the server dedupes on `(box, id)`.
 
 ### workmux watcher
@@ -351,7 +351,8 @@ message PushEventsReply { uint64 acked_through_seq; uint32 stored; uint32 duplic
 message Rejection { uint64 seq; string reason; }
 message HeartbeatRequest { string box; string hostname; string machine_id; string boot_id; string fleetd_version;
   uint64 uptime_s; uint64 queue_pending; uint64 queue_oldest_age_s; optional uint64 last_ack_age_s; }
-message HeartbeatReply { uint32 next_in_s; }
+message HeartbeatReply { uint32 next_in_s = 1; optional bytes update_manifest = 2; optional bytes update_signature = 3; }
+// HeartbeatRequest also carries uint32 protocol_version = 10.
 message ListFleetRequest { optional string box; }
 message ListFleetReply { uint64 as_of_ms; repeated BoxView boxes; }
 message BoxView { string box; string hostname; BoxStatus status; optional uint64 heartbeat_age_s; string boot_id;
@@ -602,7 +603,7 @@ Numbering continues the list above. All Decided 2026-10-24.
 
 ## ADRs
 
-All Accepted on 2026-10-24, 0011 to 0024. ADRs 0020 to 0024 are built: 0020 and 0024 run in the daemon, 0021 to 0023 in the server. Index and status in `docs/adr/README.md`.
+All Accepted on 2026-10-24, 0011 to 0024. ADRs 0020 to 0024 are built: 0020 and 0024 run in the daemon, 0021 to 0023 in the server. ADRs from 0025 on, and the current status of every ADR, are in `docs/adr/README.md`.
 
 | ADR | Title | Relation |
 |---|---|---|
@@ -619,7 +620,7 @@ All Accepted on 2026-10-24, 0011 to 0024. ADRs 0020 to 0024 are built: 0020 and 
 | 0021 | Job protocol | New, built. `FleetJobs`, `FleetWorker`, `ReportJob`, 120 s lease, 15 s reaper. Supersedes the claim sketch of 0016 |
 | 0022 | Job transcripts on the server | New, built. Stream-json chunks in Postgres, 4 MiB cap. Amends 0013 |
 | 0023 | Two bearer token scopes | New, built. Box and client tokens. Amends 0014 |
-| 0024 | Job git credentials and permission policy | New, built and run by the daemon. Fine-grained PAT held by fleetd and stripped from the agent environment block, disposable Box flag. The agent shares fleetd's uid, so it can still read the token (ADR-0024 Known limit). Amends 0011 |
+| 0024 | Job git credentials and permission policy | New, built and run by the daemon. Fine-grained PAT held by fleetd and stripped from the agent environment block, disposable Box flag. The Known limit of the shared uid is superseded by ADR-0031. Amends 0011 |
 
 Relation to the existing setup: the ssh polling in the picker conflicts with ADR-0015, hence the partial replacement. The existing design deferred `fleet-job` to its first phase. This plan builds it in Phase 3 of the fleetd rollout, which still fits. A pending check on the `workmux status --json` schema is absorbed by T5. Workers use the full global config, so hooks in the baked `settings.json` fire on the Box. Workmux hooks failing harmlessly on a Box is a pre-existing item and is orthogonal.
 

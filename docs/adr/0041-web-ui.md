@@ -14,7 +14,7 @@ The web UI is embedded in `fleet-server` and built with Topcoat 0.11.0 (tokio-rs
 - **Passkey: pass.** webauthn-rs 0.5.5 registers and logs in over Topcoat routes, driven by a software authenticator. The 0.6 releases are dev prereleases and were not used.
 - **Asset embedding: pass only through a workaround.** Topcoat's `asset!` writes files to an `assets` directory beside the binary, and rendering a missing asset panics. Assets are served from a route over `include_str!`. The cost: no content-hashed URLs, no cache headers, one hand-written route per asset.
 - **Negative test: pass.** A gRPC content type on a web route gets 4xx and the server keeps answering. Removing the path-prefix condition turned the test red.
-- **Known gap.** Bypassing `topcoat::serve` drops its graceful-shutdown drain. The spike's accept loop has a plain stop signal only. The server needs its own drain before this ships.
+- **Graceful drain.** Bypassing `topcoat::serve` drops its graceful-shutdown drain, so `crates/fleet-server/src/web/serve.rs` runs its own: it serves until the shutdown future resolves, then drains open connections with hyper-util's `GracefulShutdown`.
 
 ### Pre-1.0 risk and pin policy
 
@@ -27,7 +27,7 @@ The fallback is axum plus maud. It was not needed and was not built. It is the e
 ## Consequences
 
 - One port and one deployment. No second service, ingress or certificate.
-- A hand-written accept loop and an asset route to maintain, and a shutdown drain to write.
+- A hand-written accept loop and an asset route to maintain, and a shutdown drain to maintain.
 - Topcoat upgrades are deliberate and may need route changes.
 - Login and sessions are specified in ADR-0042.
 - TLS terminates upstream of the server. The `__Host-` session cookie is `Secure`, so a browser login works only over HTTPS. The server listens in plaintext and sets no HSTS header itself.
