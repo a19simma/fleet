@@ -27,7 +27,7 @@ const CHUNK_BYTES: usize = 64 * 1024;
 pub const MAX_MISE_BYTES: u64 = 256 * 1024 * 1024;
 
 /// Pins as they appear in Box config. Every field is required for [`MisePins::new`].
-#[derive(Debug, Clone, Default, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct MisePinsConfig {
     /// Pinned mise version.
