@@ -141,7 +141,8 @@ impl Detector {
         self.window.len()
     }
 
-    /// Most steps the history window keeps.
+    /// Most steps the history window keeps: the largest rule length, at least 2. No test can
+    /// tell the floor of 2 from its absence.
     #[must_use]
     pub fn window_cap(&self) -> usize {
         self.rules

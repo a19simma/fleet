@@ -5,7 +5,7 @@
 //! arrival time as milliseconds since job start. Event content is never logged.
 //!
 //! The `permission_denied` system message shape is an assumption: `tool_name`, `tool_use_id` and
-//! `message` fields. Inferred, not part of the design.
+//! `message` fields. It is unverified against a real Claude Code sample.
 
 use std::collections::{BTreeMap, HashMap};
 
@@ -152,7 +152,9 @@ pub struct JobEvent {
     pub dur_ms: Option<u64>,
     /// Byte length of the result text.
     pub out_bytes: Option<u64>,
-    /// First 16 hex chars of the SHA-256 of the result text.
+    /// First 16 hex chars of the SHA-256 of the result text. The text is the decoded content
+    /// of the line, which the redactor saw only in its encoded form, so the hash can cover a
+    /// secret that was escaped inside the JSON string. The digest is not reversible.
     pub out_hash: Option<String>,
     /// Bash command or file path, cut at the command cap.
     pub cmd: Option<String>,
@@ -411,8 +413,9 @@ impl Telemetry {
     ///
     /// Fails with [`FetchRecordError::Truncated`] when the event is the one that goes past the
     /// cap (the one after the last stored event), because it is replaced by the truncation
-    /// marker. The marker is still pushed into `out`. The event reaching the cap is kept. A URL over [`MAX_FETCH_URL_BYTES`], before or after `redact`,
-    /// fails with [`FetchRecordError::UrlTooLong`] and is never cut.
+    /// marker. The marker is still pushed into `out`. The event reaching the cap is kept. A URL
+    /// over [`MAX_FETCH_URL_BYTES`], before or after `redact`, fails with
+    /// [`FetchRecordError::UrlTooLong`] and is never cut.
     ///
     /// # Errors
     ///
@@ -510,6 +513,10 @@ impl Telemetry {
     }
 
     /// The summary so far.
+    ///
+    /// A partial stream still yields a summary and `missing` names what is absent. A `stuck`
+    /// rule that fired before the stream ended stays set, so `stuck` can accompany a non-empty
+    /// `missing` list.
     #[must_use]
     pub fn summary(&self) -> JobSummary {
         let count = |n: u64| self.observed.then_some(n);

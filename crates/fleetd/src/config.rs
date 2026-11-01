@@ -175,7 +175,7 @@ pub struct Config {
     /// `--max-turns`. See [`crate::runner::DEFAULT_MAX_TURNS`].
     pub max_turns: u32,
     /// Dollars one job may spend, above 0 and at most 1000, 5.0 by default. Always passed as
-    /// `--max-budget-usd`. See [`crate::runner::DEFAULT_MAX_TURNS`].
+    /// `--max-budget-usd`. See [`crate::runner::DEFAULT_MAX_BUDGET_USD`].
     pub max_budget_usd: f64,
     /// Longest one agent run may take, 1 to [`MAX_AGENT_TIMEOUT_SECS`] seconds, 1800 by
     /// default, config file only. It sets `RunConfig::timeout` and, with the systemd launcher,
@@ -292,15 +292,16 @@ impl Config {
     /// Precedence is environment, then file, then default. The overrides are
     /// `FLEETD_PORT`, `FLEET_BOX_NAME`, `FLEETD_DB`, `FLEETD_SOCKET` and
     /// `FLEETD_SECRETS_FILE`, plus `FLEETD_HOOK_SOCKET`, `FLEETD_HOOK_SOCKET_UID` and
-    /// `FLEETD_HOOK_SOCKET_GROUP` for the hook socket keys. Without an override the db lives under `STATE_DIRECTORY`
-    /// and the socket under `RUNTIME_DIRECTORY`, else the working directory.
+    /// `FLEETD_HOOK_SOCKET_GROUP` for the hook socket keys. Without an override the db lives
+    /// under `STATE_DIRECTORY` and the socket under `RUNTIME_DIRECTORY`, else the working
+    /// directory.
     ///
     /// # Errors
     ///
     /// Fails on invalid TOML, an unparsable `FLEETD_PORT`, a zero
     /// `queue_max_bytes` or `queue_max_age_secs`, a `max_turns` outside 1 to 1000, a
-    /// `max_budget_usd` that is not finite, not above 0 or above 1000, a `repo_hosts` entry that is not a bare
-    /// host name, a `token_host` that is not in `repo_hosts`, a `hook_socket` that is relative
+    /// `max_budget_usd` that is not finite, not above 0 or above 1000, a `repo_hosts` entry that
+    /// is not a bare host name, a `token_host` that is not in `repo_hosts`, a `hook_socket` that is relative
     /// or equals `socket_path`, an unparsable `hook_socket_uid`, or a `hook_socket_group` that
     /// is not a plain name or has no `hook_socket`. An empty environment value
     /// counts as unset.

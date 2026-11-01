@@ -1,8 +1,9 @@
 //! Files and modes that let a launcher hand a job to another uid.
 //!
 //! The jobs directory is meant to be `fleetd:fleet-work` mode 3770. With a job group set,
-//! the per-job directories are group-writable for that group, and `.git-home` and
-//! `.finish-<id>` stay 0700. Nothing here talks to systemd.
+//! the per-job directories are group-writable for that group, and `.finish-<id>` stays 0700.
+//! `.git-home` is made by `create_dir_all` and follows the process umask. Nothing here talks to
+//! systemd.
 
 use std::fmt;
 use std::fs::{self, File, OpenOptions};

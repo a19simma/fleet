@@ -52,6 +52,8 @@ const DEFAULT_POLL: Duration = Duration::from_millis(500);
 const DEFAULT_START_DEADLINE: Duration = Duration::from_secs(60);
 const CALL_TIMEOUT: Duration = Duration::from_secs(30);
 const SHOW_CAP: usize = 4096;
+/// Mode of the per-job run dir. With no `job_gid` set the job uid is neither owner nor group,
+/// so it cannot read `spec.json` under this mode.
 const DIR_MODE: u32 = 0o750;
 const DEFAULT_INSTALL_RUN_DEADLINE: Duration = Duration::from_secs(16 * 60);
 const HOOK_DIR: &str = "hook";
@@ -88,6 +90,8 @@ pub struct ToolInstallSetup {
 impl ToolInstallSetup {
     /// A setup that asks `tools` for each job and checks against `egress_allow`, the exact host
     /// names of the Box egress list. A wildcard entry is not an exact name and must be left out.
+    /// A job whose lookup returns no tools needs no host, so the host check is vacuous and
+    /// passes for it, even on an empty list. An entry that is not a plain DNS name still fails.
     #[must_use]
     pub fn new(tools: ToolLookup, egress_allow: Vec<String>) -> Self {
         Self {
@@ -294,7 +298,9 @@ impl SystemdLauncher {
     }
 
     /// Sets the run deadline. A unit that ends by a signal after it has passed reads as
-    /// timed out through [`AgentProc::timed_out`], as the unit's own timeout does.
+    /// timed out through [`AgentProc::timed_out`], as the unit's own timeout does. That includes
+    /// a real crash such as `SIGSEGV`. The deadline is checked when the poller sees the unit end,
+    /// so the verdict can be one 500 ms poll late.
     #[must_use]
     pub fn with_run_timeout(mut self, timeout: Duration) -> Self {
         self.run_timeout = Some(timeout);

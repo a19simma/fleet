@@ -268,8 +268,9 @@ impl Workspace {
     /// Gives the cache dir to `gid` search-only (2710), the mirror a clone borrows read-only
     /// (dirs 2750), and makes each job clone group-writable (2770), so the job group can read
     /// that mirror but never write it. `None`, the default,
-    /// leaves the modes git and `create_dir_all` set. `.git-home` and `.finish-<id>` stay
-    /// private either way.
+    /// leaves the modes git and `create_dir_all` set. `.finish-<id>` is 0700 either way.
+    /// `.git-home` comes from `create_dir_all`, so its mode follows the process umask
+    /// (0755 under the usual 022).
     #[must_use]
     pub fn with_job_group(mut self, gid: Option<u32>) -> Self {
         self.job_gid = gid;
@@ -549,9 +550,10 @@ impl Workspace {
         .await
     }
 
-    /// Removes the job's clone, its `.finish-<job_id>` scratch dir and its `.agent/<job_id>`
-    /// agent config dir with the staging dir. The bare mirror holds no record of the job and
-    /// stays. Every step runs even when an earlier one fails.
+    /// Removes three things of the job: its clone together with the staging dir, its
+    /// `.finish-<job_id>` scratch dir and its `.agent/<job_id>` agent config dir. The bare
+    /// mirror holds no record of the job and stays. Every step runs even when an earlier one
+    /// fails.
     ///
     /// # Errors
     ///
@@ -610,8 +612,8 @@ impl Workspace {
     ///
     /// An existing mirror is trusted only when it passes [`mirror_is_trusted`]. Otherwise it is
     /// renamed to a sibling `.old`, deleted and created again, which costs one full fetch. A
-    /// crash mid-delete leaves only `.old` debris, which the next call removes. A new mirror is built in a
-    /// sibling directory and renamed into place, so a mirror path never holds a repo without
+    /// crash mid-delete leaves only `.old` debris, which the next call removes. A new mirror is
+    /// built in a sibling directory and renamed into place, so a mirror path never holds a repo without
     /// its gc settings.
     async fn sync_mirror(&self, mirror: &Path, repo: &str) -> Result<(), WorkspaceError> {
         self.ensure_mirror(mirror).await?;

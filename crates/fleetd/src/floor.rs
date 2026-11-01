@@ -15,7 +15,8 @@ pub const PERMISSION_MODE: &str = "dontAsk";
 /// The `Bash(git push *)`, `Bash(gh *)`, `Edit`, `Write`, `NotebookEdit` and `MultiEdit` entries
 /// are the argv floor in `runner.rs` (ADR-0024). `Bash(curl *)` is the deny in the default
 /// `agent-config/settings.json`. `Bash(git push*)` closes the form without a space, and
-/// `WebFetch` is denied because fetches go through the egress proxy (ADR-0031), not the tool.
+/// `WebFetch` is denied because fetches go through `fleetd fetch` on the per-job socket
+/// (ADR-0038), not the built-in tool.
 pub const FLOOR_DENY: &[&str] = &[
     "Bash(git push *)",
     "Bash(git push*)",
@@ -119,6 +120,11 @@ pub fn covers(deny: &str, allow: &str) -> bool {
 }
 
 /// Applies the Floor and the Box ceilings to `profile`.
+///
+/// An allow is dropped when a Floor deny covers it. A repeated dropped allow is listed once.
+/// Matching is on the text: an allow with extra whitespace or a tab, `Bash(git -C . push*)` and a
+/// bare `Bash(gh)` with no argument are kept, because they do not match a Floor pattern. The deny
+/// still applies when `claude` evaluates the call, and the git credential is withheld (ADR-0024).
 pub fn apply(profile: &Profile, ceilings: &BoxCeilings) -> Effective {
     let extra: BTreeSet<&str> = profile
         .deny

@@ -196,7 +196,15 @@ fn overlay(
 /// files at `skills/<name>/<path>`, both inside the bundle root, so the import resolves from
 /// `CLAUDE.md`. `settings.json` is generated: permissions from [`floor::apply`], the Profile
 /// model and attribution. Rules in `settings.permissions` join `allow` and `deny` before the
-/// Floor. A Profile with no allow rules keeps the default bundle's allow list.
+/// Floor. A Profile with no allow rules left after the Floor drops its own keeps the default
+/// bundle's allow list, which includes bare `Bash`.
+///
+/// The returned [`Applied`] carries no permission mode: the runner adds `dontAsk` itself. The
+/// collision check compares whole lowercased paths, so directories that differ only in case, a
+/// file against a directory and NFC against NFD forms are not detected. A `claude_md` that ends
+/// inside a code fence also fences the appended `@` imports, and it may carry its own `@`
+/// lines; nothing here rejects either. Skill discovery under `CLAUDE_CONFIG_DIR` and the
+/// relative `@.claude/ctx` import are unverified against a live `claude`.
 ///
 /// # Errors
 ///

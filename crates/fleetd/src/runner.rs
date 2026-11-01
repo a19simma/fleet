@@ -33,8 +33,9 @@
 //! request with `gh` from that repo, then sends the terminal report. Every helper runs in
 //! its own process group with an allowlisted environment and a scratch `HOME` and config
 //! dirs, so no agent-writable config is read. The push carries only `GIT_ASKPASS`, which
-//! names `fleetd askpass`, and the `GH_TOKEN` that helper prints, and `gh` only its own
-//! token. Push is limited to `https` remotes on the [`RepoPolicy`] hosts.
+//! names the fleetd binary, the `FLEETD_ASKPASS` marker that makes it answer as the helper,
+//! `FLEETD_ASKPASS_HOST` and the `GH_TOKEN` the helper prints, and `gh` only its own token.
+//! Push is limited to `https` remotes on the [`RepoPolicy`] hosts.
 //!
 //! The agent runs with `HOME` and `CLAUDE_CONFIG_DIR` in a per-job directory
 //! ([`crate::agent_config`]) and an allowlisted environment, never the operator's home. Before
@@ -99,7 +100,8 @@ use crate::workspace::{RepoPolicy, validate_job_id};
 /// The agent environment is an allowlist, so this list is the test oracle and the check for
 /// `agent_env_passthrough`. It limits the block only. An agent under fleetd's uid can still
 /// read the fleetd environment through `/proc` (ADR-0024 Known limit); with the job uid
-/// split in place that read fails. The push child keeps `GH_TOKEN` and `GIT_ASKPASS`.
+/// split in place that read fails. The push child gets `GH_TOKEN`, `GIT_ASKPASS`,
+/// `FLEETD_ASKPASS` and `FLEETD_ASKPASS_HOST` from the runner, never from the base env.
 pub const STRIPPED_ENV: [&str; 11] = [
     "GH_TOKEN",
     "GITHUB_TOKEN",
@@ -149,7 +151,8 @@ pub const DEFAULT_FINISH_TIMEOUT: Duration = Duration::from_secs(300);
 /// Default longest time for preparing the workspace.
 pub const DEFAULT_PREPARE_TIMEOUT: Duration = Duration::from_secs(300);
 
-/// Default longest time to wait for the checks of the pull request, counted from the push.
+/// Default longest time to wait for the checks of the pull request, counted from the start of
+/// the check watch, which begins once the pull request url is known.
 pub const DEFAULT_CI_DEADLINE: Duration = Duration::from_secs(900);
 
 /// Default wait before the second check poll. The wait doubles up to
@@ -457,7 +460,8 @@ pub enum Interrupt {
 
 /// Awaits the exit of a spawned agent process.
 ///
-/// Production uses the [`Child`] itself. Tests inject a stand-in to force a wait error.
+/// Production uses the [`Child`] itself, whose impl delegates to [`Child::wait`]. Tests inject
+/// a stand-in to force a wait error.
 pub trait ChildWait: Send {
     /// Resolves with the exit status once the process has ended.
     fn wait(&mut self) -> impl Future<Output = io::Result<ExitStatus>> + Send;
@@ -1389,8 +1393,9 @@ impl<R: Reporter> AgentRunner<R> {
     /// environment. The push (`--no-verify`, no hooks path, no stored credential helper, no
     /// global or system git config) and `gh` run from that repo with an allowlisted
     /// environment, a scratch `HOME` and scratch config dirs. The push holds only
-    /// `GIT_ASKPASS` (`fleetd askpass`) and the `GH_TOKEN` it prints, and `gh` only its own
-    /// token, so config the agent planted cannot capture a token. The push allows `https`
+    /// `GIT_ASKPASS` (the fleetd binary), the `FLEETD_ASKPASS` marker, `FLEETD_ASKPASS_HOST` and
+    /// the `GH_TOKEN` it prints, and `gh` only its own token, so config the agent planted
+    /// cannot capture a token. The push allows `https`
     /// remotes on the policy hosts only, and the helper answers only for those hosts. A
     /// failure sends a `FAILED` report with a fixed error and the redacted, bounded tail of
     /// the helper's stderr as one transcript chunk. The raw output goes nowhere else.
@@ -1404,7 +1409,8 @@ impl<R: Reporter> AgentRunner<R> {
     /// # Errors
     ///
     /// Returns [`RunError`] when `shutdown` fires. A best-effort `FAILED` report is sent
-    /// first and the helper's process group is killed.
+    /// first and the helper's process group is killed. A lost lease returns
+    /// [`FinishOutcome::Lost`] and a cancel returns [`FinishOutcome::Cancelled`], both as `Ok`.
     pub async fn finish(
         &self,
         job: &Job,
@@ -1723,6 +1729,14 @@ impl<R: Reporter> AgentRunner<R> {
                     .any(|extra| extra == name))
     }
 
+    /// The version string `claude --version` prints, cached for the life of the runner.
+    ///
+    /// The probe runs in `cwd` through the runner's own `program`, outside any launcher sandbox,
+    /// with a cleared environment: `HOME`, the config dir variable, `DISABLE_AUTOUPDATER` and
+    /// `PATH` from the base env. It is cut off after [`VERSION_TIMEOUT`] and keeps at most
+    /// [`VERSION_BYTES`] bytes of stdout. A failure of any kind returns `None` and is not
+    /// cached, so the next job probes again. Whether the CLI reads project config in `cwd` for
+    /// `--version` is unverified.
     async fn claude_version(&self, cwd: &Path, home: &Path) -> Option<String> {
         let cached = self
             .claude_version

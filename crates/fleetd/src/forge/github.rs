@@ -40,7 +40,8 @@ struct Bucketed {
 /// gives `NoChecks`.
 ///
 /// A list the broker truncated hides checks, so without a visible `fail` or `cancel` it is
-/// `Err(ForgeError::Failed)` and never a passing or pending result.
+/// `Err(ForgeError::Failed)` and never a passing or pending result. A truncated list and an
+/// executor error both return `ForgeError::Failed`, so a caller cannot tell them apart.
 fn from_buckets(output: &str) -> Result<CiResult, ForgeError> {
     let listed: Listed = serde_json::from_str(output).map_err(|_| ForgeError::Failed)?;
     let has = |wanted: &[&str]| {

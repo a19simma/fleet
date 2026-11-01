@@ -148,8 +148,8 @@ impl Feed {
     /// full (the event after the last stored one, the 2001st by default, becomes the truncation
     /// marker and fails; the one that reaches the cap is kept), and when the URL is over
     /// [`MAX_FETCH_URL_BYTES`] after redaction. An outcome phase carries the HTTP status into
-    /// `exit_code` and the body length into `out_bytes`; an intent carries neither. A refused outcome record adds
-    /// `fetch_outcome` to the summary `missing` list. The caller refuses the fetch when an
+    /// `exit_code` and the body length into `out_bytes`; an intent carries neither. A refused
+    /// outcome record adds `fetch_outcome` to the summary `missing` list. The caller refuses the fetch when an
     /// intent record fails. "Recorded" means this feed accepted the event, not that the server
     /// confirmed it.
     pub(crate) fn record_fetch(

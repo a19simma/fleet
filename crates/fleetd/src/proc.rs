@@ -104,6 +104,8 @@ async fn read(pipe: Option<impl AsyncRead + Unpin>, limit: u64, keep: Keep) -> (
     (String::from_utf8_lossy(&buf).into_owned(), dropped > 0)
 }
 
+/// Keeps the last `limit` bytes of `pipe` and drains the rest. The cut is on raw bytes, before
+/// any redaction, so a secret that straddles the cut can lose its prefix and no longer match.
 async fn read_tail(mut pipe: impl AsyncRead + Unpin, limit: u64) -> (String, bool) {
     let cap = usize::try_from(limit).unwrap_or(usize::MAX);
     let mut buf: Vec<u8> = Vec::new();
