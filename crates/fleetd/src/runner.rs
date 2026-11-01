@@ -85,7 +85,12 @@ use crate::toolhook::HookHub;
 mod ci;
 mod codex;
 mod kimi;
+mod preflight;
 mod token;
+
+pub use preflight::{
+    InstallFuture, PreflightError, TOOL_PREFLIGHT_FAILED, ToolInstaller, ToolPreflight,
+};
 
 use crate::workspace::{RepoPolicy, validate_job_id};
 
@@ -737,6 +742,8 @@ pub struct AgentRunner<R> {
     carries: Mutex<HashMap<String, Carry>>,
     phases: Mutex<HashMap<String, Phases>>,
     profiles: Mutex<HashMap<String, Arc<Applied>>>,
+    tool_paths: Mutex<HashMap<String, String>>,
+    tool_preflight: Option<ToolPreflight>,
     pub(crate) clock: Arc<dyn Clock>,
     hub: Option<Arc<HookHub>>,
     feeds: Option<Arc<FeedBook>>,
@@ -771,6 +778,8 @@ impl<R: Reporter> AgentRunner<R> {
             carries: Mutex::new(HashMap::new()),
             phases: Mutex::new(HashMap::new()),
             profiles: Mutex::new(HashMap::new()),
+            tool_paths: Mutex::new(HashMap::new()),
+            tool_preflight: None,
             clock: Arc::new(SystemClock::new()),
             hub: None,
             feeds: None,
@@ -778,6 +787,14 @@ impl<R: Reporter> AgentRunner<R> {
             claude_version: Mutex::new(None),
             publishing: Mutex::new(HashMap::new()),
         }
+    }
+
+    /// Resolves the tools of each Profile through `preflight` before the agent starts. Without
+    /// it a job whose Profile carries tools fails with [`TOOL_PREFLIGHT_FAILED`].
+    #[must_use]
+    pub fn with_tool_preflight(mut self, preflight: ToolPreflight) -> Self {
+        self.tool_preflight = Some(preflight);
+        self
     }
 
     /// Starts agents through `launcher` instead of [`DirectLauncher`].
@@ -1016,6 +1033,7 @@ impl<R: Reporter> AgentRunner<R> {
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .remove(&Self::carry_key(job));
+        self.clear_tool_path(job);
     }
 
     fn take_phases(&self, job: &Job) -> Phases {
@@ -1749,13 +1767,17 @@ impl<R: Reporter> AgentRunner<R> {
     /// `CODEX_API_KEY` from its held `codex_api_key`. A job whose `agent` is `kimi` gets the
     /// Kimi argv and environment, with the one secret `KIMI_MODEL_API_KEY` from its held Kimi key.
     pub fn agent_spec(&self, job: &Job, cwd: &Path, home: &Path) -> AgentSpec {
-        if Self::is_codex(job) {
+        let mut spec = if Self::is_codex(job) {
             self.codex_spec(job, cwd, home)
         } else if Self::is_kimi(job) {
             self.kimi_spec(job, cwd, home)
         } else {
             self.claude_spec(job, cwd, home)
+        };
+        if let Some(path) = self.tool_path_for(job) {
+            preflight::apply_agent_path_env(&mut spec.env, &path);
         }
+        spec
     }
 
     fn claude_spec(&self, job: &Job, cwd: &Path, home: &Path) -> AgentSpec {
