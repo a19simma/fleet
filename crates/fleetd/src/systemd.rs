@@ -28,11 +28,14 @@ use tokio::net::unix::pipe::Receiver;
 use tokio::sync::watch;
 use tokio::task::JoinHandle;
 
-use crate::agent_exec::{SPEC_FILE, write_spec};
+use fleet_core::tools::ToolName;
+
+use crate::agent_exec::{SPEC_FILE, TOOL_PROXY_PORT, write_spec};
 use crate::config::{AgentLauncher, Config};
 use crate::jobenv::{create_stdout_fifo, open_fifo_reader, render_env_file, write_env_file};
 use crate::jobsock::{JobSocket, Limits, Peer, ProcPeer, ServiceName, Services, socket_path};
 use crate::runner::{AgentProc, AgentSpec, DirectLauncher, Launched, Launcher};
+use crate::tools::{check_tool_hosts, write_tool_env};
 use crate::workspace::validate_job_id;
 
 /// Default parent of the per-job run directories.
@@ -58,6 +61,43 @@ pub const JOB_SOCKET_REFUSED: &str = "job socket refused: agent_launcher is dire
 
 /// The one log line written when the systemd launcher starts with no services registered.
 pub const NO_SERVICES_WARNING: &str = "agent_launcher is systemd and no services are registered: the unit sets PrivateNetwork=yes, so jobs cannot reach the model API";
+
+/// The one error text of a job whose install hosts the Box egress list does not cover.
+pub const TOOL_HOSTS_REFUSED: &str = "tool install hosts are not covered by egress_allow";
+
+/// The tools of one job, looked up by job id. An empty list means no install.
+pub type ToolLookup = Arc<dyn Fn(&str) -> Vec<ToolName> + Send + Sync>;
+
+/// What the launcher needs to prepare the tool install unit of each job (ADR-0048).
+///
+/// Before the unit starts, the launcher requires `egress_allow` to hold every host of the
+/// job's tools ([`check_tool_hosts`]) and writes `tool-env` into the run dir
+/// ([`write_tool_env`]). A refusal fails the launch before any directory or unit exists.
+#[derive(Clone)]
+pub struct ToolInstallSetup {
+    tools: ToolLookup,
+    egress_allow: Vec<String>,
+}
+
+impl ToolInstallSetup {
+    /// A setup that asks `tools` for each job and checks against `egress_allow`, the exact host
+    /// names of the Box egress list. A wildcard entry is not an exact name and must be left out.
+    #[must_use]
+    pub fn new(tools: ToolLookup, egress_allow: Vec<String>) -> Self {
+        Self {
+            tools,
+            egress_allow,
+        }
+    }
+}
+
+impl std::fmt::Debug for ToolInstallSetup {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ToolInstallSetup")
+            .field("egress_allow", &self.egress_allow.len())
+            .finish_non_exhaustive()
+    }
+}
 
 /// The launcher the config selects.
 ///
@@ -146,6 +186,7 @@ pub struct SystemdLauncher {
     run_timeout: Option<Duration>,
     gid: Option<u32>,
     socket: Option<JobSocketSetup>,
+    tool_install: Option<ToolInstallSetup>,
 }
 
 impl SystemdLauncher {
@@ -161,7 +202,15 @@ impl SystemdLauncher {
             run_timeout: None,
             gid: None,
             socket: None,
+            tool_install: None,
         }
+    }
+
+    /// Writes `tool-env` and checks the install hosts before each unit start.
+    #[must_use]
+    pub fn with_tool_install(mut self, setup: ToolInstallSetup) -> Self {
+        self.tool_install = Some(setup);
+        self
     }
 
     /// Binds a job socket in each run dir, offering the services in `setup`.
@@ -357,6 +406,16 @@ fn fail<T>(kind: io::ErrorKind) -> io::Result<T> {
 }
 
 impl SystemdLauncher {
+    fn checked_tools(&self, id: &str) -> io::Result<Vec<ToolName>> {
+        let Some(setup) = &self.tool_install else {
+            return Ok(Vec::new());
+        };
+        let tools = (setup.tools)(id);
+        check_tool_hosts(&setup.egress_allow, &tools)
+            .map_err(|_| io::Error::new(io::ErrorKind::PermissionDenied, TOOL_HOSTS_REFUSED))?;
+        Ok(tools)
+    }
+
     fn bind_job_socket(&self, id: &str) -> io::Result<Option<JobSocket>> {
         let Some(setup) = &self.socket else {
             return Ok(None);
@@ -398,6 +457,7 @@ impl Launcher for SystemdLauncher {
         if !self.ctl.systemctl.is_absolute() {
             return fail(io::ErrorKind::InvalidInput);
         }
+        let tools = self.checked_tools(&id)?;
         fs::create_dir_all(&self.run_dir)?;
         let dir = self.run_dir.join(&id);
         fs::DirBuilder::new().mode(DIR_MODE).create(&dir)?;
@@ -410,6 +470,8 @@ impl Launcher for SystemdLauncher {
             render_env_file(&spec).map_err(|_| io::Error::from(io::ErrorKind::InvalidInput))?;
         write_env_file(&dir.join(ENV_FILE), &body)?;
         write_spec(&dir.join(SPEC_FILE), &id, &spec, self.gid)?;
+        write_tool_env(&self.run_dir, &id, TOOL_PROXY_PORT, &tools)
+            .map_err(|err| io::Error::other(err.to_string()))?;
         let fifo = dir.join(STDOUT_FIFO);
         create_stdout_fifo(&fifo, self.gid)?;
         let reader = Receiver::from_file(open_fifo_reader(&fifo)?)?;

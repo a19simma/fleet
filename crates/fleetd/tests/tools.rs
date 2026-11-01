@@ -571,6 +571,38 @@ fn tool_env_refuses_port_zero_and_existing_file() {
 }
 
 #[test]
+fn tool_env_refuses_an_id_directory_that_is_a_symlink() {
+    let dir = tool_env_dir();
+    let elsewhere = TempDir::new().unwrap();
+    symlink(elsewhere.path(), dir.path().join("job_2")).unwrap();
+    let err = write_tool_env(dir.path(), "job_2", PROXY_PORT, &[ToolName::Jq]).unwrap_err();
+    assert!(matches!(err, ToolsError::Io(_)));
+    assert_eq!(fs::read_dir(elsewhere.path()).unwrap().count(), 0);
+}
+
+#[test]
+fn tool_env_refuses_an_id_that_is_a_file_or_missing() {
+    let dir = tool_env_dir();
+    fs::write(dir.path().join("job_3"), b"x").unwrap();
+    for id in ["job_3", "job_missing"] {
+        let err = write_tool_env(dir.path(), id, PROXY_PORT, &[ToolName::Jq]).unwrap_err();
+        assert!(matches!(err, ToolsError::Io(_)), "{id}");
+    }
+}
+
+#[test]
+fn tool_env_refuses_a_file_symlink_at_the_target_name() {
+    let dir = tool_env_dir();
+    let outside = TempDir::new().unwrap();
+    let target = outside.path().join("victim");
+    fs::write(&target, b"keep").unwrap();
+    symlink(&target, dir.path().join("job_1").join(TOOL_ENV_FILE)).unwrap();
+    let err = write_tool_env(dir.path(), "job_1", PROXY_PORT, &[ToolName::Jq]).unwrap_err();
+    assert!(matches!(err, ToolsError::Io(_)));
+    assert_eq!(fs::read(&target).unwrap(), b"keep");
+}
+
+#[test]
 fn tool_hosts_are_exact_sorted_and_cover_every_tool() {
     for tool in ToolName::ALL {
         let hosts = tool_hosts(&[tool]);

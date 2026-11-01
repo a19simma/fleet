@@ -26,6 +26,7 @@ use tokio::time::{Instant, sleep_until, timeout};
 
 use crate::jobsock::{ServiceName, connect, socket_path};
 use crate::runner::AgentSpec;
+use crate::tools::{MisePins, verify_mise};
 use crate::workspace::validate_job_id;
 
 /// File name of the spec inside a job's run directory.
@@ -306,6 +307,17 @@ async fn pump(client: TcpStream, upstream: UnixStream, idle: Duration) {
     }
 }
 
+/// Points the four proxy URL variables of `command` at `proxy` and removes `NO_PROXY` and
+/// `ALL_PROXY` in both cases, so no inherited value bypasses the forwarder.
+pub fn apply_proxy_env(command: &mut Command, proxy: &str) {
+    for name in PROXY_URL_ENV {
+        command.env(name, proxy);
+    }
+    for name in PROXY_CLEARED_ENV {
+        command.env_remove(name);
+    }
+}
+
 fn exit_code(status: ExitStatus) -> i32 {
     status
         .code()
@@ -349,12 +361,7 @@ pub fn exec_job(run_dir: &Path, id: &str) -> AgentExecError {
     let proxy = format!("http://127.0.0.1:{}", forwarder.port());
     let mut command = Command::new(program);
     command.args(args).current_dir(&spec.cwd);
-    for name in PROXY_URL_ENV {
-        command.env(name, &proxy);
-    }
-    for name in PROXY_CLEARED_ENV {
-        command.env_remove(name);
-    }
+    apply_proxy_env(&mut command, &proxy);
     command.env(NODE_PROXY_ENV, "1");
     let mut child = match command.spawn() {
         Ok(child) => child,
@@ -363,6 +370,116 @@ pub fn exec_job(run_dir: &Path, id: &str) -> AgentExecError {
     let code = child.wait().map_or(1, exit_code);
     drop(forwarder);
     std::process::exit(code)
+}
+
+/// Port of the install forwarder inside the install unit's private network namespace.
+///
+/// The namespace is empty, so the port cannot clash. [`crate::tools::write_tool_env`] callers
+/// write the same port into `tool-env`, and the wrapper sets the same URL on the child.
+pub const TOOL_PROXY_PORT: u16 = 3128;
+
+/// Path of the bundled mise binary the install unit runs, owned by root.
+pub const MISE_BINARY: &str = "/usr/local/libexec/fleet/mise";
+
+/// Uid that must own [`MISE_BINARY`] and its directory.
+pub const MISE_OWNER_UID: u32 = 0;
+
+/// Arguments the wrapper passes to the bundled mise.
+pub const TOOL_INSTALL_ARGS: [&str; 2] = ["install", "--locked"];
+
+/// Why `tool-install-exec` did not run the install. Display text is fixed and holds no path,
+/// pin or environment value.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum ToolInstallError {
+    /// The job id is not `[A-Za-z0-9_]{1,64}`.
+    InvalidId,
+    /// Box config has no complete `[mise]` pin table.
+    MissingPins,
+    /// The bundled mise failed its pin, owner, mode or signature checks.
+    Unverified,
+    /// The egress forwarder could not listen on the loopback.
+    Listen(io::ErrorKind),
+    /// The install program could not be executed.
+    Exec(io::ErrorKind),
+}
+
+impl fmt::Display for ToolInstallError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::InvalidId => f.write_str("job id is not valid"),
+            Self::MissingPins => f.write_str("mise pins are not configured"),
+            Self::Unverified => f.write_str("bundled mise failed verification"),
+            Self::Listen(kind) => write!(f, "egress forwarder could not listen: {kind}"),
+            Self::Exec(kind) => write!(f, "tool install could not be executed: {kind}"),
+        }
+    }
+}
+
+impl std::error::Error for ToolInstallError {}
+
+/// Verifies the bundled `mise` against `pins`, then runs `mise install --locked` for job `id`
+/// next to an egress [`Forwarder`], and exits this process with the install's exit code.
+///
+/// The forwarder binds `127.0.0.1` on [`TOOL_PROXY_PORT`] in the unit's network namespace and
+/// dials only `run_dir/<id>/job.sock`, as `agent-exec` does. Without `pins`, or when the binary
+/// does not verify, nothing is started and the error comes back.
+///
+/// Only returns on failure, with the reason.
+pub fn exec_tool_install(
+    run_dir: &Path,
+    id: &str,
+    mise: &Path,
+    pins: Option<&MisePins>,
+    expected_owner: u32,
+) -> ToolInstallError {
+    if validate_job_id(id).is_err() {
+        return ToolInstallError::InvalidId;
+    }
+    let Some(pins) = pins else {
+        return ToolInstallError::MissingPins;
+    };
+    let Ok(verified) = verify_mise(mise, pins, expected_owner) else {
+        return ToolInstallError::Unverified;
+    };
+    let addr = SocketAddr::from(([127, 0, 0, 1], TOOL_PROXY_PORT));
+    match run_tool_install(run_dir, id, verified.path(), addr) {
+        Ok(code) => std::process::exit(code),
+        Err(err) => err,
+    }
+}
+
+/// Runs `program install --locked` with the proxy variables of an egress [`Forwarder`] bound on
+/// `addr`, and returns the exit code. The forwarder is dropped before this returns.
+///
+/// # Errors
+///
+/// Returns [`ToolInstallError`] when the id is invalid, the forwarder cannot listen or the
+/// program cannot be executed.
+#[doc(hidden)]
+pub fn run_tool_install(
+    run_dir: &Path,
+    id: &str,
+    program: &Path,
+    addr: SocketAddr,
+) -> Result<i32, ToolInstallError> {
+    if validate_job_id(id).is_err() {
+        return Err(ToolInstallError::InvalidId);
+    }
+    let socket = socket_path(run_dir, id).ok_or(ToolInstallError::InvalidId)?;
+    let uid = fs::metadata(run_dir.join(id)).map_or(u32::MAX, |meta| meta.uid());
+    let forwarder = Forwarder::start_on(addr, socket, uid, ForwardLimits::default())
+        .map_err(|err| ToolInstallError::Listen(err.kind()))?;
+    let proxy = format!("http://127.0.0.1:{}", forwarder.port());
+    let mut command = Command::new(program);
+    command.args(TOOL_INSTALL_ARGS);
+    apply_proxy_env(&mut command, &proxy);
+    let mut child = command
+        .spawn()
+        .map_err(|err| ToolInstallError::Exec(err.kind()))?;
+    let code = child.wait().map_or(1, exit_code);
+    drop(forwarder);
+    Ok(code)
 }
 
 #[cfg(test)]
