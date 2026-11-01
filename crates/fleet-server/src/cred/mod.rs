@@ -9,4 +9,4 @@ pub mod users;
 
 pub use api::CredentialService;
 pub use seal::{Aad, FileSealer, KeyRingError, SealError, Sealed, Sealer};
-pub use users::{NewApiToken, UserError, Users};
+pub use users::{NewApiToken, SetupRedemption, UserError, Users};

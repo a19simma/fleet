@@ -13,10 +13,11 @@ use std::time::Duration;
 
 use fleet_server::auth::BearerAuth;
 use fleet_server::config::Token;
+use fleet_server::cred::admin::{AdminCommand, run};
 use fleet_server::cred::users::Users;
 use fleet_server::service::serve_with_web;
 use fleet_server::store::Store;
-use fleet_server::web::{MAX_BODY_BYTES, SESSION_COOKIE, Web, WebAuth};
+use fleet_server::web::{AuthError, MAX_BODY_BYTES, SESSION_COOKIE, Web, WebAuth};
 use serde_json::{Value, json};
 use sqlx::PgPool;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -894,4 +895,148 @@ async fn a_login_purges_expired_and_idle_sessions(pool: PgPool) {
     assert_eq!(h.login_at(&mut authn, "alice", ORIGIN).await.status, 200);
     assert_eq!(count(&h.pool, "SELECT count(*) FROM web_sessions").await, 1);
     h.finish().await;
+}
+
+const SETTLE: Duration = Duration::from_millis(400);
+
+async fn direct_admin(
+    pool: &PgPool,
+    authn: &mut Authenticator,
+) -> (WebAuth, Users, i64, fleet_server::web::NewSession) {
+    let users = Users::new(pool.clone());
+    let auth = webauth(pool, &users, ORIGIN, Some("example.com"));
+    let code = users.issue_setup_code().await.unwrap().unwrap();
+    let code = String::from_utf8(code.expose().to_vec()).unwrap();
+    let (ceremony, options) = auth.setup_start(&code, "alice").await.unwrap();
+    let credential = authn
+        .do_registration(Url::parse(ORIGIN).unwrap(), options)
+        .unwrap();
+    let session = auth.setup_finish(&ceremony, &credential).await.unwrap();
+    let alice: i64 = sqlx::query_scalar("SELECT id FROM users WHERE username = 'alice'")
+        .fetch_one(pool)
+        .await
+        .unwrap();
+    (auth, users, alice, session)
+}
+
+async fn add_ceremony(
+    auth: &WebAuth,
+    alice: i64,
+) -> (String, webauthn_rs::prelude::RegisterPublicKeyCredential) {
+    let (ceremony, options) = auth.add_start(alice).await.unwrap();
+    let mut second = authenticator();
+    let credential = second
+        .do_registration(Url::parse(ORIGIN).unwrap(), options)
+        .unwrap();
+    (ceremony, credential)
+}
+
+#[sqlx::test]
+async fn a_reset_between_add_start_and_add_finish_leaves_no_passkey(pool: PgPool) {
+    let mut authn = authenticator();
+    let (auth, _users, alice, session) = direct_admin(&pool, &mut authn).await;
+    let (ceremony, credential) = add_ceremony(&auth, alice).await;
+    run(
+        &pool,
+        &AdminCommand::ResetPasskeys("alice".to_owned()),
+        "op",
+    )
+    .await
+    .unwrap();
+    let outcome = auth
+        .add_finish(alice, session.id.expose(), &ceremony, &credential)
+        .await;
+    assert!(matches!(outcome, Err(AuthError::Refused)));
+    assert_eq!(count(&pool, "SELECT count(*) FROM passkeys").await, 0);
+}
+
+#[sqlx::test]
+async fn add_finish_waits_for_the_user_lock_and_loses_to_a_reset(pool: PgPool) {
+    let mut authn = authenticator();
+    let (auth, _users, alice, session) = direct_admin(&pool, &mut authn).await;
+    let (ceremony, credential) = add_ceremony(&auth, alice).await;
+    let mut tx = pool.begin().await.unwrap();
+    sqlx::query("SELECT id FROM users WHERE id = $1 FOR UPDATE")
+        .bind(alice)
+        .fetch_one(&mut *tx)
+        .await
+        .unwrap();
+    let cookie = session.id.expose().to_vec();
+    let racer = tokio::spawn(async move {
+        auth.add_finish(alice, &cookie, &ceremony, &credential)
+            .await
+    });
+    tokio::time::sleep(SETTLE).await;
+    assert!(!racer.is_finished(), "add_finish ran without the user lock");
+    sqlx::query("DELETE FROM passkeys WHERE user_id = $1")
+        .bind(alice)
+        .execute(&mut *tx)
+        .await
+        .unwrap();
+    sqlx::query("DELETE FROM web_sessions WHERE user_id = $1")
+        .bind(alice)
+        .execute(&mut *tx)
+        .await
+        .unwrap();
+    tx.commit().await.unwrap();
+    let outcome = tokio::time::timeout(WAIT, racer).await.unwrap().unwrap();
+    assert!(matches!(outcome, Err(AuthError::Refused)));
+    assert_eq!(count(&pool, "SELECT count(*) FROM passkeys").await, 0);
+}
+
+#[sqlx::test]
+async fn add_finish_with_a_live_session_stores_the_passkey(pool: PgPool) {
+    let mut authn = authenticator();
+    let (auth, _users, alice, session) = direct_admin(&pool, &mut authn).await;
+    let (ceremony, credential) = add_ceremony(&auth, alice).await;
+    auth.add_finish(alice, session.id.expose(), &ceremony, &credential)
+        .await
+        .unwrap();
+    assert_eq!(count(&pool, "SELECT count(*) FROM passkeys").await, 2);
+}
+
+#[sqlx::test]
+async fn a_failing_passkey_insert_during_setup_leaves_no_admin_and_no_delete(pool: PgPool) {
+    let users = Users::new(pool.clone());
+    let auth = webauth(&pool, &users, ORIGIN, Some("example.com"));
+    let mut authn = authenticator();
+    let code = users.issue_setup_code().await.unwrap().unwrap();
+    let code = String::from_utf8(code.expose().to_vec()).unwrap();
+    let (ceremony, options) = auth.setup_start(&code, "alice").await.unwrap();
+    let credential = authn
+        .do_registration(Url::parse(ORIGIN).unwrap(), options)
+        .unwrap();
+    let bootstrap = users.bootstrap_user().await.unwrap();
+    sqlx::query("INSERT INTO passkeys (user_id, credential_id, public_key) VALUES ($1, $2, $3)")
+        .bind(bootstrap)
+        .bind(credential.raw_id.as_ref())
+        .bind(b"x".as_slice())
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query(
+        "CREATE FUNCTION refuse_user_delete() RETURNS trigger LANGUAGE plpgsql AS \
+         $$ BEGIN RAISE EXCEPTION 'user delete'; END $$",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "CREATE TRIGGER refuse_user_delete BEFORE DELETE ON users \
+         FOR EACH ROW EXECUTE FUNCTION refuse_user_delete()",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+    let outcome = auth.setup_finish(&ceremony, &credential).await;
+    assert!(outcome.is_err());
+    assert_eq!(
+        count(
+            &pool,
+            "SELECT count(*) FROM users WHERE lower(username) <> 'bootstrap'"
+        )
+        .await,
+        0
+    );
+    assert!(!users.has_real_users().await.unwrap());
 }

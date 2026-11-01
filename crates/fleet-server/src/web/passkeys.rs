@@ -43,7 +43,10 @@ const KEYS_LOCKED: &str =
 const UPDATE_KEY: &str = "UPDATE passkeys SET public_key = $2 WHERE credential_id = $1";
 const INSERT_KEY: &str =
     "INSERT INTO passkeys (user_id, credential_id, public_key) VALUES ($1, $2, $3)";
-const DELETE_USER: &str = "DELETE FROM users WHERE id = $1";
+const LOCK_USER: &str = "SELECT id FROM users WHERE id = $1 FOR UPDATE";
+const LIVE_SESSION: &str = "\
+SELECT 1 FROM web_sessions WHERE id_hash = sha256($1::bytea) AND user_id = $2 \
+AND expires_at > now() AND last_seen > now() - ($3::bigint * interval '1 second')";
 const USERNAME_OF: &str = "SELECT username FROM users WHERE id = $1";
 const INSERT_SESSION: &str = "\
 INSERT INTO web_sessions (id_hash, user_id, csrf, expires_at) \
@@ -318,6 +321,10 @@ impl WebAuth {
     ///
     /// Returns [`AuthError::Refused`] when the ceremony is unknown or replayed, verification
     /// fails or the setup code is wrong or already spent.
+    #[expect(
+        clippy::significant_drop_tightening,
+        reason = "commit consumes the redemption; the lint cannot see the move"
+    )]
     pub async fn setup_finish(
         &self,
         ceremony: &str,
@@ -334,18 +341,15 @@ impl WebAuth {
         let passkey = self
             .webauthn
             .finish_passkey_registration(credential, &state)?;
-        let user_id = self.users.redeem_setup(code.expose(), &username).await?;
-        if let Err(err) = self.store_key(user_id, &passkey).await {
-            if let Err(cleanup) = sqlx::query(DELETE_USER)
-                .bind(user_id)
-                .execute(&self.pool)
-                .await
-            {
-                tracing::error!(%cleanup, "could not remove the admin left without a passkey");
-            }
-            return Err(err);
-        }
-        self.open_session(user_id).await
+        let mut redemption = self
+            .users
+            .begin_redeem_setup(code.expose(), &username)
+            .await?;
+        let user_id = redemption.user_id();
+        store_key_on(redemption.conn(), user_id, &passkey).await?;
+        let session = insert_session(redemption.conn(), user_id, None).await?;
+        redemption.commit().await?;
+        Ok(session)
     }
 
     /// Starts passkey registration for the user an admin issued `code` to. The code is
@@ -453,13 +457,18 @@ impl WebAuth {
 
     /// Finishes adding a passkey. `user_id` must be the user who started the ceremony.
     ///
+    /// The user row is locked in one transaction with the insert, and `cookie` must still
+    /// name a live session of that user under the lock, so a reset that ran after the
+    /// ceremony started cannot be undone by this insert.
+    ///
     /// # Errors
     ///
     /// Returns [`AuthError::Refused`] for an unknown or replayed ceremony, another user's
-    /// ceremony or a failed verification.
+    /// ceremony, a failed verification, a missing user or a session that ended.
     pub async fn add_finish(
         &self,
         user_id: i64,
+        cookie: &[u8],
         ceremony: &str,
         credential: &RegisterPublicKeyCredential,
     ) -> Result<(), AuthError> {
@@ -476,7 +485,22 @@ impl WebAuth {
         let passkey = self
             .webauthn
             .finish_passkey_registration(credential, &state)?;
-        self.store_key(user_id, &passkey).await
+        let mut tx = self.pool.begin().await?;
+        sqlx::query(LOCK_USER)
+            .bind(user_id)
+            .fetch_optional(&mut *tx)
+            .await?
+            .ok_or(AuthError::Refused)?;
+        sqlx::query(LIVE_SESSION)
+            .bind(cookie)
+            .bind(user_id)
+            .bind(SESSION_IDLE_SECS)
+            .fetch_optional(&mut *tx)
+            .await?
+            .ok_or(AuthError::Refused)?;
+        store_key_on(&mut tx, user_id, &passkey).await?;
+        tx.commit().await?;
+        Ok(())
     }
 
     /// Starts a login for `username`, matched without regard to letter case.
@@ -601,18 +625,6 @@ impl WebAuth {
             .iter()
             .map(|blob| serde_json::from_slice(blob).map_err(AuthError::from))
             .collect()
-    }
-
-    async fn store_key(&self, user_id: i64, key: &Passkey) -> Result<(), AuthError> {
-        let mut conn = self.pool.acquire().await?;
-        store_key_on(&mut conn, user_id, key).await
-    }
-
-    async fn open_session(&self, user_id: i64) -> Result<NewSession, AuthError> {
-        let mut tx = self.pool.begin().await?;
-        let session = insert_session(&mut tx, user_id, None).await?;
-        tx.commit().await?;
-        Ok(session)
     }
 }
 

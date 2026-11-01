@@ -11,7 +11,7 @@ use chacha20poly1305::aead::rand_core::RngCore;
 use fleet_core::constant_time_eq;
 use fleet_core::credential::Secret;
 use sqlx::PgPool;
-use tokio::sync::{Mutex, OnceCell};
+use tokio::sync::{Mutex, OnceCell, OwnedMutexGuard};
 
 /// The reserved name of the lazily created owner of legacy jobs.
 pub const BOOTSTRAP_USERNAME: &str = "bootstrap";
@@ -132,6 +132,37 @@ impl fmt::Debug for NewApiToken {
     }
 }
 
+/// An admin user created in an open transaction, with the setup code still held.
+pub struct SetupRedemption {
+    tx: sqlx::Transaction<'static, sqlx::Postgres>,
+    slot: OwnedMutexGuard<Option<Secret>>,
+    user_id: i64,
+}
+
+impl SetupRedemption {
+    /// The id of the user created in the transaction.
+    pub const fn user_id(&self) -> i64 {
+        self.user_id
+    }
+
+    /// The connection of the open transaction.
+    pub fn conn(&mut self) -> &mut sqlx::PgConnection {
+        &mut self.tx
+    }
+
+    /// Commits the transaction and spends the setup code.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`UserError::Db`] when the commit fails; the code stays in place.
+    pub async fn commit(self) -> Result<(), UserError> {
+        let Self { tx, mut slot, .. } = self;
+        tx.commit().await?;
+        *slot = None;
+        Ok(())
+    }
+}
+
 /// Users, API tokens and the in-memory setup code over one pool.
 #[derive(Clone)]
 pub struct Users {
@@ -213,8 +244,33 @@ impl Users {
     ///
     /// Returns [`UserError::BadSetupCode`], [`UserError::SetupClosed`], a username error or
     /// [`UserError::Db`].
+    #[expect(
+        clippy::significant_drop_tightening,
+        reason = "commit consumes the redemption; the lint cannot see the move"
+    )]
     pub async fn redeem_setup(&self, code: &[u8], username: &str) -> Result<i64, UserError> {
-        let mut slot = self.setup.lock().await;
+        let redemption = self.begin_redeem_setup(code, username).await?;
+        let id = redemption.user_id();
+        redemption.commit().await?;
+        Ok(id)
+    }
+
+    /// Creates the admin user inside an open transaction and holds the setup code.
+    ///
+    /// The caller stores the first passkey through [`SetupRedemption::conn`] and then calls
+    /// [`SetupRedemption::commit`]. Dropping the redemption rolls back the user and leaves
+    /// the code in place, so no admin exists without a passkey.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`UserError::BadSetupCode`], [`UserError::SetupClosed`], a username error or
+    /// [`UserError::Db`].
+    pub async fn begin_redeem_setup(
+        &self,
+        code: &[u8],
+        username: &str,
+    ) -> Result<SetupRedemption, UserError> {
+        let mut slot = Arc::clone(&self.setup).lock_owned().await;
         let matches = slot
             .as_ref()
             .is_some_and(|issued| constant_time_eq(issued.expose(), code));
@@ -239,10 +295,11 @@ impl Users {
                 sqlx::Error::Database(db) if db.is_unique_violation() => UserError::Taken,
                 _ => UserError::Db(e),
             })?;
-        tx.commit().await?;
-        *slot = None;
-        drop(slot);
-        Ok(id)
+        Ok(SetupRedemption {
+            tx,
+            slot,
+            user_id: id,
+        })
     }
 
     /// The id of the `bootstrap` user that `FLEET_CLIENT_TOKEN` acts as.
