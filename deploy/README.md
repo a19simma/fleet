@@ -143,6 +143,76 @@ Wired: the unit, tmpfiles, the swap module, the guard subcommand, the health mar
 
 Unverified, no live run: `systemd-analyze verify` on the changed unit; that `ReadWritePaths=-/var/lib/fleet/bin` makes the path writable for `fleetd`; that systemd-tmpfiles `L` leaves an existing `current` alone after a swap; `rename(2)` over a symlink on the target host; the unpacked layout against a real cargo-dist archive (the reader takes the single entry named `fleetd` at any depth and rejects pax headers).
 
+### Self-update runbook
+
+Design: `docs/adr/0047-fleetd-self-update.md`. This section is the operator view and names the code each rule comes from.
+
+Status, stated plainly: nothing in the update path has run on a real box. The pieces are unit and process tested against temp dirs and fakes only. Two gaps are known. `fleetd` has no code that reads `HeartbeatReply.update_manifest` (`grep update_manifest crates/fleetd/src` finds nothing), so no running daemon polls, verifies, stages and applies a manifest by itself; `Updater::apply` has no caller in the daemon. The release workflow (`.github/workflows/release.yml`) has no step that signs archives or writes a manifest. Every step below that needs those two pieces is a procedure for when they exist, and is marked as such.
+
+#### Trust root
+
+- Path: `/etc/fleetd/update.pub` (`DEFAULT_TRUST_ROOT` in `crates/fleetd/src/update.rs`). Content: one minisign public key file, at most 1024 bytes (`MAX_TRUST_ROOT_BYTES`), UTF-8.
+- Needed owner and mode: a regular file owned by root (uid 0, `ROOT_UID`) whose mode has no group or other write bit (`mode & 0o022 == 0`). The same two checks apply to its parent directory, `/etc/fleetd`. A symlink at the path is refused (`O_NOFOLLOW`). `load_trust_root` returns `TrustRootWritable`, `TrustRootOwner`, `TrustRootNotRegular`, `TrustRootTooLarge` or `TrustRootInvalid` and the update stops. ADR-0047 asks for 0644 root-owned.
+- Install: put the public half of the release key there as root, for example `sudo install -o root -g root -m 0644 update.pub /etc/fleetd/update.pub` with `/etc/fleetd` root-owned and 0755. Bake it into the Template so every Box starts with it. The `fleetd` user must not be able to write either path, so a compromised daemon cannot widen what it trusts.
+- Rotate: the manifest signature is checked against this one file, so a new key means a new file on every Box. There is no multi-key or key-rollover support in `load_trust_root`. Replace the file as root (write beside it, then `mv` over it) on each Box or rebuild the Template, and publish manifests signed by the new key only after every Box holds it. A Box still on the old key refuses the new manifest with a `Signature` error and stays on its running version.
+- The same loader checks the key that verifies the bundled mise binary (`crates/fleetd/src/tools.rs`, ADR-0048), so rotating the file affects both.
+
+#### Signing
+
+- Tool: minisign. `minisign_verify` 0.3 in `crates/fleetd/Cargo.toml` verifies. It accepts prehashed signatures only (`verify_manifest` calls `verify(manifest, &sig, false)`), so sign with the prehash flag.
+- What is signed: the exact bytes of the manifest file. `verify_manifest` checks the size caps, then the signature over those bytes, and only then parses the JSON, so an unsigned body is never parsed. The archives are not signed by fleetd's check: the signed manifest carries each archive's sha256 and size, and staging checks both (`crates/fleetd/src/update.rs`, `stage`). The `.minisig` per archive that ADR-0047 lists is not read by any fleetd code.
+- Manifest shape (`RawManifest` in `update.rs`, unknown fields refused, duplicate keys refused):
+
+```json
+{
+  "version": "<semver, newer than the running version>",
+  "min_protocol": 1,
+  "seq": 1,
+  "targets": {
+    "<target name>": {"sha256": "<64 lowercase hex>", "size": 12345, "url": "https://..."}
+  }
+}
+```
+
+  `targets` holds 1 to 16 entries. A target name is 1 to 64 bytes of `a-z`, `0-9`, `_`, `-`, `.`. `size` is 1 to 268435456 bytes (`MAX_ARCHIVE_BYTES`). `url` is optional in the schema but staging refuses a target without one (`NoUrl`); it must start with `https://`, stay under 2048 bytes, and pass the box egress policy. The manifest is at most 16384 bytes and the signature at most 1024 bytes (`MAX_MANIFEST_BYTES`, `MAX_SIGNATURE_BYTES` in `crates/fleet-proto/src/lib.rs`). Which target name a Box looks up is unverified, because the daemon side that picks it is not wired.
+- Accept rules (`Policy`, `verify_manifest`): `seq` strictly greater than the last accepted `seq` (kept in `update_seq` under the bin dir), `version` newer than the running one (`version_is_newer`), `min_protocol` not above what this fleetd serves.
+- Archive layout: `fleetd-<target>.tar.gz` holding exactly one entry named `fleetd` (`crates/fleetd/src/update/unpack.rs`). Links, absolute paths, `..`, pax headers and non-regular entries refuse the archive.
+- Sign and publish, as a procedure for a release holder:
+  1. Build the cargo-dist archives and compute `sha256sum` and the byte size of each.
+  2. Write `manifest.json` in the shape above with `seq` one higher than the last published value. Never reuse or lower a `seq`: fleetd then rejects the manifest forever.
+  3. `minisign -S -H -s <release secret key> -m manifest.json` writes `manifest.json.minisig`. Check it with `minisign -V -p update.pub -m manifest.json` before publishing.
+  4. Upload the archives to the `https://` urls named in the manifest.
+  5. Copy `manifest.json` and `manifest.json.minisig` side by side onto the server host and set `FLEET_UPDATE_MANIFEST` to the manifest path (`crates/fleet-server/src/config.rs`). The server reads the signature from the same path with `.minisig` appended (`UpdateRelay::load` in `crates/fleet-server/src/service.rs`), relays both in `HeartbeatReply.update_manifest` and `update_signature`, and never signs. It drops the pair when a file is missing, the manifest is not JSON, or either is over its cap. The server never holds the release key, so a compromised server can withhold or replay a manifest and cannot forge one. A replay fails the `seq` check.
+
+#### Update flow
+
+1. The Box heartbeat reply carries the signed pair. Daemon side: not wired (see Status).
+2. fleetd verifies the pair against `/etc/fleetd/update.pub` and the policy above.
+3. Drain: claiming pauses and the drain waits until no lease is held. After 30 minutes (`DRAIN_CAP`, `crates/fleetd/src/update/drain.rs`) the attempt aborts and claiming resumes. The drain never kills a job.
+4. Stage: fleetd downloads the archive through the egress policy, checks size and sha256 against the manifest, and stores it as `/var/lib/fleet/bin/<ver>/fleetd.tar.gz` (dir 0700 while staging, `crates/fleetd/src/update.rs`). `Swapper::unpack` writes `<ver>/fleetd` (0755) and opens the dir to 0755.
+5. Swap: `Swapper` renames `previous` to the old `current` target, then flips `current` with `rename(2)` over a temp symlink (`crates/fleetd/src/update/swap.rs`).
+6. Restart: `RestartSignal` ends the daemon run with exit 0 and `Restart=always` (`deploy/fleetd-systemd.service`) starts the binary behind `/var/lib/fleet/bin/current/fleetd`. `Updater::apply` refuses a version listed in `bad_versions`.
+
+#### Rollback
+
+- Guard: `ExecStartPre=-/usr/local/bin/fleetd update-guard` in the unit runs the baked, root-owned binary, never `current`. It always exits 0. The `-` prefix lets the daemon start even if the guard cannot run. Its state files are in `/var/lib/fleet/bin`: `health`, `starts`, `bad_versions` (`crates/fleetd/src/update/guard.rs`).
+- Count: each start of an unproven `current` raises `starts`. `MAX_UNHEALTHY_STARTS = 3`: starts 1 to 3 are counted and the 4th start of that version rolls back.
+- Health marker: the new daemon writes `health` with its version after it sent `READY=1` and one heartbeat the server accepted (`HealthGate` in `crates/fleetd/src/update/restart.rs`). A daemon with no `FLEET_SERVER_URL` never marks itself healthy.
+- Rollback action: the guard appends the failed version to `bad_versions` (kept to the last 64), moves `current` back to `previous`, writes `health` for the restored version and clears `starts`. It does nothing when `previous` is missing, equals `current`, or is itself in `bad_versions`, and it does nothing when `current` is the `/usr/local/bin` seed. The first update off the seed therefore has no rollback target.
+- Check state: `sudo -u fleetd /usr/local/bin/fleetd update-guard` prints one outcome line, but it also counts a start, so prefer `ls -l /var/lib/fleet/bin` and `cat /var/lib/fleet/bin/{health,starts,bad_versions}`.
+- Manual rollback: on the Box, as the owner of `/var/lib/fleet/bin` (`fleetd`), flip the link the same way `Swapper` does: `ln -s <previous version> /var/lib/fleet/bin/.current.tmp && mv -T /var/lib/fleet/bin/.current.tmp /var/lib/fleet/bin/current`, where `<previous version>` is the target shown by `readlink /var/lib/fleet/bin/previous`, then `sudo systemctl restart fleetd`. Add the bad version to `bad_versions` (one version per line) so `Updater::apply` refuses it, and write that version to `health` only if it should count as proven. The `mv -T` form is an assumption about GNU coreutils on the Box and is unverified.
+- Server side stop: remove `FLEET_UPDATE_MANIFEST` from the server environment and restart the server, or replace the manifest with one carrying a higher `seq`. Boxes already on the new version do not downgrade: the `seq` and version checks refuse an older manifest.
+
+#### Release key custody
+
+- Location: the private key lives offline (an encrypted removable drive or a hardware token held by the release owner) or as a secret of a protected CI environment that only the release workflow can read. It never lives on the fleet server, on a Box, or in this repository. ADR-0047 fixes this rule. The CI route does not exist yet, since `release.yml` signs nothing.
+- Who may sign: the release owner named by the repository owner, and one backup holder. Signing needs a passphrase for the key. Keep the passphrase apart from the key file.
+- Storage: two copies of the encrypted key on separate offline media in separate places. Keep the public key in the repository and in the Template.
+- Rotation: generate a new key pair, ship the new `update.pub` to every Box as in Trust root, publish manifests signed by the new key, then destroy the old key. Plan a rotation before a Template rebuild, since a rebuild resets the Box to the baked key and binary.
+- Compromise response: a leaked key lets an attacker ship a binary to every Box that fetches a manifest signed by it, and this is the one failure ADR-0047 names as fleet-wide. Steps: remove `FLEET_UPDATE_MANIFEST` from the server at once so no manifest is relayed; generate a new key; rebuild the Template with the new `update.pub` and replace Boxes, or replace the file on each Box as root; publish a manifest signed by the new key with a higher `seq`. A Box that already took a malicious binary runs it as `fleetd`, so treat the Box and its credentials as lost. A Box still holding the old key will accept any manifest signed by the leaked key until its file is replaced, and a higher `seq` signed with the leaked key outranks yours. Do not trust the old key again.
+
+Unverified, no live run: the whole runbook on a real Box; `minisign -S -H` output against `minisign_verify` 0.3 prehash handling on a real manifest; the manual rollback commands; the file mode of the staged `fleetd.tar.gz` after publish; whether the egress policy admits the release host (ADR-0047 lists this too); the CI signing route.
+
 ### Install order
 
 1. Install a system-wide Claude (see [Claude install](#claude-install)).
