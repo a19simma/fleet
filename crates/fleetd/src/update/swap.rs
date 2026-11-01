@@ -119,6 +119,12 @@ impl Swapper {
         self
     }
 
+    /// The bin root this swapper works under.
+    #[must_use]
+    pub fn bin_root(&self) -> &Path {
+        &self.bin_root
+    }
+
     fn require_dir(path: &Path, modes: &[u32]) -> Result<(), SwapError> {
         let meta = fs::symlink_metadata(path).map_err(|err| {
             if err.kind() == io::ErrorKind::NotFound {
@@ -223,6 +229,53 @@ impl Swapper {
             Some(text) if validate_stage_version(text).is_ok() => Ok(Some(text.to_owned())),
             _ => Ok(None),
         }
+    }
+
+    /// The version `current` points at, or `None` when it is absent or not a version name.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SwapError::UnsafeLink`] when `current` exists and is not a symlink.
+    pub fn current_version(&self) -> Result<Option<Version>, SwapError> {
+        self.link_version(CURRENT_LINK)
+    }
+
+    /// The version `previous` points at, or `None` when it is absent or not a version name.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SwapError::UnsafeLink`] when `previous` exists and is not a symlink.
+    pub fn previous_version(&self) -> Result<Option<Version>, SwapError> {
+        self.link_version(PREVIOUS_LINK)
+    }
+
+    fn link_version(&self, name: &str) -> Result<Option<Version>, SwapError> {
+        Ok(self
+            .read_link_target(name)?
+            .and_then(|text| Version::new(&text).ok()))
+    }
+
+    /// Points `current` back at `previous` and drops `previous`, so a rollback never leaves a
+    /// link to the version it just left. Returns the restored version.
+    ///
+    /// `previous` must name a version directory that holds an unpacked binary. On any error
+    /// both links are as they were.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SwapError::NotStaged`] when `previous` is absent or its binary is missing, or
+    /// another [`SwapError`].
+    pub fn rollback(&self) -> Result<Version, SwapError> {
+        let version = self.previous_version()?.ok_or(SwapError::NotStaged)?;
+        let dir = self.version_dir(&version)?;
+        match fs::symlink_metadata(dir.join(BINARY_FILE)) {
+            Ok(meta) if meta.file_type().is_file() => {}
+            Ok(_) | Err(_) => return Err(SwapError::NotStaged),
+        }
+        self.point(CURRENT_TEMP, CURRENT_LINK, version.as_str())?;
+        remove_if_present(&self.bin_root.join(PREVIOUS_LINK))?;
+        Self::sync_dir(&self.bin_root)?;
+        Ok(version)
     }
 
     fn point(&self, temp: &str, name: &str, target: &str) -> Result<(), SwapError> {

@@ -27,6 +27,7 @@ use crate::store::Store;
 use crate::system::read_identity;
 use crate::systemd;
 use crate::toolhook::HookHub;
+use crate::update::{DEFAULT_BIN_ROOT, RestartSignal, UpdateWiring};
 
 const DEFAULT_WATCHDOG_PERIOD: Duration = Duration::from_secs(20);
 const MIN_WATCHDOG_PERIOD: Duration = Duration::from_millis(1);
@@ -210,10 +211,15 @@ async fn first_exit(
     tasks: &mut JoinSet<ListenerExit>,
     poller: &mut Option<JoinHandle<()>>,
     heartbeat: &mut Option<JoinHandle<()>>,
+    restart: &RestartSignal,
     shutdown: impl Future<Output = ()>,
 ) -> Result<(), Error> {
     tokio::select! {
         () = shutdown => Ok(()),
+        () = restart.requested() => {
+            tracing::info!("update applied, exiting for restart");
+            Ok(())
+        }
         Some(joined) = tasks.join_next() => listener_exit(joined),
         joined = exited(poller, "poller") => listener_exit(joined),
         joined = exited(heartbeat, "heartbeat") => listener_exit(joined),
@@ -354,8 +360,12 @@ pub async fn run_with_env(
         },
     )
     .await?;
+    let update = UpdateWiring::for_bin_root(DEFAULT_BIN_ROOT);
     let heartbeat = match Heartbeat::from_env(env) {
-        Ok(target) => target,
+        Ok(target) => target.map(|target| match update.health.clone() {
+            Some(health) => target.with_on_success(move || health.mark_heartbeat_ok()),
+            None => target,
+        }),
         Err(err) => {
             tracing::warn!(%err, "heartbeat disabled");
             None
@@ -368,6 +378,7 @@ pub async fn run_with_env(
         &identity.box_name,
         redactor.clone(),
         hub.clone(),
+        &update,
     ) {
         Ok(poller) => poller,
         Err(err) => {
@@ -383,6 +394,7 @@ pub async fn run_with_env(
         heartbeat,
         jobs,
         hub,
+        update,
         Path::new(systemd::DEFAULT_RUN_DIR),
         Path::new(managed_settings::DEFAULT_PATH),
         shutdown,
@@ -430,11 +442,29 @@ async fn run_with_store(
         heartbeat,
         jobs,
         HookHub::new(),
+        UpdateWiring::default(),
         Path::new(systemd::DEFAULT_RUN_DIR),
         Path::new(managed_settings::DEFAULT_PATH),
         shutdown,
     )
     .await
+}
+
+async fn stop_workers(poller: &mut Option<JoinHandle<()>>, heartbeat: &mut Option<JoinHandle<()>>) {
+    if let Some(poller) = poller.as_mut()
+        && tokio::time::timeout(JOBS_GRACE, &mut *poller)
+            .await
+            .is_err()
+    {
+        poller.abort();
+    }
+    if let Some(heartbeat) = heartbeat.as_mut()
+        && tokio::time::timeout(SHUTDOWN_GRACE, &mut *heartbeat)
+            .await
+            .is_err()
+    {
+        heartbeat.abort();
+    }
 }
 
 #[expect(
@@ -449,6 +479,7 @@ async fn run_with_hub(
     heartbeat: Option<Heartbeat>,
     jobs: Option<JobPoller>,
     hub: Arc<HookHub>,
+    update: UpdateWiring,
     run_root: &Path,
     managed_settings: &Path,
     shutdown: impl Future<Output = ()>,
@@ -514,26 +545,23 @@ async fn run_with_hub(
         let _ = sd_notify::notify(&[NotifyState::Watchdog]);
     }));
     let _ = sd_notify::notify(&[NotifyState::Ready]);
+    if let Some(health) = &update.health {
+        health.mark_ready();
+    }
 
-    let outcome = first_exit(&mut tasks, &mut poller, &mut heartbeat, shutdown).await;
+    let outcome = first_exit(
+        &mut tasks,
+        &mut poller,
+        &mut heartbeat,
+        &update.restart,
+        shutdown,
+    )
+    .await;
     tracing::info!("shutting down");
     let _ = sd_notify::notify(&[NotifyState::Stopping]);
     dog.abort();
     let _ = stop_tx.send(true);
-    if let Some(poller) = poller.as_mut()
-        && tokio::time::timeout(JOBS_GRACE, &mut *poller)
-            .await
-            .is_err()
-    {
-        poller.abort();
-    }
-    if let Some(heartbeat) = heartbeat.as_mut()
-        && tokio::time::timeout(SHUTDOWN_GRACE, &mut *heartbeat)
-            .await
-            .is_err()
-    {
-        heartbeat.abort();
-    }
+    stop_workers(&mut poller, &mut heartbeat).await;
     let drained = tokio::time::timeout(SHUTDOWN_GRACE, async {
         while tasks.join_next().await.is_some() {}
     })
@@ -660,6 +688,7 @@ mod tests {
                 &mut tasks,
                 &mut poller,
                 &mut heartbeat,
+                &RestartSignal::new(),
                 std::future::pending(),
             ),
         )
@@ -688,7 +717,14 @@ mod tests {
         let mut tasks = JoinSet::new();
         let mut poller = Some(tokio::spawn(std::future::pending()));
         let mut heartbeat = Some(tokio::spawn(std::future::pending()));
-        let outcome = first_exit(&mut tasks, &mut poller, &mut heartbeat, async {}).await;
+        let outcome = first_exit(
+            &mut tasks,
+            &mut poller,
+            &mut heartbeat,
+            &RestartSignal::new(),
+            async {},
+        )
+        .await;
         assert!(outcome.is_ok());
         assert!(poller.is_some() && heartbeat.is_some());
     }
@@ -908,6 +944,7 @@ mod tests {
             None,
             None,
             HookHub::new(),
+            UpdateWiring::default(),
             &run_root,
             Path::new(managed_settings::DEFAULT_PATH),
             std::future::pending(),
@@ -966,6 +1003,7 @@ mod tests {
             None,
             None,
             HookHub::new(),
+            UpdateWiring::default(),
             &dir.path().join("run"),
             &settings,
             tokio::time::sleep(Duration::from_millis(200)),
@@ -1101,7 +1139,14 @@ mod tests {
     async fn a_listener_finishing_is_the_fatal_exit() {
         let mut tasks = JoinSet::new();
         serve(&mut tasks, "tcp", async { Ok(()) });
-        let outcome = first_exit(&mut tasks, &mut None, &mut None, std::future::pending()).await;
+        let outcome = first_exit(
+            &mut tasks,
+            &mut None,
+            &mut None,
+            &RestartSignal::new(),
+            std::future::pending(),
+        )
+        .await;
         assert!(matches!(outcome, Err(Error::Runtime(_))));
     }
 
@@ -1110,9 +1155,60 @@ mod tests {
         let mut tasks = JoinSet::new();
         serve(&mut tasks, "tcp", std::future::pending());
         assert!(
-            first_exit(&mut tasks, &mut None, &mut None, async {})
-                .await
-                .is_ok()
+            first_exit(
+                &mut tasks,
+                &mut None,
+                &mut None,
+                &RestartSignal::new(),
+                async {}
+            )
+            .await
+            .is_ok()
         );
+    }
+
+    #[tokio::test]
+    async fn a_restart_request_ends_the_wait_cleanly_before_shutdown() {
+        let mut tasks = JoinSet::new();
+        serve(&mut tasks, "tcp", std::future::pending());
+        let restart = RestartSignal::new();
+        restart.request();
+        let outcome = first_exit(
+            &mut tasks,
+            &mut None,
+            &mut None,
+            &restart,
+            std::future::pending(),
+        )
+        .await;
+        assert!(outcome.is_ok());
+    }
+
+    #[tokio::test]
+    async fn the_daemon_returns_ok_once_a_restart_is_requested()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let dir = TempDir::new()?;
+        let store = open_store(&dir).await?;
+        let wiring = UpdateWiring::default();
+        wiring.restart.request();
+        let result = tokio::time::timeout(
+            Duration::from_secs(20),
+            run_with_hub(
+                test_config(&dir, 0)?,
+                store,
+                test_identity(),
+                Redactor::default(),
+                None,
+                None,
+                HookHub::new(),
+                wiring,
+                &dir.path().join("run"),
+                Path::new(managed_settings::DEFAULT_PATH),
+                std::future::pending(),
+            ),
+        )
+        .await?;
+        assert!(result.is_ok());
+        Ok(())
     }
 }

@@ -15,6 +15,7 @@ use fleetd::broker::Denial;
 use fleetd::fetch_policy::MAX_URL_BYTES;
 use fleetd::jobsock::{ServiceName, connect, read_frame, socket_path, write_frame};
 use fleetd::systemd::DEFAULT_RUN_DIR;
+use fleetd::update::{DEFAULT_BIN_ROOT, Guard, GuardOutcome};
 use fleetd::{Config, Error, Signals, askpass, dump, run, run_hook};
 use serde::Deserialize;
 use tokio::io::BufReader;
@@ -90,6 +91,13 @@ enum Command {
         #[arg(long, default_value = DEFAULT_RUN_DIR)]
         run_dir: PathBuf,
     },
+    /// Count this start of the current version and roll back to the previous one when it never
+    /// proved healthy, as the unit's `ExecStartPre` does. Always exits 0 so the unit starts.
+    UpdateGuard {
+        /// Directory holding the version directories, `current` and `previous`.
+        #[arg(long, default_value = DEFAULT_BIN_ROOT)]
+        bin_root: PathBuf,
+    },
     /// Report a finished pueue task. Not implemented yet.
     PueueCallback {
         /// pueue task id.
@@ -97,6 +105,18 @@ enum Command {
         /// pueue group.
         group: String,
     },
+}
+
+fn guard_line(outcome: &GuardOutcome) -> String {
+    match outcome {
+        GuardOutcome::NoCurrent => "no versioned binary is current".to_owned(),
+        GuardOutcome::Healthy => "current version is healthy".to_owned(),
+        GuardOutcome::Counted(count) => format!("start {count} of the current version"),
+        GuardOutcome::RolledBack { from, to } => format!("rolled back from {from} to {to}"),
+        GuardOutcome::NoPrevious => "no previous version to roll back to".to_owned(),
+        GuardOutcome::PreviousRefused => "previous version is recorded as bad".to_owned(),
+        GuardOutcome::Failed(why) => format!("failed: {why}"),
+    }
 }
 
 async fn execute(cli: Cli) -> Result<ExitCode, Error> {
@@ -119,6 +139,11 @@ async fn execute(cli: Cli) -> Result<ExitCode, Error> {
                 eprintln!("fleetd hook: {err}");
             }
             std::process::exit(0)
+        }
+        Command::UpdateGuard { bin_root } => {
+            let outcome = Guard::new(bin_root).run();
+            eprintln!("fleetd update-guard: {}", guard_line(&outcome));
+            Ok(ExitCode::SUCCESS)
         }
         Command::Askpass { prompt } => Ok(askpass_reply(&prompt)),
         Command::Fetch { args } => {

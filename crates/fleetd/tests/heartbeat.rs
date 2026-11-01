@@ -5,6 +5,7 @@
 use std::collections::HashMap;
 use std::io::Write;
 use std::net::SocketAddr;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -215,9 +216,17 @@ async fn failure_warns_without_the_token_and_keeps_running() {
             .finish(),
     );
     let (stop, stopped) = oneshot::channel::<()>();
-    let task = tokio::spawn(target(closed).run(identity(), queue(0, 0), async move {
-        let _ = stopped.await;
-    }));
+    let hook_calls = Arc::new(AtomicUsize::new(0));
+    let hooked = Arc::clone(&hook_calls);
+    let task = tokio::spawn(
+        target(closed)
+            .with_on_success(move || {
+                hooked.fetch_add(1, Ordering::SeqCst);
+            })
+            .run(identity(), queue(0, 0), async move {
+                let _ = stopped.await;
+            }),
+    );
 
     for _ in 0..2 {
         tokio::time::timeout(WIDE, writes.recv())
@@ -233,6 +242,7 @@ async fn failure_warns_without_the_token_and_keeps_running() {
     assert!(logs.contains("WARN"), "logs were {logs:?}");
     assert!(logs.contains("heartbeat failed"), "logs were {logs:?}");
     assert!(!logs.contains(TOKEN));
+    assert_eq!(hook_calls.load(Ordering::SeqCst), 0);
 }
 
 fn env_of(pairs: &[(&str, &str)]) -> impl Fn(&str) -> Option<String> {
@@ -294,4 +304,26 @@ async fn store_snapshot_counts_and_ages_the_queue() {
         "age was {}",
         snap.oldest_age_s
     );
+}
+
+#[tokio::test]
+async fn the_success_hook_runs_once_per_accepted_heartbeat() {
+    let (addr, mut rx) = stub();
+    let calls = Arc::new(AtomicUsize::new(0));
+    let seen = Arc::clone(&calls);
+    let (stop, stopped) = oneshot::channel::<()>();
+    let task = tokio::spawn(
+        target(addr)
+            .with_on_success(move || {
+                seen.fetch_add(1, Ordering::SeqCst);
+            })
+            .run(identity(), queue(0, 0), async move {
+                let _ = stopped.await;
+            }),
+    );
+    next(&mut rx).await;
+    next(&mut rx).await;
+    stop.send(()).unwrap();
+    task.await.unwrap();
+    assert!(calls.load(Ordering::SeqCst) >= 1);
 }

@@ -10,6 +10,7 @@ Group=fleetd
 SupplementaryGroups=fleet-work
 EnvironmentFile=-/etc/swarm/box.env
 EnvironmentFile=-/etc/swarm/secrets.env
+ExecStartPre=-/usr/local/bin/fleetd update-guard
 ExecStart=/var/lib/fleet/bin/current/fleetd serve
 Restart=always
 RestartSec=2
