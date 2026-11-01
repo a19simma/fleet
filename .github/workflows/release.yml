@@ -40,6 +40,7 @@ permissions:
 # will be marked as a prerelease.
 on:
   pull_request:
+  workflow_dispatch:
   push:
     tags:
       - '**[0-9]+.[0-9]+.[0-9]+*'
@@ -52,7 +53,7 @@ jobs:
       val: ${{ steps.plan.outputs.manifest }}
       tag: ${{ !github.event.pull_request && github.ref_name || '' }}
       tag-flag: ${{ !github.event.pull_request && format('--tag={0}', github.ref_name) || '' }}
-      publishing: ${{ !github.event.pull_request }}
+      publishing: ${{ github.event_name == 'push' && github.ref_type == 'tag' }}
     env:
       GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
     steps:
@@ -277,6 +278,99 @@ jobs:
           echo "$ANNOUNCEMENT_BODY" > $RUNNER_TEMP/notes.txt
 
           gh release create "${{ needs.plan.outputs.tag }}" --target "$RELEASE_COMMIT" $PRERELEASE_FLAG --title "$ANNOUNCEMENT_TITLE" --notes-file "$RUNNER_TEMP/notes.txt" artifacts/*
+
+  update-manifest-dry-run:
+    if: ${{ github.event_name == 'pull_request' || github.event_name == 'workflow_dispatch' }}
+    permissions:
+      contents: read
+    runs-on: "ubuntu-22.04"
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+      - name: Install minisign
+        run: sudo apt-get update && sudo apt-get install -y minisign
+      - name: Test the manifest script
+        run: python3 -m unittest discover -s .github/scripts -p 'test_*.py'
+      - name: Build fixture archives
+        run: |
+          mkdir fixture
+          for target in x86_64-unknown-linux-musl aarch64-unknown-linux-musl; do
+            work=$(mktemp -d)
+            head -c 4096 /dev/urandom > "$work/fleetd"
+            tar -czf "fixture/fleetd-$target.tar.gz" -C "$work" fleetd
+          done
+      - name: Write the manifest
+        run: .github/scripts/build_release_manifest.sh fixture v0.0.0-dryrun.1 1 "$GITHUB_REPOSITORY" manifest.json
+      - name: Sign with a throwaway key and verify
+        run: |
+          echo "::notice::dry run: signing with a key generated for this run, not the release key"
+          minisign -G -W -p dry.pub -s dry.key
+          minisign -S -H -s dry.key -m manifest.json
+          minisign -V -p dry.pub -m manifest.json
+          test "$(sed -n 2p manifest.json.minisig | base64 -d | head -c 2)" = "ED"
+          printf ' ' >> manifest.json
+          if minisign -V -p dry.pub -m manifest.json; then
+            echo "::error::a tampered manifest verified"
+            exit 1
+          fi
+
+  sign-update-manifest:
+    needs:
+      - plan
+      - host
+    if: ${{ needs.host.result == 'success' && needs.plan.outputs.publishing == 'true' && github.event_name == 'push' && github.ref_type == 'tag' }}
+    permissions:
+      contents: write
+    runs-on: "ubuntu-22.04"
+    env:
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      TAG: ${{ needs.plan.outputs.tag }}
+      SIGNING_KEY: ${{ secrets.FLEET_UPDATE_SIGNING_KEY }}
+      SIGNING_PASSWORD: ${{ secrets.FLEET_UPDATE_SIGNING_PASSWORD }}
+      UPDATE_PUBLIC_KEY: ${{ vars.FLEET_UPDATE_PUBLIC_KEY }}
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+      - name: Require the signing key
+        run: |
+          if [ -z "$SIGNING_KEY" ]; then
+            echo "::error::secret FLEET_UPDATE_SIGNING_KEY is not set, so no update manifest was signed. The release exists without a manifest and no Box will update from it."
+            exit 1
+          fi
+      - name: Install minisign
+        run: sudo apt-get update && sudo apt-get install -y minisign
+      - name: Fetch archives
+        uses: actions/download-artifact@v8
+        with:
+          pattern: artifacts-*
+          path: artifacts
+          merge-multiple: true
+      - name: Write the manifest
+        run: .github/scripts/build_release_manifest.sh artifacts "$TAG" "$GITHUB_RUN_NUMBER" "$GITHUB_REPOSITORY" manifest.json
+      - name: Sign
+        run: |
+          umask 077
+          key=$(mktemp)
+          trap 'rm -f "$key"' EXIT
+          printf '%s\n' "$SIGNING_KEY" > "$key"
+          if [ -n "$SIGNING_PASSWORD" ]; then
+            printf '%s\n' "$SIGNING_PASSWORD" | minisign -S -H -s "$key" -m manifest.json
+          else
+            minisign -S -H -W -s "$key" -m manifest.json
+          fi
+          test "$(sed -n 2p manifest.json.minisig | base64 -d | head -c 2)" = "ED"
+      - name: Verify
+        run: |
+          if [ -z "$UPDATE_PUBLIC_KEY" ]; then
+            echo "::notice::variable FLEET_UPDATE_PUBLIC_KEY is not set, so the signature was not verified in CI"
+            exit 0
+          fi
+          printf '%s\n' "$UPDATE_PUBLIC_KEY" > release.pub
+          minisign -V -p release.pub -m manifest.json
+      - name: Upload manifest and signature
+        run: gh release upload "$TAG" manifest.json manifest.json.minisig
 
   announce:
     needs:

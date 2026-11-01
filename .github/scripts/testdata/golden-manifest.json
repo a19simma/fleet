@@ -1,0 +1,17 @@
+{
+  "version": "1.2.3",
+  "min_protocol": 1,
+  "seq": 7,
+  "targets": {
+    "aarch64-unknown-linux-gnu": {
+      "sha256": "582057695cb285f6bb1df64c4b3820a9dadf301d84c7a294c42ea3266cf393d8",
+      "size": 35,
+      "url": "https://example.invalid/releases/download/v1.2.3/fleetd-aarch64-unknown-linux-musl.tar.gz"
+    },
+    "x86_64-unknown-linux-gnu": {
+      "sha256": "3e9a2c83fa7ac89708069c3394aa5c78e53df12d42d0b6ea84d4f31806041f61",
+      "size": 18,
+      "url": "https://example.invalid/releases/download/v1.2.3/fleetd-x86_64-unknown-linux-musl.tar.gz"
+    }
+  }
+}
