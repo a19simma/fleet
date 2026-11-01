@@ -15,7 +15,11 @@ use std::path::{Path, PathBuf};
 
 use crate::fetch_policy::HostPattern;
 
+mod drain;
 mod fetcher;
+pub use drain::{
+    DRAIN_CAP, DRAIN_POLL, DrainController, DrainOutcome, DrainRefused, DrainState, Draining,
+};
 pub use fetcher::{
     ARCHIVE_CONNECT_TIMEOUT, ARCHIVE_TOTAL_TIMEOUT, MAX_ARCHIVE_REDIRECTS, PolicyArchiveFetcher,
     archive_caps,
