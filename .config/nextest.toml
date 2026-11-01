@@ -1,0 +1,15 @@
+[profile.default]
+test-threads = 8
+fail-fast = false
+
+[test-groups]
+pg-e2e = { max-threads = 2 }
+spawn-children = { max-threads = 2 }
+
+[[profile.default.overrides]]
+filter = 'binary_id(fleetd::e2e_jobs)'
+test-group = 'pg-e2e'
+
+[[profile.default.overrides]]
+filter = 'binary_id(/^fleetd::(hook_process|askpass_process|systemd_launcher|tool_install_exec|runner)$/)'
+test-group = 'spawn-children'
