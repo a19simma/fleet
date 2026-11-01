@@ -18,8 +18,9 @@ use std::path::{Path, PathBuf};
 use fleet_core::tools::ToolName;
 use fleet_proto::MAX_SIGNATURE_BYTES;
 use fleetd::tools::{
-    MisePins, MisePinsConfig, TOOL_ENV_FILE, ToolsError, check_tool_hosts, tool_hosts, verify_mise,
-    verify_mise_capped, write_tool_env,
+    CacheLimits, MAX_CACHE_BYTES, MAX_CACHE_ENTRIES, MisePins, MisePinsConfig, TOOL_ENV_FILE,
+    ToolCache, ToolsError, check_tool_hosts, tool_hosts, verify_mise, verify_mise_capped,
+    write_tool_env,
 };
 use ring::signature::{Ed25519KeyPair, KeyPair};
 use sha2::{Digest, Sha256};
@@ -677,4 +678,476 @@ fn check_tool_hosts_refuses_hostile_entries() {
         check_tool_hosts(&good, &[ToolName::Jq]),
         Err(ToolsError::InvalidHost)
     ));
+}
+
+fn cache_owner(dir: &Path) -> u32 {
+    fs::metadata(dir).unwrap().uid()
+}
+
+fn put_entry(root: &Path, name: &str, version: &str, bytes: usize) -> PathBuf {
+    let dir = root.join(name).join(version);
+    fs::create_dir_all(&dir).unwrap();
+    fs::set_permissions(&dir, fs::Permissions::from_mode(0o755)).unwrap();
+    fs::write(dir.join("payload"), vec![7u8; bytes]).unwrap();
+    dir
+}
+
+fn entry_exists(root: &Path, name: &str, version: &str) -> bool {
+    root.join(name).join(version).exists()
+}
+
+fn leftovers(root: &Path) -> Vec<String> {
+    fs::read_dir(root)
+        .unwrap()
+        .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+        .filter(|n| n.starts_with('.'))
+        .collect()
+}
+
+#[test]
+fn cache_miss_then_hit_after_entry_appears() {
+    let tmp = TempDir::new().unwrap();
+    let cache = ToolCache::new(tmp.path(), cache_owner(tmp.path()));
+    assert!(cache.lookup("jq", "1.7.1").unwrap().is_none());
+    let dir = put_entry(tmp.path(), "jq", "1.7.1", 4);
+    let hit = cache.lookup("jq", "1.7.1").unwrap().unwrap();
+    assert_eq!(hit.path(), dir.as_path());
+    assert!(cache.lookup("jq", "1.7.2").unwrap().is_none());
+    assert!(cache.lookup("just", "1.7.1").unwrap().is_none());
+}
+
+#[test]
+fn cache_hit_works_with_a_relative_root() {
+    let tmp = TempDir::new().unwrap();
+    let rel = PathBuf::from(format!("target/tool-cache-rel-{}", std::process::id()));
+    let _ = fs::remove_dir_all(&rel);
+    fs::create_dir_all(&rel).unwrap();
+    let owner = cache_owner(&rel);
+    put_entry(&rel, "jq", "1.7.1", 4);
+    let cache = ToolCache::new(&rel, owner);
+    assert!(cache.lookup("jq", "1.7.1").unwrap().is_some());
+    let report = cache
+        .evict(CacheLimits {
+            max_bytes: 0,
+            max_entries: 8,
+        })
+        .unwrap();
+    assert_eq!(report.evicted.len(), 1);
+    assert!(!entry_exists(&rel, "jq", "1.7.1"));
+    fs::remove_dir_all(&rel).unwrap();
+    drop(tmp);
+}
+
+#[test]
+fn cache_refuses_symlink_entry_and_symlink_name_dir() {
+    let tmp = TempDir::new().unwrap();
+    let owner = cache_owner(tmp.path());
+    let cache = ToolCache::new(tmp.path(), owner);
+    let real = put_entry(tmp.path(), "go", "1.22.0", 4);
+    fs::create_dir_all(tmp.path().join("jq")).unwrap();
+    symlink(&real, tmp.path().join("jq").join("1.7.1")).unwrap();
+    assert!(cache.lookup("jq", "1.7.1").unwrap().is_none());
+    symlink(tmp.path().join("go"), tmp.path().join("uv")).unwrap();
+    assert!(cache.lookup("uv", "1.22.0").unwrap().is_none());
+    assert!(cache.lookup("go", "1.22.0").unwrap().is_some());
+}
+
+#[test]
+fn cache_refuses_wrong_owner_file_and_writable_entry() {
+    let tmp = TempDir::new().unwrap();
+    let owner = cache_owner(tmp.path());
+    let dir = put_entry(tmp.path(), "jq", "1.7.1", 4);
+    assert!(
+        ToolCache::new(tmp.path(), owner + 1)
+            .lookup("jq", "1.7.1")
+            .unwrap()
+            .is_none()
+    );
+    let cache = ToolCache::new(tmp.path(), owner);
+    fs::set_permissions(&dir, fs::Permissions::from_mode(0o775)).unwrap();
+    assert!(cache.lookup("jq", "1.7.1").unwrap().is_none());
+    fs::set_permissions(&dir, fs::Permissions::from_mode(0o755)).unwrap();
+    assert!(cache.lookup("jq", "1.7.1").unwrap().is_some());
+    fs::remove_dir_all(&dir).unwrap();
+    fs::write(&dir, b"file").unwrap();
+    assert!(cache.lookup("jq", "1.7.1").unwrap().is_none());
+}
+
+#[test]
+fn cache_lookup_rejects_hostile_names_and_versions() {
+    let tmp = TempDir::new().unwrap();
+    let cache = ToolCache::new(tmp.path(), cache_owner(tmp.path()));
+    put_entry(tmp.path(), "jq", "1.7.1", 4);
+    let long_version = "1".repeat(65);
+    let long_name = "j".repeat(300);
+    let names = [
+        "../jq",
+        "jq/../jq",
+        "jq/",
+        "/jq",
+        "jq\x00",
+        "",
+        "JQ",
+        "Jq",
+        "jq ",
+        "j\u{fb}q",
+        "ｊｑ",
+        "..",
+        ".",
+        long_name.as_str(),
+        "bash",
+    ];
+    for name in names {
+        assert!(
+            matches!(cache.lookup(name, "1.7.1"), Err(ToolsError::InvalidTool)),
+            "{name:?}"
+        );
+    }
+    let versions = [
+        "../1.7.1",
+        "1.7.1/",
+        "1/../1",
+        "..",
+        ".",
+        "1..7",
+        "1.7.1\0",
+        "",
+        "latest",
+        "1.7.x",
+        "^1.7",
+        "1.7.1 ",
+        "1.7.\u{661}",
+        "1.7.1\n",
+        "1.7.1\r\n",
+        long_version.as_str(),
+    ];
+    for version in versions {
+        assert!(
+            matches!(cache.lookup("jq", version), Err(ToolsError::InvalidTool)),
+            "{version:?}"
+        );
+        assert!(matches!(
+            cache.touch("jq", version, 1),
+            Err(ToolsError::InvalidTool)
+        ));
+        assert!(matches!(
+            cache.lease("jq", version),
+            Err(ToolsError::InvalidTool)
+        ));
+    }
+    let exact = "1".repeat(64);
+    assert!(cache.lookup("jq", &exact).unwrap().is_none());
+}
+
+#[test]
+fn cache_evicts_least_recently_used_first_until_under_the_byte_cap() {
+    let tmp = TempDir::new().unwrap();
+    let root = tmp.path();
+    let cache = ToolCache::new(root, cache_owner(root));
+    put_entry(root, "jq", "1.0.0", 100);
+    put_entry(root, "jq", "2.0.0", 100);
+    put_entry(root, "just", "1.0.0", 100);
+    cache.touch("jq", "1.0.0", 30).unwrap();
+    cache.touch("jq", "2.0.0", 10).unwrap();
+    cache.touch("just", "1.0.0", 20).unwrap();
+    let report = cache
+        .evict(CacheLimits {
+            max_bytes: 200 + 64,
+            max_entries: 8,
+        })
+        .unwrap();
+    assert_eq!(report.evicted.len(), 1);
+    assert!(!entry_exists(root, "jq", "2.0.0"));
+    assert!(entry_exists(root, "jq", "1.0.0"));
+    assert!(entry_exists(root, "just", "1.0.0"));
+    assert!(leftovers(root).is_empty(), "{:?}", leftovers(root));
+}
+
+#[test]
+fn cache_touch_reorders_the_lru() {
+    let tmp = TempDir::new().unwrap();
+    let root = tmp.path();
+    let cache = ToolCache::new(root, cache_owner(root));
+    put_entry(root, "jq", "1.0.0", 10);
+    put_entry(root, "jq", "2.0.0", 10);
+    cache.touch("jq", "1.0.0", 5).unwrap();
+    cache.touch("jq", "2.0.0", 6).unwrap();
+    cache.touch("jq", "1.0.0", 7).unwrap();
+    cache
+        .evict(CacheLimits {
+            max_bytes: u64::MAX,
+            max_entries: 1,
+        })
+        .unwrap();
+    assert!(entry_exists(root, "jq", "1.0.0"));
+    assert!(!entry_exists(root, "jq", "2.0.0"));
+}
+
+#[test]
+fn cache_entry_without_marker_is_oldest() {
+    let tmp = TempDir::new().unwrap();
+    let root = tmp.path();
+    let cache = ToolCache::new(root, cache_owner(root));
+    put_entry(root, "jq", "1.0.0", 10);
+    put_entry(root, "jq", "2.0.0", 10);
+    cache.touch("jq", "1.0.0", 1).unwrap();
+    cache
+        .evict(CacheLimits {
+            max_bytes: u64::MAX,
+            max_entries: 1,
+        })
+        .unwrap();
+    assert!(entry_exists(root, "jq", "1.0.0"));
+    assert!(!entry_exists(root, "jq", "2.0.0"));
+}
+
+#[test]
+fn cache_touch_leaves_no_temp_file_and_ignores_atime() {
+    let tmp = TempDir::new().unwrap();
+    let root = tmp.path();
+    let cache = ToolCache::new(root, cache_owner(root));
+    let dir = put_entry(root, "jq", "1.0.0", 10);
+    cache.touch("jq", "1.0.0", 9).unwrap();
+    cache.touch("jq", "1.0.0", 11).unwrap();
+    let mut names: Vec<String> = fs::read_dir(&dir)
+        .unwrap()
+        .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+        .collect();
+    names.sort();
+    assert_eq!(names.len(), 2, "{names:?}");
+    assert!(names.contains(&"payload".to_owned()));
+    assert!(matches!(
+        cache.touch("jq", "9.9.9", 1),
+        Err(ToolsError::NotCached)
+    ));
+}
+
+#[test]
+fn cache_evicts_by_entry_count_with_exactly_the_limit_kept() {
+    let tmp = TempDir::new().unwrap();
+    let root = tmp.path();
+    let cache = ToolCache::new(root, cache_owner(root));
+    for n in 1..=4u64 {
+        let v = format!("{n}.0.0");
+        put_entry(root, "uv", &v, 1);
+        cache.touch("uv", &v, n).unwrap();
+    }
+    let at = cache
+        .evict(CacheLimits {
+            max_bytes: u64::MAX,
+            max_entries: 4,
+        })
+        .unwrap();
+    assert_eq!(at.evicted.len(), 0);
+    let over = cache
+        .evict(CacheLimits {
+            max_bytes: u64::MAX,
+            max_entries: 3,
+        })
+        .unwrap();
+    assert_eq!(over.evicted.len(), 1);
+    assert!(!entry_exists(root, "uv", "1.0.0"));
+    assert!(entry_exists(root, "uv", "4.0.0"));
+}
+
+#[test]
+fn cache_byte_cap_exact_keeps_and_one_over_evicts() {
+    let tmp = TempDir::new().unwrap();
+    let root = tmp.path();
+    let cache = ToolCache::new(root, cache_owner(root));
+    put_entry(root, "jq", "1.0.0", 100);
+    cache.touch("jq", "1.0.0", 1).unwrap();
+    let size = cache
+        .evict(CacheLimits {
+            max_bytes: u64::MAX,
+            max_entries: 8,
+        })
+        .unwrap()
+        .remaining_bytes;
+    assert!(size >= 100);
+    let at = cache
+        .evict(CacheLimits {
+            max_bytes: size,
+            max_entries: 8,
+        })
+        .unwrap();
+    assert_eq!(at.evicted.len(), 0);
+    let over = cache
+        .evict(CacheLimits {
+            max_bytes: size - 1,
+            max_entries: 8,
+        })
+        .unwrap();
+    assert_eq!(over.evicted.len(), 1);
+    assert_eq!(over.remaining_bytes, 0);
+}
+
+#[test]
+fn cache_never_evicts_an_entry_with_a_live_lease() {
+    let tmp = TempDir::new().unwrap();
+    let root = tmp.path();
+    let cache = ToolCache::new(root, cache_owner(root));
+    put_entry(root, "jq", "1.0.0", 50);
+    put_entry(root, "jq", "2.0.0", 50);
+    cache.touch("jq", "1.0.0", 1).unwrap();
+    cache.touch("jq", "2.0.0", 2).unwrap();
+    let lease = cache.lease("jq", "1.0.0").unwrap();
+    let busy = cache
+        .evict(CacheLimits {
+            max_bytes: 0,
+            max_entries: 0,
+        })
+        .unwrap();
+    assert!(entry_exists(root, "jq", "1.0.0"));
+    assert!(!entry_exists(root, "jq", "2.0.0"));
+    assert_eq!(busy.skipped_in_use, 1);
+    assert_eq!(busy.evicted.len(), 1);
+    drop(lease);
+    let idle = cache
+        .evict(CacheLimits {
+            max_bytes: 0,
+            max_entries: 0,
+        })
+        .unwrap();
+    assert!(!entry_exists(root, "jq", "1.0.0"));
+    assert_eq!(idle.skipped_in_use, 0);
+    assert_eq!(idle.evicted.len(), 1);
+}
+
+#[test]
+fn cache_two_leases_share_and_lease_on_a_miss_fails() {
+    let tmp = TempDir::new().unwrap();
+    let root = tmp.path();
+    let cache = ToolCache::new(root, cache_owner(root));
+    put_entry(root, "jq", "1.0.0", 5);
+    let a = cache.lease("jq", "1.0.0").unwrap();
+    let b = cache.lease("jq", "1.0.0").unwrap();
+    drop(a);
+    let report = cache
+        .evict(CacheLimits {
+            max_bytes: 0,
+            max_entries: 0,
+        })
+        .unwrap();
+    assert_eq!(report.skipped_in_use, 1);
+    drop(b);
+    assert!(matches!(
+        cache.lease("jq", "9.9.9"),
+        Err(ToolsError::NotCached)
+    ));
+}
+
+#[test]
+fn cache_eviction_ignores_foreign_dirs_and_sweeps_stale_aside_dirs() {
+    let tmp = TempDir::new().unwrap();
+    let root = tmp.path();
+    let cache = ToolCache::new(root, cache_owner(root));
+    fs::create_dir_all(root.join("cache/state")).unwrap();
+    fs::create_dir_all(root.join("notatool/1.0.0")).unwrap();
+    fs::create_dir_all(root.join("jq/not-a-version")).unwrap();
+    let stale = root.join(".evicting-jq-1.0.0-0");
+    fs::create_dir_all(stale.join("x")).unwrap();
+    put_entry(root, "jq", "1.0.0", 5);
+    cache
+        .evict(CacheLimits {
+            max_bytes: 0,
+            max_entries: 0,
+        })
+        .unwrap();
+    assert!(root.join("cache/state").exists());
+    assert!(root.join("notatool/1.0.0").exists());
+    assert!(root.join("jq/not-a-version").exists());
+    assert!(!stale.exists());
+    assert!(!entry_exists(root, "jq", "1.0.0"));
+}
+
+#[test]
+fn cache_default_limits_are_the_named_constants() {
+    let limits = CacheLimits::default();
+    assert_eq!(limits.max_bytes, MAX_CACHE_BYTES);
+    assert_eq!(limits.max_entries, MAX_CACHE_ENTRIES);
+}
+
+#[test]
+fn deploy_units_keep_the_cache_read_only_to_the_agent() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../deploy");
+    let agent = fs::read_to_string(root.join("fleet-agent@.service")).unwrap();
+    let install = fs::read_to_string(root.join("fleet-tool-install@.service")).unwrap();
+    let tmpfiles = fs::read_to_string(root.join("tmpfiles.d/fleet.conf")).unwrap();
+    assert!(
+        agent
+            .lines()
+            .any(|l| l == "ReadOnlyPaths=/var/lib/fleet/tools")
+    );
+    assert!(
+        !agent
+            .lines()
+            .any(|l| l.starts_with("ReadWritePaths=") && l.contains("/var/lib/fleet/tools"))
+    );
+    let writers: Vec<&str> = install
+        .lines()
+        .filter(|l| l.starts_with("ReadWritePaths="))
+        .collect();
+    assert_eq!(writers, ["ReadWritePaths=/var/lib/fleet/tools"]);
+    assert!(
+        tmpfiles
+            .lines()
+            .any(|l| l == "d /var/lib/fleet/tools 0750 fleet-job fleet-work -")
+    );
+}
+
+#[test]
+fn lease_refuses_an_entry_renamed_aside_between_open_and_lock() {
+    let tmp = TempDir::new().unwrap();
+    let root = tmp.path();
+    let cache = ToolCache::new(root, cache_owner(root));
+    put_entry(root, "jq", "1.0.0", 5);
+    let entry = root.join("jq").join("1.0.0");
+    let aside = root.join("jq").join("aside");
+    let result = cache.lease_with_hook("jq", "1.0.0", || {
+        fs::rename(&entry, &aside).unwrap();
+    });
+    assert!(matches!(result, Err(ToolsError::NotCached)));
+    assert!(aside.is_dir());
+    assert_eq!(fs::read_dir(&aside).unwrap().count(), 1);
+}
+
+#[test]
+fn lease_refuses_an_entry_replaced_by_a_new_dir_between_open_and_lock() {
+    let tmp = TempDir::new().unwrap();
+    let root = tmp.path();
+    let cache = ToolCache::new(root, cache_owner(root));
+    put_entry(root, "jq", "1.0.0", 5);
+    let entry = root.join("jq").join("1.0.0");
+    let aside = root.join("jq").join("aside");
+    let result = cache.lease_with_hook("jq", "1.0.0", || {
+        fs::rename(&entry, &aside).unwrap();
+        fs::create_dir(&entry).unwrap();
+    });
+    assert!(matches!(result, Err(ToolsError::NotCached)));
+    assert!(aside.is_dir());
+    assert!(entry.is_dir());
+}
+
+#[test]
+fn lease_refuses_an_entry_removed_between_open_and_lock() {
+    let tmp = TempDir::new().unwrap();
+    let root = tmp.path();
+    let cache = ToolCache::new(root, cache_owner(root));
+    put_entry(root, "jq", "1.0.0", 5);
+    let entry = root.join("jq").join("1.0.0");
+    let result = cache.lease_with_hook("jq", "1.0.0", || {
+        fs::remove_dir_all(&entry).unwrap();
+    });
+    assert!(matches!(result, Err(ToolsError::NotCached)));
+    assert!(!entry.exists());
+}
+
+#[test]
+fn lease_with_hook_still_leases_an_untouched_entry() {
+    let tmp = TempDir::new().unwrap();
+    let root = tmp.path();
+    let cache = ToolCache::new(root, cache_owner(root));
+    put_entry(root, "jq", "1.0.0", 5);
+    assert!(cache.lease_with_hook("jq", "1.0.0", || {}).is_ok());
 }

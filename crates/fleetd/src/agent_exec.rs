@@ -482,6 +482,119 @@ pub fn run_tool_install(
     Ok(code)
 }
 
+/// Fixed system directories that follow the cache bin dirs on the agent `PATH`.
+pub const SYSTEM_PATH_TAIL: &str = "/usr/local/bin:/usr/bin:/bin";
+
+/// Most tools one agent `PATH` may name. It equals the cache entry cap.
+pub const MAX_PATH_TOOLS: usize = crate::tools::MAX_CACHE_ENTRIES;
+
+/// Why the agent `PATH` could not be built or an environment was refused.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum AgentPathError {
+    /// A name is outside the registry or a version is not an exact pin.
+    InvalidTool,
+    /// The list names one tool twice.
+    DuplicateTool,
+    /// The list is longer than [`MAX_PATH_TOOLS`].
+    TooMany,
+    /// An entry or its `bin` directory failed the cache check.
+    NotCached,
+    /// The cache could not be read.
+    Cache,
+    /// The environment sets `PATH`.
+    PathOverride,
+}
+
+impl fmt::Display for AgentPathError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Self::InvalidTool => "tool name or version is not valid",
+            Self::DuplicateTool => "tool list names a tool twice",
+            Self::TooMany => "tool list is too long",
+            Self::NotCached => "tool is not in the cache",
+            Self::Cache => "tool cache could not be read",
+            Self::PathOverride => "environment sets PATH",
+        })
+    }
+}
+
+impl std::error::Error for AgentPathError {}
+
+/// Builds the agent `PATH` from the job's resolved `(name, version)` list.
+///
+/// The result is the `bin` directory of each cache entry in list order, then
+/// [`SYSTEM_PATH_TAIL`]. Every entry must pass [`ToolCache::lookup`] and its `bin` must be a real
+/// directory (never a symlink) without group or other write bits; a miss or a failed check is
+/// an error, never skipped. A repeated name is refused so list order alone decides precedence.
+/// Nothing comes from the parent environment or the profile.
+///
+/// Layout: the entry is `root/<name>/<version>` and this function assumes the tool puts its
+/// executables in `bin` below it, the layout mise uses for `installs/<tool>/<version>/bin`.
+/// Unverified: that every registry tool installs into that `bin` (tools that unpack to a
+/// differently named directory, or that mise shims, are not mapped). No live run has confirmed
+/// it, and the install unit's layout (TOOL-8) may need a mapping here.
+///
+/// # Errors
+///
+/// Returns the [`AgentPathError`] for the first failing entry.
+pub fn build_agent_path(
+    cache: &crate::tools::ToolCache,
+    tools: &[(String, String)],
+) -> Result<String, AgentPathError> {
+    if tools.len() > MAX_PATH_TOOLS {
+        return Err(AgentPathError::TooMany);
+    }
+    let mut seen: Vec<&str> = Vec::with_capacity(tools.len());
+    let mut path = String::new();
+    for (name, version) in tools {
+        let hit = cache
+            .lookup(name, version)
+            .map_err(|err| match err {
+                crate::tools::ToolsError::InvalidTool => AgentPathError::InvalidTool,
+                _ => AgentPathError::Cache,
+            })?
+            .ok_or(AgentPathError::NotCached)?;
+        if seen.contains(&name.as_str()) {
+            return Err(AgentPathError::DuplicateTool);
+        }
+        seen.push(name);
+        let bin = hit.path().join("bin");
+        let usable =
+            fs::symlink_metadata(&bin).is_ok_and(|meta| meta.is_dir() && meta.mode() & 0o022 == 0);
+        if !usable {
+            return Err(AgentPathError::NotCached);
+        }
+        path.push_str(bin.to_str().ok_or(AgentPathError::Cache)?);
+        path.push(':');
+    }
+    path.push_str(SYSTEM_PATH_TAIL);
+    Ok(path)
+}
+
+/// Refuses an environment that sets `PATH` in any letter case. A profile or job env never
+/// sets it, so a key that matches is an error rather than a value to ignore.
+///
+/// # Errors
+///
+/// Returns [`AgentPathError::PathOverride`] for the first matching key.
+pub fn refuse_path_override<'a>(
+    keys: impl IntoIterator<Item = &'a str>,
+) -> Result<(), AgentPathError> {
+    if keys.into_iter().any(|key| key.eq_ignore_ascii_case("PATH")) {
+        Err(AgentPathError::PathOverride)
+    } else {
+        Ok(())
+    }
+}
+
+/// Sets `PATH` on `command` to `path`, replacing any inherited value. Call it after the
+/// environment is applied so nothing the parent holds survives.
+pub fn apply_agent_path(command: &mut Command, path: &str) {
+    command.env_remove("PATH");
+    command.env("PATH", path);
+}
+
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
