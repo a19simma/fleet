@@ -296,7 +296,7 @@ impl Updater {
             return ApplyOutcome::DrainAborted;
         }
         if let Err(err) = self.swapper.swap(version) {
-            tracing::warn!(%err, "update swap failed");
+            tracing::warn!(reason = err.reason(), "update swap failed");
             return ApplyOutcome::SwapFailed;
         }
         *self.held.lock().unwrap_or_else(PoisonError::into_inner) = Some(draining);

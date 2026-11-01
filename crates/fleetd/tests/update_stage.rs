@@ -357,17 +357,103 @@ fn a_symlinked_bin_root_is_refused() {
     assert_eq!(entries(&real), Vec::<String>::new());
 }
 
+fn leftover_dir(bin: &Path) -> std::path::PathBuf {
+    let dir = bin.join("1.2.3");
+    fs::create_dir(&dir).unwrap();
+    fs::set_permissions(&dir, fs::Permissions::from_mode(0o700)).unwrap();
+    dir
+}
+
 #[test]
-fn an_existing_staged_binary_is_never_replaced() {
+fn a_leftover_archive_from_a_crashed_run_is_replaced() {
     let (_guard, bin) = root();
+    let dir = leftover_dir(&bin);
+    fs::write(dir.join("fleetd.tar.gz"), b"old archive").unwrap();
+    fs::write(dir.join("fleetd"), b"old binary").unwrap();
+    fs::write(dir.join(".fleetd.tmp"), b"old temp").unwrap();
+    let body = b"new release";
+    let fake = Fake::new(body);
+    let path = Stager::new(&bin, allow(), &fake)
+        .stage(&version(), &target(body, Some(URL)))
+        .unwrap();
+    assert_eq!(fs::read(&path).unwrap(), body);
+    assert_eq!(mode(&path), 0o700);
+    assert_eq!(entries(&dir), vec!["fleetd.tar.gz".to_owned()]);
+}
+
+#[test]
+fn a_staged_version_is_replaced_by_a_second_stage() {
+    let (_guard, bin) = root();
+    let fake = Fake::new(b"x");
+    let stager = Stager::new(&bin, allow(), &fake);
+    stager.stage(&version(), &target(b"x", Some(URL))).unwrap();
+    let path = stager.stage(&version(), &target(b"x", Some(URL))).unwrap();
+    assert_eq!(fs::read(path).unwrap(), b"x");
+}
+
+#[test]
+fn a_planted_symlink_in_a_leftover_dir_is_unlinked_not_followed() {
+    let (guard, bin) = root();
+    let victim = guard.path().join("victim");
+    fs::write(&victim, b"keep").unwrap();
+    let dir = leftover_dir(&bin);
+    symlink(&victim, dir.join("fleetd.tar.gz")).unwrap();
+    symlink(&victim, dir.join("fleetd")).unwrap();
+    let body = b"new release";
+    let fake = Fake::new(body);
+    let path = Stager::new(&bin, allow(), &fake)
+        .stage(&version(), &target(body, Some(URL)))
+        .unwrap();
+    assert_eq!(fs::read(&victim).unwrap(), b"keep");
+    assert!(fs::symlink_metadata(&path).unwrap().file_type().is_file());
+    assert_eq!(fs::read(&path).unwrap(), body);
+    assert_eq!(entries(&dir), vec!["fleetd.tar.gz".to_owned()]);
+}
+
+#[test]
+fn a_directory_in_place_of_the_archive_is_refused() {
+    let (_guard, bin) = root();
+    let dir = leftover_dir(&bin);
+    fs::create_dir(dir.join("fleetd.tar.gz")).unwrap();
     let body = b"x";
     let fake = Fake::new(body);
-    let stager = Stager::new(&bin, allow(), &fake);
-    stager.stage(&version(), &target(body, Some(URL))).unwrap();
-    let err = stager
+    let err = Stager::new(&bin, allow(), &fake)
         .stage(&version(), &target(body, Some(URL)))
         .unwrap_err();
-    assert!(matches!(err, StageError::AlreadyStaged), "{err}");
+    assert!(matches!(err, StageError::UnsafeDir(_)), "{err}");
+    assert!(fake.seen.lock().unwrap().is_empty());
+}
+
+#[test]
+fn a_leftover_dir_owned_by_someone_else_is_refused_and_left_alone() {
+    let (_guard, bin) = root();
+    let dir = leftover_dir(&bin);
+    fs::write(dir.join("fleetd.tar.gz"), b"theirs").unwrap();
+    let body = b"x";
+    let fake = Fake::new(body);
+    let foreign = rustix::process::geteuid().as_raw().wrapping_add(1);
+    let err = Stager::new(&bin, allow(), &fake)
+        .with_owner(foreign)
+        .stage(&version(), &target(body, Some(URL)))
+        .unwrap_err();
+    assert!(matches!(err, StageError::UnsafeDir(_)), "{err}");
+    assert_eq!(fs::read(dir.join("fleetd.tar.gz")).unwrap(), b"theirs");
+    assert!(fake.seen.lock().unwrap().is_empty());
+}
+
+#[test]
+fn a_loose_leftover_dir_keeps_its_contents() {
+    let (_guard, bin) = root();
+    let dir = leftover_dir(&bin);
+    fs::write(dir.join("fleetd.tar.gz"), b"theirs").unwrap();
+    fs::set_permissions(&dir, fs::Permissions::from_mode(0o777)).unwrap();
+    let body = b"x";
+    let fake = Fake::new(body);
+    let err = Stager::new(&bin, allow(), &fake)
+        .stage(&version(), &target(body, Some(URL)))
+        .unwrap_err();
+    assert!(matches!(err, StageError::UnsafeDir(_)), "{err}");
+    assert_eq!(fs::read(dir.join("fleetd.tar.gz")).unwrap(), b"theirs");
 }
 
 #[test]

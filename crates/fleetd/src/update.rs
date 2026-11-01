@@ -48,6 +48,7 @@ use rustix::fs::OFlags;
 use serde::de::{MapAccess, Visitor};
 use serde::{Deserialize, Deserializer};
 use sha2::{Digest, Sha256};
+use swap::BINARY_TEMP;
 pub use swap::{
     CURRENT_LINK, MAX_BINARY_BYTES, MAX_UNPACKED_BYTES, PREVIOUS_LINK, SwapError, Swapper,
 };
@@ -764,6 +765,7 @@ pub struct Stager<'a, F> {
     bin_root: PathBuf,
     allow: Vec<HostPattern>,
     fetcher: &'a F,
+    owner: u32,
 }
 
 impl<'a, F: ArchiveFetcher> Stager<'a, F> {
@@ -774,7 +776,15 @@ impl<'a, F: ArchiveFetcher> Stager<'a, F> {
             bin_root: bin_root.into(),
             allow,
             fetcher,
+            owner: rustix::process::geteuid().as_raw(),
         }
+    }
+
+    /// Replaces the uid every staging directory must belong to. Tests set a foreign one.
+    #[must_use]
+    pub const fn with_owner(mut self, owner: u32) -> Self {
+        self.owner = owner;
+        self
     }
 
     fn check_url(&self, url: &str) -> Result<(), StageError> {
@@ -786,34 +796,53 @@ impl<'a, F: ArchiveFetcher> Stager<'a, F> {
         }
     }
 
-    fn require_dir(path: &Path, mode: Option<u32>) -> Result<(), StageError> {
+    fn require_dir(&self, path: &Path, mode: Option<u32>) -> Result<(), StageError> {
         let meta = fs::symlink_metadata(path).map_err(StageError::Io)?;
-        let uid = rustix::process::geteuid().as_raw();
         let loose = mode.is_some_and(|want| meta.mode() & 0o7777 != want);
-        if !meta.file_type().is_dir() || meta.uid() != uid || loose {
+        if !meta.file_type().is_dir() || meta.uid() != self.owner || loose {
             return Err(StageError::UnsafeDir(path.to_path_buf()));
         }
         Ok(())
     }
 
     fn version_dir(&self, version: &Version) -> Result<PathBuf, StageError> {
-        Self::require_dir(&self.bin_root, None)?;
+        self.require_dir(&self.bin_root, None)?;
         let dir = self.bin_root.join(version.as_str());
         match fs::symlink_metadata(&dir) {
-            Ok(_) => Self::require_dir(&dir, Some(0o700))?,
+            Ok(_) => self.require_dir(&dir, Some(0o700))?,
             Err(err) if err.kind() == io::ErrorKind::NotFound => {
                 fs::DirBuilder::new()
                     .mode(0o700)
                     .create(&dir)
                     .map_err(StageError::Io)?;
-                Self::require_dir(&dir, Some(0o700))?;
+                self.require_dir(&dir, Some(0o700))?;
             }
             Err(err) => return Err(StageError::Io(err)),
         }
         Ok(dir)
     }
 
+    fn clear_leftovers(dir: &Path) -> Result<(), StageError> {
+        for name in [STAGED_FILE, STAGE_TEMP_FILE, BINARY_FILE, BINARY_TEMP] {
+            let path = dir.join(name);
+            match fs::symlink_metadata(&path) {
+                Ok(meta) if meta.file_type().is_dir() => {
+                    return Err(StageError::UnsafeDir(path));
+                }
+                Ok(_) => fs::remove_file(&path).map_err(StageError::Io)?,
+                Err(err) if err.kind() == io::ErrorKind::NotFound => {}
+                Err(err) => return Err(StageError::Io(err)),
+            }
+        }
+        Ok(())
+    }
+
     /// Fetches, checks and stages `target` as `version`, returning the staged path.
+    ///
+    /// A leftover from an earlier run inside a version directory that is a real directory,
+    /// owned by this uid and mode 0700 is unlinked first: the archive, the unpacked binary
+    /// and their temp files. Unlinking never follows a symlink. A directory of one of those
+    /// names is refused.
     ///
     /// # Errors
     ///
@@ -828,9 +857,7 @@ impl<'a, F: ArchiveFetcher> Stager<'a, F> {
         self.check_url(url)?;
         let dir = self.version_dir(version)?;
         let final_path = dir.join(STAGED_FILE);
-        if fs::symlink_metadata(&final_path).is_ok() {
-            return Err(StageError::AlreadyStaged);
-        }
+        Self::clear_leftovers(&dir)?;
         let response = self.fetcher.get(url).map_err(StageError::Fetch)?;
         self.check_url(&response.final_url)?;
         let temp = dir.join(STAGE_TEMP_FILE);

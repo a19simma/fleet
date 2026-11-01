@@ -103,6 +103,35 @@ fn ver(s: &str) -> Version {
 }
 
 #[test]
+fn every_swap_error_maps_to_a_closed_reason_without_the_hostile_text() {
+    let hostile = format!("/{}/victim/secret/../../etc/passwd", "Users");
+    let hostile = hostile.as_str();
+    let rows: Vec<(SwapError, &str)> = vec![
+        (SwapError::Version, "version not a safe name"),
+        (SwapError::NotStaged, "version not staged"),
+        (SwapError::UnsafeDir(hostile.into()), "directory unsafe"),
+        (SwapError::UnsafeLink(hostile.into()), "link unsafe"),
+        (SwapError::AlreadyCurrent, "version already current"),
+        (SwapError::Archive("hostile why"), "archive refused"),
+        (
+            SwapError::UnsafeEntry(hostile.to_owned()),
+            "archive entry refused",
+        ),
+        (SwapError::TooLarge, "archive over the unpack cap"),
+        (
+            SwapError::Io(io::Error::other(hostile)),
+            "swap write failed",
+        ),
+    ];
+    for (err, want) in rows {
+        assert_eq!(err.reason(), want, "{err}");
+        assert!(!err.reason().contains("victim"), "{err}");
+        assert!(!err.reason().contains("passwd"), "{err}");
+        assert!(!err.reason().contains("hostile"), "{err}");
+    }
+}
+
+#[test]
 fn unpack_writes_runnable_binary_and_opens_the_dir() {
     let rig = Rig::new();
     rig.stage_ok("1.2.3");

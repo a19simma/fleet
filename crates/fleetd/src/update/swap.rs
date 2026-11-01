@@ -37,7 +37,7 @@ pub const MAX_UNPACKED_BYTES: u64 = 2 * MAX_ARCHIVE_BYTES;
 
 const CURRENT_TEMP: &str = ".current.tmp";
 const PREVIOUS_TEMP: &str = ".previous.tmp";
-const BINARY_TEMP: &str = ".fleetd.tmp";
+pub(super) const BINARY_TEMP: &str = ".fleetd.tmp";
 
 /// Why an unpack or a swap was refused.
 #[derive(Debug)]
@@ -61,6 +61,25 @@ pub enum SwapError {
     TooLarge,
     /// A filesystem step failed.
     Io(io::Error),
+}
+
+impl SwapError {
+    /// A closed reason for logs. It names the kind of failure and carries no path, archive
+    /// entry name or OS error text.
+    #[must_use]
+    pub const fn reason(&self) -> &'static str {
+        match self {
+            Self::Version => "version not a safe name",
+            Self::NotStaged => "version not staged",
+            Self::UnsafeDir(_) => "directory unsafe",
+            Self::UnsafeLink(_) => "link unsafe",
+            Self::AlreadyCurrent => "version already current",
+            Self::Archive(_) => "archive refused",
+            Self::UnsafeEntry(_) => "archive entry refused",
+            Self::TooLarge => "archive over the unpack cap",
+            Self::Io(_) => "swap write failed",
+        }
+    }
 }
 
 impl fmt::Display for SwapError {

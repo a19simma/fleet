@@ -133,6 +133,7 @@ pub struct UpdateDriver<F> {
     updater: Updater,
     seq: SeqStore,
     last: Option<[u8; 32]>,
+    restarting: bool,
     attempts: HashMap<String, u32>,
 }
 
@@ -200,11 +201,14 @@ impl<F: ArchiveFetcher + Send + Sync + 'static> UpdateDriver<F> {
             updater,
             seq,
             last: None,
+            restarting: false,
             attempts: HashMap::new(),
         }
     }
 
-    /// Handles each offer the receiver delivers, until the sender is gone.
+    /// Handles each offer the receiver delivers, until the sender is gone. After an apply
+    /// has raised the restart signal the driver stays alive, because dropping it would drop
+    /// the held drain and resume claiming, but refuses every further offer.
     pub async fn run(mut self, mut offers: watch::Receiver<Option<Offer>>) {
         while offers.changed().await.is_ok() {
             let offer = offers.borrow_and_update().clone();
@@ -216,6 +220,9 @@ impl<F: ArchiveFetcher + Send + Sync + 'static> UpdateDriver<F> {
 
     /// Verifies, stages and applies `offer`, and logs how it ended.
     pub async fn handle(&mut self, offer: &Offer) -> DriverOutcome {
+        if self.restarting {
+            return DriverOutcome::Refused("restart pending");
+        }
         let digest = offer.digest();
         if self.last == Some(digest) {
             return DriverOutcome::Unchanged;
@@ -274,11 +281,20 @@ impl<F: ArchiveFetcher + Send + Sync + 'static> UpdateDriver<F> {
         };
         match staged {
             Ok(Ok(_)) => {}
-            Ok(Err(err)) => return DriverOutcome::Failed(stage_failure(&err)),
-            Err(_) => return DriverOutcome::Failed("staging task failed"),
+            Ok(Err(err)) => {
+                if !matches!(err, StageError::Version | StageError::UnsafeDir(_)) {
+                    self.discard(&version);
+                }
+                return DriverOutcome::Failed(stage_failure(&err));
+            }
+            Err(_) => {
+                self.discard(&version);
+                return DriverOutcome::Failed("staging task failed");
+            }
         }
         let applied = self.updater.apply(&version).await;
         if applied == ApplyOutcome::Restarting {
+            self.restarting = true;
             if let Err(err) = self.seq.store(manifest.seq) {
                 tracing::warn!(reason = refusal(&err), "seq not stored after the swap");
             }

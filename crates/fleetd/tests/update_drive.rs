@@ -381,8 +381,9 @@ async fn a_replayed_seq_is_refused_after_a_good_update() {
         DriverOutcome::Restarting
     );
     let after = rig.snapshot();
+    let mut restarted = rig.driver(false);
     assert_eq!(
-        driver.handle(&rig.offer("1.2.0", 7)).await,
+        restarted.handle(&rig.offer("1.2.0", 7)).await,
         DriverOutcome::Refused("seq not newer")
     );
     assert_eq!(rig.snapshot(), after);
@@ -455,9 +456,97 @@ async fn an_identical_offer_is_handled_once_and_a_version_has_a_capped_number_of
         MAX_ATTEMPTS_PER_VERSION as usize
     );
     assert_eq!(rig.current(), "1.0.0");
-    let mut now = rig.snapshot();
-    now.retain(|(name, _)| name != "1.1.0");
-    assert_eq!(now, before);
+    assert_eq!(rig.snapshot(), before);
+}
+
+#[tokio::test]
+async fn a_stage_error_discards_the_version_directory() {
+    let rig = rig();
+    let mut driver = rig.driver(false);
+    let before = rig.snapshot();
+    let json = String::from_utf8(manifest("1.1.0", 7, TARGET, &rig.archive))
+        .unwrap()
+        .replace(&sha_hex(&rig.archive), &sha_hex(b"other bytes"));
+    let offer = signed(&rig.signer, json.into_bytes());
+    assert_eq!(
+        driver.handle(&offer).await,
+        DriverOutcome::Failed("archive hash mismatch")
+    );
+    assert_eq!(rig.snapshot(), before);
+}
+
+#[tokio::test]
+async fn a_second_signed_offer_after_the_restart_signal_applies_nothing() {
+    let rig = rig();
+    let mut driver = rig.driver(false);
+    assert_eq!(
+        driver.handle(&rig.offer("1.1.0", 7)).await,
+        DriverOutcome::Restarting
+    );
+    let after_first = rig.snapshot();
+    let second = driver.handle(&rig.offer("1.2.0", 8)).await;
+    assert_eq!(second, DriverOutcome::Refused("restart pending"));
+    assert_eq!(rig.calls.load(Ordering::SeqCst), 1);
+    assert_eq!(rig.current(), "1.1.0");
+    assert_eq!(
+        fs::read_link(rig.root.join("previous")).unwrap(),
+        Path::new("1.0.0")
+    );
+    assert_eq!(rig.snapshot(), after_first);
+    assert_eq!(SeqStore::new(&rig.root).load().unwrap(), 7);
+}
+
+fn reply_for(offer: &Offer) -> HeartbeatReply {
+    let (manifest, signature) = offer.parts();
+    HeartbeatReply {
+        next_in_s: 30,
+        update_manifest: Some(manifest.to_vec()),
+        update_signature: Some(signature.to_vec()),
+    }
+}
+
+#[tokio::test]
+async fn the_driver_loop_ignores_offers_after_the_restart_signal() {
+    let rig = rig();
+    let (sink, task) = rig.driver(false).spawn();
+    sink.offer(&reply_for(&rig.offer("1.1.0", 7)));
+    tokio::time::timeout(WIDE, rig.restart.requested())
+        .await
+        .unwrap();
+    sink.offer(&reply_for(&rig.offer("1.2.0", 8)));
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert!(!task.is_finished());
+    assert!(rig.wiring.gate.is_paused());
+    assert_eq!(rig.calls.load(Ordering::SeqCst), 1);
+    assert_eq!(rig.current(), "1.1.0");
+}
+
+#[tokio::test]
+async fn a_swap_failure_logs_a_closed_reason_with_no_path() {
+    let rig = rig();
+    let capture = Capture(Arc::default());
+    let _guard = tracing::subscriber::set_default(
+        tracing_subscriber::fmt()
+            .with_writer(capture.clone())
+            .with_ansi(false)
+            .finish(),
+    );
+    let staged = rig.root.join("1.1.0");
+    fs::create_dir(&staged).unwrap();
+    fs::set_permissions(&staged, fs::Permissions::from_mode(0o777)).unwrap();
+    let updater = Updater::new(
+        DrainController::new(rig.wiring.gate.clone(), CAP, POLL),
+        rig.wiring.tracker.clone(),
+        Swapper::new(&rig.root),
+        rig.restart.clone(),
+    );
+    let outcome = updater.apply(&Version::new("1.1.0").unwrap()).await;
+    assert_eq!(outcome, fleetd::update::ApplyOutcome::SwapFailed);
+    let text = String::from_utf8(capture.0.lock().unwrap().clone()).unwrap();
+    assert!(text.contains("update swap failed"), "{text}");
+    assert!(text.contains("directory unsafe"), "{text}");
+    assert!(!text.contains(rig.root.to_str().unwrap()), "{text}");
+    assert!(!text.contains("1.1.0"), "{text}");
 }
 
 #[tokio::test]
