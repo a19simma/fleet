@@ -28,7 +28,7 @@ pub use drain::{
 };
 pub use driver::{
     DriverConfig, DriverOutcome, MAX_ATTEMPTS_PER_VERSION, Offer, OfferSink, UpdateDriver,
-    host_target, start_production,
+    host_target, start_production, target_name,
 };
 pub use fetcher::{
     ARCHIVE_CONNECT_TIMEOUT, ARCHIVE_TOTAL_TIMEOUT, MAX_ARCHIVE_REDIRECTS, PolicyArchiveFetcher,

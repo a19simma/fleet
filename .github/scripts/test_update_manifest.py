@@ -211,7 +211,7 @@ class Hostile(unittest.TestCase):
     def test_versions(self):
         with Fixture() as fx:
             path = fx.archive("fleetd.tar.gz", b"x")
-            for version in ["", "1.2", "v1.2.3", "1.2.3\n", "1.2.3 ", "01.2.3", "1.2.3+\"", "x"]:
+            for version in ["", "1.2", "v1.2.3", "1.2.3\n", "1.2.3 ", "01.2.3", "1.2.3+\"", "1.2.3+build.5", "1.2.3-rc.1+b", "x"]:
                 with self.subTest(version=version):
                     with self.assertRaises(um.ManifestError):
                         build([(X86, path)], version=version)
@@ -239,6 +239,9 @@ class Hostile(unittest.TestCase):
                 "https://example.invalid/a\nb",
                 "https://example.invalid/ ",
                 "ftp://example.invalid/a",
+                "https://example.invalid/a#b",
+                "https://example.invalid/a?b",
+                "https://example.invalid/a%23b",
                 "https://example.invalid/" + "a" * 2100,
             ]
             for url in bad:
