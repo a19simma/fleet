@@ -2,6 +2,8 @@
 Description=Fleet agent job %i
 BindsTo=fleetd.service
 After=fleetd.service
+Requires=fleet-tool-install@%i.service
+After=fleet-tool-install@%i.service
 
 [Service]
 Type=exec
@@ -31,6 +33,7 @@ LockPersonality=yes
 CapabilityBoundingSet=
 ReadWritePaths=/var/lib/fleet/jobs
 ReadOnlyPaths=-/var/lib/fleet/jobs/.cache
+ReadOnlyPaths=/var/lib/fleet/tools
 InaccessiblePaths=/etc/swarm
 InaccessiblePaths=-/run/docker.sock
 InaccessiblePaths=-/var/run/docker.sock

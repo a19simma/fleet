@@ -100,7 +100,10 @@ sqlite3 /var/lib/fleetd/queue.db 'select seq, kind, state from events order by s
 | `tmpfiles.d/fleet.conf` | `/etc/tmpfiles.d/fleet.conf` |
 | `polkit/50-fleet-agent.rules` | `/etc/polkit-1/rules.d/50-fleet-agent.rules` |
 | `fleet-agent@.service` | `/etc/systemd/system/fleet-agent@.service` |
+| `fleet-tool-install@.service` | `/etc/systemd/system/fleet-tool-install@.service` |
 | `fleetd-systemd.service` | `/etc/systemd/system/fleetd.service`, replacing the legacy unit |
+
+`fleet-tool-install@.service` (ADR-0048) runs `mise install --locked` as `fleet-job` with `MISE_SAFE=1` against a fleetd-written `/run/fleet/<id>/mise.toml`. The agent unit has `Requires=` and `After=` on it, so a failed install fails the job before the agent starts. The install writes only to `/var/lib/fleet/tools` (`MISE_DATA_DIR`, created by tmpfiles.d as `fleet-job` 0750), never under the `.cache` mirror. The agent unit mounts that directory read-only. A job without a `mise.toml` skips the install unit through `ConditionPathExists`. Unverified: `MISE_SAFE=1` taking effect with `install`, and the proxy path from the private network namespace (fleetd must write `tool-env` and a forwarder); no live run has happened.
 
 The units and `sysusers.d` file were installed live on systemd 257. `systemd-analyze verify ./fleet-agent@.service ./fleetd.service` on a scratch copy of the repo units (with the mount lines above, `fleetd-systemd.service` copied as `fleetd.service`) on systemd 257.13 exited 0 with no output. That checks syntax only, not the mount behaviour. Run `systemd-analyze verify /etc/systemd/system/fleet-agent@.service /etc/systemd/system/fleetd.service` on the box before the first start anyway.
 

@@ -1335,3 +1335,193 @@ fn agent_unit_exposes_only_own_run_dir_and_hook_dir() {
             .any(|l| l.contains("/run/fleet ") || l == "ReadWritePaths=/run/fleet")
     );
 }
+
+const INSTALL_UNIT: &str = "fleet-tool-install@.service";
+
+fn has_line(lines: &[String], want: &str) -> bool {
+    lines.iter().any(|l| l == want)
+}
+
+#[test]
+fn install_unit_runs_the_locked_bundled_mise_as_fleet_job_with_safe_mode() {
+    let lines = unit_directives(INSTALL_UNIT);
+    assert_ne!(lines.len(), 0);
+    for want in [
+        "User=fleet-job",
+        "Group=fleet-work",
+        "Environment=MISE_SAFE=1",
+        "Environment=MISE_CONFIG_FILE=/run/fleet/%i/mise.toml",
+        "ExecStart=/usr/local/libexec/fleet/mise install --locked",
+        "ConditionPathExists=/run/fleet/%i/mise.toml",
+    ] {
+        assert!(has_line(&lines, want), "{want}");
+    }
+    let starts = lines.iter().filter(|l| l.starts_with("ExecStart=")).count();
+    assert_eq!(starts, 1);
+    assert_eq!(privileged_exec_lines(&lines).len(), 0);
+}
+
+#[test]
+fn install_unit_keeps_the_agent_hardening_that_fits() {
+    let install = unit_directives(INSTALL_UNIT);
+    let agent = unit_directives("fleet-agent@.service");
+    for key in [
+        "NoNewPrivileges=yes",
+        "ProtectSystem=strict",
+        "ProtectHome=yes",
+        "ProtectProc=invisible",
+        "ProcSubset=pid",
+        "PrivateNetwork=yes",
+        "PrivateTmp=yes",
+        "RestrictSUIDSGID=yes",
+        "LockPersonality=yes",
+        "CapabilityBoundingSet=",
+        "InaccessiblePaths=/etc/swarm",
+        "InaccessiblePaths=-/run/docker.sock",
+        "InaccessiblePaths=-/var/run/docker.sock",
+        "TemporaryFileSystem=/run/fleet:ro",
+        "BindReadOnlyPaths=/run/fleet/%i",
+    ] {
+        assert!(has_line(&install, key), "{key}");
+    }
+    assert!(!has_line(&install, "PrivateNetwork=no"));
+    assert!(has_line(&agent, "PrivateNetwork=yes"));
+    assert!(
+        !install
+            .iter()
+            .any(|l| l.contains("docker") && !l.starts_with("InaccessiblePaths="))
+    );
+    assert!(install.iter().any(|l| l.starts_with("RuntimeMaxSec=")));
+    assert!(install.iter().any(|l| l.starts_with("MemoryMax=")));
+    assert!(install.iter().any(|l| l.starts_with("TasksMax=")));
+}
+
+#[test]
+fn install_unit_writes_only_to_the_tools_dir_and_the_agent_mounts_it_read_only() {
+    let install = unit_directives(INSTALL_UNIT);
+    let agent = unit_directives("fleet-agent@.service");
+    let tmpfiles = deploy_file("tmpfiles.d/fleet.conf");
+    let writable: Vec<&String> = install
+        .iter()
+        .filter(|l| l.starts_with("ReadWritePaths="))
+        .collect();
+    assert_eq!(writable, ["ReadWritePaths=/var/lib/fleet/tools"]);
+    assert!(
+        !install
+            .iter()
+            .any(|l| { l.starts_with("ReadWritePaths=") && l.contains("/var/lib/fleet/jobs") })
+    );
+    assert!(has_line(
+        &install,
+        "Environment=MISE_DATA_DIR=/var/lib/fleet/tools"
+    ));
+    assert!(
+        tmpfiles
+            .lines()
+            .any(|l| l == "d /var/lib/fleet/tools 0750 fleet-job fleet-work -")
+    );
+    assert!(has_line(&agent, "ReadOnlyPaths=/var/lib/fleet/tools"));
+    assert!(
+        !agent
+            .iter()
+            .any(|l| l.starts_with("ReadWritePaths=") && l.contains("tools"))
+    );
+}
+
+#[test]
+fn a_failed_install_unit_blocks_the_agent_unit() {
+    let agent = unit_directives("fleet-agent@.service");
+    let install = unit_directives(INSTALL_UNIT);
+    assert!(has_line(&agent, "Requires=fleet-tool-install@%i.service"));
+    assert!(has_line(&agent, "After=fleet-tool-install@%i.service"));
+    assert!(has_line(&install, "Type=oneshot"));
+    assert!(has_line(&install, "RemainAfterExit=yes"));
+    assert!(has_line(&install, "BindsTo=fleetd.service"));
+    assert!(has_line(&install, "After=fleetd.service"));
+    assert!(!install.iter().any(|l| l.starts_with("SuccessExitStatus=")));
+    assert!(!install.iter().any(|l| l.starts_with("ExecStart=-")));
+    assert!(!install.iter().any(|l| l.contains("fleet-agent@")));
+}
+
+fn polkit_pattern(rule: &str, prefix: &str) -> String {
+    rule.lines()
+        .find(|l| l.contains(prefix))
+        .and_then(|l| l.split_once("/^").map(|(_, r)| r))
+        .and_then(|r| r.split_once("/.test").map(|(p, _)| format!("^{p}")))
+        .unwrap_or_default()
+}
+
+fn instance_pattern_accepts(pattern: &str, prefix: &str, id: &str) -> bool {
+    let want = format!("^{prefix}@[A-Za-z0-9_]{{1,64}}\\.service$");
+    if pattern != want {
+        return false;
+    }
+    let suffix = ".service";
+    let Some(rest) = id.strip_prefix(&format!("{prefix}@")) else {
+        return false;
+    };
+    let Some(inst) = rest.strip_suffix(suffix) else {
+        return false;
+    };
+    (1..=64).contains(&inst.len())
+        && inst.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+        && !id.contains('\n')
+}
+
+#[test]
+fn polkit_allows_the_install_template_with_the_same_instance_charset() {
+    let rule = deploy_file("polkit/50-fleet-agent.rules");
+    let install = polkit_pattern(&rule, "fleet-tool-install@");
+    let agent = polkit_pattern(&rule, "fleet-agent@");
+    assert_eq!(install, "^fleet-tool-install@[A-Za-z0-9_]{1,64}\\.service$");
+    assert_eq!(
+        agent.replace("fleet-agent", "X"),
+        install.replace("fleet-tool-install", "X")
+    );
+    assert!(rule.contains("subject.user !== \"fleetd\""));
+    assert!(rule.contains("polkit.Result.NO;"));
+}
+
+#[test]
+fn install_instance_names_are_confined_to_the_agent_charset() {
+    let rule = deploy_file("polkit/50-fleet-agent.rules");
+    let pattern = polkit_pattern(&rule, "fleet-tool-install@");
+    let good = ["a", "A_9", &"x".repeat(64)];
+    for id in good {
+        let unit = format!("fleet-tool-install@{id}.service");
+        assert!(
+            instance_pattern_accepts(&pattern, "fleet-tool-install", &unit),
+            "{id}"
+        );
+    }
+    let long = "x".repeat(65);
+    let hostile = [
+        "",
+        "a-b",
+        "a.b",
+        "a/b",
+        "a b",
+        "a\r",
+        "a\r\nb",
+        "a\u{85}b",
+        "a\u{2028}b",
+        "a\\b",
+        "a@b",
+        "..",
+        "a%20b",
+        "\u{e9}",
+        "a\0b",
+        "a:b",
+        "[::1]",
+        long.as_str(),
+    ];
+    for id in hostile {
+        let unit = format!("fleet-tool-install@{id}.service");
+        assert!(
+            !instance_pattern_accepts(&pattern, "fleet-tool-install", &unit),
+            "{id:?}"
+        );
+    }
+    assert!(!rule.contains("fleet-tool-install@.*"));
+    assert!(!rule.contains("fleet-tool-install@[^"));
+}

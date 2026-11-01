@@ -1,0 +1,43 @@
+[Unit]
+Description=Fleet tool install for job %i
+BindsTo=fleetd.service
+After=fleetd.service
+ConditionPathExists=/run/fleet/%i/mise.toml
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+User=fleet-job
+Group=fleet-work
+UMask=0007
+Environment=MISE_SAFE=1
+Environment=HOME=/var/lib/fleet/tools
+Environment=MISE_DATA_DIR=/var/lib/fleet/tools
+Environment=MISE_CACHE_DIR=/var/lib/fleet/tools/cache
+Environment=MISE_STATE_DIR=/var/lib/fleet/tools/state
+Environment=MISE_CONFIG_FILE=/run/fleet/%i/mise.toml
+EnvironmentFile=-/run/fleet/%i/tool-env
+ExecStart=/usr/local/libexec/fleet/mise install --locked
+Restart=no
+RuntimeMaxSec=15min
+TimeoutStopSec=10
+KillMode=control-group
+MemoryMax=1G
+TasksMax=256
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+ProtectProc=invisible
+ProcSubset=pid
+PrivateNetwork=yes
+PrivateTmp=yes
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+RestrictSUIDSGID=yes
+LockPersonality=yes
+CapabilityBoundingSet=
+ReadWritePaths=/var/lib/fleet/tools
+InaccessiblePaths=/etc/swarm
+InaccessiblePaths=-/run/docker.sock
+InaccessiblePaths=-/var/run/docker.sock
+TemporaryFileSystem=/run/fleet:ro
+BindReadOnlyPaths=/run/fleet/%i
