@@ -8,6 +8,7 @@ use crate::fetch_policy::{FetchCaps, FetchPolicy, HostPattern};
 use crate::runner::{
     DEFAULT_CI_DEADLINE, DEFAULT_MAX_BUDGET_USD, DEFAULT_MAX_TURNS, DEFAULT_TIMEOUT,
 };
+use crate::tools::{MisePins, MisePinsConfig, ToolsError};
 
 /// Config file read when `--config` is not given and the file exists.
 pub const DEFAULT_CONFIG_PATH: &str = "/etc/fleetd/config.toml";
@@ -91,6 +92,7 @@ struct FileConfig {
     fetch_max_per_job: Option<i64>,
     egress_allow: Option<Vec<String>>,
     egress_observe: Option<bool>,
+    mise: Option<MisePinsConfig>,
 }
 
 /// How agents are started.
@@ -218,9 +220,21 @@ pub struct Config {
     /// When true, the egress proxy logs each refused host name once per process, host only,
     /// and still refuses. Default false. Config file only.
     pub egress_observe: bool,
+    /// Pins for the bundled mise binary, the `[mise]` table. Config file only, unknown keys
+    /// refused. Use [`Config::mise_pins`] to validate them.
+    pub mise: Option<MisePinsConfig>,
 }
 
 impl Config {
+    /// Validates the `[mise]` table, `None` when it is absent.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ToolsError`] naming the missing or malformed pin.
+    pub fn mise_pins(&self) -> Result<Option<MisePins>, ToolsError> {
+        self.mise.clone().map(MisePins::new).transpose()
+    }
+
     /// Loads config from `explicit` or, when absent, from [`DEFAULT_CONFIG_PATH`] if that
     /// file exists, then applies the process environment. Only the selected file is read.
     ///
@@ -313,12 +327,7 @@ impl Config {
             db_path,
             queue_max_bytes,
             queue_max_age,
-            hook_events: file.hook_events.unwrap_or_else(|| {
-                DEFAULT_HOOK_EVENTS
-                    .iter()
-                    .map(|e| (*e).to_owned())
-                    .collect()
-            }),
+            hook_events: file.hook_events.unwrap_or_else(default_hook_events),
             secrets_file,
             box_name: env("FLEET_BOX_NAME")
                 .or(file.box_name)
@@ -354,8 +363,16 @@ impl Config {
             fetch_caps,
             egress_allow,
             egress_observe: file.egress_observe.unwrap_or(false),
+            mise: file.mise,
         })
     }
+}
+
+fn default_hook_events() -> Vec<String> {
+    DEFAULT_HOOK_EVENTS
+        .iter()
+        .map(|e| (*e).to_owned())
+        .collect()
 }
 
 fn resolve_secrets(env: &dyn Fn(&str) -> Option<String>, file: Option<PathBuf>) -> SecretsFile {
@@ -1299,5 +1316,62 @@ mod tests {
     fn rejects_bad_port_and_unknown_keys() {
         assert!(Config::resolve(None, &env_of(&[("FLEETD_PORT", "nope")])).is_err());
         assert!(Config::resolve(Some("bogus = 1"), &env_of(&[])).is_err());
+    }
+
+    const FULL_MISE: &str = "[mise]\nversion = \"2024.11.3\"\nsha256 = \"0000000000000000000000000000000000000000000000000000000000000000\"\nsignature_path = \"etc/mise.minisig\"\npublic_key_path = \"etc/mise.pub\"\n";
+
+    fn mise_without(key: &str) -> String {
+        FULL_MISE
+            .lines()
+            .filter(|line| !line.starts_with(key))
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    #[test]
+    fn mise_section_absent_gives_no_pins() {
+        let cfg = Config::resolve(None, &env_of(&[])).unwrap();
+        assert!(cfg.mise.is_none());
+        assert!(cfg.mise_pins().unwrap().is_none());
+    }
+
+    #[test]
+    fn mise_section_full_builds_pins_with_relative_paths_kept() {
+        let cfg = Config::resolve(Some(FULL_MISE), &env_of(&[])).unwrap();
+        let raw = cfg.mise.as_ref().unwrap();
+        assert_eq!(
+            raw.signature_path.as_deref(),
+            Some(Path::new("etc/mise.minisig"))
+        );
+        assert!(cfg.mise_pins().unwrap().is_some());
+    }
+
+    #[test]
+    fn mise_section_missing_each_pin_names_it() {
+        for key in ["version", "sha256", "signature_path", "public_key_path"] {
+            let cfg = Config::resolve(Some(&mise_without(key)), &env_of(&[])).unwrap();
+            match cfg.mise_pins() {
+                Err(ToolsError::MissingPin(name)) => assert_eq!(name, key),
+                other => panic!("{key}: {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn mise_section_empty_names_the_first_missing_pin() {
+        let cfg = Config::resolve(Some("[mise]\n"), &env_of(&[])).unwrap();
+        assert!(matches!(
+            cfg.mise_pins(),
+            Err(ToolsError::MissingPin("version"))
+        ));
+    }
+
+    #[test]
+    fn mise_section_rejects_unknown_keys() {
+        let text = format!("{FULL_MISE}extra = 1\n");
+        assert!(matches!(
+            Config::resolve(Some(&text), &env_of(&[])),
+            Err(Error::ConfigFile(_))
+        ));
     }
 }
