@@ -1,6 +1,6 @@
 # fleetd self-update
 
-Status: Proposed 2026-11-01. Built and wired in fleetd (`crates/fleetd/src/update/`, the release workflow signs the manifest, the server relays it in the heartbeat). No live run on a real Box yet. Amends ADR-0017.
+Status: Proposed 2026-11-01. Built and wired in fleetd (`crates/fleetd/src/update/`, the release workflow signs the manifest, the server relays it in the heartbeat). No live run on a real Box yet. Amends ADR-0017. The trust root is amended by ADR-0050.
 
 ADR-0017 makes a fleetd upgrade a Template rebuild: the Template pins a version and boxes reach GitHub at build time only. This ADR adds an in-place update so a running Box can move to a new fleetd without a rebuild. The design fixes who signs, where the trust root lives, how the binary is laid out on disk, and how a bad update is undone.
 
