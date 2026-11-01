@@ -315,6 +315,22 @@ impl Profile {
         }
     }
 
+    /// Parses a Profile from the canonical JSON the server stores, which may carry `tools`.
+    ///
+    /// Only a caller that re-validates the profile and checks its hash against a trusted
+    /// reference may use this; [`Profile::from_json`] stays the entry for untrusted input.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ProfileError::Malformed`] for bad JSON, a top level that is not an object,
+    /// unknown fields, wrong types, an unknown tool or a version that is not an exact pin.
+    pub fn from_stored_json(bytes: &[u8]) -> Result<Self, ProfileError> {
+        if bytes.trim_ascii_start().first() != Some(&b'{') {
+            return Err(ProfileError::Malformed);
+        }
+        serde_json::from_slice(bytes).map_err(|_| ProfileError::Malformed)
+    }
+
     /// Parses a Profile from TOML text, the only input that accepts `tools`.
     ///
     /// # Errors
@@ -707,6 +723,19 @@ mod tests {
         assert_eq!(ab.hash(), ba.hash());
         assert_eq!(ab.canonical_json(), ba.canonical_json());
         assert_eq!(Profile::from_toml(TOOLS_TOML).unwrap().tools.len(), 2);
+    }
+
+    #[test]
+    fn stored_json_accepts_tools_and_still_rejects_bad_entries() {
+        let text = br#"{"tools":[{"name":"node","version":"20.11.1"}]}"#;
+        assert_eq!(Profile::from_stored_json(text).unwrap().tools.len(), 1);
+        for bad in [
+            &br#"{"tools":[{"name":"emacs","version":"1"}]}"#[..],
+            br#"{"tools":[{"name":"node","version":"latest"}]}"#,
+            br"[]",
+        ] {
+            assert_eq!(Profile::from_stored_json(bad), Err(ProfileError::Malformed));
+        }
     }
 
     #[test]
