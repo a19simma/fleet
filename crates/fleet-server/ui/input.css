@@ -1,0 +1,51 @@
+@import "tailwindcss" source(none);
+@source "../src/web";
+@plugin "./vendor/daisyui.mjs" {
+  themes: false;
+}
+@plugin "./vendor/daisyui-theme.mjs" {
+  name: "console";
+  default: true;
+  prefersdark: true;
+  color-scheme: dark;
+  --color-base-100: #0d1117;
+  --color-base-200: #090c10;
+  --color-base-300: #1c232c;
+  --color-base-content: #c9d1d9;
+  --color-primary: #3fb950;
+  --color-primary-content: #04130a;
+  --color-secondary: #d29922;
+  --color-secondary-content: #1a1200;
+  --color-accent: #58a6ff;
+  --color-accent-content: #04111f;
+  --color-neutral: #30363d;
+  --color-neutral-content: #c9d1d9;
+  --color-info: #58a6ff;
+  --color-info-content: #04111f;
+  --color-success: #3fb950;
+  --color-success-content: #04130a;
+  --color-warning: #d29922;
+  --color-warning-content: #1a1200;
+  --color-error: #f85149;
+  --color-error-content: #1f0504;
+  --radius-selector: 2px;
+  --radius-field: 2px;
+  --radius-box: 2px;
+  --size-selector: 0.2rem;
+  --size-field: 0.2rem;
+  --border: 1px;
+  --depth: 0;
+  --noise: 0;
+}
+:root {
+  --font-body: ui-monospace, "SF Mono", "JetBrains Mono", Menlo, Consolas, monospace;
+  --font-mono: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+  --space-cell: 0.15rem;
+  --space-gutter: 0.75rem;
+  --type-body: 13px;
+}
+html { font-size: var(--type-body); }
+body { font-family: var(--font-body); background: var(--color-base-100); color: var(--color-base-content); }
+pre, code, kbd { font-family: var(--font-mono); }
+.table :where(th, td) { padding-block: var(--space-cell); }
+:focus-visible { outline: 2px solid var(--color-accent); outline-offset: 1px; }

@@ -25,8 +25,8 @@ use tokio::task::JoinHandle;
 
 use super::{
     ApplyOutcome, ArchiveFetcher, Policy, PolicyArchiveFetcher, ROOT_UID, SeqStore, StageError,
-    Stager, Swapper, TrustRoot, UpdateError, UpdateWiring, Updater, load_trust_root,
-    verify_manifest,
+    Stager, Swapper, TrustRoot, TrustSource, UpdateError, UpdateWiring, Updater,
+    resolve_trust_root, verify_manifest,
 };
 use crate::fetch_policy::HostPattern;
 
@@ -151,6 +151,7 @@ const fn refusal(err: &UpdateError) -> &'static str {
         | UpdateError::TrustRootTooLarge
         | UpdateError::TrustRootInvalid(_)
         | UpdateError::TrustRootIo(_) => "trust root unusable",
+        UpdateError::TrustRootMissing => "trust root file required and missing",
         UpdateError::ManifestTooLarge => "manifest too large",
         UpdateError::SignatureTooLarge => "signature too large",
         UpdateError::Signature(_) => "signature refused",
@@ -355,23 +356,33 @@ pub fn host_target() -> String {
 
 /// Starts the production driver, or returns `None` with one warning.
 ///
-/// The trust root at `trust_root` must load: a missing, unsafe or invalid file disables
-/// updating and nothing else. The driver fetches through the egress policy for `hosts` and
+/// The trust root comes from [`resolve_trust_root`]: an absent default file selects the
+/// embedded key, and a present file that is unsafe or invalid disables updating without
+/// falling back to the embedded key. The driver fetches through the egress policy for `hosts` and
 /// applies through `wiring`. Call it once at startup, inside the runtime.
 #[must_use]
 pub fn start_production(
     trust_root: &Path,
+    source: TrustSource,
     bin_root: &Path,
     hosts: Vec<HostPattern>,
     wiring: &UpdateWiring,
 ) -> Option<(OfferSink, JoinHandle<()>)> {
-    let trust = match load_trust_root(trust_root, ROOT_UID) {
+    let trust = match resolve_trust_root(trust_root, source, ROOT_UID) {
         Ok(trust) => trust,
         Err(err) => {
-            tracing::warn!(reason = refusal(&err), "self-update disabled");
+            let reason = match err {
+                UpdateError::TrustRootMissing => refusal(&err),
+                _ => "trust file present but refused, baked key not used",
+            };
+            tracing::warn!(reason, "self-update disabled");
             return None;
         }
     };
+    tracing::info!(
+        source = if trust.is_baked() { "baked" } else { "file" },
+        "update trust root selected"
+    );
     let Ok(running) = Version::new(env!("CARGO_PKG_VERSION")) else {
         tracing::warn!(reason = "own version unusable", "self-update disabled");
         return None;

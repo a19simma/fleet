@@ -1,6 +1,6 @@
 # Fleet
 
-Fleet runs coding-agent Jobs on Boxes and records what each Job did. This file defines the terms of the ADRs on telemetry and metrics (0029, 0030), profiles (0034, 0035), the job socket, broker and registration (0036, 0037, 0039), fetch policy (0038), credentials and users (0040, 0042, 0043), agent runners and forges (0044, 0045) and the mirror key (0046).
+Fleet runs coding-agent Jobs on Boxes and records what each Job did. This file defines the terms of the ADRs on telemetry and metrics (0029, 0030), profiles (0034, 0035), the job socket, broker and registration (0036, 0037, 0039), fetch policy (0038), credentials and users (0040, 0042, 0043), agent runners and forges (0044, 0045) the mirror key (0046) and the update trust root (0047, 0050).
 
 ## Language
 
@@ -101,8 +101,16 @@ The Box-level rule for which hosts `fleetd fetch` may reach. Set by `fetch_polic
 _Avoid_: egress allowlist, proxy policy
 
 **User**:
-A person who owns **Credentials** and submits Jobs. Built in fleet-server (ADR-0042). Jobs without an owner still default to the bootstrap user.
+A person who owns **Credentials** and submits Jobs. Built in fleet-server (ADR-0042). Jobs without an owner default to the **Bootstrap user**.
 _Avoid_: account, tenant
+
+**Bootstrap user**:
+The reserved legacy owner `bootstrap`, created lazily. `FLEET_CLIENT_TOKEN` and Jobs submitted without an owner act as it. It has no passkey, so it can never log in, and no one can create or reset a user with that name in any letter case (`BOOTSTRAP_USERNAME` in `crates/fleet-server/src/cred/users.rs`, ADR-0042).
+_Avoid_: admin, root user
+
+**First admin**:
+The ordinary first **User**, created through a **Setup code** while no user other than the **Bootstrap user** exists. It is a normal row with a passkey and can log in.
+_Avoid_: bootstrap user, root user
 
 **Credential**:
 One secret a **User** stores for a Job: an agent key or token, or a forge token. Sealed in the `credentials` table (ADR-0040).
@@ -140,6 +148,14 @@ _Avoid_: token, client token
 The server-side browser login state of a **User**, created by passkey login. Built in fleet-server (ADR-0042).
 _Avoid_: login token, cookie
 
+**Setup code**:
+The one-time code behind `/setup/{code}` that creates the **First admin**. The server holds it in memory only, issues it at start when no user other than the **Bootstrap user** exists, logs the path, replaces it on every restart and drops it once any user exists. The page asks for a username and a passkey (`Users::issue_setup_code`, `redeem_setup`, ADR-0042).
+_Avoid_: enroll code, admin code
+
+**Enroll code**:
+The one-time code behind `/enroll/{code}` that registers a passkey for an existing **User**. `fleet-server admin` issues it on create-user and on a passkey reset. The server stores a SHA-256 of it in the `setup_codes` table, which also names it "setup code" in code, and it expires after 24 hours (`SETUP_CODE_TTL_HOURS`). The page asks for no username (`redeem_user_setup`, ADR-0042).
+_Avoid_: setup code, invite
+
 **Credential holder**:
 The server component that opens a **Credential** for one claimed Job and records the read in `credential_use`. Built in `crates/fleet-server/src/cred/store.rs` (ADR-0040).
 _Avoid_: vault, secret manager
@@ -175,6 +191,14 @@ _Avoid_: token, worker token
 **Client token**:
 The bearer token the CLI uses with the server, `FLEET_CLIENT_TOKEN`, in client scope (ADR-0014, ADR-0023).
 _Avoid_: token, API token
+
+**Trust root**:
+The key source fleetd verifies update manifests against: the file `/etc/fleetd/update.pub` when it exists, else the **Baked key**. A present but invalid file disables updating and never falls back (ADR-0047, ADR-0050).
+_Avoid_: trust anchor, signing key
+
+**Baked key**:
+The default minisign public key embedded in the fleetd binary from `crates/fleetd/trust/update.pub` (`BAKED_TRUST_KEY`). Only a new fleetd build changes it (ADR-0050).
+_Avoid_: update.pub, signing key
 
 ## Relationships
 
