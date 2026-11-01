@@ -109,6 +109,15 @@ fn row(job: &Job) -> Row {
     }
 }
 
+fn badge_class(state: &str) -> &'static str {
+    match state {
+        "JOB_STATE_RUNNING" => "badge badge-sm badge-warning",
+        "JOB_STATE_SUCCEEDED" => "badge badge-sm badge-success",
+        "JOB_STATE_FAILED" | "JOB_STATE_LOST" => "badge badge-sm badge-error",
+        _ => "badge badge-sm badge-ghost",
+    }
+}
+
 fn internal(err: &StoreError) -> topcoat::Error {
     tracing::error!(error = %err, "jobs page store read failed");
     fail(AuthError::Internal)
@@ -129,28 +138,33 @@ async fn jobs_page(cx: &Cx) -> Result<impl View> {
     let csrf = String::from_utf8_lossy(session.csrf.expose()).into_owned();
     Ok(view! {
         shell(title: "fleet jobs", active: Nav::Jobs, user: session.username.as_str(), csrf: csrf.as_str(), mode: "",
-                <h1>"Jobs"</h1>
-                <p><a href="/account">"Account"</a></p>
-                <table>
-                    <thead>
-                        <tr>
-                            <th>"Job"</th>
-                            <th>"State"</th>
-                            <th>"Repo"</th>
-                            <th>"Created"</th>
-                        </tr>
-                    </thead>
-                    <tbody>
-                        for row in rows {
+                <header class="mb-3 flex items-center gap-3 border-b border-base-300 pb-2 text-xs">
+                    <span class="text-primary">"$"</span>
+                    <h1 class="text-sm font-bold">"Jobs"</h1>
+                    <a class="link link-hover ml-auto" href="/account">"Account"</a>
+                </header>
+                <div class="overflow-x-auto">
+                    <table class="table table-zebra table-xs">
+                        <thead>
                             <tr>
-                                <td><a href=(format!("/jobs/{}", row.id))>(row.id.as_str())</a></td>
-                                <td>(row.state)</td>
-                                <td>(row.repo)</td>
-                                <td>(row.created)</td>
+                                <th>"Job"</th>
+                                <th>"State"</th>
+                                <th>"Repo"</th>
+                                <th>"Created"</th>
                             </tr>
-                        }
-                    </tbody>
-                </table>
+                        </thead>
+                        <tbody>
+                            for row in rows {
+                                <tr>
+                                    <td><a class="link link-primary" href=(format!("/jobs/{}", row.id))>(row.id.as_str())</a></td>
+                                    <td><span class=(badge_class(row.state))>(row.state)</span></td>
+                                    <td>(row.repo)</td>
+                                    <td>(row.created)</td>
+                                </tr>
+                            }
+                        </tbody>
+                    </table>
+                </div>
             )
     })
 }
@@ -185,33 +199,43 @@ async fn job_page(cx: &Cx) -> Result<impl View> {
     let csrf = String::from_utf8_lossy(session.csrf.expose()).into_owned();
     Ok(view! {
         shell(title: "fleet job", active: Nav::Jobs, user: session.username.as_str(), csrf: csrf.as_str(), mode: "",
-                <h1>(job.job_id.as_str())</h1>
-                <p><a href="/jobs">"Jobs"</a></p>
-                <dl>
-                    <dt>"State"</dt><dd>(state)</dd>
-                    <dt>"Repo"</dt><dd>(job.repo.as_str())</dd>
-                    <dt>"Base ref"</dt><dd>(job.base_ref.as_str())</dd>
-                    <dt>"Created"</dt><dd>(created)</dd>
-                    <dt>"Phase"</dt><dd>(job.phase.as_str())</dd>
-                    <dt>"Progress"</dt><dd>(job.progress.as_str())</dd>
-                    <dt>"Branch"</dt><dd>(branch)</dd>
-                    <dt>"Error"</dt><dd>(error)</dd>
-                    <dt>"Pull request"</dt>
-                    <dd>
-                        if pr_link {
-                            <a href=(pr_url.as_str())>(pr_url.as_str())</a>
-                        } else {
-                            (pr_url.as_str())
+                <header class="mb-3 flex items-center gap-3 border-b border-base-300 pb-2 text-xs">
+                    <span class="text-primary">"$"</span>
+                    <h1 class="text-sm font-bold">(job.job_id.as_str())</h1>
+                    <a class="link link-hover ml-auto" href="/jobs">"Jobs"</a>
+                </header>
+                <div class="grid gap-3 lg:grid-cols-[22rem_1fr]">
+                    <section class="flex flex-col gap-3">
+                        <dl class="grid grid-cols-[6rem_1fr] gap-y-1 border border-base-300 p-2 text-xs">
+                            <dt class="text-base-content/60">"State"</dt>
+                            <dd><span class=(badge_class(state))>(state)</span></dd>
+                            <dt class="text-base-content/60">"Repo"</dt><dd class="break-all">(job.repo.as_str())</dd>
+                            <dt class="text-base-content/60">"Base ref"</dt><dd class="break-all">(job.base_ref.as_str())</dd>
+                            <dt class="text-base-content/60">"Created"</dt><dd>(created)</dd>
+                            <dt class="text-base-content/60">"Phase"</dt><dd>(job.phase.as_str())</dd>
+                            <dt class="text-base-content/60">"Progress"</dt><dd>(job.progress.as_str())</dd>
+                            <dt class="text-base-content/60">"Branch"</dt><dd class="break-all">(branch)</dd>
+                            <dt class="text-base-content/60">"Error"</dt><dd class="text-error">(error)</dd>
+                            <dt class="text-base-content/60">"Pull request"</dt>
+                            <dd class="break-all">
+                                if pr_link {
+                                    <a class="link link-primary" href=(pr_url.as_str())>(pr_url.as_str())</a>
+                                } else {
+                                    (pr_url.as_str())
+                                }
+                            </dd>
+                        </dl>
+                        <h2 class="text-xs font-bold uppercase text-base-content/60">"Prompt"</h2>
+                        <pre id="prompt" class="overflow-auto whitespace-pre-wrap border border-base-300 bg-base-200 p-2 text-xs">(job.prompt.as_str())</pre>
+                    </section>
+                    <section>
+                        <h2 class="mb-1 text-xs font-bold uppercase text-base-content/60">"Transcript"</h2>
+                        <pre id="transcript" class="h-[70vh] overflow-auto border border-base-300 bg-base-300 p-2 text-xs">(transcript.text.as_str())</pre>
+                        if transcript.cut {
+                            <p id="cut" class="mt-1 text-xs text-warning">"transcript cut: the rest is not shown here."</p>
                         }
-                    </dd>
-                </dl>
-                <h2>"Prompt"</h2>
-                <pre id="prompt">(job.prompt.as_str())</pre>
-                <h2>"Transcript"</h2>
-                <pre id="transcript">(transcript.text.as_str())</pre>
-                if transcript.cut {
-                    <p id="cut">"transcript cut: the rest is not shown here."</p>
-                }
+                    </section>
+                </div>
             )
     })
 }

@@ -378,9 +378,6 @@ async fn every_page_is_accessible_markup(pool: PgPool) {
         assert!(body.contains("<html lang=\"en\""), "{path}");
         assert_eq!(body.matches("<h1").count(), 1, "{path}");
         assert!(body.contains("<main id=\"app\""), "{path}");
-        if matches!(path.as_str(), "/tokens" | "/credentials") {
-            continue;
-        }
         let labels: Vec<&str> = tags(&body, "label");
         let for_ids: HashSet<&str> = labels.iter().filter_map(|tag| attr(tag, "for")).collect();
         for control in ["input", "select", "textarea"] {

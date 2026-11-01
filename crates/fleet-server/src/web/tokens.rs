@@ -113,49 +113,55 @@ async fn tokens_page(cx: &Cx) -> Result<impl View> {
     let csrf = String::from_utf8_lossy(session.csrf.expose()).into_owned();
     Ok(view! {
         shell(title: "fleet API tokens", active: Nav::Tokens, user: session.username.as_str(), csrf: csrf.as_str(), mode: "",
-                <h1>"API tokens"</h1>
-                <p><a href="/account">"Account"</a></p>
+                <header class="mb-3 flex items-center gap-3 border-b border-base-300 pb-2 text-xs">
+                    <span class="text-primary">"$"</span>
+                    <h1 class="text-sm font-bold">"API tokens"</h1>
+                    <a class="link link-hover ml-auto" href="/account">"Account"</a>
+                </header>
                 if let Some(text) = notice {
-                    <p id="notice">(text)</p>
+                    <p id="notice" class="mb-2 border border-base-300 bg-base-200 p-2 text-xs">(text)</p>
                 }
-                <table>
-                    <thead>
-                        <tr>
-                            <th>"Label"</th>
-                            <th>"Created"</th>
-                            <th>"Status"</th>
-                            <th>"Actions"</th>
-                        </tr>
-                    </thead>
-                    <tbody>
-                        for row in rows {
+                <div class="overflow-x-auto">
+                    <table class="table table-zebra table-xs">
+                        <thead>
                             <tr>
-                                <td>(row.label)</td>
-                                <td>(row.created)</td>
-                                if row.revoked {
-                                    <td>"revoked"</td>
-                                    <td></td>
-                                } else {
-                                    <td>"active"</td>
-                                    <td>
-                                        <form method="post" action="/tokens/revoke">
-                                            <input type="hidden" name="csrf" value=(csrf.as_str())>
-                                            <input type="hidden" name="id" value=(row.id)>
-                                            <button type="submit">"Revoke"</button>
-                                        </form>
-                                    </td>
-                                }
+                                <th>"Label"</th>
+                                <th>"Created"</th>
+                                <th>"Status"</th>
+                                <th class="text-right">"Actions"</th>
                             </tr>
-                        }
-                    </tbody>
-                </table>
-                <h2>"Create a token"</h2>
-                <form method="post" action="/tokens/create" autocomplete="off">
+                        </thead>
+                        <tbody>
+                            for row in rows {
+                                <tr>
+                                    <td>(row.label)</td>
+                                    <td>(row.created)</td>
+                                    if row.revoked {
+                                        <td><span class="badge badge-sm badge-ghost">"revoked"</span></td>
+                                        <td></td>
+                                    } else {
+                                        <td><span class="badge badge-sm badge-success">"active"</span></td>
+                                        <td class="text-right">
+                                            <form method="post" action="/tokens/revoke">
+                                                <input type="hidden" name="csrf" value=(csrf.as_str())>
+                                                <input type="hidden" name="id" value=(row.id)>
+                                                <button class="btn btn-xs btn-outline btn-error" type="submit">"Revoke"</button>
+                                            </form>
+                                        </td>
+                                    }
+                                </tr>
+                            }
+                        </tbody>
+                    </table>
+                </div>
+                <h2 class="mb-1 mt-6 text-xs font-bold uppercase text-base-content/60">"Create a token"</h2>
+                <form class="mt-1 flex items-end gap-2" method="post" action="/tokens/create" autocomplete="off">
                     <input type="hidden" name="csrf" value=(csrf.as_str())>
-                    <label>"Label"
-                        <input name="label" maxlength="64" autocomplete="off">
-                    </label>
-                    <button type="submit">"Create"</button>
+                    <fieldset class="fieldset">
+                        <label class="label" for="token-label">"Label"</label>
+                        <input class="input input-sm" id="token-label" name="label" maxlength="64" autocomplete="off">
+                    </fieldset>
+                    <button class="btn btn-sm btn-primary" type="submit">"Create"</button>
                 </form>
             )
     })
@@ -177,10 +183,13 @@ async fn create(cx: &Cx, Form(form): Form<HashMap<String, String>>) -> Result<im
     let csrf = String::from_utf8_lossy(session.csrf.expose()).into_owned();
     Ok(view! {
         shell(title: "fleet API token", active: Nav::Tokens, user: session.username.as_str(), csrf: csrf.as_str(), mode: "",
-                <h1>"API token created"</h1>
-                <p>"Copy it now. It is not shown again."</p>
-                <pre id="token">(token.as_str())</pre>
-                <p><a href="/tokens">"API tokens"</a></p>
+                <header class="mb-3 flex items-center gap-3 border-b border-base-300 pb-2 text-xs">
+                    <span class="text-primary">"$"</span>
+                    <h1 class="text-sm font-bold">"API token created"</h1>
+                    <a class="link link-hover ml-auto" href="/tokens">"API tokens"</a>
+                </header>
+                <p class="mb-2 text-xs text-warning">"Copy it now. It is not shown again."</p>
+                <pre id="token" class="overflow-auto border border-base-300 bg-base-300 p-2 text-xs">(token.as_str())</pre>
             )
     })
 }

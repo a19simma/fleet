@@ -156,12 +156,16 @@ async fn credentials_page(cx: &Cx) -> Result<impl View> {
     let csrf = String::from_utf8_lossy(session.csrf.expose()).into_owned();
     Ok(view! {
         shell(title: "fleet credentials", active: Nav::Credentials, user: session.username.as_str(), csrf: csrf.as_str(), mode: "",
-                <h1>"Credentials"</h1>
-                <p><a href="/account">"Account"</a></p>
+                <header class="mb-3 flex items-center gap-3 border-b border-base-300 pb-2 text-xs">
+                    <span class="text-primary">"$"</span>
+                    <h1 class="text-sm font-bold">"Credentials"</h1>
+                    <a class="link link-hover ml-auto" href="/account">"Account"</a>
+                </header>
                 if let Some(text) = notice {
-                    <p id="notice">(text)</p>
+                    <p id="notice" class="mb-2 border border-base-300 bg-base-200 p-2 text-xs">(text)</p>
                 }
-                <table>
+                <div class="overflow-x-auto">
+                <table class="table table-zebra table-xs">
                     <thead>
                         <tr>
                             <th>"Kind"</th>
@@ -170,7 +174,7 @@ async fn credentials_page(cx: &Cx) -> Result<impl View> {
                             <th>"Fingerprint"</th>
                             <th>"Expires"</th>
                             <th>"Last used"</th>
-                            <th>"Actions"</th>
+                            <th class="text-right">"Actions"</th>
                         </tr>
                     </thead>
                     <tbody>
@@ -178,27 +182,27 @@ async fn credentials_page(cx: &Cx) -> Result<impl View> {
                             <tr data-kind=(row.kind)>
                                 <td>(row.kind)</td>
                                 if let Some(id) = row.id {
-                                    <td>"stored"</td>
+                                    <td><span class="badge badge-sm badge-success">"stored"</span></td>
                                     <td>(row.login)</td>
                                     <td>(row.fingerprint)</td>
                                     <td>(if row.expires.is_empty() { "none".to_owned() } else { row.expires })</td>
                                     <td>(if row.last_used.is_empty() { "never".to_owned() } else { row.last_used })</td>
-                                    <td>
-                                        <form method="post" action="/credentials/delete">
+                                    <td class="text-right">
+                                        <form class="inline" method="post" action="/credentials/delete">
                                             <input type="hidden" name="csrf" value=(csrf.as_str())>
                                             <input type="hidden" name="id" value=(id.to_string())>
-                                            <button type="submit">"Delete"</button>
+                                            <button class="btn btn-xs btn-outline btn-error" type="submit">"Delete"</button>
                                         </form>
                                         if row.kind == CredentialKind::GithubPat.wire_name() {
-                                            <form method="post" action="/credentials/verify">
+                                            <form class="inline" method="post" action="/credentials/verify">
                                                 <input type="hidden" name="csrf" value=(csrf.as_str())>
                                                 <input type="hidden" name="id" value=(id.to_string())>
-                                                <button type="submit">"Verify"</button>
+                                                <button class="btn btn-xs btn-outline" type="submit">"Verify"</button>
                                             </form>
                                         }
                                     </td>
                                 } else {
-                                    <td>"not set"</td>
+                                    <td><span class="badge badge-sm badge-ghost">"not set"</span></td>
                                     <td></td>
                                     <td></td>
                                     <td></td>
@@ -209,20 +213,23 @@ async fn credentials_page(cx: &Cx) -> Result<impl View> {
                         }
                     </tbody>
                 </table>
-                <h2>"Set a credential"</h2>
-                <form method="post" action="/credentials/put" autocomplete="off">
+                </div>
+                <h2 class="mb-1 mt-6 text-xs font-bold uppercase text-base-content/60">"Set a credential"</h2>
+                <form class="mt-1 flex items-end gap-2" method="post" action="/credentials/put" autocomplete="off">
                     <input type="hidden" name="csrf" value=(csrf.as_str())>
-                    <label>"Kind"
-                        <select name="kind">
+                    <fieldset class="fieldset">
+                        <label class="label" for="credential-kind">"Kind"</label>
+                        <select class="select select-sm" id="credential-kind" name="kind">
                             for kind in CredentialKind::ALL {
                                 <option value=(kind.wire_name())>(kind.wire_name())</option>
                             }
                         </select>
-                    </label>
-                    <label>"Value"
-                        <input type="password" name="value" autocomplete="off" required="">
-                    </label>
-                    <button type="submit">"Save"</button>
+                    </fieldset>
+                    <fieldset class="fieldset">
+                        <label class="label" for="credential-value">"Value"</label>
+                        <input class="input input-sm" id="credential-value" type="password" name="value" autocomplete="off" required="">
+                    </fieldset>
+                    <button class="btn btn-sm btn-primary" type="submit">"Save"</button>
                 </form>
             )
     })
