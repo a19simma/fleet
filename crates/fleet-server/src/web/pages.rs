@@ -350,8 +350,12 @@ async fn add_finish(cx: &Cx, Json(body): Json<Value>) -> Result<Json<Value>> {
     if !csrf_matches(&session, presented) {
         return Err(forbidden().into());
     }
+    let Some(cookie) = session_cookie(headers(cx)) else {
+        return Err(forbidden().into());
+    };
     auth.add_finish(
         session.user_id,
+        cookie.as_bytes(),
         field(&body, "ceremony")?,
         &registration(&body)?,
     )
