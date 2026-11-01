@@ -88,6 +88,29 @@ sqlite3 /var/lib/fleetd/queue.db 'select seq, kind, state from events order by s
 
 `fleetd dump` prints one JSON object per queued event. The unit runs with `Type=notify` and a 60 second watchdog. Every half `WatchdogSec` fleetd makes a real `GET /healthz` round trip to the loopback listener and the unix socket. It sends the watchdog ping only when both answer 200 with body `ok` within 3 seconds, so a wedged or ended listener makes systemd restart it. The ping comes from its own task and does not wait on job progress, so a long running job does not trip `WatchdogSec`. Only a wedged runtime or listener does.
 
+## Smoke test
+
+`deploy/smoke.sh` submits one tiny read-only job through the live server with the `fleet` CLI and waits for it. It reads everything from the environment: `FLEET_SERVER_URL`, `FLEET_CLIENT_TOKEN` and `SMOKE_REPO` are required, and it refuses to start with a one-line message when one is unset. The token never goes on a command line and the script never prints it. Run it under fnox so the secret stays out of your shell history and scrollback:
+
+```sh
+fnox -c <your fnox.toml> exec -- deploy/smoke.sh
+```
+
+Optional variables: `SMOKE_BASE` (default `main`), `SMOKE_AGENT` (default `claude`, matches `[a-z0-9_-]{1,32}`), `SMOKE_DEADLINE_SECS` (default 300, integer 10 to 3600) and `FLEET_BIN` (default `fleet`). It polls `fleet status` every 5 seconds and prints only state and phase. On a failed, cancelled, lost or timed out job it prints up to 4000 bytes of `fleet logs`, minus lines starting with `chmod:`. Control characters are removed from the printed transcript. On the deadline it runs `fleet cancel` best effort.
+
+| Exit | Meaning |
+| --- | --- |
+| 0 | job succeeded |
+| 1 | submit failed |
+| 2 | missing or invalid input |
+| 3 | job failed |
+| 4 | job cancelled |
+| 5 | deadline passed |
+| 6 | unknown or lost state |
+| 7 | submit returned an unusable job id |
+
+Test the script with `python3 -m unittest deploy/tests/test_smoke.py`. It drives `smoke.sh` against a fake `fleet` and a fake `sleep`.
+
 ## Systemd agent launcher
 
 `agent_launcher = "systemd"` runs each agent as a `fleet-agent@<job id>.service` unit under a second uid, so a job under the second uid cannot read `/etc/swarm/secrets.env` or `/proc/<fleetd pid>/environ`. Under this launcher the agent asks fleetd for `push`, `pr_create`, `pr_checks` and `fetch` through `fleetd broker` on its per-job socket (ADR-0037), and holds no GitHub token. The direct launcher serves no job socket, so no broker runs there and the agent shares fleetd's uid and can read both. These claims come from the code and its tests. The live probe in [Credential isolation probe](#credential-isolation-probe) has not run yet, so none of them is proven on a box. The design and the live findings are in [ADR-0031](../docs/adr/0031-agent-isolation.md). The default is `direct`, the legacy path above.
