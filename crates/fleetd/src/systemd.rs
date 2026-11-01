@@ -28,14 +28,19 @@ use tokio::net::unix::pipe::Receiver;
 use tokio::sync::watch;
 use tokio::task::JoinHandle;
 
-use fleet_core::tools::ToolName;
+use fleet_core::tools::{ToolName, ToolSpec};
 
 use crate::agent_exec::{SPEC_FILE, TOOL_PROXY_PORT, write_spec};
 use crate::config::{AgentLauncher, Config};
+use crate::fetch_policy::HostPattern;
 use crate::jobenv::{create_stdout_fifo, open_fifo_reader, render_env_file, write_env_file};
 use crate::jobsock::{JobSocket, Limits, Peer, ProcPeer, ServiceName, Services, socket_path};
-use crate::runner::{AgentProc, AgentSpec, DirectLauncher, Launched, Launcher};
-use crate::tools::{check_tool_hosts, write_tool_env};
+use crate::runner::{
+    AgentProc, AgentSpec, DirectLauncher, InstallFuture, Launched, Launcher, ToolInstaller,
+};
+use crate::tools::{
+    MAX_CACHE_ENTRIES, check_tool_hosts, tool_hosts, write_mise_toml, write_tool_env,
+};
 use crate::workspace::validate_job_id;
 
 /// Default parent of the per-job run directories.
@@ -48,6 +53,7 @@ const DEFAULT_START_DEADLINE: Duration = Duration::from_secs(60);
 const CALL_TIMEOUT: Duration = Duration::from_secs(30);
 const SHOW_CAP: usize = 4096;
 const DIR_MODE: u32 = 0o750;
+const DEFAULT_INSTALL_RUN_DEADLINE: Duration = Duration::from_secs(16 * 60);
 const HOOK_DIR: &str = "hook";
 const ENV_FILE: &str = "env";
 const STDOUT_FIFO: &str = "stdout";
@@ -124,14 +130,60 @@ pub fn select_launcher(
             if services.is_empty() {
                 tracing::warn!("{NO_SERVICES_WARNING}");
             }
-            Arc::new(
-                SystemdLauncher::new(&config.systemctl_path)
-                    .with_job_gid(job_gid)
-                    .with_run_timeout(config.agent_timeout)
-                    .with_job_socket(JobSocketSetup::new(services)),
-            )
+            let launcher = SystemdLauncher::new(&config.systemctl_path)
+                .with_job_gid(job_gid)
+                .with_run_timeout(config.agent_timeout)
+                .with_job_socket(JobSocketSetup::new(services));
+            Arc::new(if tool_install_configured(config) {
+                launcher.with_tool_install(ToolInstallSetup::new(
+                    Arc::new(|_| Vec::new()),
+                    exact_egress_hosts(config),
+                ))
+            } else {
+                launcher
+            })
         }
     }
+}
+
+fn tool_install_configured(config: &Config) -> bool {
+    config.mise_pins().is_ok_and(|pins| pins.is_some())
+}
+
+fn exact_egress_hosts(config: &Config) -> Vec<String> {
+    config
+        .egress_allow
+        .iter()
+        .filter_map(|pattern| match pattern {
+            HostPattern::Exact(host) => Some(host.clone()),
+            HostPattern::Subdomain(_) => None,
+        })
+        .collect()
+}
+
+/// The production [`ToolInstaller`]: `Some` only when the config selects the systemd launcher
+/// and holds valid `[mise]` pins, else `None` and every missing tool fails the pre-flight.
+///
+/// `services` are the job socket services the install unit may select (only the egress proxy is
+/// accepted for it), `hosts` receives the job id and the install hosts before the unit starts.
+#[must_use]
+pub fn select_tool_installer(
+    config: &Config,
+    job_gid: Option<u32>,
+    services: Services,
+    hosts: Option<HostsHook>,
+) -> Option<Arc<dyn ToolInstaller>> {
+    if config.agent_launcher != AgentLauncher::Systemd || !tool_install_configured(config) {
+        return None;
+    }
+    let mut installer =
+        SystemdToolInstaller::new(&config.systemctl_path, exact_egress_hosts(config))
+            .with_job_gid(job_gid)
+            .with_job_socket(JobSocketSetup::new(services));
+    if let Some(hosts) = hosts {
+        installer = installer.with_hosts_hook(hosts);
+    }
+    Some(Arc::new(installer))
 }
 
 /// What the launcher needs to bind the job socket of each job.
@@ -363,6 +415,31 @@ impl Ctl {
         String::from_utf8(out.stdout).map_err(|_| io::Error::from(io::ErrorKind::InvalidData))
     }
 
+    async fn start(&self, unit: &str) -> io::Result<()> {
+        let mut command =
+            tokio::process::Command::from(self.command(&["start", "--no-block", unit]));
+        command.kill_on_drop(true);
+        let status = tokio::time::timeout(CALL_TIMEOUT, command.status())
+            .await
+            .map_err(|_| io::Error::from(io::ErrorKind::TimedOut))??;
+        if status.success() {
+            Ok(())
+        } else {
+            Err(io::Error::other("systemctl failed"))
+        }
+    }
+
+    async fn kill_unit(&self, unit: &str) {
+        let mut command = tokio::process::Command::from(self.command(&[
+            "kill",
+            "--kill-whom=all",
+            "--signal=SIGKILL",
+            unit,
+        ]));
+        command.kill_on_drop(true);
+        let _ = tokio::time::timeout(CALL_TIMEOUT, command.status()).await;
+    }
+
     async fn stop(&self, unit: &str) {
         let mut command = tokio::process::Command::from(self.command(&["stop", unit]));
         command.kill_on_drop(true);
@@ -417,23 +494,32 @@ impl SystemdLauncher {
     }
 
     fn bind_job_socket(&self, id: &str) -> io::Result<Option<JobSocket>> {
-        let Some(setup) = &self.socket else {
-            return Ok(None);
-        };
-        let path = socket_path(&self.run_dir, id)
-            .ok_or_else(|| io::Error::from(io::ErrorKind::InvalidInput))?;
-        let socket = JobSocket::bind(
-            &path,
-            id,
-            setup.services.clone(),
-            Arc::clone(&setup.peer),
-            setup.limits,
-        )?;
-        if let Some(gid) = self.gid {
-            std::os::unix::fs::chown(&path, None, Some(gid))?;
-        }
-        Ok(Some(socket))
+        bind_socket(self.socket.as_ref(), &self.run_dir, self.gid, id)
     }
+}
+
+fn bind_socket(
+    setup: Option<&JobSocketSetup>,
+    run_dir: &Path,
+    gid: Option<u32>,
+    id: &str,
+) -> io::Result<Option<JobSocket>> {
+    let Some(setup) = setup else {
+        return Ok(None);
+    };
+    let path =
+        socket_path(run_dir, id).ok_or_else(|| io::Error::from(io::ErrorKind::InvalidInput))?;
+    let socket = JobSocket::bind(
+        &path,
+        id,
+        setup.services.clone(),
+        Arc::clone(&setup.peer),
+        setup.limits,
+    )?;
+    if let Some(gid) = gid {
+        std::os::unix::fs::chown(&path, None, Some(gid))?;
+    }
+    Ok(Some(socket))
 }
 
 impl Launcher for SystemdLauncher {
@@ -758,5 +844,217 @@ fn ended(result: &str, code: u32, status: u32, sent: i32) -> io::Result<Show> {
         "timeout" | "watchdog" => signalled(SIGTERM),
         "oom-kill" => signalled(SIGKILL),
         _ => Err(bad()),
+    }
+}
+
+/// Receives the job id and the exact hosts of an install before its unit starts.
+pub type HostsHook = Arc<dyn Fn(&str, &[&str]) + Send + Sync>;
+
+fn install_unit_name(id: &str) -> String {
+    format!("fleet-tool-install@{id}.service")
+}
+
+/// Installs the missing tools of a job through `fleet-tool-install@<id>.service` (ADR-0048).
+///
+/// For one install it checks the Box egress list against the tool hosts, makes
+/// `<run_dir>/<id>/`, writes `mise.toml` and `tool-env` into it, binds the job socket the
+/// install unit's forwarder dials, starts the unit with `systemctl start --no-block`, and
+/// polls its state until it ends. The unit and the run dir are always cleaned up before the
+/// result returns, and a dropped future kills the unit. The run dir is gone before the agent
+/// launch, which makes the same dir.
+///
+/// Every failure is an [`io::Error`] with a bare kind: a non-zero unit exit is `Other`, an
+/// unreadable or malformed state, a start that never ran and a unit past its deadline end the
+/// unit with a kill request and count as ended. No unit output or path leaves this type.
+///
+/// Nothing here is verified on a live box.
+#[derive(Clone)]
+pub struct SystemdToolInstaller {
+    ctl: Ctl,
+    run_dir: PathBuf,
+    poll: Duration,
+    start_deadline: Duration,
+    run_deadline: Duration,
+    gid: Option<u32>,
+    socket: Option<JobSocketSetup>,
+    egress_allow: Vec<String>,
+    hosts: Option<HostsHook>,
+}
+
+impl std::fmt::Debug for SystemdToolInstaller {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SystemdToolInstaller")
+            .field("egress_allow", &self.egress_allow.len())
+            .field("hosts_hook", &self.hosts.is_some())
+            .finish_non_exhaustive()
+    }
+}
+
+struct InstallGuard {
+    ctl: Ctl,
+    unit: String,
+    socket: Option<JobSocket>,
+    armed: bool,
+    _dir: RunDir,
+}
+
+impl Drop for InstallGuard {
+    fn drop(&mut self) {
+        drop(self.socket.take());
+        if self.armed {
+            let _ = self
+                .ctl
+                .run(&["kill", "--kill-whom=all", "--signal=SIGKILL", &self.unit]);
+            let _ = self.ctl.run(&["reset-failed", &self.unit]);
+        }
+    }
+}
+
+impl SystemdToolInstaller {
+    /// An installer that runs `systemctl`, an absolute path, under [`DEFAULT_RUN_DIR`], and
+    /// requires `egress_allow` (exact host names) to cover each install.
+    pub fn new(systemctl: impl Into<PathBuf>, egress_allow: Vec<String>) -> Self {
+        Self {
+            ctl: Ctl {
+                systemctl: systemctl.into(),
+            },
+            run_dir: PathBuf::from(DEFAULT_RUN_DIR),
+            poll: DEFAULT_POLL,
+            start_deadline: DEFAULT_START_DEADLINE,
+            run_deadline: DEFAULT_INSTALL_RUN_DEADLINE,
+            gid: None,
+            socket: None,
+            egress_allow,
+            hosts: None,
+        }
+    }
+
+    /// Puts the per-job run directories under `run_dir`.
+    #[must_use]
+    pub fn with_run_dir(mut self, run_dir: impl Into<PathBuf>) -> Self {
+        self.run_dir = run_dir.into();
+        self
+    }
+
+    /// Sets how often the unit state is polled.
+    #[must_use]
+    pub fn with_poll_interval(mut self, poll: Duration) -> Self {
+        self.poll = poll;
+        self
+    }
+
+    /// Sets how long the unit may stay inactive without having run before it counts as failed.
+    #[must_use]
+    pub fn with_start_deadline(mut self, deadline: Duration) -> Self {
+        self.start_deadline = deadline;
+        self
+    }
+
+    /// Sets how long the unit may run before it is killed. The default is above the unit's own
+    /// `RuntimeMaxSec`.
+    #[must_use]
+    pub fn with_run_deadline(mut self, deadline: Duration) -> Self {
+        self.run_deadline = deadline;
+        self
+    }
+
+    /// Shares the run directory, `mise.toml` and the socket with `gid`, the job group.
+    #[must_use]
+    pub fn with_job_gid(mut self, gid: Option<u32>) -> Self {
+        self.gid = gid;
+        self
+    }
+
+    /// Binds a job socket offering the services in `setup` for the install unit.
+    #[must_use]
+    pub fn with_job_socket(mut self, setup: JobSocketSetup) -> Self {
+        self.socket = Some(setup);
+        self
+    }
+
+    /// Calls `hook` with the job id and the install hosts before the unit starts.
+    #[must_use]
+    pub fn with_hosts_hook(mut self, hook: HostsHook) -> Self {
+        self.hosts = Some(hook);
+        self
+    }
+
+    async fn install_tools(&self, job_id: &str, tools: &[ToolSpec]) -> io::Result<()> {
+        if validate_job_id(job_id).is_err()
+            || !self.ctl.systemctl.is_absolute()
+            || tools.is_empty()
+            || tools.len() > MAX_CACHE_ENTRIES
+        {
+            return fail(io::ErrorKind::InvalidInput);
+        }
+        let names: Vec<ToolName> = tools.iter().map(ToolSpec::name).collect();
+        check_tool_hosts(&self.egress_allow, &names)
+            .map_err(|_| io::Error::from(io::ErrorKind::PermissionDenied))?;
+        fs::create_dir_all(&self.run_dir)?;
+        let dir = self.run_dir.join(job_id);
+        fs::DirBuilder::new().mode(DIR_MODE).create(&dir)?;
+        let mut guard = InstallGuard {
+            ctl: self.ctl.clone(),
+            unit: install_unit_name(job_id),
+            socket: None,
+            armed: false,
+            _dir: RunDir(dir.clone()),
+        };
+        fs::set_permissions(&dir, fs::Permissions::from_mode(DIR_MODE))?;
+        if let Some(gid) = self.gid {
+            std::os::unix::fs::chown(&dir, None, Some(gid))?;
+        }
+        write_mise_toml(&self.run_dir, job_id, tools, self.gid)
+            .map_err(|_| io::Error::from(io::ErrorKind::InvalidData))?;
+        write_tool_env(&self.run_dir, job_id, TOOL_PROXY_PORT, &names)
+            .map_err(|_| io::Error::from(io::ErrorKind::InvalidData))?;
+        guard.socket = bind_socket(self.socket.as_ref(), &self.run_dir, self.gid, job_id)?;
+        if let Some(hook) = &self.hosts {
+            hook(job_id, &tool_hosts(&names));
+        }
+        guard.armed = true;
+        let outcome = match self.ctl.start(&guard.unit).await {
+            Ok(()) => self.wait_for_end(&guard.unit).await,
+            Err(err) => Err(err.kind()),
+        };
+        drop(guard.socket.take());
+        self.ctl.stop(&guard.unit).await;
+        self.ctl.reset_failed(&guard.unit).await;
+        guard.armed = false;
+        outcome.map_err(io::Error::from)
+    }
+
+    async fn wait_for_end(&self, unit: &str) -> Result<(), io::ErrorKind> {
+        let started = Instant::now();
+        loop {
+            let shown = match self.ctl.show(unit).await {
+                Ok(text) => parse_show(&text, 0),
+                Err(err) => Err(err),
+            };
+            let waited = started.elapsed();
+            match shown {
+                Ok(Show::Ended(status)) if status.success() => return Ok(()),
+                Ok(Show::Ended(_)) => return Err(io::ErrorKind::Other),
+                Ok(Show::Idle) if waited >= self.start_deadline => {
+                    self.ctl.kill_unit(unit).await;
+                    return Err(io::ErrorKind::TimedOut);
+                }
+                Ok(Show::Running) if waited >= self.run_deadline => {
+                    self.ctl.kill_unit(unit).await;
+                    return Err(io::ErrorKind::TimedOut);
+                }
+                Ok(Show::Running | Show::Idle) => tokio::time::sleep(self.poll).await,
+                Err(err) => {
+                    self.ctl.kill_unit(unit).await;
+                    return Err(err.kind());
+                }
+            }
+        }
+    }
+}
+
+impl ToolInstaller for SystemdToolInstaller {
+    fn install<'a>(&'a self, job_id: &'a str, tools: &'a [ToolSpec]) -> InstallFuture<'a> {
+        Box::pin(self.install_tools(job_id, tools))
     }
 }

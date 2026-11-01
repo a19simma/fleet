@@ -22,7 +22,7 @@ use std::os::fd::OwnedFd;
 use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 
-use fleet_core::tools::{ToolError, ToolName, Version};
+use fleet_core::tools::{ToolError, ToolName, ToolSpec, Version};
 use fleet_proto::MAX_SIGNATURE_BYTES;
 use minisign_verify::Signature;
 use rustix::fs::{FlockOperation, Mode, OFlags};
@@ -469,6 +469,92 @@ pub fn write_tool_env(
         return Err(ToolsError::Io(err));
     }
     Ok(Some(path))
+}
+
+/// File name of the mise config the install unit reads from a job's run directory.
+pub const MISE_TOML_FILE: &str = "mise.toml";
+
+/// Absolute path of the tool cache the install unit writes and the agent unit reads.
+pub const TOOL_CACHE_ROOT: &str = "/var/lib/fleet/tools";
+
+/// The `mise.toml` text that pins exactly `tools`: a `[tools]` table of `name = "version"`.
+///
+/// Names come from the closed registry and versions are exact pins, so neither holds a quote,
+/// a backslash or a line break.
+#[must_use]
+pub fn render_mise_toml(tools: &[ToolSpec]) -> String {
+    let mut out = String::from("[tools]\n");
+    for tool in tools {
+        let _ = writeln!(
+            out,
+            "{} = \"{}\"",
+            tool.name().as_str(),
+            tool.version().as_str()
+        );
+    }
+    out
+}
+
+/// Writes `run_dir/<id>/mise.toml` for the install unit and returns its path.
+///
+/// The directory is opened with `O_DIRECTORY | O_NOFOLLOW` and the file is created beneath that
+/// handle with `O_EXCL | O_NOFOLLOW`, mode 0640. With `gid` the file belongs to that group, so
+/// the install uid in the job group can read it; without it the mode is 0644.
+///
+/// # Errors
+///
+/// Returns [`ToolsError::InvalidId`] for a bad job id or an empty `tools`, and
+/// [`ToolsError::Io`] when the file cannot be created or written; a partial file is removed.
+pub fn write_mise_toml(
+    run_dir: &Path,
+    id: &str,
+    tools: &[ToolSpec],
+    gid: Option<u32>,
+) -> Result<PathBuf, ToolsError> {
+    let valid_id = !id.is_empty()
+        && id.len() <= 64
+        && id.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_');
+    if !valid_id || tools.is_empty() {
+        return Err(ToolsError::InvalidId);
+    }
+    let body = render_mise_toml(tools);
+    let root = rustix::fs::open(
+        run_dir,
+        OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC,
+        Mode::empty(),
+    )
+    .map_err(|errno| ToolsError::Io(errno.into()))?;
+    let job_dir = rustix::fs::openat(
+        &root,
+        id,
+        OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+        Mode::empty(),
+    )
+    .map_err(|errno| ToolsError::Io(errno.into()))?;
+    let mode = if gid.is_some() {
+        Mode::RUSR | Mode::WUSR | Mode::RGRP
+    } else {
+        Mode::RUSR | Mode::WUSR | Mode::RGRP | Mode::ROTH
+    };
+    let fd = rustix::fs::openat(
+        &job_dir,
+        MISE_TOML_FILE,
+        OFlags::WRONLY | OFlags::CREATE | OFlags::EXCL | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+        mode,
+    )
+    .map_err(|errno| ToolsError::Io(errno.into()))?;
+    let mut file = File::from(fd);
+    let written = file.write_all(body.as_bytes()).and_then(|()| {
+        gid.map_or(Ok(()), |gid| {
+            rustix::fs::fchown(&file, None, Some(rustix::fs::Gid::from_raw(gid)))
+                .map_err(std::io::Error::from)
+        })
+    });
+    if let Err(err) = written {
+        let _ = rustix::fs::unlinkat(&job_dir, MISE_TOML_FILE, rustix::fs::AtFlags::empty());
+        return Err(ToolsError::Io(err));
+    }
+    Ok(run_dir.join(id).join(MISE_TOML_FILE))
 }
 
 /// Largest total size of the tool cache, in bytes, before [`ToolCache::evict`] removes entries.

@@ -31,10 +31,13 @@ use crate::poller::{
     Token, channel,
 };
 use crate::publish::{PublishGh, PublishGit};
-use crate::runner::{AgentOutcome, AgentRunner, Interrupt, JobEnd, Reporter, RunConfig};
-use crate::systemd::select_launcher;
+use crate::runner::{
+    AgentOutcome, AgentRunner, Interrupt, JobEnd, Reporter, RunConfig, ToolPreflight,
+};
+use crate::systemd::{HostsHook, select_launcher, select_tool_installer};
 use crate::telemetry::{FetchPhase, FetchRecordError};
 use crate::toolhook::HookHub;
+use crate::tools::{TOOL_CACHE_ROOT, ToolCache};
 use crate::update::{TrackedRunner, UpdateWiring};
 use crate::workspace::{RepoPolicy, Workspace, broker_scratch_path, job_owner};
 
@@ -621,6 +624,32 @@ where
     }
 }
 
+/// The tool pre-flight of a box: `None` without a `[mise]` table, so every tool profile fails
+/// with the fixed message. With one it reads the cache `/var/lib/fleet/tools` as
+/// `tool_cache_uid` and installs misses through [`select_tool_installer`], which exists only
+/// with the systemd launcher.
+///
+/// # Errors
+///
+/// Fails when `[mise]` is set and `tool_cache_uid` is not.
+pub(crate) fn tool_preflight(
+    config: &Config,
+    job_gid: Option<u32>,
+    services: Services,
+    hosts: Option<HostsHook>,
+) -> Result<Option<ToolPreflight>, Error> {
+    let Some(owner) = config.tool_cache_owner()? else {
+        return Ok(None);
+    };
+    let preflight = ToolPreflight::new(ToolCache::new(TOOL_CACHE_ROOT, owner));
+    Ok(Some(
+        match select_tool_installer(config, job_gid, services, hosts) {
+            Some(installer) => preflight.with_installer(installer),
+            None => preflight,
+        },
+    ))
+}
+
 /// Builds the poller when `FLEET_SERVER_URL` is set and non-empty, else `None`.
 ///
 /// # Errors
@@ -677,6 +706,11 @@ pub(crate) fn build(
     let workspace = job_workspace(config, &mut run).with_redactor(redactor.clone());
     let feeds = Arc::new(FeedBook::default());
     let wired = job_services(config, &feeds);
+    let proxy = Arc::clone(&wired.proxy);
+    let hosts: HostsHook = Arc::new(move |job_id, hosts| {
+        proxy.set_job_hosts(job_id, hosts);
+    });
+    let preflight = tool_preflight(config, run.job_gid, wired.services.clone(), Some(hosts))?;
     let launcher = select_launcher(config, run.job_gid, wired.services);
     let wiring = BrokerWiring {
         registry: wired.broker,
@@ -690,11 +724,15 @@ pub(crate) fn build(
         token: String::new(),
         redactor: redactor.clone(),
     };
+    let mut agent = AgentRunner::new(run, reporter, redactor)
+        .with_hook_hub(hub)
+        .with_launcher(launcher);
+    if let Some(preflight) = preflight {
+        agent = agent.with_tool_preflight(preflight);
+    }
     let runner = DaemonRunner::new(
         workspace,
-        AgentRunner::new(run, reporter, redactor)
-            .with_hook_hub(hub)
-            .with_launcher(launcher)
+        agent
             .with_feed_book(feeds)
             .with_job_end(wired.end.on_end(book.end_hook()).on_end({
                 let tracker = update.tracker.clone();
@@ -841,10 +879,45 @@ mod tests {
         .is_ok())
     }
 
+    #[test]
+    fn the_tool_preflight_exists_only_with_mise_and_needs_the_cache_uid() -> TestResult {
+        let mise = "[mise]\nversion = \"2024.11.3\"\nsha256 = \"0000000000000000000000000000000000000000000000000000000000000000\"\nsignature_path = \"/etc/mise.minisig\"\npublic_key_path = \"/etc/mise.pub\"\n";
+        let make = |text: &str| -> Result<Option<ToolPreflight>, Error> {
+            let config = Config::resolve(Some(text), &|_| None)?;
+            tool_preflight(&config, None, Services::new(), None)
+        };
+        assert!(make("agent_launcher = \"systemd\"\n")?.is_none());
+        assert!(make("tool_cache_uid = 990\nagent_launcher = \"systemd\"\n")?.is_none());
+        let refused = make(&format!("agent_launcher = \"systemd\"\n{mise}"));
+        assert!(matches!(
+            refused,
+            Err(Error::InvalidValue {
+                name: "tool_cache_uid",
+                ..
+            })
+        ));
+        let systemd = make(&format!(
+            "tool_cache_uid = 990\nagent_launcher = \"systemd\"\n{mise}"
+        ))?;
+        assert!(
+            format!("{systemd:?}").contains("installer: Some"),
+            "{systemd:?}"
+        );
+        let direct = make(&format!("tool_cache_uid = 990\n{mise}"))?;
+        assert!(
+            format!("{direct:?}").contains("installer: None"),
+            "{direct:?}"
+        );
+        Ok(())
+    }
+
     #[tokio::test]
     async fn startup_validates_the_mise_pins_and_refuses_a_partial_section() -> TestResult {
-        let full = "[mise]\nversion = \"2024.11.3\"\nsha256 = \"0000000000000000000000000000000000000000000000000000000000000000\"\nsignature_path = \"/etc/mise.minisig\"\npublic_key_path = \"/etc/mise.pub\"\n";
+        let full = "tool_cache_uid = 990\n[mise]\nversion = \"2024.11.3\"\nsha256 = \"0000000000000000000000000000000000000000000000000000000000000000\"\nsignature_path = \"/etc/mise.minisig\"\npublic_key_path = \"/etc/mise.pub\"\n";
         assert!(build_with_mise(full)?);
+        assert!(!build_with_mise(
+            full.trim_start_matches("tool_cache_uid = 990\n")
+        )?);
         assert!(!build_with_mise("[mise]\nversion = \"2024.11.3\"\n")?);
         assert!(build_with_mise("")?);
         Ok(())
@@ -1289,7 +1362,7 @@ mod tests {
         let profile = tool_profile()?;
         let job = profile_job(&profile);
         let mut fx = fixture(Ok(reply_for(&job, profile.canonical_json())))?;
-        let cache = crate::tools::ToolCache::new(fx.dir.path().join("tools"), 0);
+        let cache = ToolCache::new(fx.dir.path().join("tools"), 0);
         let (tx, reports) = mpsc::unbounded_channel();
         let blob = Blob {
             reports: tx,
@@ -1300,9 +1373,7 @@ mod tests {
         fx.runner = DaemonRunner::new(
             workspace(fx.dir.path(), &git),
             AgentRunner::new(RunConfig::new("claude", false), blob, Redactor::default())
-                .with_tool_preflight(
-                    crate::runner::ToolPreflight::new(cache).with_installer(Arc::new(Refusing)),
-                ),
+                .with_tool_preflight(ToolPreflight::new(cache).with_installer(Arc::new(Refusing))),
             "the-box",
         );
         fx.reports = reports;

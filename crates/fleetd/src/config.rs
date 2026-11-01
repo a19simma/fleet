@@ -85,6 +85,7 @@ struct FileConfig {
     hook_socket_uid: Option<u32>,
     hook_socket_group: Option<String>,
     job_group: Option<String>,
+    tool_cache_uid: Option<u32>,
     agent_launcher: Option<String>,
     systemctl_path: Option<PathBuf>,
     fetch_policy: Option<String>,
@@ -237,6 +238,10 @@ pub struct Config {
     /// Pins for the bundled mise binary, the `[mise]` table. Config file only, unknown keys
     /// refused. Use [`Config::mise_pins`] to validate them.
     pub mise: Option<MisePinsConfig>,
+    /// Uid that owns the tool cache `/var/lib/fleet/tools`, the install uid the agent side
+    /// reads the cache as. Env `FLEETD_TOOL_CACHE_UID` wins over the file key. Required when
+    /// `[mise]` is set, see [`Config::tool_cache_owner`]. Root and `u32::MAX` are refused.
+    pub tool_cache_uid: Option<u32>,
 }
 
 impl Config {
@@ -247,6 +252,26 @@ impl Config {
     /// Returns [`ToolsError`] naming the missing or malformed pin.
     pub fn mise_pins(&self) -> Result<Option<MisePins>, ToolsError> {
         self.mise.clone().map(MisePins::new).transpose()
+    }
+
+    /// The cache owner uid for the tool pre-flight: `None` when `[mise]` is absent.
+    ///
+    /// The ADR names no default uid and the `fleet-job` uid differs per box, so a box with
+    /// `[mise]` and no `tool_cache_uid` is refused rather than guessed.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::InvalidValue`] naming `tool_cache_uid` when `[mise]` is set and the key
+    /// is not.
+    pub fn tool_cache_owner(&self) -> Result<Option<u32>, Error> {
+        match (&self.mise, self.tool_cache_uid) {
+            (None, _) => Ok(None),
+            (Some(_), Some(uid)) => Ok(Some(uid)),
+            (Some(_), None) => Err(Error::InvalidValue {
+                name: "tool_cache_uid",
+                value: String::from("required when [mise] is set"),
+            }),
+        }
     }
 
     /// Loads config from `explicit` or, when absent, from [`DEFAULT_CONFIG_PATH`] if that
@@ -372,6 +397,7 @@ impl Config {
             hook_socket_uid,
             hook_socket_group,
             job_group: resolve_job_group(&env, file.job_group)?,
+            tool_cache_uid: resolve_tool_cache_uid(&env, file.tool_cache_uid)?,
             agent_launcher,
             systemctl_path,
             fetch_policy,
@@ -556,6 +582,28 @@ fn resolve_gh_bin_in(file: Option<PathBuf>, dirs: &[&str]) -> Result<PathBuf, Er
             .map(|dir| Path::new(dir).join("gh"))
             .find(|candidate| candidate.is_file())
             .unwrap_or_else(|| PathBuf::from(GH_FALLBACK))),
+    }
+}
+
+fn resolve_tool_cache_uid(
+    env: &dyn Fn(&str) -> Option<String>,
+    file: Option<u32>,
+) -> Result<Option<u32>, Error> {
+    let bad = |value: String| Error::InvalidValue {
+        name: "tool_cache_uid",
+        value,
+    };
+    let uid = match env("FLEETD_TOOL_CACHE_UID") {
+        Some(raw) => {
+            let plain = !raw.is_empty() && raw.bytes().all(|b| b.is_ascii_digit());
+            let parsed = plain.then(|| raw.parse::<u32>().ok()).flatten();
+            Some(parsed.ok_or_else(|| bad(raw))?)
+        }
+        None => file,
+    };
+    match uid {
+        Some(0 | u32::MAX) => Err(bad(uid.map_or_else(String::new, |u| u.to_string()))),
+        other => Ok(other),
     }
 }
 
@@ -1375,6 +1423,90 @@ mod tests {
             .filter(|line| !line.starts_with(key))
             .collect::<Vec<_>>()
             .join("\n")
+    }
+
+    #[test]
+    fn tool_cache_uid_reads_file_then_env_and_defaults_to_unset() {
+        assert_eq!(
+            Config::resolve(None, &env_of(&[])).unwrap().tool_cache_uid,
+            None
+        );
+        let file = "tool_cache_uid = 990\n";
+        let cfg = Config::resolve(Some(file), &env_of(&[])).unwrap();
+        assert_eq!(cfg.tool_cache_uid, Some(990));
+        let env = env_of(&[("FLEETD_TOOL_CACHE_UID", "991")]);
+        let cfg = Config::resolve(Some(file), &env).unwrap();
+        assert_eq!(cfg.tool_cache_uid, Some(991));
+        let top = (u32::MAX - 1).to_string();
+        assert_eq!(
+            Config::resolve(None, &env_of(&[("FLEETD_TOOL_CACHE_UID", top.as_str())]))
+                .unwrap()
+                .tool_cache_uid,
+            Some(u32::MAX - 1)
+        );
+    }
+
+    #[test]
+    fn a_bad_tool_cache_uid_is_refused_by_name() {
+        for raw in [
+            "abc",
+            "-1",
+            "+5",
+            " 5",
+            "5 ",
+            "1.5",
+            "0x10",
+            "4294967296",
+            "0",
+            "4294967295",
+            "٣",
+            "5\n",
+        ] {
+            match Config::resolve(None, &env_of(&[("FLEETD_TOOL_CACHE_UID", raw)])) {
+                Err(Error::InvalidValue { name, .. }) => {
+                    assert_eq!(name, "tool_cache_uid", "{raw:?}");
+                }
+                other => panic!("{raw:?}: {other:?}"),
+            }
+        }
+        for file in ["tool_cache_uid = 0\n", "tool_cache_uid = 4294967295\n"] {
+            assert!(
+                matches!(
+                    Config::resolve(Some(file), &env_of(&[])),
+                    Err(Error::InvalidValue {
+                        name: "tool_cache_uid",
+                        ..
+                    })
+                ),
+                "{file}"
+            );
+        }
+        for file in [
+            "tool_cache_uid = -1\n",
+            "tool_cache_uid = 4294967296\n",
+            "tool_cache_uid = \"5\"\n",
+        ] {
+            assert!(Config::resolve(Some(file), &env_of(&[])).is_err(), "{file}");
+        }
+    }
+
+    #[test]
+    fn the_cache_owner_is_required_exactly_when_mise_is_set() {
+        let plain = Config::resolve(None, &env_of(&[])).unwrap();
+        assert_eq!(plain.tool_cache_owner().unwrap(), None);
+        let uid_only = Config::resolve(Some("tool_cache_uid = 990\n"), &env_of(&[])).unwrap();
+        assert_eq!(uid_only.tool_cache_owner().unwrap(), None);
+        let mise_only = Config::resolve(Some(FULL_MISE), &env_of(&[])).unwrap();
+        match mise_only.tool_cache_owner() {
+            Err(Error::InvalidValue { name, value }) => {
+                assert_eq!(name, "tool_cache_uid");
+                assert!(value.contains("required"), "{value}");
+            }
+            other => panic!("{other:?}"),
+        }
+        let both = format!("tool_cache_uid = 990\n{FULL_MISE}");
+        let both = Config::resolve(Some(&both), &env_of(&[])).unwrap();
+        assert_eq!(both.tool_cache_owner().unwrap(), Some(990));
     }
 
     #[test]
