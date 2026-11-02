@@ -1,0 +1,8 @@
+{"type":"session.start","ts_ms":1000}
+{"type":"llm.request","id":"req-1","ts_ms":1100,"model":"kimi-k2"}
+{"type":"llm.request","id":"req-2","ts_ms":1150}
+{"type":"usage.record","request_id":"req-2","ts_ms":1400,"tokens":{"in":10,"out":4}}
+{"type":"tool.call","ts_ms":1450}
+{"type":"usage.record","request_id":"req-1","ts_ms":1900}
+{"type":"llm.request","id":"req-3","ts_ms":2000}
+{"type":"usage.record","request_id":"req-3","ts_ms":2600}
