@@ -2,6 +2,7 @@
 
 pub mod auth;
 pub mod batches;
+pub mod catalog;
 pub mod config;
 pub mod cred;
 pub mod jobs;
@@ -14,4 +15,5 @@ pub mod stats;
 pub mod store;
 pub mod supervise;
 pub mod telemetry;
+pub mod timing;
 pub mod web;

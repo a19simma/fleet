@@ -3,15 +3,19 @@
 //! This crate performs no IO. Callers supply the clock, entropy and identity.
 
 mod box_name;
+pub mod capability;
+pub mod catalog;
 pub mod credential;
 mod ct;
 mod envelope;
 mod error;
 pub mod forge;
 mod id;
+pub mod model_allowlist;
 mod normalize;
 mod profile;
 mod redact;
+pub mod timing;
 pub mod tools;
 mod validate;
 
@@ -22,8 +26,9 @@ pub use error::Error;
 pub use id::EventId;
 pub use normalize::{HookAllowlist, normalize_hook};
 pub use profile::{
-    Attribution, ContextFile, EnvFlag, PROFILE_HASH_DOMAIN, PROFILE_HASH_DOMAIN_V2, Profile,
-    ProfileError, ProfileHash, Settings, SettingsPermissions, Skill,
+    Attribution, ContextFile, EnvFlag, OwnerId, OwnerIdError, PROFILE_HASH_DOMAIN,
+    PROFILE_HASH_DOMAIN_V2, Profile, ProfileError, ProfileHash, Settings, SettingsPermissions,
+    Skill, Visibility, VisibilityError,
 };
 pub use redact::{MIN_SECRET_LEN, PLACEHOLDER, Redactor};
 pub use validate::{

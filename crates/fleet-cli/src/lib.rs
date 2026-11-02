@@ -1,12 +1,14 @@
 //! The `fleet` command line client: job submission and inspection over gRPC.
 
 pub mod batch;
+pub mod catalog;
 pub mod config;
 pub mod list;
 pub mod logs;
 pub mod profile;
 pub mod stats;
 pub mod telemetry;
+pub mod timing;
 pub mod watch;
 
 use std::fmt;

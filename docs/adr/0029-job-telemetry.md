@@ -2,6 +2,8 @@
 
 Status: Accepted. Built: fleetd parses and hooks telemetry, the server stores, serves and prunes it, and `fleet status` shows it. Amends ADR-0021 and sits beside ADR-0022.
 
+Superseded in part by 0055: the "Not built" bullet (no OTLP receiver, no pueue).
+
 A Job leaves a transcript (ADR-0022) but no figures: turns, cost, tool errors, how long until the first edit. A laptop had to read the whole stream to learn what a Job did. The stream-json output omits some facts, such as a Bash exit code, so one source cannot give a complete record.
 
 ## Decision
