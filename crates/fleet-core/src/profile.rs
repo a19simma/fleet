@@ -960,3 +960,314 @@ mod visibility_tests {
         assert_eq!(profile.hash(), before);
     }
 }
+
+/// Most entries a [`Selection`] holds.
+pub const MAX_SELECTION: usize = 256;
+
+/// Failures from building an [`ItemId`] or a [`Selection`]. Messages never echo input.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum SelectionError {
+    /// The bytes are not a selection: bad JSON, a non-array, an unknown or duplicate key, a wrong type.
+    Malformed,
+    /// An item id breaks the id shape.
+    InvalidId,
+    /// Two entries name the same item id.
+    Duplicate,
+    /// An entry sets `enabled` to `true`; only switched-off items are stored (ADR-0053).
+    EnabledEntry,
+    /// More than [`MAX_SELECTION`] entries.
+    TooMany,
+}
+
+impl fmt::Display for SelectionError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Self::Malformed => "selection is not a valid list of entries",
+            Self::InvalidId => "selection item id has an invalid shape",
+            Self::Duplicate => "selection names an item id twice",
+            Self::EnabledEntry => "selection stores only disabled items",
+            Self::TooMany => "selection has too many entries",
+        })
+    }
+}
+
+impl std::error::Error for SelectionError {}
+
+/// A catalog item id: 1 to [`ItemId::MAX_LEN`] bytes of `[a-z0-9_-]`, starting with `[a-z0-9]`.
+///
+/// Inferred, not part of the design: the shape is lowercase ASCII only, so an id has one
+/// spelling and a case variant is refused.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct ItemId(String);
+
+impl ItemId {
+    /// Longest id in bytes.
+    pub const MAX_LEN: usize = 64;
+
+    /// Checks the id shape.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SelectionError::InvalidId`] for any other input.
+    pub fn new(raw: &str) -> Result<Self, SelectionError> {
+        let bytes = raw.as_bytes();
+        let head_ok = bytes
+            .first()
+            .is_some_and(|b| b.is_ascii_lowercase() || b.is_ascii_digit());
+        let rest_ok = bytes
+            .iter()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || matches!(b, b'_' | b'-'));
+        if head_ok && rest_ok && bytes.len() <= Self::MAX_LEN {
+            Ok(Self(raw.to_owned()))
+        } else {
+            Err(SelectionError::InvalidId)
+        }
+    }
+
+    /// The id text.
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl fmt::Display for ItemId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawEntry {
+    item_id: String,
+    #[serde(default)]
+    enabled: Option<bool>,
+}
+
+/// The catalog items a Profile switches off, sorted by id with no duplicates (ADR-0053).
+///
+/// The wire form is an array of `{"item_id", "enabled"}` objects. A missing `enabled` and
+/// `false` both mean switched off and are stored as `false`; `true` is refused with
+/// [`SelectionError::EnabledEntry`], because a Profile inherits every enabled item.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Selection(Vec<ItemId>);
+
+impl Selection {
+    /// Parses a Selection from JSON bytes.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SelectionError::Malformed`] for bad JSON, a non-array, an unknown or duplicate
+    /// key or a wrong type, and the other variants for a bad id, a repeated id, an enabled
+    /// entry or more than [`MAX_SELECTION`] entries.
+    pub fn from_json(bytes: &[u8]) -> Result<Self, SelectionError> {
+        if bytes.trim_ascii_start().first() != Some(&b'[') {
+            return Err(SelectionError::Malformed);
+        }
+        let raw: Vec<RawEntry> =
+            serde_json::from_slice(bytes).map_err(|_| SelectionError::Malformed)?;
+        Self::from_raw(raw)
+    }
+
+    fn from_raw(raw: Vec<RawEntry>) -> Result<Self, SelectionError> {
+        if raw.len() > MAX_SELECTION {
+            return Err(SelectionError::TooMany);
+        }
+        let mut ids = Vec::with_capacity(raw.len());
+        for entry in raw {
+            if entry.enabled == Some(true) {
+                return Err(SelectionError::EnabledEntry);
+            }
+            ids.push(ItemId::new(&entry.item_id)?);
+        }
+        ids.sort();
+        if ids.iter().zip(ids.iter().skip(1)).any(|(a, b)| a == b) {
+            return Err(SelectionError::Duplicate);
+        }
+        Ok(Self(ids))
+    }
+
+    /// The switched-off ids in sorted order.
+    pub fn ids(&self) -> impl Iterator<Item = &ItemId> {
+        self.0.iter()
+    }
+
+    /// The number of entries.
+    pub fn len(&self) -> usize {
+        self.0.len()
+    }
+
+    /// Whether nothing is switched off.
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+}
+
+impl Serialize for Selection {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        #[derive(Serialize)]
+        struct Entry<'a> {
+            item_id: &'a str,
+            enabled: bool,
+        }
+        serializer.collect_seq(self.0.iter().map(|id| Entry {
+            item_id: id.as_str(),
+            enabled: false,
+        }))
+    }
+}
+
+impl<'de> Deserialize<'de> for Selection {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let raw = Vec::<RawEntry>::deserialize(deserializer)?;
+        Self::from_raw(raw).map_err(de::Error::custom)
+    }
+}
+
+#[cfg(test)]
+mod selection_tests {
+    use super::*;
+
+    fn parse(json: &str) -> Result<Selection, SelectionError> {
+        Selection::from_json(json.as_bytes())
+    }
+
+    #[test]
+    fn hostile_ids_are_refused() {
+        let long = "a".repeat(ItemId::MAX_LEN + 1);
+        let hostile = [
+            "",
+            " ",
+            "a b",
+            " a",
+            "a ",
+            "a\r",
+            "a\r\nb",
+            "a\nb",
+            "a\u{85}b",
+            "a\u{2028}b",
+            "a\u{2029}b",
+            "a\\b",
+            "a/b",
+            "a\0b",
+            "a\tb",
+            "é",
+            "caf\u{e9}",
+            "\u{ff41}bc",
+            "A",
+            "Skill",
+            "-a",
+            "_a",
+            "a.b",
+            "a@b",
+            long.as_str(),
+        ];
+        for id in hostile {
+            assert_eq!(ItemId::new(id), Err(SelectionError::InvalidId), "{id:?}");
+        }
+    }
+
+    #[test]
+    fn well_formed_ids_are_accepted() {
+        let max = "a".repeat(ItemId::MAX_LEN);
+        for id in ["a", "0", "tdd", "my-skill_2", "a0", max.as_str()] {
+            assert_eq!(
+                ItemId::new(id).map(|i| i.as_str().to_owned()),
+                Ok(id.to_owned())
+            );
+        }
+    }
+
+    #[test]
+    fn disabled_entries_are_kept() {
+        let s = parse(r#"[{"item_id":"b","enabled":false},{"item_id":"a"}]"#).unwrap_or_default();
+        let ids: Vec<_> = s.ids().map(ItemId::as_str).collect();
+        assert_eq!(ids, ["a", "b"]);
+    }
+
+    #[test]
+    fn enabled_true_is_refused() {
+        assert_eq!(
+            parse(r#"[{"item_id":"a","enabled":true}]"#),
+            Err(SelectionError::EnabledEntry)
+        );
+    }
+
+    #[test]
+    fn duplicate_ids_are_refused() {
+        assert_eq!(
+            parse(r#"[{"item_id":"a"},{"item_id":"a","enabled":false}]"#),
+            Err(SelectionError::Duplicate)
+        );
+    }
+
+    #[test]
+    fn duplicate_keys_in_an_entry_are_refused() {
+        assert_eq!(
+            parse(r#"[{"item_id":"a","item_id":"b"}]"#),
+            Err(SelectionError::Malformed)
+        );
+        assert_eq!(
+            parse(r#"[{"item_id":"a","enabled":false,"enabled":false}]"#),
+            Err(SelectionError::Malformed)
+        );
+    }
+
+    #[test]
+    fn malformed_shapes_are_refused() {
+        for json in [
+            "{}",
+            "null",
+            r#"["a"]"#,
+            "[{}]",
+            r#"[{"item_id":1}]"#,
+            r#"[{"item_id":"a","extra":1}]"#,
+            r#"[{"item_id":"a","enabled":"no"}]"#,
+            r#"[{"item_id":null}]"#,
+        ] {
+            assert_eq!(parse(json), Err(SelectionError::Malformed), "{json}");
+        }
+    }
+
+    #[test]
+    fn invalid_id_in_json_is_refused() {
+        assert_eq!(
+            parse(r#"[{"item_id":"A"}]"#),
+            Err(SelectionError::InvalidId)
+        );
+    }
+
+    #[test]
+    fn cap_is_enforced_just_over() {
+        let build = |n: usize| {
+            let items: Vec<_> = (0..n).map(|i| format!(r#"{{"item_id":"i{i}"}}"#)).collect();
+            format!("[{}]", items.join(","))
+        };
+        assert_eq!(
+            parse(&build(MAX_SELECTION)).map(|s| s.len()),
+            Ok(MAX_SELECTION)
+        );
+        assert_eq!(
+            parse(&build(MAX_SELECTION + 1)),
+            Err(SelectionError::TooMany)
+        );
+    }
+
+    #[test]
+    fn serde_round_trip_is_canonical() {
+        let s = parse(r#"[{"item_id":"b"},{"item_id":"a","enabled":false}]"#).unwrap_or_default();
+        let json = serde_json::to_string(&s).unwrap_or_default();
+        assert_eq!(
+            json,
+            r#"[{"item_id":"a","enabled":false},{"item_id":"b","enabled":false}]"#
+        );
+        assert_eq!(parse(&json), Ok(s));
+    }
+
+    #[test]
+    fn deserialize_refuses_enabled_true() {
+        let r: Result<Selection, _> = serde_json::from_str(r#"[{"item_id":"a","enabled":true}]"#);
+        assert!(r.is_err());
+    }
+}

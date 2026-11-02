@@ -26,9 +26,9 @@ pub use error::Error;
 pub use id::EventId;
 pub use normalize::{HookAllowlist, normalize_hook};
 pub use profile::{
-    Attribution, ContextFile, EnvFlag, OwnerId, OwnerIdError, PROFILE_HASH_DOMAIN,
-    PROFILE_HASH_DOMAIN_V2, Profile, ProfileError, ProfileHash, Settings, SettingsPermissions,
-    Skill, Visibility, VisibilityError,
+    Attribution, ContextFile, EnvFlag, ItemId, MAX_SELECTION, OwnerId, OwnerIdError,
+    PROFILE_HASH_DOMAIN, PROFILE_HASH_DOMAIN_V2, Profile, ProfileError, ProfileHash, Selection,
+    SelectionError, Settings, SettingsPermissions, Skill, Visibility, VisibilityError,
 };
 pub use redact::{MIN_SECRET_LEN, PLACEHOLDER, Redactor};
 pub use validate::{
