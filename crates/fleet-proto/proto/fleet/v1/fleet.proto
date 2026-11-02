@@ -497,6 +497,65 @@ message ReadJobEventsReply {
   uint32 next_seq = 2;
 }
 
+enum TimingSpanKind {
+  TIMING_SPAN_KIND_UNSPECIFIED = 0;
+  TIMING_SPAN_KIND_API = 1;
+  TIMING_SPAN_KIND_TOOL = 2;
+  TIMING_SPAN_KIND_SHELL = 3;
+  TIMING_SPAN_KIND_BG_SHELL = 4;
+}
+
+message TimingSummary {
+  uint64 wall_ms = 1;
+  uint64 api_wait_ms = 2;
+  uint64 tool_ms = 3;
+  uint64 shell_ms = 4;
+  uint64 idle_ms = 5;
+  uint64 overhead_ms = 6;
+}
+
+message TimingSpan {
+  TimingSpanKind kind = 1;
+  uint64 start_ms = 2;
+  uint64 end_ms = 3;
+  string name = 4;
+  optional string tool_use_id = 5;
+}
+
+message ShellCommand {
+  string id = 1;
+  string command = 2;
+  bool background = 3;
+  uint64 started_ms = 4;
+  optional uint64 ended_ms = 5;
+  uint64 duration_ms = 6;
+  optional int32 exit_code = 7;
+  string log = 8;
+  bool log_truncated = 9;
+  optional string ended_by = 10;
+}
+
+message ReportTimingRequest {
+  string job_id = 1;
+  uint32 attempt = 2;
+  string box = 3;
+  TimingSummary summary = 4;
+  repeated TimingSpan spans = 5;
+  repeated ShellCommand shell_commands = 6;
+}
+
+message ReportTimingReply {}
+
+message GetJobTimingRequest {
+  string job_id = 1;
+}
+
+message GetJobTimingReply {
+  optional TimingSummary summary = 1;
+  repeated TimingSpan spans = 2;
+  repeated ShellCommand shell_commands = 3;
+}
+
 message ReportJobReply {
   uint64 lease_expires_at_ms = 1;
   bool cancel_requested = 2;
