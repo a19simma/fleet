@@ -147,6 +147,17 @@ pub enum Command {
         #[arg(long, value_enum)]
         by: Option<StatsBy>,
     },
+    /// Show where the time of one job went.
+    Timing {
+        /// Job id.
+        job: String,
+        /// Also list the job's shell commands with their durations.
+        #[arg(long)]
+        commands: bool,
+        /// Print JSON instead of a table.
+        #[arg(long)]
+        json: bool,
+    },
     /// Compare the jobs of a batch, one column per profile.
     Batch {
         /// The batch action.
@@ -715,6 +726,11 @@ pub async fn run_with(
             let mut client = session(server, insecure, lookup, timeouts).await?.jobs;
             stats::stats(&mut client, since, repo, box_name, by, out).await?;
         }
+        Command::Timing {
+            job,
+            commands,
+            json,
+        } => timing::run(&job, commands, json)?,
         Command::Batch { action } => {
             run_batch(action, server, insecure, lookup, timeouts, stdin, out).await?;
         }

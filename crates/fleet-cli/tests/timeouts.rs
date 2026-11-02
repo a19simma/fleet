@@ -111,6 +111,13 @@ impl FleetJobs for Hang {
     ) -> Result<Response<ReadTranscriptReply>, Status> {
         Err(Status::unimplemented("not used"))
     }
+
+    async fn get_job_timing(
+        &self,
+        _: Request<fleet_proto::v1::GetJobTimingRequest>,
+    ) -> Result<Response<fleet_proto::v1::GetJobTimingReply>, Status> {
+        Err(Status::unimplemented("not used"))
+    }
 }
 
 #[tokio::test]

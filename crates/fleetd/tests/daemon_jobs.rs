@@ -175,6 +175,13 @@ impl FleetWorker for Stub {
         let _ = self.0.reports.send((auth, request.into_inner()));
         Ok(Response::new(ReportJobReply::default()))
     }
+
+    async fn report_timing(
+        &self,
+        _: Request<fleet_proto::v1::ReportTimingRequest>,
+    ) -> Result<Response<fleet_proto::v1::ReportTimingReply>, Status> {
+        Err(Status::unimplemented("not used"))
+    }
 }
 
 fn script(dir: &Path, name: &str, body: &str) -> Result<std::path::PathBuf, std::io::Error> {
