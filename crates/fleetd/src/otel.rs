@@ -1,0 +1,1 @@
+//! Loopback OTLP/HTTP receiver.

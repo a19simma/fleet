@@ -3,15 +3,19 @@
 //! This crate performs no IO. Callers supply the clock, entropy and identity.
 
 mod box_name;
+pub mod capability;
+pub mod catalog;
 pub mod credential;
 mod ct;
 mod envelope;
 mod error;
 pub mod forge;
 mod id;
+pub mod model_allowlist;
 mod normalize;
 mod profile;
 mod redact;
+pub mod timing;
 pub mod tools;
 mod validate;
 
