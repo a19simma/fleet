@@ -521,6 +521,8 @@ const CLASSIFIED: &[(&str, &str)] = &[
     ("FleetProfiles", "CreateProfile:global"),
     ("FleetProfiles", "GetProfile:global"),
     ("FleetProfiles", "ListProfiles:global"),
+    ("FleetProfiles", "ShareProfile:global"),
+    ("FleetProfiles", "UnshareProfile:global"),
     ("FleetJudge", "SubmitJudge:scoped"),
     ("FleetBatches", "SubmitBatch:scoped"),
     ("FleetBatches", "GetBatch:scoped"),

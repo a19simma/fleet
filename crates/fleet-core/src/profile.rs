@@ -1037,6 +1037,77 @@ impl fmt::Display for ItemId {
     }
 }
 
+/// Longest authored prompt text in bytes; mirrors the job prompt cap of 64 KiB.
+pub const MAX_PROMPT_TEXT_BYTES: usize = 64 * 1024;
+
+/// Failures from building a [`PromptText`]. Messages never echo input.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum PromptTextError {
+    /// The text is longer than [`MAX_PROMPT_TEXT_BYTES`].
+    TooLong,
+    /// The text holds a refused character: NUL, a control character other than newline and tab
+    /// (CR and NEL included), U+2028, U+2029 or a bidirectional control.
+    ForbiddenChar,
+}
+
+impl fmt::Display for PromptTextError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Self::TooLong => "prompt text is too long",
+            Self::ForbiddenChar => "prompt text has a forbidden character",
+        })
+    }
+}
+
+impl std::error::Error for PromptTextError {}
+
+fn is_refused_char(c: char) -> bool {
+    (c.is_control() && !matches!(c, '\n' | '\t'))
+        || matches!(
+            c,
+            '\u{061C}' | '\u{200E}' | '\u{200F}' | '\u{2028}' | '\u{2029}'
+                | '\u{202A}'..='\u{202E}' | '\u{2066}'..='\u{2069}'
+        )
+}
+
+/// User-authored prompt text: 1 to [`MAX_PROMPT_TEXT_BYTES`] bytes, no NUL, no control
+/// character other than newline and tab, no CR, no U+2028, U+2029 or bidirectional control.
+///
+/// Inferred, not part of the design: CR is refused so a text has one line ending, and
+/// backslash and non-ASCII text are allowed.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct PromptText(String);
+
+impl PromptText {
+    /// Longest text in bytes.
+    pub const MAX_BYTES: usize = MAX_PROMPT_TEXT_BYTES;
+
+    /// Checks the text. Empty text means absent and gives `Ok(None)`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PromptTextError::TooLong`] past the cap and [`PromptTextError::ForbiddenChar`]
+    /// for a refused character.
+    pub fn new(raw: &str) -> Result<Option<Self>, PromptTextError> {
+        if raw.is_empty() {
+            return Ok(None);
+        }
+        if raw.len() > Self::MAX_BYTES {
+            return Err(PromptTextError::TooLong);
+        }
+        if raw.chars().any(is_refused_char) {
+            return Err(PromptTextError::ForbiddenChar);
+        }
+        Ok(Some(Self(raw.to_owned())))
+    }
+
+    /// The text.
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct RawEntry {
@@ -1269,5 +1340,93 @@ mod selection_tests {
     fn deserialize_refuses_enabled_true() {
         let r: Result<Selection, _> = serde_json::from_str(r#"[{"item_id":"a","enabled":true}]"#);
         assert!(r.is_err());
+    }
+}
+
+#[cfg(test)]
+mod prompt_text_tests {
+    use super::*;
+
+    fn text(raw: &str) -> Result<Option<String>, PromptTextError> {
+        PromptText::new(raw).map(|o| o.map(|t| t.as_str().to_owned()))
+    }
+
+    #[test]
+    fn empty_means_absent() {
+        assert_eq!(text(""), Ok(None));
+    }
+
+    #[test]
+    fn cap_is_accepted_and_one_over_is_refused() {
+        let at = "a".repeat(MAX_PROMPT_TEXT_BYTES);
+        assert_eq!(text(&at), Ok(Some(at.clone())));
+        let over = "a".repeat(MAX_PROMPT_TEXT_BYTES + 1);
+        assert_eq!(text(&over), Err(PromptTextError::TooLong));
+    }
+
+    #[test]
+    fn cap_counts_bytes_not_chars() {
+        let at = "é".repeat(MAX_PROMPT_TEXT_BYTES / 2);
+        assert_eq!(at.len(), MAX_PROMPT_TEXT_BYTES);
+        assert!(text(&at).is_ok());
+        let over = format!("{at}a");
+        assert_eq!(text(&over), Err(PromptTextError::TooLong));
+    }
+
+    #[test]
+    fn hostile_characters_are_refused() {
+        let hostile = [
+            "a\0b",
+            "a\rb",
+            "a\r\nb",
+            "a\u{85}b",
+            "a\u{2028}b",
+            "a\u{2029}b",
+            "a\u{1b}b",
+            "a\u{7f}b",
+            "a\u{8}b",
+            "a\u{b}b",
+            "a\u{c}b",
+            "a\u{9f}b",
+            "a\u{61C}b",
+            "a\u{200E}b",
+            "a\u{200F}b",
+            "a\u{202A}b",
+            "a\u{202B}b",
+            "a\u{202C}b",
+            "a\u{202D}b",
+            "a\u{202E}b",
+            "a\u{2066}b",
+            "a\u{2067}b",
+            "a\u{2068}b",
+            "a\u{2069}b",
+            "\r",
+        ];
+        for raw in hostile {
+            assert_eq!(text(raw), Err(PromptTextError::ForbiddenChar), "{raw:?}");
+        }
+    }
+
+    #[test]
+    fn plain_text_is_kept_verbatim() {
+        let ok = [
+            "a\nb\tc",
+            "path C:\\x \\n",
+            "h\u{e9}llo \u{4e16}\u{754c} \u{1f600}",
+            "  padded  ",
+            "\n",
+        ];
+        for raw in ok {
+            assert_eq!(text(raw), Ok(Some(raw.to_owned())), "{raw:?}");
+        }
+    }
+
+    #[test]
+    fn errors_never_echo_input() {
+        for e in [PromptTextError::TooLong, PromptTextError::ForbiddenChar] {
+            assert!(!e.to_string().contains("secret"));
+        }
+        let shown = PromptText::new("secret\0").unwrap_err().to_string();
+        assert!(!shown.contains("secret"));
     }
 }

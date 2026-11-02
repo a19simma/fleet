@@ -21,11 +21,11 @@ use fleet_proto::v1::{
     GetProfileBlobRequest, GetProfileRequest, GetStatsReply, GetStatsRequest, HeartbeatReply,
     HeartbeatRequest, Job, ListCredentialsReply, ListCredentialsRequest, ListFleetReply,
     ListFleetRequest, ListJobsReply, ListJobsRequest, ListProfilesReply, ListProfilesRequest,
-    ProfileVersion, PushEventsReply, PushEventsRequest, PutCredentialRequest, QueuedEvent,
+    Profile, ProfileVersion, PushEventsReply, PushEventsRequest, PutCredentialRequest, QueuedEvent,
     ReadJobEventsReply, ReadJobEventsRequest, ReadTranscriptReply, ReadTranscriptRequest,
     Rejection, ReportJobReply, ReportJobRequest, ReportTimingReply, ReportTimingRequest,
-    SubmitBatchReply, SubmitBatchRequest, SubmitJobRequest, SubmitJudgeRequest,
-    VerifyCredentialReply, VerifyCredentialRequest,
+    ShareProfileRequest, SubmitBatchReply, SubmitBatchRequest, SubmitJobRequest,
+    SubmitJudgeRequest, UnshareProfileRequest, VerifyCredentialReply, VerifyCredentialRequest,
 };
 use fleet_proto::{ConvertError, validate_box};
 use tonic::service::Routes;
@@ -585,6 +585,20 @@ impl FleetProfiles for FleetService {
             .await
             .map_err(|err| profiles_error(&err))?;
         Ok(Response::new(reply))
+    }
+
+    async fn share_profile(
+        &self,
+        _request: Request<ShareProfileRequest>,
+    ) -> Result<Response<Profile>, Status> {
+        Err(Status::unimplemented("profile sharing is not implemented"))
+    }
+
+    async fn unshare_profile(
+        &self,
+        _request: Request<UnshareProfileRequest>,
+    ) -> Result<Response<Profile>, Status> {
+        Err(Status::unimplemented("profile sharing is not implemented"))
     }
 }
 

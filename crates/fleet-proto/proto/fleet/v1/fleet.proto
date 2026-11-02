@@ -26,6 +26,8 @@ service FleetProfiles {
   rpc CreateProfile(CreateProfileRequest) returns (ProfileVersion);
   rpc GetProfile(GetProfileRequest) returns (ProfileVersion);
   rpc ListProfiles(ListProfilesRequest) returns (ListProfilesReply);
+  rpc ShareProfile(ShareProfileRequest) returns (Profile);
+  rpc UnshareProfile(UnshareProfileRequest) returns (Profile);
 }
 
 service FleetJudge {
@@ -690,6 +692,42 @@ message ProfileSummary {
 
 message ListProfilesReply {
   repeated ProfileSummary profiles = 1;
+}
+
+// Who besides the owner may see a Profile (ADR-0052). A new Profile is PRIVATE.
+enum ProfileVisibility {
+  PROFILE_VISIBILITY_UNSPECIFIED = 0;
+  PROFILE_VISIBILITY_PRIVATE = 1;
+  PROFILE_VISIBILITY_SHARED = 2;
+}
+
+// One catalog item a Profile switches off (ADR-0053). Selection is opt-out: a Profile
+// inherits every enabled catalog item and stores only switched-off items, so a stored entry
+// always has enabled = false. A missing enabled field is false. enabled = true is refused
+// with INVALID_ARGUMENT, mirroring fleet_core::Selection.
+message SelectionEntry {
+  string item_id = 1;
+  bool enabled = 2;
+}
+
+// A Profile with its owner, visibility and authored content (ADR-0052, ADR-0053).
+// owner_user_id is the owning user, set when the name is first created and never changed.
+// selection lists only switched-off items, sorted by item_id with no duplicates.
+// authored_prompt is the user-authored prompt text.
+message Profile {
+  string name = 1;
+  uint64 owner_user_id = 2;
+  ProfileVisibility visibility = 3;
+  repeated SelectionEntry selection = 4;
+  string authored_prompt = 5;
+}
+
+message ShareProfileRequest {
+  string name = 1;
+}
+
+message UnshareProfileRequest {
+  string name = 1;
 }
 
 message GetStatsReply {
