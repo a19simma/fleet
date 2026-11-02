@@ -16,13 +16,14 @@ use fleet_proto::v1::fleet_worker_server::{FleetWorker, FleetWorkerServer};
 use fleet_proto::v1::{
     CancelJobRequest, ClaimJobReply, ClaimJobRequest, CreateProfileRequest, CredentialInfo,
     DeleteCredentialReply, DeleteCredentialRequest, GetBatchReply, GetBatchRequest,
-    GetJobCredentialsReply, GetJobCredentialsRequest, GetJobRequest, GetJobTranscriptReply,
-    GetJobTranscriptRequest, GetProfileBlobReply, GetProfileBlobRequest, GetProfileRequest,
-    GetStatsReply, GetStatsRequest, HeartbeatReply, HeartbeatRequest, Job, ListCredentialsReply,
-    ListCredentialsRequest, ListFleetReply, ListFleetRequest, ListJobsReply, ListJobsRequest,
-    ListProfilesReply, ListProfilesRequest, ProfileVersion, PushEventsReply, PushEventsRequest,
-    PutCredentialRequest, QueuedEvent, ReadJobEventsReply, ReadJobEventsRequest,
-    ReadTranscriptReply, ReadTranscriptRequest, Rejection, ReportJobReply, ReportJobRequest,
+    GetJobCredentialsReply, GetJobCredentialsRequest, GetJobRequest, GetJobTimingReply,
+    GetJobTimingRequest, GetJobTranscriptReply, GetJobTranscriptRequest, GetProfileBlobReply,
+    GetProfileBlobRequest, GetProfileRequest, GetStatsReply, GetStatsRequest, HeartbeatReply,
+    HeartbeatRequest, Job, ListCredentialsReply, ListCredentialsRequest, ListFleetReply,
+    ListFleetRequest, ListJobsReply, ListJobsRequest, ListProfilesReply, ListProfilesRequest,
+    ProfileVersion, PushEventsReply, PushEventsRequest, PutCredentialRequest, QueuedEvent,
+    ReadJobEventsReply, ReadJobEventsRequest, ReadTranscriptReply, ReadTranscriptRequest,
+    Rejection, ReportJobReply, ReportJobRequest, ReportTimingReply, ReportTimingRequest,
     SubmitBatchReply, SubmitBatchRequest, SubmitJobRequest, SubmitJudgeRequest,
     VerifyCredentialReply, VerifyCredentialRequest,
 };
@@ -37,6 +38,7 @@ use crate::auth::{BearerAuth, Caller};
 use crate::cred::CredentialService;
 use crate::profiles::ProfileContent;
 use crate::store::{Store, StoreError};
+use crate::timing;
 use crate::web::{Dispatch, HEADER_READ_TIMEOUT, Web, serve};
 use fleet_proto::MAX_PROFILE_MESSAGE_BYTES;
 
@@ -422,6 +424,13 @@ impl FleetWorker for FleetService {
             .map_err(|err| worker_error(&err))?;
         Ok(Response::new(reply))
     }
+
+    async fn report_timing(
+        &self,
+        request: Request<ReportTimingRequest>,
+    ) -> Result<Response<ReportTimingReply>, Status> {
+        timing::report_timing(request.get_ref()).map(Response::new)
+    }
 }
 
 #[tonic::async_trait]
@@ -686,6 +695,13 @@ impl FleetJobs for FleetService {
             .await
             .map_err(|err| jobs_error(&err))?;
         Ok(Response::new(reply))
+    }
+
+    async fn get_job_timing(
+        &self,
+        request: Request<GetJobTimingRequest>,
+    ) -> Result<Response<GetJobTimingReply>, Status> {
+        timing::get_job_timing(request.get_ref()).map(Response::new)
     }
 }
 

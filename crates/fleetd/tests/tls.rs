@@ -94,6 +94,13 @@ impl FleetWorker for Stub {
     ) -> Result<Response<ReportJobReply>, Status> {
         Err(Status::unimplemented("unused"))
     }
+
+    async fn report_timing(
+        &self,
+        _: Request<fleet_proto::v1::ReportTimingRequest>,
+    ) -> Result<Response<fleet_proto::v1::ReportTimingReply>, Status> {
+        Err(Status::unimplemented("not used"))
+    }
 }
 
 #[tonic::async_trait]

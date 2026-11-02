@@ -19,6 +19,7 @@ service FleetJobs {
   rpc ReadTranscript(ReadTranscriptRequest) returns (ReadTranscriptReply);
   rpc ReadJobEvents(ReadJobEventsRequest) returns (ReadJobEventsReply);
   rpc GetStats(GetStatsRequest) returns (GetStatsReply);
+  rpc GetJobTiming(GetJobTimingRequest) returns (GetJobTimingReply);
 }
 
 service FleetProfiles {
@@ -49,6 +50,7 @@ service FleetWorker {
   rpc GetProfileBlob(GetProfileBlobRequest) returns (GetProfileBlobReply);
   rpc GetJobTranscript(GetJobTranscriptRequest) returns (GetJobTranscriptReply);
   rpc GetJobCredentials(GetJobCredentialsRequest) returns (GetJobCredentialsReply);
+  rpc ReportTiming(ReportTimingRequest) returns (ReportTimingReply);
 }
 
 message PutCredentialRequest {

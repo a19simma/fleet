@@ -77,6 +77,13 @@ impl FleetJobs for Stub {
             .push(request.into_inner());
         Ok(Response::new(self.reply.clone()))
     }
+
+    async fn get_job_timing(
+        &self,
+        _: Request<fleet_proto::v1::GetJobTimingRequest>,
+    ) -> Result<Response<fleet_proto::v1::GetJobTimingReply>, Status> {
+        Err(Status::unimplemented("not used"))
+    }
 }
 
 async fn serve(stub: Stub) -> Result<String, Box<dyn std::error::Error>> {

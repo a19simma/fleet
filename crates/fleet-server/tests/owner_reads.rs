@@ -517,6 +517,7 @@ const CLASSIFIED: &[(&str, &str)] = &[
     ("FleetJobs", "ReadTranscript:scoped"),
     ("FleetJobs", "ReadJobEvents:scoped"),
     ("FleetJobs", "GetStats:scoped"),
+    ("FleetJobs", "GetJobTiming:scoped"),
     ("FleetProfiles", "CreateProfile:global"),
     ("FleetProfiles", "GetProfile:global"),
     ("FleetProfiles", "ListProfiles:global"),
@@ -532,6 +533,7 @@ const CLASSIFIED: &[(&str, &str)] = &[
     ("FleetWorker", "GetProfileBlob:box-only"),
     ("FleetWorker", "GetJobTranscript:box-only"),
     ("FleetWorker", "GetJobCredentials:box-only"),
+    ("FleetWorker", "ReportTiming:box-only"),
 ];
 
 #[test]

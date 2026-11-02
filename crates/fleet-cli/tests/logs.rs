@@ -89,6 +89,13 @@ impl FleetJobs for Stub {
         next.unwrap_or_else(|| Err(Status::failed_precondition("script exhausted")))
             .map(Response::new)
     }
+
+    async fn get_job_timing(
+        &self,
+        _: Request<fleet_proto::v1::GetJobTimingRequest>,
+    ) -> Result<Response<fleet_proto::v1::GetJobTimingReply>, Status> {
+        Err(Status::unimplemented("not used"))
+    }
 }
 
 fn chunk(seq: u64, text: &str) -> TranscriptChunk {

@@ -268,6 +268,13 @@ impl FleetWorker for Worker {
     ) -> Result<Response<ReportJobReply>, Status> {
         Err(Status::unimplemented("unused"))
     }
+
+    async fn report_timing(
+        &self,
+        _: Request<fleet_proto::v1::ReportTimingRequest>,
+    ) -> Result<Response<fleet_proto::v1::ReportTimingReply>, Status> {
+        Err(Status::unimplemented("not used"))
+    }
 }
 
 fn box_name() -> String {
