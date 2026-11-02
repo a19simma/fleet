@@ -441,8 +441,9 @@ fn exit_code(status: ExitStatus) -> i32 {
 ///
 /// When the spec names a `telemetry_port` it also binds a second [`Forwarder`] on
 /// `127.0.0.1:<port>` that relays raw bytes to `run_dir/<id>/otel.sock`, bounded by
-/// [`ForwardLimits::telemetry`]. A failed bind is logged and the job runs without it: timing
-/// capture never fails a job.
+/// [`ForwardLimits::telemetry`]. It binds only in a private network namespace: see
+/// [`namespace_is_private`]. A refused or failed bind is logged and the job runs without it:
+/// timing capture never fails a job.
 ///
 /// Only returns on failure, with the reason.
 pub fn exec_job(run_dir: &Path, id: &str) -> AgentExecError {
@@ -463,12 +464,11 @@ pub fn exec_job(run_dir: &Path, id: &str) -> AgentExecError {
         return AgentExecError::InvalidId;
     };
     let uid = fs::metadata(run_dir.join(id)).map_or(u32::MAX, |meta| meta.uid());
-    let telemetry = spec.telemetry_port.and_then(|port| {
-        let receiver = run_dir.join(id).join(crate::otel::SOCKET_NAME);
-        Forwarder::start_raw(telemetry_addr(port), receiver, ForwardLimits::telemetry())
-            .inspect_err(|err| eprintln!("fleetd agent-exec: telemetry forwarder: {}", err.kind()))
-            .ok()
-    });
+    let telemetry = start_telemetry(
+        spec.telemetry_port,
+        &run_dir.join(id).join(crate::otel::SOCKET_NAME),
+        namespace_is_private(netns_identity(NET_NS_SELF), netns_identity(NET_NS_INIT)),
+    );
     let forwarder = match Forwarder::start(socket, uid, ForwardLimits::default()) {
         Ok(forwarder) => forwarder,
         Err(err) => return AgentExecError::Listen(err.kind()),
@@ -486,6 +486,56 @@ pub fn exec_job(run_dir: &Path, id: &str) -> AgentExecError {
     drop(forwarder);
     drop(telemetry);
     std::process::exit(code)
+}
+
+/// Network namespace link of this process.
+const NET_NS_SELF: &str = "/proc/self/ns/net";
+
+/// Network namespace link of the init process.
+const NET_NS_INIT: &str = "/proc/1/ns/net";
+
+/// Device and inode of the namespace behind `link`, or the read error.
+///
+/// Off Linux there is no `/proc`, so the answer is always an error.
+#[cfg(target_os = "linux")]
+fn netns_identity(link: &str) -> io::Result<(u64, u64)> {
+    fs::metadata(link).map(|meta| (meta.dev(), meta.ino()))
+}
+
+/// Device and inode of the namespace behind `link`, or the read error.
+///
+/// Off Linux there is no `/proc`, so the answer is always an error.
+#[cfg(not(target_os = "linux"))]
+fn netns_identity(_link: &str) -> io::Result<(u64, u64)> {
+    Err(io::ErrorKind::Unsupported.into())
+}
+
+/// Whether this process runs in a network namespace other than the init one.
+///
+/// Takes the `(dev, ino)` of this process and of the init process. A read error on either
+/// side, or equal ids, means not private: a loopback bind would land on the host, where any
+/// local user could reach it as fleetd.
+pub fn namespace_is_private(own: io::Result<(u64, u64)>, init: io::Result<(u64, u64)>) -> bool {
+    matches!((own, init), (Ok(own), Ok(init)) if own != init)
+}
+
+/// Binds the telemetry [`Forwarder`] for `port` when `private` and a port is given.
+///
+/// Returns `None` and logs one fixed line when the namespace is not private. A failed bind is
+/// logged by kind only. Neither fails the job.
+pub fn start_telemetry(port: Option<u16>, receiver: &Path, private: bool) -> Option<Forwarder> {
+    let port = port?;
+    if !private {
+        eprintln!("fleetd agent-exec: telemetry forwarder skipped, network namespace is shared");
+        return None;
+    }
+    Forwarder::start_raw(
+        telemetry_addr(port),
+        receiver.to_path_buf(),
+        ForwardLimits::telemetry(),
+    )
+    .inspect_err(|err| eprintln!("fleetd agent-exec: telemetry forwarder: {}", err.kind()))
+    .ok()
 }
 
 /// Port of the install forwarder inside the install unit's private network namespace.
@@ -1038,6 +1088,45 @@ mod tests {
             limits.max_bytes,
             Some(super::MAX_TELEMETRY_CONNECTION_BYTES)
         );
+    }
+
+    fn denied() -> std::io::Result<(u64, u64)> {
+        Err(std::io::ErrorKind::PermissionDenied.into())
+    }
+
+    #[test]
+    fn a_namespace_that_differs_from_init_is_private() {
+        assert!(super::namespace_is_private(Ok((1, 10)), Ok((1, 11))));
+        assert!(super::namespace_is_private(Ok((2, 10)), Ok((1, 10))));
+    }
+
+    #[test]
+    fn the_init_namespace_is_not_private() {
+        assert!(!super::namespace_is_private(Ok((1, 10)), Ok((1, 10))));
+    }
+
+    #[test]
+    fn a_metadata_error_on_either_side_is_not_private() {
+        assert!(!super::namespace_is_private(denied(), Ok((1, 10))));
+        assert!(!super::namespace_is_private(Ok((1, 10)), denied()));
+        assert!(!super::namespace_is_private(denied(), denied()));
+    }
+
+    #[tokio::test]
+    async fn a_shared_namespace_binds_nothing_and_a_private_one_binds() -> TestResult {
+        let dir = TempDir::new()?;
+        let receiver = dir.path().join("otel.sock");
+        let port = std::net::TcpListener::bind(("127.0.0.1", 0))?
+            .local_addr()?
+            .port();
+        let skipped = super::start_telemetry(Some(port), &receiver, false);
+        assert!(skipped.is_none());
+        assert!(std::net::TcpListener::bind(("127.0.0.1", port)).is_ok());
+        assert!(super::start_telemetry(None, &receiver, true).is_none());
+        let bound = super::start_telemetry(Some(port), &receiver, true);
+        assert!(bound.is_some());
+        assert!(std::net::TcpListener::bind(("127.0.0.1", port)).is_err());
+        Ok(())
     }
 
     #[test]

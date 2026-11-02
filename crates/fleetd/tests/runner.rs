@@ -2264,7 +2264,7 @@ mod agent_exec_telemetry {
     use std::process::{Child, Command, Stdio};
     use std::time::{Duration, Instant};
 
-    use fleetd::agent_exec::write_spec_telemetry;
+    use fleetd::agent_exec::{start_telemetry, write_spec_telemetry};
     use fleetd::runner::AgentSpec;
     use tempfile::TempDir;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -2276,7 +2276,6 @@ mod agent_exec_telemetry {
     type TestResult2<T> = Result<T, Box<dyn std::error::Error>>;
 
     const WIDE: Duration = Duration::from_secs(20);
-    const SCRIPT: &str = "read line; exit 5";
 
     fn free_port() -> std::io::Result<u16> {
         let probe = std::net::TcpListener::bind(("127.0.0.1", 0))?;
@@ -2289,9 +2288,13 @@ mod agent_exec_telemetry {
         std::fs::set_permissions(&job_dir, std::fs::Permissions::from_mode(0o750))
     }
 
-    fn start(run: &Path, cwd: &Path, port: u16) -> TestResult2<Child> {
+    fn start_marked(run: &Path, cwd: &Path, port: u16) -> TestResult2<Child> {
+        spawn_agent(run, cwd, port, "touch ready; read line; exit 5")
+    }
+
+    fn spawn_agent(run: &Path, cwd: &Path, port: u16, script: &str) -> TestResult2<Child> {
         let spec = AgentSpec {
-            argv: ["/bin/sh", "-c", SCRIPT].map(Into::into).to_vec(),
+            argv: ["/bin/sh", "-c", script].map(Into::into).to_vec(),
             cwd: cwd.to_path_buf(),
             ..AgentSpec::default()
         };
@@ -2356,24 +2359,20 @@ mod agent_exec_telemetry {
     }
 
     #[tokio::test]
-    async fn a_loopback_client_reaches_the_receiver_socket_and_the_port_dies_with_the_agent()
+    async fn a_loopback_client_reaches_the_receiver_socket_and_the_port_dies_with_the_forwarder()
     -> TestResult {
         common::bounded(Box::pin(async {
             let run = TempDir::new()?;
-            let cwd = TempDir::new()?;
             let port = free_port()?;
-            prepare(run.path())?;
-            serve_echo(UnixListener::bind(
-                run.path().join("tm_job").join("otel.sock"),
-            )?);
-            let mut child = start(run.path(), cwd.path(), port)?;
+            let socket = run.path().join("otel.sock");
+            serve_echo(UnixListener::bind(&socket)?);
+            let forwarder = start_telemetry(Some(port), &socket, true);
             let mut client = connect_when_up(port).await?;
             client.write_all(b"POST /v1/logs").await?;
             let mut back = [0_u8; 13];
             timeout(WIDE, client.read_exact(&mut back)).await??;
             assert_eq!(&back, b"POST /v1/logs");
-            drop(child.stdin.take());
-            assert_eq!(wait_exit(&mut child).await?, Some(5));
+            drop(forwarder);
             let mut rest = Vec::new();
             timeout(WIDE, client.read_to_end(&mut rest)).await??;
             assert!(TcpStream::connect(("127.0.0.1", port)).await.is_err());
@@ -2386,11 +2385,33 @@ mod agent_exec_telemetry {
     async fn a_telemetry_port_already_taken_does_not_fail_the_job() -> TestResult {
         common::bounded(Box::pin(async {
             let run = TempDir::new()?;
-            let cwd = TempDir::new()?;
             let taken = std::net::TcpListener::bind(("127.0.0.1", 0))?;
             let port = taken.local_addr()?.port();
+            let socket = run.path().join("otel.sock");
+            assert!(start_telemetry(Some(port), &socket, true).is_none());
+            Ok(())
+        }))
+        .await
+    }
+
+    #[tokio::test]
+    async fn a_spec_with_a_port_in_the_host_namespace_does_not_bind_it() -> TestResult {
+        common::bounded(Box::pin(async {
+            let run = TempDir::new()?;
+            let cwd = TempDir::new()?;
+            let port = free_port()?;
             prepare(run.path())?;
-            let mut child = start(run.path(), cwd.path(), port)?;
+            let mut child = start_marked(run.path(), cwd.path(), port)?;
+            let ready = cwd.path().join("ready");
+            let end = Instant::now() + WIDE;
+            while !ready.exists() {
+                assert!(Instant::now() < end, "agent never started");
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+            let probe = std::net::TcpListener::bind(("127.0.0.1", port));
+            assert!(probe.is_ok(), "the forwarder holds the host port");
+            drop(probe);
+            assert!(TcpStream::connect(("127.0.0.1", port)).await.is_err());
             drop(child.stdin.take());
             assert_eq!(wait_exit(&mut child).await?, Some(5));
             Ok(())
@@ -2399,20 +2420,17 @@ mod agent_exec_telemetry {
     }
 
     #[tokio::test]
-    async fn a_missing_receiver_socket_closes_the_client_and_the_job_runs_on() -> TestResult {
+    async fn a_missing_receiver_socket_closes_the_client() -> TestResult {
         common::bounded(Box::pin(async {
             let run = TempDir::new()?;
-            let cwd = TempDir::new()?;
             let port = free_port()?;
-            prepare(run.path())?;
-            let mut child = start(run.path(), cwd.path(), port)?;
+            let socket = run.path().join("otel.sock");
+            let _forwarder = start_telemetry(Some(port), &socket, true);
             let mut client = connect_when_up(port).await?;
             client.write_all(b"x").await?;
             let mut rest = Vec::new();
             let _ = timeout(WIDE, client.read_to_end(&mut rest)).await?;
             assert_eq!(rest, Vec::<u8>::new());
-            drop(child.stdin.take());
-            assert_eq!(wait_exit(&mut child).await?, Some(5));
             Ok(())
         }))
         .await
