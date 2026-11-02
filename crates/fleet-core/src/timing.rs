@@ -133,6 +133,95 @@ pub fn covered_ms(set: &[Interval]) -> u64 {
     merge(set).iter().map(Interval::len_ms).sum()
 }
 
+/// Kind of a timing span.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[non_exhaustive]
+pub enum SpanKind {
+    /// Foreground shell command.
+    Shell,
+    /// Background shell command.
+    BgShell,
+    /// Tool call other than shell.
+    Tool,
+    /// Wait on a model API request.
+    ApiWait,
+}
+
+/// One timed span of a kind.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Span {
+    /// What the span measures.
+    pub kind: SpanKind,
+    /// When it ran.
+    pub interval: Interval,
+}
+
+/// Five-part timing breakdown of a job. The parts sum to the job wall time.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct Summary {
+    /// Milliseconds waiting on the model API, not shadowed by a tool or shell span.
+    pub api_wait_ms: u64,
+    /// Milliseconds in tools, not shadowed by a shell span.
+    pub tool_ms: u64,
+    /// Milliseconds in foreground or background shell commands.
+    pub shell_ms: u64,
+    /// Agent window milliseconds covered by no span.
+    pub idle_ms: u64,
+    /// Job window milliseconds outside the agent window.
+    pub overhead_ms: u64,
+}
+
+impl Summary {
+    /// Sum of the five parts, saturating.
+    #[must_use]
+    pub const fn total_ms(&self) -> u64 {
+        self.api_wait_ms
+            .saturating_add(self.tool_ms)
+            .saturating_add(self.shell_ms)
+            .saturating_add(self.idle_ms)
+            .saturating_add(self.overhead_ms)
+    }
+}
+
+/// Reconciles spans into a [`Summary`].
+///
+/// Spans are clamped to the agent window, itself clamped to the job window.
+/// Each instant counts once, for its highest kind: shell and background shell
+/// over tool over API wait. Idle is agent window time with no span. Overhead is
+/// the job window minus the agent window.
+#[must_use]
+pub fn aggregate(spans: &[Span], job_window: Interval, agent_window: Interval) -> Summary {
+    let agent = clamp(&[agent_window], job_window)
+        .first()
+        .copied()
+        .unwrap_or(Interval {
+            start_ms: job_window.start_ms,
+            end_ms: job_window.start_ms,
+        });
+    let of = |kinds: &[SpanKind]| -> Vec<Interval> {
+        let picked: Vec<Interval> = spans
+            .iter()
+            .filter(|s| kinds.contains(&s.kind))
+            .map(|s| s.interval)
+            .collect();
+        clamp(&picked, agent)
+    };
+    let shell = of(&[SpanKind::Shell, SpanKind::BgShell]);
+    let tool = subtract(&of(&[SpanKind::Tool]), &shell);
+    let shell_and_tool: Vec<Interval> = shell.iter().chain(tool.iter()).copied().collect();
+    let api = subtract(&of(&[SpanKind::ApiWait]), &shell_and_tool);
+    let shell_ms = covered_ms(&shell);
+    let tool_ms = covered_ms(&tool);
+    let api_wait_ms = covered_ms(&api);
+    Summary {
+        api_wait_ms,
+        tool_ms,
+        shell_ms,
+        idle_ms: agent.len_ms() - shell_ms - tool_ms - api_wait_ms,
+        overhead_ms: job_window.len_ms() - agent.len_ms(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -342,5 +431,146 @@ mod tests {
         let inter = subtract(&set, &left);
         assert_eq!(covered_ms(&left) + covered_ms(&inter), covered_ms(&set));
         assert_eq!(subtract(&left, &cut), left);
+    }
+
+    struct Lcg(u64);
+
+    impl Lcg {
+        fn next(&mut self) -> u64 {
+            self.0 = self
+                .0
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            self.0 >> 33
+        }
+    }
+
+    fn sp(kind: SpanKind, a: u64, b: u64) -> Span {
+        Span {
+            kind,
+            interval: iv(a, b),
+        }
+    }
+
+    fn agg(spans: &[Span]) -> Summary {
+        aggregate(spans, iv(0, 100), iv(10, 90))
+    }
+
+    #[test]
+    fn five_parts_sum_to_wall_for_generated_cases() {
+        let kinds = [
+            SpanKind::Shell,
+            SpanKind::BgShell,
+            SpanKind::Tool,
+            SpanKind::ApiWait,
+        ];
+        let mut rng = Lcg(0x5eed);
+        for case in 0..10_000 {
+            let js = rng.next() % 500;
+            let je = js + rng.next() % 500;
+            let agent_start = js.saturating_sub(50) + rng.next() % 600;
+            let agent_end = agent_start + rng.next() % 600;
+            let n = rng.next() % 12;
+            let spans: Vec<Span> = (0..n)
+                .map(|_| {
+                    let from = rng.next() % 1200;
+                    let to = from + rng.next() % 300;
+                    sp(kinds[(rng.next() % 4) as usize], from, to)
+                })
+                .collect();
+            let job = iv(js, je);
+            let sum = aggregate(&spans, job, iv(agent_start, agent_end));
+            assert_eq!(sum.total_ms(), job.len_ms(), "case {case}");
+        }
+    }
+
+    #[test]
+    fn empty_spans_are_all_idle_and_overhead() {
+        let s = agg(&[]);
+        assert_eq!((s.idle_ms, s.overhead_ms), (80, 20));
+        assert_eq!((s.api_wait_ms, s.tool_ms, s.shell_ms), (0, 0, 0));
+    }
+
+    #[test]
+    fn precedence_shell_over_tool() {
+        let s = agg(&[sp(SpanKind::Shell, 20, 40), sp(SpanKind::Tool, 20, 40)]);
+        assert_eq!((s.shell_ms, s.tool_ms), (20, 0));
+    }
+
+    #[test]
+    fn precedence_bgshell_over_tool() {
+        let s = agg(&[sp(SpanKind::BgShell, 20, 40), sp(SpanKind::Tool, 20, 40)]);
+        assert_eq!((s.shell_ms, s.tool_ms), (20, 0));
+    }
+
+    #[test]
+    fn precedence_tool_over_api_wait() {
+        let s = agg(&[sp(SpanKind::Tool, 20, 40), sp(SpanKind::ApiWait, 20, 40)]);
+        assert_eq!((s.tool_ms, s.api_wait_ms), (20, 0));
+    }
+
+    #[test]
+    fn precedence_shell_over_api_wait() {
+        let s = agg(&[sp(SpanKind::Shell, 20, 40), sp(SpanKind::ApiWait, 20, 40)]);
+        assert_eq!((s.shell_ms, s.api_wait_ms), (20, 0));
+    }
+
+    #[test]
+    fn precedence_bgshell_over_api_wait() {
+        let s = agg(&[sp(SpanKind::BgShell, 20, 40), sp(SpanKind::ApiWait, 20, 40)]);
+        assert_eq!((s.shell_ms, s.api_wait_ms), (20, 0));
+    }
+
+    #[test]
+    fn shell_and_bgshell_merge_into_one_part() {
+        let s = agg(&[sp(SpanKind::Shell, 20, 40), sp(SpanKind::BgShell, 30, 50)]);
+        assert_eq!(s.shell_ms, 30);
+    }
+
+    #[test]
+    fn partial_overlap_splits_by_precedence() {
+        let s = agg(&[
+            sp(SpanKind::ApiWait, 10, 50),
+            sp(SpanKind::Tool, 30, 60),
+            sp(SpanKind::Shell, 50, 70),
+        ]);
+        assert_eq!(
+            (
+                s.api_wait_ms,
+                s.tool_ms,
+                s.shell_ms,
+                s.idle_ms,
+                s.overhead_ms
+            ),
+            (20, 20, 20, 20, 20)
+        );
+    }
+
+    #[test]
+    fn spans_outside_windows_are_clamped() {
+        let s = agg(&[
+            sp(SpanKind::Tool, 0, 20),
+            sp(SpanKind::Shell, 80, 200),
+            sp(SpanKind::ApiWait, 0, 5),
+            sp(SpanKind::ApiWait, 95, 99),
+        ]);
+        assert_eq!(
+            (
+                s.api_wait_ms,
+                s.tool_ms,
+                s.shell_ms,
+                s.idle_ms,
+                s.overhead_ms
+            ),
+            (0, 10, 10, 60, 20)
+        );
+    }
+
+    #[test]
+    fn agent_window_clamped_to_job_window() {
+        let s = aggregate(&[sp(SpanKind::Tool, 0, 500)], iv(100, 200), iv(50, 300));
+        assert_eq!((s.tool_ms, s.idle_ms, s.overhead_ms), (100, 0, 0));
+        let none = aggregate(&[sp(SpanKind::Tool, 0, 500)], iv(100, 200), iv(300, 400));
+        assert_eq!((none.tool_ms, none.idle_ms, none.overhead_ms), (0, 0, 100));
     }
 }
