@@ -392,15 +392,15 @@ fn command_row(input: &CommandInput) -> CommandRow {
     }
 }
 
+/// Whether a char is escaped in rendered command text.
+///
+/// Allowlist: only ASCII printable (U+0020..=U+007E) and chars for which
+/// [`char::is_alphanumeric`] holds are kept. Every other char is unsafe.
+/// Alphabetic and numeric chars are letters, numbers and combining marks, so
+/// the rule excludes by construction the general categories Cc, Cf, Zl, Zp,
+/// Co and Cn, noncharacters included, without a hand-kept range list.
 fn is_unsafe_char(c: char) -> bool {
-    c.is_control()
-        || matches!(
-            c,
-            '\u{061c}'
-                | '\u{200b}'..='\u{200f}'
-                | '\u{2028}'..='\u{202e}'
-                | '\u{2066}'..='\u{2069}'
-        )
+    !(c == ' ' || c.is_ascii_graphic() || c.is_alphanumeric())
 }
 
 fn display_command(text: &str) -> (String, bool) {
@@ -1051,6 +1051,83 @@ mod tests {
                     .any(|c| c.is_control() || c == '\u{2028}' || c == '\u{2029}'),
                 "{name}"
             );
+        }
+    }
+
+    const UNSAFE_RANGES: &[(u32, u32)] = &[
+        (0x0, 0x1F),
+        (0x7F, 0x9F),
+        (0xAD, 0xAD),
+        (0x600, 0x605),
+        (0x61C, 0x61C),
+        (0x6DD, 0x6DD),
+        (0x70F, 0x70F),
+        (0x890, 0x891),
+        (0x8E2, 0x8E2),
+        (0x180E, 0x180E),
+        (0x200B, 0x200F),
+        (0x2028, 0x2029),
+        (0x202A, 0x202E),
+        (0x2060, 0x2064),
+        (0x2066, 0x206F),
+        (0xFEFF, 0xFEFF),
+        (0xFFF9, 0xFFFB),
+        (0x110BD, 0x110BD),
+        (0x110CD, 0x110CD),
+        (0x13430, 0x1343F),
+        (0x1BCA0, 0x1BCA3),
+        (0x1D173, 0x1D17A),
+        (0xE0001, 0xE0001),
+        (0xE0020, 0xE007F),
+        (0xE000, 0xF8FF),
+        (0xF0000, 0xFFFFD),
+        (0x0010_0000, 0x0010_FFFD),
+        (0x378, 0x378),
+        (0xFDD0, 0xFDEF),
+        (0xE0080, 0xE00FF),
+    ];
+
+    fn in_unsafe_table(cp: u32) -> bool {
+        UNSAFE_RANGES
+            .iter()
+            .any(|&(lo, hi)| (lo..=hi).contains(&cp))
+            || matches!(cp & 0xFFFF, 0xFFFE | 0xFFFF)
+    }
+
+    /// The table is Cc, Cf, Zl, Zp and Co from `UnicodeData` 16.0.0, plus
+    /// noncharacters and a few unassigned code points (Cn).
+    #[test]
+    fn every_code_point_in_a_unicode_unsafe_category_is_escaped() {
+        let mut checked = 0_u32;
+        for cp in 0..=0x0010_FFFF_u32 {
+            let Some(c) = char::from_u32(cp) else {
+                continue;
+            };
+            let view = TimingView::new(&Summary::default(), &[cmd(&c.to_string())]);
+            let out = &view.commands[0].command;
+            if in_unsafe_table(cp) {
+                assert_eq!(*out, format!("\\u{{{cp:x}}}"), "U+{cp:04X}");
+                checked += 1;
+            }
+        }
+        assert!(checked > 130_000, "table covered {checked}");
+    }
+
+    #[test]
+    fn letters_and_digits_of_many_scripts_pass_through() {
+        for text in [
+            "aZ09 ~!",
+            "é",
+            "αβγ",
+            "кириллица",
+            "שלום",
+            "日本語",
+            "한글",
+            "हम",
+            "٣٤",
+        ] {
+            let view = TimingView::new(&Summary::default(), &[cmd(text)]);
+            assert_eq!(view.commands[0].command, text);
         }
     }
 
