@@ -148,6 +148,23 @@ pub const MAX_CLAUDE_VERSION_CHARS: usize = 64;
 /// Longest stored `model` of a job summary, in bytes.
 pub const MAX_MODEL_BYTES: usize = 128;
 
+/// Most timing spans stored per job. Migration 0022 checks `seq BETWEEN 0 AND MAX_SPANS - 1`.
+pub const MAX_SPANS: usize = 4096;
+
+/// Most shell commands stored per job. Migration 0022 checks
+/// `seq BETWEEN 0 AND MAX_SHELL_COMMANDS - 1`.
+pub const MAX_SHELL_COMMANDS: usize = 256;
+
+/// Longest stored shell log of one command, in bytes. Migration 0022 checks it.
+pub const MAX_SHELL_LOG_BYTES: usize = 16 * 1024;
+
+/// Longest stored shell command line, in bytes. Migration 0022 checks it.
+pub const MAX_COMMAND_BYTES: usize = 2048;
+
+/// Longest stored span name, tool use id, shell command id or `ended_by`, in bytes. Migration
+/// 0022 checks each.
+pub const MAX_TIMING_NAME_BYTES: usize = 128;
+
 /// Largest stored phase or queue duration of a job summary: seven days, in milliseconds.
 pub const MAX_PHASE_MS: u64 = 7 * 24 * 60 * 60 * 1000;
 

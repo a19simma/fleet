@@ -384,6 +384,110 @@ impl Profile {
     }
 }
 
+/// Failure from parsing a [`Visibility`]. The message never echoes input text.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum VisibilityError {
+    /// The text is not exactly `private` or `shared`.
+    Unknown,
+}
+
+impl fmt::Display for VisibilityError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Unknown => f.write_str("visibility must be \"private\" or \"shared\""),
+        }
+    }
+}
+
+impl std::error::Error for VisibilityError {}
+
+/// Who besides the owner may see a Profile (ADR-0052). Not part of the profile hash.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
+pub enum Visibility {
+    /// Only the owner sees the Profile. The default.
+    #[default]
+    Private,
+    /// Every authenticated user sees published versions.
+    Shared,
+}
+
+impl Visibility {
+    /// The canonical text: `private` or `shared`.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Private => "private",
+            Self::Shared => "shared",
+        }
+    }
+}
+
+impl fmt::Display for Visibility {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl FromStr for Visibility {
+    type Err = VisibilityError;
+
+    fn from_str(raw: &str) -> Result<Self, Self::Err> {
+        match raw {
+            "private" => Ok(Self::Private),
+            "shared" => Ok(Self::Shared),
+            _ => Err(VisibilityError::Unknown),
+        }
+    }
+}
+
+/// Failure from building an [`OwnerId`]. The message never echoes input.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum OwnerIdError {
+    /// The id is zero or negative.
+    NotPositive,
+}
+
+impl fmt::Display for OwnerIdError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::NotPositive => f.write_str("owner id must be positive"),
+        }
+    }
+}
+
+impl std::error::Error for OwnerIdError {}
+
+/// The user that owns a Profile: a positive user id (ADR-0052). Not part of the profile hash.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct OwnerId(i64);
+
+impl OwnerId {
+    /// Wraps a user id.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`OwnerIdError::NotPositive`] when `raw` is zero or negative.
+    pub const fn new(raw: i64) -> Result<Self, OwnerIdError> {
+        if raw > 0 {
+            Ok(Self(raw))
+        } else {
+            Err(OwnerIdError::NotPositive)
+        }
+    }
+
+    /// The user id.
+    pub const fn get(self) -> i64 {
+        self.0
+    }
+}
+
+impl fmt::Display for OwnerId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -777,5 +881,82 @@ mod tests {
         hasher.update(b"fleet-profile-v1\0{}");
         let expected: [u8; 32] = hasher.finalize().into();
         assert_eq!(parse("{}").hash().as_bytes(), &expected);
+    }
+}
+
+#[cfg(test)]
+mod visibility_tests {
+    use super::*;
+
+    #[test]
+    fn visibility_default_is_private() {
+        assert_eq!(Visibility::default(), Visibility::Private);
+    }
+
+    #[test]
+    fn visibility_round_trips_canonical_text() {
+        assert_eq!("private".parse::<Visibility>(), Ok(Visibility::Private));
+        assert_eq!("shared".parse::<Visibility>(), Ok(Visibility::Shared));
+        assert_eq!(Visibility::Private.as_str(), "private");
+        assert_eq!(Visibility::Shared.to_string(), "shared");
+    }
+
+    #[test]
+    fn visibility_rejects_hostile_text() {
+        let long = "a".repeat(4096);
+        let cases = [
+            "",
+            "Private",
+            "SHARED",
+            "Shared",
+            " private",
+            "shared ",
+            "private\n",
+            "shared\r",
+            "private\r\n",
+            "shared\u{85}",
+            "private\u{2028}",
+            "shared\0",
+            "public",
+            "privаte",
+            "ｓhared",
+            long.as_str(),
+        ];
+        for case in cases {
+            assert_eq!(
+                case.parse::<Visibility>(),
+                Err(VisibilityError::Unknown),
+                "{case:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn visibility_error_message_is_fixed() {
+        let shown = VisibilityError::Unknown.to_string();
+        assert_eq!(shown, "visibility must be \"private\" or \"shared\"");
+    }
+
+    #[test]
+    fn owner_id_accepts_positive() {
+        let owner = OwnerId::new(7).unwrap();
+        assert_eq!(owner.get(), 7);
+        assert_eq!(OwnerId::new(i64::MAX).unwrap().get(), i64::MAX);
+        assert_eq!(OwnerId::new(1).unwrap().to_string(), "1");
+    }
+
+    #[test]
+    fn owner_id_rejects_zero_and_negative() {
+        for raw in [0, -1, i64::MIN] {
+            assert_eq!(OwnerId::new(raw), Err(OwnerIdError::NotPositive));
+        }
+    }
+
+    #[test]
+    fn visibility_and_owner_do_not_change_profile_hash() {
+        let profile: Profile = serde_json::from_str(r#"{"claude_md":"x"}"#).unwrap();
+        let before = profile.hash();
+        let _ = (Visibility::Shared, OwnerId::new(3).unwrap());
+        assert_eq!(profile.hash(), before);
     }
 }
