@@ -2257,3 +2257,164 @@ mod agent_exec_forwarder {
         .await
     }
 }
+
+mod agent_exec_telemetry {
+    use std::os::unix::fs::PermissionsExt;
+    use std::path::Path;
+    use std::process::{Child, Command, Stdio};
+    use std::time::{Duration, Instant};
+
+    use fleetd::agent_exec::write_spec_telemetry;
+    use fleetd::runner::AgentSpec;
+    use tempfile::TempDir;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::{TcpStream, UnixListener};
+    use tokio::time::timeout;
+
+    use super::{TestResult, common};
+
+    type TestResult2<T> = Result<T, Box<dyn std::error::Error>>;
+
+    const WIDE: Duration = Duration::from_secs(20);
+    const SCRIPT: &str = "read line; exit 5";
+
+    fn free_port() -> std::io::Result<u16> {
+        let probe = std::net::TcpListener::bind(("127.0.0.1", 0))?;
+        Ok(probe.local_addr()?.port())
+    }
+
+    fn prepare(run: &Path) -> std::io::Result<()> {
+        let job_dir = run.join("tm_job");
+        std::fs::create_dir(&job_dir)?;
+        std::fs::set_permissions(&job_dir, std::fs::Permissions::from_mode(0o750))
+    }
+
+    fn start(run: &Path, cwd: &Path, port: u16) -> TestResult2<Child> {
+        let spec = AgentSpec {
+            argv: ["/bin/sh", "-c", SCRIPT].map(Into::into).to_vec(),
+            cwd: cwd.to_path_buf(),
+            ..AgentSpec::default()
+        };
+        write_spec_telemetry(
+            &run.join("tm_job").join("spec.json"),
+            "tm_job",
+            &spec,
+            None,
+            std::num::NonZeroU16::new(port),
+        )?;
+        Ok(Command::new(env!("CARGO_BIN_EXE_fleetd"))
+            .args(["agent-exec", "tm_job", "--run-dir"])
+            .arg(run)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()?)
+    }
+
+    fn serve_echo(receiver: UnixListener) {
+        tokio::spawn(async move {
+            while let Ok((mut stream, _)) = receiver.accept().await {
+                tokio::spawn(async move {
+                    let mut buf = [0_u8; 64];
+                    while let Ok(n @ 1..) = stream.read(&mut buf).await {
+                        if stream
+                            .write_all(buf.get(..n).unwrap_or_default())
+                            .await
+                            .is_err()
+                        {
+                            return;
+                        }
+                    }
+                });
+            }
+        });
+    }
+
+    async fn connect_when_up(port: u16) -> TestResult2<TcpStream> {
+        let end = Instant::now() + WIDE;
+        loop {
+            match TcpStream::connect(("127.0.0.1", port)).await {
+                Ok(stream) => return Ok(stream),
+                Err(err) if Instant::now() >= end => return Err(err.into()),
+                Err(_) => tokio::time::sleep(Duration::from_millis(20)).await,
+            }
+        }
+    }
+
+    async fn wait_exit(child: &mut Child) -> TestResult2<Option<i32>> {
+        let end = Instant::now() + WIDE;
+        loop {
+            if let Some(status) = child.try_wait()? {
+                return Ok(status.code());
+            }
+            if Instant::now() >= end {
+                child.kill()?;
+                return Err("agent-exec did not exit".into());
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn a_loopback_client_reaches_the_receiver_socket_and_the_port_dies_with_the_agent()
+    -> TestResult {
+        common::bounded(Box::pin(async {
+            let run = TempDir::new()?;
+            let cwd = TempDir::new()?;
+            let port = free_port()?;
+            prepare(run.path())?;
+            serve_echo(UnixListener::bind(
+                run.path().join("tm_job").join("otel.sock"),
+            )?);
+            let mut child = start(run.path(), cwd.path(), port)?;
+            let mut client = connect_when_up(port).await?;
+            client.write_all(b"POST /v1/logs").await?;
+            let mut back = [0_u8; 13];
+            timeout(WIDE, client.read_exact(&mut back)).await??;
+            assert_eq!(&back, b"POST /v1/logs");
+            drop(child.stdin.take());
+            assert_eq!(wait_exit(&mut child).await?, Some(5));
+            let mut rest = Vec::new();
+            timeout(WIDE, client.read_to_end(&mut rest)).await??;
+            assert!(TcpStream::connect(("127.0.0.1", port)).await.is_err());
+            Ok(())
+        }))
+        .await
+    }
+
+    #[tokio::test]
+    async fn a_telemetry_port_already_taken_does_not_fail_the_job() -> TestResult {
+        common::bounded(Box::pin(async {
+            let run = TempDir::new()?;
+            let cwd = TempDir::new()?;
+            let taken = std::net::TcpListener::bind(("127.0.0.1", 0))?;
+            let port = taken.local_addr()?.port();
+            prepare(run.path())?;
+            let mut child = start(run.path(), cwd.path(), port)?;
+            drop(child.stdin.take());
+            assert_eq!(wait_exit(&mut child).await?, Some(5));
+            Ok(())
+        }))
+        .await
+    }
+
+    #[tokio::test]
+    async fn a_missing_receiver_socket_closes_the_client_and_the_job_runs_on() -> TestResult {
+        common::bounded(Box::pin(async {
+            let run = TempDir::new()?;
+            let cwd = TempDir::new()?;
+            let port = free_port()?;
+            prepare(run.path())?;
+            let mut child = start(run.path(), cwd.path(), port)?;
+            let mut client = connect_when_up(port).await?;
+            client.write_all(b"x").await?;
+            let mut rest = Vec::new();
+            let _ = timeout(WIDE, client.read_to_end(&mut rest)).await?;
+            assert_eq!(rest, Vec::<u8>::new());
+            drop(child.stdin.take());
+            assert_eq!(wait_exit(&mut child).await?, Some(5));
+            Ok(())
+        }))
+        .await
+    }
+}

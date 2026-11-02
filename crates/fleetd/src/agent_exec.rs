@@ -10,6 +10,7 @@ use std::fmt;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Write};
 use std::net::SocketAddr;
+use std::num::NonZeroU16;
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::os::unix::process::ExitStatusExt;
 use std::path::{Path, PathBuf};
@@ -44,6 +45,8 @@ struct SpecFile {
     id: String,
     argv: Vec<String>,
     cwd: PathBuf,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    telemetry_port: Option<u16>,
 }
 
 /// Why `agent-exec` could not start the agent. No variant carries an argument or an
@@ -91,6 +94,25 @@ impl std::error::Error for AgentExecError {}
 /// Fails when `path` exists, an argument is not UTF-8, or the file cannot be written. A
 /// partial file is removed.
 pub fn write_spec(path: &Path, id: &str, spec: &AgentSpec, gid: Option<u32>) -> io::Result<()> {
+    write_spec_telemetry(path, id, spec, gid, None)
+}
+
+/// Like [`write_spec`], with an optional telemetry port.
+///
+/// With `telemetry_port` set, `agent-exec` listens on `127.0.0.1:<port>` in the unit's
+/// namespace and relays to the receiver socket in the job directory. fleetd chooses the port
+/// and puts the same one in the agent's OTLP endpoint.
+///
+/// # Errors
+///
+/// Fails as [`write_spec`] does.
+pub fn write_spec_telemetry(
+    path: &Path,
+    id: &str,
+    spec: &AgentSpec,
+    gid: Option<u32>,
+    telemetry_port: Option<NonZeroU16>,
+) -> io::Result<()> {
     let argv = spec
         .argv
         .iter()
@@ -101,6 +123,7 @@ pub fn write_spec(path: &Path, id: &str, spec: &AgentSpec, gid: Option<u32>) -> 
         id: id.to_owned(),
         argv,
         cwd: spec.cwd.clone(),
+        telemetry_port: telemetry_port.map(NonZeroU16::get),
     })
     .map_err(io::Error::other)?;
     let mut file = OpenOptions::new()
@@ -128,7 +151,12 @@ fn read_spec(path: &Path) -> Result<SpecFile, AgentExecError> {
     if u64::try_from(body.len()).map_or(true, |len| len > MAX_SPEC_BYTES) {
         return Err(AgentExecError::MalformedSpec);
     }
-    serde_json::from_slice(&body).map_err(|_| AgentExecError::MalformedSpec)
+    let spec: SpecFile =
+        serde_json::from_slice(&body).map_err(|_| AgentExecError::MalformedSpec)?;
+    if spec.telemetry_port == Some(0) {
+        return Err(AgentExecError::MalformedSpec);
+    }
+    Ok(spec)
 }
 
 /// Most connections the forwarder serves at once. It equals the default tunnel cap of the
@@ -145,6 +173,8 @@ pub struct ForwardLimits {
     pub max_connections: usize,
     /// Longest time without a byte in either direction.
     pub idle_timeout: Duration,
+    /// Most bytes one connection may carry, both directions together. `None` is unbounded.
+    pub max_bytes: Option<u64>,
 }
 
 impl Default for ForwardLimits {
@@ -152,8 +182,36 @@ impl Default for ForwardLimits {
         Self {
             max_connections: MAX_FORWARDED,
             idle_timeout: FORWARD_IDLE_TIMEOUT,
+            max_bytes: None,
         }
     }
+}
+
+/// Most connections the telemetry forwarder serves at once.
+pub const MAX_TELEMETRY_CONNECTIONS: usize = 4;
+
+/// Idle time after which the telemetry forwarder closes a connection.
+pub const TELEMETRY_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Most bytes one telemetry connection carries, both directions together.
+pub const MAX_TELEMETRY_CONNECTION_BYTES: u64 = 16 * 1024 * 1024;
+
+impl ForwardLimits {
+    /// The bounds of the telemetry forwarder.
+    #[must_use]
+    pub const fn telemetry() -> Self {
+        Self {
+            max_connections: MAX_TELEMETRY_CONNECTIONS,
+            idle_timeout: TELEMETRY_IDLE_TIMEOUT,
+            max_bytes: Some(MAX_TELEMETRY_CONNECTION_BYTES),
+        }
+    }
+}
+
+/// The address the telemetry forwarder binds: IPv4 loopback only, on `port`.
+#[must_use]
+pub const fn telemetry_addr(port: u16) -> SocketAddr {
+    SocketAddr::new(std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST), port)
 }
 
 const COPY_CHUNK: usize = 16 * 1024;
@@ -171,10 +229,16 @@ pub struct Forwarder {
     thread: Option<JoinHandle<()>>,
 }
 
+enum Target {
+    Handshake { uid: u32 },
+    Raw,
+}
+
 struct Dial {
     socket: PathBuf,
-    uid: u32,
+    target: Target,
     idle: Duration,
+    max_bytes: Option<u64>,
 }
 
 impl Forwarder {
@@ -185,6 +249,20 @@ impl Forwarder {
     /// Fails when the bind fails.
     pub fn start(socket: PathBuf, uid: u32, limits: ForwardLimits) -> io::Result<Self> {
         Self::start_on(SocketAddr::from(([127, 0, 0, 1], 0)), socket, uid, limits)
+    }
+
+    /// Binds `addr` and relays raw bytes to the plain unix socket at `socket`, with no Job
+    /// socket handshake. The telemetry receiver speaks HTTP on that socket itself. `addr` must
+    /// be a loopback address.
+    ///
+    /// # Errors
+    ///
+    /// Fails when `addr` is not a loopback address or the bind fails.
+    pub fn start_raw(addr: SocketAddr, socket: PathBuf, limits: ForwardLimits) -> io::Result<Self> {
+        if !addr.ip().is_loopback() {
+            return Err(io::Error::from(io::ErrorKind::InvalidInput));
+        }
+        Self::spawn(addr, socket, Target::Raw, limits)
     }
 
     /// Binds `addr`.
@@ -198,6 +276,15 @@ impl Forwarder {
         uid: u32,
         limits: ForwardLimits,
     ) -> io::Result<Self> {
+        Self::spawn(addr, socket, Target::Handshake { uid }, limits)
+    }
+
+    fn spawn(
+        addr: SocketAddr,
+        socket: PathBuf,
+        target: Target,
+        limits: ForwardLimits,
+    ) -> io::Result<Self> {
         let listener = std::net::TcpListener::bind(addr)?;
         listener.set_nonblocking(true)?;
         let port = listener.local_addr()?.port();
@@ -207,8 +294,9 @@ impl Forwarder {
         let (stop, stopped) = oneshot::channel();
         let dial = Arc::new(Dial {
             socket,
-            uid,
+            target,
             idle: limits.idle_timeout,
+            max_bytes: limits.max_bytes,
         });
         let permits = Arc::new(Semaphore::new(limits.max_connections));
         let thread = std::thread::Builder::new()
@@ -272,23 +360,31 @@ async fn accept_loop(
 }
 
 async fn relay(client: TcpStream, dial: &Dial) {
-    let Ok(upstream) = connect(&dial.socket, ServiceName::EgressProxy, dial.uid).await else {
+    let upstream = match dial.target {
+        Target::Handshake { uid } => connect(&dial.socket, ServiceName::EgressProxy, uid).await,
+        Target::Raw => UnixStream::connect(&dial.socket).await,
+    };
+    let Ok(upstream) = upstream else {
         return;
     };
-    pump(client, upstream, dial.idle).await;
+    pump(client, upstream, dial.idle, dial.max_bytes).await;
 }
 
-async fn pump(client: TcpStream, upstream: UnixStream, idle: Duration) {
+async fn pump(client: TcpStream, upstream: UnixStream, idle: Duration, max_bytes: Option<u64>) {
     let (mut client_rd, mut client_wr) = client.into_split();
     let (mut up_rd, mut up_wr) = upstream.into_split();
     let mut from_client = vec![0_u8; COPY_CHUNK];
     let mut from_upstream = vec![0_u8; COPY_CHUNK];
     let mut deadline = Instant::now() + idle;
+    let mut carried: u64 = 0;
     loop {
         tokio::select! {
             () = sleep_until(deadline) => return,
             read = client_rd.read(&mut from_client) => {
                 let Ok(n @ 1..) = read else { return };
+                if over_cap(&mut carried, n, max_bytes) {
+                    return;
+                }
                 let chunk = from_client.get(..n).unwrap_or_default();
                 if !matches!(timeout(idle, up_wr.write_all(chunk)).await, Ok(Ok(()))) {
                     return;
@@ -297,6 +393,9 @@ async fn pump(client: TcpStream, upstream: UnixStream, idle: Duration) {
             }
             read = up_rd.read(&mut from_upstream) => {
                 let Ok(n @ 1..) = read else { return };
+                if over_cap(&mut carried, n, max_bytes) {
+                    return;
+                }
                 let chunk = from_upstream.get(..n).unwrap_or_default();
                 if !matches!(timeout(idle, client_wr.write_all(chunk)).await, Ok(Ok(()))) {
                     return;
@@ -305,6 +404,11 @@ async fn pump(client: TcpStream, upstream: UnixStream, idle: Duration) {
             }
         }
     }
+}
+
+fn over_cap(carried: &mut u64, n: usize, max_bytes: Option<u64>) -> bool {
+    *carried = carried.saturating_add(u64::try_from(n).unwrap_or(u64::MAX));
+    max_bytes.is_some_and(|cap| *carried > cap)
 }
 
 /// Points the four proxy URL variables of `command` at `proxy` and removes `NO_PROXY` and
@@ -335,6 +439,11 @@ fn exit_code(status: ExitStatus) -> i32 {
 /// The forwarder thread lives as long as this process, which waits for the agent, so no
 /// forwarder outlives it. The unit's cgroup kill ends both when systemd stops the unit.
 ///
+/// When the spec names a `telemetry_port` it also binds a second [`Forwarder`] on
+/// `127.0.0.1:<port>` that relays raw bytes to `run_dir/<id>/otel.sock`, bounded by
+/// [`ForwardLimits::telemetry`]. A failed bind is logged and the job runs without it: timing
+/// capture never fails a job.
+///
 /// Only returns on failure, with the reason.
 pub fn exec_job(run_dir: &Path, id: &str) -> AgentExecError {
     if validate_job_id(id).is_err() {
@@ -354,6 +463,12 @@ pub fn exec_job(run_dir: &Path, id: &str) -> AgentExecError {
         return AgentExecError::InvalidId;
     };
     let uid = fs::metadata(run_dir.join(id)).map_or(u32::MAX, |meta| meta.uid());
+    let telemetry = spec.telemetry_port.and_then(|port| {
+        let receiver = run_dir.join(id).join(crate::otel::SOCKET_NAME);
+        Forwarder::start_raw(telemetry_addr(port), receiver, ForwardLimits::telemetry())
+            .inspect_err(|err| eprintln!("fleetd agent-exec: telemetry forwarder: {}", err.kind()))
+            .ok()
+    });
     let forwarder = match Forwarder::start(socket, uid, ForwardLimits::default()) {
         Ok(forwarder) => forwarder,
         Err(err) => return AgentExecError::Listen(err.kind()),
@@ -369,6 +484,7 @@ pub fn exec_job(run_dir: &Path, id: &str) -> AgentExecError {
     };
     let code = child.wait().map_or(1, exit_code);
     drop(forwarder);
+    drop(telemetry);
     std::process::exit(code)
 }
 
@@ -606,7 +722,12 @@ mod tests {
     use tokio::net::{TcpListener, TcpStream, UnixStream};
     use tokio::time::timeout;
 
-    use super::{ForwardLimits, Forwarder};
+    use std::net::SocketAddr;
+    use std::num::NonZeroU16;
+
+    use super::{
+        ForwardLimits, Forwarder, read_spec, telemetry_addr, write_spec, write_spec_telemetry,
+    };
     use crate::jobsock::{
         AGENT_SLICE, JobContext, JobSocket, Limits, Peer, PeerId, ServeFuture, Service,
         ServiceName, Services,
@@ -709,6 +830,7 @@ mod tests {
         ForwardLimits {
             max_connections,
             idle_timeout: Duration::from_millis(idle_ms),
+            max_bytes: None,
         }
     }
 
@@ -789,6 +911,167 @@ mod tests {
         let mut client = TcpStream::connect(("127.0.0.1", forwarder.port())).await?;
         client.write_all(b"x").await?;
         assert_eq!(reads_eof(&mut client).await?, Vec::<u8>::new());
+        Ok(())
+    }
+
+    struct RawRig {
+        dir: TempDir,
+        forwarder: Forwarder,
+    }
+
+    fn raw_limits(max_connections: usize, idle_ms: u64, max_bytes: u64) -> ForwardLimits {
+        ForwardLimits {
+            max_connections,
+            idle_timeout: Duration::from_millis(idle_ms),
+            max_bytes: Some(max_bytes),
+        }
+    }
+
+    fn raw_rig(limits: ForwardLimits, echo: bool) -> TestResult2<RawRig> {
+        let dir = TempDir::new()?;
+        let path = dir.path().join("otel.sock");
+        let listener = tokio::net::UnixListener::bind(&path)?;
+        tokio::spawn(async move {
+            while let Ok((mut stream, _)) = listener.accept().await {
+                tokio::spawn(async move {
+                    let mut buf = [0_u8; 256];
+                    while let Ok(n @ 1..) = stream.read(&mut buf).await {
+                        if echo
+                            && stream
+                                .write_all(buf.get(..n).unwrap_or_default())
+                                .await
+                                .is_err()
+                        {
+                            return;
+                        }
+                    }
+                });
+            }
+        });
+        let forwarder = Forwarder::start_raw(telemetry_addr(0), path, limits)?;
+        Ok(RawRig { dir, forwarder })
+    }
+
+    #[tokio::test]
+    async fn the_telemetry_forwarder_relays_to_a_plain_unix_socket_without_a_handshake()
+    -> TestResult {
+        let rig = raw_rig(raw_limits(4, 60_000, 1024), true)?;
+        let mut client = TcpStream::connect(("127.0.0.1", rig.forwarder.port())).await?;
+        client.write_all(b"POST /v1/logs").await?;
+        let mut back = [0_u8; 13];
+        timeout(OUTER, client.read_exact(&mut back)).await??;
+        assert_eq!(&back, b"POST /v1/logs");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn the_telemetry_forwarder_closes_a_connection_past_its_byte_cap() -> TestResult {
+        let rig = raw_rig(raw_limits(4, 60_000, 16), true)?;
+        let mut client = TcpStream::connect(("127.0.0.1", rig.forwarder.port())).await?;
+        client.write_all(b"12345678").await?;
+        let mut back = [0_u8; 8];
+        timeout(OUTER, client.read_exact(&mut back)).await??;
+        assert_eq!(&back, b"12345678");
+        client.write_all(b"x").await?;
+        assert_eq!(reads_eof(&mut client).await?, Vec::<u8>::new());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn the_telemetry_forwarder_keeps_a_connection_at_exactly_its_byte_cap() -> TestResult {
+        let rig = raw_rig(raw_limits(4, 60_000, 16), true)?;
+        let mut client = TcpStream::connect(("127.0.0.1", rig.forwarder.port())).await?;
+        client.write_all(b"12345678").await?;
+        let mut back = [0_u8; 8];
+        timeout(OUTER, client.read_exact(&mut back)).await??;
+        assert!(stays_open(&mut client).await);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn the_telemetry_forwarder_closes_an_idle_connection() -> TestResult {
+        let rig = raw_rig(raw_limits(4, 300, 1024), true)?;
+        let mut client = TcpStream::connect(("127.0.0.1", rig.forwarder.port())).await?;
+        assert_eq!(reads_eof(&mut client).await?, Vec::<u8>::new());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn the_telemetry_forwarder_refuses_connections_over_its_cap() -> TestResult {
+        let rig = raw_rig(raw_limits(1, 60_000, 1024), false)?;
+        let mut first = TcpStream::connect(("127.0.0.1", rig.forwarder.port())).await?;
+        first.write_all(b"a").await?;
+        assert!(stays_open(&mut first).await);
+        let mut second = TcpStream::connect(("127.0.0.1", rig.forwarder.port())).await?;
+        assert_eq!(reads_eof(&mut second).await?, Vec::<u8>::new());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn the_telemetry_forwarder_closes_the_client_when_the_socket_is_gone() -> TestResult {
+        let rig = raw_rig(raw_limits(4, 60_000, 1024), true)?;
+        std::fs::remove_file(rig.dir.path().join("otel.sock"))?;
+        let mut client = TcpStream::connect(("127.0.0.1", rig.forwarder.port())).await?;
+        client.write_all(b"x").await?;
+        assert_eq!(reads_eof(&mut client).await?, Vec::<u8>::new());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn the_raw_forwarder_refuses_a_non_loopback_address() {
+        let err = Forwarder::start_raw(
+            SocketAddr::from(([0, 0, 0, 0], 0)),
+            "/nonexistent/otel.sock".into(),
+            ForwardLimits::telemetry(),
+        )
+        .err()
+        .map(|err| err.kind());
+        assert_eq!(err, Some(std::io::ErrorKind::InvalidInput));
+    }
+
+    #[test]
+    fn the_telemetry_limits_bound_connections_idle_time_and_bytes() {
+        let limits = ForwardLimits::telemetry();
+        assert_eq!(limits.max_connections, super::MAX_TELEMETRY_CONNECTIONS);
+        assert_eq!(limits.idle_timeout, super::TELEMETRY_IDLE_TIMEOUT);
+        assert_eq!(
+            limits.max_bytes,
+            Some(super::MAX_TELEMETRY_CONNECTION_BYTES)
+        );
+    }
+
+    #[test]
+    fn the_telemetry_address_is_the_ipv4_loopback_on_the_given_port() {
+        let addr = telemetry_addr(4318);
+        assert_eq!(addr.to_string(), "127.0.0.1:4318");
+    }
+
+    #[test]
+    fn the_spec_carries_the_telemetry_port_only_when_given() -> TestResult {
+        let dir = TempDir::new()?;
+        let spec = crate::runner::AgentSpec::default();
+        let with = dir.path().join("with.json");
+        let without = dir.path().join("without.json");
+        write_spec_telemetry(&with, "job1", &spec, None, NonZeroU16::new(4318))?;
+        write_spec(&without, "job1", &spec, None)?;
+        assert_eq!(read_spec(&with)?.telemetry_port, Some(4318));
+        assert_eq!(read_spec(&without)?.telemetry_port, None);
+        assert!(!std::fs::read_to_string(&without)?.contains("telemetry"));
+        Ok(())
+    }
+
+    #[test]
+    fn a_zero_telemetry_port_in_a_spec_is_refused() -> TestResult {
+        let dir = TempDir::new()?;
+        let path = dir.path().join("spec.json");
+        std::fs::write(
+            &path,
+            br#"{"id":"job1","argv":["x"],"cwd":"/","telemetry_port":0}"#,
+        )?;
+        assert_eq!(
+            read_spec(&path).err(),
+            Some(super::AgentExecError::MalformedSpec)
+        );
         Ok(())
     }
 
