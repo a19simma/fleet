@@ -222,6 +222,267 @@ pub fn aggregate(spans: &[Span], job_window: Interval, agent_window: Interval) -
     }
 }
 
+/// Percentages are whole tenths of a percent, so the parts of a view sum to this.
+pub const PERMILLE_TOTAL: u16 = 1000;
+
+/// Most source characters of a command kept in a view, before the truncated marker.
+pub const MAX_COMMAND_CHARS: usize = 256;
+
+/// Most command rows kept in a view. Further commands count in `commands_omitted`.
+pub const MAX_COMMAND_ROWS: usize = 50;
+
+/// One displayed field: a stable key and its label.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Field {
+    /// Stable machine key, shared by the CLI, the web page and the parity check.
+    pub key: &'static str,
+    /// Label shown to a person.
+    pub label: &'static str,
+}
+
+/// Every field of a timing view, in display order. Both renderers read this list.
+pub const FIELDS: &[Field] = &[
+    Field {
+        key: "api_wait",
+        label: "API wait",
+    },
+    Field {
+        key: "tool",
+        label: "Tools",
+    },
+    Field {
+        key: "shell",
+        label: "Shell",
+    },
+    Field {
+        key: "idle",
+        label: "Idle",
+    },
+    Field {
+        key: "overhead",
+        label: "Overhead",
+    },
+    Field {
+        key: "total",
+        label: "Total",
+    },
+    Field {
+        key: "commands",
+        label: "Commands",
+    },
+];
+
+/// A shell command to show, with its text already redacted upstream.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CommandInput {
+    /// Redacted command text. Control characters are marked by the view.
+    pub command: String,
+    /// Run time in milliseconds.
+    pub duration_ms: u64,
+    /// Start in milliseconds on the job clock.
+    pub start_ms: u64,
+    /// Exit code when known.
+    pub exit: Option<i32>,
+    /// True when upstream already cut the command.
+    pub truncated: bool,
+}
+
+/// One command row of a [`TimingView`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CommandRow {
+    /// Display text: no control characters, at most [`MAX_COMMAND_CHARS`] source characters.
+    pub command: String,
+    /// Run time in milliseconds.
+    pub duration_ms: u64,
+    /// Start in milliseconds on the job clock.
+    pub start_ms: u64,
+    /// Exit code when known.
+    pub exit: Option<i32>,
+    /// True when upstream or this view cut the command.
+    pub truncated: bool,
+}
+
+/// One part row of a [`TimingView`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PartRow {
+    /// Key of the matching entry in [`FIELDS`].
+    pub key: &'static str,
+    /// Milliseconds in this part.
+    pub ms: u64,
+    /// Share of the total in tenths of a percent. The five rows sum to 1000, or all are 0.
+    pub permille: u16,
+}
+
+impl PartRow {
+    /// Share as text with one decimal, for example `12.3%`.
+    #[must_use]
+    pub fn percent_label(&self) -> String {
+        format!("{}.{}%", self.permille / 10, self.permille % 10)
+    }
+
+    /// Duration as text, see [`human_duration_ms`].
+    #[must_use]
+    pub fn duration_label(&self) -> String {
+        human_duration_ms(self.ms)
+    }
+}
+
+/// The timing breakdown of a job as both renderers show it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TimingView {
+    /// The five parts in [`FIELDS`] order.
+    pub rows: Vec<PartRow>,
+    /// Sum of the parts, saturating.
+    pub total_ms: u64,
+    /// Command rows in input order, at most [`MAX_COMMAND_ROWS`].
+    pub commands: Vec<CommandRow>,
+    /// Commands given beyond [`MAX_COMMAND_ROWS`].
+    pub commands_omitted: usize,
+}
+
+impl TimingView {
+    /// Builds the view from a summary and command rows.
+    #[must_use]
+    pub fn new(summary: &Summary, commands: &[CommandInput]) -> Self {
+        let ms = [
+            summary.api_wait_ms,
+            summary.tool_ms,
+            summary.shell_ms,
+            summary.idle_ms,
+            summary.overhead_ms,
+        ];
+        let shares = permille_shares(&ms);
+        let rows = ms
+            .iter()
+            .zip(shares)
+            .zip(FIELDS)
+            .map(|((&ms, permille), field)| PartRow {
+                key: field.key,
+                ms,
+                permille,
+            })
+            .collect();
+        Self {
+            rows,
+            total_ms: summary.total_ms(),
+            commands: commands
+                .iter()
+                .take(MAX_COMMAND_ROWS)
+                .map(command_row)
+                .collect(),
+            commands_omitted: commands.len().saturating_sub(MAX_COMMAND_ROWS),
+        }
+    }
+
+    /// Total as text, see [`human_duration_ms`].
+    #[must_use]
+    pub fn total_label(&self) -> String {
+        human_duration_ms(self.total_ms)
+    }
+}
+
+fn command_row(input: &CommandInput) -> CommandRow {
+    let (command, cut) = display_command(&input.command);
+    CommandRow {
+        command,
+        duration_ms: input.duration_ms,
+        start_ms: input.start_ms,
+        exit: input.exit,
+        truncated: input.truncated || cut,
+    }
+}
+
+fn is_unsafe_char(c: char) -> bool {
+    c.is_control()
+        || matches!(
+            c,
+            '\u{061c}'
+                | '\u{200b}'..='\u{200f}'
+                | '\u{2028}'..='\u{202e}'
+                | '\u{2066}'..='\u{2069}'
+        )
+}
+
+fn display_command(text: &str) -> (String, bool) {
+    let mut out = String::new();
+    let mut cut = false;
+    for (kept, c) in text.chars().take(MAX_COMMAND_CHARS + 1).enumerate() {
+        if kept == MAX_COMMAND_CHARS {
+            cut = true;
+            out.push('\u{2026}');
+            break;
+        }
+        if is_unsafe_char(c) {
+            out.extend(c.escape_unicode());
+        } else {
+            out.push(c);
+        }
+    }
+    (out, cut)
+}
+
+/// Splits [`PERMILLE_TOTAL`] over `parts` in proportion to their values.
+///
+/// Largest remainder rule: each part gets the floor of its exact share, then
+/// the leftover tenths go one each to the parts with the largest remainders,
+/// ties to the earlier part. The result sums to 1000. When every part is 0 the
+/// result is all 0, with no division.
+#[must_use]
+pub fn permille_shares(parts: &[u64]) -> Vec<u16> {
+    let total: u128 = parts.iter().map(|&p| u128::from(p)).sum();
+    if total == 0 {
+        return vec![0; parts.len()];
+    }
+    let scale = u128::from(PERMILLE_TOTAL);
+    let mut shares: Vec<u16> = Vec::with_capacity(parts.len());
+    let mut remainders: Vec<(u128, usize)> = Vec::with_capacity(parts.len());
+    for (i, &p) in parts.iter().enumerate() {
+        let scaled = u128::from(p) * scale;
+        shares.push(u16::try_from(scaled / total).unwrap_or(PERMILLE_TOTAL));
+        remainders.push((scaled % total, i));
+    }
+    let given: u16 = shares.iter().sum();
+    let leftover = usize::from(PERMILLE_TOTAL - given);
+    remainders.sort_unstable_by(|a, b| b.0.cmp(&a.0).then(a.1.cmp(&b.1)));
+    for &(_, i) in remainders.iter().take(leftover) {
+        if let Some(share) = shares.get_mut(i) {
+            *share += 1;
+        }
+    }
+    shares
+}
+
+/// Formats milliseconds for people, deterministic and overflow-safe.
+///
+/// Under a second: `750ms`. Under a minute: `12.3s`, truncated to tenths.
+/// Under an hour: `2m 05s`. Otherwise `1h 02m 05s`, where hours are not wrapped
+/// into days. Sub-second parts of a minute or more are dropped.
+#[must_use]
+pub fn human_duration_ms(ms: u64) -> String {
+    let secs = ms / 1000;
+    if secs == 0 {
+        return format!("{ms}ms");
+    }
+    if secs < 60 {
+        return format!("{secs}.{}s", (ms % 1000) / 100);
+    }
+    if secs < 3600 {
+        return format!("{}m {:02}s", secs / 60, secs % 60);
+    }
+    format!(
+        "{}h {:02}m {:02}s",
+        secs / 3600,
+        (secs % 3600) / 60,
+        secs % 60
+    )
+}
+
+/// Formats a [`std::time::Duration`] like [`human_duration_ms`], saturating at `u64::MAX` ms.
+#[must_use]
+pub fn human_duration(d: std::time::Duration) -> String {
+    human_duration_ms(u64::try_from(d.as_millis()).unwrap_or(u64::MAX))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -572,5 +833,283 @@ mod tests {
         assert_eq!((s.tool_ms, s.idle_ms, s.overhead_ms), (100, 0, 0));
         let none = aggregate(&[sp(SpanKind::Tool, 0, 500)], iv(100, 200), iv(300, 400));
         assert_eq!((none.tool_ms, none.idle_ms, none.overhead_ms), (0, 0, 100));
+    }
+
+    fn summary(parts: [u64; 5]) -> Summary {
+        Summary {
+            api_wait_ms: parts[0],
+            tool_ms: parts[1],
+            shell_ms: parts[2],
+            idle_ms: parts[3],
+            overhead_ms: parts[4],
+        }
+    }
+
+    fn cmd(text: &str) -> CommandInput {
+        CommandInput {
+            command: text.to_owned(),
+            duration_ms: 5,
+            start_ms: 1,
+            exit: Some(0),
+            truncated: false,
+        }
+    }
+
+    #[test]
+    fn fields_order_is_pinned() {
+        let keys: Vec<&str> = FIELDS.iter().map(|f| f.key).collect();
+        assert_eq!(
+            keys,
+            [
+                "api_wait", "tool", "shell", "idle", "overhead", "total", "commands"
+            ]
+        );
+        let labels: Vec<&str> = FIELDS.iter().map(|f| f.label).collect();
+        assert_eq!(
+            labels,
+            [
+                "API wait", "Tools", "Shell", "Idle", "Overhead", "Total", "Commands"
+            ]
+        );
+    }
+
+    #[test]
+    fn fields_keys_are_unique() {
+        for (i, a) in FIELDS.iter().enumerate() {
+            for b in &FIELDS[i + 1..] {
+                assert_ne!(a.key, b.key);
+            }
+        }
+    }
+
+    #[test]
+    fn every_view_row_maps_to_exactly_one_field() {
+        let view = TimingView::new(&summary([1, 2, 3, 4, 5]), &[]);
+        assert_eq!(view.rows.len(), 5);
+        for row in &view.rows {
+            assert_eq!(FIELDS.iter().filter(|f| f.key == row.key).count(), 1);
+        }
+        let row_keys: Vec<&str> = view.rows.iter().map(|r| r.key).collect();
+        let field_keys: Vec<&str> = FIELDS.iter().map(|f| f.key).collect();
+        assert_eq!(row_keys[..], field_keys[..5]);
+        assert_eq!(field_keys[5..], ["total", "commands"]);
+    }
+
+    #[test]
+    fn view_carries_summary_and_total() {
+        let view = TimingView::new(&summary([10, 20, 30, 40, 50]), &[]);
+        let ms: Vec<u64> = view.rows.iter().map(|r| r.ms).collect();
+        assert_eq!(ms, [10, 20, 30, 40, 50]);
+        assert_eq!(view.total_ms, 150);
+        assert_eq!(view.total_label(), "150ms");
+    }
+
+    #[test]
+    fn permille_table() {
+        let max = u64::MAX;
+        let cases: &[(&str, &[u64], &[u16])] = &[
+            ("empty", &[], &[]),
+            ("all zero", &[0, 0, 0, 0, 0], &[0, 0, 0, 0, 0]),
+            ("single", &[7], &[1000]),
+            ("single among zeros", &[0, 9, 0], &[0, 1000, 0]),
+            ("exact", &[1, 1, 1, 1], &[250, 250, 250, 250]),
+            ("thirds", &[1, 1, 1], &[334, 333, 333]),
+            ("remainder to largest", &[1, 2, 0], &[333, 667, 0]),
+            (
+                "tie to earlier",
+                &[1, 1, 0, 1, 1, 1, 1],
+                &[167, 167, 0, 167, 167, 166, 166],
+            ),
+            ("tiny part stays zero", &[1, 1_000_000], &[0, 1000]),
+            ("max single", &[max, 0], &[1000, 0]),
+            ("max pair", &[max, max], &[500, 500]),
+            ("max and one", &[max, 1], &[1000, 0]),
+            ("max triple", &[max, max, max], &[334, 333, 333]),
+        ];
+        for (name, parts, want) in cases {
+            assert_eq!(permille_shares(parts), *want, "{name}");
+        }
+    }
+
+    #[test]
+    fn permille_sums_to_1000_for_generated_cases() {
+        let mut rng = Lcg(0xfeed);
+        for case in 0..10_000 {
+            let n = 1 + (rng.next() % 8) as usize;
+            let parts: Vec<u64> = (0..n)
+                .map(|_| match rng.next() % 4 {
+                    0 => 0,
+                    1 => rng.next() % 10,
+                    2 => rng.next() % 1_000_000,
+                    _ => u64::MAX - rng.next() % 1000,
+                })
+                .collect();
+            let shares = permille_shares(&parts);
+            let sum: u32 = shares.iter().map(|&s| u32::from(s)).sum();
+            if parts.iter().all(|&p| p == 0) {
+                assert_eq!(sum, 0, "case {case}");
+            } else {
+                assert_eq!(sum, 1000, "case {case}");
+            }
+            for (p, s) in parts.iter().zip(&shares) {
+                if *p == 0 {
+                    assert_eq!(*s, 0, "case {case}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn zero_duration_job_has_zero_percent_and_no_nan() {
+        let view = TimingView::new(&Summary::default(), &[]);
+        for row in &view.rows {
+            assert_eq!(row.permille, 0);
+            assert_eq!(row.percent_label(), "0.0%");
+            assert_eq!(row.duration_label(), "0ms");
+        }
+        assert_eq!(view.total_ms, 0);
+    }
+
+    #[test]
+    fn percent_label_has_one_decimal() {
+        let view = TimingView::new(&summary([1, 1, 1, 0, 0]), &[]);
+        let labels: Vec<String> = view.rows.iter().map(PartRow::percent_label).collect();
+        assert_eq!(labels, ["33.4%", "33.3%", "33.3%", "0.0%", "0.0%"]);
+        let full = TimingView::new(&summary([0, 0, 5, 0, 0]), &[]);
+        assert_eq!(full.rows[2].percent_label(), "100.0%");
+    }
+
+    #[test]
+    fn human_duration_table() {
+        use std::time::Duration;
+        let cases: &[(&str, u64, &str)] = &[
+            ("zero", 0, "0ms"),
+            ("one ms", 1, "1ms"),
+            ("sub second", 999, "999ms"),
+            ("one second", 1_000, "1.0s"),
+            ("tenths truncate", 1_999, "1.9s"),
+            ("seconds", 12_345, "12.3s"),
+            ("just under minute", 59_999, "59.9s"),
+            ("one minute", 60_000, "1m 00s"),
+            ("minute and seconds", 125_000, "2m 05s"),
+            ("just under hour", 3_599_999, "59m 59s"),
+            ("one hour", 3_600_000, "1h 00m 00s"),
+            ("hour mixed", 3_725_000, "1h 02m 05s"),
+            ("hundred hours", 360_000_000, "100h 00m 00s"),
+            ("max", u64::MAX, "5124095576030h 25m 51s"),
+        ];
+        for (name, ms, want) in cases {
+            assert_eq!(human_duration_ms(*ms), *want, "{name}");
+        }
+        assert_eq!(human_duration(Duration::from_millis(1500)), "1.5s");
+        assert_eq!(human_duration(Duration::ZERO), "0ms");
+        assert_eq!(human_duration(Duration::MAX), "5124095576030h 25m 51s");
+    }
+
+    #[test]
+    fn command_rows_carry_fields() {
+        let mut input = cmd("cargo test");
+        input.exit = None;
+        input.truncated = true;
+        let view = TimingView::new(&Summary::default(), &[input, cmd("ls")]);
+        assert_eq!(view.commands.len(), 2);
+        assert_eq!(view.commands[0].command, "cargo test");
+        assert_eq!(view.commands[0].exit, None);
+        assert!(view.commands[0].truncated);
+        assert_eq!(view.commands[1].exit, Some(0));
+        assert!(!view.commands[1].truncated);
+        assert_eq!(
+            (view.commands[1].duration_ms, view.commands[1].start_ms),
+            (5, 1)
+        );
+    }
+
+    #[test]
+    fn hostile_commands_hold_no_control_characters() {
+        let cases: &[(&str, &str, &str)] = &[
+            ("cr", "a\rb", "a\\u{d}b"),
+            ("lf", "a\nb", "a\\u{a}b"),
+            ("crlf", "a\r\nb", "a\\u{d}\\u{a}b"),
+            ("esc", "\u{1b}[31mred", "\\u{1b}[31mred"),
+            ("nul", "a\0b", "a\\u{0}b"),
+            ("line separator", "a\u{2028}b", "a\\u{2028}b"),
+            ("paragraph separator", "a\u{2029}b", "a\\u{2029}b"),
+            ("nel", "a\u{85}b", "a\\u{85}b"),
+            ("bidi override", "a\u{202e}b", "a\\u{202e}b"),
+            ("tab", "a\tb", "a\\u{9}b"),
+            ("plain", "echo héllo", "echo héllo"),
+            ("empty", "", ""),
+        ];
+        for (name, input, want) in cases {
+            let view = TimingView::new(&Summary::default(), &[cmd(input)]);
+            let got = &view.commands[0];
+            assert_eq!(got.command, *want, "{name}");
+            assert!(!got.truncated, "{name}");
+            assert!(
+                !got.command
+                    .chars()
+                    .any(|c| c.is_control() || c == '\u{2028}' || c == '\u{2029}'),
+                "{name}"
+            );
+        }
+    }
+
+    #[test]
+    fn long_command_is_cut_and_flagged() {
+        let at_cap = "x".repeat(MAX_COMMAND_CHARS);
+        let view = TimingView::new(&Summary::default(), &[cmd(&at_cap)]);
+        assert_eq!(view.commands[0].command, at_cap);
+        assert!(!view.commands[0].truncated);
+
+        let over = "y".repeat(MAX_COMMAND_CHARS + 1);
+        let view = TimingView::new(&Summary::default(), &[cmd(&over)]);
+        assert_eq!(
+            view.commands[0].command,
+            format!("{}…", "y".repeat(MAX_COMMAND_CHARS))
+        );
+        assert!(view.commands[0].truncated);
+
+        let huge = "é".repeat(1_000_000);
+        let view = TimingView::new(&Summary::default(), &[cmd(&huge)]);
+        assert_eq!(
+            view.commands[0].command.chars().count(),
+            MAX_COMMAND_CHARS + 1
+        );
+        assert!(view.commands[0].truncated);
+    }
+
+    #[test]
+    fn upstream_truncated_flag_survives_a_short_command() {
+        let mut input = cmd("short");
+        input.truncated = true;
+        let view = TimingView::new(&Summary::default(), &[input]);
+        assert!(view.commands[0].truncated);
+    }
+
+    #[test]
+    fn control_characters_cut_by_the_cap_still_escape() {
+        let text = format!("{}\u{1b}tail", "z".repeat(MAX_COMMAND_CHARS - 1));
+        let view = TimingView::new(&Summary::default(), &[cmd(&text)]);
+        let got = &view.commands[0];
+        assert!(got.command.starts_with(&"z".repeat(MAX_COMMAND_CHARS - 1)));
+        assert!(got.command.contains("\\u{1b}"));
+        assert!(got.truncated);
+        assert!(!got.command.contains('\u{1b}'));
+    }
+
+    #[test]
+    fn command_rows_are_capped_and_counted() {
+        let many: Vec<CommandInput> = (0..MAX_COMMAND_ROWS + 3)
+            .map(|i| cmd(&format!("c{i}")))
+            .collect();
+        let view = TimingView::new(&Summary::default(), &many);
+        assert_eq!(view.commands.len(), MAX_COMMAND_ROWS);
+        assert_eq!(view.commands_omitted, 3);
+        assert_eq!(
+            view.commands[MAX_COMMAND_ROWS - 1].command,
+            format!("c{}", MAX_COMMAND_ROWS - 1)
+        );
+        let exact = TimingView::new(&Summary::default(), &many[..MAX_COMMAND_ROWS]);
+        assert_eq!(exact.commands_omitted, 0);
     }
 }
