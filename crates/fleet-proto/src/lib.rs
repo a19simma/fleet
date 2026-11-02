@@ -105,6 +105,16 @@ pub fn is_swarm_branch(text: &str) -> bool {
 /// Longest credential value a client may put and a box may receive, in bytes.
 pub const MAX_CREDENTIAL_VALUE_BYTES: usize = fleet_core::credential::MAX_CREDENTIAL_LEN;
 
+/// Longest catalog item content in bytes. The `catalog_items.content` CHECK of migration 0024
+/// carries the same number, and a test pins the two equal.
+pub const MAX_CATALOG_CONTENT_BYTES: usize = fleet_core::catalog::MAX_BODY_BYTES;
+
+/// Whether `content` is a legal catalog item content length: 1 to [`MAX_CATALOG_CONTENT_BYTES`]
+/// bytes.
+pub fn validate_catalog_content(content: &str) -> bool {
+    (1..=MAX_CATALOG_CONTENT_BYTES).contains(&content.len())
+}
+
 /// Longest credential login, in bytes.
 pub const MAX_CREDENTIAL_LOGIN_BYTES: usize = 256;
 
