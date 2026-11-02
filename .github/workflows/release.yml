@@ -307,7 +307,7 @@ jobs:
         with:
           persist-credentials: false
       - name: Install minisign
-        run: sudo apt-get update && sudo apt-get install -y minisign
+        run: bash .github/scripts/install-minisign.sh
       - name: Test the manifest script
         run: python3 -m unittest discover -s .github/scripts -p 'test_*.py'
       - name: Build fixture dist archives
@@ -353,7 +353,7 @@ jobs:
         with:
           persist-credentials: false
       - name: Install minisign
-        run: sudo apt-get update && sudo apt-get install -y minisign
+        run: bash .github/scripts/install-minisign.sh
       - name: Fetch archives
         uses: actions/download-artifact@v8
         with:
