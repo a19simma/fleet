@@ -9,6 +9,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::path::PathBuf;
 
+use fleet_core::model_allowlist::ModelAllowlist;
 use fleet_core::tools::ToolSpec;
 use fleet_core::{Profile, ProfileHash, ProfileInvalid};
 use fleet_proto::MAX_PROFILE_JSON_BYTES;
@@ -288,6 +289,8 @@ pub enum LoadError {
     HashMismatch,
     /// The shared validator refused the Profile.
     Invalid(ProfileInvalid),
+    /// The Profile model is outside the box allowlist, [`floor::MODEL_DENIED_REASON`].
+    ModelDenied,
     /// The Profile could not be laid over the bundle.
     Apply(ApplyError),
 }
@@ -350,6 +353,7 @@ impl LoadError {
             Self::NotCanonical => "profile invalid: profile blob is not canonical",
             Self::HashMismatch => "profile invalid: profile hash does not match the job",
             Self::Invalid(err) => invalid_reason(*err),
+            Self::ModelDenied => floor::MODEL_DENIED_REASON,
             Self::Apply(ApplyError::Collision) => {
                 "profile invalid: profile paths collide when compared without case"
             }
@@ -369,12 +373,7 @@ impl fmt::Display for LoadError {
 
 impl std::error::Error for LoadError {}
 
-/// Checks the blob `reply` against the Job's `expected` reference, then lays the Profile over
-/// `default` with [`apply_profile`].
-///
-/// The reply must name `expected` exactly. The blob must fit [`MAX_PROFILE_JSON_BYTES`], parse
-/// as a Profile, equal that Profile's canonical JSON and hash to the hash in `expected`. The
-/// shared validator runs last, before the overlay, so fleetd does not trust the server's check.
+/// [`load_checked`] with no box allowlist: the box trusts the server's model check.
 ///
 /// # Errors
 ///
@@ -384,6 +383,30 @@ pub fn load(
     reply: &GetProfileBlobReply,
     default: &Bundle,
     ceilings: &BoxCeilings,
+    job_prompt: &str,
+) -> Result<Applied, LoadError> {
+    load_checked(expected, reply, default, ceilings, None, job_prompt)
+}
+
+/// Checks the blob `reply` against the Job's `expected` reference, then lays the Profile over
+/// `default` with [`apply_profile`].
+///
+/// The reply must name `expected` exactly. The blob must fit [`MAX_PROFILE_JSON_BYTES`], parse
+/// as a Profile, equal that Profile's canonical JSON and hash to the hash in `expected`. The
+/// shared validator runs next, so fleetd does not trust the server's check. Then `allowlist`
+/// re-checks the Profile model with [`floor::check_model`], before the overlay is built, so a
+/// refused model leaves no bundle, argv or prompt behind (ADR-0054).
+///
+/// # Errors
+///
+/// Returns the [`LoadError`] of the first check that fails, [`LoadError::ModelDenied`] for a
+/// model outside `allowlist`.
+pub fn load_checked(
+    expected: &ProfileRef,
+    reply: &GetProfileBlobReply,
+    default: &Bundle,
+    ceilings: &BoxCeilings,
+    allowlist: Option<&ModelAllowlist>,
     job_prompt: &str,
 ) -> Result<Applied, LoadError> {
     if reply.profile.as_ref() != Some(expected) {
@@ -407,6 +430,13 @@ pub fn load(
         return Err(LoadError::HashMismatch);
     }
     profile.validate().map_err(LoadError::Invalid)?;
+    floor::check_model(allowlist, profile.model.as_deref()).map_err(|denied| {
+        tracing::warn!(
+            model = denied.model(),
+            "profile model is outside the box allowlist"
+        );
+        LoadError::ModelDenied
+    })?;
     apply_profile(&profile, default, ceilings, job_prompt).map_err(LoadError::Apply)
 }
 
@@ -706,6 +736,108 @@ mod tests {
 
     fn loaded(reference: &ProfileRef, reply: &GetProfileBlobReply) -> Result<Applied, LoadError> {
         load(reference, reply, &Bundle::default(), &ceilings(), "fix it")
+    }
+
+    fn loaded_with(
+        reference: &ProfileRef,
+        reply: &GetProfileBlobReply,
+        allowlist: Option<&ModelAllowlist>,
+    ) -> Result<Applied, LoadError> {
+        load_checked(
+            reference,
+            reply,
+            &Bundle::default(),
+            &ceilings(),
+            allowlist,
+            "fix it",
+        )
+    }
+
+    fn allow(entries: &[&str]) -> ModelAllowlist {
+        ModelAllowlist::new(entries.iter().copied()).unwrap_or_else(|e| panic!("{e}"))
+    }
+
+    fn with_model(model: &str) -> Profile {
+        Profile {
+            model: Some(model.to_owned()),
+            ..Profile::default()
+        }
+    }
+
+    #[test]
+    fn a_model_outside_the_box_allowlist_is_refused_with_the_fixed_reason() {
+        let (reference, reply) = blob(&with_model("claude-haiku-4-5"));
+        let list = allow(&["claude-opus-4-1"]);
+        let out = loaded_with(&reference, &reply, Some(&list));
+        assert_eq!(out, Err(LoadError::ModelDenied));
+        assert_eq!(
+            LoadError::ModelDenied.reason(),
+            "profile invalid: profile model is not in the box allowlist"
+        );
+        assert!(!LoadError::ModelDenied.reason().contains("haiku"));
+    }
+
+    #[test]
+    fn a_listed_model_is_applied_and_reaches_the_argv() -> Result<(), LoadError> {
+        let (reference, reply) = blob(&with_model("claude-opus-4-1"));
+        let list = allow(&["claude-sonnet-4-5", "claude-opus-4-1"]);
+        let applied = loaded_with(&reference, &reply, Some(&list))?;
+        assert!(
+            applied
+                .argv
+                .windows(2)
+                .any(|w| w == ["--model", "claude-opus-4-1"])
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn no_box_allowlist_trusts_the_server() -> Result<(), LoadError> {
+        let (reference, reply) = blob(&with_model("claude-haiku-4-5"));
+        loaded_with(&reference, &reply, None)?;
+        loaded(&reference, &reply)?;
+        Ok(())
+    }
+
+    #[test]
+    fn a_profile_without_a_model_passes_a_box_allowlist() -> Result<(), LoadError> {
+        let (reference, reply) = blob(&Profile::default());
+        let list = allow(&["claude-opus-4-1"]);
+        let applied = loaded_with(&reference, &reply, Some(&list))?;
+        assert!(!applied.argv.iter().any(|a| a == "--model"));
+        Ok(())
+    }
+
+    #[test]
+    fn the_model_check_runs_before_the_overlay_is_built() {
+        let profile = Profile {
+            model: Some("claude-haiku-4-5".to_owned()),
+            context_files: vec![file("A.md", "x"), file("a.md", "y")],
+            ..Profile::default()
+        };
+        let (reference, reply) = blob(&profile);
+        let open = loaded_with(&reference, &reply, None);
+        assert_eq!(open, Err(LoadError::Apply(ApplyError::Collision)));
+        let list = allow(&["claude-opus-4-1"]);
+        let shut = loaded_with(&reference, &reply, Some(&list));
+        assert_eq!(shut, Err(LoadError::ModelDenied));
+    }
+
+    #[test]
+    fn the_model_check_runs_after_the_hash_and_validator_checks() {
+        let list = allow(&["claude-opus-4-1"]);
+        let (reference, mut reply) = blob(&with_model("claude-haiku-4-5"));
+        reply.content = with_model("other").canonical_json();
+        assert_eq!(
+            loaded_with(&reference, &reply, Some(&list)),
+            Err(LoadError::HashMismatch)
+        );
+        let hostile = with_model("claude-opus-4-1\r\n");
+        let (reference, reply) = blob(&hostile);
+        assert_eq!(
+            loaded_with(&reference, &reply, Some(&list)),
+            Err(LoadError::Invalid(ProfileInvalid::Model))
+        );
     }
 
     #[test]
