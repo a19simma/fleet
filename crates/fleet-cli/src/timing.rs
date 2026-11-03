@@ -258,7 +258,7 @@ async fn print_chunks<S: ChunkSource>(
         out.write_all(b"\n")?;
     }
     out.flush()?;
-    if cut && !ended {
+    if !ended && outcome.is_ok() {
         return Err(CliError::JobEnded("status unknown"));
     }
     outcome
@@ -276,7 +276,8 @@ async fn print_chunks<S: ChunkSource>(
 /// # Errors
 /// Returns [`CliError::Rpc`] when the stream fails, [`CliError::JobEnded`] when the command
 /// ended `failed` or the follow hit [`FOLLOW_DEADLINE`], and [`CliError::JobEnded`] with
-/// `status unknown` when a print or message cap cut the log and no terminal status followed, and [`CliError::Io`] on an output failure.
+/// `status unknown` when the stream ended, or a print or message cap cut it, before a terminal
+/// status for this command, and [`CliError::Io`] on an output failure.
 pub async fn print_log<S: ChunkSource>(
     source: &mut S,
     command_id: &str,

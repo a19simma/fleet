@@ -329,6 +329,44 @@ async fn a_cut_followed_by_stream_end_has_unknown_status() {
 }
 
 #[tokio::test]
+async fn a_stream_ending_without_a_cut_or_terminal_status_is_unknown() {
+    let (result, text) = printed(
+        script(vec![
+            chunk(0, b"one\n", ShellStatus::Running),
+            chunk(1, b"two\n", ShellStatus::Running),
+        ]),
+        false,
+    )
+    .await;
+    assert!(
+        matches!(result, Err(CliError::JobEnded("status unknown"))),
+        "{result:?}"
+    );
+    assert_eq!(text, "one\ntwo\n");
+}
+
+#[tokio::test]
+async fn a_stream_of_only_foreign_chunks_is_unknown() {
+    let mut other = chunk(0, b"intruder\n", ShellStatus::Done);
+    other.command_id = "c2".into();
+    let (result, text) = printed(script(vec![other]), false).await;
+    assert!(
+        matches!(result, Err(CliError::JobEnded("status unknown"))),
+        "{result:?}"
+    );
+    assert_eq!(text, "");
+}
+
+#[tokio::test]
+async fn an_empty_stream_is_unknown() {
+    let (result, _) = printed(script(vec![]), false).await;
+    assert!(
+        matches!(result, Err(CliError::JobEnded("status unknown"))),
+        "{result:?}"
+    );
+}
+
+#[tokio::test]
 async fn a_stream_error_is_returned() {
     let mut source = Script(VecDeque::from([
         Ok(Some(chunk(0, b"a\n", ShellStatus::Running))),
