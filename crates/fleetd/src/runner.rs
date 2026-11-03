@@ -532,6 +532,9 @@ pub struct AgentSpec {
     pub cwd: PathBuf,
     /// The version stamp every job carries.
     pub stamp: VersionStamp,
+    /// Whether a launcher with telemetry set up may start capture and add the exporter
+    /// variables. True for a Claude job that is not a judge, false for every other agent.
+    pub otel: bool,
 }
 
 /// A running agent process behind a [`Launcher`].
@@ -1926,6 +1929,7 @@ impl<R: Reporter> AgentRunner<R> {
                 bundle_sha: bundle.sha256(),
                 ..VersionStamp::default()
             },
+            otel: !judge,
         }
     }
 }
@@ -3095,6 +3099,7 @@ mod tests {
             env: std::collections::BTreeMap::new(),
             cwd: "/".into(),
             stamp: VersionStamp::default(),
+            otel: false,
         };
         let err = DirectLauncher.launch(spec).err().map(|err| err.kind());
         assert_eq!(err, Some(io::ErrorKind::InvalidInput));
@@ -3454,6 +3459,7 @@ mod tests {
             env: std::collections::BTreeMap::from([(OsString::from("A"), OsString::from("1"))]),
             cwd: PathBuf::from("/"),
             stamp: VersionStamp::default(),
+            otel: false,
         };
         let mut launched = spawn_direct(&spec, std::convert::identity).expect("spawn");
         let mut out = String::new();
