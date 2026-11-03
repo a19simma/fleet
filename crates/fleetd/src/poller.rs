@@ -429,9 +429,12 @@ impl TimingTransport for GrpcTimingTransport {
         request: ReportTimingRequest,
     ) -> Result<ReportTimingReply, Status> {
         let mut request = Request::new(request);
-        if let Ok(value) = MetadataValue::try_from(idempotency_key) {
-            request.metadata_mut().insert(IDEMPOTENCY_METADATA, value);
-        }
+        let Ok(value) = MetadataValue::try_from(idempotency_key) else {
+            return Err(Status::invalid_argument(
+                "idempotency key is not a header value",
+            ));
+        };
+        request.metadata_mut().insert(IDEMPOTENCY_METADATA, value);
         let mut client = self.client.lock().await;
         backstop(client.report_timing(request))
             .await
@@ -462,26 +465,38 @@ pub enum TimingOutcome {
 pub enum TimingReportError {
     /// The request names no job, so no stable idempotency key exists.
     EmptyJobId,
+    /// The job id is too long or holds a byte outside printable ASCII without space.
+    BadJobId,
 }
 
 impl fmt::Display for TimingReportError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(match self {
             Self::EmptyJobId => "timing report has no job id",
+            Self::BadJobId => "timing report job id is not a short run of printable ASCII",
         })
     }
 }
 
 impl std::error::Error for TimingReportError {}
 
+/// Longest job id, in bytes, that a timing idempotency key accepts.
+pub const MAX_TIMING_JOB_ID_BYTES: usize = 128;
+
 /// The idempotency key of a timing report: stable for one job attempt, never empty.
 ///
 /// # Errors
 ///
-/// Fails when `job_id` is empty.
+/// Fails with [`TimingReportError::EmptyJobId`] when `job_id` is empty, and with
+/// [`TimingReportError::BadJobId`] when it is longer than [`MAX_TIMING_JOB_ID_BYTES`] or
+/// holds any byte that is not printable ASCII, space excluded. The error never contains it.
 pub fn timing_idempotency_key(job_id: &str, attempt: u32) -> Result<String, TimingReportError> {
     if job_id.is_empty() {
         return Err(TimingReportError::EmptyJobId);
+    }
+    if job_id.len() > MAX_TIMING_JOB_ID_BYTES || !job_id.bytes().all(|byte| byte.is_ascii_graphic())
+    {
+        return Err(TimingReportError::BadJobId);
     }
     Ok(format!("timing:{job_id}:{attempt}"))
 }

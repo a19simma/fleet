@@ -20,10 +20,10 @@ use fleet_proto::v1::{
 use fleetd::backoff::Random;
 use fleetd::poller::{
     CLAIM_GRACE, ClaimGate, Claimed, GrpcReporter, GrpcTimingTransport, IDEMPOTENCY_METADATA,
-    JobRunner, MAX_IDLE_WAIT, MAX_SERVER_WAIT, MAX_TIMING_ATTEMPTS, PUSHBACK_METADATA, PollRandom,
-    Poller, REQUEST_TIMEOUT, RetryClock, RunError, SHUTDOWN_GRACE, Shutdown,
-    TIMING_REPORT_DEADLINE, TimingOutcome, TimingReportError, TimingReporter, TimingTransport,
-    Token, timing_idempotency_key,
+    JobRunner, MAX_IDLE_WAIT, MAX_SERVER_WAIT, MAX_TIMING_ATTEMPTS, MAX_TIMING_JOB_ID_BYTES,
+    PUSHBACK_METADATA, PollRandom, Poller, REQUEST_TIMEOUT, RetryClock, RunError, SHUTDOWN_GRACE,
+    Shutdown, TIMING_REPORT_DEADLINE, TimingOutcome, TimingReportError, TimingReporter,
+    TimingTransport, Token, timing_idempotency_key,
 };
 use fleetd::runner::Reporter;
 use fleetd::update::{DrainController, DrainOutcome};
@@ -1165,5 +1165,80 @@ async fn timing_report_deadline_is_inclusive() -> Test {
     let outcome = bounded(reporter.report(timing_request("job-1"))).await??;
     assert_eq!(outcome, TimingOutcome::GaveUp);
     assert_eq!(transport.keys().len(), 7);
+    Ok(())
+}
+
+fn hostile_job_ids() -> Vec<(&'static str, String)> {
+    vec![
+        ("space", "a b".into()),
+        ("tab", "a\tb".into()),
+        ("cr", "a\rb".into()),
+        ("lf", "a\nb".into()),
+        ("crlf", "a\r\nb".into()),
+        ("nel", "a\u{85}b".into()),
+        ("u2028", "a\u{2028}b".into()),
+        ("non_ascii", "j\u{f6}b".into()),
+        ("nul", "a\0b".into()),
+        ("cap_plus_one", "a".repeat(MAX_TIMING_JOB_ID_BYTES + 1)),
+    ]
+}
+
+#[tokio::test]
+async fn timing_key_rejects_every_hostile_job_id_without_sending() -> Test {
+    assert_eq!(
+        timing_idempotency_key("", 1),
+        Err(TimingReportError::EmptyJobId)
+    );
+    for (name, job) in hostile_job_ids() {
+        assert_eq!(
+            timing_idempotency_key(&job, 1),
+            Err(TimingReportError::BadJobId),
+            "{name}"
+        );
+        let (mut reporter, transport, _clock) = timing_rig(vec![Ok(())]);
+        let refused = bounded(reporter.report(timing_request(&job))).await?;
+        assert_eq!(refused, Err(TimingReportError::BadJobId), "{name}");
+        assert_eq!(transport.keys().len(), 0, "{name}");
+    }
+    let longest = "a".repeat(MAX_TIMING_JOB_ID_BYTES);
+    assert!(timing_idempotency_key(&longest, 1).is_ok());
+    let control = "!~09Az-_.:/".repeat(2);
+    assert!(timing_idempotency_key(&control, 1).is_ok());
+    assert_eq!(
+        TimingReportError::BadJobId.to_string(),
+        "timing report job id is not a short run of printable ASCII"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn grpc_timing_transport_refuses_a_key_that_is_not_a_header_value() -> Test {
+    let rig = rig(Vec::new());
+    let transport = GrpcTimingTransport::new(rig.channel.clone(), &Token::new(SECRET))?;
+    for key in ["a\r\nb", "a\rb", "a\nb", "a\0b", "a\x7fb"] {
+        let status = transport
+            .report_timing(key, timing_request("job-1"))
+            .await
+            .err()
+            .ok_or_else(|| format!("sent {key:?}"))?;
+        assert_eq!(status.code(), tonic::Code::InvalidArgument, "{key:?}");
+    }
+    let sent = rig
+        .shared
+        .timing_keys
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .len();
+    assert_eq!(sent, 0);
+    transport
+        .report_timing("timing:job-1:1", timing_request("job-1"))
+        .await?;
+    let sent = rig
+        .shared
+        .timing_keys
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .clone();
+    assert_eq!(sent, ["timing:job-1:1"]);
     Ok(())
 }
