@@ -18,8 +18,8 @@ use fleetd::jobsock::{
 };
 use fleetd::runner::{AgentProc, AgentSpec, Launched, Launcher};
 use fleetd::systemd::{
-    JobSocketSetup, SystemdLauncher, TOOL_HOSTS_REFUSED, ToolInstallSetup, select_launcher,
-    sweep_stale_runs,
+    JobSocketSetup, SystemdLauncher, TOOL_HOSTS_REFUSED, TelemetrySetup, ToolInstallSetup,
+    select_launcher, sweep_stale_runs,
 };
 use fleetd::tools::{TOOL_ENV_FILE, tool_hosts};
 use fleetd::{AgentLauncher, Config, Error};
@@ -1682,4 +1682,103 @@ fn install_instance_names_are_confined_to_the_agent_charset() {
     }
     assert!(!rule.contains("fleet-tool-install@.*"));
     assert!(!rule.contains("fleet-tool-install@[^"));
+}
+
+fn telemetry_case(id: &str) -> Result<Case, io::Error> {
+    let case = Case::new(id)?;
+    case.last(&show("active", "success", 0, 0))?;
+    Ok(case)
+}
+
+fn spec_json(case: &Case) -> Result<serde_json::Value, Box<dyn std::error::Error>> {
+    Ok(serde_json::from_slice(&fs::read(
+        case.dir().join("spec.json"),
+    )?)?)
+}
+
+fn fixed_port(port: u16) -> fleetd::systemd::PortSource {
+    Arc::new(move || std::num::NonZeroU16::new(port).ok_or_else(|| io::Error::other("zero port")))
+}
+
+#[tokio::test]
+async fn the_spec_carries_the_port_and_the_receiver_socket_is_group_shared() -> TestResult {
+    let case = telemetry_case("t_tele_ok")?;
+    let gid = fs::metadata(case.run.path())?.gid();
+    let setup =
+        TelemetrySetup::new(fleetd::otel::Limits::default()).with_port_source(fixed_port(4318));
+    let launched = case
+        .launcher()
+        .with_job_gid(Some(gid))
+        .with_telemetry(setup)
+        .launch(case.spec())?;
+    assert_eq!(spec_json(&case)?["telemetry_port"], 4318);
+    let capture = launched.telemetry.as_ref().ok_or("no capture")?;
+    assert_eq!(capture.port.get(), 4318);
+    assert_eq!(capture.token.len(), 48);
+    let meta = fs::symlink_metadata(case.dir().join("otel.sock"))?;
+    assert!(meta.file_type().is_socket());
+    assert_eq!(meta.permissions().mode() & 0o7777, 0o660);
+    assert_eq!(meta.gid(), gid);
+    assert_eq!(meta.uid(), fs::metadata(case.run.path())?.uid());
+    Ok(())
+}
+
+#[tokio::test]
+async fn the_default_port_is_nonzero() -> TestResult {
+    let case = telemetry_case("t_tele_default")?;
+    let setup = TelemetrySetup::new(fleetd::otel::Limits::default());
+    let _launched = case.launcher().with_telemetry(setup).launch(case.spec())?;
+    let port = spec_json(&case)?["telemetry_port"]
+        .as_u64()
+        .ok_or("no port")?;
+    assert!(port > 0 && port <= 65535, "{port}");
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_failed_port_or_token_fails_the_capture_and_not_the_job() -> TestResult {
+    let no_port: fleetd::systemd::PortSource =
+        Arc::new(|| Err(io::Error::other("no port available")));
+    let short_token: fleetd::systemd::TokenSource = Arc::new(|| Ok("short".to_owned()));
+    let failing = [
+        ("t_tele_noport", Some(no_port), None),
+        ("t_tele_badtoken", None, Some(short_token)),
+    ];
+    for (id, port, token) in failing {
+        let case = telemetry_case(id)?;
+        let mut setup =
+            TelemetrySetup::new(fleetd::otel::Limits::default()).with_port_source(fixed_port(4318));
+        if let Some(port) = port {
+            setup = setup.with_port_source(port);
+        }
+        if let Some(token) = token {
+            setup = setup.with_token_source(token);
+        }
+        let launched = case.launcher().with_telemetry(setup).launch(case.spec())?;
+        assert!(launched.telemetry.is_none(), "{id}");
+        assert!(spec_json(&case)?.get("telemetry_port").is_none(), "{id}");
+        assert!(!case.dir().join("otel.sock").exists(), "{id}");
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_launcher_without_telemetry_writes_no_port() -> TestResult {
+    let case = telemetry_case("t_tele_off")?;
+    let launched = case.launch()?;
+    assert!(launched.telemetry.is_none());
+    assert!(spec_json(&case)?.get("telemetry_port").is_none());
+    assert!(!case.dir().join("otel.sock").exists());
+    Ok(())
+}
+
+#[test]
+fn the_fleetd_unit_shares_the_host_network_namespace() -> TestResult {
+    let unit = fs::read_to_string(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../deploy/fleetd-systemd.service"
+    ))?;
+    assert!(!unit.contains("PrivateNetwork"), "{unit}");
+    assert!(!unit.contains("NetworkNamespacePath"), "{unit}");
+    Ok(())
 }
