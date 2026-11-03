@@ -176,6 +176,13 @@ impl FleetWorker for Stub {
         Ok(Response::new(ReportJobReply::default()))
     }
 
+    async fn report_shell_log(
+        &self,
+        _: Request<fleet_proto::v1::ReportShellLogRequest>,
+    ) -> Result<Response<fleet_proto::v1::ReportShellLogReply>, Status> {
+        Err(Status::unimplemented("not used"))
+    }
+
     async fn report_timing(
         &self,
         _: Request<fleet_proto::v1::ReportTimingRequest>,
