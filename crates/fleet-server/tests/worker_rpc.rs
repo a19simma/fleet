@@ -10,7 +10,7 @@ use std::time::Duration;
 use fleet_proto::v1::fleet_worker_client::FleetWorkerClient;
 use fleet_proto::v1::{
     ClaimJobRequest, JobState, ReportJobRequest, ReportTimingRequest, SubmitJobRequest,
-    TranscriptChunk,
+    TimingSummary, TranscriptChunk,
 };
 use fleet_server::auth::BearerAuth;
 use fleet_server::config::Token;
@@ -319,12 +319,20 @@ fn timing(job_id: &str, attempt: u32) -> ReportTimingRequest {
         job_id: job_id.to_owned(),
         attempt,
         r#box: box_name(1),
+        summary: Some(TimingSummary {
+            wall_ms: 10,
+            api_wait_ms: 1,
+            tool_ms: 2,
+            shell_ms: 3,
+            idle_ms: 1,
+            overhead_ms: 3,
+        }),
         ..ReportTimingRequest::default()
     }
 }
 
 #[sqlx::test]
-async fn report_timing_needs_a_live_lease(pool: PgPool) {
+async fn report_timing_persists_for_the_lease_holder_and_needs_a_live_lease(pool: PgPool) {
     let store = store(pool.clone()).await;
     let mut worker = spawn(&store);
     submit(&store, "k1").await;
@@ -348,11 +356,30 @@ async fn report_timing_needs_a_live_lease(pool: PgPool) {
         assert_eq!(err.code(), Code::FailedPrecondition, "{job_id} {attempt}");
     }
 
-    let live = worker
+    let mut wrong_box = timing(&job.job_id, job.attempt);
+    wrong_box.r#box = box_name(2);
+    let err = worker.report_timing(wrong_box).await.unwrap_err();
+    assert_eq!(err.code(), Code::FailedPrecondition);
+    assert_eq!(err.message(), "report does not match the running job");
+    let stored: i64 = sqlx::query_scalar("SELECT count(*) FROM job_timing")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(stored, 0);
+
+    worker
         .report_timing(timing(&job.job_id, job.attempt))
         .await
-        .unwrap_err();
-    assert_eq!(live.code(), Code::Unimplemented);
+        .unwrap();
+    worker
+        .report_timing(timing(&job.job_id, job.attempt))
+        .await
+        .unwrap();
+    let rows: Vec<(i64, i64)> = sqlx::query_as("SELECT wall_ms, api_wait_ms FROM job_timing")
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+    assert_eq!(rows, [(10, 1)]);
 
     sqlx::query("UPDATE jobs SET lease_expires_at = now() - interval '1 second'")
         .execute(&pool)
