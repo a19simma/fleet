@@ -10,6 +10,9 @@
 //!
 //! The server URL must use `http` or `https`. An `https` URL gets TLS with the webpki roots,
 //! the same provider and roots as the laptop CLI, and the bearer token travels inside it.
+//! [`TimingReporter`] sends one job's timing summary over `ReportTiming` with retry. It is
+//! built and tested, and no runtime path calls it yet.
+//!
 //! A certificate the roots do not vouch for fails the call. A handshake that never completes is
 //! cut off by [`CALL_BACKSTOP`], because the channel timeout does not cover it.
 
@@ -24,7 +27,8 @@ use fleet_proto::MAX_PROFILE_MESSAGE_BYTES;
 use fleet_proto::v1::fleet_worker_client::FleetWorkerClient;
 use fleet_proto::v1::{
     ClaimJobRequest, GetJobTranscriptReply, GetJobTranscriptRequest, GetProfileBlobReply,
-    GetProfileBlobRequest, Job, ReportJobReply, ReportJobRequest,
+    GetProfileBlobRequest, Job, ReportJobReply, ReportJobRequest, ReportTimingReply,
+    ReportTimingRequest,
 };
 use tokio::sync::watch;
 use tonic::codegen::http::Uri;
@@ -319,6 +323,248 @@ impl Reporter for GrpcReporter {
         backstop(client.get_job_transcript(request))
             .await
             .map(tonic::Response::into_inner)
+    }
+}
+
+/// Metadata key a server uses to ask for a longer wait before the next try, in milliseconds.
+pub const PUSHBACK_METADATA: &str = "grpc-retry-pushback-ms";
+
+/// Metadata key that carries the idempotency key of a timing report.
+pub const IDEMPOTENCY_METADATA: &str = "idempotency-key";
+
+/// Longest a timing report waits on a server-supplied pushback, whatever the server says.
+pub const MAX_SERVER_WAIT: Duration = Duration::from_secs(60);
+
+/// Most calls one timing report makes before it gives up.
+pub const MAX_TIMING_ATTEMPTS: u32 = 10;
+
+/// Longest one timing report keeps retrying, counted on its [`RetryClock`].
+pub const TIMING_REPORT_DEADLINE: Duration = Duration::from_secs(600);
+
+/// A time source and sleeper for retry loops. A test passes a fake that never really sleeps.
+pub trait RetryClock: Send + Sync {
+    /// Time since a fixed origin. Later calls never return less.
+    fn now(&self) -> Duration;
+
+    /// Completes after `duration`.
+    fn sleep(&self, duration: Duration) -> impl Future<Output = ()> + Send;
+}
+
+/// The real clock: monotonic time and `tokio::time::sleep`.
+#[derive(Debug)]
+pub struct TokioClock {
+    origin: tokio::time::Instant,
+}
+
+impl TokioClock {
+    /// A clock whose origin is now.
+    #[must_use]
+    pub fn new() -> Self {
+        Self {
+            origin: tokio::time::Instant::now(),
+        }
+    }
+}
+
+impl Default for TokioClock {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl RetryClock for TokioClock {
+    fn now(&self) -> Duration {
+        self.origin.elapsed()
+    }
+
+    fn sleep(&self, duration: Duration) -> impl Future<Output = ()> + Send {
+        tokio::time::sleep(duration)
+    }
+}
+
+/// Where a timing report goes. The real one is [`GrpcTimingTransport`].
+pub trait TimingTransport: Send + Sync {
+    /// Sends `request` with `idempotency_key` attached.
+    ///
+    /// # Errors
+    ///
+    /// Returns the gRPC status when the call fails.
+    fn report_timing(
+        &self,
+        idempotency_key: &str,
+        request: ReportTimingRequest,
+    ) -> impl Future<Output = Result<ReportTimingReply, Status>> + Send;
+}
+
+/// Sends timing reports over `ReportTiming` with the bearer token attached.
+pub struct GrpcTimingTransport {
+    client: tokio::sync::Mutex<Client>,
+}
+
+impl fmt::Debug for GrpcTimingTransport {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("GrpcTimingTransport")
+            .finish_non_exhaustive()
+    }
+}
+
+impl GrpcTimingTransport {
+    /// A transport over `channel`. The caller sets the request timeout on the channel.
+    ///
+    /// # Errors
+    ///
+    /// Fails when the token is not a valid header value. The error never contains it.
+    pub fn new(channel: Channel, token: &Token) -> Result<Self, Error> {
+        let client = attach_client(channel, bearer_header(token)?);
+        Ok(Self {
+            client: tokio::sync::Mutex::new(client),
+        })
+    }
+}
+
+impl TimingTransport for GrpcTimingTransport {
+    async fn report_timing(
+        &self,
+        idempotency_key: &str,
+        request: ReportTimingRequest,
+    ) -> Result<ReportTimingReply, Status> {
+        let mut request = Request::new(request);
+        if let Ok(value) = MetadataValue::try_from(idempotency_key) {
+            request.metadata_mut().insert(IDEMPOTENCY_METADATA, value);
+        }
+        let mut client = self.client.lock().await;
+        backstop(client.report_timing(request))
+            .await
+            .map(tonic::Response::into_inner)
+    }
+}
+
+/// What became of one timing report.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum TimingOutcome {
+    /// The server stored the report after this many calls.
+    Acked {
+        /// Calls made, the acknowledged one included.
+        attempts: u32,
+    },
+    /// The job is gone from the server. Terminal, never retried.
+    Pruned,
+    /// The server refused the report for good with this code. Terminal, never retried.
+    Refused(Code),
+    /// The attempt or deadline budget ran out while the server kept failing.
+    GaveUp,
+}
+
+/// Why a timing report was not attempted.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum TimingReportError {
+    /// The request names no job, so no stable idempotency key exists.
+    EmptyJobId,
+}
+
+impl fmt::Display for TimingReportError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Self::EmptyJobId => "timing report has no job id",
+        })
+    }
+}
+
+impl std::error::Error for TimingReportError {}
+
+/// The idempotency key of a timing report: stable for one job attempt, never empty.
+///
+/// # Errors
+///
+/// Fails when `job_id` is empty.
+pub fn timing_idempotency_key(job_id: &str, attempt: u32) -> Result<String, TimingReportError> {
+    if job_id.is_empty() {
+        return Err(TimingReportError::EmptyJobId);
+    }
+    Ok(format!("timing:{job_id}:{attempt}"))
+}
+
+/// Reads the server's pushback from `status`, capped at [`MAX_SERVER_WAIT`].
+///
+/// A value that is not a plain run of digits is ignored. A run of digits too long for a
+/// `u64` counts as the largest wait and is capped.
+fn server_wait(status: &Status) -> Option<Duration> {
+    let text = status.metadata().get(PUSHBACK_METADATA)?.to_str().ok()?;
+    if text.is_empty() || !text.bytes().all(|byte| byte.is_ascii_digit()) {
+        return None;
+    }
+    let millis = text.parse::<u64>().unwrap_or(u64::MAX);
+    Some(Duration::from_millis(millis).min(MAX_SERVER_WAIT))
+}
+
+/// Sends the timing of a job to the server and retries until it is stored or refused.
+///
+/// One call to [`TimingReporter::report`] sends one idempotency key, the same on every retry.
+/// The backoff schedule lives in the reporter and resets only when the server stores a
+/// report, so a server that keeps failing is not hit faster by the next job.
+#[derive(Debug)]
+pub struct TimingReporter<T, C = TokioClock, R = SystemRandom> {
+    transport: T,
+    clock: C,
+    backoff: Backoff<R>,
+}
+
+impl<T: TimingTransport, C: RetryClock, R: Random> TimingReporter<T, C, R> {
+    /// A reporter over `transport` with the standard backoff drawn from `random`.
+    pub fn new(transport: T, clock: C, random: R) -> Self {
+        Self {
+            transport,
+            clock,
+            backoff: Backoff::standard(random),
+        }
+    }
+
+    /// Sends `request` until the server stores it or refuses it for good.
+    ///
+    /// `NotFound` means the job was pruned and ends the report as [`TimingOutcome::Pruned`].
+    /// `InvalidArgument` and `PermissionDenied` end it as [`TimingOutcome::Refused`]. Any other
+    /// failure waits the backoff delay, raised to the server's pushback capped at
+    /// [`MAX_SERVER_WAIT`], and tries again. It stops with [`TimingOutcome::GaveUp`] after
+    /// [`MAX_TIMING_ATTEMPTS`] calls or when the next wait would pass
+    /// [`TIMING_REPORT_DEADLINE`].
+    ///
+    /// # Errors
+    ///
+    /// Fails before any call when the request has no job id.
+    pub async fn report(
+        &mut self,
+        request: ReportTimingRequest,
+    ) -> Result<TimingOutcome, TimingReportError> {
+        let key = timing_idempotency_key(&request.job_id, request.attempt)?;
+        let started = self.clock.now();
+        let mut attempts = 0u32;
+        loop {
+            attempts += 1;
+            let Err(status) = self.transport.report_timing(&key, request.clone()).await else {
+                self.backoff.reset();
+                return Ok(TimingOutcome::Acked { attempts });
+            };
+            match status.code() {
+                Code::NotFound => return Ok(TimingOutcome::Pruned),
+                Code::InvalidArgument | Code::PermissionDenied => {
+                    return Ok(TimingOutcome::Refused(status.code()));
+                }
+                _ => {}
+            }
+            let delay = self.backoff.next_delay();
+            let wait = server_wait(&status).map_or(delay, |server| server.max(delay));
+            let spent = self.clock.now().saturating_sub(started);
+            if attempts >= MAX_TIMING_ATTEMPTS
+                || spent.saturating_add(wait) > TIMING_REPORT_DEADLINE
+            {
+                tracing::warn!(code = ?status.code(), attempts, "timing report abandoned");
+                return Ok(TimingOutcome::GaveUp);
+            }
+            tracing::warn!(code = ?status.code(), retry_in = ?wait, "timing report failed");
+            self.clock.sleep(wait).await;
+        }
     }
 }
 
