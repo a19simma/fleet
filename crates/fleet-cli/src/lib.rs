@@ -734,14 +734,18 @@ pub async fn run_with(
             commands,
             follow,
             json,
-        } => {
-            let mut client = session(server, insecure, lookup, timeouts).await?.jobs;
-            match follow {
-                Some(c) => timing::follow(&mut client, &job, &c, json, out).await?,
-                None if commands => timing::list_commands(&mut client, &job, json, out).await?,
-                None => timing::run(&job, commands, json)?,
+        } => match follow {
+            Some(c) => {
+                timing::check_command_id(&c)?;
+                let mut client = session(server, insecure, lookup, timeouts).await?.jobs;
+                timing::follow(&mut client, &job, &c, json, out).await?;
             }
-        }
+            None if commands => {
+                let mut client = session(server, insecure, lookup, timeouts).await?.jobs;
+                timing::list_commands(&mut client, &job, json, out).await?;
+            }
+            None => timing::run(&job, commands, json)?,
+        },
         Command::Batch { action } => {
             run_batch(action, server, insecure, lookup, timeouts, stdin, out).await?;
         }

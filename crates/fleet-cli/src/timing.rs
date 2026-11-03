@@ -10,7 +10,7 @@ use fleet_proto::v1::{
 };
 use fleet_proto::{
     MAX_SHELL_LOG_CHUNK_BYTES, MAX_SHELL_LOG_CHUNKS, shell_status_name,
-    validate_shell_log_command_id,
+    validate_shell_log_command_id, validate_shell_log_seq,
 };
 use tonic::{Status, Streaming};
 
@@ -193,6 +193,11 @@ async fn print_chunks<S: ChunkSource>(
             ShellStatus::try_from(chunk.status),
             Ok(ShellStatus::Done | ShellStatus::Failed)
         );
+        if !validate_shell_log_seq(chunk.seq) {
+            return Err(CliError::Rpc(Status::invalid_argument(
+                "log stream sent an invalid chunk number",
+            )));
+        }
         let fresh = chunk.seq >= next_seq;
         if fresh && !chunk.bytes.is_empty() {
             next_seq = chunk.seq.saturating_add(1);
@@ -272,6 +277,20 @@ pub async fn print_log<S: ChunkSource>(
     }
 }
 
+/// Checks a `--follow` command id against the wire contract.
+///
+/// # Errors
+/// Returns [`CliError::Usage`] with a fixed message for an id the contract refuses.
+pub(crate) fn check_command_id(command_id: &str) -> Result<(), CliError> {
+    if validate_shell_log_command_id(command_id) {
+        Ok(())
+    } else {
+        Err(CliError::Usage(
+            "command id must be 1 to 128 characters of letters, digits and _ . : -".to_owned(),
+        ))
+    }
+}
+
 /// Opens the live log of command `command_id` of job `job` and prints it with [`print_log`].
 ///
 /// # Errors
@@ -284,18 +303,20 @@ pub(crate) async fn follow(
     json: bool,
     out: &mut impl Write,
 ) -> Result<(), CliError> {
-    if !validate_shell_log_command_id(command_id) {
-        return Err(CliError::Usage(
-            "command id must be 1 to 128 characters of letters, digits and _ . : -".to_owned(),
-        ));
-    }
-    let mut stream = client
-        .stream_shell_log(StreamShellLogRequest {
+    check_command_id(command_id)?;
+    let opened = tokio::time::timeout(
+        FOLLOW_DEADLINE,
+        client.stream_shell_log(StreamShellLogRequest {
             job_id: job.to_owned(),
             command_id: command_id.to_owned(),
             from_seq: 0,
-        })
-        .await?
-        .into_inner();
+        }),
+    )
+    .await;
+    let Ok(opened) = opened else {
+        writeln!(out, "{DEADLINE_MARKER}")?;
+        return Ok(());
+    };
+    let mut stream = opened?.into_inner();
     print_log(&mut stream, command_id, json, out).await
 }

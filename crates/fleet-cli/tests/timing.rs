@@ -528,6 +528,69 @@ mod served {
         Ok(())
     }
 
+    async fn run_no_token(url: &str, args: &[&str]) -> Result<(), CliError> {
+        let mut full = vec!["fleet", "--server", url];
+        full.extend_from_slice(args);
+        let Ok(parsed) = Cli::try_parse_from(full) else {
+            return Err(CliError::Usage("parse".into()));
+        };
+        let mut out = Vec::new();
+        tokio::time::timeout(
+            Duration::from_secs(10),
+            run(parsed, |_| None, &mut &b""[..], &mut out),
+        )
+        .await
+        .unwrap_or_else(|_| Err(CliError::Usage("timed out".into())))
+    }
+
+    #[tokio::test]
+    async fn a_bad_id_is_refused_before_any_connection_or_token_check() -> TestResult {
+        let listener = TcpListener::bind("127.0.0.1:0").await?;
+        let url = format!("http://{}", listener.local_addr()?);
+        let accepts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let seen = accepts.clone();
+        tokio::spawn(async move {
+            while listener.accept().await.is_ok() {
+                seen.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            }
+        });
+        let result = run_no_token(&url, &["timing", "job-1", "--follow", "bad id"]).await;
+        let Err(CliError::Usage(message)) = result else {
+            panic!("expected the usage error, got {result:?}");
+        };
+        assert_eq!(message, super::BAD_ID);
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert_eq!(accepts.load(std::sync::atomic::Ordering::SeqCst), 0);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn the_plain_summary_opens_no_session() -> TestResult {
+        let result = run_no_token("http://127.0.0.1:1", &["timing", "job-1"]).await;
+        let Err(CliError::Rpc(status)) = result else {
+            panic!("expected an rpc error, got {result:?}");
+        };
+        assert_eq!(status.code(), tonic::Code::Unimplemented);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_chunk_number_past_the_cap_refuses_the_stream() -> TestResult {
+        let stub = Stub {
+            chunks: vec![chunk(u32::MAX, b"x", ShellStatus::Running)],
+            ..Stub::default()
+        };
+        let url = serve(stub).await?;
+        let (result, text) = cli(&url, &["timing", "job-1", "--follow", "cmd-1"]).await;
+        let Err(CliError::Rpc(status)) = result else {
+            panic!("expected an rpc error, got {result:?}");
+        };
+        assert_eq!(status.code(), tonic::Code::InvalidArgument);
+        assert_eq!(status.message(), "log stream sent an invalid chunk number");
+        assert_eq!(text, "");
+        Ok(())
+    }
+
     #[tokio::test]
     async fn the_plain_summary_is_still_not_implemented() -> TestResult {
         let url = serve(Stub::default()).await?;
