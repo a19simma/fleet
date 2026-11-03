@@ -1,5 +1,6 @@
-//! `ReportTiming` and `GetJobTiming` over a real tonic server on a loopback port. Both
-//! answer `UNIMPLEMENTED` for the right token and `PERMISSION_DENIED` for the other scope.
+//! `ReportTiming` and `GetJobTiming` over a real tonic server on a loopback port. Each
+//! answers `PERMISSION_DENIED` for the other scope's token. `ReportTiming` refuses a report
+//! with no matching lease, and `GetJobTiming` is still `UNIMPLEMENTED`.
 //! The tests need a Postgres superuser URL in `DATABASE_URL` and live in their own binary
 //! because each one binds a socket.
 

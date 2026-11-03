@@ -37,14 +37,6 @@ const STREAM_QUEUE: usize = 16;
 
 const NOT_IMPLEMENTED: &str = "job timing is not implemented";
 
-/// Stores the timing a box reports for one job attempt.
-///
-/// # Errors
-/// Returns `UNIMPLEMENTED` until the store is built.
-pub fn report_timing(_request: &ReportTimingRequest) -> Result<ReportTimingReply, Status> {
-    Err(Status::unimplemented(NOT_IMPLEMENTED))
-}
-
 const LOCK_REPORTED_JOB: &str = "\
 SELECT 1 FROM jobs WHERE job_id = $1 AND attempt = $2 AND state = 'RUNNING' \
 AND lease_expires_at > now() FOR UPDATE";
@@ -97,7 +89,8 @@ fn kind_name(record: &TimingSpanRecord) -> Result<&'static str, Status> {
 
 /// Stores the timing a box reports for one job, replacing any earlier report.
 ///
-/// The `box` field is ignored. The report is accepted only while the job is `RUNNING` at
+/// The `box` field is not checked here: the `ReportTiming` handler refuses a box other than
+/// the lease holder before calling. The report is accepted only while the job is `RUNNING` at
 /// the reported attempt with an unexpired lease. That row is locked `FOR UPDATE` for the
 /// whole transaction, so two reports for one job run one after the other and the later one
 /// replaces the summary, every span and every shell command of the earlier one. The wire
