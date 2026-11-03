@@ -1,18 +1,532 @@
-//! Timing pages.
+//! The job tasks page and its live log stream.
+//!
+//! `/jobs/{id}/timing` lists the pueue tasks a job reported with a status badge.
+//! `/jobs/{id}/shell/{command}/log` streams one task's log as server-sent events from the
+//! same follow loop `StreamShellLog` uses: replay, then follow, capped at
+//! [`STREAM_MAX_WAIT`]. Both routes check the job owner first and answer 404 for a job that
+//! is unknown or not the caller's, so the two cases look identical.
+//!
+//! Log text is untrusted. [`Pane`] decodes chunks as UTF-8 across chunk borders, drops
+//! control characters, line and paragraph separators and bidi overrides, cuts each line at
+//! [`MAX_LINE_CHARS`] and stops at [`MAX_PANE_BYTES`]. The stream sends the text as a JSON
+//! string with `<`, `>` and `&` written as `\u` escapes, and the script sets it with
+//! `textContent`, never as markup.
 
+use std::convert::Infallible;
+
+use fleet_proto::v1::{StreamShellLogChunk, StreamShellLogRequest};
+use fleet_proto::{
+    shell_status_name, validate_shell_log_command_id, validate_shell_log_seq,
+    validate_shell_log_status,
+};
+use http_body_util::StreamBody;
+use hyper::body::{Bytes, Frame};
+use sqlx::Row;
+use tokio::sync::mpsc;
+use tonic::codegen::BoxStream;
+use tonic::codegen::tokio_stream::StreamExt;
+use tonic::codegen::tokio_stream::wrappers::ReceiverStream;
 use topcoat::{
     Result,
-    context::Cx,
-    router::{StatusCode, error::see_other, route},
+    context::{Cx, app_context},
+    router::{
+        Body,
+        error::{not_found, see_other, unauthorized},
+        header, page, path_param,
+        request::headers,
+        route,
+    },
+    view::{View, view},
 };
 
-use super::pages::{auth, current};
+use super::jobs::{ConsoleSlot, MAX_RENDER_BYTES};
+use super::layout::{Nav, shell};
+use super::pages::{auth, current, fail};
+use super::passkeys::AuthError;
+use crate::store::{Store, StoreError};
+use crate::timing::{MAX_LOG_COMMANDS_PER_JOB, StreamLimits, stream_shell_log};
 
-#[route(GET "/jobs/{job_id}/timing")]
-async fn timing_page(cx: &Cx) -> Result<(StatusCode, &'static str)> {
-    let auth = auth(cx)?;
-    if current(cx, auth).await?.is_none() {
-        return Err(see_other("/login").into());
+/// The most characters one log line shows before the rest of it is replaced by a marker.
+const MAX_LINE_CHARS: usize = 2048;
+
+/// The most log text one stream sends, in bytes.
+const MAX_PANE_BYTES: usize = MAX_RENDER_BYTES;
+
+/// URL path of the embedded log script.
+const LOG_SCRIPT_PATH: &str = "/static/tasklog.js";
+
+const COMMAND_PREVIEW_BYTES: usize = 160;
+const FRAME_QUEUE: usize = 8;
+const CARRY_MAX: usize = 3;
+
+const LOG_JS: &str = r#"(function () {
+  var pane = document.getElementById("task-log");
+  var title = document.getElementById("task-log-title");
+  var state = document.getElementById("task-log-state");
+  if (!pane || !title || !state) { return; }
+  var MAX_CHARS = 262144;
+  var source = null;
+  var text = "";
+  function render() {
+    if (text.length > MAX_CHARS) { text = text.slice(text.length - MAX_CHARS); }
+    pane.textContent = text;
+    pane.scrollTop = pane.scrollHeight;
+  }
+  function stop(label) {
+    if (source) { source.close(); source = null; }
+    state.textContent = label;
+  }
+  function parse(event) {
+    try { return JSON.parse(event.data); } catch (err) { return null; }
+  }
+  function open(url, task) {
+    if (source) { source.close(); }
+    text = "";
+    render();
+    title.textContent = task;
+    state.textContent = "connecting";
+    source = new EventSource(url);
+    source.addEventListener("chunk", function (event) {
+      var data = parse(event);
+      if (!data) { return; }
+      text += String(data.text);
+      state.textContent = String(data.status);
+      render();
+    });
+    source.addEventListener("end", function (event) {
+      var data = parse(event);
+      stop(data ? "ended: " + String(data.status) : "ended");
+    });
+    source.addEventListener("fail", function () { stop("stream failed"); });
+    source.onerror = function () { stop("disconnected"); };
+  }
+  document.addEventListener("click", function (event) {
+    var target = event.target;
+    var button = target && target.closest ? target.closest("[data-log-url]") : null;
+    if (!button) { return; }
+    open(button.getAttribute("data-log-url"), button.getAttribute("data-task") || "");
+  });
+})();
+"#;
+
+path_param!(job_id);
+path_param!(command_id);
+
+const SELECT_TASKS: &str = "\
+SELECT c.command_id, (array_agg(c.status ORDER BY c.seq DESC))[1] AS status, \
+max(s.command) AS command \
+FROM job_shell_log_chunks c \
+LEFT JOIN job_shell_commands s ON s.job_id = c.job_id AND s.id = c.command_id \
+WHERE c.job_id = $1 GROUP BY c.command_id ORDER BY min(c.created_at), c.command_id LIMIT $2";
+
+struct Task {
+    id: String,
+    status: String,
+    command: String,
+    url: String,
+}
+
+fn store(cx: &Cx) -> Result<&Store> {
+    app_context::<ConsoleSlot>(cx)
+        .0
+        .as_deref()
+        .ok_or_else(|| not_found().into())
+}
+
+fn internal(err: &dyn std::fmt::Display) -> topcoat::Error {
+    tracing::error!(error = %err, "tasks page read failed");
+    fail(AuthError::Internal)
+}
+
+fn cut_at(text: &str, max: usize) -> &str {
+    let mut end = max.min(text.len());
+    while !text.is_char_boundary(end) {
+        end -= 1;
     }
-    Ok((StatusCode::NOT_IMPLEMENTED, "job timing is not implemented"))
+    text.get(..end).unwrap_or_default()
+}
+
+fn badge_class(status: &str) -> &'static str {
+    match status {
+        "running" => "badge badge-sm badge-warning",
+        "done" => "badge badge-sm badge-success",
+        "failed" => "badge badge-sm badge-error",
+        _ => "badge badge-sm badge-ghost",
+    }
+}
+
+fn log_url(job_id: &str, command_id: &str) -> String {
+    format!("/jobs/{job_id}/shell/{command_id}/log")
+}
+
+async fn owned(store: &Store, user_id: i64, job_id: &str) -> Result<()> {
+    match store.get_job_for(Some(user_id), job_id).await {
+        Ok(_) => Ok(()),
+        Err(StoreError::NotFound | StoreError::InvalidJob(_)) => Err(not_found().into()),
+        Err(err) => Err(internal(&err)),
+    }
+}
+
+async fn tasks(store: &Store, job_id: &str) -> Result<Vec<Task>> {
+    let limit = i64::try_from(MAX_LOG_COMMANDS_PER_JOB).unwrap_or(i64::MAX);
+    let rows = sqlx::query(SELECT_TASKS)
+        .bind(job_id)
+        .bind(limit)
+        .fetch_all(store.pool())
+        .await
+        .map_err(|err| internal(&err))?;
+    rows.iter()
+        .map(|row| {
+            let id: String = row.try_get("command_id").map_err(|err| internal(&err))?;
+            let status: String = row.try_get("status").map_err(|err| internal(&err))?;
+            let command: Option<String> = row.try_get("command").map_err(|err| internal(&err))?;
+            let command = command.unwrap_or_default();
+            Ok(Task {
+                url: log_url(job_id, &id),
+                command: cut_at(&command, COMMAND_PREVIEW_BYTES).to_owned(),
+                id,
+                status,
+            })
+        })
+        .collect()
+}
+
+#[page("/jobs/{job_id}/timing")]
+async fn timing_page(cx: &Cx) -> Result<impl View> {
+    let auth = auth(cx)?;
+    let store = store(cx)?;
+    let Some(session) = current(cx, auth).await? else {
+        return Err(see_other("/login").into());
+    };
+    let id = path_param::<JobId>(cx);
+    owned(store, session.user_id, id).await?;
+    let tasks = tasks(store, id).await?;
+    let back = format!("/jobs/{id}");
+    let csrf = String::from_utf8_lossy(session.csrf.expose()).into_owned();
+    Ok(view! {
+        shell(title: "fleet job tasks", active: Nav::Jobs, user: session.username.as_str(), csrf: csrf.as_str(), mode: "",
+                <header class="mb-3 flex items-center gap-3 border-b border-base-300 pb-2 text-xs">
+                    <span class="text-primary">"$"</span>
+                    <h1 class="text-sm font-bold">"Tasks of " (id)</h1>
+                    <a class="link link-hover ml-auto" href=(back.as_str())>"Job"</a>
+                </header>
+                <div class="grid gap-3 lg:grid-cols-[26rem_1fr]">
+                    <section>
+                        <h2 class="mb-1 text-xs font-bold uppercase text-base-content/60">"Shell tasks"</h2>
+                        if tasks.is_empty() {
+                            <p id="no-tasks" class="text-xs text-base-content/60">"No shell tasks reported."</p>
+                        } else {
+                            <table class="table table-zebra table-xs">
+                                <thead>
+                                    <tr>
+                                        <th>"Task"</th>
+                                        <th>"Status"</th>
+                                    </tr>
+                                </thead>
+                                <tbody>
+                                    for task in tasks {
+                                        <tr>
+                                            <td>
+                                                <button type="button" class="link link-primary break-all text-left" data-task=(task.id.as_str()) data-log-url=(task.url.as_str())>(task.id.as_str())</button>
+                                                <div class="break-all text-base-content/60">(task.command.as_str())</div>
+                                            </td>
+                                            <td><span class=(badge_class(task.status.as_str()))>(task.status.as_str())</span></td>
+                                        </tr>
+                                    }
+                                </tbody>
+                            </table>
+                        }
+                    </section>
+                    <section>
+                        <h2 class="mb-1 flex gap-2 text-xs font-bold uppercase text-base-content/60">
+                            <span>"Log"</span>
+                            <span id="task-log-title" class="normal-case"></span>
+                            <span id="task-log-state" class="normal-case"></span>
+                        </h2>
+                        <pre id="task-log" class="h-[70vh] overflow-auto whitespace-pre-wrap border border-base-300 bg-base-300 p-2 text-xs"></pre>
+                    </section>
+                </div>
+                <script src=(LOG_SCRIPT_PATH) defer=""></script>
+            )
+    })
+}
+
+#[route(GET "/static/tasklog.js")]
+async fn log_script() -> Result<([(header::HeaderName, &'static str); 1], &'static str)> {
+    Ok(([(header::CONTENT_TYPE, "text/javascript")], LOG_JS))
+}
+
+/// Decodes, cleans and bounds the log text of one command for display.
+struct Pane {
+    carry: Vec<u8>,
+    column: usize,
+    skipping: bool,
+    sent: usize,
+}
+
+fn is_dropped(ch: char) -> bool {
+    (ch.is_control() && ch != '\t')
+        || matches!(
+            ch,
+            '\u{2028}'
+                | '\u{2029}'
+                | '\u{061c}'
+                | '\u{200e}'
+                | '\u{200f}'
+                | '\u{202a}'..='\u{202e}'
+                | '\u{2066}'..='\u{2069}'
+        )
+}
+
+impl Pane {
+    fn new() -> Self {
+        Self {
+            carry: Vec::new(),
+            column: 0,
+            skipping: false,
+            sent: 0,
+        }
+    }
+
+    fn full(&self) -> bool {
+        self.sent >= MAX_PANE_BYTES
+    }
+
+    fn push(&mut self, bytes: &[u8]) -> String {
+        let mut joined = std::mem::take(&mut self.carry);
+        joined.extend_from_slice(bytes);
+        let mut out = String::new();
+        let mut rest = joined.as_slice();
+        loop {
+            match std::str::from_utf8(rest) {
+                Ok(valid) => {
+                    self.clean(valid, &mut out);
+                    return out;
+                }
+                Err(err) => {
+                    let (good, bad) = rest.split_at(err.valid_up_to());
+                    self.clean(std::str::from_utf8(good).unwrap_or_default(), &mut out);
+                    match err.error_len() {
+                        None if bad.len() <= CARRY_MAX => {
+                            self.carry = bad.to_vec();
+                            return out;
+                        }
+                        None => {
+                            self.clean("\u{fffd}", &mut out);
+                            return out;
+                        }
+                        Some(skip) => {
+                            self.clean("\u{fffd}", &mut out);
+                            rest = bad.get(skip..).unwrap_or_default();
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    fn clean(&mut self, text: &str, out: &mut String) {
+        for ch in text.chars() {
+            if self.full() {
+                return;
+            }
+            if ch == '\n' {
+                out.push('\n');
+                self.sent += 1;
+                self.column = 0;
+                self.skipping = false;
+            } else if is_dropped(ch) || self.skipping {
+            } else if self.column >= MAX_LINE_CHARS {
+                out.push('\u{2026}');
+                self.sent += '\u{2026}'.len_utf8();
+                self.skipping = true;
+            } else {
+                out.push(ch);
+                self.sent += ch.len_utf8();
+                self.column += 1;
+            }
+        }
+    }
+}
+
+fn inert(json: &str) -> String {
+    json.replace('<', "\\u003c")
+        .replace('>', "\\u003e")
+        .replace('&', "\\u0026")
+}
+
+fn frame(id: Option<u32>, event: &str, data: &serde_json::Value) -> Frame<Bytes> {
+    let id = id.map(|seq| format!("id: {seq}\n")).unwrap_or_default();
+    let text = format!("{id}event: {event}\ndata: {}\n\n", inert(&data.to_string()));
+    Frame::data(Bytes::from(text))
+}
+
+fn end_frame(status: &str) -> Frame<Bytes> {
+    frame(None, "end", &serde_json::json!({ "status": status }))
+}
+
+async fn pump(
+    mut chunks: BoxStream<StreamShellLogChunk>,
+    tx: mpsc::Sender<Result<Frame<Bytes>, Infallible>>,
+) {
+    let mut pane = Pane::new();
+    let mut last = "closed";
+    while let Some(item) = chunks.next().await {
+        let Ok(chunk) = item else {
+            let fail = serde_json::json!({ "error": "log stream failed" });
+            let _ = tx.send(Ok(frame(None, "fail", &fail))).await;
+            return;
+        };
+        let status = validate_shell_log_status(chunk.status)
+            .and_then(shell_status_name)
+            .unwrap_or("unknown");
+        let data = serde_json::json!({
+            "seq": chunk.seq,
+            "status": status,
+            "text": pane.push(&chunk.bytes),
+        });
+        if tx
+            .send(Ok(frame(Some(chunk.seq), "chunk", &data)))
+            .await
+            .is_err()
+        {
+            return;
+        }
+        if pane.full() {
+            last = "truncated";
+            break;
+        }
+        if status == "done" || status == "failed" {
+            last = status;
+            break;
+        }
+    }
+    let _ = tx.send(Ok(end_frame(last))).await;
+}
+
+fn resume_from(cx: &Cx) -> u32 {
+    headers(cx)
+        .get("last-event-id")
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.trim().parse::<u32>().ok())
+        .map_or(0, |seen| seen.saturating_add(1))
+}
+
+#[route(GET "/jobs/{job_id}/shell/{command_id}/log")]
+async fn log_stream(cx: &Cx) -> Result<([(header::HeaderName, &'static str); 2], Body)> {
+    let auth = auth(cx)?;
+    let store = store(cx)?;
+    let Some(session) = current(cx, auth).await? else {
+        return Err(unauthorized().into());
+    };
+    let job_id = path_param::<JobId>(cx);
+    let command_id = path_param::<CommandId>(cx);
+    owned(store, session.user_id, job_id).await?;
+    if !validate_shell_log_command_id(command_id) {
+        return Err(not_found().into());
+    }
+    let (tx, rx) = mpsc::channel(FRAME_QUEUE);
+    let from_seq = resume_from(cx);
+    let request = StreamShellLogRequest {
+        job_id: job_id.to_owned(),
+        command_id: command_id.to_owned(),
+        from_seq,
+    };
+    if validate_shell_log_seq(from_seq) {
+        let chunks = stream_shell_log(store.pool(), &request, StreamLimits::default())
+            .map_err(|err| internal(&err))?;
+        tokio::spawn(pump(chunks, tx));
+    } else {
+        let _ = tx.try_send(Ok(end_frame("closed")));
+    }
+    Ok((
+        [
+            (header::CONTENT_TYPE, "text/event-stream"),
+            (header::CACHE_CONTROL, "no-store"),
+        ],
+        Body::new(StreamBody::new(ReceiverStream::new(rx))),
+    ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn clean(input: &str) -> String {
+        Pane::new().push(input.as_bytes())
+    }
+
+    #[test]
+    fn control_and_separator_characters_are_dropped() {
+        let input = "a\u{1b}[31mb\rc\u{85}d\u{2028}e\u{2029}f\u{7}g\u{202e}h\u{7f}i\0j";
+        assert_eq!(clean(input), "a[31mbcdefghij");
+    }
+
+    #[test]
+    fn newline_and_tab_survive() {
+        assert_eq!(clean("a\tb\r\nc\n"), "a\tb\nc\n");
+    }
+
+    #[test]
+    fn markup_text_passes_through_for_the_caller_to_escape() {
+        assert_eq!(clean("<script>x</script>"), "<script>x</script>");
+        assert_eq!(
+            inert(r#"{"text":"<script>&"}"#),
+            r#"{"text":"\u003cscript\u003e\u0026"}"#
+        );
+    }
+
+    #[test]
+    fn a_line_is_cut_at_the_cap_and_the_next_line_starts_fresh() {
+        let input = format!("{}\nok\n", "x".repeat(MAX_LINE_CHARS + 10));
+        let out = clean(&input);
+        let lines: Vec<&str> = out.lines().collect();
+        assert_eq!(lines.first().unwrap().chars().count(), MAX_LINE_CHARS + 1);
+        assert!(lines.first().unwrap().ends_with('\u{2026}'));
+        assert_eq!(lines.get(1), Some(&"ok"));
+    }
+
+    #[test]
+    fn a_line_of_exactly_the_cap_is_not_cut() {
+        let out = clean(&"x".repeat(MAX_LINE_CHARS));
+        assert_eq!(out.chars().count(), MAX_LINE_CHARS);
+        assert!(!out.contains('\u{2026}'));
+    }
+
+    #[test]
+    fn a_cut_line_stays_cut_across_chunks() {
+        let mut pane = Pane::new();
+        let first = pane.push("x".repeat(MAX_LINE_CHARS + 1).as_bytes());
+        let second = pane.push(b"yyy\nz");
+        assert!(first.ends_with('\u{2026}'));
+        assert_eq!(second, "\nz");
+    }
+
+    #[test]
+    fn the_pane_stops_at_its_byte_cap() {
+        let mut pane = Pane::new();
+        let line = format!("{}\n", "x".repeat(1000));
+        let mut total = 0;
+        while !pane.full() {
+            total += pane.push(line.as_bytes()).len();
+        }
+        assert!(total <= MAX_PANE_BYTES);
+        assert!(total + line.len() > MAX_PANE_BYTES);
+        assert_eq!(pane.push(b"more"), "");
+    }
+
+    #[test]
+    fn a_character_split_across_chunks_is_rebuilt() {
+        let euro = "\u{20ac}".as_bytes();
+        let mut pane = Pane::new();
+        let a = pane.push(euro.get(..2).unwrap());
+        let b = pane.push(euro.get(2..).unwrap());
+        assert_eq!(a, "");
+        assert_eq!(b, "\u{20ac}");
+    }
+
+    #[test]
+    fn invalid_bytes_become_the_replacement_character() {
+        assert_eq!(Pane::new().push(b"a\xffb\xc3("), "a\u{fffd}b\u{fffd}(");
+    }
 }
