@@ -47,6 +47,8 @@ struct SpecFile {
     cwd: PathBuf,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     telemetry_port: Option<u16>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    host_netns: Option<(u64, u64)>,
 }
 
 /// Why `agent-exec` could not start the agent. No variant carries an argument or an
@@ -101,7 +103,9 @@ pub fn write_spec(path: &Path, id: &str, spec: &AgentSpec, gid: Option<u32>) -> 
 ///
 /// With `telemetry_port` set, `agent-exec` listens on `127.0.0.1:<port>` in the unit's
 /// namespace and relays to the receiver socket in the job directory. fleetd chooses the port
-/// and puts the same one in the agent's OTLP endpoint.
+/// and puts the same one in the agent's OTLP endpoint. The spec also carries the network
+/// namespace identity of fleetd, which `agent-exec` takes as the host one: the unit hides
+/// `/proc/1` from the job uid, so it cannot read the init namespace itself. See [`host_netns`].
 ///
 /// # Errors
 ///
@@ -124,6 +128,8 @@ pub fn write_spec_telemetry(
         argv,
         cwd: spec.cwd.clone(),
         telemetry_port: telemetry_port.map(NonZeroU16::get),
+        host_netns: telemetry_port
+            .and_then(|_| host_netns(netns_identity(NET_NS_SELF), netns_identity(NET_NS_INIT))),
     })
     .map_err(io::Error::other)?;
     let mut file = OpenOptions::new()
@@ -467,7 +473,10 @@ pub fn exec_job(run_dir: &Path, id: &str) -> AgentExecError {
     let telemetry = start_telemetry(
         spec.telemetry_port,
         &run_dir.join(id).join(crate::otel::SOCKET_NAME),
-        namespace_is_private(netns_identity(NET_NS_SELF), netns_identity(NET_NS_INIT)),
+        namespace_is_private(
+            netns_identity(NET_NS_SELF),
+            host_identity(spec.host_netns, || netns_identity(NET_NS_INIT)),
+        ),
     );
     let forwarder = match Forwarder::start(socket, uid, ForwardLimits::default()) {
         Ok(forwarder) => forwarder,
@@ -508,6 +517,33 @@ fn netns_identity(link: &str) -> io::Result<(u64, u64)> {
 #[cfg(not(target_os = "linux"))]
 fn netns_identity(_link: &str) -> io::Result<(u64, u64)> {
     Err(io::ErrorKind::Unsupported.into())
+}
+
+/// The host namespace identity `agent-exec` compares against.
+///
+/// A value from the spec, which only fleetd can write, wins. Without one `read` runs, and its
+/// error stays an error, so [`namespace_is_private`] fails closed.
+fn host_identity(
+    spec: Option<(u64, u64)>,
+    read: impl FnOnce() -> io::Result<(u64, u64)>,
+) -> io::Result<(u64, u64)> {
+    spec.map_or_else(read, Ok)
+}
+
+/// The namespace identity fleetd writes into the spec as the host one.
+///
+/// Takes the `(dev, ino)` of fleetd and of the init process. Returns fleetd's own identity
+/// when the init one is equal or unreadable, and `None` when fleetd cannot read its own or
+/// the init one differs, because then fleetd is not in the host namespace and a loopback bind
+/// on its behalf would land elsewhere. An unreadable init identity is the case under the
+/// `fleetd` uid, which cannot read `/proc/1/ns/net`: it relies on the fleetd unit not setting
+/// `PrivateNetwork`, which a test pins.
+pub fn host_netns(own: io::Result<(u64, u64)>, init: io::Result<(u64, u64)>) -> Option<(u64, u64)> {
+    match (own, init) {
+        (Ok(own), Ok(init)) if own == init => Some(own),
+        (Ok(own), Err(_)) => Some(own),
+        _ => None,
+    }
 }
 
 /// Whether this process runs in a network namespace other than the init one.
@@ -1110,6 +1146,34 @@ mod tests {
         assert!(!super::namespace_is_private(denied(), Ok((1, 10))));
         assert!(!super::namespace_is_private(Ok((1, 10)), denied()));
         assert!(!super::namespace_is_private(denied(), denied()));
+    }
+
+    #[test]
+    fn the_spec_identity_beats_the_unreadable_init_link() {
+        let read = || Err(std::io::ErrorKind::PermissionDenied.into());
+        assert_eq!(super::host_identity(Some((3, 7)), read).ok(), Some((3, 7)));
+        assert!(super::host_identity(None, read).is_err());
+        assert!(!super::namespace_is_private(
+            Ok((3, 7)),
+            super::host_identity(Some((3, 7)), read)
+        ));
+        assert!(super::namespace_is_private(
+            Ok((3, 8)),
+            super::host_identity(Some((3, 7)), read)
+        ));
+        assert!(!super::namespace_is_private(
+            Ok((3, 8)),
+            super::host_identity(None, read)
+        ));
+    }
+
+    #[test]
+    fn fleetd_writes_its_own_identity_only_when_it_is_in_the_host_namespace() {
+        assert_eq!(super::host_netns(Ok((1, 10)), Ok((1, 10))), Some((1, 10)));
+        assert_eq!(super::host_netns(Ok((1, 10)), denied()), Some((1, 10)));
+        assert_eq!(super::host_netns(Ok((1, 10)), Ok((1, 11))), None);
+        assert_eq!(super::host_netns(denied(), Ok((1, 10))), None);
+        assert_eq!(super::host_netns(denied(), denied()), None);
     }
 
     #[tokio::test]

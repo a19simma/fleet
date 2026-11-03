@@ -18,8 +18,9 @@ use std::time::Duration;
 use sha2::{Digest, Sha256};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
 use tokio::net::{UnixListener, UnixStream};
-use tokio::sync::{Semaphore, mpsc};
+use tokio::sync::{Semaphore, mpsc, watch};
 use tokio::task::{JoinHandle, JoinSet};
+use tokio::time::Instant;
 
 /// File name of the receiver socket inside the Job directory.
 pub const SOCKET_NAME: &str = "otel.sock";
@@ -33,6 +34,22 @@ pub const MAX_TOKEN_BYTES: usize = 256;
 pub const MAX_HEAD_BYTES: usize = 8 * 1024;
 /// Most header lines accepted in one request.
 pub const MAX_HEADERS: usize = 64;
+
+/// How long no body may arrive before a flush counts the stream as drained.
+pub const QUIET_PERIOD: Duration = Duration::from_millis(1500);
+/// Longest wait a flush honours, whatever deadline the caller passes.
+pub const MAX_FLUSH_DEADLINE: Duration = Duration::from_secs(10);
+
+/// Result of a flush.
+///
+/// `flush` returns once no connection is in flight and no body has been queued for the quiet
+/// period, counted from the call at the earliest. The caller's deadline is capped at
+/// [`MAX_FLUSH_DEADLINE`]. Dropping the future mutates nothing.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Flush {
+    /// The deadline fired before the stream went quiet.
+    pub incomplete: bool,
+}
 
 const MAX_CHUNK_LINE_BYTES: usize = 32;
 const READ_BUF_BYTES: usize = 4096;
@@ -141,9 +158,33 @@ pub struct OtelReceiver {
     path: PathBuf,
     identity: (u64, u64),
     task: JoinHandle<()>,
+    activity: Arc<watch::Sender<Activity>>,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct Activity {
+    in_flight: usize,
+    last_body: Option<Instant>,
+}
+
+struct InFlight(Arc<watch::Sender<Activity>>);
+
+impl InFlight {
+    fn enter(activity: &Arc<watch::Sender<Activity>>) -> Self {
+        activity.send_modify(|a| a.in_flight += 1);
+        Self(Arc::clone(activity))
+    }
+}
+
+impl Drop for InFlight {
+    fn drop(&mut self) {
+        self.0
+            .send_modify(|a| a.in_flight = a.in_flight.saturating_sub(1));
+    }
 }
 
 struct Shared {
+    activity: Arc<watch::Sender<Activity>>,
     token: BearerToken,
     tx: mpsc::Sender<Vec<u8>>,
     permits: Arc<Semaphore>,
@@ -182,7 +223,12 @@ impl OtelReceiver {
         }
         let (listener, identity) = publish(path, group)?;
         let (tx, rx) = mpsc::channel(limits.queue);
+        let activity = Arc::new(watch::Sender::new(Activity {
+            in_flight: 0,
+            last_body: None,
+        }));
         let shared = Arc::new(Shared {
+            activity: Arc::clone(&activity),
             token,
             tx,
             permits: Arc::new(Semaphore::new(limits.max_connections)),
@@ -195,6 +241,7 @@ impl OtelReceiver {
                 path: path.to_path_buf(),
                 identity,
                 task,
+                activity,
             },
             rx,
         ))
@@ -204,6 +251,39 @@ impl OtelReceiver {
     #[must_use]
     pub fn path(&self) -> &Path {
         &self.path
+    }
+
+    /// Waits for in-flight bodies and a quiet period; see [`Flush`].
+    pub async fn flush(&self, deadline: Duration) -> Flush {
+        self.flush_with(deadline, QUIET_PERIOD).await
+    }
+
+    /// [`flush`](Self::flush) with the quiet period as a parameter, for tests.
+    pub async fn flush_with(&self, deadline: Duration, quiet: Duration) -> Flush {
+        let start = Instant::now();
+        let end = start + deadline.min(MAX_FLUSH_DEADLINE);
+        let mut rx = self.activity.subscribe();
+        loop {
+            let snapshot = *rx.borrow_and_update();
+            let now = Instant::now();
+            let wake = if snapshot.in_flight == 0 {
+                let quiet_from = snapshot.last_body.map_or(start, |at| at.max(start));
+                let quiet_at = quiet_from + quiet;
+                if now >= quiet_at {
+                    return Flush { incomplete: false };
+                }
+                quiet_at.min(end)
+            } else {
+                end
+            };
+            if now >= end {
+                return Flush { incomplete: true };
+            }
+            tokio::select! {
+                () = tokio::time::sleep_until(wake) => {}
+                _ = rx.changed() => {}
+            }
+        }
     }
 }
 
@@ -285,10 +365,12 @@ async fn accept_loop(listener: UnixListener, shared: Arc<Shared>) {
                     let _ = stream.try_write(&render(Reply::BUSY));
                     continue;
                 };
+                let guard = InFlight::enter(&shared.activity);
                 let shared = Arc::clone(&shared);
                 set.spawn(async move {
                     serve(&shared, stream).await;
                     drop(permit);
+                    drop(guard);
                 });
             }
             Some(_) = set.join_next(), if !set.is_empty() => {}
@@ -571,7 +653,12 @@ async fn handle<R: AsyncRead + Unpin>(
         return Err(Reply::BAD_REQUEST.into());
     }
     match shared.tx.try_send(body) {
-        Ok(()) => Ok(()),
+        Ok(()) => {
+            shared
+                .activity
+                .send_modify(|a| a.last_body = Some(Instant::now()));
+            Ok(())
+        }
         Err(mpsc::error::TrySendError::Full(_)) => Err(Reply::FULL.into()),
         Err(mpsc::error::TrySendError::Closed(_)) => Err(Reply::BUSY.into()),
     }
