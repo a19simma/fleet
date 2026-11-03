@@ -179,6 +179,7 @@ fn gh() -> &'static Path {
 const CLAUDE: &str = r#"#!/bin/sh
 case "${2#*:}" in
 write) echo agent > new.txt ;;
+slow) sleep 0.6; echo agent > new.txt ;;
 commit) echo agent > new.txt; git add -A; git commit -q -m "feat: by the agent" ;;
 secret) echo "key hunter2-hunter2" > leak.txt ;;
 trap)
@@ -3081,4 +3082,372 @@ async fn a_job_with_open_pr_off_gets_no_broker_pull_request() -> TestResult {
         Ok(())
     }))
     .await
+}
+
+mod timing_e2e {
+    use std::future::{Future, pending};
+    use std::io;
+    use std::num::NonZeroU16;
+    use std::path::PathBuf;
+    use std::pin::Pin;
+    use std::process::ExitStatus;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{Mutex, PoisonError};
+    use std::time::Duration;
+
+    use fleet_core::{PLACEHOLDER, Redactor};
+    use fleet_proto::v1::{ReportJobRequest, ReportTimingRequest};
+    use fleetd::bg_command::{BgConfig, LogFetch, PueueClient, PueueError};
+    use fleetd::now_ms;
+    use fleetd::otel::{BearerToken, Limits, OtelReceiver, SOCKET_NAME};
+    use fleetd::poller::{Shutdown, TimingOutcome, TimingReportError};
+    use fleetd::runner::{
+        AgentOutcome, AgentProc, AgentRunner, AgentSpec, DirectLauncher, FinishOutcome, Launched,
+        Launcher, PueueBg, RunConfig, TelemetryCapture, TimingSink, TimingWiring,
+    };
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::UnixStream;
+    use tokio::sync::mpsc;
+
+    use super::{
+        Fake, Reply, Rig, TestResult, claude, common, gh, git_wrapper, job, rig, test_policy,
+    };
+
+    const TOKEN: &str = "0123456789abcdefTOKEN";
+    const SECRET: &str = "hunter2-hunter2";
+
+    type SinkFuture<'a> =
+        Pin<Box<dyn Future<Output = Result<TimingOutcome, TimingReportError>> + Send + 'a>>;
+
+    #[derive(Clone, Copy, PartialEq)]
+    enum Mode {
+        Store,
+        Fail,
+        Hang,
+    }
+
+    #[derive(Debug)]
+    struct Capturing {
+        mode: Mode,
+        seen: Mutex<Vec<ReportTimingRequest>>,
+    }
+
+    impl std::fmt::Debug for Mode {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.write_str("Mode")
+        }
+    }
+
+    impl TimingSink for Capturing {
+        fn send(&self, request: ReportTimingRequest) -> SinkFuture<'_> {
+            self.seen
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .push(request);
+            let mode = self.mode;
+            Box::pin(async move {
+                match mode {
+                    Mode::Store => Ok(TimingOutcome::Acked { attempts: 1 }),
+                    Mode::Fail => Err(TimingReportError::EmptyJobId),
+                    Mode::Hang => pending().await,
+                }
+            })
+        }
+    }
+
+    fn civil(days: i64) -> (i64, i64, i64) {
+        let z = days + 719_468;
+        let era = z.div_euclid(146_097);
+        let doe = z.rem_euclid(146_097);
+        let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+        let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+        let mp = (5 * doy + 2) / 153;
+        let day = doy - (153 * mp + 2) / 5 + 1;
+        let month = if mp < 10 { mp + 3 } else { mp - 9 };
+        let year = yoe + era * 400 + i64::from(month <= 2);
+        (year, month, day)
+    }
+
+    fn rfc3339(ms: u64) -> String {
+        let ms = i64::try_from(ms).unwrap_or(0);
+        let secs = ms / 1000;
+        let (year, month, day) = civil(secs / 86_400);
+        let rest = secs % 86_400;
+        format!(
+            "{year:04}-{month:02}-{day:02}T{:02}:{:02}:{:02}.{:03}000+00:00",
+            rest / 3600,
+            rest % 3600 / 60,
+            rest % 60,
+            ms % 1000
+        )
+    }
+
+    struct PueueState {
+        created: u64,
+        calls: AtomicUsize,
+    }
+
+    #[derive(Clone)]
+    struct Pueue(Arc<PueueState>);
+
+    impl PueueClient for Pueue {
+        fn status_json(&self) -> impl Future<Output = Result<String, PueueError>> + Send {
+            let n = self.0.calls.fetch_add(1, Ordering::SeqCst);
+            let start = rfc3339(self.0.created);
+            let status = if n == 0 {
+                String::new()
+            } else {
+                format!(
+                    r#""1":{{"id":1,"created_at":"{start}","original_command":"make {SECRET}","command":"make {SECRET}","path":"/w","envs":{{}},"group":"default","dependencies":[],"priority":0,"label":null,"status":{{"Running":{{"enqueued_at":"{start}","start":"{start}"}}}}}}"#
+                )
+            };
+            std::future::ready(Ok(format!(r#"{{"tasks":{{{status}}},"groups":{{}}}}"#)))
+        }
+
+        fn log(
+            &self,
+            _id: u64,
+            max_bytes: usize,
+        ) -> impl Future<Output = Result<LogFetch, PueueError>> + Send {
+            std::future::ready(Ok(LogFetch::checked(
+                format!("compiling with {SECRET}\ndone\n").into_bytes(),
+                max_bytes,
+            )))
+        }
+    }
+
+    struct Holding {
+        inner: Box<dyn AgentProc>,
+        _receiver: OtelReceiver,
+    }
+
+    impl AgentProc for Holding {
+        fn wait(&mut self) -> Pin<Box<dyn Future<Output = io::Result<ExitStatus>> + Send + '_>> {
+            self.inner.wait()
+        }
+
+        fn terminate(&mut self) {
+            self.inner.terminate();
+        }
+
+        fn kill(&mut self) {
+            self.inner.kill();
+        }
+    }
+
+    #[derive(Debug)]
+    struct Posting {
+        dir: PathBuf,
+        body: String,
+    }
+
+    async fn post(path: PathBuf, body: String) -> io::Result<()> {
+        let raw = format!(
+            "POST /v1/logs HTTP/1.1\r\nAuthorization: Bearer {TOKEN}\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
+            body.len()
+        );
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        let mut stream = UnixStream::connect(path).await?;
+        stream.write_all(raw.as_bytes()).await?;
+        let mut out = Vec::new();
+        stream.read_to_end(&mut out).await.map(|_| ())
+    }
+
+    impl Launcher for Posting {
+        fn launch(&self, spec: AgentSpec) -> io::Result<Launched> {
+            let mut launched = DirectLauncher.launch(spec)?;
+            let token = BearerToken::new(TOKEN).map_err(io::Error::other)?;
+            let limits = Limits {
+                max_body: 1 << 20,
+                max_connections: 4,
+                queue: 8,
+                request_timeout: Duration::from_secs(5),
+            };
+            let (receiver, bodies) =
+                OtelReceiver::bind(&self.dir.join(SOCKET_NAME), token, None, limits)?;
+            tokio::spawn(post(receiver.path().to_path_buf(), self.body.clone()));
+            launched.telemetry = Some(TelemetryCapture {
+                port: NonZeroU16::new(4318).ok_or_else(|| io::Error::other("port"))?,
+                token: TOKEN.to_owned(),
+                bodies,
+            });
+            launched.proc = Box::new(Holding {
+                inner: launched.proc,
+                _receiver: receiver,
+            });
+            Ok(launched)
+        }
+    }
+
+    fn attr(key: &str, value: &str) -> serde_json::Value {
+        serde_json::json!({"key": key, "value": {"stringValue": value}})
+    }
+
+    fn otlp() -> String {
+        let api = serde_json::json!({"timeUnixNano": "1", "attributes": [
+            attr("event.name", "claude_code.api_request"), attr("duration_ms", "300")]});
+        let tool = serde_json::json!({"timeUnixNano": "2", "attributes": [
+            attr("event.name", "claude_code.tool_result"), attr("tool_use_id", "toolu_1"),
+            attr("tool_name", "Bash"), attr("duration_ms", "40"), attr("success", "true"),
+            attr("command", &format!("echo {SECRET}"))]});
+        serde_json::json!({"resourceLogs": [{"resource": {"attributes": []},
+            "scopeLogs": [{"scope": {"name": "x"}, "logRecords": [api, tool]}]}]})
+        .to_string()
+    }
+
+    type Rigged = (
+        AgentRunner<Fake>,
+        mpsc::UnboundedReceiver<ReportJobRequest>,
+        Arc<Capturing>,
+    );
+
+    fn runner(rig: &Rig, mode: Mode) -> Rigged {
+        let (tx, rx) = mpsc::unbounded_channel();
+        let mut config = RunConfig::new(claude(), false);
+        config.ci_poll_initial = Duration::from_millis(20);
+        config.ci_poll_cap = Duration::from_millis(50);
+        config.repo_policy = test_policy();
+        gh().clone_into(&mut config.gh_bin);
+        git_wrapper().clone_into(&mut config.git_bin);
+        config.askpass_bin = PathBuf::from(env!("CARGO_BIN_EXE_fleetd"));
+        config.jobs_dir = Some(rig.dir.path().join("work"));
+        config.base_env = vec![("HOME".into(), rig.dir.path().into())];
+        config
+            .base_env
+            .extend(std::env::var_os("PATH").map(|path| ("PATH".into(), path)));
+        let sink = Arc::new(Capturing {
+            mode,
+            seen: Mutex::new(Vec::new()),
+        });
+        let pueue = Pueue(Arc::new(PueueState {
+            created: now_ms(),
+            calls: AtomicUsize::new(0),
+        }));
+        let bg = BgConfig {
+            interval: Duration::from_millis(20),
+            deadline: Duration::from_secs(30),
+            call_timeout: Duration::from_secs(1),
+        };
+        let wiring = TimingWiring::new(sink.clone())
+            .with_bg(Arc::new(PueueBg::new(pueue, bg)))
+            .with_flush(Duration::from_millis(300), Duration::from_secs(5))
+            .with_send_timeout(Duration::from_millis(500));
+        let launcher = Posting {
+            dir: rig.dir.path().to_path_buf(),
+            body: otlp(),
+        };
+        let runner = AgentRunner::new(config, Fake(tx, Reply::Ok), Redactor::new([SECRET]))
+            .with_launcher(Arc::new(launcher))
+            .with_timing(wiring);
+        (runner, rx, sink)
+    }
+
+    async fn run_job(
+        rig: &Rig,
+        runner: &AgentRunner<Fake>,
+    ) -> Result<FinishOutcome, Box<dyn std::error::Error>> {
+        let (_trigger, shutdown) = Shutdown::channel();
+        let mut job = job(rig, false);
+        "x:slow".clone_into(&mut job.prompt);
+        let ran = runner.run(&job, &rig.worktree, shutdown.clone()).await?;
+        assert_eq!(ran, AgentOutcome::Succeeded);
+        Ok(runner.finish(&job, &rig.worktree, shutdown).await?)
+    }
+
+    fn transcript(rx: &mut mpsc::UnboundedReceiver<ReportJobRequest>) -> String {
+        let mut text = String::new();
+        while let Ok(request) = rx.try_recv() {
+            for chunk in &request.chunks {
+                text.push_str(&chunk.text);
+            }
+        }
+        text
+    }
+
+    #[tokio::test]
+    async fn a_job_reports_parts_that_sum_to_wall_with_the_redacted_command_and_log() -> TestResult
+    {
+        common::bounded(Box::pin(async {
+            let rig = rig("ok").await?;
+            let (runner, mut rx, sink) = runner(&rig, Mode::Store);
+            let outcome = run_job(&rig, &runner).await?;
+            assert!(matches!(outcome, FinishOutcome::Succeeded { .. }));
+            let request = {
+                let seen = sink.seen.lock().unwrap_or_else(PoisonError::into_inner);
+                assert_eq!(seen.len(), 1);
+                seen[0].clone()
+            };
+            assert_eq!(request.job_id, "job1");
+            assert_eq!(request.attempt, 1);
+            assert_eq!(request.r#box, "boxa");
+            let summary = request.summary.ok_or("summary")?;
+            assert!(summary.wall_ms > 0);
+            assert!(summary.shell_ms > 100, "{request:?}");
+            assert_eq!(
+                summary.api_wait_ms
+                    + summary.tool_ms
+                    + summary.shell_ms
+                    + summary.idle_ms
+                    + summary.overhead_ms,
+                summary.wall_ms
+            );
+            assert!(request.spans.iter().all(|s| s.end_ms <= summary.wall_ms));
+            let fg = request
+                .shell_commands
+                .iter()
+                .find(|c| !c.background)
+                .ok_or("foreground command")?;
+            assert!(fg.command.contains(PLACEHOLDER), "{}", fg.command);
+            assert!(!fg.command.contains(SECRET));
+            let bg = request
+                .shell_commands
+                .iter()
+                .find(|c| c.background)
+                .ok_or("background command")?;
+            assert!(bg.command.contains(PLACEHOLDER), "{}", bg.command);
+            assert!(bg.log.contains(PLACEHOLDER), "{}", bg.log);
+            assert!(!bg.log.contains(SECRET));
+            assert!(bg.started_ms <= summary.wall_ms);
+            assert!(bg.ended_ms.ok_or("ended")? < summary.wall_ms);
+            assert!(bg.duration_ms > 100, "{}", bg.duration_ms);
+            assert_eq!(bg.ended_by.as_deref(), Some("job_exit"));
+            assert!(!transcript(&mut rx).contains("timing note"));
+            Ok(())
+        }))
+        .await
+    }
+
+    #[tokio::test]
+    async fn a_failing_sink_leaves_the_job_succeeded_and_records_a_note() -> TestResult {
+        common::bounded(Box::pin(async {
+            let rig = rig("ok").await?;
+            let (runner, mut rx, sink) = runner(&rig, Mode::Fail);
+            let outcome = run_job(&rig, &runner).await?;
+            assert!(matches!(outcome, FinishOutcome::Succeeded { .. }));
+            assert_eq!(
+                sink.seen
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .len(),
+                1
+            );
+            assert!(transcript(&mut rx).contains("timing note: "));
+            Ok(())
+        }))
+        .await
+    }
+
+    #[tokio::test]
+    async fn a_hanging_sink_is_cut_at_the_send_timeout_and_the_job_still_succeeds() -> TestResult {
+        common::bounded(Box::pin(async {
+            let rig = rig("ok").await?;
+            let (runner, mut rx, _sink) = runner(&rig, Mode::Hang);
+            let outcome = run_job(&rig, &runner).await?;
+            assert!(matches!(outcome, FinishOutcome::Succeeded { .. }));
+            assert!(transcript(&mut rx).contains("timing note: "));
+            Ok(())
+        }))
+        .await
+    }
 }

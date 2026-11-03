@@ -88,10 +88,15 @@ mod ci;
 mod codex;
 mod kimi;
 mod preflight;
+pub mod timing;
 mod token;
 
 pub use preflight::{
     InstallFuture, PreflightError, TOOL_PREFLIGHT_FAILED, ToolInstaller, ToolPreflight,
+};
+pub use timing::{
+    BgFactory, BgRun, Capture, Collector, Gathered, Note, PueueBg, ReporterSink, TimingSink,
+    TimingWiring, observed_id,
 };
 
 use crate::workspace::{RepoPolicy, validate_job_id};
@@ -787,6 +792,8 @@ pub struct AgentRunner<R> {
     feeds: Option<Arc<FeedBook>>,
     end: JobEnd,
     claude_version: Mutex<Option<String>>,
+    timing: Option<TimingWiring>,
+    gathered: Mutex<HashMap<String, Gathered>>,
     pub(crate) publishing: Mutex<HashMap<String, Arc<JobPublish>>>,
 }
 
@@ -823,8 +830,18 @@ impl<R: Reporter> AgentRunner<R> {
             feeds: None,
             end: JobEnd::default(),
             claude_version: Mutex::new(None),
+            timing: None,
+            gathered: Mutex::new(HashMap::new()),
             publishing: Mutex::new(HashMap::new()),
         }
+    }
+
+    /// Captures a timing breakdown of each job and reports it through `wiring` just before the
+    /// terminal report of a job that ends `SUCCEEDED`. Without it no timing is captured.
+    #[must_use]
+    pub fn with_timing(mut self, wiring: TimingWiring) -> Self {
+        self.timing = Some(wiring);
+        self
     }
 
     /// Resolves the tools of each Profile through `preflight` before the agent starts. Without
@@ -1132,6 +1149,10 @@ impl<R: Reporter> AgentRunner<R> {
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .remove(&key);
+        self.gathered
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .remove(&job.job_id);
         self.forget_publish(&job.job_id);
         self.forget_job_redactor(&job.job_id);
         self.forget_codex_home(&job.job_id);
@@ -1353,8 +1374,11 @@ impl<R: Reporter> AgentRunner<R> {
             self.end.set_hosts(&job.job_id, runner.model_hosts());
         }
         let program = spec.argv.first().cloned().unwrap_or_default();
+        let t0 = Instant::now();
         let Launched {
-            stdout, mut proc, ..
+            stdout,
+            mut proc,
+            telemetry,
         } = match launch(spec) {
             Ok(launched) => launched,
             Err(err) => {
@@ -1366,6 +1390,7 @@ impl<R: Reporter> AgentRunner<R> {
                 return Ok(stream.fail(None, ERR_START).await);
             }
         };
+        let capture = self.start_capture(job, t0, telemetry).await;
         let mut ctl = Ctl {
             deadline: Box::pin(tokio::time::sleep(self.config.timeout)),
             shutdown,
@@ -1380,6 +1405,7 @@ impl<R: Reporter> AgentRunner<R> {
         }
         proc.kill();
         let _ = proc.wait().await;
+        self.stop_capture(job, capture).await;
         match end {
             Ok(status) => {
                 let capped = stream.feed().result_subtype().and_then(cap_error);
@@ -1514,6 +1540,7 @@ impl<R: Reporter> AgentRunner<R> {
                     tracing::info!("job ended with no changes");
                     stream.push(&redactor, NO_CHANGES_NOTE);
                 }
+                self.report_timing(job, &redactor, &mut stream).await;
                 stream
                     .terminal(Terminal {
                         state: JobState::Succeeded,
@@ -1553,6 +1580,53 @@ impl<R: Reporter> AgentRunner<R> {
             Err(Stop::Shutdown) => {
                 stream.fail(None, ERR_SHUTDOWN).await;
                 Err(RunError)
+            }
+        }
+    }
+
+    async fn start_capture(
+        &self,
+        job: &Job,
+        t0: Instant,
+        telemetry: Option<TelemetryCapture>,
+    ) -> Option<Capture> {
+        let wiring = self.timing.as_ref()?;
+        let redactor = self.job_redactor(&job.job_id);
+        Some(Capture::start(wiring, t0, &redactor, telemetry).await)
+    }
+
+    async fn stop_capture(&self, job: &Job, capture: Option<Capture>) {
+        let Some(capture) = capture else { return };
+        let kimi_home = self.kimi_home_path(&job.job_id);
+        let gathered = capture.stop(kimi_home.as_deref()).await;
+        self.gathered
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .insert(job.job_id.clone(), gathered);
+    }
+
+    async fn report_timing(&self, job: &Job, redactor: &Redactor, stream: &mut Stream<'_, R>) {
+        let Some(wiring) = &self.timing else { return };
+        let gathered = self
+            .gathered
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .remove(&job.job_id);
+        let Some(gathered) = gathered else { return };
+        let built = gathered.request(&job.job_id, job.attempt, &job.r#box, gathered.wall_ms());
+        for note in &built.notes {
+            stream.push(redactor, note.text());
+        }
+        let sent = tokio::time::timeout(wiring.send_timeout, wiring.sink.send(built.request)).await;
+        match sent {
+            Ok(Ok(outcome)) => tracing::info!(?outcome, "timing report ended"),
+            Ok(Err(err)) => {
+                tracing::warn!(error = %err, "timing report not sent");
+                stream.push(redactor, Note::ReportLost.text());
+            }
+            Err(_) => {
+                tracing::warn!("timing report timed out");
+                stream.push(redactor, Note::ReportLost.text());
             }
         }
     }
