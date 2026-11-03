@@ -28,12 +28,18 @@
 //! `now`, and a task stops at [`MAX_SHELL_LOG_CHUNKS`] chunks with a final `Failed` report
 //! because the wire has no truncation status.
 //!
+//! `pueue log --lines` returns a sliding window, so the pusher cannot index a byte offset into
+//! a read that may have lost its head. A read of [`LOG_LINES`] or more lines, a read whose
+//! redacted text is shorter than what was sent, and a read whose head no longer matches the
+//! sent bytes all fail the task closed: one empty `Failed` chunk, then no more pushes.
+//!
 //! Limit: pueue reuses ids after `pueue reset`, so a task created after a reset with an id at or
 //! below the baseline is not seen. The watcher polls as the uid of its [`PueueClient`]; the
 //! caller chooses that uid when it builds the client.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
+use std::hash::{DefaultHasher, Hasher};
 use std::path::PathBuf;
 use std::time::Duration;
 
@@ -893,11 +899,34 @@ pub struct LogPushReport {
     pub overflow: u64,
 }
 
+#[derive(Debug, Default)]
+struct LogRead {
+    text: String,
+    cut: bool,
+    windowed: bool,
+}
+
+fn line_count(raw: &[u8]) -> usize {
+    let segments = raw.split(|b| *b == b'\n').count();
+    segments - usize::from(raw.last().is_none_or(|b| *b == b'\n'))
+}
+
+impl LogTask {
+    fn prefix_holds(&self, text: &str) -> bool {
+        text.get(..self.sent).is_some_and(|head| {
+            let mut again = DefaultHasher::new();
+            again.write(head.as_bytes());
+            again.finish() == self.digest.finish()
+        })
+    }
+}
+
 #[derive(Debug)]
 struct LogTask {
     command_id: String,
     seq: u32,
     sent: usize,
+    digest: DefaultHasher,
     last: Option<v1::ShellStatus>,
     done: bool,
     errors: u32,
@@ -1023,15 +1052,16 @@ impl<C: PueueClient, R: LogReporter> LogPusher<C, R> {
         self.credit >= LOG_CHUNK_COST
     }
 
-    async fn read(&self, id: u64) -> Option<(String, bool)> {
+    async fn read(&self, id: u64) -> Option<LogRead> {
         let call = self.client.log(id, LIVE_LOG_READ_CAP + 1);
         let Ok(Ok(raw)) = tokio::time::timeout(self.config.call_timeout, call).await else {
             return None;
         };
-        Some((
-            clean_log(&self.redactor, &raw),
-            raw.len() > LIVE_LOG_READ_CAP,
-        ))
+        Some(LogRead {
+            text: clean_log(&self.redactor, &raw),
+            cut: raw.len() > LIVE_LOG_READ_CAP,
+            windowed: line_count(&raw) >= LOG_LINES,
+        })
     }
 
     async fn send(&mut self, task: &mut LogTask, bytes: &str, status: v1::ShellStatus) -> bool {
@@ -1050,6 +1080,7 @@ impl<C: PueueClient, R: LogReporter> LogPusher<C, R> {
             self.credit = self.credit.saturating_sub(LOG_CHUNK_COST);
             task.seq += 1;
             task.sent += bytes.len();
+            task.digest.write(bytes.as_bytes());
             task.errors = 0;
             task.last = Some(status);
             task.done = is_terminal(status);
@@ -1086,7 +1117,14 @@ impl<C: PueueClient, R: LogReporter> LogPusher<C, R> {
         } else {
             None
         };
-        let (text, cut) = text.unwrap_or_default();
+        if let Some(read) = &text {
+            let stable = !read.windowed && task.prefix_holds(&read.text);
+            if !stable {
+                self.send(task, "", v1::ShellStatus::Failed).await;
+                return;
+            }
+        }
+        let LogRead { text, cut, .. } = text.unwrap_or_default();
         let hold = !target.terminal || cut;
         let end = if hold {
             floor_boundary(&text, text.len().saturating_sub(LOG_TAIL_GUARD))
@@ -1146,6 +1184,7 @@ impl<C: PueueClient, R: LogReporter> LogPusher<C, R> {
                 command_id: log_command_id(seen.id),
                 seq: 0,
                 sent: 0,
+                digest: DefaultHasher::new(),
                 last: None,
                 done: false,
                 errors: 0,

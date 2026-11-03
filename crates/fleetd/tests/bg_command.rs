@@ -16,9 +16,9 @@ use fleet_proto::{
 };
 use fleetd::bg_command::{
     Anchor, BgConfig, BgOutcome, BgState, BgWatcher, EndedBy, LIVE_LOG_READ_CAP, LOG_BURST,
-    LOG_CHUNK_COST, LOG_READ_CAP, LOG_TAIL_GUARD, LogChunk, LogPushConfig, LogPusher, LogReporter,
-    MAX_LOG_ERRORS, MAX_POLL_ERRORS, MAX_TRACKED_TASKS, PueueCli, PueueClient, PueueError,
-    ReportError, Rule, log_command_id, parse_timestamp, rule,
+    LOG_CHUNK_COST, LOG_LINES, LOG_READ_CAP, LOG_TAIL_GUARD, LogChunk, LogPushConfig, LogPusher,
+    LogReporter, MAX_LOG_ERRORS, MAX_POLL_ERRORS, MAX_TRACKED_TASKS, PueueCli, PueueClient,
+    PueueError, ReportError, Rule, log_command_id, parse_timestamp, rule,
 };
 use tokio::time::Instant;
 
@@ -765,8 +765,12 @@ fn push_config() -> LogPushConfig {
 }
 
 async fn drain(p: &mut LogPusher<&Fake, &Rec>, t0: Instant) {
+    drain_round(p, t0, 0).await;
+}
+
+async fn drain_round(p: &mut LogPusher<&Fake, &Rec>, t0: Instant, round: u64) {
     for i in 1..=12_u32 {
-        p.poll(t0 + Duration::from_secs(10_000) * i)
+        p.poll(t0 + Duration::from_secs(1_000_000 * round) + Duration::from_secs(10_000) * i)
             .await
             .expect("poll");
     }
@@ -1354,4 +1358,226 @@ async fn a_queued_task_is_never_read() {
     p.poll(t0).await.expect("poll");
     assert_eq!(rec.statuses(), vec![v1::ShellStatus::Queued]);
     assert_eq!(fake.log_calls.lock().expect("lock").len(), 0);
+}
+
+const PEM_LINES: [&str; 5] = [
+    "-----BEGIN PRIVATE KEY-----",
+    "MIIEvQIBADANBgkqhkiG9w0BAQEFAASCBKcwggSjAgEAAoIBAQC7pemBODYone",
+    "k7Lm2QpWfXh9sT4uVd1aRzN8cYbE0gHjKiOlMnPqRsTuVwXyZ0123456789abc",
+    "QwErTyUiOpAsDfGhJkLzXcVbNm1234567890qwertyuiopasdfghjklzxcvbnmQ",
+    "-----END PRIVATE KEY-----",
+];
+
+fn pem() -> String {
+    PEM_LINES.join("\n")
+}
+
+fn stream(first: usize, upto: usize, fill: &str) -> Vec<u8> {
+    let mut lines: Vec<String> = PEM_LINES.iter().map(|l| (*l).to_owned()).collect();
+    let mut n = 0_usize;
+    while lines.len() < upto {
+        lines.push(format!("{fill}{n:04}"));
+        n += 1;
+    }
+    let mut out = lines.get(first..upto).expect("range").join("\n");
+    out.push('\n');
+    out.into_bytes()
+}
+
+fn assert_no_pem_fragment(text: &str) {
+    for line in &PEM_LINES[1..4] {
+        for width in [8, line.len()] {
+            for at in 0..=line.len() - width {
+                assert!(
+                    !text.contains(&line[at..at + width]),
+                    "fragment {:?} was pushed",
+                    &line[at..at + width]
+                );
+            }
+        }
+    }
+}
+
+fn set_log(fake: &Fake, bytes: Vec<u8>) {
+    fake.logs.lock().expect("lock").insert(1, Ok(bytes));
+}
+
+async fn pem_pusher<'a>(fake: &'a Fake, rec: &'a Rec, t0: Instant) -> LogPusher<&'a Fake, &'a Rec> {
+    pusher(fake, rec, Redactor::new([pem()]), t0).await
+}
+
+#[tokio::test]
+async fn a_sliding_window_that_loses_a_pem_head_pushes_no_fragment() {
+    let fake = Fake::with(vec![]);
+    let rec = Rec::default();
+    let t0 = Instant::now();
+    let mut p = pem_pusher(&fake, &rec, t0).await;
+    set_log(&fake, stream(0, 400, "f"));
+    set_tasks(&fake, &[task(1, &running())]);
+    p.poll(t0).await.expect("poll");
+    assert!(rec.text().is_empty(), "guard holds the short log back");
+    set_log(&fake, stream(3, 1003, "f"));
+    set_tasks(&fake, &[finished_task(1)]);
+    drain(&mut p, t0).await;
+    assert_no_pem_fragment(&rec.text());
+    assert_eq!(
+        rec.statuses(),
+        vec![v1::ShellStatus::Running, v1::ShellStatus::Failed]
+    );
+    assert_eq!(rec.text(), "");
+}
+
+#[tokio::test]
+async fn a_sliding_window_never_duplicates_or_skips_a_chunk() {
+    let fake = Fake::with(vec![]);
+    let rec = Rec::default();
+    let t0 = Instant::now();
+    let mut p = pem_pusher(&fake, &rec, t0).await;
+    let filler = "filler-line-";
+    set_log(&fake, stream(0, 990, filler));
+    set_tasks(&fake, &[task(1, &running())]);
+    drain(&mut p, t0).await;
+    let before = rec.text();
+    assert!(
+        before.len() > 4096,
+        "positive control: the first read pushed"
+    );
+    assert!(before.starts_with(PLACEHOLDER));
+    for (i, (first, upto)) in [(3, 1003), (30, 1030), (200, 1200)].into_iter().enumerate() {
+        set_log(&fake, stream(first, upto, filler));
+        let at = t0 + Duration::from_secs(1_000_000 * (i as u64 + 1));
+        for k in 0..12_u32 {
+            p.poll(at + Duration::from_secs(10_000) * k)
+                .await
+                .expect("poll");
+        }
+    }
+    let full = rec.text();
+    assert!(full.starts_with(&before));
+    assert!(full == before, "nothing is pushed from a slid window");
+    assert_no_pem_fragment(&full);
+    assert_eq!(rec.statuses().last(), Some(&v1::ShellStatus::Failed));
+    let seqs: Vec<u32> = rec.all().iter().map(|c| c.seq).collect();
+    assert!(
+        seqs.iter()
+            .enumerate()
+            .all(|(i, s)| usize::try_from(*s) == Ok(i))
+    );
+}
+
+#[tokio::test]
+async fn a_window_at_the_line_limit_fails_closed_and_one_below_does_not() {
+    for (lines, fails) in [
+        (LOG_LINES - 1, false),
+        (LOG_LINES, true),
+        (LOG_LINES + 1, true),
+    ] {
+        let fake = Fake::with(vec![]);
+        let rec = Rec::default();
+        let t0 = Instant::now();
+        let mut p = pem_pusher(&fake, &rec, t0).await;
+        set_log(&fake, stream(0, lines, "w"));
+        set_tasks(&fake, &[finished_task(1)]);
+        drain(&mut p, t0).await;
+        let last = rec.statuses().last().copied();
+        if fails {
+            assert_eq!(rec.statuses(), vec![v1::ShellStatus::Failed], "{lines}");
+            assert!(rec.text().is_empty(), "{lines}");
+        } else {
+            assert_eq!(last, Some(v1::ShellStatus::Done), "{lines}");
+            assert!(rec.text().contains(PLACEHOLDER), "{lines}");
+        }
+    }
+}
+
+#[tokio::test]
+async fn a_log_without_a_trailing_newline_counts_its_last_line() {
+    for (lines, fails) in [(LOG_LINES - 1, false), (LOG_LINES, true)] {
+        let fake = Fake::with(vec![]);
+        let rec = Rec::default();
+        let t0 = Instant::now();
+        let mut p = pem_pusher(&fake, &rec, t0).await;
+        let mut bytes = stream(0, lines, "w");
+        bytes.pop();
+        set_log(&fake, bytes);
+        set_tasks(&fake, &[finished_task(1)]);
+        drain(&mut p, t0).await;
+        let failed = rec.statuses() == vec![v1::ShellStatus::Failed];
+        assert_eq!(failed, fails, "{lines}");
+    }
+}
+
+#[tokio::test]
+async fn a_log_that_shrinks_or_resets_mid_task_fails_closed() {
+    for shrunk in [Vec::new(), b"short\n".to_vec()] {
+        let fake = Fake::with(vec![]);
+        let rec = Rec::default();
+        let t0 = Instant::now();
+        let mut p = pem_pusher(&fake, &rec, t0).await;
+        set_log(&fake, stream(0, 900, "f"));
+        set_tasks(&fake, &[task(1, &running())]);
+        drain(&mut p, t0).await;
+        let before = rec.all().len();
+        assert!(before > 0, "positive control: the first read pushed");
+        set_log(&fake, shrunk);
+        drain_round(&mut p, t0, 1).await;
+        let chunks = rec.all();
+        assert_eq!(chunks.len(), before + 1);
+        let last = chunks.last().expect("chunk");
+        assert_eq!(last.status, v1::ShellStatus::Failed);
+        assert_eq!(last.bytes, Vec::<u8>::new());
+    }
+}
+
+#[tokio::test]
+async fn a_log_rewritten_in_place_fails_closed() {
+    let fake = Fake::with(vec![]);
+    let rec = Rec::default();
+    let t0 = Instant::now();
+    let mut p = pem_pusher(&fake, &rec, t0).await;
+    let original = stream(0, 900, "f");
+    set_log(&fake, original.clone());
+    set_tasks(&fake, &[task(1, &running())]);
+    drain(&mut p, t0).await;
+    let before = rec.all().len();
+    assert!(before > 0, "positive control: the first read pushed");
+    let mut rewritten = original;
+    rewritten[40] ^= 1;
+    set_log(&fake, rewritten);
+    drain_round(&mut p, t0, 1).await;
+    assert_eq!(rec.all().len(), before + 1);
+    assert_eq!(rec.statuses().last(), Some(&v1::ShellStatus::Failed));
+}
+
+#[tokio::test]
+async fn a_failed_task_pushes_nothing_more_after_the_window_fails_it() {
+    let fake = Fake::with(vec![]);
+    let rec = Rec::default();
+    let t0 = Instant::now();
+    let mut p = pem_pusher(&fake, &rec, t0).await;
+    set_log(&fake, stream(0, LOG_LINES, "w"));
+    set_tasks(&fake, &[task(1, &running())]);
+    drain(&mut p, t0).await;
+    set_log(&fake, stream(0, 500, "w"));
+    drain_round(&mut p, t0, 1).await;
+    assert_eq!(rec.all().len(), 1);
+}
+
+#[tokio::test]
+async fn a_failed_fail_closed_report_pushes_no_data_and_is_retried() {
+    let fake = Fake::with(vec![]);
+    let rec = Rec::default();
+    let t0 = Instant::now();
+    let mut p = pem_pusher(&fake, &rec, t0).await;
+    set_log(&fake, stream(3, 1003, "f"));
+    set_tasks(&fake, &[finished_task(1)]);
+    *rec.fail.lock().expect("lock") = 1;
+    p.poll(t0).await.expect("poll");
+    assert!(
+        rec.all().is_empty(),
+        "the failed report sent no data after it"
+    );
+    drain(&mut p, t0).await;
+    assert_eq!(rec.statuses(), vec![v1::ShellStatus::Failed]);
+    assert_eq!(rec.text(), "");
 }
