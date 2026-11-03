@@ -82,6 +82,6 @@ Security of the receiver itself: any process on the Box can reach a host loopbac
 
 - fleetd gains an HTTP receiver, an OTLP parser, a pueue poller and a Kimi wire parser. Each is a pure parser or an injected client, so each has a table test.
 - `ReportTiming` and `GetJobTiming` are new RPCs. Reporting needs the box token and a live lease on the Job. Reading needs the client token.
-- The server stores spans and shell commands per Job, and retention removes them with the Job.
+- The server stores spans and shell commands per Job. Retention prunes the timing, span and shell command rows at the summary age. Jobs themselves are not deleted today.
 - Claude events carry tool parameters when `OTEL_LOG_TOOL_DETAILS=1`. The receiver redacts the command before it stores or forwards it, and the raw event body is never kept.
 - Not covered: a background task that outlives the Job has no end time, and Kimi timing waits on a captured fixture.
