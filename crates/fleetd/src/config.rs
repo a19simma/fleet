@@ -5,6 +5,7 @@ use serde::Deserialize;
 
 use crate::Error;
 use crate::fetch_policy::{FetchCaps, FetchPolicy, HostPattern};
+use crate::jobenv::TelemetryRefused;
 use crate::runner::{
     DEFAULT_CI_DEADLINE, DEFAULT_MAX_BUDGET_USD, DEFAULT_MAX_TURNS, DEFAULT_TIMEOUT,
 };
@@ -73,6 +74,7 @@ struct FileConfig {
     kimi_bin: Option<PathBuf>,
     gh_bin: Option<PathBuf>,
     disposable: Option<bool>,
+    host_netns_attested: Option<bool>,
     jobs_dir: Option<PathBuf>,
     repo_hosts: Option<Vec<String>>,
     token_host: Option<String>,
@@ -126,6 +128,10 @@ pub struct SecretsFile {
 
 /// Resolved fleetd settings.
 #[derive(Debug, Clone, PartialEq)]
+#[expect(
+    clippy::struct_excessive_bools,
+    reason = "each flag is an independent operator switch"
+)]
 pub struct Config {
     /// Loopback TCP port for hooks.
     pub http_port: u16,
@@ -156,6 +162,11 @@ pub struct Config {
     pub gh_bin: PathBuf,
     /// True when the box is disposable, which lets jobs run with permission checks off.
     pub disposable: bool,
+    /// Operator attestation that fleetd runs in the host network namespace. Default `false`.
+    ///
+    /// Telemetry capture trusts fleetd's own namespace as the host one when `/proc/1/ns/net`
+    /// is unreadable, so it starts only when this is `true` ([`Config::require_host_netns`]).
+    pub host_netns_attested: bool,
     /// Directory for job worktrees and git mirrors. Defaults to `jobs` under
     /// `STATE_DIRECTORY`, else `jobs` in the working directory.
     pub jobs_dir: PathBuf,
@@ -393,6 +404,7 @@ impl Config {
                 .unwrap_or_else(|| PathBuf::from(crate::agent::kimi::DEFAULT_PROGRAM)),
             gh_bin: resolve_gh_bin(file.gh_bin)?,
             disposable: file.disposable.unwrap_or(false),
+            host_netns_attested: file.host_netns_attested.unwrap_or(false),
             jobs_dir: resolve_jobs_dir(&env, file.jobs_dir),
             repo_hosts,
             token_host,
@@ -788,6 +800,21 @@ fn resolve_repo_hosts(raw: Option<Vec<String>>) -> Result<Vec<String>, Error> {
     }
 }
 
+impl Config {
+    /// Gate for starting telemetry capture.
+    ///
+    /// # Errors
+    ///
+    /// [`TelemetryRefused::HostNetnsUnattested`] unless `host_netns_attested` is `true`.
+    pub fn require_host_netns(&self) -> Result<(), TelemetryRefused> {
+        if self.host_netns_attested {
+            Ok(())
+        } else {
+            Err(TelemetryRefused::HostNetnsUnattested)
+        }
+    }
+}
+
 fn resolve_passthrough(raw: Option<Vec<String>>) -> Result<Vec<String>, Error> {
     let names = raw.unwrap_or_default();
     let valid = |name: &String| {
@@ -1106,6 +1133,11 @@ mod tests {
         assert_eq!(cfg.claude_bin, PathBuf::from("claude"));
         assert!(cfg.gh_bin.is_absolute());
         assert!(!cfg.disposable);
+        assert!(!cfg.host_netns_attested);
+        assert_eq!(
+            cfg.require_host_netns(),
+            Err(TelemetryRefused::HostNetnsUnattested)
+        );
         assert_eq!(cfg.kimi_bin, PathBuf::from("kimi"));
         let file = "claude_bin = \"/opt/claude\"\nkimi_bin = \"/opt/kimi\"\ngh_bin = \"/opt/gh\"\ndisposable = true\n";
         let cfg = Config::resolve(Some(file), &env_of(&[])).unwrap();
@@ -1113,6 +1145,14 @@ mod tests {
         assert_eq!(cfg.claude_bin, PathBuf::from("/opt/claude"));
         assert_eq!(cfg.gh_bin, PathBuf::from("/opt/gh"));
         assert!(cfg.disposable);
+        assert!(!cfg.host_netns_attested);
+        let attested = Config::resolve(Some("host_netns_attested = true\n"), &env_of(&[])).unwrap();
+        assert!(attested.host_netns_attested);
+        assert_eq!(attested.require_host_netns(), Ok(()));
+        assert_eq!(
+            TelemetryRefused::HostNetnsUnattested.to_string(),
+            "telemetry needs host_netns_attested = true in the fleetd config"
+        );
         assert_eq!(cfg.agent_config_dir, None);
         assert_eq!(cfg.agent_env_passthrough, Vec::<String>::new());
         assert_eq!(cfg.jobs_dir, std::path::absolute("jobs").unwrap());
@@ -1136,7 +1176,17 @@ mod tests {
             cfg.agent_env_passthrough,
             ["ANTHROPIC_BASE_URL", "CLAUDE_CODE_USE_BEDROCK"]
         );
-        for bad in ["GH_TOKEN", "FLEETD_ASKPASS", "FLEET_TOKEN", "A=B", "", "1X"] {
+        for bad in [
+            "GH_TOKEN",
+            "FLEETD_ASKPASS",
+            "FLEET_TOKEN",
+            "A=B",
+            "",
+            "1X",
+            "OTEL_EXPORTER_OTLP_ENDPOINT",
+            "otel_sdk_disabled",
+            "CLAUDE_CODE_ENABLE_TELEMETRY",
+        ] {
             let file = format!("agent_env_passthrough = [\"{bad}\"]\n");
             assert!(Config::resolve(Some(&file), &env_of(&[])).is_err(), "{bad}");
         }

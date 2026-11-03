@@ -5,6 +5,9 @@
 //! `.git-home` is made by `create_dir_all` and follows the process umask. Nothing here talks to
 //! systemd.
 
+use std::collections::BTreeMap;
+use std::error::Error;
+use std::ffi::{OsStr, OsString};
 use std::fmt;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Write};
@@ -39,7 +42,95 @@ impl fmt::Display for EnvFileError {
     }
 }
 
-impl std::error::Error for EnvFileError {}
+impl Error for EnvFileError {}
+
+/// Why telemetry capture may not start.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum TelemetryRefused {
+    /// `host_netns_attested` is not `true` in the config.
+    HostNetnsUnattested,
+}
+
+impl fmt::Display for TelemetryRefused {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Self::HostNetnsUnattested => {
+                "telemetry needs host_netns_attested = true in the fleetd config"
+            }
+        })
+    }
+}
+
+impl Error for TelemetryRefused {}
+
+/// Longest environment name a Profile or Job may supply.
+pub const MAX_ENV_NAME: usize = 128;
+const TELEMETRY_PREFIX: &str = "OTEL_";
+const TELEMETRY_SWITCH: &str = "CLAUDE_CODE_ENABLE_TELEMETRY";
+
+/// Why [`build_job_env`] refused a supplied name.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum SuppliedEnvError {
+    /// Not `[A-Za-z_][A-Za-z0-9_]*`, empty, over [`MAX_ENV_NAME`] or not UTF-8.
+    InvalidName,
+    /// An `OTEL_` name in any case, or `CLAUDE_CODE_ENABLE_TELEMETRY`.
+    Reserved,
+    /// A name fleetd already set.
+    Shadows,
+}
+
+impl fmt::Display for SuppliedEnvError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Self::InvalidName => "supplied environment name is not allowed",
+            Self::Reserved => "environment name is reserved for fleetd telemetry",
+            Self::Shadows => "supplied environment name shadows a fleetd value",
+        })
+    }
+}
+
+impl Error for SuppliedEnvError {}
+
+/// True for an `OTEL_` name in any ASCII case and for `CLAUDE_CODE_ENABLE_TELEMETRY`.
+#[must_use]
+pub fn reserved_telemetry_name(name: &str) -> bool {
+    let upper = name.to_ascii_uppercase();
+    upper.starts_with(TELEMETRY_PREFIX) || upper == TELEMETRY_SWITCH
+}
+
+/// Merges names a Profile or Job supplies into the environment fleetd built.
+///
+/// The fleetd-set values, telemetry ones included, pass through unchanged. A supplied name is
+/// checked before anything merges: a reserved telemetry name is [`SuppliedEnvError::Reserved`]
+/// and any other name outside the identifier grammar is [`SuppliedEnvError::InvalidName`], so
+/// a padded, NUL-bearing or lookalike spelling of a reserved name fails closed. A supplied name
+/// equal to a fleetd-set one is [`SuppliedEnvError::Shadows`].
+///
+/// # Errors
+///
+/// Returns the first refusal; nothing is merged then.
+pub fn build_job_env(
+    fleet: BTreeMap<OsString, OsString>,
+    supplied: &[(OsString, OsString)],
+) -> Result<BTreeMap<OsString, OsString>, SuppliedEnvError> {
+    let mut env = fleet;
+    for (name, value) in supplied {
+        let name = name.to_str().ok_or(SuppliedEnvError::InvalidName)?;
+        if reserved_telemetry_name(name) {
+            return Err(SuppliedEnvError::Reserved);
+        }
+        if name.len() > MAX_ENV_NAME || !valid_key(name) {
+            return Err(SuppliedEnvError::InvalidName);
+        }
+        if env.contains_key(OsStr::new(name)) {
+            return Err(SuppliedEnvError::Shadows);
+        }
+        env.insert(OsString::from(name), value.clone());
+    }
+    Ok(env)
+}
 
 fn valid_key(key: &str) -> bool {
     let mut bytes = key.bytes();
@@ -254,8 +345,8 @@ pub fn group_id(spec: &str, groups: &str) -> Option<u32> {
 #[cfg(test)]
 mod tests {
     use super::{
-        EnvFileError, create_stdout_fifo, open_fifo_reader, render_env_file, share_tree,
-        write_env_file,
+        EnvFileError, SuppliedEnvError, build_job_env, create_stdout_fifo, open_fifo_reader,
+        render_env_file, share_tree, write_env_file,
     };
     use crate::runner::AgentSpec;
     use std::ffi::OsString;
@@ -273,6 +364,118 @@ mod tests {
                 .collect(),
             ..AgentSpec::default()
         }
+    }
+
+    fn fleet_set() -> std::collections::BTreeMap<OsString, OsString> {
+        [
+            (
+                "OTEL_EXPORTER_OTLP_LOGS_ENDPOINT",
+                "http://127.0.0.1:4318/v1/logs",
+            ),
+            ("CLAUDE_CODE_ENABLE_TELEMETRY", "1"),
+            ("HOME", "/h"),
+        ]
+        .iter()
+        .map(|(k, v)| (OsString::from(k), OsString::from(v)))
+        .collect()
+    }
+
+    fn supplied(names: &[&str]) -> Vec<(OsString, OsString)> {
+        names
+            .iter()
+            .map(|name| (OsString::from(name), OsString::from("x")))
+            .collect()
+    }
+
+    #[test]
+    fn fleet_set_telemetry_values_pass_through_unchanged() -> TestResult {
+        let built = build_job_env(fleet_set(), &supplied(&["FOO", "ANTHROPIC_BASE_URL"]))?;
+        assert_eq!(
+            built.get(&OsString::from("OTEL_EXPORTER_OTLP_LOGS_ENDPOINT")),
+            Some(&OsString::from("http://127.0.0.1:4318/v1/logs"))
+        );
+        assert_eq!(
+            built.get(&OsString::from("CLAUDE_CODE_ENABLE_TELEMETRY")),
+            Some(&OsString::from("1"))
+        );
+        assert_eq!(
+            built.get(&OsString::from("FOO")),
+            Some(&OsString::from("x"))
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn supplied_telemetry_names_are_refused_with_a_named_error() {
+        let reserved = [
+            "OTEL_EXPORTER_OTLP_ENDPOINT",
+            "otel_exporter_otlp_endpoint",
+            "Otel_Sdk_Disabled",
+            "OTEL_",
+            "CLAUDE_CODE_ENABLE_TELEMETRY",
+            "claude_code_enable_telemetry",
+        ];
+        for name in reserved {
+            assert_eq!(
+                build_job_env(fleet_set(), &supplied(&[name])),
+                Err(SuppliedEnvError::Reserved),
+                "{name}"
+            );
+        }
+        assert_eq!(
+            SuppliedEnvError::Reserved.to_string(),
+            "environment name is reserved for fleetd telemetry"
+        );
+    }
+
+    #[test]
+    fn hostile_supplied_names_fail_closed() {
+        let long = "A".repeat(super::MAX_ENV_NAME + 1);
+        let hostile = [
+            " OTEL_X",
+            "OTEL_X ",
+            "\tOTEL_X",
+            "\u{0}OTEL_X",
+            "OTEL_X\u{0}",
+            "OTEL_X\r",
+            "OTEL_X\n",
+            "OTEL_X=1",
+            "\u{ff2f}TEL_X",
+            "OTEL\u{ff3f}X",
+            "\u{2028}OTEL_X",
+            "\u{85}OTEL_X",
+            "",
+            "1X",
+            "A B",
+            "caf\u{e9}",
+            long.as_str(),
+        ];
+        for name in hostile {
+            assert!(
+                matches!(
+                    build_job_env(fleet_set(), &supplied(&[name])),
+                    Err(SuppliedEnvError::InvalidName | SuppliedEnvError::Reserved)
+                ),
+                "{name:?}"
+            );
+        }
+        assert_eq!(
+            build_job_env(fleet_set(), &supplied(&[" OTEL_X"])),
+            Err(SuppliedEnvError::InvalidName)
+        );
+        let raw = vec![(OsString::from_vec(vec![0xff]), OsString::from("x"))];
+        assert_eq!(
+            build_job_env(fleet_set(), &raw),
+            Err(SuppliedEnvError::InvalidName)
+        );
+    }
+
+    #[test]
+    fn a_supplied_name_cannot_shadow_a_fleet_set_one() {
+        assert_eq!(
+            build_job_env(fleet_set(), &supplied(&["HOME"])),
+            Err(SuppliedEnvError::Shadows)
+        );
     }
 
     #[test]
