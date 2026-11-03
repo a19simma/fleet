@@ -108,6 +108,20 @@ pub fn is_swarm_branch(text: &str) -> bool {
 /// Longest credential value a client may put and a box may receive, in bytes.
 pub const MAX_CREDENTIAL_VALUE_BYTES: usize = fleet_core::credential::MAX_CREDENTIAL_LEN;
 
+/// Path prefix of `FleetCapabilityAdmin`, with the trailing slash the auth layer matches on.
+/// No bearer token scope covers it.
+pub const CAPABILITY_ADMIN_PATH: &str = "/fleet.v1.FleetCapabilityAdmin/";
+
+/// Reads the wire text of a capability: exactly the canonical text, nothing trimmed or folded.
+pub fn capability_from_wire(raw: &str) -> Option<fleet_core::capability::Capability> {
+    fleet_core::capability::Capability::parse(raw).ok()
+}
+
+/// Reads a wire user id as the signed id the database stores: 1 to `i64::MAX`.
+pub fn user_id_from_wire(raw: u64) -> Option<i64> {
+    i64::try_from(raw).ok().filter(|id| *id > 0)
+}
+
 /// Longest catalog item content in bytes. The `catalog_items.content` CHECK of migration 0024
 /// carries the same number, and a test pins the two equal.
 pub const MAX_CATALOG_CONTENT_BYTES: usize = fleet_core::catalog::MAX_BODY_BYTES;

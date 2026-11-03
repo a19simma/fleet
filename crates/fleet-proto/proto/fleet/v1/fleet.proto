@@ -43,6 +43,14 @@ service FleetCatalogAdmin {
   rpc SetCatalogItemEnabled(SetCatalogItemEnabledRequest) returns (CatalogItem);
 }
 
+// Per-user capability grants (ADR-0054). Admin scope only: no bearer token scope reaches this
+// service until an admin scope exists, so every call is denied.
+service FleetCapabilityAdmin {
+  rpc GrantCapability(GrantCapabilityRequest) returns (UserCapability);
+  rpc RevokeCapability(RevokeCapabilityRequest) returns (RevokeCapabilityReply);
+  rpc ListCapabilities(ListCapabilitiesRequest) returns (ListCapabilitiesReply);
+}
+
 service FleetJudge {
   rpc SubmitJudge(SubmitJudgeRequest) returns (Job);
 }
@@ -280,6 +288,9 @@ message Job {
   optional CiRetry ci_retry = 31;
   uint64 user_id = 32;
   string agent = 33;
+  // Set by the server alone: whether the owner held profile:tools when the job was submitted.
+  // No request message carries it and the server ignores it on input.
+  bool profile_tools_granted = 34;
 }
 
 enum CiRetry {
@@ -614,6 +625,40 @@ message StreamShellLogChunk {
   uint32 seq = 2;
   bytes bytes = 3;
   ShellStatus status = 4;
+}
+
+// One capability a user holds. capability is the canonical text of fleet_core::capability,
+// today only "profile:tools". granted_by is the admin user id.
+message UserCapability {
+  uint64 user_id = 1;
+  string capability = 2;
+  uint64 granted_by = 3;
+  uint64 granted_at_ms = 4;
+}
+
+// Idempotent: granting a held capability returns the stored row unchanged. user_id must name
+// an existing user and fit a signed 64-bit integer.
+message GrantCapabilityRequest {
+  uint64 user_id = 1;
+  string capability = 2;
+}
+
+message RevokeCapabilityRequest {
+  uint64 user_id = 1;
+  string capability = 2;
+}
+
+// removed is false when the user did not hold the capability.
+message RevokeCapabilityReply {
+  bool removed = 1;
+}
+
+message ListCapabilitiesRequest {
+  uint64 user_id = 1;
+}
+
+message ListCapabilitiesReply {
+  repeated UserCapability capabilities = 1;
 }
 
 message ReportJobReply {

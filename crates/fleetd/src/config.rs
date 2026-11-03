@@ -1,6 +1,7 @@
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
+use fleet_core::model_allowlist::ModelAllowlist;
 use serde::Deserialize;
 
 use crate::Error;
@@ -77,6 +78,7 @@ struct FileConfig {
     host_netns_attested: Option<bool>,
     jobs_dir: Option<PathBuf>,
     repo_hosts: Option<Vec<String>>,
+    model_allowlist: Option<Vec<String>>,
     token_host: Option<String>,
     agent_config_dir: Option<PathBuf>,
     agent_env_passthrough: Option<Vec<String>>,
@@ -173,6 +175,10 @@ pub struct Config {
     /// Hosts a job repo may name, lowercase. Jobs run only https repos on these hosts, with
     /// no port. Defaults to `github.com`. An empty list rejects every repo.
     pub repo_hosts: Vec<String>,
+    /// Exact model ids a job may run, config file only. Unset is `None`: fleetd adds no
+    /// restriction of its own. A key that is present must hold at least one valid entry, or
+    /// fleetd fails to start. See [`ModelAllowlist`] for the entry rules.
+    pub model_allowlist: Option<ModelAllowlist>,
     /// The one host whose prompts receive `GH_TOKEN`, lowercase. Config file only. Defaults to
     /// `github.com` when `repo_hosts` lists it, else none. An explicit value must be in
     /// `repo_hosts`. A host in `repo_hosts` other than this one never gets the token.
@@ -369,6 +375,7 @@ impl Config {
             resolve_queue(file.queue_max_bytes, file.queue_max_age_secs)?;
         let repo_hosts = resolve_repo_hosts(file.repo_hosts)?;
         let token_host = resolve_token_host(file.token_host, &repo_hosts)?;
+        let model_allowlist = resolve_model_allowlist(file.model_allowlist)?;
         let agent_env_passthrough = resolve_passthrough(file.agent_env_passthrough)?;
         let max_budget_usd = resolve_max_budget(file.max_budget_usd)?;
         let (hook_socket, hook_socket_uid, hook_socket_group) = resolve_hook_socket(
@@ -407,6 +414,7 @@ impl Config {
             host_netns_attested: file.host_netns_attested.unwrap_or(false),
             jobs_dir: resolve_jobs_dir(&env, file.jobs_dir),
             repo_hosts,
+            model_allowlist,
             token_host,
             agent_config_dir: file.agent_config_dir,
             agent_env_passthrough,
@@ -815,6 +823,15 @@ impl Config {
     }
 }
 
+fn resolve_model_allowlist(raw: Option<Vec<String>>) -> Result<Option<ModelAllowlist>, Error> {
+    raw.map(ModelAllowlist::new)
+        .transpose()
+        .map_err(|e| Error::InvalidValue {
+            name: "model_allowlist",
+            value: e.to_string(),
+        })
+}
+
 fn resolve_passthrough(raw: Option<Vec<String>>) -> Result<Vec<String>, Error> {
     let names = raw.unwrap_or_default();
     let valid = |name: &String| {
@@ -863,6 +880,8 @@ fn read(path: &Path) -> Result<String, Error> {
 #[cfg(test)]
 mod tests {
     use std::collections::HashMap;
+
+    use fleet_core::model_allowlist::ModelAllowlistError;
 
     use super::*;
 
@@ -1415,6 +1434,121 @@ mod tests {
         assert_eq!(cfg.repo_hosts, ["git.example.com", "github.com"]);
         let cfg = Config::resolve(Some("repo_hosts = []"), &env_of(&[])).unwrap();
         assert_eq!(cfg.repo_hosts, Vec::<String>::new());
+    }
+
+    fn toml_string(raw: &str) -> String {
+        let body: String = raw
+            .chars()
+            .map(|c| {
+                if c.is_ascii_alphanumeric() || matches!(c, '-' | '.' | '_' | ':' | '/' | '[' | ']')
+                {
+                    c.to_string()
+                } else {
+                    format!("\\u{:04X}", u32::from(c))
+                }
+            })
+            .collect();
+        format!("\"{body}\"")
+    }
+
+    #[test]
+    fn model_allowlist_is_none_when_the_key_is_absent() {
+        let cfg = Config::resolve(None, &env_of(&[])).unwrap();
+        assert_eq!(cfg.model_allowlist, None);
+        let cfg = Config::resolve(Some("max_turns = 3"), &env_of(&[])).unwrap();
+        assert_eq!(cfg.model_allowlist, None);
+    }
+
+    #[test]
+    fn model_allowlist_parses_into_the_core_list_in_order() {
+        let file = "model_allowlist = [\"claude-opus-4-1\", \"claude-sonnet-4-5\"]";
+        let cfg = Config::resolve(Some(file), &env_of(&[])).unwrap();
+        let list = cfg.model_allowlist.unwrap();
+        assert_eq!(list.entries(), ["claude-opus-4-1", "claude-sonnet-4-5"]);
+        assert_eq!(list.check("claude-opus-4-1"), Ok(()));
+        assert!(list.check("gpt-5").is_err());
+    }
+
+    #[test]
+    fn model_allowlist_parses_with_the_default_config_shape() {
+        let cfg = Config::resolve(Some("model_allowlist = [\"a\"]"), &env_of(&[])).unwrap();
+        assert!(cfg.socket_path.is_relative());
+        assert!(cfg.db_path.is_relative());
+        assert!(cfg.model_allowlist.unwrap().allows("a"));
+    }
+
+    #[test]
+    fn model_allowlist_empty_list_is_a_startup_error() {
+        match Config::resolve(Some("model_allowlist = []"), &env_of(&[])) {
+            Err(Error::InvalidValue { name, value }) => {
+                assert_eq!(name, "model_allowlist");
+                assert_eq!(value, ModelAllowlistError::Empty.to_string());
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
+    fn model_allowlist_hostile_entries_fail_startup_without_echo() {
+        let over_long = "m".repeat(fleet_core::model_allowlist::MAX_ENTRY_BYTES + 1);
+        let many: Vec<String> = (0..=fleet_core::model_allowlist::MAX_ENTRIES)
+            .map(|i| format!("m{i}"))
+            .collect();
+        let cases: Vec<(&str, Vec<String>, ModelAllowlistError)> = vec![
+            ("cr", vec!["a\rb".into()], ModelAllowlistError::BadEntry),
+            ("crlf", vec!["a\r\nb".into()], ModelAllowlistError::BadEntry),
+            ("lf", vec!["a\nb".into()], ModelAllowlistError::BadEntry),
+            (
+                "nel",
+                vec!["a\u{85}b".into()],
+                ModelAllowlistError::BadEntry,
+            ),
+            (
+                "line separator",
+                vec!["a\u{2028}b".into()],
+                ModelAllowlistError::BadEntry,
+            ),
+            ("space", vec!["a b".into()], ModelAllowlistError::BadEntry),
+            (
+                "trailing space",
+                vec!["a ".into()],
+                ModelAllowlistError::BadEntry,
+            ),
+            ("tab", vec!["a\tb".into()], ModelAllowlistError::BadEntry),
+            (
+                "non-ascii",
+                vec!["mod\u{e9}l".into()],
+                ModelAllowlistError::BadEntry,
+            ),
+            ("comma", vec!["a,b".into()], ModelAllowlistError::BadEntry),
+            (
+                "empty entry",
+                vec![String::new()],
+                ModelAllowlistError::EmptyEntry,
+            ),
+            (
+                "duplicate",
+                vec!["a".into(), "a".into()],
+                ModelAllowlistError::Duplicate,
+            ),
+            (
+                "over long",
+                vec![over_long],
+                ModelAllowlistError::EntryTooLong,
+            ),
+            ("over many", many, ModelAllowlistError::TooMany),
+        ];
+        for (label, entries, want) in cases {
+            let quoted: Vec<String> = entries.iter().map(|e| toml_string(e)).collect();
+            let file = format!("model_allowlist = [{}]", quoted.join(", "));
+            match Config::resolve(Some(&file), &env_of(&[])) {
+                Err(Error::InvalidValue { name, value }) => {
+                    assert_eq!(name, "model_allowlist", "{label}");
+                    assert_eq!(value, want.to_string(), "{label}");
+                }
+                other => panic!("{label}: {other:?}"),
+            }
+        }
     }
 
     #[test]

@@ -292,6 +292,12 @@ WHERE j.state IN ('SUCCEEDED', 'FAILED', 'CANCELLED', 'LOST') \
 AND COALESCE(j.finished_at, j.created_at) < now() - make_interval(days => $1) \
 LIMIT $2 FOR UPDATE OF m SKIP LOCKED), \
 shell_cleared AS (DELETE FROM job_shell_commands x USING shell_old WHERE x.job_id = shell_old.job_id AND x.seq = shell_old.seq), \
+log_old AS (\
+SELECT g.job_id, g.command_id, g.seq FROM job_shell_log_chunks g JOIN jobs j ON j.job_id = g.job_id \
+WHERE j.state IN ('SUCCEEDED', 'FAILED', 'CANCELLED', 'LOST') \
+AND COALESCE(j.finished_at, j.created_at) < now() - make_interval(days => $1) \
+LIMIT $2 FOR UPDATE OF g SKIP LOCKED), \
+log_cleared AS (DELETE FROM job_shell_log_chunks x USING log_old WHERE x.job_id = log_old.job_id AND x.command_id = log_old.command_id AND x.seq = log_old.seq), \
 doomed AS (\
 SELECT s.job_id FROM job_summary s JOIN jobs j ON j.job_id = s.job_id \
 WHERE j.state IN ('SUCCEEDED', 'FAILED', 'CANCELLED', 'LOST') \
@@ -594,6 +600,7 @@ fn job_from_row(row: &PgRow) -> Result<Job, StoreError> {
         user_id: u64::try_from(row.try_get::<i64, _>("user_id")?)
             .map_err(|_| StoreError::OutOfRange("user id"))?,
         agent: row.try_get("agent")?,
+        profile_tools_granted: false,
         ci_retry_attempt: u32::try_from(row.try_get::<i32, _>("ci_retry_attempt")?)
             .map_err(|_| StoreError::OutOfRange("ci retry attempt"))?,
         ci_retry: row
@@ -780,6 +787,11 @@ impl Store {
             #[cfg(test)]
             snapshot_gate: None,
         }
+    }
+
+    /// The connection pool, for modules that own their own tables.
+    pub(crate) fn pool(&self) -> &PgPool {
+        &self.pool
     }
 
     /// Allows profiles with tools, off otherwise. When off, creating one is refused and a
