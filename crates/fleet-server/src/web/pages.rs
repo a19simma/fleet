@@ -125,13 +125,28 @@ pub(super) fn csrf_matches(expected: &SessionInfo, presented: Option<&str>) -> b
     presented.is_some_and(|token| constant_time_eq(expected.csrf.expose(), token.as_bytes()))
 }
 
-fn set_cookie(cx: &Cx, value: &str, max_age: i64) {
+/// A session cookie value outside the cookie-octet grammar (RFC 6265 section 4.1.1).
+#[derive(Debug, PartialEq, Eq)]
+struct CookieValueError;
+
+fn cookie_octet(byte: u8) -> bool {
+    matches!(byte, 0x21 | 0x23..=0x2B | 0x2D..=0x3A | 0x3C..=0x5B | 0x5D..=0x7E)
+}
+
+fn cookie_header(value: &str, max_age: i64) -> Result<HeaderValue, CookieValueError> {
+    if !value.bytes().all(cookie_octet) {
+        return Err(CookieValueError);
+    }
     let cookie = format!(
         "{SESSION_COOKIE}={value}; Path=/; Max-Age={max_age}; Secure; HttpOnly; SameSite=Strict"
     );
-    if let Ok(cookie) = HeaderValue::from_str(&cookie) {
-        response_headers(cx).append(header::SET_COOKIE, cookie);
-    }
+    HeaderValue::from_str(&cookie).map_err(|_| CookieValueError)
+}
+
+fn set_cookie(cx: &Cx, value: &str, max_age: i64) -> Result<()> {
+    let cookie = cookie_header(value, max_age).map_err(|_| fail(AuthError::Internal))?;
+    response_headers(cx).append(header::SET_COOKIE, cookie);
+    Ok(())
 }
 
 #[page("/")]
@@ -389,7 +404,7 @@ async fn setup_finish(cx: &Cx, Json(body): Json<Value>) -> Result<Json<Value>> {
         cx,
         &String::from_utf8_lossy(session.id.expose()),
         SESSION_TTL_SECS,
-    );
+    )?;
     Ok(Json(json!({ "ok": true })))
 }
 
@@ -412,7 +427,7 @@ async fn enroll_finish(cx: &Cx, Json(body): Json<Value>) -> Result<Json<Value>> 
         cx,
         &String::from_utf8_lossy(session.id.expose()),
         SESSION_TTL_SECS,
-    );
+    )?;
     Ok(Json(json!({ "ok": true })))
 }
 
@@ -439,7 +454,7 @@ async fn login_finish(cx: &Cx, Json(body): Json<Value>) -> Result<Json<Value>> {
         cx,
         &String::from_utf8_lossy(session.id.expose()),
         SESSION_TTL_SECS,
-    );
+    )?;
     Ok(Json(json!({ "ok": true })))
 }
 
@@ -494,7 +509,7 @@ async fn logout(
     if let Some(id) = session_cookie(headers(cx)) {
         auth.logout(id.as_bytes()).await.map_err(fail)?;
     }
-    set_cookie(cx, "", 0);
+    set_cookie(cx, "", 0)?;
     Ok(see_other("/login"))
 }
 
@@ -578,5 +593,44 @@ impl Web {
 impl Default for Web {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn hostile_cookie_values_are_refused() {
+        for value in [
+            "a\rb",
+            "a\nb",
+            "a\r\nSet-Cookie: x=y",
+            "a\0b",
+            "caf\u{e9}",
+            "a\u{85}b",
+            "a b",
+            "a;b",
+            "a,b",
+            "a\"b",
+            "a\\b",
+            "a\tb",
+            "a\x7fb",
+        ] {
+            assert_eq!(cookie_header(value, 1), Err(CookieValueError), "{value:?}");
+        }
+    }
+
+    #[test]
+    fn valid_cookie_values_are_built() {
+        let hex = "0123456789abcdefABCDEF";
+        let header = cookie_header(hex, 60).expect("hex value");
+        assert_eq!(
+            header.to_str().expect("ascii"),
+            format!(
+                "{SESSION_COOKIE}={hex}; Path=/; Max-Age=60; Secure; HttpOnly; SameSite=Strict"
+            )
+        );
+        assert!(cookie_header("", 0).is_ok());
     }
 }
