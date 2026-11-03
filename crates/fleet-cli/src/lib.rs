@@ -154,6 +154,9 @@ pub enum Command {
         /// Also list the job's shell commands with their durations.
         #[arg(long)]
         commands: bool,
+        /// Stream the live log of one shell command until it ends.
+        #[arg(long, value_name = "COMMAND_ID", conflicts_with = "commands")]
+        follow: Option<String>,
         /// Print JSON instead of a table.
         #[arg(long)]
         json: bool,
@@ -729,8 +732,20 @@ pub async fn run_with(
         Command::Timing {
             job,
             commands,
+            follow,
             json,
-        } => timing::run(&job, commands, json)?,
+        } => match follow {
+            Some(c) => {
+                timing::check_command_id(&c)?;
+                let mut client = session(server, insecure, lookup, timeouts).await?.jobs;
+                timing::follow(&mut client, &job, &c, json, out).await?;
+            }
+            None if commands => {
+                let mut client = session(server, insecure, lookup, timeouts).await?.jobs;
+                timing::list_commands(&mut client, &job, json, out).await?;
+            }
+            None => timing::run(&job, commands, json)?,
+        },
         Command::Batch { action } => {
             run_batch(action, server, insecure, lookup, timeouts, stdin, out).await?;
         }

@@ -6,6 +6,7 @@
 use std::collections::BTreeSet;
 
 use fleet_core::Profile;
+use fleet_core::model_allowlist::{ModelAllowlist, ModelDenied};
 
 /// The permission mode of every job.
 pub const PERMISSION_MODE: &str = "dontAsk";
@@ -50,6 +51,30 @@ pub fn with_floor_allow(allow: &[String]) -> Vec<String> {
         }
     }
     merged
+}
+
+/// The fixed reason a Job reports when its model is outside the box allowlist.
+///
+/// It never echoes the model: the name comes from the server and is untrusted.
+pub const MODEL_DENIED_REASON: &str = "profile invalid: profile model is not in the box allowlist";
+
+/// Re-checks the model of a Job against the box's own allowlist (ADR-0054).
+///
+/// With no allowlist the box trusts the server and every model passes. A Job with no model also
+/// passes: no `--model` argument is built, and the server checked the model at submit. Match is
+/// exact and case-sensitive.
+///
+/// # Errors
+///
+/// Returns [`ModelDenied`] when an allowlist is set and `model` is outside it.
+pub fn check_model(
+    allowlist: Option<&ModelAllowlist>,
+    model: Option<&str>,
+) -> Result<(), ModelDenied> {
+    match (allowlist, model) {
+        (Some(list), Some(model)) => list.check(model),
+        _ => Ok(()),
+    }
 }
 
 /// Per-box limits and defaults. Budgets are whole US cents.
@@ -445,6 +470,80 @@ mod tests {
             &ceilings(),
         );
         assert_eq!(a.deny, b.deny);
+    }
+
+    fn list(entries: &[&str]) -> ModelAllowlist {
+        ModelAllowlist::new(entries.iter().copied()).unwrap_or_else(|e| panic!("{e}"))
+    }
+
+    #[test]
+    fn a_listed_model_passes_and_a_missing_list_or_model_passes() {
+        let allow = list(&["claude-opus-4-1", "claude-sonnet-4-5"]);
+        assert!(check_model(Some(&allow), Some("claude-sonnet-4-5")).is_ok());
+        assert!(check_model(Some(&allow), None).is_ok());
+        assert!(check_model(None, Some("anything-at-all")).is_ok());
+        assert!(check_model(None, None).is_ok());
+    }
+
+    #[test]
+    fn a_model_outside_the_list_is_denied_with_its_escaped_name() {
+        let allow = list(&["claude-opus-4-1"]);
+        let denied = check_model(Some(&allow), Some("claude-haiku-4-5"))
+            .err()
+            .map(|d| d.to_string());
+        assert_eq!(
+            denied.as_deref(),
+            Some("model claude-haiku-4-5 is not in the allowlist")
+        );
+    }
+
+    #[test]
+    fn hostile_model_strings_are_denied_not_matched() {
+        let allow = list(&["claude-opus-4-1"]);
+        let long = "a".repeat(10_000);
+        let table: &[(&str, &str)] = &[
+            ("empty", ""),
+            ("cr", "claude-opus-4-1\r"),
+            ("lf", "claude-opus-4-1\n"),
+            ("crlf", "claude-opus-4-1\r\n"),
+            ("nel", "claude-opus-4-1\u{85}"),
+            ("line separator", "claude-opus-4-1\u{2028}"),
+            ("paragraph separator", "claude-opus-4-1\u{2029}"),
+            ("backslash", "claude-opus-4-1\\"),
+            ("leading space", " claude-opus-4-1"),
+            ("trailing space", "claude-opus-4-1 "),
+            ("tab", "claude-opus-4-1\t"),
+            ("nul", "claude-opus-4-1\0"),
+            ("non-ascii lookalike", "claude-opus-4\u{2011}1"),
+            ("fullwidth", "claude-opus-4-\u{ff11}"),
+            ("zero width", "claude-opus-4-1\u{200b}"),
+            ("upper case", "Claude-Opus-4-1"),
+            ("all caps", "CLAUDE-OPUS-4-1"),
+            ("prefix", "claude-opus-4"),
+            ("glob", "claude-*"),
+            ("over-long", long.as_str()),
+        ];
+        for (name, model) in table {
+            let denied = check_model(Some(&allow), Some(model));
+            let Err(denied) = denied else {
+                panic!("{name} passed the allowlist");
+            };
+            assert!(
+                denied.model().chars().all(|c| !c.is_control()
+                    && !matches!(c, '\u{85}' | '\u{2028}' | '\u{2029}' | '\u{200b}')),
+                "{name}: unescaped control in {:?}",
+                denied.model()
+            );
+            assert!(denied.to_string().len() < 2_000, "{name}");
+        }
+    }
+
+    #[test]
+    fn model_denied_reason_is_fixed_and_echoes_nothing() {
+        assert_eq!(
+            MODEL_DENIED_REASON,
+            "profile invalid: profile model is not in the box allowlist"
+        );
     }
 
     #[test]
