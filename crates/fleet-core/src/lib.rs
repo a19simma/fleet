@@ -27,9 +27,9 @@ pub use id::EventId;
 pub use normalize::{HookAllowlist, normalize_hook};
 pub use profile::{
     Attribution, ContextFile, EnvFlag, ItemId, MAX_PROMPT_TEXT_BYTES, MAX_SELECTION, OwnerId,
-    OwnerIdError, PROFILE_HASH_DOMAIN, PROFILE_HASH_DOMAIN_V2, Profile, ProfileError, ProfileHash,
-    PromptText, PromptTextError, Selection, SelectionError, Settings, SettingsPermissions, Skill,
-    Visibility, VisibilityError,
+    OwnerIdError, PROFILE_HASH_DOMAIN, PROFILE_HASH_DOMAIN_V2, PROFILE_HASH_DOMAIN_V3, Profile,
+    ProfileError, ProfileHash, PromptText, PromptTextError, Selection, SelectionError, Settings,
+    SettingsPermissions, Skill, Visibility, VisibilityError,
 };
 pub use redact::{MIN_SECRET_LEN, PLACEHOLDER, Redactor};
 pub use validate::{
