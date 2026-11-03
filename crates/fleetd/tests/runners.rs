@@ -4,7 +4,12 @@ use std::ffi::OsString;
 use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 
+use fleet_core::Redactor;
+use fleet_core::Selection;
+use fleet_core::catalog::{CatalogEntry, CatalogItem, CatalogKind};
+use fleet_proto::v1::{JobEvent, JobEventKind};
 use fleetd::agent::codex::{self, CodexHome, CodexJob};
+use fleetd::agent::notes::{dropped_subagent_events, sanitise_note};
 use fleetd::agent::{ERR_UNKNOWN_AGENT, resolve};
 use tempfile::TempDir;
 
@@ -327,5 +332,159 @@ mod claude_telemetry {
                 "{bad:?}"
             );
         }
+    }
+}
+
+fn entry(
+    kind: CatalogKind,
+    id: &str,
+    enabled: bool,
+) -> Result<CatalogEntry, Box<dyn std::error::Error>> {
+    let body = if kind == CatalogKind::Tool {
+        "22.1.0"
+    } else {
+        "body"
+    };
+    Ok(CatalogEntry::new(
+        CatalogItem::new(kind, id, id, body)?,
+        enabled,
+    ))
+}
+
+fn catalog(subagents: usize) -> Result<Vec<CatalogEntry>, Box<dyn std::error::Error>> {
+    let mut out = vec![entry(CatalogKind::Skill, "skill-one", true)?];
+    for index in 0..subagents {
+        out.push(entry(
+            CatalogKind::Subagent,
+            &format!("agent-{index}"),
+            true,
+        )?);
+    }
+    out.push(entry(CatalogKind::Subagent, "agent-off", false)?);
+    Ok(out)
+}
+
+fn notes(agent: &str, subagents: usize) -> Result<Vec<JobEvent>, Box<dyn std::error::Error>> {
+    Ok(dropped_subagent_events(
+        agent,
+        &Selection::default(),
+        &catalog(subagents)?,
+        &Redactor::new(Vec::<String>::new()),
+        7,
+        1234,
+    )?)
+}
+
+#[test]
+fn kimi_with_n_dropped_subagents_emits_exactly_n_notes() -> TestResult {
+    for n in [0usize, 1, 2, 5] {
+        let events = notes("kimi", n)?;
+        assert_eq!(events.len(), n, "{n}");
+    }
+    Ok(())
+}
+
+#[test]
+fn a_kimi_note_is_a_phase_event_naming_the_item() -> TestResult {
+    let events = notes("kimi", 2)?;
+    let details: Vec<_> = events
+        .iter()
+        .map(|e| e.detail.clone().unwrap_or_default())
+        .collect();
+    assert_eq!(
+        details,
+        [
+            "kimi has no subagents: dropped agent-0",
+            "kimi has no subagents: dropped agent-1"
+        ]
+    );
+    for (offset, event) in events.iter().enumerate() {
+        assert_eq!(event.kind, i32::from(JobEventKind::Phase));
+        assert_eq!(event.seq, 7 + u32::try_from(offset)?);
+        assert_eq!(event.ts_ms, 1234);
+    }
+    Ok(())
+}
+
+#[test]
+fn claude_codex_and_default_emit_no_notes() -> TestResult {
+    for agent in ["claude", "", "codex", "gemini"] {
+        assert!(notes(agent, 3)?.is_empty(), "{agent}");
+    }
+    Ok(())
+}
+
+#[test]
+fn a_subagent_the_selection_switched_off_gets_no_kimi_note() -> TestResult {
+    let selection = Selection::from_json(br#"[{"item_id":"agent-0"}]"#)?;
+    let events = dropped_subagent_events(
+        "kimi",
+        &selection,
+        &catalog(2)?,
+        &Redactor::new(Vec::<String>::new()),
+        1,
+        0,
+    )?;
+    assert_eq!(events.len(), 1);
+    Ok(())
+}
+
+#[test]
+fn a_note_scrubs_a_secret_shaped_id() -> TestResult {
+    let secret = "secretvalue-0123456789";
+    let catalog = vec![entry(CatalogKind::Subagent, secret, true)?];
+    let events = dropped_subagent_events(
+        "kimi",
+        &Selection::default(),
+        &catalog,
+        &Redactor::new([secret]),
+        1,
+        0,
+    )?;
+    let detail = events[0].detail.clone().unwrap_or_default();
+    assert!(!detail.contains(secret), "{detail}");
+    assert!(detail.starts_with("kimi has no subagents: dropped "));
+    Ok(())
+}
+
+#[test]
+fn a_note_over_the_detail_cap_is_cut_on_a_char_boundary() {
+    let long = "x".repeat(fleet_proto::MAX_EVENT_DETAIL_BYTES * 2);
+    let out = sanitise_note(&long, &Redactor::new(Vec::<String>::new()));
+    assert_eq!(out.len(), fleet_proto::MAX_EVENT_DETAIL_BYTES);
+    let wide = "\u{e9}".repeat(fleet_proto::MAX_EVENT_DETAIL_BYTES);
+    let out = sanitise_note(&wide, &Redactor::new(Vec::<String>::new()));
+    assert!(out.len() <= fleet_proto::MAX_EVENT_DETAIL_BYTES);
+    assert!(out.chars().all(|c| c == '\u{e9}'));
+}
+
+#[test]
+fn hostile_characters_are_stripped_from_note_text() {
+    let redactor = Redactor::new(Vec::<String>::new());
+    for (raw, want) in [
+        ("a\rb", "ab"),
+        ("a\r\nb", "ab"),
+        ("a\nb", "ab"),
+        ("a\u{85}b", "ab"),
+        ("a\u{2028}b", "ab"),
+        ("a\u{2029}b", "ab"),
+        ("a\u{202e}b", "ab"),
+        ("a\u{2066}b", "ab"),
+        ("a\u{e0041}b", "ab"),
+        ("a\u{1b}b", "ab"),
+        ("a\tb", "ab"),
+        ("a\u{0}b", "ab"),
+    ] {
+        assert_eq!(sanitise_note(raw, &redactor), want, "{raw:?}");
+    }
+}
+
+#[test]
+fn a_hostile_id_cannot_reach_a_note() {
+    for raw in ["a\nb", "a\u{202e}b", "A", ""] {
+        assert!(
+            CatalogItem::new(CatalogKind::Subagent, raw, "n", "b").is_err(),
+            "{raw:?}"
+        );
     }
 }
