@@ -30,6 +30,18 @@ service FleetProfiles {
   rpc UnshareProfile(UnshareProfileRequest) returns (Profile);
 }
 
+// Read side of the global catalog (ADR-0053). Client scope.
+service FleetCatalog {
+  rpc ListCatalog(ListCatalogRequest) returns (ListCatalogReply);
+}
+
+// Write side of the global catalog (ADR-0053). Admin scope only: no bearer token scope
+// reaches this service until an admin scope exists, so every call is denied.
+service FleetCatalogAdmin {
+  rpc UpsertCatalogItem(UpsertCatalogItemRequest) returns (CatalogItem);
+  rpc SetCatalogItemEnabled(SetCatalogItemEnabledRequest) returns (CatalogItem);
+}
+
 service FleetJudge {
   rpc SubmitJudge(SubmitJudgeRequest) returns (Job);
 }
@@ -728,6 +740,49 @@ message ShareProfileRequest {
 
 message UnshareProfileRequest {
   string name = 1;
+}
+
+// What a catalog item is. Names match fleet_core::catalog::CatalogKind::as_str, lowercased.
+enum CatalogKind {
+  CATALOG_KIND_UNSPECIFIED = 0;
+  CATALOG_KIND_SKILL = 1;
+  CATALOG_KIND_SUBAGENT = 2;
+  CATALOG_KIND_TOOL = 3;
+  CATALOG_KIND_CONTEXT = 4;
+}
+
+// One catalog item (ADR-0053). id and name follow the fleet_core item id shape.
+// content is at most MAX_CATALOG_CONTENT_BYTES bytes and is never empty; for a tool it is
+// the pinned version. digest is the 32-byte fleet_core::catalog digest, computed by the
+// server and ignored on input. admin_enabled is set only by an admin; a new item is created
+// with admin_enabled = false.
+message CatalogItem {
+  string id = 1;
+  CatalogKind kind = 2;
+  string name = 3;
+  string content = 4;
+  bytes digest = 5;
+  bool admin_enabled = 6;
+}
+
+message ListCatalogRequest {}
+
+message ListCatalogReply {
+  repeated CatalogItem items = 1;
+}
+
+// Creates the item, or replaces the content of the item with this id. kind and name of an
+// existing id cannot change. A request never sets admin_enabled.
+message UpsertCatalogItemRequest {
+  string id = 1;
+  CatalogKind kind = 2;
+  string name = 3;
+  string content = 4;
+}
+
+message SetCatalogItemEnabledRequest {
+  string id = 1;
+  bool enabled = 2;
 }
 
 message GetStatsReply {
