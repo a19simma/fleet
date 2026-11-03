@@ -322,6 +322,34 @@ impl FleetQuery for FleetService {
     }
 }
 
+const LIVE_LEASE: &str = "\
+SELECT 1 FROM jobs WHERE job_id = $1 AND attempt = $2 AND state = 'RUNNING' \
+AND lease_expires_at > now()";
+
+/// Refuses a timing report unless its job is `RUNNING` at the reported attempt with an
+/// unexpired lease.
+///
+/// # Errors
+/// `FAILED_PRECONDITION` when no running lease matches, `UNAVAILABLE` when the query fails.
+async fn require_live_lease(
+    pool: &sqlx::PgPool,
+    request: &ReportTimingRequest,
+) -> Result<(), Status> {
+    let stale = || Status::failed_precondition("report does not match the running job");
+    let attempt = i32::try_from(request.attempt).map_err(|_| stale())?;
+    sqlx::query(LIVE_LEASE)
+        .bind(&request.job_id)
+        .bind(attempt)
+        .fetch_optional(pool)
+        .await
+        .map_err(|err| {
+            tracing::error!(%err, "storage failed");
+            Status::unavailable("storage unavailable")
+        })?
+        .map(|_| ())
+        .ok_or_else(stale)
+}
+
 fn worker_error(err: &StoreError) -> Status {
     match err {
         StoreError::StaleReport => {
@@ -431,6 +459,7 @@ impl FleetWorker for FleetService {
         &self,
         request: Request<ReportTimingRequest>,
     ) -> Result<Response<ReportTimingReply>, Status> {
+        require_live_lease(self.store.pool(), request.get_ref()).await?;
         timing::report_timing(request.get_ref()).map(Response::new)
     }
 

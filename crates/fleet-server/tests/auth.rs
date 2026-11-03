@@ -15,9 +15,10 @@ mod tests {
     use fleet_proto::v1::fleet_query_client::FleetQueryClient;
     use fleet_proto::v1::fleet_worker_client::FleetWorkerClient;
     use fleet_proto::v1::{
-        ClaimJobRequest, Envelope, GetJobCredentialsRequest, GetStatsRequest, HeartbeatRequest,
-        ListCredentialsRequest, ListFleetRequest, ListJobsRequest, ListProfilesRequest,
-        PushEventsRequest, QueuedEvent, ReadJobEventsRequest,
+        ClaimJobRequest, Envelope, GetJobCredentialsRequest, GetJobTimingRequest, GetStatsRequest,
+        HeartbeatRequest, ListCredentialsRequest, ListFleetRequest, ListJobsRequest,
+        ListProfilesRequest, PushEventsRequest, QueuedEvent, ReadJobEventsRequest,
+        ReportTimingRequest,
     };
     use fleet_server::auth::BearerAuth;
     use fleet_server::config::Token;
@@ -218,6 +219,18 @@ mod tests {
                     .await
                     .map(|_| ())
             }
+            "report_timing" => FleetWorkerClient::with_interceptor(chan, move |r| header.apply(r))
+                .report_timing(ReportTimingRequest {
+                    job_id: "01ARZ3NDEKTSV4RRFFQ69G5FAV".to_owned(),
+                    attempt: 1,
+                    ..ReportTimingRequest::default()
+                })
+                .await
+                .map(|_| ()),
+            "get_job_timing" => FleetJobsClient::with_interceptor(chan, move |r| header.apply(r))
+                .get_job_timing(GetJobTimingRequest::default())
+                .await
+                .map(|_| ()),
             "stats" => FleetJobsClient::with_interceptor(chan, move |r| header.apply(r))
                 .get_stats(GetStatsRequest::default())
                 .await
@@ -245,6 +258,8 @@ mod tests {
             ("batches", false, true),
             ("credentials", false, true),
             ("job_credentials", true, false),
+            ("report_timing", true, false),
+            ("get_job_timing", false, true),
         ] {
             for (name, token, ok) in [("box", TOKEN, box_ok), ("client", CLIENT, client_ok)] {
                 let status = status_of(addr, service, Some(token)).await;
@@ -272,6 +287,34 @@ mod tests {
                 assert_eq!(code, Code::Unauthenticated, "{token:?} on {service}");
             }
         }
+    }
+
+    #[tokio::test]
+    async fn report_timing_takes_the_box_token_and_checks_the_lease() {
+        let addr = spawn_with(Some(CLIENT));
+        let status = status_of(addr, "report_timing", Some(TOKEN)).await;
+        assert_eq!(status.code(), Code::Unavailable);
+    }
+
+    #[tokio::test]
+    async fn report_timing_refuses_the_client_token() {
+        let addr = spawn_with(Some(CLIENT));
+        let status = status_of(addr, "report_timing", Some(CLIENT)).await;
+        assert_eq!(status.code(), Code::PermissionDenied);
+    }
+
+    #[tokio::test]
+    async fn get_job_timing_takes_the_client_token() {
+        let addr = spawn_with(Some(CLIENT));
+        let status = status_of(addr, "get_job_timing", Some(CLIENT)).await;
+        assert_eq!(status.code(), Code::Unimplemented);
+    }
+
+    #[tokio::test]
+    async fn get_job_timing_refuses_the_box_token() {
+        let addr = spawn_with(Some(CLIENT));
+        let status = status_of(addr, "get_job_timing", Some(TOKEN)).await;
+        assert_eq!(status.code(), Code::PermissionDenied);
     }
 
     #[tokio::test]

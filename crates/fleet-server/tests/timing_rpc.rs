@@ -79,13 +79,15 @@ async fn start(pool: PgPool) -> SocketAddr {
 }
 
 #[sqlx::test]
-async fn report_timing_is_unimplemented_for_the_box_token(pool: PgPool) {
+async fn report_timing_with_the_box_token_reaches_the_lease_check_and_refuses_a_default_request(
+    pool: PgPool,
+) {
     let addr = start(pool).await;
     let err = worker(addr, as_box)
         .report_timing(ReportTimingRequest::default())
         .await
         .unwrap_err();
-    assert_eq!(err.code(), Code::Unimplemented);
+    assert_eq!(err.code(), Code::FailedPrecondition);
 }
 
 #[sqlx::test]
