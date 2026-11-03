@@ -18,6 +18,16 @@
 //! [`ShellRecorder`](crate::shell_timing::ShellRecorder) (NUL strip, redaction, then cut), and
 //! has its control characters other than newline and tab replaced by `?` after redaction.
 //!
+//! A [`LogPusher`] tails the same tasks live. Per task it reads the log, redacts the whole read
+//! first, scrubs control characters, and only then cuts chunks of at most
+//! [`MAX_SHELL_LOG_CHUNK_BYTES`] bytes. Each cut lands on a `char` boundary at or below the
+//! cap, so no chunk splits a UTF-8 character. While a task runs, the last [`LOG_TAIL_GUARD`]
+//! bytes of the redacted text are held back, so a secret still being written is never sent as
+//! a fragment; the guard has the same bound as above and a longer secret is a documented
+//! residual. Chunks go out through a [`LogReporter`] under a token budget on an injected
+//! `now`, and a task stops at [`MAX_SHELL_LOG_CHUNKS`] chunks with a final `Failed` report
+//! because the wire has no truncation status.
+//!
 //! Limit: pueue reuses ids after `pueue reset`, so a task created after a reset with an id at or
 //! below the baseline is not seen. The watcher polls as the uid of its [`PueueClient`]; the
 //! caller chooses that uid when it builds the client.
@@ -28,7 +38,9 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use fleet_core::Redactor;
-use fleet_proto::{MAX_SHELL_COMMANDS, MAX_SHELL_LOG_BYTES};
+use fleet_proto::{
+    MAX_SHELL_COMMANDS, MAX_SHELL_LOG_BYTES, MAX_SHELL_LOG_CHUNK_BYTES, MAX_SHELL_LOG_CHUNKS, v1,
+};
 use serde::Deserialize;
 use tokio::io::AsyncReadExt;
 use tokio::process::Command;
@@ -792,4 +804,424 @@ async fn fetch_status<C: PueueClient>(
         .await
         .map_err(|_| PueueError::Timeout)??;
     serde_json::from_str(&text).map_err(|_| PueueError::Parse)
+}
+
+/// Shortest pause between two log reads of one running task.
+pub const LOG_READ_INTERVAL: Duration = Duration::from_secs(1);
+/// Rate budget one reported chunk costs.
+pub const LOG_CHUNK_COST: Duration = Duration::from_millis(250);
+/// Most chunks reported back to back before the rate budget runs dry.
+pub const LOG_BURST: u32 = 8;
+/// Consecutive failed reads or reports after which a task is given up.
+pub const MAX_LOG_ERRORS: u32 = 5;
+/// Most log bytes read for one live task: the whole chunk budget plus the guard and one byte,
+/// so a read that reaches it is known to be cut.
+pub const LIVE_LOG_READ_CAP: usize =
+    MAX_SHELL_LOG_CHUNKS * MAX_SHELL_LOG_CHUNK_BYTES + LOG_TAIL_GUARD + 1;
+
+/// The live log command id of pueue task `task_id`: `bg-` and the decimal id, at most 23 bytes
+/// of `[a-z0-9-]`, always valid for [`fleet_proto::validate_shell_log_command_id`].
+#[must_use]
+pub fn log_command_id(task_id: u64) -> String {
+    format!("bg-{task_id}")
+}
+
+/// One chunk to report. The reporter adds the job, attempt and box.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LogChunk {
+    /// The live log command id, valid on the wire.
+    pub command_id: String,
+    /// Chunk number from 0, below [`MAX_SHELL_LOG_CHUNKS`].
+    pub seq: u32,
+    /// Redacted UTF-8 text of at most [`MAX_SHELL_LOG_CHUNK_BYTES`] bytes. Empty for a status
+    /// change alone.
+    pub bytes: Vec<u8>,
+    /// The task status after this chunk. Never `Unspecified`.
+    pub status: v1::ShellStatus,
+}
+
+/// A chunk report that did not go through.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ReportError;
+
+impl fmt::Display for ReportError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("log chunk report failed")
+    }
+}
+
+impl std::error::Error for ReportError {}
+
+/// Where chunks go. The gRPC client is wired behind this later.
+pub trait LogReporter: Send + Sync {
+    /// Sends one chunk. An error leaves the chunk unsent and it is offered again.
+    fn report(&self, chunk: LogChunk) -> impl Future<Output = Result<(), ReportError>> + Send;
+}
+
+/// Timing of one [`LogPusher`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LogPushConfig {
+    /// Pause between polls.
+    pub interval: Duration,
+    /// Longest the push runs.
+    pub deadline: Duration,
+    /// Longest one client or reporter call may take.
+    pub call_timeout: Duration,
+    /// Shortest pause between two log reads of one running task.
+    pub read_interval: Duration,
+}
+
+impl Default for LogPushConfig {
+    fn default() -> Self {
+        Self {
+            interval: POLL_INTERVAL,
+            deadline: WATCH_DEADLINE,
+            call_timeout: CALL_TIMEOUT,
+            read_interval: LOG_READ_INTERVAL,
+        }
+    }
+}
+
+/// What a finished push holds.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LogPushReport {
+    /// Tasks whose terminal status was reported, with that status.
+    pub ended: Vec<(u64, v1::ShellStatus)>,
+    /// Tasks that stopped without a reported terminal status.
+    pub unreported: Vec<u64>,
+    /// Tasks seen past [`MAX_TRACKED_TASKS`] and not pushed.
+    pub overflow: u64,
+}
+
+#[derive(Debug)]
+struct LogTask {
+    command_id: String,
+    seq: u32,
+    sent: usize,
+    last: Option<v1::ShellStatus>,
+    done: bool,
+    errors: u32,
+    next_read: Option<Instant>,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct Target {
+    status: v1::ShellStatus,
+    terminal: bool,
+    readable: bool,
+}
+
+fn wire_status(state: BgState, outcome: Option<BgOutcome>) -> Target {
+    match state {
+        BgState::Queued | BgState::Stashed | BgState::Locked => Target {
+            status: v1::ShellStatus::Queued,
+            terminal: false,
+            readable: false,
+        },
+        BgState::Running | BgState::Paused => Target {
+            status: v1::ShellStatus::Running,
+            terminal: false,
+            readable: true,
+        },
+        BgState::Done => Target {
+            status: if outcome == Some(BgOutcome::Success) {
+                v1::ShellStatus::Done
+            } else {
+                v1::ShellStatus::Failed
+            },
+            terminal: true,
+            readable: true,
+        },
+    }
+}
+
+fn is_terminal(status: v1::ShellStatus) -> bool {
+    matches!(status, v1::ShellStatus::Done | v1::ShellStatus::Failed)
+}
+
+fn scrub_chunk_text(text: &str) -> String {
+    text.chars()
+        .map(|c| {
+            if (c.is_control() && c != '\n' && c != '\t') || c == '\u{2028}' || c == '\u{2029}' {
+                '?'
+            } else {
+                c
+            }
+        })
+        .collect()
+}
+
+fn clean_log(redactor: &Redactor, raw: &[u8]) -> String {
+    let text = String::from_utf8_lossy(raw).replace('\0', "");
+    scrub_chunk_text(&redactor.redact_str(&text))
+}
+
+fn floor_boundary(text: &str, max: usize) -> usize {
+    let mut end = text.len().min(max);
+    while !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    end
+}
+
+/// Tails every pueue task that starts after the watch did and pushes redacted chunks.
+#[derive(Debug)]
+pub struct LogPusher<C, R> {
+    client: C,
+    reporter: R,
+    redactor: Redactor,
+    config: LogPushConfig,
+    baseline: u64,
+    tasks: BTreeMap<u64, LogTask>,
+    credit: Duration,
+    credit_at: Instant,
+    untracked: u64,
+    errors: u32,
+}
+
+impl<C: PueueClient, R: LogReporter> LogPusher<C, R> {
+    /// Reads the status once and sets the baseline to its highest task id.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BgError`] when that read fails, for the reason [`BgWatcher::start`] refuses.
+    pub async fn start(
+        client: C,
+        reporter: R,
+        redactor: Redactor,
+        config: LogPushConfig,
+        now: Instant,
+    ) -> Result<Self, BgError> {
+        let snapshot = fetch_status(&client, config.call_timeout).await?;
+        let baseline = snapshot
+            .tasks
+            .values()
+            .map(|t| t.id)
+            .max()
+            .unwrap_or_default();
+        Ok(Self {
+            client,
+            reporter,
+            redactor,
+            config,
+            baseline,
+            tasks: BTreeMap::new(),
+            credit: LOG_CHUNK_COST * LOG_BURST,
+            credit_at: now,
+            untracked: 0,
+            errors: 0,
+        })
+    }
+
+    fn refill(&mut self, now: Instant) {
+        let gained = now.saturating_duration_since(self.credit_at);
+        self.credit = (self.credit + gained).min(LOG_CHUNK_COST * LOG_BURST);
+        self.credit_at = self.credit_at.max(now);
+    }
+
+    fn has_credit(&self) -> bool {
+        self.credit >= LOG_CHUNK_COST
+    }
+
+    async fn read(&self, id: u64) -> Option<(String, bool)> {
+        let call = self.client.log(id, LIVE_LOG_READ_CAP + 1);
+        let Ok(Ok(raw)) = tokio::time::timeout(self.config.call_timeout, call).await else {
+            return None;
+        };
+        Some((
+            clean_log(&self.redactor, &raw),
+            raw.len() > LIVE_LOG_READ_CAP,
+        ))
+    }
+
+    async fn send(&mut self, task: &mut LogTask, bytes: &str, status: v1::ShellStatus) -> bool {
+        let chunk = LogChunk {
+            command_id: task.command_id.clone(),
+            seq: task.seq,
+            bytes: bytes.as_bytes().to_vec(),
+            status,
+        };
+        let call = self.reporter.report(chunk);
+        let sent = matches!(
+            tokio::time::timeout(self.config.call_timeout, call).await,
+            Ok(Ok(()))
+        );
+        if sent {
+            self.credit = self.credit.saturating_sub(LOG_CHUNK_COST);
+            task.seq += 1;
+            task.sent += bytes.len();
+            task.errors = 0;
+            task.last = Some(status);
+            task.done = is_terminal(status);
+        } else {
+            task.errors += 1;
+            task.done = task.errors >= MAX_LOG_ERRORS;
+        }
+        sent
+    }
+
+    async fn advance(&mut self, id: u64, target: Target, now: Instant) {
+        self.refill(now);
+        let Some(mut task) = self.tasks.remove(&id) else {
+            return;
+        };
+        if !task.done && self.has_credit() {
+            self.push(&mut task, id, target, now).await;
+        }
+        self.tasks.insert(id, task);
+    }
+
+    async fn push(&mut self, task: &mut LogTask, id: u64, target: Target, now: Instant) {
+        let due = task.next_read.is_none_or(|at| now >= at);
+        let text = if target.readable && (target.terminal || due) {
+            task.next_read = Some(now + self.config.read_interval);
+            let read = self.read(id).await;
+            if read.is_none() {
+                task.errors += 1;
+                if target.terminal && task.errors < MAX_LOG_ERRORS {
+                    return;
+                }
+            }
+            read
+        } else {
+            None
+        };
+        let (text, cut) = text.unwrap_or_default();
+        let hold = !target.terminal || cut;
+        let end = if hold {
+            floor_boundary(&text, text.len().saturating_sub(LOG_TAIL_GUARD))
+        } else {
+            text.len()
+        };
+        let ready = text.get(..end).unwrap_or_default();
+        while !task.done && self.has_credit() {
+            let rest = ready.get(task.sent..).unwrap_or_default();
+            let take = floor_boundary(rest, MAX_SHELL_LOG_CHUNK_BYTES);
+            let chunk = rest.get(..take).unwrap_or_default();
+            let consumes = take == rest.len();
+            let last_slot = task.seq as usize + 1 >= MAX_SHELL_LOG_CHUNKS;
+            let truncated = (last_slot && !consumes) || (consumes && cut);
+            let status = if truncated {
+                v1::ShellStatus::Failed
+            } else if last_slot && !target.terminal {
+                break;
+            } else if consumes {
+                if rest.is_empty() && task.last == Some(target.status) {
+                    break;
+                }
+                target.status
+            } else if target.terminal {
+                v1::ShellStatus::Running
+            } else {
+                target.status
+            };
+            if !self.send(task, chunk, status).await {
+                break;
+            }
+        }
+    }
+
+    /// Polls once: starts tracking new tasks, reads the log of every running task and of
+    /// every task that just ended, and reports what the rate budget allows.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BgError`] when the status read fails, times out or does not parse.
+    pub async fn poll(&mut self, now: Instant) -> Result<(), BgError> {
+        let snapshot = fetch_status(&self.client, self.config.call_timeout).await?;
+        let mut present = BTreeSet::new();
+        let mut targets = Vec::new();
+        let mut untracked = 0_u64;
+        for raw in snapshot.tasks.into_values() {
+            if raw.id <= self.baseline {
+                continue;
+            }
+            if !self.tasks.contains_key(&raw.id) && self.tasks.len() >= MAX_TRACKED_TASKS {
+                untracked += 1;
+                continue;
+            }
+            present.insert(raw.id);
+            let seen = observe(raw);
+            self.tasks.entry(seen.id).or_insert_with(|| LogTask {
+                command_id: log_command_id(seen.id),
+                seq: 0,
+                sent: 0,
+                last: None,
+                done: false,
+                errors: 0,
+                next_read: None,
+            });
+            let outcome = seen.done.as_ref().map(|d| d.outcome);
+            targets.push((seen.id, wire_status(seen.state, outcome)));
+        }
+        self.untracked = self.untracked.max(untracked);
+        for (id, task) in &self.tasks {
+            if !task.done && !present.contains(id) {
+                targets.push((*id, removed_target()));
+            }
+        }
+        for (id, target) in targets {
+            self.advance(id, target, now).await;
+        }
+        Ok(())
+    }
+
+    /// Polls once more, then reports `Failed` for every task still open and returns the
+    /// report. A task the rate budget leaves no room for is listed as unreported.
+    pub async fn finish(mut self, now: Instant) -> LogPushReport {
+        let _ = self.poll(now).await;
+        let open: Vec<u64> = self
+            .tasks
+            .iter()
+            .filter(|(_, t)| !t.done)
+            .map(|(id, _)| *id)
+            .collect();
+        for id in open {
+            self.advance(id, removed_target(), now).await;
+        }
+        let mut ended = Vec::new();
+        let mut unreported = Vec::new();
+        for (id, task) in &self.tasks {
+            match task.last {
+                Some(status) if is_terminal(status) => ended.push((*id, status)),
+                _ => unreported.push(*id),
+            }
+        }
+        LogPushReport {
+            ended,
+            unreported,
+            overflow: self.untracked,
+        }
+    }
+
+    /// Polls every [`LogPushConfig::interval`] until `stop` resolves, the deadline passes or
+    /// [`MAX_POLL_ERRORS`] polls fail in a row, then calls [`Self::finish`].
+    pub async fn watch(mut self, stop: impl Future<Output = ()>) -> LogPushReport {
+        tokio::pin!(stop);
+        let deadline = Instant::now() + self.config.deadline;
+        loop {
+            tokio::select! {
+                () = &mut stop => break,
+                () = tokio::time::sleep_until(deadline) => break,
+                () = tokio::time::sleep(self.config.interval) => {}
+            }
+            if self.poll(Instant::now()).await.is_ok() {
+                self.errors = 0;
+            } else {
+                self.errors += 1;
+                if self.errors >= MAX_POLL_ERRORS {
+                    break;
+                }
+            }
+        }
+        self.finish(Instant::now()).await
+    }
+}
+
+fn removed_target() -> Target {
+    Target {
+        status: v1::ShellStatus::Failed,
+        terminal: true,
+        readable: false,
+    }
 }

@@ -4,14 +4,21 @@
 #![expect(clippy::expect_used, reason = "test code asserts by panicking")]
 
 use std::collections::BTreeMap;
+use std::fmt::Write as _;
 use std::sync::Mutex;
 use std::time::Duration;
 
 use fleet_core::{PLACEHOLDER, Redactor};
-use fleet_proto::{MAX_SHELL_COMMANDS, MAX_SHELL_LOG_BYTES};
+use fleet_proto::{
+    MAX_SHELL_COMMANDS, MAX_SHELL_LOG_BYTES, MAX_SHELL_LOG_CHUNK_BYTES, MAX_SHELL_LOG_CHUNKS, v1,
+    validate_shell_log_bytes, validate_shell_log_command_id, validate_shell_log_seq,
+    validate_shell_log_status,
+};
 use fleetd::bg_command::{
-    Anchor, BgConfig, BgOutcome, BgState, BgWatcher, EndedBy, LOG_READ_CAP, MAX_POLL_ERRORS,
-    MAX_TRACKED_TASKS, PueueCli, PueueClient, PueueError, Rule, parse_timestamp, rule,
+    Anchor, BgConfig, BgOutcome, BgState, BgWatcher, EndedBy, LIVE_LOG_READ_CAP, LOG_BURST,
+    LOG_CHUNK_COST, LOG_READ_CAP, LOG_TAIL_GUARD, LogChunk, LogPushConfig, LogPusher, LogReporter,
+    MAX_LOG_ERRORS, MAX_POLL_ERRORS, MAX_TRACKED_TASKS, PueueCli, PueueClient, PueueError,
+    ReportError, Rule, log_command_id, parse_timestamp, rule,
 };
 use tokio::time::Instant;
 
@@ -707,4 +714,644 @@ async fn the_cli_client_caps_and_fails_closed() {
     assert_eq!(no.status_json().await.err(), Some(PueueError::Run));
     let missing = PueueCli::new("/nonexistent/pueue", Vec::new());
     assert_eq!(missing.status_json().await.err(), Some(PueueError::Run));
+}
+
+#[derive(Default)]
+struct Rec {
+    chunks: Mutex<Vec<LogChunk>>,
+    fail: Mutex<u32>,
+}
+
+impl LogReporter for &Rec {
+    fn report(&self, chunk: LogChunk) -> impl Future<Output = Result<(), ReportError>> + Send {
+        let mut fail = self.fail.lock().expect("lock");
+        let failing = *fail > 0;
+        if failing {
+            *fail -= 1;
+        }
+        drop(fail);
+        let out = if failing {
+            Err(ReportError)
+        } else {
+            self.chunks.lock().expect("lock").push(chunk);
+            Ok(())
+        };
+        std::future::ready(out)
+    }
+}
+
+impl Rec {
+    fn all(&self) -> Vec<LogChunk> {
+        self.chunks.lock().expect("lock").clone()
+    }
+
+    fn text(&self) -> String {
+        let bytes: Vec<u8> = self.all().into_iter().flat_map(|c| c.bytes).collect();
+        String::from_utf8(bytes).expect("chunks are utf-8")
+    }
+
+    fn statuses(&self) -> Vec<v1::ShellStatus> {
+        self.all().into_iter().map(|c| c.status).collect()
+    }
+}
+
+fn push_config() -> LogPushConfig {
+    LogPushConfig {
+        interval: Duration::from_millis(100),
+        deadline: Duration::from_secs(60),
+        call_timeout: Duration::from_secs(1),
+        read_interval: Duration::from_secs(1),
+    }
+}
+
+async fn drain(p: &mut LogPusher<&Fake, &Rec>, t0: Instant) {
+    for i in 1..=12_u32 {
+        p.poll(t0 + Duration::from_secs(10_000) * i)
+            .await
+            .expect("poll");
+    }
+}
+
+fn set_tasks(fake: &Fake, tasks: &[String]) {
+    *fake.statuses.lock().expect("lock") = vec![Ok(status(tasks))];
+}
+
+async fn pusher<'a>(
+    fake: &'a Fake,
+    rec: &'a Rec,
+    redactor: Redactor,
+    now: Instant,
+) -> LogPusher<&'a Fake, &'a Rec> {
+    set_tasks(fake, &[]);
+    LogPusher::start(fake, rec, redactor, push_config(), now)
+        .await
+        .expect("start")
+}
+
+fn finished_task(id: u64) -> String {
+    task(id, &done(r#""Success""#))
+}
+
+fn pad(len: usize) -> String {
+    "a".repeat(len)
+}
+
+fn long_secret(len: usize) -> String {
+    let mut out = String::new();
+    let mut n = 0_u32;
+    while out.len() < len {
+        let _ = write!(out, "{:04}", n % 10_000);
+        n += 1;
+    }
+    out.truncate(len);
+    out
+}
+
+#[tokio::test]
+async fn a_secret_straddling_a_chunk_boundary_is_replaced_whole() {
+    let fake = Fake::with(vec![]);
+    let rec = Rec::default();
+    let t0 = Instant::now();
+    let mut p = pusher(&fake, &rec, Redactor::new([SECRET]), t0).await;
+    let raw = format!("{}{SECRET}tail", pad(MAX_SHELL_LOG_CHUNK_BYTES - 5));
+    fake.logs
+        .lock()
+        .expect("lock")
+        .insert(1, Ok(raw.clone().into_bytes()));
+    set_tasks(&fake, &[finished_task(1)]);
+    p.poll(t0).await.expect("poll");
+    let chunks = rec.all();
+    assert_eq!(chunks.len(), 2);
+    assert_eq!(chunks[0].bytes.len(), MAX_SHELL_LOG_CHUNK_BYTES);
+    assert!(
+        chunks[0].bytes.ends_with(b"[REDA"),
+        "really cut inside the placeholder"
+    );
+    assert!(chunks[1].bytes.starts_with(b"CTED]"));
+    assert!(!rec.text().contains("s3cr3t"));
+    assert!(rec.text().contains(PLACEHOLDER));
+}
+
+#[tokio::test]
+async fn redaction_runs_before_the_chunks_are_cut() {
+    let fake = Fake::with(vec![]);
+    let rec = Rec::default();
+    let t0 = Instant::now();
+    let mut p = pusher(&fake, &rec, Redactor::new([SECRET]), t0).await;
+    let raw = format!("{SECRET}{}", pad(MAX_SHELL_LOG_CHUNK_BYTES - 10));
+    assert!(raw.len() > MAX_SHELL_LOG_CHUNK_BYTES);
+    fake.logs
+        .lock()
+        .expect("lock")
+        .insert(1, Ok(raw.into_bytes()));
+    set_tasks(&fake, &[finished_task(1)]);
+    p.poll(t0).await.expect("poll");
+    let chunks = rec.all();
+    assert_eq!(chunks.len(), 1, "the redacted text fits one chunk");
+    assert!(rec.text().starts_with(PLACEHOLDER));
+}
+
+#[tokio::test]
+async fn a_running_task_holds_back_the_guard_tail() {
+    let fake = Fake::with(vec![]);
+    let rec = Rec::default();
+    let t0 = Instant::now();
+    let mut p = pusher(&fake, &rec, Redactor::new([SECRET]), t0).await;
+    let first = format!("{}{SECRET}", pad(100));
+    let raw = format!("{first}{}", pad(LOG_TAIL_GUARD - 3));
+    fake.logs
+        .lock()
+        .expect("lock")
+        .insert(1, Ok(raw.into_bytes()));
+    set_tasks(&fake, &[task(1, &running())]);
+    p.poll(t0).await.expect("poll");
+    let sent = rec.text();
+    assert!(sent.len() <= 100 + PLACEHOLDER.len());
+    assert!(!sent.contains("s3cr3t"));
+    assert_eq!(rec.statuses().last(), Some(&v1::ShellStatus::Running));
+}
+
+#[tokio::test]
+async fn a_secret_split_by_the_read_cap_leaves_no_fragment_up_to_the_guard() {
+    let secret = long_secret(LOG_TAIL_GUARD + 1);
+    let fake = Fake::with(vec![]);
+    let rec = Rec::default();
+    let t0 = Instant::now();
+    let mut p = pusher(&fake, &rec, Redactor::new([secret.clone()]), t0).await;
+    let head = pad(LIVE_LOG_READ_CAP - 100);
+    let raw = format!("{head}{secret}");
+    fake.logs
+        .lock()
+        .expect("lock")
+        .insert(1, Ok(raw.into_bytes()));
+    set_tasks(&fake, &[finished_task(1)]);
+    drain(&mut p, t0).await;
+    assert!(rec.text().len() > head.len() - 2 * LOG_TAIL_GUARD);
+    assert!(!rec.text().contains(&secret[..8]));
+}
+
+#[tokio::test]
+async fn a_secret_longer_than_the_guard_split_by_the_read_cap_leaks_a_fragment() {
+    let secret = long_secret(3 * LOG_TAIL_GUARD);
+    let fake = Fake::with(vec![]);
+    let rec = Rec::default();
+    let t0 = Instant::now();
+    let mut p = pusher(&fake, &rec, Redactor::new([secret.clone()]), t0).await;
+    let head = pad(LIVE_LOG_READ_CAP - 2 * LOG_TAIL_GUARD - 100);
+    let raw = format!("{head}{secret}");
+    fake.logs
+        .lock()
+        .expect("lock")
+        .insert(1, Ok(raw.into_bytes()));
+    set_tasks(&fake, &[finished_task(1)]);
+    drain(&mut p, t0).await;
+    assert!(rec.text().contains(&secret[..8]), "the documented residual");
+}
+
+#[tokio::test]
+async fn the_rate_budget_bounds_chunks_per_instant() {
+    let fake = Fake::with(vec![]);
+    let rec = Rec::default();
+    let t0 = Instant::now();
+    let mut p = pusher(&fake, &rec, Redactor::new([SECRET]), t0).await;
+    let raw = pad(40 * MAX_SHELL_LOG_CHUNK_BYTES);
+    fake.logs
+        .lock()
+        .expect("lock")
+        .insert(1, Ok(raw.into_bytes()));
+    set_tasks(&fake, &[finished_task(1)]);
+    p.poll(t0).await.expect("poll");
+    assert_eq!(rec.all().len(), LOG_BURST as usize);
+    p.poll(t0).await.expect("poll");
+    assert_eq!(rec.all().len(), LOG_BURST as usize, "no time passed");
+    let step = LOG_CHUNK_COST * 4;
+    p.poll(t0 + step).await.expect("poll");
+    assert_eq!(rec.all().len(), LOG_BURST as usize + 4);
+    p.poll(t0 + step * 1000).await.expect("poll");
+    assert_eq!(rec.all().len(), LOG_BURST as usize + 4 + LOG_BURST as usize);
+    drain(&mut p, t0 + step * 1000).await;
+    assert_eq!(rec.all().len(), 40);
+    assert_eq!(rec.text().len(), 40 * MAX_SHELL_LOG_CHUNK_BYTES);
+}
+
+#[tokio::test]
+async fn a_long_log_stops_at_the_chunk_cap_with_a_failed_status() {
+    let fake = Fake::with(vec![]);
+    let rec = Rec::default();
+    let t0 = Instant::now();
+    let mut p = pusher(&fake, &rec, Redactor::new([SECRET]), t0).await;
+    let raw = pad(MAX_SHELL_LOG_CHUNKS * MAX_SHELL_LOG_CHUNK_BYTES + 1000);
+    fake.logs
+        .lock()
+        .expect("lock")
+        .insert(1, Ok(raw.into_bytes()));
+    set_tasks(&fake, &[finished_task(1)]);
+    let far = Duration::from_secs(10_000);
+    for i in 0..10 {
+        p.poll(t0 + far * (i + 1)).await.expect("poll");
+    }
+    let chunks = rec.all();
+    assert_eq!(chunks.len(), MAX_SHELL_LOG_CHUNKS);
+    let seqs: Vec<u32> = chunks.iter().map(|c| c.seq).collect();
+    assert_eq!(seqs, (0..64).collect::<Vec<u32>>());
+    assert_eq!(chunks[63].status, v1::ShellStatus::Failed);
+    assert!(
+        chunks[..63]
+            .iter()
+            .all(|c| c.status == v1::ShellStatus::Running)
+    );
+    assert_eq!(
+        rec.text().len(),
+        MAX_SHELL_LOG_CHUNKS * MAX_SHELL_LOG_CHUNK_BYTES
+    );
+}
+
+#[tokio::test]
+async fn a_log_that_exactly_fills_the_chunk_cap_ends_done() {
+    let fake = Fake::with(vec![]);
+    let rec = Rec::default();
+    let t0 = Instant::now();
+    let mut p = pusher(&fake, &rec, Redactor::new([SECRET]), t0).await;
+    let raw = pad(MAX_SHELL_LOG_CHUNKS * MAX_SHELL_LOG_CHUNK_BYTES);
+    fake.logs
+        .lock()
+        .expect("lock")
+        .insert(1, Ok(raw.into_bytes()));
+    set_tasks(&fake, &[finished_task(1)]);
+    drain(&mut p, t0).await;
+    let chunks = rec.all();
+    assert_eq!(chunks.len(), MAX_SHELL_LOG_CHUNKS);
+    assert_eq!(chunks[63].status, v1::ShellStatus::Done);
+}
+
+#[tokio::test]
+async fn a_cut_read_that_redaction_shrinks_under_the_cap_still_reports_truncation() {
+    let fake = Fake::with(vec![]);
+    let rec = Rec::default();
+    let t0 = Instant::now();
+    let mut p = pusher(&fake, &rec, Redactor::new([SECRET]), t0).await;
+    let raw = format!("{SECRET}\n").repeat(LIVE_LOG_READ_CAP / SECRET.len() + 10);
+    assert!(raw.len() > LIVE_LOG_READ_CAP);
+    fake.logs
+        .lock()
+        .expect("lock")
+        .insert(1, Ok(raw.into_bytes()));
+    set_tasks(&fake, &[finished_task(1)]);
+    drain(&mut p, t0).await;
+    let chunks = rec.all();
+    assert!(chunks.len() < MAX_SHELL_LOG_CHUNKS);
+    assert_eq!(
+        chunks.last().map(|c| c.status),
+        Some(v1::ShellStatus::Failed)
+    );
+}
+
+#[tokio::test]
+async fn a_task_stops_being_read_once_its_end_is_reported() {
+    let fake = Fake::with(vec![]);
+    let rec = Rec::default();
+    let t0 = Instant::now();
+    let mut p = pusher(&fake, &rec, Redactor::new([SECRET]), t0).await;
+    fake.logs
+        .lock()
+        .expect("lock")
+        .insert(1, Ok(b"out\n".to_vec()));
+    set_tasks(&fake, &[finished_task(1)]);
+    p.poll(t0).await.expect("poll");
+    let reports = rec.all().len();
+    let reads = fake.log_calls.lock().expect("lock").len();
+    assert_eq!(reports, 1);
+    for i in 1..5 {
+        p.poll(t0 + Duration::from_secs(100 * i))
+            .await
+            .expect("poll");
+    }
+    assert_eq!(rec.all().len(), reports);
+    assert_eq!(fake.log_calls.lock().expect("lock").len(), reads);
+    set_tasks(&fake, &[]);
+    p.poll(t0 + Duration::from_secs(1000)).await.expect("poll");
+    assert_eq!(
+        rec.all().len(),
+        reports,
+        "a vanished finished task is not reported again"
+    );
+}
+
+#[tokio::test]
+async fn every_pueue_state_reports_its_wire_status() {
+    let paused = format!(r#"{{"Paused":{{"enqueued_at":"{START}","start":"{START}"}}}}"#);
+    let stashed = r#"{"Stashed":{"enqueue_at":null}}"#.to_owned();
+    let locked = format!(r#"{{"Locked":{{"previous_status":{}}}}}"#, queued());
+    let table = [
+        ("queued", queued(), v1::ShellStatus::Queued),
+        ("stashed", stashed, v1::ShellStatus::Queued),
+        ("locked", locked, v1::ShellStatus::Queued),
+        ("running", running(), v1::ShellStatus::Running),
+        ("paused", paused, v1::ShellStatus::Running),
+        ("success", done(r#""Success""#), v1::ShellStatus::Done),
+        ("failed", done(r#"{"Failed":2}"#), v1::ShellStatus::Failed),
+        ("killed", done(r#""Killed""#), v1::ShellStatus::Failed),
+        ("errored", done(r#""Errored""#), v1::ShellStatus::Failed),
+        (
+            "spawn",
+            done(r#"{"FailedToSpawn":"x"}"#),
+            v1::ShellStatus::Failed,
+        ),
+        (
+            "dependency",
+            done(r#""DependencyFailed""#),
+            v1::ShellStatus::Failed,
+        ),
+    ];
+    for (name, state, expected) in table {
+        let fake = Fake::with(vec![]);
+        let rec = Rec::default();
+        let t0 = Instant::now();
+        let mut p = pusher(&fake, &rec, Redactor::new([SECRET]), t0).await;
+        set_tasks(&fake, &[task(1, &state)]);
+        p.poll(t0).await.expect("poll");
+        assert_eq!(rec.statuses(), vec![expected], "{name}");
+        assert_eq!(rec.all()[0].bytes.len(), 0, "{name}");
+    }
+}
+
+#[tokio::test]
+async fn a_task_walks_queued_running_done_and_a_vanished_one_fails() {
+    let fake = Fake::with(vec![]);
+    let rec = Rec::default();
+    let t0 = Instant::now();
+    let mut p = pusher(&fake, &rec, Redactor::new([SECRET]), t0).await;
+    fake.logs
+        .lock()
+        .expect("lock")
+        .insert(1, Ok(b"hi\n".to_vec()));
+    set_tasks(&fake, &[task(1, &queued()), task(2, &running())]);
+    p.poll(t0).await.expect("poll");
+    p.poll(t0 + Duration::from_millis(10)).await.expect("poll");
+    set_tasks(&fake, &[task(1, &running())]);
+    p.poll(t0 + Duration::from_secs(5)).await.expect("poll");
+    set_tasks(&fake, &[finished_task(1)]);
+    p.poll(t0 + Duration::from_secs(10)).await.expect("poll");
+    let one: Vec<v1::ShellStatus> = rec
+        .all()
+        .into_iter()
+        .filter(|c| c.command_id == log_command_id(1))
+        .map(|c| c.status)
+        .collect();
+    assert_eq!(
+        one,
+        [
+            v1::ShellStatus::Queued,
+            v1::ShellStatus::Running,
+            v1::ShellStatus::Done
+        ]
+    );
+    let two: Vec<v1::ShellStatus> = rec
+        .all()
+        .into_iter()
+        .filter(|c| c.command_id == log_command_id(2))
+        .map(|c| c.status)
+        .collect();
+    assert_eq!(two, [v1::ShellStatus::Running, v1::ShellStatus::Failed]);
+}
+
+#[tokio::test]
+async fn a_task_at_or_below_the_baseline_is_not_pushed() {
+    let fake = Fake::with(vec![status(&[finished_task(3)])]);
+    let rec = Rec::default();
+    let t0 = Instant::now();
+    let mut p = LogPusher::start(&fake, &rec, Redactor::new([SECRET]), push_config(), t0)
+        .await
+        .expect("start");
+    p.poll(t0).await.expect("poll");
+    assert_eq!(rec.all().len(), 0);
+    assert_eq!(fake.log_calls.lock().expect("lock").len(), 0);
+}
+
+#[test]
+fn the_command_id_always_validates() {
+    for id in [0, 1, 7, 255, u64::MAX] {
+        assert!(validate_shell_log_command_id(&log_command_id(id)), "{id}");
+    }
+}
+
+#[tokio::test]
+async fn every_chunk_passes_the_proto_validators_for_hostile_input() {
+    let raw: Vec<u8> = [
+        b"a\xffb\0c\r\n".as_slice(),
+        "\u{85}d\u{2028}e\u{2029}f\t".as_bytes(),
+        SECRET.as_bytes(),
+        &[0xC3],
+        pad(MAX_SHELL_LOG_CHUNK_BYTES * 2).as_bytes(),
+        "\u{1F600}".repeat(2000).as_bytes(),
+    ]
+    .concat();
+    let fake = Fake::with(vec![]);
+    let rec = Rec::default();
+    let t0 = Instant::now();
+    let mut p = pusher(&fake, &rec, Redactor::new([SECRET]), t0).await;
+    fake.logs.lock().expect("lock").insert(u64::MAX, Ok(raw));
+    let hostile = format!(
+        r#""{id}":{{"id":{id},"created_at":"{START}","original_command":"x\r\n\u0085\u2028 {SECRET}","command":"x","path":"/w","envs":{{}},"group":"default","dependencies":[],"priority":0,"label":null,"status":{state}}}"#,
+        id = u64::MAX,
+        state = done(r#""Success""#),
+    );
+    set_tasks(
+        &fake,
+        &[format!(r#"{{"tasks":{{{hostile}}},"groups":{{}}}}"#)],
+    );
+    *fake.statuses.lock().expect("lock") =
+        vec![Ok(format!(r#"{{"tasks":{{{hostile}}},"groups":{{}}}}"#))];
+    drain(&mut p, t0).await;
+    let chunks = rec.all();
+    assert!(chunks.len() > 2);
+    for chunk in &chunks {
+        assert!(validate_shell_log_command_id(&chunk.command_id));
+        assert!(validate_shell_log_seq(chunk.seq));
+        assert!(validate_shell_log_bytes(&chunk.bytes));
+        assert!(validate_shell_log_status(chunk.status as i32).is_some());
+        let text = std::str::from_utf8(&chunk.bytes).expect("utf-8, no split char");
+        for bad in ['\0', '\r', '\u{85}', '\u{2028}', '\u{2029}'] {
+            assert!(!text.contains(bad), "{bad:?}");
+        }
+        assert!(!text.contains("s3cr3t"));
+    }
+    assert!(rec.text().contains("a\u{fffd}bc"));
+    assert!(rec.text().contains('\u{1F600}'));
+}
+
+#[tokio::test]
+async fn a_failed_report_is_offered_again_with_the_same_seq() {
+    let fake = Fake::with(vec![]);
+    let rec = Rec::default();
+    let t0 = Instant::now();
+    let mut p = pusher(&fake, &rec, Redactor::new([SECRET]), t0).await;
+    fake.logs
+        .lock()
+        .expect("lock")
+        .insert(1, Ok(b"out\n".to_vec()));
+    set_tasks(&fake, &[finished_task(1)]);
+    *rec.fail.lock().expect("lock") = 2;
+    p.poll(t0).await.expect("poll");
+    assert_eq!(rec.all().len(), 0);
+    p.poll(t0 + Duration::from_secs(1)).await.expect("poll");
+    p.poll(t0 + Duration::from_secs(2)).await.expect("poll");
+    let chunks = rec.all();
+    assert_eq!(chunks.len(), 1);
+    assert_eq!(chunks[0].seq, 0);
+    assert_eq!(chunks[0].bytes, b"out\n");
+}
+
+#[tokio::test]
+async fn a_task_is_given_up_after_repeated_report_failures() {
+    let fake = Fake::with(vec![]);
+    let rec = Rec::default();
+    let t0 = Instant::now();
+    let mut p = pusher(&fake, &rec, Redactor::new([SECRET]), t0).await;
+    set_tasks(&fake, &[finished_task(1)]);
+    *rec.fail.lock().expect("lock") = u32::MAX;
+    for i in 0..(MAX_LOG_ERRORS + 3) {
+        p.poll(t0 + Duration::from_secs(u64::from(i)))
+            .await
+            .expect("poll");
+    }
+    let tries = u32::MAX - *rec.fail.lock().expect("lock");
+    assert_eq!(tries, MAX_LOG_ERRORS);
+}
+
+#[tokio::test]
+async fn a_failed_log_read_of_a_finished_task_is_retried_then_ends_without_data() {
+    let fake = Fake::with(vec![]);
+    let rec = Rec::default();
+    let t0 = Instant::now();
+    let mut p = pusher(&fake, &rec, Redactor::new([SECRET]), t0).await;
+    fake.logs
+        .lock()
+        .expect("lock")
+        .insert(1, Err(PueueError::Run));
+    set_tasks(&fake, &[finished_task(1)]);
+    p.poll(t0).await.expect("poll");
+    assert_eq!(rec.all().len(), 0, "retry before giving up");
+    for i in 1..=MAX_LOG_ERRORS {
+        p.poll(t0 + Duration::from_secs(u64::from(i)))
+            .await
+            .expect("poll");
+    }
+    assert_eq!(rec.statuses(), vec![v1::ShellStatus::Done]);
+}
+
+#[tokio::test]
+async fn finish_fails_every_open_task() {
+    let fake = Fake::with(vec![]);
+    let rec = Rec::default();
+    let t0 = Instant::now();
+    let mut p = pusher(&fake, &rec, Redactor::new([SECRET]), t0).await;
+    set_tasks(
+        &fake,
+        &[task(1, &running()), finished_task(2), task(3, &queued())],
+    );
+    p.poll(t0).await.expect("poll");
+    let report = p.finish(t0 + Duration::from_secs(1)).await;
+    assert_eq!(report.unreported.len(), 0);
+    assert_eq!(
+        report.ended,
+        vec![
+            (1, v1::ShellStatus::Failed),
+            (2, v1::ShellStatus::Done),
+            (3, v1::ShellStatus::Failed)
+        ]
+    );
+}
+
+#[tokio::test]
+async fn tasks_past_the_tracking_cap_are_counted_not_pushed() {
+    let fake = Fake::with(vec![]);
+    let rec = Rec::default();
+    let t0 = Instant::now();
+    let mut p = pusher(&fake, &rec, Redactor::new([SECRET]), t0).await;
+    let tasks: Vec<String> = (1..=MAX_TRACKED_TASKS as u64 + 3)
+        .map(|id| task(id, &queued()))
+        .collect();
+    set_tasks(&fake, &tasks);
+    p.poll(t0).await.expect("poll");
+    let report = p.finish(t0).await;
+    assert_eq!(report.overflow, 3);
+}
+
+#[tokio::test]
+async fn a_running_task_is_read_at_most_once_per_read_interval() {
+    let fake = Fake::with(vec![]);
+    let rec = Rec::default();
+    let t0 = Instant::now();
+    let mut p = pusher(&fake, &rec, Redactor::new([SECRET]), t0).await;
+    set_tasks(&fake, &[task(1, &running())]);
+    for ms in [0, 100, 200, 900] {
+        p.poll(t0 + Duration::from_millis(ms)).await.expect("poll");
+    }
+    assert_eq!(fake.log_calls.lock().expect("lock").len(), 1);
+    p.poll(t0 + Duration::from_secs(10)).await.expect("poll");
+    assert_eq!(fake.log_calls.lock().expect("lock").len(), 2);
+}
+
+#[tokio::test]
+async fn a_chunk_cut_never_splits_a_multibyte_character() {
+    for (glyph, pad_len) in [("\u{e9}", 4095), ("\u{20ac}", 4094), ("\u{1F600}", 4093)] {
+        let fake = Fake::with(vec![]);
+        let rec = Rec::default();
+        let t0 = Instant::now();
+        let mut p = pusher(&fake, &rec, Redactor::new([SECRET]), t0).await;
+        let raw = format!("{}{glyph}{glyph}", pad(pad_len));
+        fake.logs
+            .lock()
+            .expect("lock")
+            .insert(1, Ok(raw.into_bytes()));
+        set_tasks(&fake, &[finished_task(1)]);
+        p.poll(t0).await.expect("poll");
+        let chunks = rec.all();
+        assert_eq!(chunks.len(), 2, "{glyph}");
+        assert_eq!(chunks[0].bytes.len(), pad_len, "{glyph}");
+        assert!(std::str::from_utf8(&chunks[0].bytes).is_ok());
+        assert!(chunks[1].bytes.starts_with(glyph.as_bytes()));
+        assert_eq!(rec.text(), format!("{}{glyph}{glyph}", pad(pad_len)));
+    }
+}
+
+#[tokio::test]
+async fn the_last_chunk_slot_is_kept_for_the_terminal_status() {
+    let fake = Fake::with(vec![]);
+    let rec = Rec::default();
+    let t0 = Instant::now();
+    let mut p = pusher(&fake, &rec, Redactor::new([SECRET]), t0).await;
+    let raw = pad(63 * MAX_SHELL_LOG_CHUNK_BYTES + 500 + LOG_TAIL_GUARD);
+    fake.logs
+        .lock()
+        .expect("lock")
+        .insert(1, Ok(raw.into_bytes()));
+    set_tasks(&fake, &[task(1, &running())]);
+    for i in 1..=12_u32 {
+        p.poll(t0 + Duration::from_secs(10_000) * i)
+            .await
+            .expect("poll");
+    }
+    assert_eq!(rec.all().len(), MAX_SHELL_LOG_CHUNKS - 1);
+    set_tasks(&fake, &[finished_task(1)]);
+    p.poll(t0 + Duration::from_secs(200_000))
+        .await
+        .expect("poll");
+    let chunks = rec.all();
+    assert_eq!(chunks.len(), MAX_SHELL_LOG_CHUNKS);
+    assert!(chunks.iter().all(|c| validate_shell_log_seq(c.seq)));
+    assert_eq!(chunks[63].status, v1::ShellStatus::Failed);
+}
+
+#[tokio::test]
+async fn a_queued_task_is_never_read() {
+    let fake = Fake::with(vec![]);
+    let rec = Rec::default();
+    let t0 = Instant::now();
+    let mut p = pusher(&fake, &rec, Redactor::new([SECRET]), t0).await;
+    set_tasks(&fake, &[task(1, &queued())]);
+    p.poll(t0).await.expect("poll");
+    assert_eq!(rec.statuses(), vec![v1::ShellStatus::Queued]);
+    assert_eq!(fake.log_calls.lock().expect("lock").len(), 0);
 }
