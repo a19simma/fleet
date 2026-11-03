@@ -207,6 +207,27 @@ impl CatalogEntry {
 pub enum NoteReason {
     /// An admin disabled the item.
     AdminDisabled,
+    /// The job runner has no mechanism for this kind of item.
+    RunnerUnsupported,
+}
+
+/// The agent runner a job uses.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[non_exhaustive]
+pub enum RunnerKind {
+    /// Claude Code.
+    Claude,
+    /// Codex.
+    Codex,
+    /// Kimi, which has no subagent mechanism (ADR-0053).
+    Kimi,
+}
+
+impl RunnerKind {
+    /// Whether the runner can load an item of `kind`.
+    pub const fn supports(self, kind: CatalogKind) -> bool {
+        !matches!((self, kind), (Self::Kimi, CatalogKind::Subagent))
+    }
 }
 
 /// A visible note about an item left out of the effective set.
@@ -267,7 +288,9 @@ impl std::error::Error for ResolveError {}
 ///
 /// The result is every admin-enabled item minus the items the selection switched off.
 /// Admin-disabled items are always dropped, each with a [`ResolveNote`], even when the
-/// selection names them. Items and notes are ordered by kind, then name, then id.
+/// selection names them. For a runner that cannot load an item kind (Kimi and subagents), each
+/// item the selection kept is dropped with a [`NoteReason::RunnerUnsupported`] note. Items and
+/// notes are ordered by kind, then name, then id.
 ///
 /// # Errors
 ///
@@ -275,6 +298,7 @@ impl std::error::Error for ResolveError {}
 /// catalog, [`ResolveError::DuplicateCatalogId`] for a repeated catalog id, and
 /// [`ResolveError::CatalogTooLarge`] past [`MAX_CATALOG`] entries.
 pub fn resolve(
+    runner: RunnerKind,
     selection: &Selection,
     catalog: &[CatalogEntry],
 ) -> Result<EffectiveSet, ResolveError> {
@@ -306,7 +330,15 @@ pub fn resolve(
                 reason: NoteReason::AdminDisabled,
             });
         } else if !off.contains(item.id()) {
-            out.items.push(item.clone());
+            if runner.supports(item.kind()) {
+                out.items.push(item.clone());
+            } else {
+                out.notes.push(ResolveNote {
+                    kind: item.kind(),
+                    id: item.id().clone(),
+                    reason: NoteReason::RunnerUnsupported,
+                });
+            }
         }
     }
     Ok(out)
@@ -515,35 +547,43 @@ mod tests {
 
     #[test]
     fn empty_selection_yields_all_admin_enabled() {
-        let got = resolve(&Selection::default(), &sample()).unwrap_or_else(|_| unreachable!());
+        let got = resolve(RunnerKind::Claude, &Selection::default(), &sample())
+            .unwrap_or_else(|_| unreachable!());
         assert_eq!(ids(&got), ["s1", "s2", "t1", "c1"]);
         assert_eq!(note_ids(&got), ["a1"]);
     }
 
     #[test]
     fn empty_catalog_and_selection_yield_nothing() {
-        let got = resolve(&Selection::default(), &[]).unwrap_or_else(|_| unreachable!());
+        let got = resolve(RunnerKind::Claude, &Selection::default(), &[])
+            .unwrap_or_else(|_| unreachable!());
         assert_eq!(got, EffectiveSet::default());
     }
 
     #[test]
     fn switched_off_items_are_removed_without_note() {
-        let got = resolve(&sel(&["s1", "t1"]), &sample()).unwrap_or_else(|_| unreachable!());
+        let got = resolve(RunnerKind::Claude, &sel(&["s1", "t1"]), &sample())
+            .unwrap_or_else(|_| unreachable!());
         assert_eq!(ids(&got), ["s2", "c1"]);
         assert_eq!(note_ids(&got), ["a1"]);
     }
 
     #[test]
     fn switching_off_everything_leaves_only_notes() {
-        let got =
-            resolve(&sel(&["c1", "s1", "s2", "t1"]), &sample()).unwrap_or_else(|_| unreachable!());
+        let got = resolve(
+            RunnerKind::Claude,
+            &sel(&["c1", "s1", "s2", "t1"]),
+            &sample(),
+        )
+        .unwrap_or_else(|_| unreachable!());
         assert_eq!(got.items(), []);
         assert_eq!(note_ids(&got), ["a1"]);
     }
 
     #[test]
     fn admin_disabled_item_named_by_selection_is_noted_once() {
-        let got = resolve(&sel(&["a1"]), &sample()).unwrap_or_else(|_| unreachable!());
+        let got = resolve(RunnerKind::Claude, &sel(&["a1"]), &sample())
+            .unwrap_or_else(|_| unreachable!());
         assert_eq!(ids(&got), ["s1", "s2", "t1", "c1"]);
         assert_eq!(
             got.notes(),
@@ -555,15 +595,59 @@ mod tests {
         );
     }
 
+    fn kimi_note(id: &str) -> ResolveNote {
+        ResolveNote {
+            kind: CatalogKind::Subagent,
+            id: validate_id(id).unwrap_or_else(|_| unreachable!()),
+            reason: NoteReason::RunnerUnsupported,
+        }
+    }
+
+    fn with_enabled_subagent() -> Vec<CatalogEntry> {
+        let mut c = sample();
+        c.push(entry(CatalogKind::Subagent, "a2", "helper", true));
+        c
+    }
+
+    #[test]
+    fn kimi_drops_subagents_with_a_note() {
+        let got = resolve(
+            RunnerKind::Kimi,
+            &Selection::default(),
+            &with_enabled_subagent(),
+        )
+        .unwrap_or_else(|_| unreachable!());
+        assert_eq!(ids(&got), ["s1", "s2", "t1", "c1"]);
+        assert_eq!(got.notes().len(), 2);
+        assert!(got.notes().contains(&kimi_note("a2")));
+    }
+
+    #[test]
+    fn claude_and_codex_keep_subagents() {
+        for runner in [RunnerKind::Claude, RunnerKind::Codex] {
+            let got = resolve(runner, &Selection::default(), &with_enabled_subagent())
+                .unwrap_or_else(|_| unreachable!());
+            assert_eq!(ids(&got), ["s1", "s2", "a2", "t1", "c1"], "{runner:?}");
+            assert_eq!(note_ids(&got), ["a1"], "{runner:?}");
+        }
+    }
+
+    #[test]
+    fn kimi_does_not_note_a_subagent_the_selection_switched_off() {
+        let got = resolve(RunnerKind::Kimi, &sel(&["a2"]), &with_enabled_subagent())
+            .unwrap_or_else(|_| unreachable!());
+        assert_eq!(note_ids(&got), ["a1"]);
+    }
+
     #[test]
     fn unknown_selection_id_is_an_error() {
         let want = validate_id("zz").unwrap_or_else(|_| unreachable!());
         assert_eq!(
-            resolve(&sel(&["s1", "zz"]), &sample()),
+            resolve(RunnerKind::Claude, &sel(&["s1", "zz"]), &sample()),
             Err(ResolveError::UnknownItem(want))
         );
         assert_eq!(
-            resolve(&sel(&["zz"]), &[]),
+            resolve(RunnerKind::Claude, &sel(&["zz"]), &[]),
             Err(ResolveError::UnknownItem(
                 validate_id("zz").unwrap_or_else(|_| unreachable!())
             ))
@@ -581,12 +665,14 @@ mod tests {
             entry(CatalogKind::Skill, "s6", "off1", false),
             entry(CatalogKind::Context, "c8", "off0", false),
         ];
-        let got = resolve(&Selection::default(), &catalog).unwrap_or_else(|_| unreachable!());
+        let got = resolve(RunnerKind::Claude, &Selection::default(), &catalog)
+            .unwrap_or_else(|_| unreachable!());
         assert_eq!(ids(&got), ["s7", "s8", "s9", "c9"]);
         assert_eq!(note_ids(&got), ["s6", "a9", "c8"]);
         let mut reversed = catalog;
         reversed.reverse();
-        let again = resolve(&Selection::default(), &reversed).unwrap_or_else(|_| unreachable!());
+        let again = resolve(RunnerKind::Claude, &Selection::default(), &reversed)
+            .unwrap_or_else(|_| unreachable!());
         assert_eq!(got, again);
     }
 
@@ -597,7 +683,7 @@ mod tests {
             entry(CatalogKind::Context, "s1", "b", false),
         ];
         assert_eq!(
-            resolve(&Selection::default(), &catalog),
+            resolve(RunnerKind::Claude, &Selection::default(), &catalog),
             Err(ResolveError::DuplicateCatalogId)
         );
     }
@@ -609,17 +695,25 @@ mod tests {
                 .map(|i| entry(CatalogKind::Skill, &format!("s{i}"), "n", true))
                 .collect()
         };
-        let at = resolve(&Selection::default(), &build(MAX_CATALOG));
+        let at = resolve(
+            RunnerKind::Claude,
+            &Selection::default(),
+            &build(MAX_CATALOG),
+        );
         assert_eq!(at.map(|s| s.items().len()), Ok(MAX_CATALOG));
         assert_eq!(
-            resolve(&Selection::default(), &build(MAX_CATALOG + 1)),
+            resolve(
+                RunnerKind::Claude,
+                &Selection::default(),
+                &build(MAX_CATALOG + 1)
+            ),
             Err(ResolveError::CatalogTooLarge)
         );
     }
 
     #[test]
     fn resolve_errors_never_echo_input() {
-        let err = resolve(&sel(&["secretid"]), &[]).unwrap_err();
+        let err = resolve(RunnerKind::Claude, &sel(&["secretid"]), &[]).unwrap_err();
         assert!(!err.to_string().contains("secretid"));
     }
 }
