@@ -259,10 +259,16 @@ const ERR_FINISH_TIMEOUT: &str = "finish step timed out";
 const LOG_TAIL_BYTES: usize = 512;
 const NO_CHANGES_NOTE: &str = "fleet: no_changes";
 
-/// True when `name` may not reach the agent: a [`STRIPPED_ENV`] name or a `FLEETD_` one.
+/// True when `name` may not reach the agent from the base env or passthrough list.
+///
+/// That is a [`STRIPPED_ENV`] name, a `FLEETD_` one, or a reserved telemetry name
+/// ([`crate::jobenv::reserved_telemetry_name`]). fleetd sets its own telemetry values after
+/// this filter.
 #[must_use]
 pub fn env_forbidden(name: &str) -> bool {
-    STRIPPED_ENV.contains(&name) || name.starts_with("FLEETD_")
+    STRIPPED_ENV.contains(&name)
+        || name.starts_with("FLEETD_")
+        || crate::jobenv::reserved_telemetry_name(name)
 }
 
 /// Sends one `ReportJob` call. The seam lets tests run without a server.
@@ -2784,6 +2790,36 @@ mod tests {
             job_id: "job1".into(),
             prompt: "do it".into(),
             ..Job::default()
+        }
+    }
+
+    #[test]
+    fn base_env_telemetry_names_never_reach_the_agent() {
+        let jobs = Path::new("/jobs");
+        let mut config = test_config(jobs);
+        config.base_env.extend(
+            [
+                "OTEL_EXPORTER_OTLP_ENDPOINT",
+                "otel_sdk_disabled",
+                "CLAUDE_CODE_ENABLE_TELEMETRY",
+            ]
+            .map(|name| (OsString::from(name), OsString::from("evil"))),
+        );
+        config.env_passthrough.extend(
+            [
+                "OTEL_EXPORTER_OTLP_ENDPOINT",
+                "CLAUDE_CODE_ENABLE_TELEMETRY",
+            ]
+            .map(String::from),
+        );
+        let runner = AgentRunner::new(config, Replies { cancel: false }, Redactor::default());
+        let spec = runner.agent_spec(&test_job(), Path::new("/work"), Path::new("/jobs/home"));
+        for name in [
+            "OTEL_EXPORTER_OTLP_ENDPOINT",
+            "otel_sdk_disabled",
+            "CLAUDE_CODE_ENABLE_TELEMETRY",
+        ] {
+            assert!(!spec.env.contains_key(&OsString::from(name)), "{name}");
         }
     }
 
