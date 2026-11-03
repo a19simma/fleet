@@ -6,10 +6,11 @@ use fleet_core::BoxName;
 use fleet_core::timing::Summary;
 use fleet_proto::v1::{
     GetJobTimingReply, GetJobTimingRequest, ReportShellLogReply, ReportShellLogRequest,
-    ReportTimingReply, ReportTimingRequest, StreamShellLogChunk, StreamShellLogRequest,
-    TimingSummary,
+    ReportTimingReply, ReportTimingRequest, ShellCommand, StreamShellLogChunk,
+    StreamShellLogRequest, TimingSpan, TimingSummary,
 };
 use fleet_proto::{
+    MAX_COMMAND_BYTES, MAX_SHELL_COMMANDS, MAX_SHELL_LOG_BYTES, MAX_SPANS, MAX_TIMING_NAME_BYTES,
     ShellCommandRecord, TimingSpanRecord, shell_commands_from_wire, shell_status_name,
     spans_from_wire, validate_shell_log_bytes, validate_shell_log_command_id,
     validate_shell_log_seq, validate_shell_log_status,
@@ -20,6 +21,8 @@ use tokio::time::Instant;
 use tonic::Status;
 use tonic::codegen::BoxStream;
 use tonic::codegen::tokio_stream::wrappers::ReceiverStream;
+
+use crate::jobs::validate_job_id;
 
 /// Most distinct command ids one job may log.
 pub const MAX_LOG_COMMANDS_PER_JOB: usize = 256;
@@ -47,10 +50,10 @@ pub const REASON_SPAN_OUTSIDE: &str = "timing span lies outside the job window";
 /// Refusal when the reported wall window ends after the server clock.
 pub const REASON_WINDOW_AHEAD: &str = "timing wall time runs past the present";
 
+const NOT_IMPLEMENTED: &str = "job timing is not implemented";
+
 const STREAM_BATCH: i64 = 64;
 const STREAM_QUEUE: usize = 16;
-
-const NOT_IMPLEMENTED: &str = "job timing is not implemented";
 
 const LOCK_REPORTED_JOB: &str = "\
 SELECT (EXTRACT(EPOCH FROM claimed_at) * 1000)::bigint, \
@@ -307,10 +310,182 @@ async fn insert_commands(
     Ok(())
 }
 
-/// Reads the stored timing of one job.
+const SELECT_TIMING_OWNER: &str = "\
+SELECT 1 FROM jobs WHERE job_id = $1 AND ($2::bigint IS NULL OR user_id = $2)";
+
+const SELECT_TIMING: &str = "\
+SELECT wall_ms, api_wait_ms, tool_ms, shell_ms, idle_ms, overhead_ms \
+FROM job_timing WHERE job_id = $1";
+
+const SELECT_SPANS: &str = "\
+SELECT kind, start_ms, end_ms, name, tool_use_id \
+FROM job_timing_spans WHERE job_id = $1 ORDER BY seq LIMIT $2";
+
+const SELECT_COMMANDS: &str = "\
+SELECT id, command, background, started_ms, ended_ms, duration_ms, exit_code, log, \
+log_truncated, ended_by FROM job_shell_commands WHERE job_id = $1 ORDER BY seq LIMIT $2";
+
+fn unreadable() -> Status {
+    Status::internal("stored timing is unreadable")
+}
+
+fn unsigned(value: i64) -> Result<u64, Status> {
+    u64::try_from(value).map_err(|_| unreadable())
+}
+
+fn read<'r, T>(row: &'r sqlx::postgres::PgRow, column: &str) -> Result<T, Status>
+where
+    T: sqlx::Decode<'r, sqlx::Postgres> + sqlx::Type<sqlx::Postgres>,
+{
+    row.try_get(column).map_err(|_| unreadable())
+}
+
+fn span_kind(text: &str) -> Result<i32, Status> {
+    use fleet_proto::v1::TimingSpanKind;
+    let kind = match text {
+        "api" => TimingSpanKind::Api,
+        "tool" => TimingSpanKind::Tool,
+        "shell" => TimingSpanKind::Shell,
+        "bg_shell" => TimingSpanKind::BgShell,
+        _ => return Err(unreadable()),
+    };
+    Ok(kind as i32)
+}
+
+fn summary_from_row(row: &sqlx::postgres::PgRow) -> Result<TimingSummary, Status> {
+    let summary = TimingSummary {
+        wall_ms: unsigned(read(row, "wall_ms")?)?,
+        api_wait_ms: unsigned(read(row, "api_wait_ms")?)?,
+        tool_ms: unsigned(read(row, "tool_ms")?)?,
+        shell_ms: unsigned(read(row, "shell_ms")?)?,
+        idle_ms: unsigned(read(row, "idle_ms")?)?,
+        overhead_ms: unsigned(read(row, "overhead_ms")?)?,
+    };
+    if parts_sum_to_wall(&summary) {
+        Ok(summary)
+    } else {
+        Err(unreadable())
+    }
+}
+
+fn span_from_row(row: &sqlx::postgres::PgRow) -> Result<TimingSpan, Status> {
+    let kind: String = read(row, "kind")?;
+    let name: String = read(row, "name")?;
+    if name.len() > MAX_TIMING_NAME_BYTES {
+        return Err(unreadable());
+    }
+    Ok(TimingSpan {
+        kind: span_kind(&kind)?,
+        start_ms: unsigned(read(row, "start_ms")?)?,
+        end_ms: unsigned(read(row, "end_ms")?)?,
+        name,
+        tool_use_id: read(row, "tool_use_id")?,
+    })
+}
+
+fn command_from_row(row: &sqlx::postgres::PgRow) -> Result<ShellCommand, Status> {
+    let command: String = read(row, "command")?;
+    let log: String = read(row, "log")?;
+    if command.len() > MAX_COMMAND_BYTES || log.len() > MAX_SHELL_LOG_BYTES {
+        return Err(unreadable());
+    }
+    let ended: Option<i64> = read(row, "ended_ms")?;
+    Ok(ShellCommand {
+        id: read(row, "id")?,
+        command,
+        background: read(row, "background")?,
+        started_ms: unsigned(read(row, "started_ms")?)?,
+        ended_ms: ended.map(unsigned).transpose()?,
+        duration_ms: unsigned(read(row, "duration_ms")?)?,
+        exit_code: read(row, "exit_code")?,
+        log,
+        log_truncated: read(row, "log_truncated")?,
+        ended_by: read(row, "ended_by")?,
+    })
+}
+
+/// Reads the stored timing of one job for `owner`.
+///
+/// `Some(user)` reads only that user's jobs; `None` is the box token and reads any job. The
+/// job id is validated before any query. An unknown job and another user's job both answer
+/// the same `NOT_FOUND`, so the reply is no existence oracle. A job that never got a report
+/// answers `Ok` with `summary` unset and no spans or commands: absent, never zeros. All
+/// reads run in one repeatable-read transaction, so a concurrent replacement is seen whole or
+/// not at all.
+///
+/// The reply is bounded: at most `MAX_SPANS` spans and `MAX_SHELL_COMMANDS` commands, each
+/// name, command and log within its `fleet-proto` cap. A stored row that breaks a cap, a
+/// negative number, an unknown kind or parts that do not sum to `wall_ms` fails closed with
+/// `INTERNAL` instead of being sent.
 ///
 /// # Errors
-/// Returns `UNIMPLEMENTED` until the store is built.
+/// `INVALID_ARGUMENT` for a malformed job id, `NOT_FOUND` as above, `INTERNAL` for an
+/// unreadable stored row and `UNAVAILABLE` when a statement fails.
+pub async fn read_job_timing(
+    pool: &PgPool,
+    owner: Option<i64>,
+    request: &GetJobTimingRequest,
+) -> Result<GetJobTimingReply, Status> {
+    validate_job_id(&request.job_id)
+        .map_err(|_| Status::invalid_argument("invalid job request"))?;
+    let mut tx = pool.begin().await.map_err(|e| storage_unavailable(&e))?;
+    sqlx::query("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ")
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| storage_unavailable(&e))?;
+    sqlx::query(SELECT_TIMING_OWNER)
+        .bind(&request.job_id)
+        .bind(owner)
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(|e| storage_unavailable(&e))?
+        .ok_or_else(|| Status::not_found("job not found"))?;
+    let Some(row) = sqlx::query(SELECT_TIMING)
+        .bind(&request.job_id)
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(|e| storage_unavailable(&e))?
+    else {
+        return Ok(GetJobTimingReply::default());
+    };
+    let summary = summary_from_row(&row)?;
+    let span_cap = i64::try_from(MAX_SPANS).map_err(|_| unreadable())?;
+    let span_rows = sqlx::query(SELECT_SPANS)
+        .bind(&request.job_id)
+        .bind(span_cap.saturating_add(1))
+        .fetch_all(&mut *tx)
+        .await
+        .map_err(|e| storage_unavailable(&e))?;
+    if span_rows.len() > MAX_SPANS {
+        return Err(unreadable());
+    }
+    let command_cap = i64::try_from(MAX_SHELL_COMMANDS).map_err(|_| unreadable())?;
+    let command_rows = sqlx::query(SELECT_COMMANDS)
+        .bind(&request.job_id)
+        .bind(command_cap.saturating_add(1))
+        .fetch_all(&mut *tx)
+        .await
+        .map_err(|e| storage_unavailable(&e))?;
+    if command_rows.len() > MAX_SHELL_COMMANDS {
+        return Err(unreadable());
+    }
+    Ok(GetJobTimingReply {
+        summary: Some(summary),
+        spans: span_rows
+            .iter()
+            .map(span_from_row)
+            .collect::<Result<_, _>>()?,
+        shell_commands: command_rows
+            .iter()
+            .map(command_from_row)
+            .collect::<Result<_, _>>()?,
+    })
+}
+
+/// Placeholder the RPC handler calls until it routes to [`read_job_timing`].
+///
+/// # Errors
+/// Always `UNIMPLEMENTED`.
 pub fn get_job_timing(_request: &GetJobTimingRequest) -> Result<GetJobTimingReply, Status> {
     Err(Status::unimplemented(NOT_IMPLEMENTED))
 }
