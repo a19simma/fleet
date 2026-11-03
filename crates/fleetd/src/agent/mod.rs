@@ -5,6 +5,7 @@
 
 pub mod codex;
 pub mod kimi;
+pub mod notes;
 
 mod claude;
 

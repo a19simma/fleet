@@ -15,11 +15,12 @@
 //! is redacted first, so a secret that straddles the output cap is replaced whole. A cut read
 //! then loses its last [`LOG_TAIL_GUARD`] bytes, so a secret split by the read cap leaves no
 //! fragment. The text is passed through the
-//! [`ShellRecorder`](crate::shell_timing::ShellRecorder) (NUL strip, redaction, then cut), and
-//! has its control characters other than newline and tab replaced by `?` after redaction.
+//! [`ShellRecorder`](crate::shell_timing::ShellRecorder) (strip, redaction, strip again, then
+//! cut). The strip drops NUL, control, format, line and paragraph separator and tag characters
+//! other than newline and tab, so none can split a secret past the redactor.
 //!
 //! A [`LogPusher`] tails the same tasks live. Per task it reads the log, redacts the whole read
-//! first, scrubs control characters, and only then cuts chunks of at most
+//! first, strips the same characters before and after redaction, and only then cuts chunks of at most
 //! [`MAX_SHELL_LOG_CHUNK_BYTES`] bytes. Each cut lands on a `char` boundary at or below the
 //! cap, so no chunk splits a UTF-8 character. While a task runs, the last [`LOG_TAIL_GUARD`]
 //! bytes of the redacted text are held back, so a secret still being written is never sent as
@@ -65,7 +66,7 @@ use tokio::io::AsyncReadExt;
 use tokio::process::Command;
 use tokio::time::Instant;
 
-use crate::shell_timing::{ShellInput, ShellRecord, ShellRecorder};
+use crate::shell_timing::{ShellInput, ShellRecord, ShellRecorder, strip_redact};
 
 /// Default pause between status polls.
 pub const POLL_INTERVAL: Duration = Duration::from_secs(1);
@@ -571,24 +572,6 @@ fn observe(raw: RawTask) -> Seen {
     }
 }
 
-fn scrub_controls(text: &mut String) {
-    if text
-        .chars()
-        .any(|c| c.is_control() && c != '\n' && c != '\t')
-    {
-        *text = text
-            .chars()
-            .map(|c| {
-                if c.is_control() && c != '\n' && c != '\t' {
-                    '?'
-                } else {
-                    c
-                }
-            })
-            .collect();
-    }
-}
-
 /// Watches pueue for tasks that start after the job did.
 #[derive(Debug)]
 pub struct BgWatcher<C> {
@@ -736,8 +719,8 @@ impl<C: PueueClient> BgWatcher<C> {
         }
         let raw = fetch.bytes;
         let cut = raw.len() > LOG_READ_CAP;
-        let text = String::from_utf8_lossy(&raw).replace('\0', "");
-        let mut text = self.redactor.redact_str(&text).into_owned();
+        let text = String::from_utf8_lossy(&raw);
+        let mut text = strip_redact(&self.redactor, &text, true);
         if cut {
             let mut end = text.len().saturating_sub(LOG_TAIL_GUARD);
             while !text.is_char_boundary(end) {
@@ -793,11 +776,9 @@ impl<C: PueueClient> BgWatcher<C> {
         if self.recorder.record(&input).is_err() || self.recorder.records().len() == before {
             return;
         }
-        let Some(mut record) = self.recorder.records().last().cloned() else {
+        let Some(record) = self.recorder.records().last().cloned() else {
             return;
         };
-        scrub_controls(&mut record.command);
-        scrub_controls(&mut record.output);
         self.records.push(BgRecord {
             id,
             record,
@@ -1019,21 +1000,8 @@ fn is_terminal(status: v1::ShellStatus) -> bool {
     matches!(status, v1::ShellStatus::Done | v1::ShellStatus::Failed)
 }
 
-fn scrub_chunk_text(text: &str) -> String {
-    text.chars()
-        .map(|c| {
-            if (c.is_control() && c != '\n' && c != '\t') || c == '\u{2028}' || c == '\u{2029}' {
-                '?'
-            } else {
-                c
-            }
-        })
-        .collect()
-}
-
 fn clean_log(redactor: &Redactor, raw: &[u8]) -> String {
-    let text = String::from_utf8_lossy(raw).replace('\0', "");
-    scrub_chunk_text(&redactor.redact_str(&text))
+    strip_redact(redactor, &String::from_utf8_lossy(raw), true)
 }
 
 fn floor_boundary(text: &str, max: usize) -> usize {

@@ -10,9 +10,9 @@ use std::time::Duration;
 
 use fleet_core::{PLACEHOLDER, Redactor};
 use fleet_proto::{
-    MAX_SHELL_COMMANDS, MAX_SHELL_LOG_BYTES, MAX_SHELL_LOG_CHUNK_BYTES, MAX_SHELL_LOG_CHUNKS, v1,
-    validate_shell_log_bytes, validate_shell_log_command_id, validate_shell_log_seq,
-    validate_shell_log_status,
+    MAX_COMMAND_BYTES, MAX_SHELL_COMMANDS, MAX_SHELL_LOG_BYTES, MAX_SHELL_LOG_CHUNK_BYTES,
+    MAX_SHELL_LOG_CHUNKS, v1, validate_shell_log_bytes, validate_shell_log_command_id,
+    validate_shell_log_seq, validate_shell_log_status,
 };
 use fleetd::bg_command::{
     Anchor, BgConfig, BgOutcome, BgState, BgWatcher, EndedBy, LIVE_LOG_READ_CAP, LOG_BURST,
@@ -520,11 +520,11 @@ async fn output_of(fake: &Fake) -> (String, bool, bool) {
 async fn hostile_log_content_table() {
     let table: Vec<(&str, Vec<u8>, &str)> = vec![
         ("nul", b"a\0b\0c".to_vec(), "abc"),
-        ("cr", b"one\rtwo\r\nthree".to_vec(), "one?two?\nthree"),
+        ("cr", b"one\rtwo\r\nthree".to_vec(), "onetwo\nthree"),
         (
             "esc",
             b"\x1b[31mred\x1b]0;title\x07".to_vec(),
-            "?[31mred?]0;title?",
+            "[31mred]0;title",
         ),
         ("tab and newline kept", b"a\tb\nc".to_vec(), "a\tb\nc"),
         (
@@ -533,11 +533,7 @@ async fn hostile_log_content_table() {
             "x [REDACTED] y",
         ),
         ("invalid utf8", vec![b'a', 0xff, b'b'], "a\u{fffd}b"),
-        (
-            "c1 control",
-            "a\u{85}b\u{2028}c".as_bytes().to_vec(),
-            "a?b\u{2028}c",
-        ),
+        ("c1 control", "a\u{85}b\u{2028}c".as_bytes().to_vec(), "abc"),
     ];
     for (name, bytes, expected) in table {
         let (out, cut, failed) = output_of(&hostile_log(bytes)).await;
@@ -667,7 +663,7 @@ async fn a_secret_in_the_command_is_redacted() {
         .await
         .records
         .remove(0);
-    assert_eq!(r.record.command, "curl -H [REDACTED]?");
+    assert_eq!(r.record.command, "curl -H [REDACTED]");
 }
 
 #[test]
@@ -1685,4 +1681,109 @@ fn the_fetch_counts_lines_before_the_byte_cut_at_every_boundary() {
     let plain = LogFetch::checked(b"a\nb".to_vec(), 3);
     assert_eq!(plain.bytes, b"a\nb");
     assert!(!plain.head_may_be_lost);
+}
+
+const SPLITTERS: [char; 3] = ['\u{1}', '\u{1b}', '\u{200b}'];
+
+fn split_secret(by: char) -> String {
+    format!("{}{by}{}", &SECRET[..10], &SECRET[10..])
+}
+
+async fn command_of(command: &str) -> String {
+    let json = serde_json::to_string(command).expect("json");
+    let task = format!(
+        r#""1":{{"id":1,"original_command":{json},"status":{}}}"#,
+        done(r#""Success""#)
+    );
+    let fake = Fake::with(vec![status(&[]), format!(r#"{{"tasks":{{{task}}}}}"#)]);
+    let mut w = watcher(&fake).await;
+    w.poll(Instant::now()).await.expect("poll");
+    w.finish(EndedBy::JobExit, Instant::now())
+        .await
+        .records
+        .remove(0)
+        .record
+        .command
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_bg_command_split_by_a_hidden_char_is_redacted() {
+    for by in SPLITTERS {
+        let out = command_of(&format!("curl {}", split_secret(by))).await;
+        assert_eq!(out, format!("curl {PLACEHOLDER}"), "{by:?}");
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_bg_log_split_by_a_hidden_char_is_redacted() {
+    for by in SPLITTERS {
+        let text = format!("got {}", split_secret(by));
+        let (out, _, _) = output_of(&hostile_log(text.into_bytes())).await;
+        assert_eq!(out, format!("got {PLACEHOLDER}"), "{by:?}");
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_split_secret_straddling_the_bg_command_cap_leaves_no_fragment() {
+    for by in SPLITTERS {
+        let pad = "a".repeat(MAX_COMMAND_BYTES - SECRET.len() / 2);
+        let out = command_of(&format!("{pad}{}tail", split_secret(by))).await;
+        assert!(out.len() <= MAX_COMMAND_BYTES, "{by:?}");
+        assert!(!out.contains(&SECRET[..8]), "{by:?}");
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_split_secret_straddling_the_bg_log_cap_leaves_no_fragment() {
+    for by in SPLITTERS {
+        let pad = "a".repeat(MAX_SHELL_LOG_BYTES - SECRET.len() / 2);
+        let text = format!("{pad}{}tail", split_secret(by));
+        let (out, _, _) = output_of(&hostile_log(text.into_bytes())).await;
+        assert!(out.len() <= MAX_SHELL_LOG_BYTES, "{by:?}");
+        assert!(!out.contains(&SECRET[..8]), "{by:?}");
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn ordinary_bg_text_survives_the_strip() {
+    let out = command_of("ls -la\n\techo \u{e9}\u{65e5}").await;
+    assert_eq!(out, "ls -la\n\techo \u{e9}\u{65e5}");
+    let (log, _, _) = output_of(&hostile_log("l1\nl2\ttab \u{1F600}".as_bytes().to_vec())).await;
+    assert_eq!(log, "l1\nl2\ttab \u{1F600}");
+}
+
+#[tokio::test]
+async fn a_pushed_chunk_split_by_a_hidden_char_is_redacted() {
+    for by in SPLITTERS {
+        let fake = Fake::with(vec![]);
+        let rec = Rec::default();
+        let t0 = Instant::now();
+        let mut p = pusher(&fake, &rec, Redactor::new([SECRET]), t0).await;
+        fake.logs
+            .lock()
+            .expect("lock")
+            .insert(1, Ok(format!("got {}\n", split_secret(by)).into_bytes()));
+        set_tasks(&fake, &[finished_task(1)]);
+        p.poll(t0).await.expect("poll");
+        let text = rec.text();
+        assert!(!text.contains("s3cr3t"), "{by:?}: {text}");
+        assert!(text.contains(PLACEHOLDER), "{by:?}: {text}");
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_split_secret_straddling_the_bg_read_cap_leaves_no_fragment() {
+    for by in SPLITTERS {
+        for back in 1..SECRET.len() + 2 {
+            let mut text = "a ".repeat((LOG_READ_CAP - back) / 2);
+            while text.len() < LOG_READ_CAP - back {
+                text.push('a');
+            }
+            text.push_str(&split_secret(by));
+            text.push_str(&"b".repeat(100));
+            let (out, cut, _) = output_of(&hostile_log(text.into_bytes())).await;
+            assert!(!out.contains("s3cr"), "{by:?} {back}: {out:?}");
+            assert!(cut, "{by:?} {back}");
+        }
+    }
 }

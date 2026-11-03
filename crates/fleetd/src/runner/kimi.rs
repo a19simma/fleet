@@ -79,6 +79,14 @@ impl<R: Reporter> AgentRunner<R> {
         Ok(path)
     }
 
+    pub(crate) fn kimi_home_path(&self, job_id: &str) -> Option<PathBuf> {
+        self.kimi_homes
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .get(job_id)
+            .map(|home| home.path().to_path_buf())
+    }
+
     pub(crate) fn forget_kimi_home(&self, job_id: &str) {
         self.kimi_homes
             .lock()
