@@ -205,7 +205,6 @@ async fn print_chunks<S: ChunkSource>(
         if messages > MAX_STREAM_MESSAGES {
             if !cut {
                 writeln!(out, "{CUT_MARKER}")?;
-                cut = true;
             }
             break;
         }
