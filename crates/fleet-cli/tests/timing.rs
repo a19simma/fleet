@@ -5,8 +5,8 @@ use std::future::Future;
 
 use clap::Parser;
 use fleet_cli::timing::{
-    ChunkSource, FOLLOW_DEADLINE, MAX_PRINT_CHUNK_BYTES, MAX_PRINT_TOTAL_BYTES, print_log,
-    write_commands,
+    ChunkSource, FOLLOW_DEADLINE, MAX_PRINT_CHUNK_BYTES, MAX_PRINT_TOTAL_BYTES,
+    MAX_STREAM_MESSAGES, print_log, write_commands,
 };
 use fleet_cli::{Cli, CliError, Command};
 use fleet_proto::v1::{ShellCommand, ShellStatus, StreamShellLogChunk};
@@ -229,6 +229,103 @@ async fn a_failed_status_survives_a_mid_chunk_cut() {
             assert!(matches!(result, Err(CliError::JobEnded("failed"))));
         }
     }
+}
+
+fn at_the_byte_cap_then(tail: Vec<StreamShellLogChunk>) -> Vec<StreamShellLogChunk> {
+    let full = u32::try_from(MAX_PRINT_TOTAL_BYTES / MAX_PRINT_CHUNK_BYTES).unwrap_or_default();
+    let mut chunks = chunks_before_the_last(full);
+    chunks.extend(tail);
+    chunks
+}
+
+#[tokio::test]
+async fn a_failed_status_after_a_cut_on_a_running_chunk_is_kept() {
+    let (result, text) = printed(
+        script(at_the_byte_cap_then(vec![
+            chunk(0, b"ignored\n", ShellStatus::Running),
+            chunk(0, b"", ShellStatus::Failed),
+        ])),
+        false,
+    )
+    .await;
+    assert!(text.contains("-- log output cut --"), "{text}");
+    assert!(!text.contains("ignored"), "{text}");
+    assert!(
+        matches!(result, Err(CliError::JobEnded("failed"))),
+        "{result:?}"
+    );
+}
+
+#[tokio::test]
+async fn a_done_status_after_a_cut_is_ok() {
+    let (result, text) = printed(
+        script(at_the_byte_cap_then(vec![
+            chunk(0, b"", ShellStatus::Running),
+            chunk(0, b"", ShellStatus::Done),
+        ])),
+        false,
+    )
+    .await;
+    assert!(text.contains("-- log output cut --"), "{text}");
+    assert!(result.is_ok(), "{result:?}");
+}
+
+#[tokio::test]
+async fn a_failed_status_after_status_only_messages_past_a_cut_is_kept() {
+    let mut tail: Vec<_> = (0..100)
+        .map(|_| chunk(0, b"", ShellStatus::Running))
+        .collect();
+    tail.push(chunk(1, b"", ShellStatus::Failed));
+    let (result, text) = printed(script(at_the_byte_cap_then(tail)), false).await;
+    assert!(text.contains("-- log output cut --"), "{text}");
+    assert!(
+        matches!(result, Err(CliError::JobEnded("failed"))),
+        "{result:?}"
+    );
+}
+
+#[tokio::test]
+async fn a_failed_status_on_the_message_that_trips_the_cap_is_kept() {
+    let mut chunks = vec![chunk(0, b"a\n", ShellStatus::Running)];
+    chunks.extend((0..MAX_STREAM_MESSAGES - 1).map(|_| chunk(0, b"", ShellStatus::Running)));
+    chunks.push(chunk(1, b"", ShellStatus::Failed));
+    let (result, text) = printed(script(chunks), false).await;
+    assert!(text.contains("-- log output cut --"), "{text}");
+    assert!(
+        matches!(result, Err(CliError::JobEnded("failed"))),
+        "{result:?}"
+    );
+}
+
+#[tokio::test]
+async fn a_terminal_status_past_the_drain_bound_is_unknown() {
+    let mut chunks = vec![chunk(0, b"a\n", ShellStatus::Running)];
+    chunks.extend((0..MAX_STREAM_MESSAGES).map(|_| chunk(0, b"", ShellStatus::Running)));
+    chunks.push(chunk(1, b"", ShellStatus::Failed));
+    let (result, text) = printed(script(chunks), false).await;
+    assert!(text.contains("-- log output cut --"), "{text}");
+    assert!(
+        matches!(result, Err(CliError::JobEnded("status unknown"))),
+        "{result:?}"
+    );
+}
+
+#[tokio::test]
+async fn a_cut_followed_by_stream_end_has_unknown_status() {
+    let (result, text) = printed(
+        script(at_the_byte_cap_then(vec![chunk(
+            0,
+            b"",
+            ShellStatus::Running,
+        )])),
+        false,
+    )
+    .await;
+    assert!(text.contains("-- log output cut --"), "{text}");
+    assert!(
+        matches!(result, Err(CliError::JobEnded("status unknown"))),
+        "{result:?}"
+    );
 }
 
 #[tokio::test]

@@ -178,39 +178,49 @@ async fn print_chunks<S: ChunkSource>(
     let mut messages = 0usize;
     let mut last_newline = true;
     let mut outcome = Ok(());
+    let mut cut = false;
+    let mut ended = false;
     loop {
         let Some(chunk) = source.next_chunk().await? else {
             break;
         };
         messages += 1;
+        let mine = chunk.command_id == command_id;
+        let terminal = mine
+            && matches!(
+                ShellStatus::try_from(chunk.status),
+                Ok(ShellStatus::Done | ShellStatus::Failed)
+            );
+        if mine {
+            if !validate_shell_log_seq(chunk.seq) {
+                return Err(CliError::Rpc(Status::invalid_argument(
+                    "log stream sent an invalid chunk number",
+                )));
+            }
+            if ShellStatus::try_from(chunk.status) == Ok(ShellStatus::Failed) {
+                outcome = Err(CliError::JobEnded("failed"));
+            }
+            ended |= terminal;
+        }
         if messages > MAX_STREAM_MESSAGES {
-            writeln!(out, "{CUT_MARKER}")?;
+            if !cut {
+                writeln!(out, "{CUT_MARKER}")?;
+                cut = true;
+            }
             break;
         }
-        if chunk.command_id != command_id {
+        if !mine {
             continue;
         }
-        let terminal = matches!(
-            ShellStatus::try_from(chunk.status),
-            Ok(ShellStatus::Done | ShellStatus::Failed)
-        );
-        if !validate_shell_log_seq(chunk.seq) {
-            return Err(CliError::Rpc(Status::invalid_argument(
-                "log stream sent an invalid chunk number",
-            )));
-        }
-        if ShellStatus::try_from(chunk.status) == Ok(ShellStatus::Failed) {
-            outcome = Err(CliError::JobEnded("failed"));
-        }
         let fresh = chunk.seq >= next_seq;
-        if fresh && !chunk.bytes.is_empty() {
+        if !cut && fresh && !chunk.bytes.is_empty() {
             next_seq = chunk.seq.saturating_add(1);
             let room = MAX_PRINT_TOTAL_BYTES.saturating_sub(total);
             let take = chunk.bytes.len().min(MAX_PRINT_CHUNK_BYTES).min(room);
             total += take;
             pending.extend_from_slice(chunk.bytes.get(..take).unwrap_or_default());
-            let cut = utf8_boundary(&pending);
-            let ready: Vec<u8> = pending.drain(..cut).collect();
+            let whole = utf8_boundary(&pending);
+            let ready: Vec<u8> = pending.drain(..whole).collect();
             let text = clean_text(&ready);
             if json {
                 let status = ShellStatus::try_from(chunk.status)
@@ -230,7 +240,7 @@ async fn print_chunks<S: ChunkSource>(
             }
             if take < chunk.bytes.len() || total >= MAX_PRINT_TOTAL_BYTES {
                 writeln!(out, "{CUT_MARKER}")?;
-                break;
+                cut = true;
             }
         }
         if terminal {
@@ -248,6 +258,9 @@ async fn print_chunks<S: ChunkSource>(
         out.write_all(b"\n")?;
     }
     out.flush()?;
+    if cut && !ended {
+        return Err(CliError::JobEnded("status unknown"));
+    }
     outcome
 }
 
@@ -256,12 +269,14 @@ async fn print_chunks<S: ChunkSource>(
 ///
 /// Log text is untrusted terminal output: control and bidirectional characters are dropped
 /// and only newline and tab survive. A chunk past [`MAX_PRINT_CHUNK_BYTES`] is cut, the total
-/// stops at [`MAX_PRINT_TOTAL_BYTES`], and a repeated or lower `seq` is skipped. With `json`
+/// stops at [`MAX_PRINT_TOTAL_BYTES`]; after a cut the stream is still read, without printing,
+/// up to [`MAX_STREAM_MESSAGES`] for a terminal status. A repeated or lower `seq` is skipped. With `json`
 /// each chunk is one JSON object per line.
 ///
 /// # Errors
 /// Returns [`CliError::Rpc`] when the stream fails, [`CliError::JobEnded`] when the command
-/// ended `failed` or the follow hit [`FOLLOW_DEADLINE`], and [`CliError::Io`] on an output failure.
+/// ended `failed` or the follow hit [`FOLLOW_DEADLINE`], and [`CliError::JobEnded`] with
+/// `status unknown` when a print or message cap cut the log and no terminal status followed, and [`CliError::Io`] on an output failure.
 pub async fn print_log<S: ChunkSource>(
     source: &mut S,
     command_id: &str,
