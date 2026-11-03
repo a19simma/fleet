@@ -31,6 +31,73 @@ pub fn model_env(held: &JobCredentials) -> Option<(&'static str, &Secret)> {
         })
 }
 
+/// Why [`TelemetryEnv::new`] refused its input. The text never carries the token.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TelemetryEnvError {
+    /// The bearer token is empty, too short, too long or holds a byte outside visible ASCII.
+    BadToken,
+}
+
+impl std::fmt::Display for TelemetryEnvError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("telemetry bearer token is not valid")
+    }
+}
+
+impl std::error::Error for TelemetryEnvError {}
+
+/// The `OTel` exporter variables of one Claude job (ADR-0055).
+///
+/// The endpoint is the in-namespace loopback address the forwarder serves. The token is held
+/// as an env value only: `Debug` and the error type never show it, and it never reaches argv.
+#[derive(Clone)]
+pub struct TelemetryEnv {
+    endpoint: String,
+    headers: String,
+}
+
+impl std::fmt::Debug for TelemetryEnv {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("TelemetryEnv")
+            .field("endpoint", &self.endpoint)
+            .finish_non_exhaustive()
+    }
+}
+
+impl TelemetryEnv {
+    /// Builds the variables for the forwarder on `127.0.0.1:<port>` and the receiver `token`.
+    ///
+    /// # Errors
+    ///
+    /// [`TelemetryEnvError::BadToken`] when the receiver would refuse `token`, so a value that
+    /// could break the header or the env file never reaches either.
+    pub fn new(port: std::num::NonZeroU16, token: &str) -> Result<Self, TelemetryEnvError> {
+        crate::otel::BearerToken::new(token).map_err(|_| TelemetryEnvError::BadToken)?;
+        Ok(Self {
+            endpoint: format!("http://127.0.0.1:{port}/v1/logs"),
+            headers: format!("Authorization=Bearer {token}"),
+        })
+    }
+
+    /// Sets every exporter variable in `env`, replacing any value already there.
+    pub fn apply(
+        &self,
+        env: &mut std::collections::BTreeMap<std::ffi::OsString, std::ffi::OsString>,
+    ) {
+        for (name, value) in [
+            ("CLAUDE_CODE_ENABLE_TELEMETRY", "1"),
+            ("OTEL_LOGS_EXPORTER", "otlp"),
+            ("OTEL_EXPORTER_OTLP_PROTOCOL", "http/json"),
+            ("OTEL_EXPORTER_OTLP_LOGS_ENDPOINT", self.endpoint.as_str()),
+            ("OTEL_EXPORTER_OTLP_HEADERS", self.headers.as_str()),
+            ("OTEL_LOGS_EXPORT_INTERVAL", "1000"),
+            ("OTEL_LOG_TOOL_DETAILS", "1"),
+        ] {
+            env.insert(name.into(), value.into());
+        }
+    }
+}
+
 const MODEL_HOSTS: &[&str] = &["api.anthropic.com"];
 
 pub(super) struct Claude;

@@ -8,7 +8,9 @@ pub mod kimi;
 
 mod claude;
 
-pub use claude::{API_KEY_ENV, NAME as CLAUDE, OAUTH_TOKEN_ENV, model_env};
+pub use claude::{
+    API_KEY_ENV, NAME as CLAUDE, OAUTH_TOKEN_ENV, TelemetryEnv, TelemetryEnvError, model_env,
+};
 
 use std::path::Path;
 
