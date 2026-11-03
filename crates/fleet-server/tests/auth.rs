@@ -224,6 +224,7 @@ mod tests {
                     job_id: "01ARZ3NDEKTSV4RRFFQ69G5FAV".to_owned(),
                     attempt: 1,
                     r#box: format!("box-{}", 7),
+                    summary: Some(fleet_proto::v1::TimingSummary::default()),
                     ..ReportTimingRequest::default()
                 })
                 .await

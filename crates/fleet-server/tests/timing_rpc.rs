@@ -82,9 +82,7 @@ async fn start(pool: PgPool) -> SocketAddr {
 }
 
 #[sqlx::test]
-async fn report_timing_with_the_box_token_reaches_the_lease_check_and_refuses_a_default_request(
-    pool: PgPool,
-) {
+async fn report_timing_validation_refuses_a_default_request(pool: PgPool) {
     let addr = start(pool).await;
     let err = worker(addr, as_box)
         .report_timing(ReportTimingRequest::default())
