@@ -127,10 +127,6 @@ pub fn write_commands(
 /// # Errors
 /// Returns [`CliError::Rpc`] on a server error, including the identical not-found answer for
 /// a job that is missing or not yours, and [`CliError::Io`] on an output failure.
-#[expect(
-    dead_code,
-    reason = "called from Command::Timing once lib.rs dispatches it"
-)]
 pub(crate) async fn list_commands(
     client: &mut Client,
     job: &str,
@@ -281,10 +277,6 @@ pub async fn print_log<S: ChunkSource>(
 /// # Errors
 /// Returns [`CliError::Usage`] for an id the wire contract refuses, and the errors of
 /// [`print_log`].
-#[expect(
-    dead_code,
-    reason = "called from Command::Timing once lib.rs dispatches it"
-)]
 pub(crate) async fn follow(
     client: &mut Client,
     job: &str,
