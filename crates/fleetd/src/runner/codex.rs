@@ -95,6 +95,7 @@ impl<R: Reporter> AgentRunner<R> {
                 bundle_sha: bundle.sha256(),
                 ..VersionStamp::default()
             },
+            otel: false,
         }
     }
 }

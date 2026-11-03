@@ -120,7 +120,8 @@ impl std::fmt::Debug for ToolInstallSetup {
 /// [`JOB_SOCKET_REFUSED`] once and drops them, because the agent there shares fleetd's uid and
 /// reads its environment, so a peer check adds nothing. The systemd launcher with no services
 /// logs [`NO_SERVICES_WARNING`] once, because the unit's `PrivateNetwork=yes` leaves the job
-/// without the egress proxy.
+/// without the egress proxy. The systemd launcher gets telemetry capture only when
+/// [`Config::require_host_netns`] succeeds. Otherwise it logs the refusal and runs with none.
 #[must_use]
 pub fn select_launcher(
     config: &Config,
@@ -138,10 +139,17 @@ pub fn select_launcher(
             if services.is_empty() {
                 tracing::warn!("{NO_SERVICES_WARNING}");
             }
-            let launcher = SystemdLauncher::new(&config.systemctl_path)
+            let mut launcher = SystemdLauncher::new(&config.systemctl_path)
                 .with_job_gid(job_gid)
                 .with_run_timeout(config.agent_timeout)
                 .with_job_socket(JobSocketSetup::new(services));
+            match config.require_host_netns() {
+                Ok(()) => {
+                    launcher = launcher
+                        .with_telemetry(TelemetrySetup::new(crate::otel::Limits::default()));
+                }
+                Err(refused) => tracing::warn!("{refused}"),
+            }
             Arc::new(if tool_install_configured(config) {
                 launcher.with_tool_install(ToolInstallSetup::new(
                     Arc::new(|_| Vec::new()),
@@ -322,13 +330,25 @@ fn random_token() -> io::Result<String> {
 struct Telemetry {
     port: NonZeroU16,
     token: String,
+    vars: crate::agent::TelemetryEnv,
     receiver: crate::otel::OtelReceiver,
     bodies: tokio::sync::mpsc::Receiver<Vec<u8>>,
+}
+
+fn safe_token(token: &str) -> bool {
+    token
+        .bytes()
+        .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
 }
 
 fn start_telemetry(setup: &TelemetrySetup, dir: &Path, gid: Option<u32>) -> io::Result<Telemetry> {
     let port = (setup.port)()?;
     let token = (setup.token)()?;
+    if !safe_token(&token) {
+        return Err(io::Error::from(io::ErrorKind::InvalidInput));
+    }
+    let vars = crate::agent::TelemetryEnv::new(port, &token)
+        .map_err(|err| io::Error::new(io::ErrorKind::InvalidInput, err))?;
     let bearer = crate::otel::BearerToken::new(&token)
         .map_err(|err| io::Error::new(io::ErrorKind::InvalidInput, err))?;
     let (receiver, bodies) = crate::otel::OtelReceiver::bind(
@@ -340,13 +360,18 @@ fn start_telemetry(setup: &TelemetrySetup, dir: &Path, gid: Option<u32>) -> io::
     Ok(Telemetry {
         port,
         token,
+        vars,
         receiver,
         bodies,
     })
 }
 
 impl SystemdLauncher {
-    /// Binds a receiver in each run dir and writes its port into the spec.
+    /// Binds a receiver in each run dir for a Claude job and writes its port into the spec.
+    ///
+    /// Only a job whose [`AgentSpec::otel`] is set gets a receiver. The launcher then adds the
+    /// `OTel` exporter variables to the env file, so the token stays out of argv and the spec. A
+    /// token source that returns a byte outside `[A-Za-z0-9_-]` starts no capture.
     ///
     /// The receiver socket is owned by the fleetd uid with the job group and mode 0660, the
     /// group set by [`Self::with_job_gid`].
@@ -649,7 +674,7 @@ impl Launcher for SystemdLauncher {
             .unwrap_or_default()
     }
 
-    fn launch(&self, spec: AgentSpec) -> io::Result<Launched> {
+    fn launch(&self, mut spec: AgentSpec) -> io::Result<Launched> {
         let id = spec
             .env
             .get(std::ffi::OsStr::new(JOB_ID_ENV))
@@ -671,16 +696,23 @@ impl Launcher for SystemdLauncher {
         if let Some(gid) = self.gid {
             std::os::unix::fs::chown(&dir, None, Some(gid))?;
         }
+        let telemetry = self
+            .telemetry
+            .as_ref()
+            .filter(|_| spec.otel)
+            .and_then(|setup| {
+                start_telemetry(setup, &dir, self.gid)
+                    .inspect_err(|err| {
+                        tracing::warn!(kind = ?err.kind(), "telemetry capture not started");
+                    })
+                    .ok()
+            });
+        if let Some(capture) = &telemetry {
+            capture.vars.apply(&mut spec.env);
+        }
         let body =
             render_env_file(&spec).map_err(|_| io::Error::from(io::ErrorKind::InvalidInput))?;
         write_env_file(&dir.join(ENV_FILE), &body)?;
-        let telemetry = self.telemetry.as_ref().and_then(|setup| {
-            start_telemetry(setup, &dir, self.gid)
-                .inspect_err(|err| {
-                    tracing::warn!(kind = ?err.kind(), "telemetry capture not started");
-                })
-                .ok()
-        });
         write_spec_telemetry(
             &dir.join(SPEC_FILE),
             &id,
@@ -703,6 +735,7 @@ impl Launcher for SystemdLauncher {
                 token,
                 receiver,
                 bodies,
+                ..
             }) => (
                 Some(receiver),
                 Some(TelemetryCapture {

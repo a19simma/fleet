@@ -358,6 +358,31 @@ mod tests {
             .collect()
     }
 
+    #[tokio::test]
+    async fn only_a_claude_agent_job_asks_for_the_otel_env()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (runner, _book, _dir) = fixture(true).await?;
+        let dir = Path::new("/tmp");
+        let job = |agent: &str, kind: JobKind| Job {
+            job_id: "job1".into(),
+            agent: agent.into(),
+            kind: kind as i32,
+            ..Job::default()
+        };
+        for (agent, kind, want) in [
+            ("claude", JobKind::Agent, true),
+            ("", JobKind::Agent, true),
+            ("codex", JobKind::Agent, false),
+            ("kimi", JobKind::Agent, false),
+            ("claude", JobKind::Judge, false),
+            ("", JobKind::Judge, false),
+        ] {
+            let spec = runner.agent_spec(&job(agent, kind), dir, dir);
+            assert_eq!(spec.otel, want, "{agent:?} {kind:?}");
+        }
+        Ok(())
+    }
+
     fn no_box_model_secret(env: &[(String, String)]) {
         assert!(env.iter().all(|(_, v)| v != BOX_OAUTH && v != BOX_KEY));
     }
