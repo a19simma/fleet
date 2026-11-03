@@ -10,7 +10,9 @@ use std::os::unix::fs::{FileTypeExt, MetadataExt, PermissionsExt};
 use std::path::Path;
 use std::time::Duration;
 
-use fleetd::otel::{BearerToken, Limits, OtelReceiver, SOCKET_NAME, TokenError};
+use fleetd::otel::{
+    BearerToken, Limits, MAX_FLUSH_DEADLINE, OtelReceiver, QUIET_PERIOD, SOCKET_NAME, TokenError,
+};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::UnixStream;
 use tokio::sync::mpsc;
@@ -642,4 +644,145 @@ async fn zero_limits_and_bad_tokens_are_refused() {
     }
     assert!(!path.exists());
     assert_eq!(BearerToken::new(""), Err(TokenError::TooShort));
+}
+
+fn patient() -> Limits {
+    Limits {
+        request_timeout: Duration::from_secs(100_000),
+        ..limits()
+    }
+}
+
+#[tokio::test]
+async fn flush_waits_for_a_slow_exporter_and_queues_every_body() {
+    let mut rig = rig_with(
+        Limits {
+            queue: 16,
+            ..limits()
+        },
+        None,
+    );
+    let path = rig.receiver.path().to_path_buf();
+    let (first_tx, first_rx) = tokio::sync::oneshot::channel();
+    let poster = tokio::spawn(async move {
+        let mut first = Some(first_tx);
+        for n in 0..5 {
+            let body = format!("{{\"n\":{n}}}");
+            assert_eq!(status(&exchange(&path, &request("", &body)).await), 200);
+            if let Some(tx) = first.take() {
+                tx.send(()).ok();
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    });
+    first_rx.await.unwrap();
+    let flush = tokio::time::timeout(
+        Duration::from_secs(30),
+        rig.receiver
+            .flush_with(Duration::from_secs(20), Duration::from_millis(600)),
+    )
+    .await
+    .expect("outer timeout");
+    assert!(!flush.incomplete);
+    assert!(poster.is_finished());
+    let mut seen = 0;
+    while rig.rx.try_recv().is_ok() {
+        seen += 1;
+    }
+    assert_eq!(seen, 5);
+}
+
+#[tokio::test]
+async fn flush_stops_at_the_deadline_with_a_hung_connection() {
+    let rig = rig_with(patient(), None);
+    let mut hung = UnixStream::connect(rig.receiver.path()).await.unwrap();
+    hung.write_all(b"POST /v1/logs HTTP/1.1\r\nAuthor")
+        .await
+        .unwrap();
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    let flush = tokio::time::timeout(
+        Duration::from_secs(30),
+        rig.receiver
+            .flush_with(Duration::from_millis(400), Duration::from_millis(50)),
+    )
+    .await
+    .expect("outer timeout");
+    assert!(flush.incomplete);
+}
+
+#[tokio::test]
+async fn flush_reports_incomplete_when_bodies_never_stop() {
+    let rig = rig();
+    let path = rig.receiver.path().to_path_buf();
+    let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let flag = std::sync::Arc::clone(&stop);
+    let poster = tokio::spawn(async move {
+        while !flag.load(std::sync::atomic::Ordering::Relaxed) {
+            exchange(&path, &request("", "{}")).await;
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    });
+    let flush = tokio::time::timeout(
+        Duration::from_secs(30),
+        rig.receiver
+            .flush_with(Duration::from_millis(600), Duration::from_secs(5)),
+    )
+    .await
+    .expect("outer timeout");
+    stop.store(true, std::sync::atomic::Ordering::Relaxed);
+    poster.await.unwrap();
+    assert!(flush.incomplete);
+}
+
+#[tokio::test(start_paused = true)]
+async fn an_idle_flush_waits_the_quiet_period_and_completes() {
+    let rig = rig();
+    let start = tokio::time::Instant::now();
+    let flush = rig.receiver.flush(Duration::from_secs(5)).await;
+    let elapsed = start.elapsed();
+    assert!(!flush.incomplete);
+    assert!(elapsed >= QUIET_PERIOD, "{elapsed:?}");
+    assert!(
+        elapsed < QUIET_PERIOD + Duration::from_secs(1),
+        "{elapsed:?}"
+    );
+}
+
+#[tokio::test]
+async fn no_flush_waits_past_the_cap() {
+    let rig = rig_with(patient(), None);
+    let mut hung = UnixStream::connect(rig.receiver.path()).await.unwrap();
+    hung.write_all(b"POST /v1/logs HTTP/1.1\r\nAuthor")
+        .await
+        .unwrap();
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    tokio::time::pause();
+    let start = tokio::time::Instant::now();
+    let flush = rig.receiver.flush(Duration::MAX).await;
+    let elapsed = start.elapsed();
+    assert!(flush.incomplete);
+    assert!(elapsed >= MAX_FLUSH_DEADLINE, "{elapsed:?}");
+    assert!(
+        elapsed < MAX_FLUSH_DEADLINE + Duration::from_secs(1),
+        "{elapsed:?}"
+    );
+}
+
+#[tokio::test]
+async fn a_dropped_flush_leaves_the_receiver_usable() {
+    let mut rig = rig();
+    let dropped = tokio::time::timeout(
+        Duration::from_millis(100),
+        rig.receiver
+            .flush_with(Duration::from_secs(20), Duration::from_secs(20)),
+    )
+    .await;
+    assert!(dropped.is_err());
+    assert_eq!(code(&rig, &request("", "{}")).await, 200);
+    assert_eq!(rig.rx.try_recv().unwrap(), b"{}");
+    let flush = rig
+        .receiver
+        .flush_with(Duration::from_secs(10), Duration::from_millis(50))
+        .await;
+    assert!(!flush.incomplete);
 }
