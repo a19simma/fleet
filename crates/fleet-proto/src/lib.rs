@@ -6,8 +6,12 @@
 mod convert;
 
 pub use convert::{
-    ConvertError, ShellCommandRecord, TimingConvertError, TimingSpanRecord, queued_event,
-    shell_commands_from_wire, spans_from_wire, validate_box,
+    ConvertError, ProfileConvertError, ShellCommandRecord, TimingConvertError, TimingSpanRecord,
+    capability_from_text, capability_to_text, catalog_entry_from_wire, catalog_entry_to_wire,
+    catalog_kind_from_wire, catalog_kind_to_wire, model_allowlist_from_wire,
+    model_allowlist_to_wire, queued_event, selection_from_wire, selection_to_wire,
+    shell_commands_from_wire, spans_from_wire, validate_box, visibility_from_wire,
+    visibility_to_wire,
 };
 
 /// Wire protocol version fleetd reports in `HeartbeatRequest.protocol_version`. Changes are
