@@ -121,6 +121,15 @@ impl FleetJobs for Stub {
         Ok(Response::new(ReadJobEventsReply { events, next_seq }))
     }
 
+    type StreamShellLogStream = tonic::codegen::BoxStream<fleet_proto::v1::StreamShellLogChunk>;
+
+    async fn stream_shell_log(
+        &self,
+        _: Request<fleet_proto::v1::StreamShellLogRequest>,
+    ) -> Result<Response<Self::StreamShellLogStream>, Status> {
+        Err(Status::unimplemented("not used"))
+    }
+
     async fn get_job_timing(
         &self,
         _: Request<fleet_proto::v1::GetJobTimingRequest>,
