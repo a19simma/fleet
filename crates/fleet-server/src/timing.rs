@@ -2,6 +2,7 @@
 
 use std::time::Duration;
 
+use fleet_core::BoxName;
 use fleet_core::timing::Summary;
 use fleet_proto::v1::{
     GetJobTimingReply, GetJobTimingRequest, ReportShellLogReply, ReportShellLogRequest,
@@ -37,17 +38,9 @@ const STREAM_QUEUE: usize = 16;
 
 const NOT_IMPLEMENTED: &str = "job timing is not implemented";
 
-/// Stores the timing a box reports for one job attempt.
-///
-/// # Errors
-/// Returns `UNIMPLEMENTED` until the store is built.
-pub fn report_timing(_request: &ReportTimingRequest) -> Result<ReportTimingReply, Status> {
-    Err(Status::unimplemented(NOT_IMPLEMENTED))
-}
-
 const LOCK_REPORTED_JOB: &str = "\
 SELECT 1 FROM jobs WHERE job_id = $1 AND attempt = $2 AND state = 'RUNNING' \
-AND lease_expires_at > now() FOR UPDATE";
+AND box = $3 AND lease_expires_at > now() FOR UPDATE";
 
 const UPSERT_TIMING: &str = "\
 INSERT INTO job_timing (job_id, wall_ms, api_wait_ms, tool_ms, shell_ms, idle_ms, overhead_ms) \
@@ -97,8 +90,9 @@ fn kind_name(record: &TimingSpanRecord) -> Result<&'static str, Status> {
 
 /// Stores the timing a box reports for one job, replacing any earlier report.
 ///
-/// The `box` field is ignored. The report is accepted only while the job is `RUNNING` at
-/// the reported attempt with an unexpired lease. That row is locked `FOR UPDATE` for the
+/// The `box` field of the request is ignored: `box_name` is the validated reporter. The
+/// report is accepted only while the job is `RUNNING` at the reported attempt with an
+/// unexpired lease held by `box_name`. That row is locked `FOR UPDATE` for the
 /// whole transaction, so two reports for one job run one after the other and the later one
 /// replaces the summary, every span and every shell command of the earlier one. The wire
 /// converters in `fleet-proto` own the validation: caps of `MAX_SPANS` and
@@ -107,10 +101,11 @@ fn kind_name(record: &TimingSpanRecord) -> Result<&'static str, Status> {
 ///
 /// # Errors
 /// `INVALID_ARGUMENT` for a missing summary or any value a converter refuses,
-/// `FAILED_PRECONDITION` when no running lease matches the job and attempt, and
+/// `FAILED_PRECONDITION` when no running lease matches the box, job and attempt, and
 /// `UNAVAILABLE` when a statement fails.
 pub async fn store_timing(
     pool: &PgPool,
+    box_name: &BoxName,
     request: &ReportTimingRequest,
 ) -> Result<ReportTimingReply, Status> {
     let invalid = |err: fleet_proto::TimingConvertError| Status::invalid_argument(err.to_string());
@@ -127,6 +122,7 @@ pub async fn store_timing(
     sqlx::query(LOCK_REPORTED_JOB)
         .bind(&request.job_id)
         .bind(attempt)
+        .bind(box_name.as_str())
         .fetch_optional(&mut *tx)
         .await
         .map_err(|e| storage_unavailable(&e))?
