@@ -535,6 +535,68 @@ async fn a_tampered_profile_blob_fails_the_job_and_the_agent_never_runs() -> Tes
     .await
 }
 
+async fn allowlisted_run(
+    model: &str,
+) -> Result<(bool, Option<String>), Box<dyn std::error::Error>> {
+    let dir = TempDir::new()?;
+    let ran = dir.path().join("agent-ran");
+    let agent = format!(
+        "#!/bin/sh\n[ \"$1\" = --version ] && {{ echo '2.0.0 (Claude Code)'; exit 0; }}\ntouch '{}'\n",
+        ran.display()
+    );
+    let profile = Profile {
+        model: Some(model.into()),
+        ..Profile::default()
+    };
+    let Launched {
+        mut inbox,
+        stop,
+        daemon,
+        server,
+        ..
+    } = launch_full(
+        &dir,
+        &agent,
+        None,
+        "model_allowlist = [\"opus\"]\n",
+        Some(served(&profile, profile.canonical_json())),
+    )
+    .await?;
+    let terminal = terminal_of(&mut inbox).await?;
+    let _ = stop.send(());
+    tokio::time::timeout(Duration::from_secs(30), daemon).await???;
+    server.abort();
+    Ok((ran.exists(), terminal.error))
+}
+
+#[tokio::test]
+async fn a_model_outside_the_config_allowlist_spawns_no_agent() -> TestResult {
+    common::bounded(Box::pin(async {
+        let (ran, error) = allowlisted_run("haiku").await?;
+        assert_eq!(
+            error.as_deref(),
+            Some("profile invalid: profile model is not in the box allowlist")
+        );
+        assert!(!ran);
+        Ok(())
+    }))
+    .await
+}
+
+#[tokio::test]
+async fn a_model_on_the_config_allowlist_spawns_the_agent() -> TestResult {
+    common::bounded(Box::pin(async {
+        let (ran, error) = allowlisted_run("opus").await?;
+        assert_ne!(
+            error.as_deref(),
+            Some("profile invalid: profile model is not in the box allowlist")
+        );
+        assert!(ran);
+        Ok(())
+    }))
+    .await
+}
+
 #[tokio::test]
 async fn a_job_cut_short_by_shutdown_still_loses_its_worktree_and_scratch() -> TestResult {
     common::bounded(Box::pin(async {

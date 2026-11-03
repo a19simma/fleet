@@ -443,6 +443,7 @@ fn agent_binaries(config: &Config) -> RunConfig {
     let mut run = RunConfig::new(&config.claude_bin, config.disposable);
     run.gh_bin.clone_from(&config.gh_bin);
     run.kimi_bin.clone_from(&config.kimi_bin);
+    run.model_allowlist.clone_from(&config.model_allowlist);
     run
 }
 
@@ -761,6 +762,7 @@ mod tests {
     use std::sync::{Arc, Mutex, PoisonError};
 
     use fleet_core::Profile;
+    use fleet_core::model_allowlist::ModelAllowlist;
     use fleet_proto::v1::{
         GetProfileBlobReply, GetProfileBlobRequest, ProfileRef, ReportJobReply, ReportJobRequest,
     };
@@ -1185,6 +1187,14 @@ mod tests {
         reply: Result<GetProfileBlobReply, Status>,
         jobs_dir: bool,
     ) -> Result<Fixture, std::io::Error> {
+        fixture_full(reply, jobs_dir, None)
+    }
+
+    fn fixture_full(
+        reply: Result<GetProfileBlobReply, Status>,
+        jobs_dir: bool,
+        allowlist: Option<ModelAllowlist>,
+    ) -> Result<Fixture, std::io::Error> {
         let dir = tempfile::TempDir::new()?;
         let marker = dir.path().join("git-ran");
         let git = script(dir.path(), &format!("touch {}\nexit 1", marker.display()))?;
@@ -1196,6 +1206,7 @@ mod tests {
             asked: Arc::clone(&asked),
         };
         let mut config = RunConfig::new("claude", false);
+        config.model_allowlist = allowlist;
         if jobs_dir {
             config.jobs_dir = Some(dir.path().join("agent-jobs"));
         }
@@ -1423,6 +1434,96 @@ mod tests {
             vec!["profile invalid: profile model name is not allowed".to_owned()]
         );
         assert!(!fx.marker.exists());
+        Ok(())
+    }
+
+    fn model_profile(model: &str) -> Profile {
+        Profile {
+            model: Some(model.to_owned()),
+            ..Profile::default()
+        }
+    }
+
+    fn allowlisted_fixture(
+        job: &Job,
+        profile: &Profile,
+        listed: &[&str],
+    ) -> Result<Fixture, std::io::Error> {
+        let allowlist = ModelAllowlist::new(listed.iter().copied())
+            .map_err(|e| std::io::Error::other(e.to_string()))?;
+        fixture_full(
+            Ok(reply_for(job, profile.canonical_json())),
+            true,
+            Some(allowlist),
+        )
+    }
+
+    #[tokio::test]
+    async fn a_model_outside_the_box_allowlist_fails_the_job_before_anything_spawns() -> TestResult
+    {
+        let hostile = [
+            "claude-haiku-4-5",
+            "claude-opus-4-1 ",
+            "CLAUDE-OPUS-4-1",
+            "claude-opus-4-1\n",
+            "claude-opus-4-1\r\n",
+            "claude-opus-4-1\u{2028}",
+            "claude-opus-4-1\0",
+            "claude-opus-4-1\u{85}",
+            "claude-opus-4-1/../x",
+            "claude-opus-4-1,claude-haiku-4-5",
+            "claude-opus-\u{0661}",
+            "-claude-opus-4-1",
+            "",
+        ];
+        for model in hostile {
+            let profile = model_profile(model);
+            let job = profile_job(&profile);
+            let mut fx = allowlisted_fixture(&job, &profile, &["claude-opus-4-1"])?;
+            let (_trigger, shutdown) = Shutdown::channel();
+            assert!(
+                fx.runner.run(job.clone(), shutdown).await.is_err(),
+                "{model:?}"
+            );
+            let got = errors(&mut fx.reports);
+            assert_eq!(got.len(), 1, "{model:?} {got:?}");
+            assert!(
+                got[0] == crate::floor::MODEL_DENIED_REASON
+                    || got[0] == "profile invalid: profile model name is not allowed",
+                "{model:?} {got:?}"
+            );
+            assert!(!fx.marker.exists(), "{model:?}");
+            assert!(!fx.dir.path().join("jobs").exists(), "{model:?}");
+            assert!(!fx.dir.path().join("agent-jobs").exists(), "{model:?}");
+            assert!(!fx.runner.agent.has_profile(&job), "{model:?}");
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn an_off_list_model_reports_the_exact_denied_reason() -> TestResult {
+        let profile = model_profile("claude-haiku-4-5");
+        let job = profile_job(&profile);
+        let mut fx = allowlisted_fixture(&job, &profile, &["claude-opus-4-1"])?;
+        let (_trigger, shutdown) = Shutdown::channel();
+        assert!(fx.runner.run(job, shutdown).await.is_err());
+        assert_eq!(
+            errors(&mut fx.reports),
+            vec![crate::floor::MODEL_DENIED_REASON.to_owned()]
+        );
+        assert!(!fx.marker.exists());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_listed_model_passes_the_allowlist_and_reaches_the_clone() -> TestResult {
+        let profile = model_profile("claude-opus-4-1");
+        let job = profile_job(&profile);
+        let mut fx = allowlisted_fixture(&job, &profile, &["claude-opus-4-1"])?;
+        let (_trigger, shutdown) = Shutdown::channel();
+        assert!(fx.runner.run(job, shutdown).await.is_err());
+        assert!(fx.marker.exists());
+        assert_eq!(errors(&mut fx.reports), vec![ERR_WORKSPACE.to_owned()]);
         Ok(())
     }
 

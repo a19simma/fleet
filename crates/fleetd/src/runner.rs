@@ -84,6 +84,7 @@ use crate::profile_apply::{self, Applied, LoadError};
 use crate::publish::{GH_CONFIG_DIR, HOME_DIR, JobPublish, Published};
 use crate::telemetry::Terminal as Ending;
 use crate::toolhook::HookHub;
+use fleet_core::model_allowlist::ModelAllowlist;
 mod ci;
 mod codex;
 mod kimi;
@@ -382,6 +383,9 @@ pub struct RunConfig {
     pub jobs_dir: Option<PathBuf>,
     /// Group that owns the per-job agent directory, group-writable. Unset keeps the 0700 modes.
     pub job_gid: Option<u32>,
+    /// Models a profile may name, from the box config. `None` trusts the server. A profile whose
+    /// model is outside the list ends the job before anything spawns.
+    pub model_allowlist: Option<ModelAllowlist>,
 }
 
 impl RunConfig {
@@ -414,6 +418,7 @@ impl RunConfig {
             bundle: Bundle::default(),
             jobs_dir: None,
             job_gid: None,
+            model_allowlist: None,
         }
     }
 }
@@ -936,11 +941,12 @@ impl<R: Reporter> AgentRunner<R> {
                 tracing::warn!(code = ?status.code(), "profile blob fetch failed");
                 LoadError::Fetch
             })?;
-        let applied = profile_apply::load(
+        let applied = profile_apply::load_checked(
             reference,
             &reply,
             &self.config.bundle,
             &self.ceilings(),
+            self.config.model_allowlist.as_ref(),
             &job.prompt,
         )?;
         if !applied.dropped_allows.is_empty() {
