@@ -165,3 +165,128 @@ fn a_refused_record_over_the_cap_does_not_count() {
     assert!(rec.record(&input("", "")).is_err());
     assert_eq!(rec.overflow(), 0);
 }
+
+const SPLITTERS: [char; 3] = ['\u{1}', '\u{1b}', '\u{200b}'];
+
+fn split_secret(by: char) -> String {
+    format!("{}{by}{}", &SECRET[..10], &SECRET[10..])
+}
+
+#[test]
+fn a_command_split_by_a_hidden_char_is_redacted() {
+    for by in SPLITTERS {
+        let mut rec = ShellRecorder::new(redactor());
+        rec.record(&input(&format!("run {}", split_secret(by)), "x"))
+            .expect("record");
+        assert_eq!(
+            rec.records()[0].command,
+            format!("run {PLACEHOLDER}"),
+            "{by:?}"
+        );
+    }
+}
+
+#[test]
+fn a_log_split_by_a_hidden_char_is_redacted() {
+    for by in SPLITTERS {
+        let mut rec = ShellRecorder::new(redactor());
+        rec.record(&input("x", &format!("got {}", split_secret(by))))
+            .expect("record");
+        assert_eq!(
+            rec.records()[0].output,
+            format!("got {PLACEHOLDER}"),
+            "{by:?}"
+        );
+    }
+}
+
+#[test]
+fn a_split_secret_straddling_the_command_cap_leaves_no_fragment() {
+    for by in SPLITTERS {
+        let pad = "a".repeat(MAX_COMMAND_BYTES - SECRET.len() / 2);
+        let command = format!("{pad}{}tail", split_secret(by));
+        let mut rec = ShellRecorder::new(redactor());
+        rec.record(&input(&command, "")).expect("record");
+        let r = &rec.records()[0];
+        assert!(r.command.len() <= MAX_COMMAND_BYTES, "{by:?}");
+        assert!(!r.command.contains(&SECRET[..8]), "{by:?}");
+    }
+}
+
+#[test]
+fn a_split_secret_straddling_the_log_cap_leaves_no_fragment() {
+    for by in SPLITTERS {
+        let pad = "a".repeat(MAX_SHELL_LOG_BYTES - SECRET.len() / 2);
+        let output = format!("{pad}{}tail", split_secret(by));
+        let mut rec = ShellRecorder::new(redactor());
+        rec.record(&input("x", &output)).expect("record");
+        let r = &rec.records()[0];
+        assert!(r.output.len() <= MAX_SHELL_LOG_BYTES, "{by:?}");
+        assert!(!r.output.contains(&SECRET[..8]), "{by:?}");
+    }
+}
+
+#[test]
+fn ordinary_text_survives_the_strip() {
+    let mut rec = ShellRecorder::new(redactor());
+    rec.record(&input(
+        "ls -la\n\techo \u{e9}\u{65e5}",
+        "l1\nl2\ttab \u{1F600}",
+    ))
+    .expect("record");
+    let r = &rec.records()[0];
+    assert_eq!(r.command, "ls -la\n\techo \u{e9}\u{65e5}");
+    assert_eq!(r.output, "l1\nl2\ttab \u{1F600}");
+}
+
+#[test]
+fn a_command_of_only_hidden_chars_is_refused_as_empty() {
+    let mut rec = ShellRecorder::new(redactor());
+    let result = rec.record(&input("\u{1}\u{200b}\0", "x"));
+    assert_eq!(result, Err(ShellError::EmptyCommand));
+    assert_eq!(rec.records().len(), 0);
+}
+
+#[test]
+fn every_hidden_range_edge_is_stripped_and_its_neighbours_survive() {
+    let edges: [(u32, u32); 20] = [
+        (0xAD, 0xAD),
+        (0x600, 0x605),
+        (0x61C, 0x61C),
+        (0x6DD, 0x6DD),
+        (0x70F, 0x70F),
+        (0x890, 0x891),
+        (0x8E2, 0x8E2),
+        (0x180E, 0x180E),
+        (0x200B, 0x200F),
+        (0x2028, 0x202E),
+        (0x2060, 0x2064),
+        (0x2066, 0x206F),
+        (0xFEFF, 0xFEFF),
+        (0xFFF9, 0xFFFB),
+        (0x110BD, 0x110BD),
+        (0x110CD, 0x110CD),
+        (0x13430, 0x1343F),
+        (0x1BCA0, 0x1BCA3),
+        (0x1D173, 0x1D17A),
+        (0xE0000, 0xE007F),
+    ];
+    let record = |text: &str| {
+        let mut rec = ShellRecorder::new(redactor());
+        rec.record(&input("x", text)).expect("record");
+        rec.records()[0].output.clone()
+    };
+    for (low, high) in edges {
+        for code in [low, high] {
+            let c = char::from_u32(code).expect("scalar");
+            assert_eq!(record(&format!("a{c}b")), "ab", "{code:#x}");
+        }
+        for code in [low - 1, high + 1] {
+            let c = char::from_u32(code).expect("scalar");
+            let hidden = edges.iter().any(|&(l, h)| (l..=h).contains(&code)) || c.is_control();
+            if !hidden {
+                assert_eq!(record(&format!("a{c}b")), format!("a{c}b"), "{code:#x}");
+            }
+        }
+    }
+}

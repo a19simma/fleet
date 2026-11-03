@@ -50,7 +50,7 @@ use crate::otel::{MAX_FLUSH_DEADLINE, QUIET_PERIOD};
 use crate::otel_parse::{ClaudeEvent, MAX_DECISIONS, MAX_DURATION_MS, Observed, SpanMapper};
 use crate::poller::{TimingOutcome, TimingReportError, TimingReporter, TimingTransport};
 use crate::runner::TelemetryCapture;
-use crate::shell_timing::{ShellInput, ShellRecord, ShellRecorder};
+use crate::shell_timing::{ShellInput, ShellRecord, ShellRecorder, strip_redact};
 use crate::wire_timing::parse_wire;
 
 /// Longest `Observed.id` the wiring passes to the mapper, in bytes. A longer id is dropped, so
@@ -148,15 +148,9 @@ pub struct NamedSpan {
 }
 
 fn one_line(redactor: &Redactor, text: &str, fallback: &str) -> String {
-    let clean = text.replace('\0', "");
-    let redacted = redactor.redact_str(&clean);
+    let redacted = strip_redact(redactor, text, false);
     let mut out = String::new();
     for c in redacted.chars() {
-        let c = if c.is_control() || c == '\u{2028}' || c == '\u{2029}' {
-            '?'
-        } else {
-            c
-        };
         if out.len() + c.len_utf8() > MAX_TIMING_NAME_BYTES {
             break;
         }
@@ -1094,8 +1088,70 @@ mod tests {
         let out = one_line(&redactor, &name, "fallback");
         assert!(!out.contains("hunter"), "{out}");
         assert!(out.len() <= MAX_TIMING_NAME_BYTES);
-        assert_eq!(one_line(&redactor, "a\nb\u{2028}c", "f"), "a?b?c");
+        assert_eq!(one_line(&redactor, "a\nb\u{2028}c", "f"), "abc");
         assert_eq!(one_line(&redactor, "  ", "fallback"), "fallback");
+    }
+
+    const HIDDEN_SPLITTERS: [char; 3] = ['\u{1}', '\u{1b}', '\u{200b}'];
+    const SPLIT_SECRET: &str = "hunter2-hunter2";
+
+    fn split_secret(by: char) -> String {
+        format!("{}{by}{}", &SPLIT_SECRET[..7], &SPLIT_SECRET[7..])
+    }
+
+    #[test]
+    fn a_tool_name_split_by_a_hidden_char_is_redacted() {
+        for by in HIDDEN_SPLITTERS {
+            let mut c = Collector::new(Redactor::new([SPLIT_SECRET]));
+            c.ingest(1000, vec![result("t1", &split_secret(by), 10, None)]);
+            let (spans, _, _) = c.finish();
+            let name = &spans.first().expect("span").name;
+            assert!(!name.contains("hunter"), "{by:?}: {name}");
+        }
+    }
+
+    #[test]
+    fn a_tool_use_id_split_by_a_hidden_char_is_redacted() {
+        for by in HIDDEN_SPLITTERS {
+            let mut c = Collector::new(Redactor::new([SPLIT_SECRET]));
+            c.ingest(1000, vec![result(&split_secret(by), "Bash", 10, None)]);
+            let (spans, _, _) = c.finish();
+            let id = spans
+                .first()
+                .and_then(|s| s.tool_use_id.clone())
+                .expect("id");
+            assert!(!id.contains("hunter"), "{by:?}: {id}");
+        }
+    }
+
+    #[test]
+    fn a_split_secret_straddling_the_name_cap_leaves_no_fragment() {
+        let redactor = Redactor::new([SPLIT_SECRET]);
+        for by in HIDDEN_SPLITTERS {
+            let name = format!(
+                "{}{}tail",
+                "a".repeat(MAX_TIMING_NAME_BYTES - "hunter2-hu".len()),
+                split_secret(by)
+            );
+            let out = one_line(&redactor, &name, "fallback");
+            assert!(!out.contains("hunter"), "{by:?}: {out}");
+            assert!(out.len() <= MAX_TIMING_NAME_BYTES);
+        }
+    }
+
+    #[test]
+    fn ordinary_names_and_ids_survive_the_strip() {
+        let redactor = Redactor::new([SPLIT_SECRET]);
+        assert_eq!(
+            one_line(&redactor, "mcp__srv__Lookup", "f"),
+            "mcp__srv__Lookup"
+        );
+        assert_eq!(
+            one_line(&redactor, "L\u{e9}a \u{65e5}\u{672c}", "f"),
+            "L\u{e9}a \u{65e5}\u{672c}"
+        );
+        assert_eq!(one_line(&redactor, "toolu_01AbC-9", ""), "toolu_01AbC-9");
+        assert_eq!(one_line(&redactor, "\u{200b}\u{1}", "fallback"), "fallback");
     }
 
     #[test]

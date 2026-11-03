@@ -1,11 +1,12 @@
 //! Shell command timing records.
 //!
 //! [`ShellRecorder`] turns one finished or running shell command into a [`ShellRecord`] whose
-//! command and output are safe to store. Each text first loses its NUL bytes, so a NUL cannot
-//! split a secret past the redactor and Postgres text accepts the value. It then passes the
-//! [`Redactor`], and only then is it cut at a character boundary to [`MAX_COMMAND_BYTES`] or
-//! [`MAX_SHELL_LOG_BYTES`], so a secret that straddles the cap is replaced whole and never
-//! leaves a fragment. A record past [`MAX_SHELL_COMMANDS`] stores nothing and bumps
+//! command and output are safe to store. Each text first loses its NUL, control, format, line
+//! and paragraph separator and tag characters, so none of them can split a secret past the
+//! redactor and Postgres text accepts the value. Newline and tab survive in commands and logs.
+//! The text then passes the [`Redactor`] and is stripped again, and only then is it cut at a
+//! character boundary to [`MAX_COMMAND_BYTES`] or [`MAX_SHELL_LOG_BYTES`], so a secret that
+//! straddles the cap is replaced whole and never leaves a fragment. A record past [`MAX_SHELL_COMMANDS`] stores nothing and bumps
 //! [`ShellRecorder::overflow`].
 
 use std::fmt;
@@ -82,9 +83,67 @@ pub struct ShellRecorder {
     overflow: u64,
 }
 
+/// Format (Cf), line and paragraph separator (Zl, Zp) and tag code points, sorted and
+/// non-overlapping. Generated from `UnicodeData.txt`; it matches `HIDDEN_RANGES` in
+/// `agent/notes.rs` and the set in `fetch.rs`. [`char::is_control`] covers Cc separately.
+const HIDDEN_RANGES: &[(u32, u32)] = &[
+    (0xAD, 0xAD),
+    (0x600, 0x605),
+    (0x61C, 0x61C),
+    (0x6DD, 0x6DD),
+    (0x70F, 0x70F),
+    (0x890, 0x891),
+    (0x8E2, 0x8E2),
+    (0x180E, 0x180E),
+    (0x200B, 0x200F),
+    (0x2028, 0x202E),
+    (0x2060, 0x2064),
+    (0x2066, 0x206F),
+    (0xFEFF, 0xFEFF),
+    (0xFFF9, 0xFFFB),
+    (0x110BD, 0x110BD),
+    (0x110CD, 0x110CD),
+    (0x13430, 0x1343F),
+    (0x1BCA0, 0x1BCA3),
+    (0x1D173, 0x1D17A),
+    (0xE0000, 0xE007F),
+];
+
+fn is_hidden(c: char) -> bool {
+    if c.is_control() {
+        return true;
+    }
+    let code = u32::from(c);
+    HIDDEN_RANGES
+        .binary_search_by(|&(low, high)| {
+            if high < code {
+                std::cmp::Ordering::Less
+            } else if low > code {
+                std::cmp::Ordering::Greater
+            } else {
+                std::cmp::Ordering::Equal
+            }
+        })
+        .is_ok()
+}
+
+fn strip_hidden(text: &str, keep_layout: bool) -> String {
+    text.chars()
+        .filter(|&c| (keep_layout && (c == '\n' || c == '\t')) || !is_hidden(c))
+        .collect()
+}
+
+/// Strips hidden characters, redacts, then strips again in case redaction exposed more.
+///
+/// Stripping first lets a secret split by an invisible character match the redactor. With
+/// `keep_layout`, newline and tab survive for commands and logs; names and ids lose them too.
+pub(crate) fn strip_redact(redactor: &Redactor, text: &str, keep_layout: bool) -> String {
+    let stripped = strip_hidden(text, keep_layout);
+    strip_hidden(&redactor.redact_str(&stripped), keep_layout)
+}
+
 fn clean(redactor: &Redactor, text: &str, cap: usize) -> (String, bool) {
-    let stripped = text.replace('\0', "");
-    let mut redacted = redactor.redact_str(&stripped).into_owned();
+    let mut redacted = strip_redact(redactor, text, true);
     if redacted.len() <= cap {
         return (redacted, false);
     }
@@ -121,7 +180,7 @@ impl ShellRecorder {
     /// Returns [`ShellError`] for an empty command, an end before the start, or a time above
     /// `i64::MAX`.
     pub fn record(&mut self, input: &ShellInput) -> Result<(), ShellError> {
-        if input.command.replace('\0', "").is_empty() {
+        if strip_hidden(&input.command, true).is_empty() {
             return Err(ShellError::EmptyCommand);
         }
         if !in_range(input.started) || input.ended.is_some_and(|end| !in_range(end)) {
