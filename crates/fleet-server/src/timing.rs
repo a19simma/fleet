@@ -2,12 +2,14 @@
 
 use std::time::Duration;
 
+use fleet_core::timing::Summary;
 use fleet_proto::v1::{
     GetJobTimingReply, GetJobTimingRequest, ReportShellLogReply, ReportShellLogRequest,
     ReportTimingReply, ReportTimingRequest, StreamShellLogChunk, StreamShellLogRequest,
 };
 use fleet_proto::{
-    shell_status_name, validate_shell_log_bytes, validate_shell_log_command_id,
+    ShellCommandRecord, TimingSpanRecord, shell_commands_from_wire, shell_status_name,
+    spans_from_wire, validate_shell_log_bytes, validate_shell_log_command_id,
     validate_shell_log_seq, validate_shell_log_status,
 };
 use sqlx::{PgPool, Row};
@@ -41,6 +43,191 @@ const NOT_IMPLEMENTED: &str = "job timing is not implemented";
 /// Returns `UNIMPLEMENTED` until the store is built.
 pub fn report_timing(_request: &ReportTimingRequest) -> Result<ReportTimingReply, Status> {
     Err(Status::unimplemented(NOT_IMPLEMENTED))
+}
+
+const LOCK_REPORTED_JOB: &str = "\
+SELECT 1 FROM jobs WHERE job_id = $1 AND attempt = $2 AND state = 'RUNNING' \
+AND lease_expires_at > now() FOR UPDATE";
+
+const UPSERT_TIMING: &str = "\
+INSERT INTO job_timing (job_id, wall_ms, api_wait_ms, tool_ms, shell_ms, idle_ms, overhead_ms) \
+VALUES ($1, $2, $3, $4, $5, $6, $7) \
+ON CONFLICT (job_id) DO UPDATE SET wall_ms = excluded.wall_ms, \
+api_wait_ms = excluded.api_wait_ms, tool_ms = excluded.tool_ms, shell_ms = excluded.shell_ms, \
+idle_ms = excluded.idle_ms, overhead_ms = excluded.overhead_ms, updated_at = now()";
+
+const DELETE_SPANS: &str = "DELETE FROM job_timing_spans WHERE job_id = $1";
+
+const DELETE_COMMANDS: &str = "DELETE FROM job_shell_commands WHERE job_id = $1";
+
+const INSERT_SPANS: &str = "\
+INSERT INTO job_timing_spans (job_id, seq, kind, start_ms, end_ms, name, tool_use_id) \
+SELECT $1, t.seq, t.kind, t.start_ms, t.end_ms, t.name, t.tool_use_id \
+FROM unnest($2::int[], $3::text[], $4::bigint[], $5::bigint[], $6::text[], $7::text[]) \
+AS t (seq, kind, start_ms, end_ms, name, tool_use_id)";
+
+const INSERT_COMMANDS: &str = "\
+INSERT INTO job_shell_commands (job_id, seq, id, command, background, started_ms, ended_ms, \
+duration_ms, exit_code, log, log_truncated, ended_by) \
+SELECT $1, t.seq, t.id, t.command, t.background, t.started_ms, t.ended_ms, t.duration_ms, \
+t.exit_code, t.log, t.log_truncated, t.ended_by \
+FROM unnest($2::int[], $3::text[], $4::text[], $5::bool[], $6::bigint[], $7::bigint[], \
+$8::bigint[], $9::int[], $10::text[], $11::bool[], $12::text[]) \
+AS t (seq, id, command, background, started_ms, ended_ms, duration_ms, exit_code, log, \
+log_truncated, ended_by)";
+
+fn stored(value: u64) -> Result<i64, Status> {
+    i64::try_from(value).map_err(|_| Status::invalid_argument("timing field is out of range"))
+}
+
+fn index(position: usize) -> Result<i32, Status> {
+    i32::try_from(position).map_err(|_| Status::invalid_argument("too many timing rows"))
+}
+
+fn kind_name(record: &TimingSpanRecord) -> Result<&'static str, Status> {
+    use fleet_core::timing::SpanKind;
+    match record.span.kind {
+        SpanKind::ApiWait => Ok("api"),
+        SpanKind::Tool => Ok("tool"),
+        SpanKind::Shell => Ok("shell"),
+        SpanKind::BgShell => Ok("bg_shell"),
+        _ => Err(Status::invalid_argument("unknown timing span kind")),
+    }
+}
+
+/// Stores the timing a box reports for one job, replacing any earlier report.
+///
+/// The `box` field is ignored. The report is accepted only while the job is `RUNNING` at
+/// the reported attempt with an unexpired lease. That row is locked `FOR UPDATE` for the
+/// whole transaction, so two reports for one job run one after the other and the later one
+/// replaces the summary, every span and every shell command of the earlier one. The wire
+/// converters in `fleet-proto` own the validation: caps of `MAX_SPANS` and
+/// `MAX_SHELL_COMMANDS`, a log of at most `MAX_SHELL_LOG_BYTES` per command, text rules,
+/// and a `wall_ms` equal to the sum of the parts.
+///
+/// # Errors
+/// `INVALID_ARGUMENT` for a missing summary or any value a converter refuses,
+/// `FAILED_PRECONDITION` when no running lease matches the job and attempt, and
+/// `UNAVAILABLE` when a statement fails.
+pub async fn store_timing(
+    pool: &PgPool,
+    request: &ReportTimingRequest,
+) -> Result<ReportTimingReply, Status> {
+    let invalid = |err: fleet_proto::TimingConvertError| Status::invalid_argument(err.to_string());
+    let summary = request
+        .summary
+        .ok_or_else(|| Status::invalid_argument("timing summary is missing"))?;
+    let wall = summary.wall_ms;
+    let summary = Summary::try_from(summary).map_err(invalid)?;
+    let spans = spans_from_wire(request.spans.clone()).map_err(invalid)?;
+    let commands = shell_commands_from_wire(request.shell_commands.clone()).map_err(invalid)?;
+    let stale = || Status::failed_precondition("report does not match the running job");
+    let attempt = i32::try_from(request.attempt).map_err(|_| stale())?;
+    let mut tx = pool.begin().await.map_err(|e| storage_unavailable(&e))?;
+    sqlx::query(LOCK_REPORTED_JOB)
+        .bind(&request.job_id)
+        .bind(attempt)
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(|e| storage_unavailable(&e))?
+        .ok_or_else(stale)?;
+    sqlx::query(UPSERT_TIMING)
+        .bind(&request.job_id)
+        .bind(stored(wall)?)
+        .bind(stored(summary.api_wait_ms)?)
+        .bind(stored(summary.tool_ms)?)
+        .bind(stored(summary.shell_ms)?)
+        .bind(stored(summary.idle_ms)?)
+        .bind(stored(summary.overhead_ms)?)
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| storage_unavailable(&e))?;
+    for delete in [DELETE_SPANS, DELETE_COMMANDS] {
+        sqlx::query(delete)
+            .bind(&request.job_id)
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| storage_unavailable(&e))?;
+    }
+    insert_spans(&mut tx, &request.job_id, &spans).await?;
+    insert_commands(&mut tx, &request.job_id, &commands).await?;
+    tx.commit().await.map_err(|e| storage_unavailable(&e))?;
+    Ok(ReportTimingReply {})
+}
+
+async fn insert_spans(
+    tx: &mut sqlx::PgConnection,
+    job_id: &str,
+    spans: &[TimingSpanRecord],
+) -> Result<(), Status> {
+    if spans.is_empty() {
+        return Ok(());
+    }
+    let (mut seqs, mut kinds, mut starts, mut ends) = (vec![], vec![], vec![], vec![]);
+    let (mut names, mut uses) = (vec![], vec![]);
+    for (position, record) in spans.iter().enumerate() {
+        seqs.push(index(position)?);
+        kinds.push(kind_name(record)?.to_owned());
+        starts.push(stored(record.span.interval.start_ms())?);
+        ends.push(stored(record.span.interval.end_ms())?);
+        names.push(record.name.clone());
+        uses.push(record.tool_use_id.clone());
+    }
+    sqlx::query(INSERT_SPANS)
+        .bind(job_id)
+        .bind(seqs)
+        .bind(kinds)
+        .bind(starts)
+        .bind(ends)
+        .bind(names)
+        .bind(uses)
+        .execute(tx)
+        .await
+        .map_err(|e| storage_unavailable(&e))?;
+    Ok(())
+}
+
+async fn insert_commands(
+    tx: &mut sqlx::PgConnection,
+    job_id: &str,
+    commands: &[ShellCommandRecord],
+) -> Result<(), Status> {
+    if commands.is_empty() {
+        return Ok(());
+    }
+    let (mut seqs, mut ids, mut texts, mut background) = (vec![], vec![], vec![], vec![]);
+    let (mut started, mut ended, mut durations) = (vec![], vec![], vec![]);
+    let (mut codes, mut logs, mut cut, mut by) = (vec![], vec![], vec![], vec![]);
+    for (position, record) in commands.iter().enumerate() {
+        seqs.push(index(position)?);
+        ids.push(record.id.clone());
+        texts.push(record.command.clone());
+        background.push(record.background);
+        started.push(stored(record.started_ms)?);
+        ended.push(record.ended_ms.map(stored).transpose()?);
+        durations.push(stored(record.duration_ms)?);
+        codes.push(record.exit_code);
+        logs.push(record.log.clone());
+        cut.push(record.log_truncated);
+        by.push(record.ended_by.clone());
+    }
+    sqlx::query(INSERT_COMMANDS)
+        .bind(job_id)
+        .bind(seqs)
+        .bind(ids)
+        .bind(texts)
+        .bind(background)
+        .bind(started)
+        .bind(ended)
+        .bind(durations)
+        .bind(codes)
+        .bind(logs)
+        .bind(cut)
+        .bind(by)
+        .execute(tx)
+        .await
+        .map_err(|e| storage_unavailable(&e))?;
+    Ok(())
 }
 
 /// Reads the stored timing of one job.
