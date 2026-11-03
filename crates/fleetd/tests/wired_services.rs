@@ -270,6 +270,7 @@ impl Launcher for Hold {
         Ok(Launched {
             stdout: Box::new(tokio::io::empty()),
             proc: Box::new(Held(Some(release))),
+            telemetry: None,
         })
     }
 }
