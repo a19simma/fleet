@@ -594,6 +594,7 @@ fn job_from_row(row: &PgRow) -> Result<Job, StoreError> {
         user_id: u64::try_from(row.try_get::<i64, _>("user_id")?)
             .map_err(|_| StoreError::OutOfRange("user id"))?,
         agent: row.try_get("agent")?,
+        profile_tools_granted: false,
         ci_retry_attempt: u32::try_from(row.try_get::<i32, _>("ci_retry_attempt")?)
             .map_err(|_| StoreError::OutOfRange("ci retry attempt"))?,
         ci_retry: row
