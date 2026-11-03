@@ -131,6 +131,125 @@ async fn summaries_survive_events_and_go_after_a_year(pool: PgPool) {
     assert_eq!(jobs, 3);
 }
 
+const TIMING_TABLES: [&str; 3] = ["job_timing", "job_timing_spans", "job_shell_commands"];
+
+async fn timing_rows(pool: &PgPool, id: &str) {
+    sqlx::query(
+        "INSERT INTO job_timing (job_id, wall_ms, api_wait_ms, tool_ms, shell_ms, idle_ms, \
+         overhead_ms) VALUES ($1, 1, 0, 0, 0, 0, 1)",
+    )
+    .bind(id)
+    .execute(pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO job_timing_spans (job_id, seq, kind, start_ms, end_ms, name) \
+         VALUES ($1, 0, 'api', 0, 1, 'n')",
+    )
+    .bind(id)
+    .execute(pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO job_shell_commands (job_id, seq, id, command, background, started_ms, \
+         duration_ms, log, log_truncated) VALUES ($1, 0, 'c', 'ls', false, 0, 1, '', false)",
+    )
+    .bind(id)
+    .execute(pool)
+    .await
+    .unwrap();
+}
+
+const COUNTS: [(&str, &str); 3] = [
+    (
+        "job_timing",
+        "SELECT count(*) FROM job_timing WHERE job_id = $1",
+    ),
+    (
+        "job_timing_spans",
+        "SELECT count(*) FROM job_timing_spans WHERE job_id = $1",
+    ),
+    (
+        "job_shell_commands",
+        "SELECT count(*) FROM job_shell_commands WHERE job_id = $1",
+    ),
+];
+
+async fn count_in(pool: &PgPool, table: &str, id: &str) -> i64 {
+    let sql = COUNTS.iter().find(|(name, _)| *name == table).unwrap().1;
+    sqlx::query_scalar(sql)
+        .bind(id)
+        .fetch_one(pool)
+        .await
+        .unwrap()
+}
+
+#[sqlx::test]
+async fn job_timing_rows_follow_the_summary_age(pool: PgPool) {
+    timing_case(pool, "job_timing").await;
+}
+
+#[sqlx::test]
+async fn job_timing_spans_follow_the_summary_age(pool: PgPool) {
+    timing_case(pool, "job_timing_spans").await;
+}
+
+#[sqlx::test]
+async fn job_shell_commands_follow_the_summary_age(pool: PgPool) {
+    timing_case(pool, "job_shell_commands").await;
+}
+
+async fn timing_case(pool: PgPool, table: &str) {
+    let store = store(pool.clone()).await;
+    job(&pool, "gone", "FAILED", Some(365 * DAY + 1), 400 * DAY).await;
+    job(&pool, "kept", "FAILED", Some(365 * DAY - 1), 400 * DAY).await;
+    job(&pool, "live", "RUNNING", None, 400 * DAY).await;
+    job(&pool, "bare", "SUCCEEDED", Some(400 * DAY), 400 * DAY).await;
+    job(&pool, "nulled", "LOST", None, 366 * DAY).await;
+    for id in ["gone", "kept", "live", "nulled"] {
+        timing_rows(&pool, id).await;
+    }
+    run_retention_once(&store, &policy()).await;
+    assert_eq!(count_in(&pool, table, "gone").await, 0);
+    assert_eq!(count_in(&pool, table, "kept").await, 1);
+    assert_eq!(count_in(&pool, table, "live").await, 1);
+    assert_eq!(count_in(&pool, table, "bare").await, 0);
+    assert_eq!(count_in(&pool, table, "nulled").await, 0);
+    let jobs: i64 = sqlx::query_scalar("SELECT count(*) FROM jobs")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(jobs, 5);
+}
+
+#[sqlx::test]
+async fn a_swept_job_keeps_no_timing_row_in_any_table(pool: PgPool) {
+    let store = store(pool.clone()).await;
+    job(&pool, "gone", "SUCCEEDED", Some(400 * DAY), 400 * DAY).await;
+    timing_rows(&pool, "gone").await;
+    run_retention_once(&store, &policy()).await;
+    for table in TIMING_TABLES {
+        assert_eq!(count_in(&pool, table, "gone").await, 0, "{table}");
+    }
+}
+
+#[sqlx::test]
+async fn timing_rows_are_pruned_without_a_summary(pool: PgPool) {
+    let store = store(pool.clone()).await;
+    job(&pool, "gone", "SUCCEEDED", Some(400 * DAY), 400 * DAY).await;
+    rows(&pool, "gone", 0, true).await;
+    timing_rows(&pool, "gone").await;
+    sqlx::query("DELETE FROM job_summary")
+        .execute(&pool)
+        .await
+        .unwrap();
+    let stats = run_retention_once(&store, &policy()).await;
+    assert_eq!(stats.summaries_deleted, 0);
+    for table in TIMING_TABLES {
+        assert_eq!(count_in(&pool, table, "gone").await, 0, "{table}");
+    }
+}
+
 #[sqlx::test]
 async fn summaries_follow_the_same_state_and_fallback_rules(pool: PgPool) {
     let store = store(pool.clone()).await;

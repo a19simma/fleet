@@ -20,7 +20,7 @@ ADRs for fleetd, the Fleet server and the `fleet` CLI. The plan is in `../plan.m
 | [0024](0024-job-git-credentials-and-permissions.md) | Job git credentials and permission policy | Accepted, runner, push and pull request step and reporter built and run by the daemon, repo host allowlist, cleared workspace git, token host, hardened mirror and scoped fetch credential added, amends 0011, Known limit superseded by 0031 |
 | [0025](0025-fleet-infra-directory-and-scoped-deploy.md) | Fleet infra directory and scoped deploy | Accepted, built, amends 0013 |
 | [0028](0028-eval-judge-and-ci-follow-up.md) | Eval, judge and CI follow-up | Accepted 2026-10-27, judge Job, CI status and CI retry built, builds on 0029 and 0030, amends 0021 and 0023 |
-| [0029](0029-job-telemetry.md) | Job telemetry | Accepted, built in the daemon and the server, amends 0021, beside 0022 |
+| [0029](0029-job-telemetry.md) | Job telemetry | Accepted, built in the daemon and the server, amends 0021, beside 0022, superseded in part by 0055 |
 | [0030](0030-metrics-and-improvement-loop.md) | Metrics and the improvement loop | Accepted, `GetStats`, caps and shadow stuck detector built, enforcement not built, builds on 0029 |
 | [0031](0031-agent-isolation.md) | Agent isolation | Accepted 2026-10-26, P1 built behind `agent_launcher = "systemd"` and cut over on the first Box, P2 built, P3 clone and publish built, supersedes the Known limit paragraph of 0024 and amends its credential and mirror-hardening sections |
 | [0033](0033-credential-delivery.md) | Credential delivery | Proposed 2026-10-29, built, builds on 0035, 0040 and 0043, amends 0014, 0021, 0023, 0024, 0031 and 0037 |
@@ -38,9 +38,13 @@ ADRs for fleetd, the Fleet server and the `fleet` CLI. The plan is in `../plan.m
 | [0045](0045-forge-trait.md) | Forge trait | Proposed 2026-10-29, built, builds on 0033 and 0043, amends 0024 and 0037 |
 | [0046](0046-mirror-key.md) | Mirror key | Proposed 2026-10-29, wired to the Job owner, amends 0024 and 0031 |
 | [0047](0047-fleetd-self-update.md) | fleetd self-update | Proposed 2026-11-01, built and wired, no live run, amends 0017, trust root amended by 0050 |
-| [0048](0048-profile-tools-and-bundled-mise.md) | Profile tools and bundled mise | Proposed 2026-11-01, built, no live run, amends 0034 and 0035, builds on 0038 and 0031 |
+| [0048](0048-profile-tools-and-bundled-mise.md) | Profile tools and bundled mise | Proposed 2026-11-01, built, no live run, amends 0034 and 0035, builds on 0038 and 0031, amended by 0054 |
 | [0049](0049-job-docker-and-build-egress.md) | Job docker and build-chain egress | Proposed 2026-11-01, spike pending, amends 0031 and 0038 |
 | [0050](0050-baked-default-update-trust-root.md) | Baked default update trust root | Proposed 2026-11-01, built, no live run, amends 0047 |
 | [0051](0051-web-ui-styling-tailwind-daisyui.md) | Web UI styling: Tailwind and daisyUI, generated CSS committed | Accepted 2026-11-01, built, extends 0041 |
+| [0052](0052-profile-ownership-and-visibility.md) | Profile ownership and visibility | Proposed 2026-11-02, not built, amends 0034, 0035 and 0048, builds on 0042 |
+| [0053](0053-global-catalog-and-profile-selection.md) | Global catalog and profile selection | Proposed 2026-11-02, nothing built, amends 0034 and 0035, builds on 0044, 0048 and 0054 |
+| [0054](0054-user-capabilities-and-model-allowlist.md) | User capabilities and model allowlist | Proposed 2026-11-02, not built, amends 0048, builds on 0035, 0042 and 0044 |
+| [0055](0055-job-timing-breakdown.md) | Job timing breakdown and loopback OTLP receiver | Proposed 2026-11-02, not built, loopback probe not run on a live host, supersedes in part and amends 0029, amends 0031 |
 
 Each ADR has a "Decisions (2026-10-24)" section with the choices made when the docs moved into this repo: Apache-2.0 licence, repo github.com/a19simma/fleet, `fleet watch` as a client poll in v1, job cost deferred, Tailscale not a hard dependency.

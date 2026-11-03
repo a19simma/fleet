@@ -82,6 +82,16 @@ Security of the receiver itself: any process on the Box can reach a host loopbac
 
 - fleetd gains an HTTP receiver, an OTLP parser, a pueue poller and a Kimi wire parser. Each is a pure parser or an injected client, so each has a table test.
 - `ReportTiming` and `GetJobTiming` are new RPCs. Reporting needs the box token and a live lease on the Job. Reading needs the client token.
-- The server stores spans and shell commands per Job, and retention removes them with the Job.
+- The server stores spans and shell commands per Job. Retention prunes the timing, span and shell command rows at the summary age. Jobs themselves are not deleted today.
 - Claude events carry tool parameters when `OTEL_LOG_TOOL_DETAILS=1`. The receiver redacts the command before it stores or forwards it, and the raw event body is never kept.
 - Not covered: a background task that outlives the Job has no end time, and Kimi timing waits on a captured fixture.
+
+## Build notes
+
+Checked against the code on the ralph telemetry branch. Where a note differs from the Decision above, the note describes what the code does and the Decision is unchanged until the owner amends it.
+
+- **No command-text parser (TIM-F7 dropped).** fleetd does not parse Bash command text to find background launches. A closed-grammar parser failed review three times because shell syntax is open-ended. `BgWatcher` in `crates/fleetd/src/bg_command.rs` takes the highest pueue task id at Job start as a baseline, polls `pueue status --json`, and tracks every task above it. It never reads command text. A task created after `pueue reset` with an id at or below the baseline is not seen.
+- **Receiver socket.** The built receiver listens on `otel.sock` in the Job directory (`crates/fleetd/src/otel.rs`), not on TCP. With a job group set (`job_group` in the fleetd config, env `FLEETD_JOB_GROUP`) the socket is chowned to that gid and set to mode 0660. With none it is mode 0600. Peer identity is the file mode and group. The bearer token is the only credential. Under the systemd launcher `agent-exec` binds `127.0.0.1:<port>` inside the private namespace and relays to this socket.
+- **Host network namespace.** `agent-exec` binds the namespace loopback forwarder only when its namespace is private. fleetd treats its own namespace as the host one when it equals `/proc/1/ns/net`, or when that link is unreadable, as it is under the `fleetd` uid. The unreadable case cannot prove the claim, so the config key `host_netns_attested` (default `false`) records the operator attestation that fleetd runs in the host namespace. `Config::require_host_netns` returns `HostNetnsUnattested` unless it is `true`. A unit that sets `PrivateNetwork` on fleetd breaks the attestation. No code path outside tests calls `require_host_netns` yet.
+- **Shell log stream contract (LOG-C).** The wire contract exists: `ReportShellLog` (box scope, live lease) and `StreamShellLog` (client scope, owner only) in `fleet.proto`, `MAX_SHELL_LOG_CHUNK_BYTES` of 4096 and `MAX_SHELL_LOG_CHUNKS` of 64 in `fleet-proto`, and migration 0025 `job_shell_log_chunks`. It is not live: both server handlers return `UNIMPLEMENTED`, and `BgWatcher` has no caller outside its own module. No fleetd code on this branch pushes pueue task logs to the server.
+- **Retention.** The prune query joins `jobs` and deletes `job_timing`, `job_timing_spans` and `job_shell_commands` rows at the summary age, each with its own limit.
