@@ -13,8 +13,11 @@
 //! The unit sets `RemainAfterExit=yes`, so a clean exit stays `active (exited)`. The launcher
 //! reads that as ended, then runs `stop` and `reset-failed` before it reports the result.
 
+use std::fmt::Write as _;
 use std::fs;
 use std::io;
+use std::io::Read;
+use std::num::NonZeroU16;
 use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
 use std::os::unix::process::ExitStatusExt;
 use std::path::{Path, PathBuf};
@@ -30,13 +33,14 @@ use tokio::task::JoinHandle;
 
 use fleet_core::tools::{ToolName, ToolSpec};
 
-use crate::agent_exec::{SPEC_FILE, TOOL_PROXY_PORT, write_spec};
+use crate::agent_exec::{SPEC_FILE, TOOL_PROXY_PORT, write_spec_telemetry};
 use crate::config::{AgentLauncher, Config};
 use crate::fetch_policy::HostPattern;
 use crate::jobenv::{create_stdout_fifo, open_fifo_reader, render_env_file, write_env_file};
 use crate::jobsock::{JobSocket, Limits, Peer, ProcPeer, ServiceName, Services, socket_path};
 use crate::runner::{
-    AgentProc, AgentSpec, DirectLauncher, InstallFuture, Launched, Launcher, ToolInstaller,
+    AgentProc, AgentSpec, DirectLauncher, InstallFuture, Launched, Launcher, TelemetryCapture,
+    ToolInstaller,
 };
 use crate::tools::{
     MAX_CACHE_ENTRIES, check_tool_hosts, tool_hosts, write_mise_toml, write_tool_env,
@@ -243,6 +247,114 @@ pub struct SystemdLauncher {
     gid: Option<u32>,
     socket: Option<JobSocketSetup>,
     tool_install: Option<ToolInstallSetup>,
+    telemetry: Option<TelemetrySetup>,
+}
+
+/// Source of a nonzero port for the in-namespace telemetry forwarder.
+pub type PortSource = Arc<dyn Fn() -> io::Result<NonZeroU16> + Send + Sync>;
+
+/// Source of a fresh bearer token for one job's receiver.
+pub type TokenSource = Arc<dyn Fn() -> io::Result<String> + Send + Sync>;
+
+/// Enables the per-job OTLP receiver in a [`SystemdLauncher`].
+///
+/// The launcher asks `port` for the forwarder port and `token` for the bearer token. When
+/// either fails, or the receiver cannot bind, the job runs with no capture and the spec names
+/// no port: capture never fails a job.
+#[derive(Clone)]
+pub struct TelemetrySetup {
+    port: PortSource,
+    token: TokenSource,
+    limits: crate::otel::Limits,
+}
+
+impl TelemetrySetup {
+    /// Setup with an ephemeral nonzero port and a 192-bit random token.
+    #[must_use]
+    pub fn new(limits: crate::otel::Limits) -> Self {
+        Self {
+            port: Arc::new(ephemeral_port),
+            token: Arc::new(random_token),
+            limits,
+        }
+    }
+
+    /// Replaces the port source.
+    #[must_use]
+    pub fn with_port_source(mut self, port: PortSource) -> Self {
+        self.port = port;
+        self
+    }
+
+    /// Replaces the token source.
+    #[must_use]
+    pub fn with_token_source(mut self, token: TokenSource) -> Self {
+        self.token = token;
+        self
+    }
+}
+
+impl std::fmt::Debug for TelemetrySetup {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("TelemetrySetup")
+            .field("limits", &self.limits)
+            .finish_non_exhaustive()
+    }
+}
+
+fn ephemeral_port() -> io::Result<NonZeroU16> {
+    let port = std::net::TcpListener::bind(("127.0.0.1", 0))?
+        .local_addr()?
+        .port();
+    NonZeroU16::new(port).ok_or_else(|| io::Error::other("ephemeral port is zero"))
+}
+
+fn random_token() -> io::Result<String> {
+    let mut bytes = [0_u8; 24];
+    fs::File::open("/dev/urandom")?.read_exact(&mut bytes)?;
+    let mut token = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        let _ = write!(token, "{byte:02x}");
+    }
+    Ok(token)
+}
+
+struct Telemetry {
+    port: NonZeroU16,
+    token: String,
+    receiver: crate::otel::OtelReceiver,
+    bodies: tokio::sync::mpsc::Receiver<Vec<u8>>,
+}
+
+fn start_telemetry(setup: &TelemetrySetup, dir: &Path, gid: Option<u32>) -> io::Result<Telemetry> {
+    let port = (setup.port)()?;
+    let token = (setup.token)()?;
+    let bearer = crate::otel::BearerToken::new(&token)
+        .map_err(|err| io::Error::new(io::ErrorKind::InvalidInput, err))?;
+    let (receiver, bodies) = crate::otel::OtelReceiver::bind(
+        &dir.join(crate::otel::SOCKET_NAME),
+        bearer,
+        gid,
+        setup.limits,
+    )?;
+    Ok(Telemetry {
+        port,
+        token,
+        receiver,
+        bodies,
+    })
+}
+
+impl SystemdLauncher {
+    /// Binds a receiver in each run dir and writes its port into the spec.
+    ///
+    /// The receiver socket is owned by the fleetd uid with the job group and mode 0660, the
+    /// group set by [`Self::with_job_gid`].
+    #[must_use]
+    pub fn with_telemetry(mut self, setup: TelemetrySetup) -> Self {
+        self.telemetry = Some(setup);
+        self
+    }
 }
 
 impl SystemdLauncher {
@@ -259,6 +371,7 @@ impl SystemdLauncher {
             gid: None,
             socket: None,
             tool_install: None,
+            telemetry: None,
         }
     }
 
@@ -561,7 +674,20 @@ impl Launcher for SystemdLauncher {
         let body =
             render_env_file(&spec).map_err(|_| io::Error::from(io::ErrorKind::InvalidInput))?;
         write_env_file(&dir.join(ENV_FILE), &body)?;
-        write_spec(&dir.join(SPEC_FILE), &id, &spec, self.gid)?;
+        let telemetry = self.telemetry.as_ref().and_then(|setup| {
+            start_telemetry(setup, &dir, self.gid)
+                .inspect_err(|err| {
+                    tracing::warn!(kind = ?err.kind(), "telemetry capture not started");
+                })
+                .ok()
+        });
+        write_spec_telemetry(
+            &dir.join(SPEC_FILE),
+            &id,
+            &spec,
+            self.gid,
+            telemetry.as_ref().map(|capture| capture.port),
+        )?;
         write_tool_env(&self.run_dir, &id, TOOL_PROXY_PORT, &tools)
             .map_err(|err| io::Error::other(err.to_string()))?;
         let fifo = dir.join(STDOUT_FIFO);
@@ -571,9 +697,27 @@ impl Launcher for SystemdLauncher {
         let socket = self.bind_job_socket(&id)?;
         let unit = unit_name(&id);
         self.ctl.run(&["start", "--no-block", &unit])?;
+        let (receiver, capture) = match telemetry {
+            Some(Telemetry {
+                port,
+                token,
+                receiver,
+                bodies,
+            }) => (
+                Some(receiver),
+                Some(TelemetryCapture {
+                    port,
+                    token,
+                    bodies,
+                }),
+            ),
+            None => (None, None),
+        };
         Ok(Launched {
+            telemetry: capture,
             stdout: Box::new(reader),
             proc: Box::new(SystemdProc {
+                _receiver: receiver,
                 ctl: self.ctl.clone(),
                 unit,
                 poll: self.poll,
@@ -630,6 +774,7 @@ impl Shared {
 }
 
 struct SystemdProc {
+    _receiver: Option<crate::otel::OtelReceiver>,
     ctl: Ctl,
     unit: String,
     poll: Duration,

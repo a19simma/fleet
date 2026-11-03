@@ -46,6 +46,7 @@ use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::ffi::OsString;
 use std::future::Future;
 use std::io;
+use std::num::NonZeroU16;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::process::{ExitStatus, Stdio};
@@ -560,6 +561,29 @@ pub struct Launched {
     pub stdout: Box<dyn AsyncRead + Send + Unpin>,
     /// The process handle.
     pub proc: Box<dyn AgentProc>,
+    /// The telemetry capture of this launch, when the launcher set one up.
+    pub telemetry: Option<TelemetryCapture>,
+}
+
+/// What a launcher hands over for the agent's OTLP export.
+///
+/// The receiver itself lives as long as the process handle. `token` is a secret: it goes to
+/// the agent's exporter header and nowhere else, and `Debug` hides it.
+pub struct TelemetryCapture {
+    /// The port the agent posts to, inside the unit's network namespace.
+    pub port: NonZeroU16,
+    /// The bearer token the receiver requires.
+    pub token: String,
+    /// The bodies the receiver accepted.
+    pub bodies: tokio::sync::mpsc::Receiver<Vec<u8>>,
+}
+
+impl std::fmt::Debug for TelemetryCapture {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("TelemetryCapture")
+            .field("port", &self.port)
+            .finish_non_exhaustive()
+    }
 }
 
 /// Starts the agent for [`AgentRunner`]. The seam lets a different sandbox replace the
@@ -642,6 +666,7 @@ fn spawn_direct<W: ChildWait + 'static>(
             inner: wrap(child),
             guard,
         }),
+        telemetry: None,
     })
 }
 
@@ -1319,7 +1344,9 @@ impl<R: Reporter> AgentRunner<R> {
             self.end.set_hosts(&job.job_id, runner.model_hosts());
         }
         let program = spec.argv.first().cloned().unwrap_or_default();
-        let Launched { stdout, mut proc } = match launch(spec) {
+        let Launched {
+            stdout, mut proc, ..
+        } = match launch(spec) {
             Ok(launched) => launched,
             Err(err) => {
                 tracing::warn!(
@@ -2725,6 +2752,7 @@ mod tests {
                     calls: Arc::clone(&self.calls),
                     timed_out: self.timed_out,
                 }),
+                telemetry: None,
             })
         }
     }
