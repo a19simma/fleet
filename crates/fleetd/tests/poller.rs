@@ -6,6 +6,7 @@
 
 use std::collections::VecDeque;
 use std::error::Error;
+use std::future::Future;
 use std::io;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
@@ -14,12 +15,15 @@ use std::time::Duration;
 use fleet_proto::v1::fleet_worker_server::{FleetWorker, FleetWorkerServer};
 use fleet_proto::v1::{
     ClaimJobReply, ClaimJobRequest, GetProfileBlobReply, GetProfileBlobRequest, Job,
-    ReportJobReply, ReportJobRequest,
+    ReportJobReply, ReportJobRequest, ReportTimingReply, ReportTimingRequest,
 };
 use fleetd::backoff::Random;
 use fleetd::poller::{
-    CLAIM_GRACE, ClaimGate, Claimed, GrpcReporter, JobRunner, MAX_IDLE_WAIT, PollRandom, Poller,
-    REQUEST_TIMEOUT, RunError, SHUTDOWN_GRACE, Shutdown, Token,
+    CLAIM_GRACE, ClaimGate, Claimed, GrpcReporter, GrpcTimingTransport, IDEMPOTENCY_METADATA,
+    JobRunner, MAX_IDLE_WAIT, MAX_SERVER_WAIT, MAX_TIMING_ATTEMPTS, MAX_TIMING_JOB_ID_BYTES,
+    PUSHBACK_METADATA, PollRandom, Poller, REQUEST_TIMEOUT, RetryClock, RunError, SHUTDOWN_GRACE,
+    Shutdown, TIMING_REPORT_DEADLINE, TimingOutcome, TimingReportError, TimingReporter,
+    TimingTransport, Token, timing_idempotency_key,
 };
 use fleetd::runner::Reporter;
 use fleetd::update::{DrainController, DrainOutcome};
@@ -63,6 +67,7 @@ struct Shared {
     times: Mutex<Vec<Instant>>,
     auth: Mutex<Vec<String>>,
     report_auth: Mutex<Vec<String>>,
+    timing_keys: Mutex<Vec<String>>,
     arrived: Notify,
 }
 
@@ -180,9 +185,20 @@ impl FleetWorker for Stub {
 
     async fn report_timing(
         &self,
-        _: Request<fleet_proto::v1::ReportTimingRequest>,
-    ) -> Result<Response<fleet_proto::v1::ReportTimingReply>, Status> {
-        Err(Status::unimplemented("not used"))
+        request: Request<ReportTimingRequest>,
+    ) -> Result<Response<ReportTimingReply>, Status> {
+        let key = request
+            .metadata()
+            .get(IDEMPOTENCY_METADATA)
+            .and_then(|value| value.to_str().ok())
+            .unwrap_or_default()
+            .to_owned();
+        self.0
+            .timing_keys
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .push(key);
+        Ok(Response::new(ReportTimingReply {}))
     }
 }
 
@@ -806,4 +822,423 @@ async fn pausing_the_gate_mid_run_stops_new_claims() -> Test {
     pause(300).await;
     assert_eq!(rig.claims(), seen);
     running.stop_within(Duration::from_secs(1)).await
+}
+
+struct ClockState {
+    now: Mutex<Duration>,
+    sleeps: Mutex<Vec<Duration>>,
+}
+
+#[derive(Clone)]
+struct FakeClock(Arc<ClockState>);
+
+impl FakeClock {
+    fn new() -> Self {
+        Self(Arc::new(ClockState {
+            now: Mutex::new(Duration::from_secs(1000)),
+            sleeps: Mutex::new(Vec::new()),
+        }))
+    }
+
+    fn sleeps(&self) -> Vec<Duration> {
+        self.0
+            .sleeps
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()
+    }
+}
+
+impl RetryClock for FakeClock {
+    fn now(&self) -> Duration {
+        *self.0.now.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    fn sleep(&self, duration: Duration) -> impl Future<Output = ()> + Send {
+        *self.0.now.lock().unwrap_or_else(PoisonError::into_inner) += duration;
+        self.0
+            .sleeps
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .push(duration);
+        std::future::ready(())
+    }
+}
+
+struct TransportState {
+    cost: Option<(FakeClock, Duration)>,
+    script: Mutex<VecDeque<Result<(), Status>>>,
+    keys: Mutex<Vec<String>>,
+}
+
+#[derive(Clone)]
+struct FakeTransport(Arc<TransportState>);
+
+impl FakeTransport {
+    fn scripted(steps: Vec<Result<(), Status>>) -> Self {
+        Self(Arc::new(TransportState {
+            cost: None,
+            script: Mutex::new(steps.into()),
+            keys: Mutex::new(Vec::new()),
+        }))
+    }
+
+    fn costing(steps: Vec<Result<(), Status>>, clock: &FakeClock, cost: Duration) -> Self {
+        Self(Arc::new(TransportState {
+            cost: Some((clock.clone(), cost)),
+            script: Mutex::new(steps.into()),
+            keys: Mutex::new(Vec::new()),
+        }))
+    }
+
+    fn keys(&self) -> Vec<String> {
+        self.0
+            .keys
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()
+    }
+}
+
+impl TimingTransport for FakeTransport {
+    fn report_timing(
+        &self,
+        idempotency_key: &str,
+        _request: ReportTimingRequest,
+    ) -> impl Future<Output = Result<ReportTimingReply, Status>> + Send {
+        self.0
+            .keys
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .push(idempotency_key.to_owned());
+        if let Some((clock, cost)) = &self.0.cost {
+            *clock.0.now.lock().unwrap_or_else(PoisonError::into_inner) += *cost;
+        }
+        let step = self
+            .0
+            .script
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .pop_front()
+            .unwrap_or_else(|| Err(Status::unavailable("script ended")));
+        std::future::ready(step.map(|()| ReportTimingReply {}))
+    }
+}
+
+fn timing_request(job: &str) -> ReportTimingRequest {
+    ReportTimingRequest {
+        job_id: job.into(),
+        attempt: 1,
+        ..ReportTimingRequest::default()
+    }
+}
+
+fn unavailable() -> Result<(), Status> {
+    Err(Status::unavailable("down"))
+}
+
+fn pushback(value: &str) -> Result<(), Status> {
+    let mut status = Status::unavailable("busy");
+    if let Ok(parsed) = value.parse() {
+        status.metadata_mut().insert(PUSHBACK_METADATA, parsed);
+    }
+    Err(status)
+}
+
+type TimingRig = (
+    TimingReporter<FakeTransport, FakeClock, Fixed>,
+    FakeTransport,
+    FakeClock,
+);
+
+fn timing_rig(steps: Vec<Result<(), Status>>) -> TimingRig {
+    let transport = FakeTransport::scripted(steps);
+    let clock = FakeClock::new();
+    let reporter = TimingReporter::new(transport.clone(), clock.clone(), Fixed(1.0));
+    (reporter, transport, clock)
+}
+
+fn quiet_rig(steps: Vec<Result<(), Status>>, cost: Duration) -> TimingRig {
+    let clock = FakeClock::new();
+    let transport = FakeTransport::costing(steps, &clock, cost);
+    let reporter = TimingReporter::new(transport.clone(), clock.clone(), Fixed(0.0));
+    (reporter, transport, clock)
+}
+
+async fn bounded<T>(future: impl Future<Output = T>) -> Result<T, Box<dyn Error>> {
+    Ok(tokio::time::timeout(Duration::from_secs(10), future).await?)
+}
+
+#[tokio::test]
+async fn timing_report_is_acked_on_the_first_call() -> Test {
+    let (mut reporter, transport, clock) = timing_rig(vec![Ok(())]);
+    let outcome = bounded(reporter.report(timing_request("job-1"))).await??;
+    assert_eq!(outcome, TimingOutcome::Acked { attempts: 1 });
+    assert_eq!(transport.keys().len(), 1);
+    assert_eq!(clock.sleeps().len(), 0);
+    Ok(())
+}
+
+#[tokio::test]
+async fn timing_report_retries_then_acks_with_one_stable_key() -> Test {
+    let (mut reporter, transport, clock) = timing_rig(vec![unavailable(), unavailable(), Ok(())]);
+    let outcome = bounded(reporter.report(timing_request("job-1"))).await??;
+    assert_eq!(outcome, TimingOutcome::Acked { attempts: 3 });
+    let keys = transport.keys();
+    assert_eq!(keys.len(), 3);
+    assert!(keys.iter().all(|key| *key == keys[0] && !key.is_empty()));
+    assert_eq!(keys[0], timing_idempotency_key("job-1", 1)?);
+    assert_eq!(
+        clock.sleeps(),
+        [Duration::from_secs(1), Duration::from_secs(2)]
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn timing_report_key_differs_per_job_and_attempt_and_is_never_empty()
+-> Result<(), Box<dyn Error>> {
+    let first = timing_idempotency_key("job-1", 1)?;
+    assert_ne!(first, timing_idempotency_key("job-2", 1)?);
+    assert_ne!(first, timing_idempotency_key("job-1", 2)?);
+    assert_eq!(first, timing_idempotency_key("job-1", 1)?);
+    assert_eq!(
+        timing_idempotency_key("", 1),
+        Err(TimingReportError::EmptyJobId)
+    );
+    let (mut reporter, transport, _clock) = timing_rig(vec![Ok(())]);
+    let refused = bounded(reporter.report(timing_request(""))).await?;
+    assert_eq!(refused, Err(TimingReportError::EmptyJobId));
+    assert_eq!(transport.keys().len(), 0);
+    Ok(())
+}
+
+#[tokio::test]
+async fn timing_report_stops_on_a_permanent_refusal() -> Test {
+    for code in [
+        Status::invalid_argument("bad"),
+        Status::permission_denied("no"),
+    ] {
+        let want = code.code();
+        let (mut reporter, transport, clock) = timing_rig(vec![Err(code), Ok(())]);
+        let outcome = bounded(reporter.report(timing_request("job-1"))).await??;
+        assert_eq!(outcome, TimingOutcome::Refused(want));
+        assert_eq!(transport.keys().len(), 1);
+        assert_eq!(clock.sleeps().len(), 0);
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn timing_report_stops_when_the_job_is_pruned() -> Test {
+    let (mut reporter, transport, clock) =
+        timing_rig(vec![unavailable(), Err(Status::not_found("gone")), Ok(())]);
+    let outcome = bounded(reporter.report(timing_request("job-1"))).await??;
+    assert_eq!(outcome, TimingOutcome::Pruned);
+    assert_eq!(transport.keys().len(), 2);
+    assert_eq!(clock.sleeps().len(), 1);
+    Ok(())
+}
+
+#[tokio::test]
+async fn timing_report_caps_a_hostile_server_wait() -> Test {
+    for hostile in [
+        "99999999999999999999999999",
+        "18446744073709551615",
+        "86400000",
+    ] {
+        let (mut reporter, _transport, clock) = timing_rig(vec![pushback(hostile), Ok(())]);
+        let outcome = bounded(reporter.report(timing_request("job-1"))).await??;
+        assert_eq!(outcome, TimingOutcome::Acked { attempts: 2 });
+        assert_eq!(clock.sleeps(), [MAX_SERVER_WAIT]);
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn timing_report_honours_a_small_server_wait_above_the_backoff() -> Test {
+    let (mut reporter, _transport, clock) = timing_rig(vec![pushback("5000"), Ok(())]);
+    bounded(reporter.report(timing_request("job-1"))).await??;
+    assert_eq!(clock.sleeps(), [Duration::from_secs(5)]);
+    let (mut reporter, _transport, clock) =
+        timing_rig(vec![pushback("-5"), pushback("x"), pushback(""), Ok(())]);
+    bounded(reporter.report(timing_request("job-1"))).await??;
+    assert_eq!(
+        clock.sleeps(),
+        [
+            Duration::from_secs(1),
+            Duration::from_secs(2),
+            Duration::from_secs(4)
+        ]
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn timing_report_gives_up_after_the_attempt_budget() -> Test {
+    let steps = (0..MAX_TIMING_ATTEMPTS + 5)
+        .map(|_| unavailable())
+        .collect();
+    let (mut reporter, transport, _clock) = quiet_rig(steps, Duration::ZERO);
+    let outcome = bounded(reporter.report(timing_request("job-1"))).await??;
+    assert_eq!(outcome, TimingOutcome::GaveUp);
+    assert_eq!(
+        transport.keys().len(),
+        usize::try_from(MAX_TIMING_ATTEMPTS)?
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn timing_report_gives_up_at_the_deadline() -> Test {
+    let steps = (0..MAX_TIMING_ATTEMPTS)
+        .map(|_| pushback("60000"))
+        .collect();
+    let (mut reporter, transport, clock) = timing_rig(steps);
+    let outcome = bounded(reporter.report(timing_request("job-1"))).await??;
+    assert_eq!(outcome, TimingOutcome::GaveUp);
+    let slept: Duration = clock.sleeps().iter().sum();
+    assert!(slept <= TIMING_REPORT_DEADLINE);
+    assert!(slept + MAX_SERVER_WAIT > TIMING_REPORT_DEADLINE);
+    assert!(transport.keys().len() < usize::try_from(MAX_TIMING_ATTEMPTS)?);
+    Ok(())
+}
+
+#[tokio::test]
+async fn timing_backoff_resets_after_an_ack() -> Test {
+    let (mut reporter, _transport, clock) = timing_rig(vec![
+        unavailable(),
+        unavailable(),
+        Ok(()),
+        unavailable(),
+        Ok(()),
+    ]);
+    bounded(reporter.report(timing_request("job-1"))).await??;
+    bounded(reporter.report(timing_request("job-2"))).await??;
+    assert_eq!(
+        clock.sleeps(),
+        [
+            Duration::from_secs(1),
+            Duration::from_secs(2),
+            Duration::from_secs(1)
+        ]
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn timing_backoff_does_not_reset_after_a_refusal_or_a_prune() -> Test {
+    for end in [Status::invalid_argument("bad"), Status::not_found("gone")] {
+        let (mut reporter, _transport, clock) =
+            timing_rig(vec![unavailable(), Err(end), unavailable(), Ok(())]);
+        bounded(reporter.report(timing_request("job-1"))).await??;
+        bounded(reporter.report(timing_request("job-2"))).await??;
+        assert_eq!(
+            clock.sleeps(),
+            [Duration::from_secs(1), Duration::from_secs(2)]
+        );
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn grpc_timing_transport_sends_the_idempotency_key() -> Test {
+    let rig = rig(Vec::new());
+    let transport = GrpcTimingTransport::new(rig.channel.clone(), &Token::new(SECRET))?;
+    let mut reporter = TimingReporter::new(transport, FakeClock::new(), Fixed(1.0));
+    let outcome = bounded(reporter.report(timing_request("job-9"))).await??;
+    assert_eq!(outcome, TimingOutcome::Acked { attempts: 1 });
+    let keys = rig
+        .shared
+        .timing_keys
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .clone();
+    assert_eq!(keys, [timing_idempotency_key("job-9", 1)?]);
+    Ok(())
+}
+
+#[tokio::test]
+async fn timing_report_deadline_is_inclusive() -> Test {
+    let steps = (0..MAX_TIMING_ATTEMPTS).map(|_| pushback("1000")).collect();
+    let (mut reporter, transport, _clock) = quiet_rig(steps, Duration::from_secs(99));
+    let outcome = bounded(reporter.report(timing_request("job-1"))).await??;
+    assert_eq!(outcome, TimingOutcome::GaveUp);
+    assert_eq!(transport.keys().len(), 7);
+    Ok(())
+}
+
+fn hostile_job_ids() -> Vec<(&'static str, String)> {
+    vec![
+        ("space", "a b".into()),
+        ("tab", "a\tb".into()),
+        ("cr", "a\rb".into()),
+        ("lf", "a\nb".into()),
+        ("crlf", "a\r\nb".into()),
+        ("nel", "a\u{85}b".into()),
+        ("u2028", "a\u{2028}b".into()),
+        ("non_ascii", "j\u{f6}b".into()),
+        ("nul", "a\0b".into()),
+        ("cap_plus_one", "a".repeat(MAX_TIMING_JOB_ID_BYTES + 1)),
+    ]
+}
+
+#[tokio::test]
+async fn timing_key_rejects_every_hostile_job_id_without_sending() -> Test {
+    assert_eq!(
+        timing_idempotency_key("", 1),
+        Err(TimingReportError::EmptyJobId)
+    );
+    for (name, job) in hostile_job_ids() {
+        assert_eq!(
+            timing_idempotency_key(&job, 1),
+            Err(TimingReportError::BadJobId),
+            "{name}"
+        );
+        let (mut reporter, transport, _clock) = timing_rig(vec![Ok(())]);
+        let refused = bounded(reporter.report(timing_request(&job))).await?;
+        assert_eq!(refused, Err(TimingReportError::BadJobId), "{name}");
+        assert_eq!(transport.keys().len(), 0, "{name}");
+    }
+    let longest = "a".repeat(MAX_TIMING_JOB_ID_BYTES);
+    assert!(timing_idempotency_key(&longest, 1).is_ok());
+    let control = "!~09Az-_.:/".repeat(2);
+    assert!(timing_idempotency_key(&control, 1).is_ok());
+    assert_eq!(
+        TimingReportError::BadJobId.to_string(),
+        "timing report job id is not a short run of printable ASCII"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn grpc_timing_transport_refuses_a_key_that_is_not_a_header_value() -> Test {
+    let rig = rig(Vec::new());
+    let transport = GrpcTimingTransport::new(rig.channel.clone(), &Token::new(SECRET))?;
+    for key in ["a\r\nb", "a\rb", "a\nb", "a\0b", "a\x7fb"] {
+        let status = transport
+            .report_timing(key, timing_request("job-1"))
+            .await
+            .err()
+            .ok_or_else(|| format!("sent {key:?}"))?;
+        assert_eq!(status.code(), tonic::Code::InvalidArgument, "{key:?}");
+    }
+    let sent = rig
+        .shared
+        .timing_keys
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .len();
+    assert_eq!(sent, 0);
+    transport
+        .report_timing("timing:job-1:1", timing_request("job-1"))
+        .await?;
+    let sent = rig
+        .shared
+        .timing_keys
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .clone();
+    assert_eq!(sent, ["timing:job-1:1"]);
+    Ok(())
 }
