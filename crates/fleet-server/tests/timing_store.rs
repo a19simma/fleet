@@ -9,13 +9,15 @@ use std::time::Duration;
 use fleet_core::BoxName;
 use fleet_core::timing::{Interval, Span, SpanKind, aggregate};
 use fleet_proto::v1::{
-    ReportTimingRequest, ShellCommand, TimingSpan, TimingSpanKind, TimingSummary,
+    GetJobTimingRequest, ReportTimingRequest, ShellCommand, TimingSpan, TimingSpanKind,
+    TimingSummary,
 };
 use fleet_proto::{
     MAX_COMMAND_BYTES, MAX_SHELL_COMMANDS, MAX_SHELL_LOG_BYTES, MAX_SPANS, MAX_TIMING_NAME_BYTES,
 };
 use fleet_server::timing::{
-    REASON_PARTS_SUM, REASON_SPAN_OUTSIDE, REASON_WINDOW_AHEAD, WINDOW_TOLERANCE_MS, store_timing,
+    REASON_PARTS_SUM, REASON_SPAN_OUTSIDE, REASON_WINDOW_AHEAD, WINDOW_TOLERANCE_MS,
+    read_job_timing, store_timing,
 };
 use sqlx::{PgPool, Row};
 use tonic::Code;
@@ -748,4 +750,189 @@ async fn a_running_job_with_no_claim_time_is_refused_as_stale(pool: PgPool) {
         .unwrap_err();
     assert_eq!(err.code(), Code::FailedPrecondition);
     assert_eq!(counts(&pool).await, (0, 0, 0));
+}
+
+async fn user(pool: &PgPool, name: &str) -> i64 {
+    sqlx::query_scalar("INSERT INTO users (username) VALUES ($1) RETURNING id")
+        .bind(name)
+        .fetch_one(pool)
+        .await
+        .unwrap()
+}
+
+async fn own(pool: &PgPool, user_id: i64) {
+    sqlx::query("UPDATE jobs SET user_id = $1 WHERE job_id = $2")
+        .bind(user_id)
+        .bind(JOB)
+        .execute(pool)
+        .await
+        .unwrap();
+}
+
+fn get(job_id: &str) -> GetJobTimingRequest {
+    GetJobTimingRequest {
+        job_id: job_id.to_owned(),
+    }
+}
+
+#[sqlx::test]
+async fn a_read_returns_the_stored_report_in_order(pool: PgPool) {
+    sqlx::migrate!().run(&pool).await.unwrap();
+    running_job(&pool).await;
+    let alice = user(&pool, "alice").await;
+    own(&pool, alice).await;
+    let mut tagged = span(5);
+    tagged.kind = TimingSpanKind::BgShell as i32;
+    tagged.tool_use_id = Some("toolu_1".to_owned());
+    let mut cmd = command("c1");
+    cmd.ended_by = Some("job_exit".to_owned());
+    cmd.ended_ms = None;
+    cmd.exit_code = None;
+    cmd.log_truncated = true;
+    let report = request(100, vec![span(0), tagged], vec![cmd, command("c2")]);
+    store_timing(&pool, &lease_box(), &report).await.unwrap();
+    let reply = read_job_timing(&pool, Some(alice), &get(JOB))
+        .await
+        .unwrap();
+    assert_eq!(reply.summary, report.summary);
+    assert_eq!(reply.spans, report.spans);
+    assert_eq!(reply.shell_commands, report.shell_commands);
+    let any = read_job_timing(&pool, None, &get(JOB)).await.unwrap();
+    assert_eq!(any, reply);
+}
+
+#[sqlx::test]
+async fn a_job_without_a_report_reads_as_absent_not_zeros(pool: PgPool) {
+    sqlx::migrate!().run(&pool).await.unwrap();
+    running_job(&pool).await;
+    let alice = user(&pool, "alice").await;
+    own(&pool, alice).await;
+    let reply = read_job_timing(&pool, Some(alice), &get(JOB))
+        .await
+        .unwrap();
+    assert_eq!(reply.summary, None);
+    assert!(reply.spans.is_empty() && reply.shell_commands.is_empty());
+    let zero = ReportTimingRequest {
+        summary: Some(TimingSummary::default()),
+        ..request(0, vec![], vec![])
+    };
+    store_timing(&pool, &lease_box(), &zero).await.unwrap();
+    let reply = read_job_timing(&pool, Some(alice), &get(JOB))
+        .await
+        .unwrap();
+    assert_eq!(reply.summary, Some(TimingSummary::default()));
+}
+
+#[sqlx::test]
+async fn unknown_and_foreign_jobs_get_the_same_not_found(pool: PgPool) {
+    sqlx::migrate!().run(&pool).await.unwrap();
+    running_job(&pool).await;
+    let alice = user(&pool, "alice").await;
+    let bob = user(&pool, "bob").await;
+    own(&pool, alice).await;
+    store_timing(&pool, &lease_box(), &request(0, vec![span(0)], vec![]))
+        .await
+        .unwrap();
+    let foreign = read_job_timing(&pool, Some(bob), &get(JOB))
+        .await
+        .unwrap_err();
+    let unknown = read_job_timing(&pool, Some(alice), &get("01JTIMINGSTORE00000000000Z"))
+        .await
+        .unwrap_err();
+    assert_eq!(foreign.code(), Code::NotFound);
+    assert_eq!(unknown.code(), foreign.code());
+    assert_eq!(unknown.message(), foreign.message());
+    assert!(!foreign.message().contains(JOB));
+}
+
+#[sqlx::test]
+async fn a_hostile_job_id_is_refused_before_any_query(pool: PgPool) {
+    sqlx::migrate!().run(&pool).await.unwrap();
+    pool.close().await;
+    let long = "A".repeat(4096);
+    let cases = [
+        ("empty", String::new()),
+        ("nul", "01JTIMINGSTORE0000000\x00000A".to_owned()),
+        ("cr", format!("{JOB}\r")),
+        ("crlf", format!("{JOB}\r\n")),
+        ("lf", format!("{JOB}\n")),
+        ("nel", format!("{JOB}\u{85}")),
+        ("line separator", format!("{JOB}\u{2028}")),
+        ("space", format!("{JOB} ")),
+        ("non-ascii", format!("{JOB}\u{e9}")),
+        ("over-long", long),
+    ];
+    for (label, id) in cases {
+        let err = read_job_timing(&pool, Some(1), &get(&id))
+            .await
+            .unwrap_err();
+        assert_eq!(err.code(), Code::InvalidArgument, "{label}");
+        assert!(!err.message().contains(JOB), "{label}");
+    }
+}
+
+#[sqlx::test]
+async fn a_stored_row_that_breaks_the_sum_fails_closed(pool: PgPool) {
+    sqlx::migrate!().run(&pool).await.unwrap();
+    running_job(&pool).await;
+    store_timing(&pool, &lease_box(), &request(0, vec![span(0)], vec![]))
+        .await
+        .unwrap();
+    sqlx::query("UPDATE job_timing SET wall_ms = wall_ms + 1")
+        .execute(&pool)
+        .await
+        .unwrap();
+    let err = read_job_timing(&pool, None, &get(JOB)).await.unwrap_err();
+    assert_eq!(err.code(), Code::Internal);
+    assert!(!err.message().contains("wall"));
+}
+
+#[sqlx::test]
+async fn a_report_at_the_caps_reads_back_whole(pool: PgPool) {
+    sqlx::migrate!().run(&pool).await.unwrap();
+    running_job(&pool).await;
+    let spans: Vec<TimingSpan> = (0..MAX_SPANS as u64).map(span).collect();
+    let commands: Vec<ShellCommand> = (0..MAX_SHELL_COMMANDS)
+        .map(|n| {
+            let mut c = command(&format!("c{n}"));
+            c.log = "x".repeat(MAX_SHELL_LOG_BYTES);
+            c.command = "y".repeat(MAX_COMMAND_BYTES);
+            c
+        })
+        .collect();
+    store_timing(&pool, &lease_box(), &request(0, spans, commands))
+        .await
+        .unwrap();
+    let reply = read_job_timing(&pool, None, &get(JOB)).await.unwrap();
+    assert_eq!(reply.spans.len(), MAX_SPANS);
+    assert_eq!(reply.shell_commands.len(), MAX_SHELL_COMMANDS);
+    assert_eq!(reply.shell_commands[0].log.len(), MAX_SHELL_LOG_BYTES);
+}
+
+#[sqlx::test]
+async fn printable_hostile_ids_are_inert_and_read_as_not_found(pool: PgPool) {
+    sqlx::migrate!().run(&pool).await.unwrap();
+    running_job(&pool).await;
+    let alice = user(&pool, "alice").await;
+    own(&pool, alice).await;
+    let unknown = read_job_timing(&pool, Some(alice), &get("01JTIMINGSTORE00000000000Z"))
+        .await
+        .unwrap_err();
+    let cases = [
+        format!("user@{JOB}"),
+        format!("{JOB}\\"),
+        "[::1]".to_owned(),
+        format!("{JOB}%00"),
+        format!("{JOB}'--"),
+        format!("{JOB}'OR'1'='1"),
+        "%".to_owned(),
+        "_".to_owned(),
+    ];
+    for id in cases {
+        let err = read_job_timing(&pool, Some(alice), &get(&id))
+            .await
+            .unwrap_err();
+        assert_eq!(err.code(), unknown.code(), "{id}");
+        assert_eq!(err.message(), unknown.message(), "{id}");
+    }
 }
