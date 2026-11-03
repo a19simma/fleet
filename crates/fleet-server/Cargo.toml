@@ -20,6 +20,7 @@ fleet-proto.workspace = true
 serde_json.workspace = true
 tokio.workspace = true
 tonic.workspace = true
+tonic-prost.workspace = true
 tower.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
@@ -37,7 +38,6 @@ sqlx = { version = "0.9.0", default-features = false, features = ["runtime-tokio
 argon2 = "0.5.3"
 
 [dev-dependencies]
-tonic-prost.workspace = true
 webauthn-authenticator-rs = { version = "=0.5.5", features = ["softpasskey"] }
 
 [lints]

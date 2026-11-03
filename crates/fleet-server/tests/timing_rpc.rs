@@ -1,6 +1,7 @@
 //! `ReportTiming` and `GetJobTiming` over a real tonic server on a loopback port. Each
 //! answers `PERMISSION_DENIED` for the other scope's token. `ReportTiming` refuses a report
-//! with no matching lease, and `GetJobTiming` is still `UNIMPLEMENTED`.
+//! with no matching lease. `GetJobTiming` reads the caller's own job, answers one `NOT_FOUND`
+//! for a foreign and an unknown job, and answers the absent state for a job with no report.
 //! The tests need a Postgres superuser URL in `DATABASE_URL` and live in their own binary
 //! because each one binds a socket.
 
@@ -9,11 +10,12 @@
 use std::net::SocketAddr;
 
 use fleet_proto::v1::fleet_jobs_client::FleetJobsClient;
+use fleet_proto::v1::fleet_jobs_server::FleetJobs;
 use fleet_proto::v1::fleet_worker_client::FleetWorkerClient;
 use fleet_proto::v1::{GetJobTimingRequest, ReportTimingRequest, TimingSummary};
-use fleet_server::auth::BearerAuth;
+use fleet_server::auth::{BearerAuth, Caller};
 use fleet_server::config::Token;
-use fleet_server::service::router;
+use fleet_server::service::{FleetService, router};
 use fleet_server::store::Store;
 use sqlx::PgPool;
 use tonic::metadata::MetadataValue;
@@ -92,13 +94,160 @@ async fn report_timing_validation_refuses_a_default_request(pool: PgPool) {
 }
 
 #[sqlx::test]
-async fn get_job_timing_is_unimplemented_for_the_client_token(pool: PgPool) {
-    let addr = start(pool).await;
+async fn get_job_timing_without_a_user_identity_is_refused_for_a_valid_job(pool: PgPool) {
+    let addr = start(pool.clone()).await;
+    running_job(&pool).await;
     let err = jobs(addr, as_client)
-        .get_job_timing(GetJobTimingRequest::default())
+        .get_job_timing(GetJobTimingRequest {
+            job_id: JOB.to_owned(),
+        })
         .await
         .unwrap_err();
-    assert_eq!(err.code(), Code::Unimplemented);
+    assert_eq!(err.code(), Code::PermissionDenied);
+    assert_eq!(err.message(), "job timing needs a user token");
+}
+
+#[sqlx::test]
+async fn an_over_cap_timing_reply_is_refused(pool: PgPool) {
+    let store = Store::new(pool.clone());
+    store.migrate().await.unwrap();
+    let alice = user(&pool, "alice").await;
+    owned_job(&pool, alice).await;
+    sqlx::query(
+        "INSERT INTO job_timing (job_id, wall_ms, api_wait_ms, tool_ms, shell_ms, idle_ms, \
+         overhead_ms) VALUES ($1, 5, 1, 1, 1, 1, 1)",
+    )
+    .bind(JOB)
+    .execute(&pool)
+    .await
+    .unwrap();
+    let request = |svc: FleetService| async move { read_as(&svc, alice, JOB).await };
+    let small = FleetService::new(store.clone()).with_timing_reply_cap(1);
+    let err = request(small).await.unwrap_err();
+    assert_eq!(err.code(), Code::Internal);
+    assert_eq!(err.message(), "job timing too large");
+    let fits = request(FleetService::new(store)).await.unwrap();
+    assert_eq!(fits.summary.unwrap().wall_ms, 5);
+}
+
+#[sqlx::test]
+async fn a_worst_case_list_jobs_reply_is_not_capped_to_the_timing_limit(pool: PgPool) {
+    let addr = start(pool.clone()).await;
+    let prompt = "p".repeat(64 * 1024);
+    let rows = fleet_server::service::MAX_JOB_TIMING_REPLY_BYTES / prompt.len() + 5;
+    for n in 0..rows {
+        sqlx::query(
+            "INSERT INTO jobs (job_id, prompt, repo, base_ref, branch, open_pr, state, attempt) \
+             VALUES ($1, $2, 'r', 'main', 'b', false, 'QUEUED', 0)",
+        )
+        .bind(format!("01JBIG{n:020}"))
+        .bind(&prompt)
+        .execute(&pool)
+        .await
+        .unwrap();
+    }
+    let reply = jobs(addr, as_client)
+        .max_decoding_message_size(64 * 1024 * 1024)
+        .list_jobs(fleet_proto::v1::ListJobsRequest {
+            limit: 200,
+            ..Default::default()
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(reply.jobs.len(), rows);
+    assert!(
+        tonic_prost::prost::Message::encoded_len(&reply)
+            > fleet_server::service::MAX_JOB_TIMING_REPLY_BYTES
+    );
+}
+
+fn as_user<T>(user_id: i64, message: T) -> Request<T> {
+    let mut request = Request::new(message);
+    request.extensions_mut().insert(Caller { user_id });
+    request
+}
+
+async fn user(pool: &PgPool, name: &str) -> i64 {
+    sqlx::query_scalar("INSERT INTO users (username) VALUES ($1) RETURNING id")
+        .bind(name)
+        .fetch_one(pool)
+        .await
+        .unwrap()
+}
+
+async fn owned_job(pool: &PgPool, owner: i64) {
+    running_job(pool).await;
+    sqlx::query("UPDATE jobs SET user_id = $1 WHERE job_id = $2")
+        .bind(owner)
+        .bind(JOB)
+        .execute(pool)
+        .await
+        .unwrap();
+}
+
+async fn read_as(
+    svc: &FleetService,
+    user_id: i64,
+    job_id: &str,
+) -> Result<fleet_proto::v1::GetJobTimingReply, Status> {
+    svc.get_job_timing(as_user(
+        user_id,
+        GetJobTimingRequest {
+            job_id: job_id.to_owned(),
+        },
+    ))
+    .await
+    .map(tonic::Response::into_inner)
+}
+
+#[sqlx::test]
+async fn the_owner_reads_rows_and_a_foreign_or_unknown_job_is_one_not_found(pool: PgPool) {
+    let store = Store::new(pool.clone());
+    store.migrate().await.unwrap();
+    let alice = user(&pool, "alice").await;
+    let bob = user(&pool, "bob").await;
+    owned_job(&pool, alice).await;
+    sqlx::query(
+        "INSERT INTO job_timing (job_id, wall_ms, api_wait_ms, tool_ms, shell_ms, idle_ms, \
+         overhead_ms) VALUES ($1, 5, 1, 1, 1, 1, 1)",
+    )
+    .bind(JOB)
+    .execute(&pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO job_timing_spans (job_id, seq, kind, start_ms, end_ms, name) \
+         VALUES ($1, 0, 'tool', 0, 1, 'Read')",
+    )
+    .bind(JOB)
+    .execute(&pool)
+    .await
+    .unwrap();
+    let svc = FleetService::new(store);
+    let own = read_as(&svc, alice, JOB).await.unwrap();
+    assert_eq!(own.summary.unwrap().wall_ms, 5);
+    assert_eq!(own.spans.len(), 1);
+    let foreign = read_as(&svc, bob, JOB).await.unwrap_err();
+    let unknown = read_as(&svc, alice, "01JTIMINGRPC0000000000000Z")
+        .await
+        .unwrap_err();
+    assert_eq!(foreign.code(), Code::NotFound);
+    assert_eq!(foreign.code(), unknown.code());
+    assert_eq!(foreign.message(), unknown.message());
+}
+
+#[sqlx::test]
+async fn a_job_with_no_report_reads_as_absent(pool: PgPool) {
+    let store = Store::new(pool.clone());
+    store.migrate().await.unwrap();
+    let alice = user(&pool, "alice").await;
+    owned_job(&pool, alice).await;
+    let reply = read_as(&FleetService::new(store), alice, JOB)
+        .await
+        .unwrap();
+    assert_eq!(reply.summary, None);
+    assert!(reply.spans.is_empty() && reply.shell_commands.is_empty());
 }
 
 #[sqlx::test]

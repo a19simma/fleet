@@ -230,7 +230,9 @@ mod tests {
                 .await
                 .map(|_| ()),
             "get_job_timing" => FleetJobsClient::with_interceptor(chan, move |r| header.apply(r))
-                .get_job_timing(GetJobTimingRequest::default())
+                .get_job_timing(GetJobTimingRequest {
+                    job_id: "01ARZ3NDEKTSV4RRFFQ69G5FAV".to_owned(),
+                })
                 .await
                 .map(|_| ()),
             "stats" => FleetJobsClient::with_interceptor(chan, move |r| header.apply(r))
@@ -273,6 +275,13 @@ mod tests {
                         "credentials need a user token",
                         "{name} on {service}"
                     );
+                } else if ok && service == "get_job_timing" {
+                    assert_eq!(code, Code::PermissionDenied, "{name} on {service}");
+                    assert_eq!(
+                        status.message(),
+                        "job timing needs a user token",
+                        "{name} on {service}"
+                    );
                 } else if ok {
                     assert!(scoped(code), "{name} on {service}: {code:?}");
                 } else {
@@ -306,10 +315,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn get_job_timing_takes_the_client_token() {
+    async fn get_job_timing_without_a_user_identity_is_refused_before_storage() {
         let addr = spawn_with(Some(CLIENT));
         let status = status_of(addr, "get_job_timing", Some(CLIENT)).await;
-        assert_eq!(status.code(), Code::Unimplemented);
+        assert_eq!(status.code(), Code::PermissionDenied);
+        assert_eq!(status.message(), "job timing needs a user token");
     }
 
     #[tokio::test]
