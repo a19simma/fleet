@@ -175,6 +175,54 @@ pub const MAX_COMMAND_BYTES: usize = 2048;
 /// 0022 checks each.
 pub const MAX_TIMING_NAME_BYTES: usize = 128;
 
+/// Longest shell command id in a live log chunk, in bytes. Migration 0025 checks it.
+pub const MAX_COMMAND_ID_BYTES: usize = MAX_TIMING_NAME_BYTES;
+
+/// Longest `bytes` of one live shell log chunk. Migration 0025 checks it.
+pub const MAX_SHELL_LOG_CHUNK_BYTES: usize = 4096;
+
+/// Most chunks stored per shell command. Migration 0025 checks `seq BETWEEN 0 AND
+/// MAX_SHELL_LOG_CHUNKS - 1`.
+pub const MAX_SHELL_LOG_CHUNKS: usize = 64;
+
+/// Whether `id` is a legal live log command id: 1 to [`MAX_COMMAND_ID_BYTES`] bytes of ASCII
+/// letters, digits and `_ . : -`.
+pub fn validate_shell_log_command_id(id: &str) -> bool {
+    (1..=MAX_COMMAND_ID_BYTES).contains(&id.len())
+        && id
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'.' | b':' | b'-'))
+}
+
+/// Whether `seq` is a legal live log chunk number: below [`MAX_SHELL_LOG_CHUNKS`].
+pub fn validate_shell_log_seq(seq: u32) -> bool {
+    usize::try_from(seq).is_ok_and(|n| n < MAX_SHELL_LOG_CHUNKS)
+}
+
+/// Whether `bytes` fits one chunk. An empty chunk is legal: it carries a status change alone.
+pub fn validate_shell_log_bytes(bytes: &[u8]) -> bool {
+    bytes.len() <= MAX_SHELL_LOG_CHUNK_BYTES
+}
+
+/// Reads a wire status, refusing `UNSPECIFIED` and any value this build does not know.
+pub fn validate_shell_log_status(raw: i32) -> Option<v1::ShellStatus> {
+    match v1::ShellStatus::try_from(raw).ok()? {
+        v1::ShellStatus::Unspecified => None,
+        known => Some(known),
+    }
+}
+
+/// The `job_shell_log_chunks.status` text of `status`, or `None` for `UNSPECIFIED`.
+pub fn shell_status_name(status: v1::ShellStatus) -> Option<&'static str> {
+    match status {
+        v1::ShellStatus::Unspecified => None,
+        v1::ShellStatus::Queued => Some("queued"),
+        v1::ShellStatus::Running => Some("running"),
+        v1::ShellStatus::Done => Some("done"),
+        v1::ShellStatus::Failed => Some("failed"),
+    }
+}
+
 /// Largest stored phase or queue duration of a job summary: seven days, in milliseconds.
 pub const MAX_PHASE_MS: u64 = 7 * 24 * 60 * 60 * 1000;
 
