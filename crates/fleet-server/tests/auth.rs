@@ -223,6 +223,7 @@ mod tests {
                 .report_timing(ReportTimingRequest {
                     job_id: "01ARZ3NDEKTSV4RRFFQ69G5FAV".to_owned(),
                     attempt: 1,
+                    r#box: format!("box-{}", 7),
                     ..ReportTimingRequest::default()
                 })
                 .await

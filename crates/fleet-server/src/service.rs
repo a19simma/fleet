@@ -38,6 +38,7 @@ use tower::layer::util::{Identity, Stack};
 
 use crate::auth::{BearerAuth, Caller};
 use crate::cred::CredentialService;
+use crate::jobs::validate_job_id;
 use crate::profiles::ProfileContent;
 use crate::store::{Store, StoreError};
 use crate::timing;
@@ -333,17 +334,20 @@ AND lease_expires_at > now()";
 /// this check and the locked write in [`timing::store_timing`], which re-checks the lease.
 ///
 /// # Errors
-/// `FAILED_PRECONDITION` when no running lease matches, `UNAVAILABLE` when the query fails.
+/// `FAILED_PRECONDITION` when the box or job id is malformed or no running lease matches,
+/// `UNAVAILABLE` when the query fails.
 async fn require_live_lease(
     pool: &sqlx::PgPool,
     request: &ReportTimingRequest,
 ) -> Result<(), Status> {
     let stale = || Status::failed_precondition("report does not match the running job");
     let attempt = i32::try_from(request.attempt).map_err(|_| stale())?;
+    let name = validate_box(&request.r#box).map_err(|_| stale())?;
+    validate_job_id(&request.job_id).map_err(|_| stale())?;
     sqlx::query(LIVE_LEASE)
         .bind(&request.job_id)
         .bind(attempt)
-        .bind(&request.r#box)
+        .bind(name.as_str())
         .fetch_optional(pool)
         .await
         .map_err(|err| {

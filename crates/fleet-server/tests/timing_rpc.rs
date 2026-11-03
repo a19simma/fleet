@@ -10,7 +10,7 @@ use std::net::SocketAddr;
 
 use fleet_proto::v1::fleet_jobs_client::FleetJobsClient;
 use fleet_proto::v1::fleet_worker_client::FleetWorkerClient;
-use fleet_proto::v1::{GetJobTimingRequest, ReportTimingRequest};
+use fleet_proto::v1::{GetJobTimingRequest, ReportTimingRequest, TimingSummary};
 use fleet_server::auth::BearerAuth;
 use fleet_server::config::Token;
 use fleet_server::service::router;
@@ -24,6 +24,8 @@ use tonic::{Code, Request, Status};
 
 const CLIENT: &str = "test-token-0123456789abcdef0123456789";
 const BOX: &str = "box-token-0123456789abcdef0123456789";
+const JOB: &str = "01JTIMINGRPC0000000000000A";
+const STALE_MESSAGE: &str = "report does not match the running job";
 
 type Interceptor = fn(Request<()>) -> Result<Request<()>, Status>;
 
@@ -119,4 +121,81 @@ async fn the_box_token_cannot_read_timing(pool: PgPool) {
         .await
         .unwrap_err();
     assert_eq!(err.code(), Code::PermissionDenied);
+}
+
+async fn running_job(pool: &PgPool) {
+    sqlx::query(
+        "INSERT INTO jobs (job_id, prompt, repo, base_ref, branch, open_pr, state, attempt, \
+         box, lease_expires_at) \
+         VALUES ($1, 't', 'r', 'main', 'b', false, 'RUNNING', 1, $2, now() + interval '1 hour')",
+    )
+    .bind(JOB)
+    .bind(holder())
+    .execute(pool)
+    .await
+    .unwrap();
+}
+
+fn holder() -> String {
+    format!("box-{}", 7)
+}
+
+fn report(job_id: &str, box_name: &str) -> ReportTimingRequest {
+    ReportTimingRequest {
+        job_id: job_id.to_owned(),
+        attempt: 1,
+        r#box: box_name.to_owned(),
+        summary: Some(TimingSummary::default()),
+        spans: Vec::new(),
+        shell_commands: Vec::new(),
+    }
+}
+
+async fn timing_rows(pool: &PgPool) -> i64 {
+    sqlx::query_scalar("SELECT count(*) FROM job_timing")
+        .fetch_one(pool)
+        .await
+        .unwrap()
+}
+
+#[sqlx::test]
+async fn a_malformed_box_or_job_id_gets_the_fixed_refusal_and_stores_nothing(pool: PgPool) {
+    running_job(&pool).await;
+    let addr = start(pool.clone()).await;
+    let long_box = "b".repeat(4096);
+    let cases = [
+        ("nul box", report(JOB, &format!("{}\0", holder()))),
+        ("empty box", report(JOB, "")),
+        ("over-long box", report(JOB, &long_box)),
+        ("cr box", report(JOB, &format!("{}\r", holder()))),
+        ("nel box", report(JOB, &format!("{}\u{85}", holder()))),
+        (
+            "line separator box",
+            report(JOB, &format!("{}\u{2028}", holder())),
+        ),
+        (
+            "nul job id",
+            report("01JTIMINGRPC00000000\x0000A", &holder()),
+        ),
+    ];
+    for (label, request) in cases {
+        let err = worker(addr, as_box)
+            .report_timing(request)
+            .await
+            .unwrap_err();
+        assert_eq!(err.code(), Code::FailedPrecondition, "{label}");
+        assert_eq!(err.message(), STALE_MESSAGE, "{label}");
+    }
+    assert_eq!(timing_rows(&pool).await, 0);
+}
+
+#[sqlx::test]
+async fn the_live_holder_still_persists_its_report(pool: PgPool) {
+    running_job(&pool).await;
+    let addr = start(pool.clone()).await;
+    worker(addr, as_box)
+        .report_timing(report(JOB, &holder()))
+        .await
+        .unwrap();
+    assert_eq!(timing_rows(&pool).await, 1);
 }
