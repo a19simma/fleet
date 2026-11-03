@@ -1,6 +1,6 @@
 # Profile tools and bundled mise
 
-Status: Proposed 2026-11-01. Built: the Profile `tools` field and v2 hash, the `FLEET_ALLOW_PROFILE_TOOLS` server gate, the `fleet-tool-install@.service` unit and the fleetd tool cache. No live run. Amends ADR-0034 (closed Profile field list) and ADR-0035 (hash covers tools). Builds on ADR-0038 and ADR-0031.
+Status: Proposed 2026-11-01. Built: the Profile `tools` field and v2 hash, the `FLEET_ALLOW_PROFILE_TOOLS` server gate, the `fleet-tool-install@.service` unit and the fleetd tool cache. No live run. Amends ADR-0034 (closed Profile field list) and ADR-0035 (hash covers tools). Builds on ADR-0038 and ADR-0031. Amended by ADR-0054 (the `FLEET_ALLOW_PROFILE_TOOLS` server gate becomes the per-user capability `profile:tools`).
 
 A Job sometimes needs a toolchain the Box image lacks. This ADR adds a `tools` field to the Profile and has fleetd install the tools with a bundled mise, without opening new egress or giving a repo control of the install.
 

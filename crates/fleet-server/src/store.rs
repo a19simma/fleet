@@ -274,6 +274,24 @@ WHERE j.state IN ('SUCCEEDED', 'FAILED', 'CANCELLED', 'LOST') \
 AND COALESCE(j.finished_at, j.created_at) < now() - make_interval(days => $1) \
 LIMIT $2 FOR UPDATE OF l SKIP LOCKED), \
 cleared AS (DELETE FROM job_ci_log c USING old_logs WHERE c.job_id = old_logs.job_id), \
+timing_old AS (\
+SELECT t.job_id FROM job_timing t JOIN jobs j ON j.job_id = t.job_id \
+WHERE j.state IN ('SUCCEEDED', 'FAILED', 'CANCELLED', 'LOST') \
+AND COALESCE(j.finished_at, j.created_at) < now() - make_interval(days => $1) \
+LIMIT $2 FOR UPDATE OF t SKIP LOCKED), \
+timing_cleared AS (DELETE FROM job_timing x USING timing_old WHERE x.job_id = timing_old.job_id), \
+spans_old AS (\
+SELECT p.job_id, p.seq FROM job_timing_spans p JOIN jobs j ON j.job_id = p.job_id \
+WHERE j.state IN ('SUCCEEDED', 'FAILED', 'CANCELLED', 'LOST') \
+AND COALESCE(j.finished_at, j.created_at) < now() - make_interval(days => $1) \
+LIMIT $2 FOR UPDATE OF p SKIP LOCKED), \
+spans_cleared AS (DELETE FROM job_timing_spans x USING spans_old WHERE x.job_id = spans_old.job_id AND x.seq = spans_old.seq), \
+shell_old AS (\
+SELECT m.job_id, m.seq FROM job_shell_commands m JOIN jobs j ON j.job_id = m.job_id \
+WHERE j.state IN ('SUCCEEDED', 'FAILED', 'CANCELLED', 'LOST') \
+AND COALESCE(j.finished_at, j.created_at) < now() - make_interval(days => $1) \
+LIMIT $2 FOR UPDATE OF m SKIP LOCKED), \
+shell_cleared AS (DELETE FROM job_shell_commands x USING shell_old WHERE x.job_id = shell_old.job_id AND x.seq = shell_old.seq), \
 doomed AS (\
 SELECT s.job_id FROM job_summary s JOIN jobs j ON j.job_id = s.job_id \
 WHERE j.state IN ('SUCCEEDED', 'FAILED', 'CANCELLED', 'LOST') \
@@ -1788,8 +1806,10 @@ impl Store {
     }
 
     /// Deletes up to `limit` summary rows by the same rule as [`Store::prune_events`]. The
-    /// same statement deletes up to `limit` CI failure logs of the same kind of job, so the
-    /// logs follow the retention of the telemetry rows. The count holds summary rows only.
+    /// same statement deletes up to `limit` rows of each of the CI failure log, timing,
+    /// timing span and shell command tables for the same kind of job, so they follow the
+    /// summary age. Jobs are never deleted, so no cascade removes them. The count holds
+    /// summary rows only.
     ///
     /// # Errors
     ///
