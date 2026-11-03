@@ -23,11 +23,13 @@ use fleet_proto::v1::{
     ListFleetRequest, ListJobsReply, ListJobsRequest, ListProfilesReply, ListProfilesRequest,
     Profile, ProfileVersion, PushEventsReply, PushEventsRequest, PutCredentialRequest, QueuedEvent,
     ReadJobEventsReply, ReadJobEventsRequest, ReadTranscriptReply, ReadTranscriptRequest,
-    Rejection, ReportJobReply, ReportJobRequest, ReportTimingReply, ReportTimingRequest,
-    ShareProfileRequest, SubmitBatchReply, SubmitBatchRequest, SubmitJobRequest,
+    Rejection, ReportJobReply, ReportJobRequest, ReportShellLogReply, ReportShellLogRequest,
+    ReportTimingReply, ReportTimingRequest, ShareProfileRequest, StreamShellLogChunk,
+    StreamShellLogRequest, SubmitBatchReply, SubmitBatchRequest, SubmitJobRequest,
     SubmitJudgeRequest, UnshareProfileRequest, VerifyCredentialReply, VerifyCredentialRequest,
 };
 use fleet_proto::{ConvertError, validate_box};
+use tonic::codegen::BoxStream;
 use tonic::service::Routes;
 use tonic::transport::Server;
 use tonic::transport::server::{Router, TcpIncoming};
@@ -431,6 +433,13 @@ impl FleetWorker for FleetService {
     ) -> Result<Response<ReportTimingReply>, Status> {
         timing::report_timing(request.get_ref()).map(Response::new)
     }
+
+    async fn report_shell_log(
+        &self,
+        request: Request<ReportShellLogRequest>,
+    ) -> Result<Response<ReportShellLogReply>, Status> {
+        timing::report_shell_log(request.get_ref()).map(Response::new)
+    }
 }
 
 #[tonic::async_trait]
@@ -716,6 +725,15 @@ impl FleetJobs for FleetService {
         request: Request<GetJobTimingRequest>,
     ) -> Result<Response<GetJobTimingReply>, Status> {
         timing::get_job_timing(request.get_ref()).map(Response::new)
+    }
+
+    type StreamShellLogStream = BoxStream<StreamShellLogChunk>;
+
+    async fn stream_shell_log(
+        &self,
+        request: Request<StreamShellLogRequest>,
+    ) -> Result<Response<Self::StreamShellLogStream>, Status> {
+        timing::stream_shell_log(request.get_ref()).map(Response::new)
     }
 }
 
