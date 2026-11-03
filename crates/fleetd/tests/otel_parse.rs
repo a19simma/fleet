@@ -526,3 +526,287 @@ fn error_text_never_echoes_input() {
     let err = one(attrs).expect_err("refused");
     assert!(!err.to_string().contains("SECRETVALUE"));
 }
+
+use fleet_core::timing::{Interval, Span, SpanKind, aggregate};
+use fleetd::otel_parse::{MAX_DECISIONS, MAX_SEEN_IDS, Observed, SpanMapper};
+
+#[expect(clippy::expect_used, reason = "test helper over literal bounds")]
+fn win(a: u64, b: u64) -> Interval {
+    Interval::new(a, b).expect("ordered")
+}
+
+fn span(kind: SpanKind, a: u64, b: u64) -> Span {
+    Span {
+        kind,
+        interval: win(a, b),
+    }
+}
+
+fn api(ts: u64, ms: u64) -> Observed {
+    Observed::new(
+        ts,
+        ClaudeEvent::ApiRequest(ApiRequest {
+            duration_ms: ms,
+            model: None,
+        }),
+    )
+}
+
+fn tool(ts: u64, ms: u64, id: &str, name: &str) -> Observed {
+    Observed::new(
+        ts,
+        ClaudeEvent::ToolResult(ToolResult {
+            tool_use_id: id.to_owned(),
+            tool_name: name.to_owned(),
+            duration_ms: ms,
+            success: true,
+            command: None,
+        }),
+    )
+}
+
+fn decision(ts: u64, id: &str, name: &str, text: Option<&str>) -> Observed {
+    Observed::new(
+        ts,
+        ClaudeEvent::ToolDecision(ToolDecision {
+            tool_use_id: id.to_owned(),
+            tool_name: name.to_owned(),
+            decision: text.map(str::to_owned),
+        }),
+    )
+}
+
+fn run(job: Interval, events: Vec<Observed>) -> Vec<Span> {
+    let mut m = SpanMapper::new(job);
+    events.into_iter().filter_map(|e| m.push(e)).collect()
+}
+
+#[test]
+fn api_request_is_an_api_wait_ending_at_the_event() {
+    assert_eq!(
+        run(win(0, 10_000), vec![api(5000, 1200)]),
+        vec![span(SpanKind::ApiWait, 3800, 5000)]
+    );
+}
+
+#[test]
+fn tool_result_is_tool_and_bash_is_shell() {
+    let got = run(
+        win(0, 10_000),
+        vec![tool(2000, 500, "a", "Read"), tool(4000, 500, "b", "Bash")],
+    );
+    assert_eq!(
+        got,
+        vec![
+            span(SpanKind::Tool, 1500, 2000),
+            span(SpanKind::Shell, 3500, 4000)
+        ]
+    );
+}
+
+#[test]
+fn only_the_exact_name_bash_is_shell() {
+    let got = run(
+        win(0, 10_000),
+        vec![tool(2000, 500, "a", "bash"), tool(4000, 500, "b", "Bash ")],
+    );
+    assert!(got.iter().all(|s| s.kind == SpanKind::Tool));
+}
+
+#[test]
+fn background_comes_from_the_structured_flag_only() {
+    let mut yes = tool(4000, 500, "a", "Bash");
+    yes.run_in_background = Some(true);
+    let mut no = tool(6000, 500, "b", "Bash");
+    no.run_in_background = Some(false);
+    let mut other = tool(8000, 500, "c", "Read");
+    other.run_in_background = Some(true);
+    let mut with_text = tool(9000, 500, "d", "Bash");
+    with_text.event = ClaudeEvent::ToolResult(ToolResult {
+        tool_use_id: "d".to_owned(),
+        tool_name: "Bash".to_owned(),
+        duration_ms: 500,
+        success: true,
+        command: Some("sleep 9 &".to_owned()),
+    });
+    let got = run(win(0, 10_000), vec![yes, no, other, with_text]);
+    let kinds: Vec<SpanKind> = got.iter().map(|s| s.kind).collect();
+    assert_eq!(
+        kinds,
+        vec![
+            SpanKind::BgShell,
+            SpanKind::Shell,
+            SpanKind::Tool,
+            SpanKind::Shell
+        ]
+    );
+}
+
+#[test]
+fn a_decision_alone_yields_no_span_and_a_result_alone_does() {
+    assert_eq!(
+        run(win(0, 10_000), vec![decision(1, "a", "Bash", None)]).len(),
+        0
+    );
+    assert_eq!(
+        run(win(0, 10_000), vec![tool(2000, 100, "a", "Bash")]).len(),
+        1
+    );
+}
+
+#[test]
+fn a_matching_decision_keeps_the_span() {
+    let got = run(
+        win(0, 10_000),
+        vec![
+            decision(1, "a", "Bash", Some("accept")),
+            tool(2000, 100, "a", "Bash"),
+        ],
+    );
+    assert_eq!(got, vec![span(SpanKind::Shell, 1900, 2000)]);
+}
+
+#[test]
+fn a_decision_naming_another_tool_or_rejecting_drops_the_result() {
+    for d in [
+        decision(1, "a", "Read", Some("accept")),
+        decision(1, "a", "Bash", Some("reject")),
+    ] {
+        let mut m = SpanMapper::new(win(0, 10_000));
+        assert!(m.push(d).is_none());
+        assert!(m.push(tool(2000, 100, "a", "Bash")).is_none());
+        assert_eq!(m.stats().contradicted, 1);
+    }
+}
+
+#[test]
+fn a_decision_joins_one_result_only() {
+    let mut m = SpanMapper::new(win(0, 10_000));
+    m.push(decision(1, "a", "Bash", Some("reject")));
+    assert!(m.push(tool(2000, 100, "a", "Bash")).is_none());
+    assert!(m.push(tool(3000, 100, "a", "Bash")).is_some());
+}
+
+#[test]
+fn the_decision_table_is_bounded() {
+    let mut m = SpanMapper::new(win(0, 10_000));
+    for n in 0..MAX_DECISIONS + 10 {
+        m.push(decision(1, &format!("id{n}"), "Bash", Some("reject")));
+    }
+    assert_eq!(m.stats().decisions_dropped, 10);
+    assert!(m.push(tool(2000, 100, "id0", "Bash")).is_none());
+    assert!(
+        m.push(tool(2000, 100, &format!("id{}", MAX_DECISIONS + 5), "Bash"))
+            .is_some()
+    );
+}
+
+#[test]
+fn duplicate_event_ids_are_dropped() {
+    let mut m = SpanMapper::new(win(0, 10_000));
+    assert!(m.push(api(5000, 100).with_id("e1")).is_some());
+    assert!(m.push(api(5000, 100).with_id("e1")).is_none());
+    assert!(m.push(api(5000, 100).with_id("e2")).is_some());
+    assert_eq!(m.stats().duplicates, 1);
+}
+
+#[test]
+fn the_id_set_stops_growing_at_its_cap_and_drops_new_ids() {
+    let mut m = SpanMapper::new(win(0, 10_000));
+    for n in 0..MAX_SEEN_IDS {
+        assert!(m.push(api(5000, 1).with_id(&format!("e{n}"))).is_some());
+    }
+    assert!(m.push(api(5000, 1).with_id("fresh")).is_none());
+    assert!(m.push(api(5000, 1).with_id("e0")).is_none());
+    assert_eq!(m.stats().ids_dropped, 1);
+    assert_eq!(m.stats().duplicates, 1);
+    assert!(m.push(api(5000, 1)).is_some());
+}
+
+#[test]
+fn spans_are_clamped_to_the_job_window() {
+    let job = win(1000, 5000);
+    let got = run(
+        job,
+        vec![
+            api(1500, 1000),
+            api(6000, 2000),
+            api(5000, 9000),
+            api(500, 100),
+            api(9000, 100),
+        ],
+    );
+    assert_eq!(
+        got,
+        vec![
+            span(SpanKind::ApiWait, 1000, 1500),
+            span(SpanKind::ApiWait, 4000, 5000),
+            span(SpanKind::ApiWait, 1000, 5000),
+        ]
+    );
+}
+
+#[test]
+fn hostile_durations_and_times_never_panic_or_reverse() {
+    let job = win(0, u64::MAX);
+    let mut m = SpanMapper::new(job);
+    for (ts, ms) in [
+        (0, 0),
+        (0, 5),
+        (5, u64::MAX),
+        (u64::MAX, u64::MAX),
+        (u64::MAX, 0),
+        (u64::MAX, 1),
+        (3, 2),
+        (1, 2),
+    ] {
+        if let Some(s) = m.push(api(ts, ms)) {
+            assert!(s.interval.start_ms() <= s.interval.end_ms());
+            assert!(!s.interval.is_empty());
+        }
+    }
+    assert_eq!(m.stats().empty, 3);
+}
+
+#[test]
+fn a_zero_duration_yields_no_span() {
+    assert_eq!(run(win(0, 10_000), vec![api(5000, 0)]).len(), 0);
+}
+
+#[test]
+fn non_monotonic_times_map_independently() {
+    let got = run(win(0, 10_000), vec![api(8000, 100), api(2000, 100)]);
+    assert_eq!(
+        got,
+        vec![
+            span(SpanKind::ApiWait, 7900, 8000),
+            span(SpanKind::ApiWait, 1900, 2000)
+        ]
+    );
+}
+
+#[test]
+fn overlapping_subagent_spans_stay_overlapping_for_core_to_merge() {
+    let job = win(0, 10_000);
+    let got = run(
+        job,
+        vec![tool(5000, 2000, "a", "Task"), tool(5500, 2000, "b", "Task")],
+    );
+    assert_eq!(
+        got,
+        vec![
+            span(SpanKind::Tool, 3000, 5000),
+            span(SpanKind::Tool, 3500, 5500)
+        ]
+    );
+    let s = aggregate(&got, job, job);
+    assert_eq!(s.tool_ms, 2500);
+}
+
+#[test]
+fn a_batch_past_the_cap_is_cut_and_counted() {
+    let mut m = SpanMapper::new(win(0, 10_000));
+    let batch: Vec<Observed> = (0..MAX_RECORDS + 3).map(|_| api(5000, 1)).collect();
+    assert_eq!(m.push_all(batch).len(), MAX_RECORDS);
+    assert_eq!(m.stats().batch_cut, 3);
+}
