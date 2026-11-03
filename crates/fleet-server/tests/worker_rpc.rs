@@ -9,7 +9,8 @@ use std::time::Duration;
 
 use fleet_proto::v1::fleet_worker_client::FleetWorkerClient;
 use fleet_proto::v1::{
-    ClaimJobRequest, JobState, ReportJobRequest, SubmitJobRequest, TranscriptChunk,
+    ClaimJobRequest, JobState, ReportJobRequest, ReportTimingRequest, SubmitJobRequest,
+    TranscriptChunk,
 };
 use fleet_server::auth::BearerAuth;
 use fleet_server::config::Token;
@@ -311,4 +312,67 @@ async fn database_failure_is_unavailable_with_a_fixed_message(pool: PgPool) {
         .unwrap_err();
     assert_eq!(status.code(), Code::Unavailable);
     assert_eq!(status.message(), "storage unavailable");
+}
+
+fn timing(job_id: &str, attempt: u32) -> ReportTimingRequest {
+    ReportTimingRequest {
+        job_id: job_id.to_owned(),
+        attempt,
+        r#box: box_name(1),
+        ..ReportTimingRequest::default()
+    }
+}
+
+#[sqlx::test]
+async fn report_timing_needs_a_live_lease(pool: PgPool) {
+    let store = store(pool.clone()).await;
+    let mut worker = spawn(&store);
+    submit(&store, "k1").await;
+    let job = worker
+        .claim_job(claim(&box_name(1)))
+        .await
+        .unwrap()
+        .into_inner()
+        .job
+        .unwrap();
+
+    for (job_id, attempt) in [
+        ("missing-job", job.attempt),
+        (job.job_id.as_str(), job.attempt + 1),
+        (job.job_id.as_str(), u32::MAX),
+    ] {
+        let err = worker
+            .report_timing(timing(job_id, attempt))
+            .await
+            .unwrap_err();
+        assert_eq!(err.code(), Code::FailedPrecondition, "{job_id} {attempt}");
+    }
+
+    let live = worker
+        .report_timing(timing(&job.job_id, job.attempt))
+        .await
+        .unwrap_err();
+    assert_eq!(live.code(), Code::Unimplemented);
+
+    sqlx::query("UPDATE jobs SET lease_expires_at = now() - interval '1 second'")
+        .execute(&pool)
+        .await
+        .unwrap();
+    let expired = worker
+        .report_timing(timing(&job.job_id, job.attempt))
+        .await
+        .unwrap_err();
+    assert_eq!(expired.code(), Code::FailedPrecondition);
+
+    sqlx::query(
+        "UPDATE jobs SET state = 'SUCCEEDED', lease_expires_at = now() + interval '1 hour'",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+    let ended = worker
+        .report_timing(timing(&job.job_id, job.attempt))
+        .await
+        .unwrap_err();
+    assert_eq!(ended.code(), Code::FailedPrecondition);
 }
