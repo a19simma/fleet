@@ -124,8 +124,9 @@ async fn the_box_token_cannot_read_timing(pool: PgPool) {
 async fn running_job(pool: &PgPool) {
     sqlx::query(
         "INSERT INTO jobs (job_id, prompt, repo, base_ref, branch, open_pr, state, attempt, \
-         box, lease_expires_at) \
-         VALUES ($1, 't', 'r', 'main', 'b', false, 'RUNNING', 1, $2, now() + interval '1 hour')",
+         box, lease_expires_at, claimed_at) \
+         VALUES ($1, 't', 'r', 'main', 'b', false, 'RUNNING', 1, $2, now() + interval '1 hour', \
+         now() - interval '1 minute')",
     )
     .bind(JOB)
     .bind(holder())

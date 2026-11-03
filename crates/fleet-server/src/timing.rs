@@ -7,6 +7,7 @@ use fleet_core::timing::Summary;
 use fleet_proto::v1::{
     GetJobTimingReply, GetJobTimingRequest, ReportShellLogReply, ReportShellLogRequest,
     ReportTimingReply, ReportTimingRequest, StreamShellLogChunk, StreamShellLogRequest,
+    TimingSummary,
 };
 use fleet_proto::{
     ShellCommandRecord, TimingSpanRecord, shell_commands_from_wire, shell_status_name,
@@ -33,13 +34,28 @@ pub const STREAM_POLL: Duration = Duration::from_millis(250);
 /// `from_seq`.
 pub const STREAM_MAX_WAIT: Duration = Duration::from_secs(600);
 
+/// Clock skew a report may carry: the end of the reported wall window may lie this far past
+/// the server clock, and a span may end this far past the reported wall time.
+pub const WINDOW_TOLERANCE_MS: u64 = 30_000;
+
+/// Refusal when the five parts do not add up to `wall_ms`.
+pub const REASON_PARTS_SUM: &str = "timing parts do not sum to wall time";
+
+/// Refusal when a span lies outside the job window.
+pub const REASON_SPAN_OUTSIDE: &str = "timing span lies outside the job window";
+
+/// Refusal when the reported wall window ends after the server clock.
+pub const REASON_WINDOW_AHEAD: &str = "timing wall time runs past the present";
+
 const STREAM_BATCH: i64 = 64;
 const STREAM_QUEUE: usize = 16;
 
 const NOT_IMPLEMENTED: &str = "job timing is not implemented";
 
 const LOCK_REPORTED_JOB: &str = "\
-SELECT 1 FROM jobs WHERE job_id = $1 AND attempt = $2 AND state = 'RUNNING' \
+SELECT (EXTRACT(EPOCH FROM claimed_at) * 1000)::bigint, \
+(EXTRACT(EPOCH FROM now()) * 1000)::bigint \
+FROM jobs WHERE job_id = $1 AND attempt = $2 AND state = 'RUNNING' \
 AND box = $3 AND lease_expires_at > now() FOR UPDATE";
 
 const UPSERT_TIMING: &str = "\
@@ -77,6 +93,49 @@ fn index(position: usize) -> Result<i32, Status> {
     i32::try_from(position).map_err(|_| Status::invalid_argument("too many timing rows"))
 }
 
+fn parts_sum_to_wall(wire: &TimingSummary) -> bool {
+    [
+        wire.api_wait_ms,
+        wire.tool_ms,
+        wire.shell_ms,
+        wire.idle_ms,
+        wire.overhead_ms,
+    ]
+    .into_iter()
+    .try_fold(0_u64, u64::checked_add)
+        == Some(wire.wall_ms)
+}
+
+/// Refuses a report whose wall window runs past the server clock or whose spans leave the
+/// job window.
+///
+/// Span times are job-relative milliseconds: the job window is `0..wall_ms` and a span may
+/// end at most [`WINDOW_TOLERANCE_MS`] past `wall_ms`. The claim time and the server clock,
+/// both epoch milliseconds, only bound the wall time: the window from the claim time to
+/// `wall_ms` after it must end no later than now plus the tolerance.
+fn check_window(
+    wall_ms: u64,
+    spans: &[TimingSpanRecord],
+    claimed_ms: u64,
+    now_ms: u64,
+) -> Result<(), Status> {
+    let refuse = |reason: &'static str| Status::invalid_argument(reason);
+    let job_end = claimed_ms
+        .checked_add(wall_ms)
+        .ok_or_else(|| refuse(REASON_WINDOW_AHEAD))?;
+    if job_end > now_ms.saturating_add(WINDOW_TOLERANCE_MS) {
+        return Err(refuse(REASON_WINDOW_AHEAD));
+    }
+    let latest = wall_ms.saturating_add(WINDOW_TOLERANCE_MS);
+    if spans
+        .iter()
+        .any(|record| record.span.interval.end_ms() > latest)
+    {
+        return Err(refuse(REASON_SPAN_OUTSIDE));
+    }
+    Ok(())
+}
+
 fn kind_name(record: &TimingSpanRecord) -> Result<&'static str, Status> {
     use fleet_core::timing::SpanKind;
     match record.span.kind {
@@ -96,11 +155,20 @@ fn kind_name(record: &TimingSpanRecord) -> Result<&'static str, Status> {
 /// whole transaction, so two reports for one job run one after the other and the later one
 /// replaces the summary, every span and every shell command of the earlier one. The wire
 /// converters in `fleet-proto` own the validation: caps of `MAX_SPANS` and
-/// `MAX_SHELL_COMMANDS`, a log of at most `MAX_SHELL_LOG_BYTES` per command, text rules,
-/// and a `wall_ms` equal to the sum of the parts.
+/// `MAX_SHELL_COMMANDS`, a log of at most `MAX_SHELL_LOG_BYTES` per command and text rules.
+///
+/// The lease is checked first: a box that does not hold it gets `FAILED_PRECONDITION`
+/// whatever its body holds. The server then does not trust the box's arithmetic. Before any
+/// insert it checks, with checked integer addition, that the parts sum to `wall_ms`
+/// ([`REASON_PARTS_SUM`]); that the window from the claim time to `wall_ms` after it ends no
+/// later than now plus [`WINDOW_TOLERANCE_MS`] ([`REASON_WINDOW_AHEAD`]); and that every span,
+/// in job-relative milliseconds, ends within [`WINDOW_TOLERANCE_MS`] of `wall_ms`
+/// ([`REASON_SPAN_OUTSIDE`]). The wire has no agent window, so the server does not recompute
+/// the summary from the spans.
 ///
 /// # Errors
-/// `INVALID_ARGUMENT` for a missing summary or any value a converter refuses,
+/// `INVALID_ARGUMENT` for a missing summary, a fixed reason above or any value a converter
+/// refuses,
 /// `FAILED_PRECONDITION` when no running lease matches the box, job and attempt, and
 /// `UNAVAILABLE` when a statement fails.
 pub async fn store_timing(
@@ -108,18 +176,10 @@ pub async fn store_timing(
     box_name: &BoxName,
     request: &ReportTimingRequest,
 ) -> Result<ReportTimingReply, Status> {
-    let invalid = |err: fleet_proto::TimingConvertError| Status::invalid_argument(err.to_string());
-    let summary = request
-        .summary
-        .ok_or_else(|| Status::invalid_argument("timing summary is missing"))?;
-    let wall = summary.wall_ms;
-    let summary = Summary::try_from(summary).map_err(invalid)?;
-    let spans = spans_from_wire(request.spans.clone()).map_err(invalid)?;
-    let commands = shell_commands_from_wire(request.shell_commands.clone()).map_err(invalid)?;
     let stale = || Status::failed_precondition("report does not match the running job");
     let attempt = i32::try_from(request.attempt).map_err(|_| stale())?;
     let mut tx = pool.begin().await.map_err(|e| storage_unavailable(&e))?;
-    sqlx::query(LOCK_REPORTED_JOB)
+    let locked = sqlx::query(LOCK_REPORTED_JOB)
         .bind(&request.job_id)
         .bind(attempt)
         .bind(box_name.as_str())
@@ -127,6 +187,27 @@ pub async fn store_timing(
         .await
         .map_err(|e| storage_unavailable(&e))?
         .ok_or_else(stale)?;
+    let claimed = locked
+        .try_get::<Option<i64>, _>(0)
+        .map_err(|e| storage_unavailable(&e))?
+        .and_then(|ms| u64::try_from(ms).ok())
+        .ok_or_else(stale)?;
+    let now = locked
+        .try_get::<i64, _>(1)
+        .map_err(|e| storage_unavailable(&e))?;
+    let now = u64::try_from(now).map_err(|_| stale())?;
+    let invalid = |err: fleet_proto::TimingConvertError| Status::invalid_argument(err.to_string());
+    let summary = request
+        .summary
+        .ok_or_else(|| Status::invalid_argument("timing summary is missing"))?;
+    if !parts_sum_to_wall(&summary) {
+        return Err(Status::invalid_argument(REASON_PARTS_SUM));
+    }
+    let wall = summary.wall_ms;
+    let summary = Summary::try_from(summary).map_err(invalid)?;
+    let spans = spans_from_wire(request.spans.clone()).map_err(invalid)?;
+    let commands = shell_commands_from_wire(request.shell_commands.clone()).map_err(invalid)?;
+    check_window(wall, &spans, claimed, now)?;
     sqlx::query(UPSERT_TIMING)
         .bind(&request.job_id)
         .bind(stored(wall)?)

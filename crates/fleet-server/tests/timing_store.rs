@@ -7,13 +7,16 @@
 use std::time::Duration;
 
 use fleet_core::BoxName;
+use fleet_core::timing::{Interval, Span, SpanKind, aggregate};
 use fleet_proto::v1::{
     ReportTimingRequest, ShellCommand, TimingSpan, TimingSpanKind, TimingSummary,
 };
 use fleet_proto::{
     MAX_COMMAND_BYTES, MAX_SHELL_COMMANDS, MAX_SHELL_LOG_BYTES, MAX_SPANS, MAX_TIMING_NAME_BYTES,
 };
-use fleet_server::timing::store_timing;
+use fleet_server::timing::{
+    REASON_PARTS_SUM, REASON_SPAN_OUTSIDE, REASON_WINDOW_AHEAD, WINDOW_TOLERANCE_MS, store_timing,
+};
 use sqlx::{PgPool, Row};
 use tonic::Code;
 
@@ -23,12 +26,15 @@ fn lease_box() -> BoxName {
 
 const JOB: &str = "01JTIMINGSTORE00000000000A";
 
+const CLAIMED_MS: u64 = 1_704_067_200_000;
+const WALL_BASE: u64 = 10_000;
+
 async fn running_job(pool: &PgPool) {
     sqlx::query(
         "INSERT INTO jobs (job_id, prompt, repo, base_ref, branch, open_pr, state, attempt, \
-         box, lease_expires_at) \
+         box, lease_expires_at, claimed_at) \
          VALUES ($1, 't', 'r', 'main', 'b', false, 'RUNNING', 1, $2, \
-         now() + interval '1 hour')",
+         now() + interval '1 hour', to_timestamp(1704067200))",
     )
     .bind(JOB)
     .bind(lease_box().as_str())
@@ -37,14 +43,33 @@ async fn running_job(pool: &PgPool) {
     .unwrap();
 }
 
-fn summary(api: u64) -> TimingSummary {
+fn core_kind(kind: i32) -> SpanKind {
+    match TimingSpanKind::try_from(kind).unwrap() {
+        TimingSpanKind::Api => SpanKind::ApiWait,
+        TimingSpanKind::Tool => SpanKind::Tool,
+        TimingSpanKind::Shell => SpanKind::Shell,
+        TimingSpanKind::BgShell => SpanKind::BgShell,
+        TimingSpanKind::Unspecified => unreachable!(),
+    }
+}
+
+fn summary(wall: u64, spans: &[TimingSpan]) -> TimingSummary {
+    let core: Vec<Span> = spans
+        .iter()
+        .map(|s| Span {
+            kind: core_kind(s.kind),
+            interval: Interval::new(s.start_ms, s.end_ms).unwrap(),
+        })
+        .collect();
+    let job = Interval::new(0, wall).unwrap();
+    let parts = aggregate(&core, job, job);
     TimingSummary {
-        wall_ms: api + 10,
-        api_wait_ms: api,
-        tool_ms: 1,
-        shell_ms: 2,
-        idle_ms: 3,
-        overhead_ms: 4,
+        wall_ms: wall,
+        api_wait_ms: parts.api_wait_ms,
+        tool_ms: parts.tool_ms,
+        shell_ms: parts.shell_ms,
+        idle_ms: parts.idle_ms,
+        overhead_ms: parts.overhead_ms,
     }
 }
 
@@ -73,12 +98,12 @@ fn command(id: &str) -> ShellCommand {
     }
 }
 
-fn request(api: u64, spans: Vec<TimingSpan>, commands: Vec<ShellCommand>) -> ReportTimingRequest {
+fn request(extra: u64, spans: Vec<TimingSpan>, commands: Vec<ShellCommand>) -> ReportTimingRequest {
     ReportTimingRequest {
         job_id: JOB.to_owned(),
         attempt: 1,
         r#box: "ignored".to_owned(),
-        summary: Some(summary(api)),
+        summary: Some(summary(WALL_BASE + extra, &spans)),
         spans,
         shell_commands: commands,
     }
@@ -125,7 +150,7 @@ async fn a_report_stores_the_summary_spans_and_commands(pool: PgPool) {
     .await
     .unwrap();
     let parts: Vec<i64> = (0..6).map(|i| timing.get(i)).collect();
-    assert_eq!(parts, [110, 100, 1, 2, 3, 4]);
+    assert_eq!(parts, [10_100, 0, 1, 1, 10_098, 0]);
     let rows: Vec<(i32, String, i64, i64, String, Option<String>)> = sqlx::query_as(
         "SELECT seq, kind, start_ms, end_ms, name, tool_use_id FROM job_timing_spans ORDER BY seq",
     )
@@ -184,11 +209,11 @@ async fn a_second_report_replaces_the_first(pool: PgPool) {
     .await
     .unwrap();
     assert_eq!(counts(&pool).await, (1, 1, 1));
-    let api: i64 = sqlx::query_scalar("SELECT api_wait_ms FROM job_timing")
+    let wall: i64 = sqlx::query_scalar("SELECT wall_ms FROM job_timing")
         .fetch_one(&pool)
         .await
         .unwrap();
-    assert_eq!(api, 7);
+    assert_eq!(wall, 10_007);
     let start: i64 = sqlx::query_scalar("SELECT start_ms FROM job_timing_spans")
         .fetch_one(&pool)
         .await
@@ -221,11 +246,11 @@ async fn a_refused_report_leaves_the_first_in_place(pool: PgPool) {
     let err = store_timing(&pool, &lease_box(), &bad).await.unwrap_err();
     assert_eq!(err.code(), Code::InvalidArgument);
     assert_eq!(counts(&pool).await, (1, 1, 1));
-    let api: i64 = sqlx::query_scalar("SELECT api_wait_ms FROM job_timing")
+    let wall: i64 = sqlx::query_scalar("SELECT wall_ms FROM job_timing")
         .fetch_one(&pool)
         .await
         .unwrap();
-    assert_eq!(api, 100);
+    assert_eq!(wall, 10_100);
 }
 
 #[sqlx::test]
@@ -317,11 +342,11 @@ async fn the_log_byte_cap_holds_just_under_and_just_over(pool: PgPool) {
         .unwrap_err();
     assert_eq!(err.code(), Code::InvalidArgument);
     assert_eq!(err.message(), "timing field log is too long");
-    let api: i64 = sqlx::query_scalar("SELECT api_wait_ms FROM job_timing")
+    let wall: i64 = sqlx::query_scalar("SELECT wall_ms FROM job_timing")
         .fetch_one(&pool)
         .await
         .unwrap();
-    assert_eq!(api, 1);
+    assert_eq!(wall, 10_001);
 }
 
 #[sqlx::test]
@@ -424,6 +449,42 @@ async fn a_report_from_another_box_is_refused_and_stores_nothing(pool: PgPool) {
     let err = store_timing(&pool, &other, &wrong).await.unwrap_err();
     assert_eq!(err.code(), Code::FailedPrecondition);
     assert_eq!(err.message(), "report does not match the running job");
+    assert_eq!(counts(&pool).await, (0, 0, 0));
+}
+
+#[sqlx::test]
+async fn a_non_holder_with_a_bad_body_gets_the_stale_refusal(pool: PgPool) {
+    sqlx::migrate!().run(&pool).await.unwrap();
+    running_job(&pool).await;
+    let other = BoxName::new(&format!("box-{}", 2)).unwrap();
+    let mut no_summary = request(1, vec![], vec![]);
+    no_summary.summary = None;
+    let mut parts = request(1, vec![], vec![]);
+    parts.summary.as_mut().unwrap().wall_ms += 1;
+    let mut outside = request(1, vec![tool_span(CLAIMED_MS, CLAIMED_MS + 1)], vec![]);
+    outside.summary = request(1, vec![], vec![]).summary;
+    let mut kind = request(1, vec![span(0)], vec![]);
+    kind.spans[0].kind = 0;
+    let mut reversed = request(1, vec![span(5)], vec![]);
+    reversed.spans[0].end_ms = 4;
+    let mut big = request(1, vec![], vec![command("c")]);
+    big.shell_commands[0].duration_ms = u64::MAX;
+    for (label, bad) in [
+        ("no_summary", no_summary),
+        ("parts", parts),
+        ("outside", outside),
+        ("kind", kind),
+        ("reversed", reversed),
+        ("big", big),
+    ] {
+        let err = store_timing(&pool, &other, &bad).await.unwrap_err();
+        assert_eq!(err.code(), Code::FailedPrecondition, "{label}");
+        assert_eq!(
+            err.message(),
+            "report does not match the running job",
+            "{label}"
+        );
+    }
     assert_eq!(counts(&pool).await, (0, 0, 0));
 }
 
@@ -531,10 +592,160 @@ async fn concurrent_reports_leave_one_whole_report(pool: PgPool) {
     for task in tasks {
         task.await.unwrap().unwrap();
     }
-    let api: i64 = sqlx::query_scalar("SELECT api_wait_ms FROM job_timing")
+    let wall: i64 = sqlx::query_scalar("SELECT wall_ms FROM job_timing")
         .fetch_one(&pool)
         .await
         .unwrap();
+    let n = wall - i64::try_from(WALL_BASE).unwrap();
     let (_, spans, commands) = counts(&pool).await;
-    assert_eq!((spans, commands), (api, api));
+    assert_eq!((spans, commands), (n, n));
+}
+
+async fn db_now_ms(pool: &PgPool) -> u64 {
+    let ms: i64 =
+        sqlx::query_scalar("SELECT (EXTRACT(EPOCH FROM clock_timestamp()) * 1000)::bigint")
+            .fetch_one(pool)
+            .await
+            .unwrap();
+    u64::try_from(ms).unwrap()
+}
+
+fn tool_span(start_ms: u64, end_ms: u64) -> TimingSpan {
+    TimingSpan {
+        start_ms,
+        end_ms,
+        ..span(0)
+    }
+}
+
+async fn refused(pool: &PgPool, request: &ReportTimingRequest, reason: &str, label: &str) {
+    let err = store_timing(pool, &lease_box(), request).await.unwrap_err();
+    assert_eq!(err.code(), Code::InvalidArgument, "{label}");
+    assert_eq!(err.message(), reason, "{label}");
+    assert_eq!(counts(pool).await, (0, 0, 0), "{label}");
+}
+
+#[sqlx::test]
+async fn parts_that_do_not_sum_to_wall_are_refused_with_the_exact_reason(pool: PgPool) {
+    sqlx::migrate!().run(&pool).await.unwrap();
+    running_job(&pool).await;
+    let good = request(0, vec![span(0)], vec![]);
+    let mut short = good.clone();
+    short.summary.as_mut().unwrap().idle_ms -= 1;
+    let mut long = good.clone();
+    long.summary.as_mut().unwrap().wall_ms += 1;
+    let mut overflow = good.clone();
+    {
+        let parts = overflow.summary.as_mut().unwrap();
+        parts.api_wait_ms = u64::MAX;
+        parts.shell_ms = u64::MAX;
+    }
+    for (label, r) in [("short", short), ("long", long), ("overflow", overflow)] {
+        refused(&pool, &r, REASON_PARTS_SUM, label).await;
+    }
+    store_timing(&pool, &lease_box(), &good).await.unwrap();
+    assert_eq!(counts(&pool).await, (1, 1, 0));
+}
+
+#[sqlx::test]
+async fn spans_outside_the_job_window_are_refused_with_the_exact_reason(pool: PgPool) {
+    sqlx::migrate!().run(&pool).await.unwrap();
+    running_job(&pool).await;
+    let limit = WALL_BASE + WINDOW_TOLERANCE_MS;
+    let past_end = tool_span(limit - 5, limit + 1);
+    let far_past_end = tool_span(limit + 1, limit + 10 * WINDOW_TOLERANCE_MS);
+    let epoch_based = tool_span(CLAIMED_MS, CLAIMED_MS + 10);
+    for (label, bad) in [
+        ("past_end", past_end),
+        ("far_past_end", far_past_end),
+        ("epoch_based", epoch_based),
+    ] {
+        refused(
+            &pool,
+            &request(0, vec![span(0), bad], vec![]),
+            REASON_SPAN_OUTSIDE,
+            label,
+        )
+        .await;
+    }
+    let edge = tool_span(limit - 10, limit);
+    store_timing(&pool, &lease_box(), &request(0, vec![edge], vec![]))
+        .await
+        .unwrap();
+    assert_eq!(counts(&pool).await, (1, 1, 0));
+}
+
+#[sqlx::test]
+async fn a_gathered_request_shaped_report_is_accepted(pool: PgPool) {
+    sqlx::migrate!().run(&pool).await.unwrap();
+    running_job(&pool).await;
+    let wall = 60_000;
+    let agent = Interval::new(4_000, 55_000).unwrap();
+    let spans = vec![
+        tool_span(4_500, 9_000),
+        TimingSpan {
+            kind: TimingSpanKind::Shell as i32,
+            ..tool_span(10_000, 20_000)
+        },
+    ];
+    let core: Vec<Span> = spans
+        .iter()
+        .map(|s| Span {
+            kind: core_kind(s.kind),
+            interval: Interval::new(s.start_ms, s.end_ms).unwrap(),
+        })
+        .collect();
+    let parts = aggregate(&core, Interval::new(0, wall).unwrap(), agent);
+    assert_eq!(parts.overhead_ms, 9_000);
+    let mut report = request(0, spans, vec![]);
+    report.summary = Some(TimingSummary {
+        wall_ms: wall,
+        api_wait_ms: parts.api_wait_ms,
+        tool_ms: parts.tool_ms,
+        shell_ms: parts.shell_ms,
+        idle_ms: parts.idle_ms,
+        overhead_ms: parts.overhead_ms,
+    });
+    store_timing(&pool, &lease_box(), &report).await.unwrap();
+    assert_eq!(counts(&pool).await, (1, 2, 0));
+}
+
+#[sqlx::test]
+async fn a_wall_that_runs_past_now_is_refused_with_the_exact_reason(pool: PgPool) {
+    sqlx::migrate!().run(&pool).await.unwrap();
+    running_job(&pool).await;
+    let now = db_now_ms(&pool).await;
+    let far = 20 * WINDOW_TOLERANCE_MS + now - CLAIMED_MS;
+    let mut ahead = request(0, vec![], vec![]);
+    *ahead.summary.as_mut().unwrap() = TimingSummary {
+        wall_ms: far,
+        overhead_ms: far,
+        ..TimingSummary::default()
+    };
+    refused(&pool, &ahead, REASON_WINDOW_AHEAD, "ahead").await;
+    let mut inside = ahead.clone();
+    let near = now - CLAIMED_MS;
+    *inside.summary.as_mut().unwrap() = TimingSummary {
+        wall_ms: near,
+        overhead_ms: near,
+        ..TimingSummary::default()
+    };
+    store_timing(&pool, &lease_box(), &inside).await.unwrap();
+    assert_eq!(counts(&pool).await, (1, 0, 0));
+}
+
+#[sqlx::test]
+async fn a_running_job_with_no_claim_time_is_refused_as_stale(pool: PgPool) {
+    sqlx::migrate!().run(&pool).await.unwrap();
+    running_job(&pool).await;
+    sqlx::query("UPDATE jobs SET claimed_at = NULL WHERE job_id = $1")
+        .bind(JOB)
+        .execute(&pool)
+        .await
+        .unwrap();
+    let err = store_timing(&pool, &lease_box(), &request(0, vec![span(0)], vec![]))
+        .await
+        .unwrap_err();
+    assert_eq!(err.code(), Code::FailedPrecondition);
+    assert_eq!(counts(&pool).await, (0, 0, 0));
 }
