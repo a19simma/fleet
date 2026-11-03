@@ -20,6 +20,7 @@ service FleetJobs {
   rpc ReadJobEvents(ReadJobEventsRequest) returns (ReadJobEventsReply);
   rpc GetStats(GetStatsRequest) returns (GetStatsReply);
   rpc GetJobTiming(GetJobTimingRequest) returns (GetJobTimingReply);
+  rpc StreamShellLog(StreamShellLogRequest) returns (stream StreamShellLogChunk);
 }
 
 service FleetProfiles {
@@ -65,6 +66,7 @@ service FleetWorker {
   rpc GetJobTranscript(GetJobTranscriptRequest) returns (GetJobTranscriptReply);
   rpc GetJobCredentials(GetJobCredentialsRequest) returns (GetJobCredentialsReply);
   rpc ReportTiming(ReportTimingRequest) returns (ReportTimingReply);
+  rpc ReportShellLog(ReportShellLogRequest) returns (ReportShellLogReply);
 }
 
 message PutCredentialRequest {
@@ -570,6 +572,48 @@ message GetJobTimingReply {
   optional TimingSummary summary = 1;
   repeated TimingSpan spans = 2;
   repeated ShellCommand shell_commands = 3;
+}
+
+// Where a shell command is in its life. Names match the job_shell_log_chunks.status CHECK,
+// lowercased without the prefix.
+enum ShellStatus {
+  SHELL_STATUS_UNSPECIFIED = 0;
+  SHELL_STATUS_QUEUED = 1;
+  SHELL_STATUS_RUNNING = 2;
+  SHELL_STATUS_DONE = 3;
+  SHELL_STATUS_FAILED = 4;
+}
+
+// One live chunk of a shell command's output, already redacted by the box. command_id is the
+// ShellCommand id: 1 to MAX_COMMAND_ID_BYTES bytes of [A-Za-z0-9_.:-]. seq counts chunks of
+// one command from 0 and stays below MAX_SHELL_LOG_CHUNKS. bytes is at most
+// MAX_SHELL_LOG_CHUNK_BYTES long and may be empty for a status-only report. status must not
+// be SHELL_STATUS_UNSPECIFIED. Box scope with a live lease on the job.
+message ReportShellLogRequest {
+  string job_id = 1;
+  uint32 attempt = 2;
+  string box = 3;
+  string command_id = 4;
+  uint32 seq = 5;
+  bytes bytes = 6;
+  ShellStatus status = 7;
+}
+
+message ReportShellLogReply {}
+
+// Streams the stored chunks of one command in seq order from from_seq, then new ones as they
+// arrive. Client scope, owner only.
+message StreamShellLogRequest {
+  string job_id = 1;
+  string command_id = 2;
+  uint32 from_seq = 3;
+}
+
+message StreamShellLogChunk {
+  string command_id = 1;
+  uint32 seq = 2;
+  bytes bytes = 3;
+  ShellStatus status = 4;
 }
 
 message ReportJobReply {
