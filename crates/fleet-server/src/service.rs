@@ -34,6 +34,7 @@ use tonic::service::Routes;
 use tonic::transport::Server;
 use tonic::transport::server::{Router, TcpIncoming};
 use tonic::{Request, Response, Status};
+use tonic_prost::prost::Message;
 use tower::layer::util::{Identity, Stack};
 
 use crate::auth::{BearerAuth, Caller};
@@ -124,6 +125,27 @@ pub const CLAIM_INTERVAL_S: u32 = 5;
 /// Largest request message the server decodes, in bytes.
 pub const MAX_MESSAGE_BYTES: usize = 1024 * 1024;
 
+const TIMING_SPAN_WIRE_OVERHEAD: usize = 64;
+
+const TIMING_COMMAND_WIRE_OVERHEAD: usize = 128;
+
+const TIMING_SUMMARY_WIRE_OVERHEAD: usize = 128;
+
+/// Largest `GetJobTimingReply` the server encodes, in bytes.
+///
+/// Derived from the stored caps: [`fleet_proto::MAX_SPANS`] spans of two names each and
+/// [`fleet_proto::MAX_SHELL_COMMANDS`] commands of id, command, log and `ended_by`, plus
+/// fixed per-item wire overhead. A reply over it is refused instead of sent.
+pub const MAX_JOB_TIMING_REPLY_BYTES: usize = fleet_proto::MAX_SPANS
+    * (2 * fleet_proto::MAX_TIMING_NAME_BYTES + TIMING_SPAN_WIRE_OVERHEAD)
+    + fleet_proto::MAX_SHELL_COMMANDS
+        * (fleet_proto::MAX_COMMAND_ID_BYTES
+            + fleet_proto::MAX_TIMING_NAME_BYTES
+            + fleet_proto::MAX_COMMAND_BYTES
+            + fleet_proto::MAX_SHELL_LOG_BYTES
+            + TIMING_COMMAND_WIRE_OVERHEAD)
+    + TIMING_SUMMARY_WIRE_OVERHEAD;
+
 /// Largest `FleetCredentials` request message the server decodes, in bytes.
 pub const MAX_CREDENTIAL_MESSAGE_BYTES: usize = 4 * 1024;
 
@@ -169,6 +191,7 @@ pub struct FleetService {
     store: Store,
     credentials: Option<CredentialService>,
     update: UpdateRelay,
+    timing_reply_cap: usize,
 }
 
 impl FleetService {
@@ -178,7 +201,15 @@ impl FleetService {
             store,
             credentials: None,
             update: UpdateRelay::default(),
+            timing_reply_cap: MAX_JOB_TIMING_REPLY_BYTES,
         }
+    }
+
+    /// Sets the largest `GetJobTimingReply` the handler returns, in encoded bytes.
+    #[must_use]
+    pub fn with_timing_reply_cap(mut self, cap: usize) -> Self {
+        self.timing_reply_cap = cap;
+        self
     }
 
     /// Relays the signed update manifest in `HeartbeatReply`.
@@ -744,7 +775,14 @@ impl FleetJobs for FleetService {
         &self,
         request: Request<GetJobTimingRequest>,
     ) -> Result<Response<GetJobTimingReply>, Status> {
-        timing::get_job_timing(request.get_ref()).map(Response::new)
+        let owner = caller_of(&request)
+            .ok_or_else(|| Status::permission_denied("job timing needs a user token"))?;
+        let reply =
+            timing::read_job_timing(self.store.pool(), Some(owner), request.get_ref()).await?;
+        if reply.encoded_len() > self.timing_reply_cap {
+            return Err(Status::internal("job timing too large"));
+        }
+        Ok(Response::new(reply))
     }
 
     type StreamShellLogStream = BoxStream<StreamShellLogChunk>;
@@ -922,6 +960,47 @@ mod tests {
 
     use super::*;
     use crate::jobs::JobInvalid;
+    use fleet_proto::v1::{GetJobTimingReply, ShellCommand, TimingSpan, TimingSummary};
+    use tonic_prost::prost::Message;
+
+    #[test]
+    fn the_worst_case_timing_reply_fits_the_encoding_limit() {
+        let name = "n".repeat(fleet_proto::MAX_TIMING_NAME_BYTES);
+        let span = TimingSpan {
+            kind: i32::MAX,
+            start_ms: u64::MAX,
+            end_ms: u64::MAX,
+            name: name.clone(),
+            tool_use_id: Some(name.clone()),
+        };
+        let command = ShellCommand {
+            id: name.clone(),
+            command: "c".repeat(fleet_proto::MAX_COMMAND_BYTES),
+            background: true,
+            started_ms: u64::MAX,
+            ended_ms: Some(u64::MAX),
+            duration_ms: u64::MAX,
+            exit_code: Some(i32::MIN),
+            log: "l".repeat(fleet_proto::MAX_SHELL_LOG_BYTES),
+            log_truncated: true,
+            ended_by: Some(name),
+        };
+        let reply = GetJobTimingReply {
+            summary: Some(TimingSummary {
+                wall_ms: u64::MAX,
+                api_wait_ms: u64::MAX,
+                tool_ms: u64::MAX,
+                shell_ms: u64::MAX,
+                idle_ms: u64::MAX,
+                overhead_ms: u64::MAX,
+            }),
+            spans: vec![span; fleet_proto::MAX_SPANS],
+            shell_commands: vec![command; fleet_proto::MAX_SHELL_COMMANDS],
+        };
+        let size = reply.encoded_len();
+        assert!(size <= MAX_JOB_TIMING_REPLY_BYTES, "{size}");
+        assert!(size * 10 >= MAX_JOB_TIMING_REPLY_BYTES * 9, "{size}");
+    }
 
     fn scratch(tag: &str) -> PathBuf {
         let dir = std::env::temp_dir().join(format!("fleet-upd3-{}-{tag}", std::process::id()));

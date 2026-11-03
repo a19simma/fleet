@@ -50,8 +50,6 @@ pub const REASON_SPAN_OUTSIDE: &str = "timing span lies outside the job window";
 /// Refusal when the reported wall window ends after the server clock.
 pub const REASON_WINDOW_AHEAD: &str = "timing wall time runs past the present";
 
-const NOT_IMPLEMENTED: &str = "job timing is not implemented";
-
 const STREAM_BATCH: i64 = 64;
 const STREAM_QUEUE: usize = 16;
 
@@ -480,14 +478,6 @@ pub async fn read_job_timing(
             .map(command_from_row)
             .collect::<Result<_, _>>()?,
     })
-}
-
-/// Placeholder the RPC handler calls until it routes to [`read_job_timing`].
-///
-/// # Errors
-/// Always `UNIMPLEMENTED`.
-pub fn get_job_timing(_request: &GetJobTimingRequest) -> Result<GetJobTimingReply, Status> {
-    Err(Status::unimplemented(NOT_IMPLEMENTED))
 }
 
 /// Waits a stream applies while it follows a command.
