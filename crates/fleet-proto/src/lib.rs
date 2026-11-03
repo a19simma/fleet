@@ -5,7 +5,10 @@
 
 mod convert;
 
-pub use convert::{ConvertError, queued_event, validate_box};
+pub use convert::{
+    ConvertError, ShellCommandRecord, TimingConvertError, TimingSpanRecord, queued_event,
+    shell_commands_from_wire, spans_from_wire, validate_box,
+};
 
 /// Wire protocol version fleetd reports in `HeartbeatRequest.protocol_version`. Changes are
 /// additive only, so a new server serves an old fleetd. An old fleetd sends 0.
