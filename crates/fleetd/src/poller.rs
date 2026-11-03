@@ -691,6 +691,11 @@ impl<R: JobRunner, G: Random> Poller<R, G> {
         })
     }
 
+    #[cfg(test)]
+    pub(crate) fn runner(&self) -> &R {
+        &self.runner
+    }
+
     /// Uses `gate` to pause and resume claiming.
     #[must_use]
     pub fn with_gate(mut self, gate: ClaimGate) -> Self {

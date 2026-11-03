@@ -18,6 +18,8 @@ use tonic::transport::Channel;
 use crate::AgentLauncher;
 use crate::Error;
 use crate::agent_config::Bundle;
+use crate::backoff::SystemRandom;
+use crate::bg_command::{BgConfig, PueueCli};
 use crate::broker::{Broker, GhCli, MirrorGit};
 use crate::config::Config;
 use crate::connect_proxy::{ConnectProxy, ProxyLimits};
@@ -27,12 +29,13 @@ use crate::fetch_service::{FeedBook, FetchRecorder, FetchService, MAX_CONCURRENT
 use crate::jobenv::group_id;
 use crate::jobsock::{JobContext, PerJob, ServeFuture, Service, ServiceName, Services};
 use crate::poller::{
-    GrpcReporter, JobRunner, PollRandom, Poller, RunError, SERVER_URL_ENV, Shutdown, TOKEN_ENV,
-    Token, channel,
+    GrpcReporter, GrpcTimingTransport, JobRunner, PollRandom, Poller, RunError, SERVER_URL_ENV,
+    Shutdown, TOKEN_ENV, TimingReporter, TimingTransport, Token, TokioClock, channel,
 };
 use crate::publish::{PublishGh, PublishGit};
 use crate::runner::{
-    AgentOutcome, AgentRunner, Interrupt, JobEnd, Reporter, RunConfig, ToolPreflight,
+    AgentOutcome, AgentRunner, Interrupt, JobEnd, PueueBg, Reporter, ReporterSink, RunConfig,
+    TimingWiring, ToolPreflight,
 };
 use crate::systemd::{HostsHook, select_launcher, select_tool_installer};
 use crate::telemetry::{FetchPhase, FetchRecordError};
@@ -103,6 +106,11 @@ impl BrokerWiring {
 }
 
 impl<R: Reporter> DaemonRunner<R> {
+    #[cfg(test)]
+    pub(crate) fn timing_enabled(&self) -> bool {
+        self.agent.timing_enabled()
+    }
+
     /// A runner over `workspace` and `agent`, for the box named `box_name`.
     #[must_use]
     pub fn new(workspace: Workspace, agent: AgentRunner<R>, box_name: &str) -> Self {
@@ -651,6 +659,60 @@ pub(crate) fn tool_preflight(
     ))
 }
 
+const PUEUE_SEARCH_DIRS: [&str; 4] = ["/usr/local/bin", "/usr/bin", "/opt/homebrew/bin", "/bin"];
+const PUEUE_ENV_KEYS: [&str; 2] = ["HOME", "XDG_RUNTIME_DIR"];
+
+fn find_pueue(dirs: &[&str]) -> Option<PathBuf> {
+    dirs.iter()
+        .map(|dir| Path::new(dir).join("pueue"))
+        .find(|candidate| candidate.is_file())
+}
+
+fn timing_wiring<T: TimingTransport + 'static>(
+    config: &Config,
+    transport: T,
+    pueue: Option<PueueCli>,
+) -> Option<TimingWiring> {
+    config.require_host_netns().ok()?;
+    let reporter = TimingReporter::new(transport, TokioClock::default(), SystemRandom::new());
+    let wiring = TimingWiring::new(Arc::new(ReporterSink::new(reporter)));
+    Some(match pueue {
+        Some(cli) => wiring.with_bg(Arc::new(PueueBg::new(cli, BgConfig::default()))),
+        None => wiring,
+    })
+}
+
+fn timed<R: Reporter, T: TimingTransport + 'static>(
+    agent: AgentRunner<R>,
+    config: &Config,
+    transport: T,
+    pueue: Option<PueueCli>,
+) -> AgentRunner<R> {
+    match timing_wiring(config, transport, pueue) {
+        Some(timing) => agent.with_timing(timing),
+        None => agent,
+    }
+}
+
+fn wire_agent<R: Reporter, T: TimingTransport + 'static>(
+    agent: AgentRunner<R>,
+    config: &Config,
+    transport: T,
+    env: &dyn Fn(&str) -> Option<String>,
+    pueue_dirs: &[&str],
+) -> AgentRunner<R> {
+    timed(agent, config, transport, pueue_cli(env, pueue_dirs))
+}
+
+fn pueue_cli(env: &dyn Fn(&str) -> Option<String>, dirs: &[&str]) -> Option<PueueCli> {
+    let bin = find_pueue(dirs)?;
+    let vars = PUEUE_ENV_KEYS
+        .iter()
+        .filter_map(|key| env(key).map(|value| ((*key).to_owned(), value)))
+        .collect();
+    Some(PueueCli::new(bin, vars))
+}
+
 /// Builds the poller when `FLEET_SERVER_URL` is set and non-empty, else `None`.
 ///
 /// # Errors
@@ -731,6 +793,8 @@ pub(crate) fn build(
     if let Some(preflight) = preflight {
         agent = agent.with_tool_preflight(preflight);
     }
+    let transport = GrpcTimingTransport::new(channel.clone(), &token)?;
+    agent = wire_agent(agent, config, transport, env, &PUEUE_SEARCH_DIRS);
     let runner = DaemonRunner::new(
         workspace,
         agent
@@ -765,6 +829,7 @@ mod tests {
     use fleet_core::model_allowlist::ModelAllowlist;
     use fleet_proto::v1::{
         GetProfileBlobReply, GetProfileBlobRequest, ProfileRef, ReportJobReply, ReportJobRequest,
+        ReportTimingReply, ReportTimingRequest,
     };
     use tokio::sync::mpsc;
     use tonic::Status;
@@ -774,6 +839,17 @@ mod tests {
     type TestResult = Result<(), Box<dyn std::error::Error>>;
 
     struct Recorder(mpsc::UnboundedSender<ReportJobRequest>);
+
+    struct Reporter0;
+
+    impl Reporter for Reporter0 {
+        fn report(
+            &self,
+            _request: ReportJobRequest,
+        ) -> impl Future<Output = Result<ReportJobReply, Status>> + Send {
+            std::future::ready(Ok(ReportJobReply::default()))
+        }
+    }
 
     impl Reporter for Recorder {
         fn report(
@@ -837,6 +913,188 @@ mod tests {
         Ok(())
     }
 
+    #[derive(Default)]
+    struct Fake(Mutex<Vec<(String, ReportTimingRequest)>>);
+
+    impl TimingTransport for Arc<Fake> {
+        fn report_timing(
+            &self,
+            idempotency_key: &str,
+            request: ReportTimingRequest,
+        ) -> impl Future<Output = Result<ReportTimingReply, Status>> + Send {
+            self.0
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .push((idempotency_key.to_owned(), request));
+            std::future::ready(Ok(ReportTimingReply::default()))
+        }
+    }
+
+    fn attested() -> Result<Config, Error> {
+        Config::resolve(Some("host_netns_attested = true\n"), &|_| None)
+    }
+
+    #[tokio::test]
+    async fn an_attested_runner_reports_timing_through_the_transport() -> TestResult {
+        let fake = Arc::new(Fake::default());
+        let reporter = Reporter0;
+        let agent = AgentRunner::new(
+            RunConfig::new("claude", false),
+            reporter,
+            Redactor::default(),
+        );
+        assert!(!agent.timing_enabled());
+        let wiring = timing_wiring(&attested()?, Arc::clone(&fake), None).ok_or("no wiring")?;
+        let request = ReportTimingRequest {
+            job_id: String::from("job1"),
+            attempt: 1,
+            ..ReportTimingRequest::default()
+        };
+        let outcome = wiring.sink.send(request).await?;
+        assert!(matches!(
+            outcome,
+            crate::poller::TimingOutcome::Acked { .. }
+        ));
+        let seen = fake.0.lock().unwrap_or_else(PoisonError::into_inner);
+        assert_eq!(seen.len(), 1);
+        assert_eq!(seen[0].1.job_id, "job1");
+        let timed_agent = timed(agent, &attested()?, Arc::clone(&fake), None);
+        assert!(timed_agent.timing_enabled());
+        Ok(())
+    }
+
+    fn git(dir: &Path, args: &[&str]) -> TestResult {
+        let out = std::process::Command::new("git")
+            .arg("-C")
+            .arg(dir)
+            .args(args)
+            .env("GIT_AUTHOR_NAME", "t")
+            .env("GIT_AUTHOR_EMAIL", "t@example.invalid")
+            .env("GIT_COMMITTER_NAME", "t")
+            .env("GIT_COMMITTER_EMAIL", "t@example.invalid")
+            .output()?;
+        assert!(out.status.success());
+        Ok(())
+    }
+
+    async fn run_wired_job(config: &Config, fake: Arc<Fake>) -> TestResult {
+        let dir = tempfile::TempDir::new()?;
+        let origin = dir.path().join("origin.git");
+        let seed = dir.path().join("seed");
+        std::fs::create_dir(&origin)?;
+        std::fs::create_dir(&seed)?;
+        git(&origin, &["init", "--bare", "--quiet", "-b", "main"])?;
+        git(&seed, &["init", "--quiet", "-b", "main"])?;
+        std::fs::write(seed.join("a.txt"), "a")?;
+        git(&seed, &["add", "."])?;
+        git(&seed, &["commit", "--quiet", "-m", "seed"])?;
+        git(
+            &seed,
+            &["push", "--quiet", &origin.to_string_lossy(), "main"],
+        )?;
+        let claude = dir.path().join("claude");
+        std::fs::write(&claude, "#!/bin/sh\nexit 0\n")?;
+        std::fs::set_permissions(&claude, std::fs::Permissions::from_mode(0o755))?;
+        let policy = RepoPolicy::new(["github.com"]).with_file_repos();
+        let checkout = Workspace::new(dir.path().join("work"))
+            .with_policy(policy.clone())
+            .prepare("job1", &origin.to_string_lossy(), "main")
+            .await?;
+        let mut run = RunConfig::new(&claude, false);
+        run.repo_policy = policy;
+        run.jobs_dir = Some(dir.path().join("work"));
+        run.base_env = vec![("HOME".into(), dir.path().into())];
+        run.base_env
+            .extend(std::env::var_os("PATH").map(|path| ("PATH".into(), path)));
+        let agent = AgentRunner::new(run, Reporter0, Redactor::default());
+        let env = |_: &str| None;
+        let agent = wire_agent(agent, config, fake, &env, &[]);
+        let job = Job {
+            repo: origin.to_string_lossy().into_owned(),
+            job_id: String::from("job1"),
+            attempt: 1,
+            r#box: String::from("boxa"),
+            base_ref: String::from("main"),
+            ..Job::default()
+        };
+        let (_trigger, shutdown) = Shutdown::channel();
+        let ran = agent.run(&job, &checkout.path, shutdown.clone()).await?;
+        assert_eq!(ran, AgentOutcome::Succeeded);
+        let finished = agent.finish(&job, &checkout.path, shutdown).await?;
+        assert!(matches!(
+            finished,
+            crate::runner::FinishOutcome::Succeeded { .. }
+        ));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn an_attested_job_reports_its_timing_to_the_transport() -> TestResult {
+        let fake = Arc::new(Fake::default());
+        run_wired_job(&attested()?, Arc::clone(&fake)).await?;
+        let seen = fake.0.lock().unwrap_or_else(PoisonError::into_inner);
+        assert_eq!(seen.len(), 1);
+        assert_eq!(seen[0].1.job_id, "job1");
+        assert_eq!(seen[0].1.attempt, 1);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn an_unattested_job_sends_no_timing_and_still_succeeds() -> TestResult {
+        let fake = Arc::new(Fake::default());
+        run_wired_job(&Config::resolve(None, &|_| None)?, Arc::clone(&fake)).await?;
+        let seen = fake.0.lock().unwrap_or_else(PoisonError::into_inner);
+        assert_eq!(seen.len(), 0);
+        Ok(())
+    }
+
+    #[test]
+    fn an_unattested_host_gets_no_timing() -> TestResult {
+        let config = Config::resolve(None, &|_| None)?;
+        assert!(config.require_host_netns().is_err());
+        assert!(timing_wiring(&config, Arc::new(Fake::default()), None).is_none());
+        let agent = AgentRunner::new(
+            RunConfig::new("claude", false),
+            Reporter0,
+            Redactor::default(),
+        );
+        let agent = timed(agent, &config, Arc::new(Fake::default()), None);
+        assert!(!agent.timing_enabled());
+        Ok(())
+    }
+
+    #[test]
+    fn pueue_is_watched_only_when_its_binary_exists() -> TestResult {
+        let dir = tempfile::TempDir::new()?;
+        let dirs = [dir.path().to_str().ok_or("path")?];
+        let env = |_: &str| None;
+        assert!(pueue_cli(&env, &dirs).is_none());
+        std::fs::write(dir.path().join("pueue"), "")?;
+        let cli = pueue_cli(&env, &dirs).ok_or("cli")?;
+        let config = attested()?;
+        let without = timing_wiring(&config, Arc::new(Fake::default()), None).ok_or("w")?;
+        assert!(format!("{without:?}").contains("bg: false"));
+        let with = timing_wiring(&config, Arc::new(Fake::default()), Some(cli)).ok_or("w")?;
+        assert!(format!("{with:?}").contains("bg: true"));
+        Ok(())
+    }
+
+    #[test]
+    fn the_pueue_child_env_holds_only_the_named_keys() -> TestResult {
+        let dir = tempfile::TempDir::new()?;
+        std::fs::write(dir.path().join("pueue"), "")?;
+        let dirs = [dir.path().to_str().ok_or("path")?];
+        let env = |name: &str| Some(format!("v-{name}"));
+        let cli = pueue_cli(&env, &dirs).ok_or("cli")?;
+        let text = format!("{cli:?}");
+        assert!(
+            text.contains("v-HOME") && text.contains("v-XDG_RUNTIME_DIR"),
+            "{text}"
+        );
+        assert!(!text.contains("v-FLEET_TOKEN"), "{text}");
+        Ok(())
+    }
+
     fn build_with(
         url: &str,
         extra: Option<(&'static str, &'static str)>,
@@ -859,6 +1117,34 @@ mod tests {
             &UpdateWiring::default(),
         )
         .is_ok())
+    }
+
+    fn timing_of_build(text: Option<&str>) -> Result<bool, Box<dyn std::error::Error>> {
+        let dir = tempfile::TempDir::new()?;
+        let mut config = Config::resolve(text, &|_| None)?;
+        config.jobs_dir = dir.path().join("jobs");
+        let env = |name: &str| match name {
+            "FLEET_SERVER_URL" => Some(String::from("http://127.0.0.1:1")),
+            "FLEET_TOKEN" => Some(String::from("tok-wired-0123456789")),
+            _ => None,
+        };
+        let poller = build(
+            &config,
+            &env,
+            "box",
+            Redactor::default(),
+            HookHub::new(),
+            &UpdateWiring::default(),
+        )?
+        .ok_or("no poller")?;
+        Ok(poller.runner().inner().timing_enabled())
+    }
+
+    #[tokio::test]
+    async fn build_enables_timing_only_on_an_attested_host() -> TestResult {
+        assert!(timing_of_build(Some("host_netns_attested = true\n"))?);
+        assert!(!timing_of_build(None)?);
+        Ok(())
     }
 
     fn build_with_mise(text: &str) -> Result<bool, Box<dyn std::error::Error>> {

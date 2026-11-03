@@ -849,6 +849,12 @@ impl<R: Reporter> AgentRunner<R> {
         self
     }
 
+    /// Whether [`AgentRunner::with_timing`] was applied.
+    #[must_use]
+    pub const fn timing_enabled(&self) -> bool {
+        self.timing.is_some()
+    }
+
     /// Resolves the tools of each Profile through `preflight` before the agent starts. Without
     /// it a job whose Profile carries tools fails with [`TOOL_PREFLIGHT_FAILED`].
     #[must_use]
