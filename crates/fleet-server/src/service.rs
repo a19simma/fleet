@@ -438,7 +438,9 @@ impl FleetWorker for FleetService {
         &self,
         request: Request<ReportShellLogRequest>,
     ) -> Result<Response<ReportShellLogReply>, Status> {
-        timing::report_shell_log(request.get_ref()).map(Response::new)
+        timing::report_shell_log(self.store.pool(), request.get_ref())
+            .await
+            .map(Response::new)
     }
 }
 
@@ -733,7 +735,14 @@ impl FleetJobs for FleetService {
         &self,
         request: Request<StreamShellLogRequest>,
     ) -> Result<Response<Self::StreamShellLogStream>, Status> {
-        timing::stream_shell_log(request.get_ref()).map(Response::new)
+        let owner = caller_of(&request);
+        let request = request.into_inner();
+        self.store
+            .get_job_for(owner, &request.job_id)
+            .await
+            .map_err(|err| jobs_error(&err))?;
+        timing::stream_shell_log(self.store.pool(), &request, timing::StreamLimits::default())
+            .map(Response::new)
     }
 }
 
