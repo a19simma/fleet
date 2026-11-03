@@ -1710,7 +1710,7 @@ async fn the_spec_carries_the_port_and_the_receiver_socket_is_group_shared() -> 
         .launcher()
         .with_job_gid(Some(gid))
         .with_telemetry(setup)
-        .launch(case.spec())?;
+        .launch(otel_spec(&case, true))?;
     assert_eq!(spec_json(&case)?["telemetry_port"], 4318);
     let capture = launched.telemetry.as_ref().ok_or("no capture")?;
     assert_eq!(capture.port.get(), 4318);
@@ -1727,7 +1727,10 @@ async fn the_spec_carries_the_port_and_the_receiver_socket_is_group_shared() -> 
 async fn the_default_port_is_nonzero() -> TestResult {
     let case = telemetry_case("t_tele_default")?;
     let setup = TelemetrySetup::new(fleetd::otel::Limits::default());
-    let _launched = case.launcher().with_telemetry(setup).launch(case.spec())?;
+    let _launched = case
+        .launcher()
+        .with_telemetry(setup)
+        .launch(otel_spec(&case, true))?;
     let port = spec_json(&case)?["telemetry_port"]
         .as_u64()
         .ok_or("no port")?;
@@ -1754,7 +1757,10 @@ async fn a_failed_port_or_token_fails_the_capture_and_not_the_job() -> TestResul
         if let Some(token) = token {
             setup = setup.with_token_source(token);
         }
-        let launched = case.launcher().with_telemetry(setup).launch(case.spec())?;
+        let launched = case
+            .launcher()
+            .with_telemetry(setup)
+            .launch(otel_spec(&case, true))?;
         assert!(launched.telemetry.is_none(), "{id}");
         assert!(spec_json(&case)?.get("telemetry_port").is_none(), "{id}");
         assert!(!case.dir().join("otel.sock").exists(), "{id}");
@@ -1769,6 +1775,234 @@ async fn a_launcher_without_telemetry_writes_no_port() -> TestResult {
     assert!(launched.telemetry.is_none());
     assert!(spec_json(&case)?.get("telemetry_port").is_none());
     assert!(!case.dir().join("otel.sock").exists());
+    Ok(())
+}
+
+const OTEL_NAMES: [&str; 7] = [
+    "CLAUDE_CODE_ENABLE_TELEMETRY",
+    "OTEL_LOGS_EXPORTER",
+    "OTEL_EXPORTER_OTLP_PROTOCOL",
+    "OTEL_EXPORTER_OTLP_LOGS_ENDPOINT",
+    "OTEL_EXPORTER_OTLP_HEADERS",
+    "OTEL_LOGS_EXPORT_INTERVAL",
+    "OTEL_LOG_TOOL_DETAILS",
+];
+
+fn otel_spec(case: &Case, otel: bool) -> AgentSpec {
+    AgentSpec {
+        otel,
+        ..case.spec()
+    }
+}
+
+fn env_file(case: &Case) -> Result<String, io::Error> {
+    fs::read_to_string(case.dir().join("env"))
+}
+
+fn token_source(token: &'static str) -> fleetd::systemd::TokenSource {
+    Arc::new(move || Ok(token.to_owned()))
+}
+
+#[tokio::test]
+async fn a_claude_job_with_capture_gets_the_otel_env_in_the_env_file() -> TestResult {
+    let case = telemetry_case("t_otel_claude")?;
+    let setup = TelemetrySetup::new(fleetd::otel::Limits::default())
+        .with_port_source(fixed_port(4318))
+        .with_token_source(token_source("0123456789abcdef0123456789abcdef"));
+    let launched = case
+        .launcher()
+        .with_telemetry(setup)
+        .launch(otel_spec(&case, true))?;
+    assert!(launched.telemetry.is_some());
+    let env = env_file(&case)?;
+    for name in OTEL_NAMES {
+        let prefix = format!("{name}=");
+        assert_eq!(
+            env.lines().filter(|line| line.starts_with(&prefix)).count(),
+            1,
+            "{name}"
+        );
+    }
+    assert!(env.contains("OTEL_EXPORTER_OTLP_LOGS_ENDPOINT=\"http://127.0.0.1:4318/v1/logs\"\n"));
+    assert!(env.contains(
+        "OTEL_EXPORTER_OTLP_HEADERS=\"Authorization=Bearer 0123456789abcdef0123456789abcdef\"\n"
+    ));
+    assert!(env.contains("PROBE=\"probe-value-1\"\n"));
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_claude_job_without_capture_gets_no_otel_variable() -> TestResult {
+    let no_port: fleetd::systemd::PortSource = Arc::new(|| Err(io::Error::other("no port")));
+    let case = telemetry_case("t_otel_nocapture")?;
+    let setup = TelemetrySetup::new(fleetd::otel::Limits::default()).with_port_source(no_port);
+    let launched = case
+        .launcher()
+        .with_telemetry(setup)
+        .launch(otel_spec(&case, true))?;
+    assert!(launched.telemetry.is_none());
+    let env = env_file(&case)?;
+    for name in OTEL_NAMES {
+        assert!(!env.contains(name), "{name}");
+    }
+    assert!(env.contains("PROBE="));
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_launcher_without_telemetry_gets_no_otel_variable_for_a_claude_job() -> TestResult {
+    let case = telemetry_case("t_otel_unset")?;
+    let launched = case.launcher().launch(otel_spec(&case, true))?;
+    assert!(launched.telemetry.is_none());
+    let env = env_file(&case)?;
+    for name in OTEL_NAMES {
+        assert!(!env.contains(name), "{name}");
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_codex_kimi_or_judge_job_gets_no_capture_and_no_otel_variable() -> TestResult {
+    for id in ["t_otel_codex", "t_otel_kimi", "t_otel_judge"] {
+        let case = telemetry_case(id)?;
+        let setup =
+            TelemetrySetup::new(fleetd::otel::Limits::default()).with_port_source(fixed_port(4318));
+        let launched = case
+            .launcher()
+            .with_telemetry(setup)
+            .launch(otel_spec(&case, false))?;
+        assert!(launched.telemetry.is_none(), "{id}");
+        assert!(spec_json(&case)?.get("telemetry_port").is_none(), "{id}");
+        assert!(!case.dir().join("otel.sock").exists(), "{id}");
+        let env = env_file(&case)?;
+        for name in OTEL_NAMES {
+            assert!(!env.contains(name), "{id} {name}");
+        }
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn the_fleet_otel_values_replace_any_value_already_in_the_spec_env() -> TestResult {
+    let case = telemetry_case("t_otel_replace")?;
+    let mut spec = otel_spec(&case, true);
+    for name in OTEL_NAMES {
+        spec.env.insert(name.into(), "planted-value".into());
+    }
+    let setup = TelemetrySetup::new(fleetd::otel::Limits::default())
+        .with_port_source(fixed_port(4318))
+        .with_token_source(token_source("0123456789abcdef0123456789abcdef"));
+    let _launched = case.launcher().with_telemetry(setup).launch(spec)?;
+    assert!(!env_file(&case)?.contains("planted-value"));
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_token_outside_the_safe_alphabet_starts_no_capture_and_never_reaches_the_env_file()
+-> TestResult {
+    let hostile: [&'static str; 12] = [
+        "aaaa,bbbb0123456789abcdef",
+        "aaaa=bbbb0123456789abcdef",
+        "aaaa\"bbbb0123456789abcdef",
+        "aaaa\\bbbb0123456789abcdef",
+        "aaaa$bbbb0123456789abcdef",
+        "aaaa'bbbb0123456789abcdef",
+        "aaaa bbbb0123456789abcdef",
+        "aaaa%bbbb0123456789abcdef",
+        "aaaa;bbbb0123456789abcdef",
+        "aaaa\nbbbb0123456789abcdef",
+        "aaaa\u{e9}bbbb0123456789abcdef",
+        "aaaa+bbbb/0123456789abcdef==",
+    ];
+    for (n, token) in hostile.into_iter().enumerate() {
+        let case = telemetry_case(&format!("t_otel_hostile{n}"))?;
+        let setup = TelemetrySetup::new(fleetd::otel::Limits::default())
+            .with_port_source(fixed_port(4318))
+            .with_token_source(token_source(token));
+        let launched = case
+            .launcher()
+            .with_telemetry(setup)
+            .launch(otel_spec(&case, true))?;
+        assert!(launched.telemetry.is_none(), "{token:?}");
+        let env = env_file(&case)?;
+        for name in OTEL_NAMES {
+            assert!(!env.contains(name), "{token:?} {name}");
+        }
+        assert!(!case.dir().join("otel.sock").exists(), "{token:?}");
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn the_bearer_token_is_only_in_the_env_file_and_never_in_argv_or_logs() -> TestResult {
+    const TOKEN: &str = "Zx9-_Qw8Er7TyUi6OpAs5DfGh4JkLz3X";
+    let case = telemetry_case("t_otel_secret")?;
+    let setup = TelemetrySetup::new(fleetd::otel::Limits::default())
+        .with_port_source(fixed_port(4318))
+        .with_token_source(token_source(TOKEN));
+    let spec = otel_spec(&case, true);
+    let mut launched = None;
+    let logged = captured(|| {
+        launched = case.launcher().with_telemetry(setup).launch(spec).ok();
+    });
+    let launched = launched.ok_or("launch failed")?;
+    assert!(!logged.contains(TOKEN), "{logged}");
+    assert!(!format!("{:?}", launched.telemetry).contains(TOKEN));
+    assert!(!case.log().join("\n").contains(TOKEN));
+    assert!(env_file(&case)?.contains(TOKEN));
+    for entry in fs::read_dir(case.dir())? {
+        let path = entry?.path();
+        if path.file_name().is_some_and(|name| name == "env") || !path.is_file() {
+            continue;
+        }
+        let text = fs::read_to_string(&path).unwrap_or_default();
+        assert!(!text.contains(TOKEN), "{path:?}");
+    }
+    Ok(())
+}
+
+fn attested_config(launcher: &str) -> Result<Config, Error> {
+    let none = |_: &str| None;
+    Config::resolve(
+        Some(&format!(
+            "agent_launcher = \"{launcher}\"\nhost_netns_attested = true\n"
+        )),
+        &none,
+    )
+}
+
+#[test]
+fn select_launcher_enables_telemetry_only_when_the_host_netns_is_attested() -> TestResult {
+    let none = |_: &str| None;
+    let unattested = Config::resolve(Some("agent_launcher = \"systemd\"\n"), &none)?;
+    assert_eq!(
+        unattested.require_host_netns(),
+        Err(fleetd::jobenv::TelemetryRefused::HostNetnsUnattested)
+    );
+    let attested = attested_config("systemd")?;
+    assert_eq!(attested.require_host_netns(), Ok(()));
+    let on = format!("{:?}", select_launcher(&attested, None, Services::new()));
+    assert!(on.contains("telemetry: Some("), "{on}");
+    let logged = captured(|| {
+        let off = format!("{:?}", select_launcher(&unattested, None, Services::new()));
+        assert!(off.contains("telemetry: None"), "{off}");
+    });
+    assert!(
+        logged.contains("telemetry needs host_netns_attested = true in the fleetd config"),
+        "{logged}"
+    );
+    let quiet = captured(|| {
+        let _ = select_launcher(&attested, None, Services::new());
+    });
+    assert!(!quiet.contains("host_netns_attested"), "{quiet}");
+    Ok(())
+}
+
+#[test]
+fn an_attested_direct_launcher_starts_no_telemetry() -> TestResult {
+    let direct = attested_config("direct")?;
+    let shown = format!("{:?}", select_launcher(&direct, None, Services::new()));
+    assert!(!shown.contains("TelemetrySetup"), "{shown}");
     Ok(())
 }
 

@@ -388,6 +388,30 @@ mod tests {
     }
 
     #[test]
+    fn the_headers_value_quotes_each_hostile_byte_exactly() -> TestResult {
+        let table = [
+            (",", ","),
+            ("=", "="),
+            ("\"", "\\\""),
+            ("\\", "\\\\"),
+            ("$", "$"),
+            ("'", "'"),
+            ("%", "%"),
+            ("a b", "a b"),
+        ];
+        for (raw, quoted) in table {
+            let value = format!("Authorization=Bearer x{raw}y");
+            let body = render_env_file(&spec(&[("OTEL_EXPORTER_OTLP_HEADERS", value.as_str())]))?;
+            assert_eq!(
+                body,
+                format!("OTEL_EXPORTER_OTLP_HEADERS=\"Authorization=Bearer x{quoted}y\"\n"),
+                "{raw:?}"
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
     fn fleet_set_telemetry_values_pass_through_unchanged() -> TestResult {
         let built = build_job_env(fleet_set(), &supplied(&["FOO", "ANTHROPIC_BASE_URL"]))?;
         assert_eq!(
