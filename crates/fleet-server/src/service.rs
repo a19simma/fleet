@@ -38,6 +38,7 @@ use tower::layer::util::{Identity, Stack};
 
 use crate::auth::{BearerAuth, Caller};
 use crate::cred::CredentialService;
+use crate::jobs::validate_job_id;
 use crate::profiles::ProfileContent;
 use crate::store::{Store, StoreError};
 use crate::timing;
@@ -322,32 +323,18 @@ impl FleetQuery for FleetService {
     }
 }
 
-const LIVE_LEASE: &str = "\
-SELECT 1 FROM jobs WHERE job_id = $1 AND attempt = $2 AND state = 'RUNNING' \
-AND lease_expires_at > now()";
-
-/// Refuses a timing report unless its job is `RUNNING` at the reported attempt with an
-/// unexpired lease.
+/// Validates the box and job id of a timing report before any query.
+///
+/// The live lease (job, attempt and box) is checked inside the transaction of
+/// [`timing::store_timing`].
 ///
 /// # Errors
-/// `FAILED_PRECONDITION` when no running lease matches, `UNAVAILABLE` when the query fails.
-async fn require_live_lease(
-    pool: &sqlx::PgPool,
-    request: &ReportTimingRequest,
-) -> Result<(), Status> {
+/// `FAILED_PRECONDITION` when the box or job id is malformed.
+fn report_box(request: &ReportTimingRequest) -> Result<fleet_core::BoxName, Status> {
     let stale = || Status::failed_precondition("report does not match the running job");
-    let attempt = i32::try_from(request.attempt).map_err(|_| stale())?;
-    sqlx::query(LIVE_LEASE)
-        .bind(&request.job_id)
-        .bind(attempt)
-        .fetch_optional(pool)
-        .await
-        .map_err(|err| {
-            tracing::error!(%err, "storage failed");
-            Status::unavailable("storage unavailable")
-        })?
-        .map(|_| ())
-        .ok_or_else(stale)
+    let name = validate_box(&request.r#box).map_err(|_| stale())?;
+    validate_job_id(&request.job_id).map_err(|_| stale())?;
+    Ok(name)
 }
 
 fn worker_error(err: &StoreError) -> Status {
@@ -459,8 +446,10 @@ impl FleetWorker for FleetService {
         &self,
         request: Request<ReportTimingRequest>,
     ) -> Result<Response<ReportTimingReply>, Status> {
-        require_live_lease(self.store.pool(), request.get_ref()).await?;
-        timing::report_timing(request.get_ref()).map(Response::new)
+        let name = report_box(request.get_ref())?;
+        timing::store_timing(self.store.pool(), &name, request.get_ref())
+            .await
+            .map(Response::new)
     }
 
     async fn report_shell_log(
