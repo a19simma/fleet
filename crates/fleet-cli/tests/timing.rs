@@ -195,6 +195,42 @@ async fn the_total_is_capped_and_the_stream_dropped() {
     assert_eq!(ys, MAX_PRINT_TOTAL_BYTES);
 }
 
+fn chunks_before_the_last(count: u32) -> Vec<StreamShellLogChunk> {
+    let per = vec![b'y'; MAX_PRINT_CHUNK_BYTES];
+    (0..count)
+        .map(|seq| chunk(seq, &per, ShellStatus::Running))
+        .collect()
+}
+
+#[tokio::test]
+async fn a_failed_status_survives_a_cut_at_the_total_cap() {
+    let full = u32::try_from(MAX_PRINT_TOTAL_BYTES / MAX_PRINT_CHUNK_BYTES).unwrap();
+    let per = vec![b'y'; MAX_PRINT_CHUNK_BYTES];
+    for (status, failed) in [(ShellStatus::Failed, true), (ShellStatus::Done, false)] {
+        let mut chunks = chunks_before_the_last(full - 1);
+        chunks.push(chunk(full - 1, &per, status));
+        let (result, text) = printed(script(chunks), false).await;
+        assert!(text.contains("-- log output cut --"), "{text}");
+        assert_eq!(result.is_err(), failed, "{status:?}");
+        if failed {
+            assert!(matches!(result, Err(CliError::JobEnded("failed"))));
+        }
+    }
+}
+
+#[tokio::test]
+async fn a_failed_status_survives_a_mid_chunk_cut() {
+    let big = vec![b'y'; MAX_PRINT_CHUNK_BYTES + 100];
+    for (status, failed) in [(ShellStatus::Failed, true), (ShellStatus::Done, false)] {
+        let (result, text) = printed(script(vec![chunk(0, &big, status)]), false).await;
+        assert!(text.contains("-- log output cut --"), "{text}");
+        assert_eq!(result.is_err(), failed, "{status:?}");
+        if failed {
+            assert!(matches!(result, Err(CliError::JobEnded("failed"))));
+        }
+    }
+}
+
 #[tokio::test]
 async fn a_stream_error_is_returned() {
     let mut source = Script(VecDeque::from([
@@ -251,7 +287,10 @@ async fn a_silent_stream_stops_at_the_deadline() {
     let mut out = Vec::new();
     let started = tokio::time::Instant::now();
     let result = print_log(&mut Silent, "c1", false, &mut out).await;
-    assert!(result.is_ok());
+    assert!(
+        matches!(result, Err(CliError::JobEnded("timed out"))),
+        "{result:?}"
+    );
     assert!(started.elapsed() >= FOLLOW_DEADLINE);
     assert!(String::from_utf8_lossy(&out).contains("time limit"));
 }

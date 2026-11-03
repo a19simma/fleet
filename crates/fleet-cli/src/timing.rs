@@ -25,7 +25,8 @@ pub const MAX_PRINT_TOTAL_BYTES: usize = MAX_SHELL_LOG_CHUNK_BYTES * MAX_SHELL_L
 /// Most stream messages one `--follow` reads, status-only messages included.
 pub const MAX_STREAM_MESSAGES: usize = MAX_SHELL_LOG_CHUNKS * 4;
 
-/// Longest a `--follow` waits in total: the server cap of 600 s plus a margin.
+/// Longest a `--follow` waits for each of two steps: opening the stream, and then printing it.
+/// The server cap of 600 s plus a margin.
 pub const FOLLOW_DEADLINE: Duration = Duration::from_secs(630);
 
 const CUT_MARKER: &str = "-- log output cut --";
@@ -198,6 +199,9 @@ async fn print_chunks<S: ChunkSource>(
                 "log stream sent an invalid chunk number",
             )));
         }
+        if ShellStatus::try_from(chunk.status) == Ok(ShellStatus::Failed) {
+            outcome = Err(CliError::JobEnded("failed"));
+        }
         let fresh = chunk.seq >= next_seq;
         if fresh && !chunk.bytes.is_empty() {
             next_seq = chunk.seq.saturating_add(1);
@@ -230,9 +234,6 @@ async fn print_chunks<S: ChunkSource>(
             }
         }
         if terminal {
-            if ShellStatus::try_from(chunk.status) == Ok(ShellStatus::Failed) {
-                outcome = Err(CliError::JobEnded("failed"));
-            }
             break;
         }
     }
@@ -260,7 +261,7 @@ async fn print_chunks<S: ChunkSource>(
 ///
 /// # Errors
 /// Returns [`CliError::Rpc`] when the stream fails, [`CliError::JobEnded`] when the command
-/// ended `failed`, and [`CliError::Io`] on an output failure.
+/// ended `failed` or the follow hit [`FOLLOW_DEADLINE`], and [`CliError::Io`] on an output failure.
 pub async fn print_log<S: ChunkSource>(
     source: &mut S,
     command_id: &str,
@@ -273,7 +274,7 @@ pub async fn print_log<S: ChunkSource>(
         result
     } else {
         writeln!(out, "{DEADLINE_MARKER}")?;
-        Ok(())
+        Err(CliError::JobEnded("timed out"))
     }
 }
 
@@ -315,7 +316,7 @@ pub(crate) async fn follow(
     .await;
     let Ok(opened) = opened else {
         writeln!(out, "{DEADLINE_MARKER}")?;
-        return Ok(());
+        return Err(CliError::JobEnded("timed out"));
     };
     let mut stream = opened?.into_inner();
     print_log(&mut stream, command_id, json, out).await
