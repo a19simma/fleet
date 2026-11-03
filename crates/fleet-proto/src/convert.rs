@@ -1,7 +1,12 @@
 use std::fmt;
 
+use fleet_core::capability::Capability;
+use fleet_core::catalog::{CatalogEntry, CatalogError, CatalogItem, CatalogKind};
+use fleet_core::model_allowlist::{ModelAllowlist, ModelAllowlistError};
 use fleet_core::timing::{Interval, Span, SpanKind, Summary};
-use fleet_core::{BoxName, Envelope, EventId, Source};
+use fleet_core::{
+    BoxName, Envelope, EventId, MAX_SELECTION, Selection, SelectionError, Source, Visibility,
+};
 use serde_json::Value;
 
 use crate::{
@@ -394,6 +399,181 @@ pub fn shell_commands_from_wire(
         return Err(TimingConvertError::TooMany("shell commands"));
     }
     wire.into_iter().map(ShellCommandRecord::try_from).collect()
+}
+
+/// Why a wire profile, catalog, capability or allowlist value could not become a core value.
+/// No variant keeps the input, so an error message never echoes client text.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum ProfileConvertError {
+    /// The visibility is unspecified or unknown to this build.
+    UnknownVisibility,
+    /// The catalog kind is unspecified or unknown to this build.
+    UnknownCatalogKind,
+    /// The text is not the canonical text of a capability.
+    UnknownCapability,
+    /// A selection failed the core rules.
+    Selection(SelectionError),
+    /// A catalog item failed the core rules.
+    Catalog(CatalogError),
+    /// A model allowlist failed the core rules.
+    ModelAllowlist(ModelAllowlistError),
+}
+
+impl fmt::Display for ProfileConvertError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::UnknownVisibility => f.write_str("unknown profile visibility"),
+            Self::UnknownCatalogKind => f.write_str("unknown catalog kind"),
+            Self::UnknownCapability => f.write_str("unknown capability"),
+            Self::Selection(e) => e.fmt(f),
+            Self::Catalog(e) => e.fmt(f),
+            Self::ModelAllowlist(e) => e.fmt(f),
+        }
+    }
+}
+
+impl std::error::Error for ProfileConvertError {}
+
+/// Reads a wire visibility. Unspecified and unknown values are refused.
+///
+/// # Errors
+///
+/// Returns [`ProfileConvertError::UnknownVisibility`] for unspecified and unknown values.
+pub fn visibility_from_wire(raw: i32) -> Result<Visibility, ProfileConvertError> {
+    match v1::ProfileVisibility::try_from(raw) {
+        Ok(v1::ProfileVisibility::Private) => Ok(Visibility::Private),
+        Ok(v1::ProfileVisibility::Shared) => Ok(Visibility::Shared),
+        Ok(v1::ProfileVisibility::Unspecified) | Err(_) => {
+            Err(ProfileConvertError::UnknownVisibility)
+        }
+    }
+}
+
+/// The wire visibility of a core one.
+pub fn visibility_to_wire(visibility: Visibility) -> v1::ProfileVisibility {
+    match visibility {
+        Visibility::Private => v1::ProfileVisibility::Private,
+        Visibility::Shared => v1::ProfileVisibility::Shared,
+    }
+}
+
+/// Reads wire selection entries through [`Selection::from_json`], the one core matcher.
+/// An enabled entry, a repeated id, a bad id and a list over the core cap are refused.
+///
+/// # Errors
+///
+/// Returns [`ProfileConvertError::Selection`] with the core reason.
+pub fn selection_from_wire(
+    entries: &[v1::SelectionEntry],
+) -> Result<Selection, ProfileConvertError> {
+    if entries.len() > MAX_SELECTION {
+        return Err(ProfileConvertError::Selection(SelectionError::TooMany));
+    }
+    let json = Value::Array(
+        entries
+            .iter()
+            .map(|e| serde_json::json!({"item_id": e.item_id, "enabled": e.enabled}))
+            .collect(),
+    );
+    let bytes = serde_json::to_vec(&json)
+        .map_err(|_| ProfileConvertError::Selection(SelectionError::Malformed))?;
+    Selection::from_json(&bytes).map_err(ProfileConvertError::Selection)
+}
+
+/// The wire entries of a selection: sorted, each with `enabled = false`.
+pub fn selection_to_wire(selection: &Selection) -> Vec<v1::SelectionEntry> {
+    selection
+        .ids()
+        .map(|id| v1::SelectionEntry {
+            item_id: id.as_str().to_owned(),
+            enabled: false,
+        })
+        .collect()
+}
+
+/// Reads a wire catalog kind. Unspecified and unknown values are refused.
+///
+/// # Errors
+///
+/// Returns [`ProfileConvertError::UnknownCatalogKind`] for unspecified and unknown values.
+pub fn catalog_kind_from_wire(raw: i32) -> Result<CatalogKind, ProfileConvertError> {
+    match v1::CatalogKind::try_from(raw) {
+        Ok(v1::CatalogKind::Skill) => Ok(CatalogKind::Skill),
+        Ok(v1::CatalogKind::Subagent) => Ok(CatalogKind::Subagent),
+        Ok(v1::CatalogKind::Tool) => Ok(CatalogKind::Tool),
+        Ok(v1::CatalogKind::Context) => Ok(CatalogKind::Context),
+        Ok(v1::CatalogKind::Unspecified) | Err(_) => Err(ProfileConvertError::UnknownCatalogKind),
+    }
+}
+
+/// The wire kind of a core one.
+pub fn catalog_kind_to_wire(kind: CatalogKind) -> v1::CatalogKind {
+    match kind {
+        CatalogKind::Skill => v1::CatalogKind::Skill,
+        CatalogKind::Subagent => v1::CatalogKind::Subagent,
+        CatalogKind::Tool => v1::CatalogKind::Tool,
+        CatalogKind::Context => v1::CatalogKind::Context,
+    }
+}
+
+/// Reads a wire catalog item through [`CatalogItem::new`]. The wire digest is ignored, as the
+/// proto says; `admin_enabled` becomes the entry flag.
+///
+/// # Errors
+///
+/// Returns [`ProfileConvertError::UnknownCatalogKind`] or [`ProfileConvertError::Catalog`] with the core reason.
+pub fn catalog_entry_from_wire(
+    item: &v1::CatalogItem,
+) -> Result<CatalogEntry, ProfileConvertError> {
+    let kind = catalog_kind_from_wire(item.kind)?;
+    let core = CatalogItem::new(kind, &item.id, &item.name, &item.content)
+        .map_err(ProfileConvertError::Catalog)?;
+    Ok(CatalogEntry::new(core, item.admin_enabled))
+}
+
+/// The wire item of a catalog entry, with the core digest.
+pub fn catalog_entry_to_wire(entry: &CatalogEntry) -> v1::CatalogItem {
+    let item = entry.item();
+    v1::CatalogItem {
+        id: item.id().as_str().to_owned(),
+        kind: catalog_kind_to_wire(item.kind()) as i32,
+        name: item.name().to_owned(),
+        content: item.body().to_owned(),
+        digest: item.digest().to_vec(),
+        admin_enabled: entry.enabled(),
+    }
+}
+
+/// Reads the exact canonical text of a capability.
+///
+/// # Errors
+///
+/// Returns [`ProfileConvertError::UnknownCapability`] for anything but canonical text.
+pub fn capability_from_text(raw: &str) -> Result<Capability, ProfileConvertError> {
+    Capability::parse(raw).map_err(|_| ProfileConvertError::UnknownCapability)
+}
+
+/// The canonical wire text of a capability.
+pub fn capability_to_text(capability: Capability) -> &'static str {
+    capability.as_str()
+}
+
+/// Reads wire model ids through [`ModelAllowlist::new`].
+///
+/// # Errors
+///
+/// Returns [`ProfileConvertError::ModelAllowlist`] with the core reason.
+pub fn model_allowlist_from_wire(
+    entries: &[String],
+) -> Result<ModelAllowlist, ProfileConvertError> {
+    ModelAllowlist::new(entries.iter().map(String::as_str))
+        .map_err(ProfileConvertError::ModelAllowlist)
+}
+
+/// The wire model ids of an allowlist, in configured order.
+pub fn model_allowlist_to_wire(allowlist: &ModelAllowlist) -> Vec<String> {
+    allowlist.entries().to_vec()
 }
 
 #[cfg(test)]
