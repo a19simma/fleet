@@ -28,10 +28,23 @@
 //! `now`, and a task stops at [`MAX_SHELL_LOG_CHUNKS`] chunks with a final `Failed` report
 //! because the wire has no truncation status.
 //!
-//! `pueue log --lines` returns a sliding window, so the pusher cannot index a byte offset into
-//! a read that may have lost its head. A read of [`LOG_LINES`] or more lines, a read whose
-//! redacted text is shorter than what was sent, and a read whose head no longer matches the
-//! sent bytes all fail the task closed: one empty `Failed` chunk, then no more pushes.
+//! `pueue log --lines` returns a sliding window, so a reader cannot index a byte offset into a
+//! read that may have lost its head, and a multi-line secret whose first lines fell out of the
+//! window no longer matches the [`Redactor`]. Every caller reads through one checked fetch,
+//! [`LogFetch`], which counts lines on the full pueue output before any byte truncation. Ways
+//! the head can go missing and how each is covered:
+//!
+//! - Line cap: [`LOG_LINES`] or more lines sets `head_may_be_lost`, also when the byte cap
+//!   then cuts the text below that count.
+//! - Byte cap: the cap cuts the tail and keeps the head, so it loses no head; the tail guard
+//!   covers a secret it splits.
+//! - Rotation, `pueue clean` or `pueue reset` after bytes went out: the head hash of the sent
+//!   bytes no longer matches, or the text is shorter than what was sent.
+//! - The same events before any byte went out leave no line-count or hash signal: a log
+//!   restarted below [`LOG_LINES`] lines is an undetectable residual.
+//!
+//! The pusher fails the task closed on any of these: one empty `Failed` chunk, then no more
+//! pushes. The watcher withholds the log and reports [`HEAD_LOST_MARKER`] instead.
 //!
 //! Limit: pueue reuses ids after `pueue reset`, so a task created after a reset with an id at or
 //! below the baseline is not seen. The watcher polls as the uid of its [`PueueClient`]; the
@@ -39,7 +52,6 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
-use std::hash::{DefaultHasher, Hasher};
 use std::path::PathBuf;
 use std::time::Duration;
 
@@ -48,6 +60,7 @@ use fleet_proto::{
     MAX_SHELL_COMMANDS, MAX_SHELL_LOG_BYTES, MAX_SHELL_LOG_CHUNK_BYTES, MAX_SHELL_LOG_CHUNKS, v1,
 };
 use serde::Deserialize;
+use sha2::{Digest, Sha256};
 use tokio::io::AsyncReadExt;
 use tokio::process::Command;
 use tokio::time::Instant;
@@ -109,17 +122,55 @@ impl fmt::Display for PueueError {
 
 impl std::error::Error for PueueError {}
 
+/// Text reported in place of a log whose head pueue's window may have dropped.
+pub const HEAD_LOST_MARKER: &str = "[log withheld: pueue window may have dropped its start]";
+
+/// One checked read of a task log.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct LogFetch {
+    /// At most the requested number of bytes of the output.
+    pub bytes: Vec<u8>,
+    /// Whether pueue's line window may have dropped the start of the output.
+    pub head_may_be_lost: bool,
+}
+
+impl LogFetch {
+    /// Counts the lines of `full` before cutting it to `max_bytes` bytes.
+    #[must_use]
+    pub fn checked(mut full: Vec<u8>, max_bytes: usize) -> Self {
+        let head_may_be_lost = line_count(&full) >= LOG_LINES;
+        full.truncate(max_bytes);
+        Self {
+            bytes: full,
+            head_may_be_lost,
+        }
+    }
+}
+
+async fn fetch_checked<C: PueueClient>(
+    client: &C,
+    id: u64,
+    max_bytes: usize,
+    timeout: Duration,
+) -> Option<LogFetch> {
+    tokio::time::timeout(timeout, client.log(id, max_bytes))
+        .await
+        .ok()?
+        .ok()
+}
+
 /// The two pueue reads the watcher needs.
 pub trait PueueClient: Send + Sync {
     /// The text of `pueue status --json`.
     fn status_json(&self) -> impl Future<Output = Result<String, PueueError>> + Send;
 
-    /// At most `max_bytes` bytes of the output of task `id`.
+    /// At most `max_bytes` bytes of the output of task `id`, with the window check made on
+    /// the full output; build it with [`LogFetch::checked`].
     fn log(
         &self,
         id: u64,
         max_bytes: usize,
-    ) -> impl Future<Output = Result<Vec<u8>, PueueError>> + Send;
+    ) -> impl Future<Output = Result<LogFetch, PueueError>> + Send;
 }
 
 /// Runs the `pueue` binary with a fixed environment.
@@ -180,7 +231,7 @@ impl PueueClient for PueueCli {
         String::from_utf8(out).map_err(|_| PueueError::Parse)
     }
 
-    async fn log(&self, id: u64, max_bytes: usize) -> Result<Vec<u8>, PueueError> {
+    async fn log(&self, id: u64, max_bytes: usize) -> Result<LogFetch, PueueError> {
         let args = [
             "log".to_owned(),
             "--json".to_owned(),
@@ -192,9 +243,7 @@ impl PueueClient for PueueCli {
         let mut map: BTreeMap<String, LogEntry> =
             serde_json::from_slice(&out).map_err(|_| PueueError::Parse)?;
         let entry = map.remove(&id.to_string()).ok_or(PueueError::Parse)?;
-        let mut bytes = entry.output.into_bytes();
-        bytes.truncate(max_bytes);
-        Ok(bytes)
+        Ok(LogFetch::checked(entry.output.into_bytes(), max_bytes))
     }
 }
 
@@ -677,10 +726,15 @@ impl<C: PueueClient> BgWatcher<C> {
     }
 
     async fn read_log(&self, id: u64) -> (String, bool, bool) {
-        let call = self.client.log(id, LOG_READ_CAP + 1);
-        let Ok(Ok(raw)) = tokio::time::timeout(self.config.call_timeout, call).await else {
+        let Some(fetch) =
+            fetch_checked(&self.client, id, LOG_READ_CAP + 1, self.config.call_timeout).await
+        else {
             return (String::new(), false, true);
         };
+        if fetch.head_may_be_lost {
+            return (HEAD_LOST_MARKER.to_owned(), true, false);
+        }
+        let raw = fetch.bytes;
         let cut = raw.len() > LOG_READ_CAP;
         let text = String::from_utf8_lossy(&raw).replace('\0', "");
         let mut text = self.redactor.redact_str(&text).into_owned();
@@ -903,7 +957,7 @@ pub struct LogPushReport {
 struct LogRead {
     text: String,
     cut: bool,
-    windowed: bool,
+    head_may_be_lost: bool,
 }
 
 fn line_count(raw: &[u8]) -> usize {
@@ -913,11 +967,8 @@ fn line_count(raw: &[u8]) -> usize {
 
 impl LogTask {
     fn prefix_holds(&self, text: &str) -> bool {
-        text.get(..self.sent).is_some_and(|head| {
-            let mut again = DefaultHasher::new();
-            again.write(head.as_bytes());
-            again.finish() == self.digest.finish()
-        })
+        text.get(..self.sent)
+            .is_some_and(|head| Sha256::digest(head.as_bytes()) == self.digest.clone().finalize())
     }
 }
 
@@ -926,7 +977,7 @@ struct LogTask {
     command_id: String,
     seq: u32,
     sent: usize,
-    digest: DefaultHasher,
+    digest: Sha256,
     last: Option<v1::ShellStatus>,
     done: bool,
     errors: u32,
@@ -1053,14 +1104,17 @@ impl<C: PueueClient, R: LogReporter> LogPusher<C, R> {
     }
 
     async fn read(&self, id: u64) -> Option<LogRead> {
-        let call = self.client.log(id, LIVE_LOG_READ_CAP + 1);
-        let Ok(Ok(raw)) = tokio::time::timeout(self.config.call_timeout, call).await else {
-            return None;
-        };
+        let fetch = fetch_checked(
+            &self.client,
+            id,
+            LIVE_LOG_READ_CAP + 1,
+            self.config.call_timeout,
+        )
+        .await?;
         Some(LogRead {
-            text: clean_log(&self.redactor, &raw),
-            cut: raw.len() > LIVE_LOG_READ_CAP,
-            windowed: line_count(&raw) >= LOG_LINES,
+            text: clean_log(&self.redactor, &fetch.bytes),
+            cut: fetch.bytes.len() > LIVE_LOG_READ_CAP,
+            head_may_be_lost: fetch.head_may_be_lost,
         })
     }
 
@@ -1080,7 +1134,7 @@ impl<C: PueueClient, R: LogReporter> LogPusher<C, R> {
             self.credit = self.credit.saturating_sub(LOG_CHUNK_COST);
             task.seq += 1;
             task.sent += bytes.len();
-            task.digest.write(bytes.as_bytes());
+            task.digest.update(bytes.as_bytes());
             task.errors = 0;
             task.last = Some(status);
             task.done = is_terminal(status);
@@ -1118,7 +1172,7 @@ impl<C: PueueClient, R: LogReporter> LogPusher<C, R> {
             None
         };
         if let Some(read) = &text {
-            let stable = !read.windowed && task.prefix_holds(&read.text);
+            let stable = !read.head_may_be_lost && task.prefix_holds(&read.text);
             if !stable {
                 self.send(task, "", v1::ShellStatus::Failed).await;
                 return;
@@ -1184,7 +1238,7 @@ impl<C: PueueClient, R: LogReporter> LogPusher<C, R> {
                 command_id: log_command_id(seen.id),
                 seq: 0,
                 sent: 0,
-                digest: DefaultHasher::new(),
+                digest: Sha256::new(),
                 last: None,
                 done: false,
                 errors: 0,

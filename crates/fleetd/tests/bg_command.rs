@@ -16,9 +16,9 @@ use fleet_proto::{
 };
 use fleetd::bg_command::{
     Anchor, BgConfig, BgOutcome, BgState, BgWatcher, EndedBy, LIVE_LOG_READ_CAP, LOG_BURST,
-    LOG_CHUNK_COST, LOG_LINES, LOG_READ_CAP, LOG_TAIL_GUARD, LogChunk, LogPushConfig, LogPusher,
-    LogReporter, MAX_LOG_ERRORS, MAX_POLL_ERRORS, MAX_TRACKED_TASKS, PueueCli, PueueClient,
-    PueueError, ReportError, Rule, log_command_id, parse_timestamp, rule,
+    LOG_CHUNK_COST, LOG_LINES, LOG_READ_CAP, LOG_TAIL_GUARD, LogChunk, LogFetch, LogPushConfig,
+    LogPusher, LogReporter, MAX_LOG_ERRORS, MAX_POLL_ERRORS, MAX_TRACKED_TASKS, PueueCli,
+    PueueClient, PueueError, ReportError, Rule, log_command_id, parse_timestamp, rule,
 };
 use tokio::time::Instant;
 
@@ -76,7 +76,7 @@ impl PueueClient for &Fake {
         &self,
         id: u64,
         max_bytes: usize,
-    ) -> impl Future<Output = Result<Vec<u8>, PueueError>> + Send {
+    ) -> impl Future<Output = Result<LogFetch, PueueError>> + Send {
         self.log_calls.lock().expect("lock").push((id, max_bytes));
         let out = self
             .logs
@@ -85,10 +85,7 @@ impl PueueClient for &Fake {
             .get(&id)
             .cloned()
             .unwrap_or(Ok(Vec::new()))
-            .map(|mut bytes| {
-                bytes.truncate(max_bytes);
-                bytes
-            });
+            .map(|bytes| LogFetch::checked(bytes, max_bytes));
         std::future::ready(out)
     }
 }
@@ -1580,4 +1577,112 @@ async fn a_failed_fail_closed_report_pushes_no_data_and_is_retried() {
     drain(&mut p, t0).await;
     assert_eq!(rec.statuses(), vec![v1::ShellStatus::Failed]);
     assert_eq!(rec.text(), "");
+}
+
+const DROPPED_HEAD_LINE_LEN: usize = 300;
+
+fn dropped_head_window(total: usize, first_kept: usize, at: usize) -> Vec<u8> {
+    let mut lines: Vec<String> = (0..total)
+        .map(|n| format!("{n:04}{}", "x".repeat(DROPPED_HEAD_LINE_LEN)))
+        .collect();
+    for (i, l) in PEM_LINES.iter().enumerate() {
+        lines
+            .get_mut(at + i)
+            .expect("in range")
+            .clone_from(&(*l).to_owned());
+    }
+    let mut out = lines.get(first_kept..).expect("range").join("\n");
+    out.push('\n');
+    out.into_bytes()
+}
+
+fn pem_dropped_by_the_window() -> Vec<u8> {
+    dropped_head_window(1200, 200, 198)
+}
+
+#[tokio::test]
+async fn a_byte_truncated_window_with_a_lost_pem_head_pushes_no_fragment_on_the_first_read() {
+    let window = pem_dropped_by_the_window();
+    assert!(
+        window.len() > 266_000,
+        "positive control: the byte cap bites"
+    );
+    let fake = Fake::with(vec![]);
+    let rec = Rec::default();
+    let t0 = Instant::now();
+    let mut p = pem_pusher(&fake, &rec, t0).await;
+    set_log(&fake, window);
+    set_tasks(&fake, &[finished_task(1)]);
+    drain(&mut p, t0).await;
+    assert_no_pem_fragment(&rec.text());
+    assert_eq!(rec.statuses(), vec![v1::ShellStatus::Failed]);
+    assert_eq!(rec.text(), "");
+}
+
+#[tokio::test]
+async fn a_byte_truncated_window_with_a_lost_pem_head_leaves_no_fragment_in_the_report() {
+    let fake = hostile_log(pem_dropped_by_the_window());
+    let mut w = BgWatcher::start(&fake, Redactor::new([pem()]), anchor(), config())
+        .await
+        .expect("start");
+    w.poll(Instant::now()).await.expect("poll");
+    let r = w
+        .finish(EndedBy::JobExit, Instant::now())
+        .await
+        .records
+        .remove(0);
+    assert_no_pem_fragment(&r.record.output);
+    assert!(!r.record.output.contains("xxxxxxxx"), "no log bytes");
+    assert!(!r.record.output.is_empty(), "a marker stands in");
+}
+
+#[tokio::test]
+async fn a_short_legit_log_still_pushes_and_reports_normally() {
+    let fake = Fake::with(vec![]);
+    let rec = Rec::default();
+    let t0 = Instant::now();
+    let mut p = pem_pusher(&fake, &rec, t0).await;
+    set_log(&fake, stream(0, 50, "ok"));
+    set_tasks(&fake, &[finished_task(1)]);
+    drain(&mut p, t0).await;
+    assert!(rec.text().contains("ok0000"));
+    assert!(rec.text().contains(PLACEHOLDER));
+    assert_eq!(rec.statuses().last(), Some(&v1::ShellStatus::Done));
+    let fake = hostile_log(stream(0, 50, "ok"));
+    let mut w = BgWatcher::start(&fake, Redactor::new([pem()]), anchor(), config())
+        .await
+        .expect("start");
+    w.poll(Instant::now()).await.expect("poll");
+    let r = w
+        .finish(EndedBy::JobExit, Instant::now())
+        .await
+        .records
+        .remove(0);
+    assert!(r.record.output.contains("ok0000"));
+    assert!(r.record.output.contains(PLACEHOLDER));
+}
+
+#[test]
+fn the_fetch_counts_lines_before_the_byte_cut_at_every_boundary() {
+    let line = "y".repeat(DROPPED_HEAD_LINE_LEN);
+    let lines = |n: usize| format!("{line}\n").repeat(n).into_bytes();
+    for (n, lost) in [
+        (LOG_LINES - 1, false),
+        (LOG_LINES, true),
+        (LOG_LINES + 1, true),
+    ] {
+        let cut = LogFetch::checked(lines(n), 1000);
+        assert_eq!(cut.head_may_be_lost, lost, "{n} lines");
+        assert_eq!(cut.bytes.len(), 1000, "{n} lines");
+    }
+    let whole = lines(LOG_LINES - 1);
+    let exact = LogFetch::checked(whole.clone(), whole.len());
+    assert_eq!(exact.bytes, whole);
+    assert!(!exact.head_may_be_lost);
+    let under = LogFetch::checked(whole.clone(), whole.len() - 1);
+    assert_eq!(under.bytes.len(), whole.len() - 1);
+    assert!(!under.head_may_be_lost);
+    let plain = LogFetch::checked(b"a\nb".to_vec(), 3);
+    assert_eq!(plain.bytes, b"a\nb");
+    assert!(!plain.head_may_be_lost);
 }
