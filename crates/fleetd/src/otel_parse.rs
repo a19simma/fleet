@@ -16,8 +16,10 @@
 //! attribute names are an assumption, unverified against a captured Claude Code body.
 
 use std::cell::Cell;
+use std::collections::{HashMap, HashSet};
 use std::fmt;
 
+use fleet_core::timing::{Interval, Span, SpanKind};
 use fleet_proto::is_plain_text;
 use serde::Deserializer;
 use serde::de::{self, DeserializeSeed, MapAccess, SeqAccess, Visitor};
@@ -37,6 +39,13 @@ const MAX_STRING_BYTES: usize = 64 * 1024;
 const MAX_OBJECT_KEYS: usize = 256;
 /// Most log records in one body.
 pub const MAX_RECORDS: usize = 4096;
+
+/// Most event ids remembered for duplicate detection.
+pub const MAX_SEEN_IDS: usize = 65_536;
+/// Most pending tool decisions remembered for correlation.
+pub const MAX_DECISIONS: usize = 4096;
+/// The only tool name that maps to a shell span, compared exactly.
+const SHELL_TOOL: &str = "Bash";
 
 /// One timing event.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -495,4 +504,185 @@ fn read_record(rec: &Obj, out: &mut Parsed) -> Result<(), ParseError> {
     };
     out.events.push(event);
     Ok(())
+}
+
+/// An event with the data the caller read beside it.
+///
+/// The parser reads no clock, so the caller supplies the event time on the job clock and, when it
+/// has them, the event id and the structured `run_in_background` tool input flag.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Observed {
+    /// Event end time in milliseconds on the job clock.
+    pub ts_ms: u64,
+    /// Event id for duplicate detection. An event with none is never deduplicated.
+    pub id: Option<String>,
+    /// Structured `run_in_background` flag of a Bash call. Command text is never consulted.
+    pub run_in_background: Option<bool>,
+    /// The parsed event.
+    pub event: ClaudeEvent,
+}
+
+impl Observed {
+    /// An event at `ts_ms` with no id and no background flag.
+    #[must_use]
+    pub const fn new(ts_ms: u64, event: ClaudeEvent) -> Self {
+        Self {
+            ts_ms,
+            id: None,
+            run_in_background: None,
+            event,
+        }
+    }
+
+    /// Sets the event id.
+    #[must_use]
+    pub fn with_id(mut self, id: &str) -> Self {
+        self.id = Some(id.to_owned());
+        self
+    }
+}
+
+/// Counts of events the mapper dropped, by reason.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct MapStats {
+    /// Events whose id was already seen.
+    pub duplicates: usize,
+    /// Events with an unseen id dropped because the id set was full.
+    pub ids_dropped: usize,
+    /// Decisions dropped because the decision table was full.
+    pub decisions_dropped: usize,
+    /// Results dropped for a decision that named another tool or rejected the call.
+    pub contradicted: usize,
+    /// Spans with no time inside the job window, including zero durations.
+    pub empty: usize,
+    /// Events past [`MAX_RECORDS`] in one [`SpanMapper::push_all`] call.
+    pub batch_cut: usize,
+}
+
+struct Pending {
+    tool_name: String,
+    rejected: bool,
+}
+
+/// Turns Claude events into the spans `fleet_core::timing::aggregate` consumes.
+///
+/// `api_request` becomes an `ApiWait` span and `tool_result` a `Tool` span, or `Shell` for the
+/// exact tool name `Bash`, or `BgShell` when the structured flag says background. Each span ends
+/// at the event time and starts `duration_ms` earlier, saturating, then is clamped to the job
+/// window. A span with no time left is dropped. Overlapping spans are kept as they are, because
+/// the core merges them.
+///
+/// A `tool_decision` yields no span. It is held until the result with the same `tool_use_id`. The
+/// result is dropped when the decision names another tool or is `reject`, a reading that
+/// stays strict when the events disagree. A result with no decision still yields its span.
+///
+/// Event ids and decisions live in tables capped at [`MAX_SEEN_IDS`] and [`MAX_DECISIONS`]. At the
+/// id cap an event with an unseen id is dropped, so the set never grows and dedup never fails
+/// open; ids already held still count as duplicates and events without an id still map. At the
+/// decision cap a new decision is dropped, and its result then maps as one with no decision.
+pub struct SpanMapper {
+    job: Interval,
+    seen: HashSet<String>,
+    decisions: HashMap<String, Pending>,
+    stats: MapStats,
+}
+
+impl SpanMapper {
+    /// A mapper clamping to `job`.
+    #[must_use]
+    pub fn new(job: Interval) -> Self {
+        Self {
+            job,
+            seen: HashSet::new(),
+            decisions: HashMap::new(),
+            stats: MapStats::default(),
+        }
+    }
+
+    /// Drop counts so far.
+    #[must_use]
+    pub const fn stats(&self) -> MapStats {
+        self.stats
+    }
+
+    /// Maps the first [`MAX_RECORDS`] events and counts the rest in `batch_cut`.
+    pub fn push_all(&mut self, events: Vec<Observed>) -> Vec<Span> {
+        let mut out = Vec::new();
+        for (n, obs) in events.into_iter().enumerate() {
+            if n >= MAX_RECORDS {
+                self.stats.batch_cut = self.stats.batch_cut.saturating_add(1);
+                continue;
+            }
+            out.extend(self.push(obs));
+        }
+        out
+    }
+
+    /// Maps one event. Returns the span, or `None` when the event is held or dropped.
+    pub fn push(&mut self, obs: Observed) -> Option<Span> {
+        if let Some(id) = &obs.id {
+            if self.seen.contains(id) {
+                self.stats.duplicates = self.stats.duplicates.saturating_add(1);
+                return None;
+            }
+            if self.seen.len() >= MAX_SEEN_IDS {
+                self.stats.ids_dropped = self.stats.ids_dropped.saturating_add(1);
+                return None;
+            }
+            self.seen.insert(id.clone());
+        }
+        match obs.event {
+            ClaudeEvent::ApiRequest(r) => self.span(SpanKind::ApiWait, obs.ts_ms, r.duration_ms),
+            ClaudeEvent::ToolResult(r) => {
+                if let Some(d) = self.decisions.remove(&r.tool_use_id)
+                    && (d.rejected || d.tool_name != r.tool_name)
+                {
+                    self.stats.contradicted = self.stats.contradicted.saturating_add(1);
+                    return None;
+                }
+                let kind = if r.tool_name != SHELL_TOOL {
+                    SpanKind::Tool
+                } else if obs.run_in_background == Some(true) {
+                    SpanKind::BgShell
+                } else {
+                    SpanKind::Shell
+                };
+                self.span(kind, obs.ts_ms, r.duration_ms)
+            }
+            ClaudeEvent::ToolDecision(d) => {
+                if self.decisions.len() >= MAX_DECISIONS
+                    && !self.decisions.contains_key(&d.tool_use_id)
+                {
+                    self.stats.decisions_dropped = self.stats.decisions_dropped.saturating_add(1);
+                    return None;
+                }
+                let rejected = d
+                    .decision
+                    .as_deref()
+                    .is_some_and(|t| t.eq_ignore_ascii_case("reject"));
+                self.decisions.insert(
+                    d.tool_use_id,
+                    Pending {
+                        tool_name: d.tool_name,
+                        rejected,
+                    },
+                );
+                None
+            }
+        }
+    }
+
+    fn span(&mut self, kind: SpanKind, ts_ms: u64, duration_ms: u64) -> Option<Span> {
+        let job = self.job;
+        let start = ts_ms.saturating_sub(duration_ms).max(job.start_ms());
+        let end = ts_ms.min(job.end_ms());
+        if end <= start {
+            self.stats.empty = self.stats.empty.saturating_add(1);
+            return None;
+        }
+        Some(Span {
+            kind,
+            interval: Interval::new(start, end).ok()?,
+        })
+    }
 }
