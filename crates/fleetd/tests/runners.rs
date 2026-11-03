@@ -239,3 +239,93 @@ fn a_deny_holds_with_hooks_disabled() -> TestResult {
     );
     Ok(())
 }
+
+mod claude_telemetry {
+    use std::collections::BTreeMap;
+    use std::ffi::OsString;
+    use std::num::NonZeroU16;
+
+    use fleetd::agent::{TelemetryEnv, TelemetryEnvError};
+
+    const TOKEN: &str = "0123456789abcdef0123456789abcdef";
+
+    fn port() -> NonZeroU16 {
+        NonZeroU16::new(43_210).unwrap_or(NonZeroU16::MIN)
+    }
+
+    fn os(text: &str) -> OsString {
+        OsString::from(text)
+    }
+
+    #[test]
+    fn the_env_map_is_pinned_over_a_relative_path_base() -> Result<(), TelemetryEnvError> {
+        let mut env: BTreeMap<OsString, OsString> = BTreeMap::from([
+            (os("HOME"), os("jobs/home")),
+            (os("CLAUDE_CONFIG_DIR"), os("jobs/home/.claude")),
+        ]);
+        TelemetryEnv::new(port(), TOKEN)?.apply(&mut env);
+        let want: BTreeMap<OsString, OsString> = [
+            ("HOME", "jobs/home"),
+            ("CLAUDE_CONFIG_DIR", "jobs/home/.claude"),
+            ("CLAUDE_CODE_ENABLE_TELEMETRY", "1"),
+            ("OTEL_LOGS_EXPORTER", "otlp"),
+            ("OTEL_EXPORTER_OTLP_PROTOCOL", "http/json"),
+            (
+                "OTEL_EXPORTER_OTLP_LOGS_ENDPOINT",
+                "http://127.0.0.1:43210/v1/logs",
+            ),
+            (
+                "OTEL_EXPORTER_OTLP_HEADERS",
+                "Authorization=Bearer 0123456789abcdef0123456789abcdef",
+            ),
+            ("OTEL_LOGS_EXPORT_INTERVAL", "1000"),
+            ("OTEL_LOG_TOOL_DETAILS", "1"),
+        ]
+        .map(|(key, value)| (os(key), os(value)))
+        .into();
+        assert_eq!(env, want);
+        Ok(())
+    }
+
+    #[test]
+    fn the_token_appears_only_in_the_headers_value() -> Result<(), TelemetryEnvError> {
+        let mut env = BTreeMap::new();
+        TelemetryEnv::new(port(), TOKEN)?.apply(&mut env);
+        let holders: Vec<&OsString> = env
+            .iter()
+            .filter(|(_, value)| value.to_string_lossy().contains(TOKEN))
+            .map(|(key, _)| key)
+            .collect();
+        assert_eq!(holders, [&os("OTEL_EXPORTER_OTLP_HEADERS")]);
+        Ok(())
+    }
+
+    #[test]
+    fn debug_and_errors_never_show_the_token() -> Result<(), TelemetryEnvError> {
+        let built = TelemetryEnv::new(port(), TOKEN)?;
+        assert!(!format!("{built:?}").contains(TOKEN));
+        assert!(!format!("{built:#?}").contains(TOKEN));
+        let leaky = format!("{TOKEN}\r\nX-Evil: 1");
+        let err = TelemetryEnv::new(port(), &leaky).err();
+        assert_eq!(err, Some(TelemetryEnvError::BadToken));
+        let shown = format!("{err:?} {}", TelemetryEnvError::BadToken);
+        assert!(!shown.contains(TOKEN));
+        Ok(())
+    }
+
+    #[test]
+    fn a_hostile_token_adds_no_variable() {
+        for bad in [
+            "",
+            "short",
+            "a b a b a b a b a b a b a b a b",
+            "tok\nen0123456789012345678",
+        ] {
+            assert_eq!(
+                TelemetryEnv::new(port(), bad).err(),
+                Some(TelemetryEnvError::BadToken),
+                "{bad:?}"
+            );
+        }
+    }
+}
