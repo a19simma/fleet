@@ -16,6 +16,9 @@ pub const PROFILE_HASH_DOMAIN: &[u8] = b"fleet-profile-v1\0";
 /// Domain-separation prefix for a [`Profile`] that sets `tools` (ADR-0048).
 pub const PROFILE_HASH_DOMAIN_V2: &[u8] = b"fleet-profile-v2\0";
 
+/// Domain-separation prefix for a [`Profile`] that sets `selection` or `authored_prompt` (ADR-0053).
+pub const PROFILE_HASH_DOMAIN_V3: &[u8] = b"fleet-profile-v3\0";
+
 /// Failures from parsing a [`Profile`] or a [`ProfileHash`].
 ///
 /// Messages are fixed and never echo input text.
@@ -212,6 +215,12 @@ pub struct Profile {
     /// Tool pins; accepted only from TOML input (ADR-0048).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub tools: Vec<ToolSpec>,
+    /// Catalog items the owner switched off (ADR-0053).
+    #[serde(default, skip_serializing_if = "Selection::is_empty")]
+    pub selection: Selection,
+    /// User-authored prompt text (ADR-0053).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub authored_prompt: Option<PromptText>,
 }
 
 /// The sha256 identity of a [`Profile`]; displays as 64 lowercase hex characters.
@@ -371,14 +380,21 @@ impl Profile {
     }
 
     /// The Profile hash: `sha256(PROFILE_HASH_DOMAIN + canonical bytes)`, or with
-    /// [`PROFILE_HASH_DOMAIN_V2`] when `tools` is non-empty. Tools hash in sorted order.
+    /// [`PROFILE_HASH_DOMAIN_V2`] when `tools` is non-empty, or with
+    /// [`PROFILE_HASH_DOMAIN_V3`] when `selection` or `authored_prompt` is set (v3 wins over
+    /// v2). Tools hash in sorted order. Owner and visibility are not Profile fields and never
+    /// enter the hash.
     pub fn hash(&self) -> ProfileHash {
         let mut hasher = Sha256::new();
-        hasher.update(if self.tools.is_empty() {
-            PROFILE_HASH_DOMAIN
-        } else {
-            PROFILE_HASH_DOMAIN_V2
-        });
+        hasher.update(
+            if !self.selection.is_empty() || self.authored_prompt.is_some() {
+                PROFILE_HASH_DOMAIN_V3
+            } else if self.tools.is_empty() {
+                PROFILE_HASH_DOMAIN
+            } else {
+                PROFILE_HASH_DOMAIN_V2
+            },
+        );
         hasher.update(self.canonical_json());
         ProfileHash(hasher.finalize().into())
     }
@@ -528,6 +544,116 @@ mod tests {
             p.hash().to_string(),
             "ae3b72b934976ade67b839a89fe9467ab263185bf98f8b4e8bc2640bee3dd85d"
         );
+    }
+
+    #[test]
+    fn golden_hashes_of_existing_shapes() {
+        assert_eq!(
+            parse(FULL).hash().to_string(),
+            "953f0c1f80437603baf0fba5868d12631a4e82651140146fa7ab4edd6c165baf"
+        );
+        assert_eq!(
+            toml_profile(&[("node", "20.11.1")]).hash().to_string(),
+            "24ce7d5f92a8a1c8baca4b4c73e0fe2b62c325b8199ac55b50ced10ec9be72ef"
+        );
+    }
+
+    fn with_opt_out(ids: &[&str], prompt: Option<&str>) -> Profile {
+        let entries: Vec<Value> = ids
+            .iter()
+            .map(|id| serde_json::json!({"item_id": id, "enabled": false}))
+            .collect();
+        let mut value = serde_json::json!({ "selection": entries });
+        if let Some(text) = prompt {
+            value["authored_prompt"] = text.into();
+        }
+        parse(&value.to_string())
+    }
+
+    fn v3_hash(p: &Profile) -> [u8; 32] {
+        let mut hasher = Sha256::new();
+        hasher.update(PROFILE_HASH_DOMAIN_V3);
+        hasher.update(p.canonical_json());
+        hasher.finalize().into()
+    }
+
+    #[test]
+    fn selection_or_prompt_use_the_v3_prefix() {
+        for p in [
+            with_opt_out(&["a"], None),
+            with_opt_out(&[], Some("hi")),
+            with_opt_out(&["a"], Some("hi")),
+        ] {
+            assert_eq!(p.hash().as_bytes(), &v3_hash(&p));
+        }
+        let mut tools = toml_profile(&[("node", "20.11.1")]);
+        tools.selection = with_opt_out(&["a"], None).selection;
+        assert_eq!(tools.hash().as_bytes(), &v3_hash(&tools));
+    }
+
+    #[test]
+    fn absent_selection_and_prompt_keep_old_prefixes() {
+        let p = parse(FULL);
+        let mut v1 = Sha256::new();
+        v1.update(PROFILE_HASH_DOMAIN);
+        v1.update(p.canonical_json());
+        assert_eq!(p.hash().as_bytes(), &<[u8; 32]>::from(v1.finalize()));
+        assert_ne!(p.hash().as_bytes(), &v3_hash(&p));
+    }
+
+    #[test]
+    fn selection_and_prompt_each_change_the_hash() {
+        let base = parse(FULL);
+        let mut with_selection = base.clone();
+        with_selection.selection = with_opt_out(&["a"], None).selection;
+        let mut other_selection = base.clone();
+        other_selection.selection = with_opt_out(&["b"], None).selection;
+        let mut with_prompt = base.clone();
+        with_prompt.authored_prompt = with_opt_out(&[], Some("hi")).authored_prompt;
+        let mut other_prompt = base.clone();
+        other_prompt.authored_prompt = with_opt_out(&[], Some("ho")).authored_prompt;
+        let all = [
+            base.hash(),
+            with_selection.hash(),
+            other_selection.hash(),
+            with_prompt.hash(),
+            other_prompt.hash(),
+        ];
+        for (i, a) in all.iter().enumerate() {
+            for b in &all[i + 1..] {
+                assert_ne!(a, b);
+            }
+        }
+    }
+
+    #[test]
+    fn selection_order_does_not_change_the_hash() {
+        assert_eq!(
+            with_opt_out(&["a", "b"], None).hash(),
+            with_opt_out(&["b", "a"], None).hash()
+        );
+    }
+
+    #[test]
+    fn empty_authored_prompt_is_refused() {
+        assert_eq!(
+            Profile::from_json(br#"{"authored_prompt":""}"#),
+            Err(ProfileError::Malformed)
+        );
+        assert_eq!(
+            Profile::from_json(br#"{"authored_prompt":"a\u0000b"}"#),
+            Err(ProfileError::Malformed)
+        );
+    }
+
+    #[test]
+    fn selection_and_prompt_round_trip() {
+        let p = with_opt_out(&["a", "b"], Some("be brief"));
+        assert_eq!(
+            p.canonical_json(),
+            br#"{"authored_prompt":"be brief","selection":[{"enabled":false,"item_id":"a"},{"enabled":false,"item_id":"b"}]}"#
+        );
+        assert_eq!(Profile::from_json(&p.canonical_json()).unwrap(), p);
     }
 
     #[test]
@@ -1078,6 +1204,23 @@ fn is_refused_char(c: char) -> bool {
 /// backslash and non-ASCII text are allowed.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct PromptText(String);
+
+impl Serialize for PromptText {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(&self.0)
+    }
+}
+
+impl<'de> Deserialize<'de> for PromptText {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let raw = String::deserialize(deserializer)?;
+        match Self::new(&raw) {
+            Ok(Some(text)) => Ok(text),
+            Ok(None) => Err(de::Error::custom("prompt text is empty")),
+            Err(err) => Err(de::Error::custom(err)),
+        }
+    }
+}
 
 impl PromptText {
     /// Longest text in bytes.
