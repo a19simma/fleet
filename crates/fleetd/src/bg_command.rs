@@ -11,7 +11,10 @@
 //! fails [`MAX_POLL_ERRORS`] times in a row or the task vanishes from the status, the task is
 //! closed with the matching [`EndedBy`].
 //!
-//! Log text is untrusted. It is read with a byte cap, passed through the
+//! Log text is untrusted. It is read with a byte cap larger than the output cap. The whole read
+//! is redacted first, so a secret that straddles the output cap is replaced whole. A cut read
+//! then loses its last [`LOG_TAIL_GUARD`] bytes, so a secret split by the read cap leaves no
+//! fragment. The text is passed through the
 //! [`ShellRecorder`](crate::shell_timing::ShellRecorder) (NUL strip, redaction, then cut), and
 //! has its control characters other than newline and tab replaced by `?` after redaction.
 //!
@@ -43,8 +46,14 @@ pub const CALL_TIMEOUT: Duration = Duration::from_secs(10);
 pub const MAX_POLL_ERRORS: u32 = 5;
 /// Most tasks tracked at once.
 pub const MAX_TRACKED_TASKS: usize = MAX_SHELL_COMMANDS;
-/// Bytes read past the kept log, dropped when the read was cut, so a secret split by the cut
+/// Bytes dropped from the end of a cut read after redaction, so a secret split by the read cap
 /// leaves no fragment.
+///
+/// The [`Redactor`] states no longest secret: [`fleet_core::MIN_SECRET_LEN`] is a floor and
+/// its values come from an env file with no upper bound. The guard is therefore the bound this
+/// module enforces: a secret of at most `LOG_TAIL_GUARD + 1` bytes that the read cap splits
+/// leaves a fragment shorter than the guard, and the guard removes it. 4096 bytes holds a
+/// 4096-bit RSA private key in PEM form (about 3.2 KiB). A longer secret is outside the bound.
 pub const LOG_TAIL_GUARD: usize = 4096;
 /// Most log bytes read for one task.
 pub const LOG_READ_CAP: usize = MAX_SHELL_LOG_BYTES + 1 + LOG_TAIL_GUARD;
@@ -522,6 +531,7 @@ pub struct BgWatcher<C> {
     baseline: u64,
     tracked: BTreeMap<u64, Tracked>,
     recorder: ShellRecorder,
+    redactor: Redactor,
     records: Vec<BgRecord>,
     untracked: u64,
     errors: u32,
@@ -562,7 +572,8 @@ impl<C: PueueClient> BgWatcher<C> {
             anchor,
             baseline,
             tracked: BTreeMap::new(),
-            recorder: ShellRecorder::new(redactor),
+            recorder: ShellRecorder::new(redactor.clone()),
+            redactor,
             records: Vec::new(),
             untracked: 0,
             errors: 0,
@@ -649,14 +660,20 @@ impl<C: PueueClient> BgWatcher<C> {
 
     async fn read_log(&self, id: u64) -> (String, bool, bool) {
         let call = self.client.log(id, LOG_READ_CAP + 1);
-        let Ok(Ok(mut raw)) = tokio::time::timeout(self.config.call_timeout, call).await else {
+        let Ok(Ok(raw)) = tokio::time::timeout(self.config.call_timeout, call).await else {
             return (String::new(), false, true);
         };
         let cut = raw.len() > LOG_READ_CAP;
+        let text = String::from_utf8_lossy(&raw).replace('\0', "");
+        let mut text = self.redactor.redact_str(&text).into_owned();
         if cut {
-            raw.truncate(MAX_SHELL_LOG_BYTES + 1);
+            let mut end = text.len().saturating_sub(LOG_TAIL_GUARD);
+            while !text.is_char_boundary(end) {
+                end -= 1;
+            }
+            text.truncate(end);
         }
-        (String::from_utf8_lossy(&raw).into_owned(), cut, false)
+        (text, cut, false)
     }
 
     async fn close(&mut self, id: u64, ended_by: EndedBy, now: Instant) {

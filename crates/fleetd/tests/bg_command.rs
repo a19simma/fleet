@@ -77,7 +77,11 @@ impl PueueClient for &Fake {
             .expect("lock")
             .get(&id)
             .cloned()
-            .unwrap_or(Ok(Vec::new()));
+            .unwrap_or(Ok(Vec::new()))
+            .map(|mut bytes| {
+                bytes.truncate(max_bytes);
+                bytes
+            });
         std::future::ready(out)
     }
 }
@@ -573,6 +577,61 @@ async fn a_secret_straddling_the_read_cap_leaves_no_fragment() {
         assert!(cut, "{back}");
         let calls = fake.log_calls.lock().expect("lock");
         assert_eq!(calls[0], (1, LOG_READ_CAP + 1), "{back}");
+    }
+}
+
+fn assert_no_secret_fragment(out: &str, label: &str) {
+    for k in 4..=SECRET.len() {
+        assert!(!out.contains(&SECRET[..k]), "{label}: prefix {k}");
+        assert!(
+            !out.contains(&SECRET[SECRET.len() - k..]),
+            "{label}: suffix {k}"
+        );
+    }
+}
+
+fn filler(len: usize) -> String {
+    let mut text = ". ".repeat(len / 2);
+    while text.len() < len {
+        text.push('.');
+    }
+    text
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_cut_read_hides_a_secret_straddling_the_output_cap_at_every_offset() {
+    for back in 1..SECRET.len() {
+        let mut text = filler(MAX_SHELL_LOG_BYTES - back);
+        text.push_str(SECRET);
+        let pad = LOG_READ_CAP + 200 - text.len();
+        text.push_str(&filler(pad));
+        assert!(text.len() > LOG_READ_CAP);
+        let (out, cut, _) = output_of(&hostile_log(text.into_bytes())).await;
+        assert!(cut, "{back}");
+        assert!(out.len() <= MAX_SHELL_LOG_BYTES, "{back}");
+        assert_no_secret_fragment(&out, &format!("cap {back}"));
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_cut_read_hides_a_secret_straddling_the_read_cap_at_every_offset() {
+    let copies = 400;
+    for back in 0..=SECRET.len() + 1 {
+        let mut text = String::new();
+        for _ in 0..copies {
+            text.push_str(SECRET);
+            text.push('.');
+        }
+        let start = LOG_READ_CAP + 1 - back;
+        text.push_str(&filler(start - text.len()));
+        text.push_str(SECRET);
+        text.push_str(&filler(200));
+        assert!(text.len() > LOG_READ_CAP + 1);
+        let (out, cut, _) = output_of(&hostile_log(text.into_bytes())).await;
+        assert!(cut, "{back}");
+        assert!(out.len() <= MAX_SHELL_LOG_BYTES, "{back}");
+        assert!(out.len() > 10_000, "{back}: {}", out.len());
+        assert_no_secret_fragment(&out, &format!("read {back}"));
     }
 }
 
