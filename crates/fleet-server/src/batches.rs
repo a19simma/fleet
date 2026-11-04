@@ -23,12 +23,17 @@ const SELECT_BATCH_BY_ID: &str = "SELECT prompt, repo, base_sha, repeats, \
      (EXTRACT(EPOCH FROM created_at) * 1000)::bigint AS created_at_ms FROM batch WHERE batch_id = $1";
 const SELECT_BATCH_JOB_IDS: &str = "SELECT job_id FROM jobs WHERE batch_id = $1 \
      AND ($3::bigint IS NULL OR user_id = $3) ORDER BY batch_pos LIMIT $2";
-const LOCK_NAME: &str = "SELECT pg_advisory_xact_lock(hashtextextended($1, 0))";
-const SELECT_LATEST: &str =
-    "SELECT version, hash FROM profile_version WHERE name = $1 ORDER BY version DESC LIMIT 1";
+const LOCK_OWNER: &str = "SELECT id FROM users WHERE id = $1 FOR SHARE";
+const LOCK_VISIBLE_PROFILE: &str = "SELECT id FROM profile \
+     WHERE name = $1 AND (owner_user_id = $2 OR visibility = 'shared') \
+     ORDER BY (owner_user_id = $2) DESC, id LIMIT 1 FOR SHARE";
+const LOCK_PROFILE_ID: &str = "SELECT pg_advisory_xact_lock($1)";
+const SELECT_LATEST: &str = "SELECT version, hash FROM profile_version WHERE profile_id = $1 \
+     ORDER BY version DESC LIMIT 1";
 const INSERT_BATCH_JOB: &str = "INSERT INTO jobs (job_id, prompt, repo, base_ref, branch, open_pr, \
-     batch_id, repeat_idx, batch_pos, profile_name, profile_version, profile_hash, user_id, agent) \
-     VALUES ($1, $2, $3, $4, 'swarm/' || $1, false, $5, 0, $6, $7, $8, $9, $10, $11)";
+     batch_id, repeat_idx, batch_pos, profile_name, profile_id, profile_version, profile_hash, \
+     user_id, agent) \
+     VALUES ($1, $2, $3, $4, 'swarm/' || $1, false, $5, 0, $6, $7, $8, $9, $10, $11, $12)";
 const SELECT_BOOTSTRAP_USER: &str = "SELECT bootstrap_user_id()";
 
 /// Why a batch request was refused. The variants carry no client input.
@@ -165,6 +170,56 @@ pub(crate) async fn get_head(
     Ok((reply, ids))
 }
 
+struct Pin {
+    profile_id: i64,
+    version: i32,
+    hash: Vec<u8>,
+}
+
+async fn pin_profiles(
+    tx: &mut sqlx::PgConnection,
+    owner: i64,
+    names: &[String],
+) -> Result<Vec<Pin>, StoreError> {
+    sqlx::query(LOCK_OWNER)
+        .bind(owner)
+        .fetch_optional(&mut *tx)
+        .await?
+        .ok_or(StoreError::UnknownProfile)?;
+    let mut ids = Vec::with_capacity(names.len());
+    for name in names {
+        let id: i64 = sqlx::query_scalar(LOCK_VISIBLE_PROFILE)
+            .bind(name)
+            .bind(owner)
+            .fetch_optional(&mut *tx)
+            .await?
+            .ok_or(StoreError::UnknownProfile)?;
+        ids.push(id);
+    }
+    let mut order = ids.clone();
+    order.sort_unstable();
+    for id in order {
+        sqlx::query(LOCK_PROFILE_ID)
+            .bind(id)
+            .execute(&mut *tx)
+            .await?;
+    }
+    let mut pins = Vec::with_capacity(ids.len());
+    for profile_id in ids {
+        let row = sqlx::query(SELECT_LATEST)
+            .bind(profile_id)
+            .fetch_optional(&mut *tx)
+            .await?
+            .ok_or(StoreError::UnknownProfile)?;
+        pins.push(Pin {
+            profile_id,
+            version: row.try_get("version")?,
+            hash: row.try_get("hash")?,
+        });
+    }
+    Ok(pins)
+}
+
 pub(crate) async fn submit(
     pool: &PgPool,
     owner: Option<i64>,
@@ -221,18 +276,9 @@ pub(crate) async fn submit(
             created: false,
         });
     }
-    let mut order: Vec<&String> = batch.profiles.iter().collect();
-    order.sort();
-    for name in order {
-        sqlx::query(LOCK_NAME).bind(name).execute(&mut *tx).await?;
-    }
-    let mut job_ids = Vec::with_capacity(batch.profiles.len());
-    for (pos, name) in batch.profiles.iter().enumerate() {
-        let pinned = sqlx::query(SELECT_LATEST)
-            .bind(name)
-            .fetch_optional(&mut *tx)
-            .await?
-            .ok_or(StoreError::UnknownProfile)?;
+    let pins = pin_profiles(&mut tx, owner, &batch.profiles).await?;
+    let mut job_ids = Vec::with_capacity(pins.len());
+    for (pos, (name, pin)) in batch.profiles.iter().zip(pins).enumerate() {
         let job_id = EventId::generate().to_string();
         sqlx::query(INSERT_BATCH_JOB)
             .bind(&job_id)
@@ -242,8 +288,9 @@ pub(crate) async fn submit(
             .bind(&batch_id)
             .bind(i32::try_from(pos).map_err(|_| StoreError::OutOfRange("batch position"))?)
             .bind(name)
-            .bind(pinned.try_get::<i32, _>("version")?)
-            .bind(pinned.try_get::<Vec<u8>, _>("hash")?)
+            .bind(pin.profile_id)
+            .bind(pin.version)
+            .bind(pin.hash)
             .bind(owner)
             .bind(batch.agent)
             .execute(&mut *tx)

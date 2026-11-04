@@ -318,7 +318,8 @@ async fn a_pinned_hash_that_does_not_match_the_version_fails_closed(pool: PgPool
     let job = claim(&mut worker, &name(1)).await;
     sqlx::query(
         "UPDATE jobs SET profile_version = 1, \
-         profile_hash = (SELECT hash FROM profile_version WHERE name = 'alpha' AND version = 2)",
+         profile_hash = (SELECT v.hash FROM profile_version v JOIN profile p ON p.id = v.profile_id \
+         WHERE p.name = 'alpha' AND v.version = 2)",
     )
     .execute(&pool)
     .await
@@ -369,4 +370,59 @@ async fn a_blob_over_the_default_client_limit_round_trips(pool: PgPool) {
         .await
         .unwrap_err();
     assert_eq!(err.code(), Code::OutOfRange);
+}
+
+#[sqlx::test]
+async fn the_blob_follows_the_pin_of_either_owner(pool: PgPool) {
+    let store = store(pool.clone()).await;
+    let alice: i64 =
+        sqlx::query_scalar("INSERT INTO users (username) VALUES ('alice') RETURNING id")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    let bob: i64 = sqlx::query_scalar("INSERT INTO users (username) VALUES ('bob') RETURNING id")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    for (owner, json) in [(alice, ONE), (bob, TWO)] {
+        fleet_server::profiles::create_owned(
+            &pool,
+            Some(owner),
+            "alpha",
+            ProfileContent::Json(json),
+            false,
+        )
+        .await
+        .unwrap();
+    }
+    let mut worker = worker(serve(&store), as_box);
+    for (n, (owner, json)) in [(alice, ONE), (bob, TWO)].into_iter().enumerate() {
+        let request = SubmitBatchRequest {
+            idempotency_key: format!("key-{owner}"),
+            prompt: "fix the bug".to_owned(),
+            repo: REPO.to_owned(),
+            base_sha: SHA.to_owned(),
+            repeats: 0,
+            profiles: vec!["alpha".to_owned()],
+            agent: String::new(),
+        };
+        let id = store
+            .submit_batch_for(Some(owner), &request)
+            .await
+            .unwrap()
+            .job_ids
+            .remove(0);
+        let box_name = name(u32::try_from(n).unwrap() + 1);
+        let job = claim(&mut worker, &box_name).await;
+        assert_eq!(job.job_id, id);
+        let reply = worker
+            .get_profile_blob(blob(&id, job.attempt, &box_name))
+            .await
+            .unwrap()
+            .into_inner();
+        let expected = fleet_core::Profile::from_json(json.as_bytes())
+            .unwrap()
+            .canonical_json();
+        assert_eq!(reply.content, expected);
+    }
 }
