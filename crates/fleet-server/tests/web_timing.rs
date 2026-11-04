@@ -161,6 +161,24 @@ impl Harness {
         .unwrap();
     }
 
+    async fn report(&self, job_id: &str, parts: [i64; 5]) {
+        let wall: i64 = parts.iter().sum();
+        sqlx::query(
+            "INSERT INTO job_timing (job_id, wall_ms, api_wait_ms, tool_ms, shell_ms, idle_ms, \
+             overhead_ms) VALUES ($1, $2, $3, $4, $5, $6, $7)",
+        )
+        .bind(job_id)
+        .bind(wall)
+        .bind(parts[0])
+        .bind(parts[1])
+        .bind(parts[2])
+        .bind(parts[3])
+        .bind(parts[4])
+        .execute(&self.pool)
+        .await
+        .unwrap();
+    }
+
     async fn get(&self, who: Option<&Session>, path: &str, extra: &[(&str, &str)]) -> Reply {
         let mut stream = TcpStream::connect(self.addr).await.unwrap();
         let mut request = format!(
@@ -449,5 +467,107 @@ async fn a_long_line_is_cut_and_a_split_character_is_kept(pool: PgPool) {
     assert!(reply.body.contains("\u{2026}"));
     assert!(reply.body.contains("\u{20ac}-end"));
     assert!(!reply.body.contains('\u{fffd}'));
+    h.finish().await;
+}
+
+#[sqlx::test]
+async fn the_timing_panel_shows_every_field_bar_and_escaped_commands(pool: PgPool) {
+    let h = Harness::start(pool, true).await;
+    let alice = h.session("alice", 'a').await;
+    let job = h.job(&alice, "k1").await;
+    h.report(&job, [1000, 2000, 3000, 4000, 5000]).await;
+    h.command_text(&job, "t-run", HOSTILE).await;
+    let reply = h
+        .get(Some(&alice), &format!("/jobs/{job}/timing"), &[])
+        .await;
+    assert_eq!(reply.status, 200);
+    for field in fleet_core::timing::FIELDS {
+        assert!(
+            reply
+                .body
+                .contains(&format!("data-field=\"{}\"", field.key)),
+            "{}",
+            field.key
+        );
+        assert!(reply.body.contains(field.label), "{}", field.label);
+    }
+    let row = |key: &str| {
+        reply
+            .body
+            .split("<tr")
+            .find(|row| row.contains(&format!("data-field=\"{key}\"")))
+            .unwrap_or_else(|| panic!("no row {key}"))
+            .to_owned()
+    };
+    assert!(row("api_wait").contains("1.0s") && row("api_wait").contains("6.7%"));
+    assert!(row("overhead").contains("5.0s") && row("overhead").contains("33.3%"));
+    assert!(row("total").contains("15.0s"));
+    assert!(row("commands").contains(">1<"));
+    assert!(reply.body.contains("id=\"timing-bar\""));
+    assert_eq!(reply.body.matches("<rect").count(), 5);
+    assert!(reply.body.contains("x=\"67\"") && reply.body.contains("width=\"333\""));
+    assert!(!reply.body.contains("<script>alert"));
+    assert!(reply.body.contains("&lt;script&gt;alert"));
+    assert!(!reply.body.contains("style="));
+    h.finish().await;
+}
+
+#[sqlx::test]
+async fn a_job_without_a_report_shows_the_absent_state_not_zeros(pool: PgPool) {
+    let h = Harness::start(pool, true).await;
+    let alice = h.session("alice", 'a').await;
+    let job = h.job(&alice, "k1").await;
+    let reply = h
+        .get(Some(&alice), &format!("/jobs/{job}/timing"), &[])
+        .await;
+    assert_eq!(reply.status, 200);
+    assert!(reply.body.contains("No timing reported for this job."));
+    assert!(!reply.body.contains("data-field="));
+    assert!(!reply.body.contains("id=\"timing-bar\""));
+    h.finish().await;
+}
+
+#[sqlx::test]
+async fn an_all_zero_report_renders_without_a_bar_or_division(pool: PgPool) {
+    let h = Harness::start(pool, true).await;
+    let alice = h.session("alice", 'a').await;
+    let job = h.job(&alice, "k1").await;
+    h.report(&job, [0, 0, 0, 0, 0]).await;
+    let reply = h
+        .get(Some(&alice), &format!("/jobs/{job}/timing"), &[])
+        .await;
+    assert_eq!(reply.status, 200);
+    assert!(reply.body.contains("data-field=\"total\""));
+    assert!(reply.body.contains("0.0%"));
+    assert_eq!(reply.body.matches("<rect").count(), 0);
+    assert!(!reply.body.contains("No timing reported"));
+    h.finish().await;
+}
+
+#[sqlx::test]
+async fn another_users_timing_report_is_not_shown(pool: PgPool) {
+    let h = Harness::start(pool, true).await;
+    let alice = h.session("alice", 'a').await;
+    let bob = h.session("bob", 'b').await;
+    let job = h.job(&alice, "k1").await;
+    h.report(&job, [1111, 2222, 3333, 4444, 5555]).await;
+    let foreign = h.get(Some(&bob), &format!("/jobs/{job}/timing"), &[]).await;
+    let unknown = h
+        .get(Some(&bob), &format!("/jobs/{}/timing", "0".repeat(26)), &[])
+        .await;
+    assert_eq!(foreign.status, 404);
+    assert_eq!(foreign.body, unknown.body);
+    assert!(!foreign.body.contains("data-field="));
+    h.finish().await;
+}
+
+#[sqlx::test]
+async fn the_job_page_links_to_the_timing_page(pool: PgPool) {
+    let h = Harness::start(pool, true).await;
+    let alice = h.session("alice", 'a').await;
+    let job = h.job(&alice, "k1").await;
+    let reply = h.get(Some(&alice), &format!("/jobs/{job}"), &[]).await;
+    assert_eq!(reply.status, 200);
+    assert!(reply.body.contains(&format!("href=\"/jobs/{job}/timing\"")));
     h.finish().await;
 }
