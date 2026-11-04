@@ -58,7 +58,9 @@ Terms: **wall** is the Job window, claim to finish. The **agent window** is the 
 4. `overhead` is wall minus the agent window: clone, setup, push, pull request and teardown.
 5. `api_wait + tool + shell + idle + overhead = wall` by construction, from merged intervals and subtraction. A parallel subagent span that overlaps another merges instead of adding twice.
 
-`fleet-core` owns the function. The server recomputes it from the received spans and refuses a summary that differs, whose parts do not sum to wall, or whose spans fall outside the Job window.
+`fleet-core` owns the function. Every time on the wire is job-relative milliseconds: the Job window is `0..wall_ms`, 0 is the claim as the box saw it, and no field is epoch time. `ReportTimingRequest` carries the agent window as `agent_start_ms` and `agent_end_ms` in that base.
+
+The server checks, in order, that the lease is held, that the parts sum to wall, that the wall window does not run past the server clock plus the tolerance, that every span ends within the tolerance of wall, and that `agent_start_ms <= agent_end_ms <= wall_ms`. It then runs the aggregate over the received spans with the Job window `0..wall_ms` and exactly the carried agent window, and refuses a summary that differs. The refusals use fixed reasons and nothing is written. A box that sends no window carries `0..0`, which means the agent never ran, so only an all-overhead summary matches.
 
 ### Failure handling
 

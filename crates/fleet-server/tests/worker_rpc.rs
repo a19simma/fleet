@@ -355,6 +355,8 @@ fn timing(job_id: &str, attempt: u32, _claimed_ms: u64) -> ReportTimingRequest {
             overhead_ms: parts.overhead_ms,
         }),
         spans,
+        agent_start_ms: 0,
+        agent_end_ms: TIMING_WALL_MS,
         ..ReportTimingRequest::default()
     }
 }

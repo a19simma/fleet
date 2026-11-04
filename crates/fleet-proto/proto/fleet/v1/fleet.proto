@@ -564,6 +564,13 @@ message ShellCommand {
   optional string ended_by = 10;
 }
 
+// Time base: every start_ms and end_ms in a report is job-relative milliseconds. The job
+// window is 0 to summary.wall_ms, with 0 at the claim as the box saw it. No field is epoch time.
+// agent_start_ms and agent_end_ms bound the agent window, from agent child start to its exit, in
+// that same base. They must satisfy agent_start_ms <= agent_end_ms <= summary.wall_ms. The server
+// runs the core aggregate over the spans with the job window and this agent window and refuses
+// a summary that differs. A report from a box that sends neither field carries the window 0 to 0,
+// which means the agent never ran, so only an all-overhead summary matches.
 message ReportTimingRequest {
   string job_id = 1;
   uint32 attempt = 2;
@@ -571,6 +578,8 @@ message ReportTimingRequest {
   TimingSummary summary = 4;
   repeated TimingSpan spans = 5;
   repeated ShellCommand shell_commands = 6;
+  uint64 agent_start_ms = 7;
+  uint64 agent_end_ms = 8;
 }
 
 message ReportTimingReply {}

@@ -16,8 +16,8 @@ use fleet_proto::{
     MAX_COMMAND_BYTES, MAX_SHELL_COMMANDS, MAX_SHELL_LOG_BYTES, MAX_SPANS, MAX_TIMING_NAME_BYTES,
 };
 use fleet_server::timing::{
-    REASON_PARTS_SUM, REASON_SPAN_OUTSIDE, REASON_WINDOW_AHEAD, WINDOW_TOLERANCE_MS,
-    read_job_timing, store_timing,
+    REASON_AGENT_WINDOW, REASON_PARTS_SUM, REASON_SPAN_OUTSIDE, REASON_SUMMARY_MISMATCH,
+    REASON_WINDOW_AHEAD, WINDOW_TOLERANCE_MS, read_job_timing, store_timing,
 };
 use sqlx::{PgPool, Row};
 use tonic::Code;
@@ -108,6 +108,8 @@ fn request(extra: u64, spans: Vec<TimingSpan>, commands: Vec<ShellCommand>) -> R
         summary: Some(summary(WALL_BASE + extra, &spans)),
         spans,
         shell_commands: commands,
+        agent_start_ms: 0,
+        agent_end_ms: WALL_BASE + extra,
     }
 }
 
@@ -700,6 +702,8 @@ async fn a_gathered_request_shaped_report_is_accepted(pool: PgPool) {
     let parts = aggregate(&core, Interval::new(0, wall).unwrap(), agent);
     assert_eq!(parts.overhead_ms, 9_000);
     let mut report = request(0, spans, vec![]);
+    report.agent_start_ms = 4_000;
+    report.agent_end_ms = 55_000;
     report.summary = Some(TimingSummary {
         wall_ms: wall,
         api_wait_ms: parts.api_wait_ms,
@@ -726,6 +730,7 @@ async fn a_wall_that_runs_past_now_is_refused_with_the_exact_reason(pool: PgPool
     };
     refused(&pool, &ahead, REASON_WINDOW_AHEAD, "ahead").await;
     let mut inside = ahead.clone();
+    inside.agent_end_ms = 0;
     let near = now - CLAIMED_MS;
     *inside.summary.as_mut().unwrap() = TimingSummary {
         wall_ms: near,
@@ -814,6 +819,7 @@ async fn a_job_without_a_report_reads_as_absent_not_zeros(pool: PgPool) {
     assert!(reply.spans.is_empty() && reply.shell_commands.is_empty());
     let zero = ReportTimingRequest {
         summary: Some(TimingSummary::default()),
+        agent_end_ms: 0,
         ..request(0, vec![], vec![])
     };
     store_timing(&pool, &lease_box(), &zero).await.unwrap();
@@ -935,4 +941,162 @@ async fn printable_hostile_ids_are_inert_and_read_as_not_found(pool: PgPool) {
         assert_eq!(err.code(), unknown.code(), "{id}");
         assert_eq!(err.message(), unknown.message(), "{id}");
     }
+}
+
+type Bucket = fn(&mut TimingSummary) -> &mut u64;
+
+const IDLE_BOTH_ENDS_WALL: u64 = 10_000;
+
+fn idle_both_ends() -> ReportTimingRequest {
+    let spans = vec![
+        TimingSpan {
+            kind: TimingSpanKind::Api as i32,
+            ..tool_span(2_000, 3_000)
+        },
+        tool_span(3_000, 4_000),
+        TimingSpan {
+            kind: TimingSpanKind::Shell as i32,
+            ..tool_span(4_000, 5_000)
+        },
+    ];
+    let core: Vec<Span> = spans
+        .iter()
+        .map(|s| Span {
+            kind: core_kind(s.kind),
+            interval: Interval::new(s.start_ms, s.end_ms).unwrap(),
+        })
+        .collect();
+    let job = Interval::new(0, IDLE_BOTH_ENDS_WALL).unwrap();
+    let parts = aggregate(&core, job, Interval::new(1_000, 9_000).unwrap());
+    assert_eq!(
+        [
+            parts.api_wait_ms,
+            parts.tool_ms,
+            parts.shell_ms,
+            parts.idle_ms,
+            parts.overhead_ms
+        ],
+        [1_000, 1_000, 1_000, 5_000, 2_000]
+    );
+    ReportTimingRequest {
+        summary: Some(TimingSummary {
+            wall_ms: IDLE_BOTH_ENDS_WALL,
+            api_wait_ms: parts.api_wait_ms,
+            tool_ms: parts.tool_ms,
+            shell_ms: parts.shell_ms,
+            idle_ms: parts.idle_ms,
+            overhead_ms: parts.overhead_ms,
+        }),
+        agent_start_ms: 1_000,
+        agent_end_ms: 9_000,
+        spans,
+        ..request(0, vec![], vec![])
+    }
+}
+
+#[sqlx::test]
+async fn an_honest_report_with_idle_time_at_both_ends_of_the_agent_window_is_accepted(
+    pool: PgPool,
+) {
+    sqlx::migrate!().run(&pool).await.unwrap();
+    running_job(&pool).await;
+    store_timing(&pool, &lease_box(), &idle_both_ends())
+        .await
+        .unwrap();
+    assert_eq!(counts(&pool).await, (1, 3, 0));
+}
+
+#[sqlx::test]
+async fn an_agent_window_outside_the_job_window_is_refused_with_the_exact_reason(pool: PgPool) {
+    sqlx::migrate!().run(&pool).await.unwrap();
+    running_job(&pool).await;
+    let honest = idle_both_ends();
+    let mut cases = Vec::new();
+    let mut past = honest.clone();
+    past.agent_end_ms = IDLE_BOTH_ENDS_WALL + 1;
+    cases.push(("end one past wall", past));
+    let mut huge = honest.clone();
+    huge.agent_end_ms = u64::MAX;
+    cases.push(("end u64 max", huge));
+    let mut reversed = honest.clone();
+    reversed.agent_start_ms = honest.agent_end_ms + 1;
+    cases.push(("start after end", reversed));
+    let mut start_past = honest.clone();
+    start_past.agent_start_ms = IDLE_BOTH_ENDS_WALL + 1;
+    start_past.agent_end_ms = IDLE_BOTH_ENDS_WALL + 1;
+    cases.push(("both past wall", start_past));
+    for (label, bad) in cases {
+        refused(&pool, &bad, REASON_AGENT_WINDOW, label).await;
+    }
+    store_timing(&pool, &lease_box(), &honest).await.unwrap();
+    assert_eq!(counts(&pool).await, (1, 3, 0));
+}
+
+#[sqlx::test]
+async fn a_summary_that_differs_by_one_ms_in_any_bucket_is_refused_with_the_exact_reason(
+    pool: PgPool,
+) {
+    sqlx::migrate!().run(&pool).await.unwrap();
+    running_job(&pool).await;
+    let honest = idle_both_ends();
+    let buckets: [(&str, Bucket); 5] = [
+        ("api", |s| &mut s.api_wait_ms),
+        ("tool", |s| &mut s.tool_ms),
+        ("shell", |s| &mut s.shell_ms),
+        ("idle", |s| &mut s.idle_ms),
+        ("overhead", |s| &mut s.overhead_ms),
+    ];
+    for (up_label, up) in buckets {
+        for (down_label, down) in buckets {
+            if up_label == down_label {
+                continue;
+            }
+            let mut r = honest.clone();
+            let parts = r.summary.as_mut().unwrap();
+            *up(parts) += 1;
+            *down(parts) -= 1;
+            refused(
+                &pool,
+                &r,
+                REASON_SUMMARY_MISMATCH,
+                &format!("{up_label} up {down_label} down"),
+            )
+            .await;
+        }
+    }
+    store_timing(&pool, &lease_box(), &honest).await.unwrap();
+    assert_eq!(counts(&pool).await, (1, 3, 0));
+}
+
+#[sqlx::test]
+async fn a_report_that_sends_no_agent_window_means_the_agent_never_ran(pool: PgPool) {
+    sqlx::migrate!().run(&pool).await.unwrap();
+    running_job(&pool).await;
+    let mut old = idle_both_ends();
+    old.agent_start_ms = 0;
+    old.agent_end_ms = 0;
+    refused(&pool, &old, REASON_SUMMARY_MISMATCH, "old reporter").await;
+    let mut never_ran = idle_both_ends();
+    never_ran.agent_start_ms = 0;
+    never_ran.agent_end_ms = 0;
+    never_ran.spans.clear();
+    never_ran.summary = Some(TimingSummary {
+        wall_ms: IDLE_BOTH_ENDS_WALL,
+        overhead_ms: IDLE_BOTH_ENDS_WALL,
+        ..TimingSummary::default()
+    });
+    store_timing(&pool, &lease_box(), &never_ran).await.unwrap();
+    assert_eq!(counts(&pool).await, (1, 0, 0));
+}
+
+#[sqlx::test]
+async fn the_lease_check_still_comes_before_the_window_checks(pool: PgPool) {
+    sqlx::migrate!().run(&pool).await.unwrap();
+    running_job(&pool).await;
+    let mut bad = idle_both_ends();
+    bad.agent_end_ms = u64::MAX;
+    let other = BoxName::new(&format!("box-{}", 2)).unwrap();
+    let err = store_timing(&pool, &other, &bad).await.unwrap_err();
+    assert_eq!(err.code(), Code::FailedPrecondition);
+    assert_eq!(counts(&pool).await, (0, 0, 0));
 }

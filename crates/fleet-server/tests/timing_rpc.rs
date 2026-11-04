@@ -12,7 +12,9 @@ use std::net::SocketAddr;
 use fleet_proto::v1::fleet_jobs_client::FleetJobsClient;
 use fleet_proto::v1::fleet_jobs_server::FleetJobs;
 use fleet_proto::v1::fleet_worker_client::FleetWorkerClient;
-use fleet_proto::v1::{GetJobTimingRequest, ReportTimingRequest, TimingSummary};
+use fleet_proto::v1::{
+    GetJobTimingRequest, ReportTimingRequest, TimingSpan, TimingSpanKind, TimingSummary,
+};
 use fleet_server::auth::{BearerAuth, Caller};
 use fleet_server::config::Token;
 use fleet_server::service::{FleetService, router};
@@ -296,6 +298,8 @@ fn report(job_id: &str, box_name: &str) -> ReportTimingRequest {
         summary: Some(TimingSummary::default()),
         spans: Vec::new(),
         shell_commands: Vec::new(),
+        agent_start_ms: 0,
+        agent_end_ms: 0,
     }
 }
 
@@ -343,6 +347,92 @@ async fn the_live_holder_still_persists_its_report(pool: PgPool) {
     let addr = start(pool.clone()).await;
     worker(addr, as_box)
         .report_timing(report(JOB, &holder()))
+        .await
+        .unwrap();
+    assert_eq!(timing_rows(&pool).await, 1);
+}
+
+fn windowed_report() -> ReportTimingRequest {
+    ReportTimingRequest {
+        summary: Some(TimingSummary {
+            wall_ms: 10_000,
+            tool_ms: 1_000,
+            idle_ms: 7_000,
+            overhead_ms: 2_000,
+            ..TimingSummary::default()
+        }),
+        spans: vec![TimingSpan {
+            kind: TimingSpanKind::Tool as i32,
+            start_ms: 2_000,
+            end_ms: 3_000,
+            name: "Read".to_owned(),
+            tool_use_id: None,
+        }],
+        agent_start_ms: 1_000,
+        agent_end_ms: 9_000,
+        ..report(JOB, &holder())
+    }
+}
+
+#[sqlx::test]
+async fn each_agent_window_field_reaches_the_server_over_the_box_token_wire(pool: PgPool) {
+    running_job(&pool).await;
+    let addr = start(pool.clone()).await;
+    let mismatch = "timing summary does not match its spans";
+    let window = "timing agent window lies outside the job window";
+    let rows = [
+        (
+            "start dropped",
+            ReportTimingRequest {
+                agent_start_ms: 0,
+                ..windowed_report()
+            },
+            mismatch,
+        ),
+        (
+            "end dropped",
+            ReportTimingRequest {
+                agent_end_ms: 0,
+                ..windowed_report()
+            },
+            window,
+        ),
+        (
+            "end moved",
+            ReportTimingRequest {
+                agent_end_ms: 8_999,
+                ..windowed_report()
+            },
+            mismatch,
+        ),
+        (
+            "end past wall",
+            ReportTimingRequest {
+                agent_end_ms: 10_001,
+                ..windowed_report()
+            },
+            window,
+        ),
+        (
+            "start after end",
+            ReportTimingRequest {
+                agent_start_ms: 9_001,
+                ..windowed_report()
+            },
+            window,
+        ),
+    ];
+    for (label, request, reason) in rows {
+        let err = worker(addr, as_box)
+            .report_timing(request)
+            .await
+            .unwrap_err();
+        assert_eq!(err.code(), Code::InvalidArgument, "{label}");
+        assert_eq!(err.message(), reason, "{label}");
+    }
+    assert_eq!(timing_rows(&pool).await, 0);
+    worker(addr, as_box)
+        .report_timing(windowed_report())
         .await
         .unwrap();
     assert_eq!(timing_rows(&pool).await, 1);
