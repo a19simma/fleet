@@ -13,7 +13,7 @@ use fleet_server::auth::BearerAuth;
 use fleet_server::config::Token;
 use fleet_server::profiles::{self, ProfileContent};
 use fleet_server::service::router;
-use fleet_server::store::Store;
+use fleet_server::store::{Store, StoreError};
 use sqlx::PgPool;
 use tokio::time::timeout;
 use tonic::metadata::MetadataValue;
@@ -461,7 +461,7 @@ async fn update_delete_and_truncate_are_rejected(pool: PgPool) {
         "UPDATE profile_blob SET size = size",
         "UPDATE profile_blob SET content = '\\x7b7d'",
         "UPDATE profile_version SET version = 9",
-        "UPDATE profile_version SET name = 'other'",
+        "UPDATE profile_version SET profile_id = profile_id + 1",
         "DELETE FROM profile_blob",
         "DELETE FROM profile_version",
         "TRUNCATE profile_blob CASCADE",
@@ -552,4 +552,67 @@ async fn forged_owner_in_the_content_does_not_stick(pool: PgPool) {
     assert!(!err.contains(&bob.to_string()));
     assert_eq!(counts(&pool).await, (0, 0));
     assert_eq!(owners(&pool).await, Vec::<(i64, String)>::new());
+}
+
+async fn put(pool: &PgPool, caller: i64, json: &str) -> fleet_proto::v1::ProfileVersion {
+    profiles::create_owned(
+        pool,
+        Some(caller),
+        "alpha",
+        ProfileContent::Json(json),
+        false,
+    )
+    .await
+    .unwrap()
+}
+
+const SHARED_CONTENT: &str = r#"{"claude_md":"same"}"#;
+
+#[sqlx::test]
+async fn two_owners_of_one_name_keep_independent_version_streams(pool: PgPool) {
+    store(pool.clone()).await;
+    let alice = user(&pool, "alice").await;
+    let bob = user(&pool, "bob").await;
+    let a1 = put(&pool, alice, r#"{"claude_md":"a1"}"#).await;
+    let a2 = put(&pool, alice, SHARED_CONTENT).await;
+    let b1 = put(&pool, bob, SHARED_CONTENT).await;
+    let b2 = put(&pool, bob, SHARED_CONTENT).await;
+    assert_eq!((a1.version, a1.created), (1, true));
+    assert_eq!((a2.version, a2.created), (2, true));
+    assert_eq!((b1.version, b1.created), (1, true));
+    assert_eq!((b2.version, b2.created), (1, false));
+    assert_eq!(a2.hash, b1.hash);
+}
+
+#[sqlx::test]
+async fn a_private_profile_reads_as_not_found_for_another_user(pool: PgPool) {
+    store(pool.clone()).await;
+    let alice = user(&pool, "alice").await;
+    let bob = user(&pool, "bob").await;
+    owned(&pool, Some(alice), "alpha", OWNED).await.unwrap();
+    let get = |viewer, name: &'static str, version| {
+        let pool = pool.clone();
+        async move { profiles::get_for(&pool, viewer, name, version).await }
+    };
+    assert_eq!(get(Some(alice), "alpha", None).await.unwrap().version, 1);
+    assert_eq!(get(Some(alice), "alpha", Some(1)).await.unwrap().version, 1);
+    for version in [None, Some(1)] {
+        let foreign = get(Some(bob), "alpha", version).await.unwrap_err();
+        let absent = get(Some(bob), "ghost", version).await.unwrap_err();
+        assert_eq!(foreign.to_string(), absent.to_string());
+        assert!(matches!(foreign, StoreError::NotFound));
+        assert!(matches!(
+            get(None, "alpha", version).await,
+            Err(StoreError::NotFound)
+        ));
+    }
+    let listed = profiles::list_for(&pool, Some(bob), 0, None).await.unwrap();
+    assert_eq!(
+        listed.profiles,
+        Vec::<fleet_proto::v1::ProfileSummary>::new()
+    );
+    let own = profiles::list_for(&pool, Some(alice), 0, None)
+        .await
+        .unwrap();
+    assert_eq!(own.profiles.len(), 1);
 }
