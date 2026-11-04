@@ -1,6 +1,6 @@
 # Users and auth
 
-Status: Proposed 2026-10-29. Built in fleet-server: users, hashed API tokens, passkey login, server-side sessions, the first-admin setup code, the `fleet-server admin` recovery subcommand, `jobs.user_id` and owner-scoped reads. Bootstrap password and passkey management are built. Not built: login rate limiting and a decoy challenge for unknown usernames. Amends ADR-0013 and ADR-0014. Builds on ADR-0041 (web UI) and ADR-0040 (credential store).
+Status: Proposed 2026-10-29. Built in fleet-server: users, hashed API tokens, passkey login, server-side sessions, the first-admin setup code, the `fleet-server admin` recovery subcommand, `jobs.user_id` and owner-scoped reads. Bootstrap password and passkey management are built. Not built: login rate limiting and a decoy challenge for unknown usernames. Amends ADR-0013 and ADR-0014. Amended by ADR-0056. Builds on ADR-0041 (web UI) and ADR-0040 (credential store).
 
 Credentials and the web UI make Fleet multi-user. The shared client token cannot say whose a Job or a credential is. This ADR adds users, browser login, per-user API tokens and Job ownership.
 
@@ -16,7 +16,7 @@ Credentials and the web UI make Fleet multi-user. The shared client token cannot
 
 ### Bootstrap admin
 
-On first start with no users, the server logs a one-time setup URL containing a random token and holds it in memory until used. Opening it lets the visitor pick a username and register a passkey, which creates the admin. The token dies on use or on restart: a URL logged before a restart stops working, and a restart with still no users logs a new one. The server logs the URL at `warn`, so it sits in shipped logs until someone redeems it. The logged URL stays as the fallback when no bootstrap password is configured. The cost: whoever reads the pod log first can claim the admin, so the log is the trust boundary.
+On first start with no users, the server logs a one-time setup URL containing a random token and holds it in memory until used. Opening it lets the visitor pick a username and register a passkey, which creates the first admin by setting the stored `is_admin` flag (ADR-0056). The token dies on use or on restart: a URL logged before a restart stops working, and a restart with still no users logs a new one. The server logs the URL at `warn`, so it sits in shipped logs until someone redeems it. The logged URL stays as the fallback when no bootstrap password is configured. The cost: whoever reads the pod log first can claim the admin, so the log is the trust boundary.
 
 With `FLEET_BOOTSTRAP_PASSWORD` set, the setup page also accepts that password in place of the URL token. Infra generates it once with an external-secrets Password generator. The server hashes it with argon2id at startup, keeps only the hash in memory and never logs it. The password works on the setup route pair only (start and finish). It cannot log in, reach `/account` or call the API. The first passkey revokes it in the same transaction that creates the admin and writes an `admin_audit` row, action `bootstrap_password_revoked`. Migration 0021 records the revocation in `bootstrap_password`, so a restart, a regenerated Secret or `reset-passkeys` never re-arms it.
 
@@ -28,7 +28,7 @@ A wrong, revoked or rate-limited attempt answers 400 `request refused`, so the t
 
 ### Admin recovery
 
-`fleet-server admin create-user <username>` and `fleet-server admin reset-passkeys <username>` run against the database named by `FLEET_DATABASE_URL`. No web route does this. Each command runs in one transaction that writes an `admin_audit` row and issues a setup code (table `setup_codes`, migration 0020). The server stores the code as a SHA-256 hash. The code works once, expires after 24 hours and prints once to standard output, so it lands in the operator's terminal scrollback.
+`fleet-server admin create-user <username>`, `fleet-server admin reset-passkeys <username>`, `fleet-server admin grant-admin <username>` and `fleet-server admin revoke-admin <username>` run against the database named by `FLEET_DATABASE_URL`. No web route does this. Each command runs in one transaction that writes an `admin_audit` row (actions include `admin_grant` and `admin_revoke`, ADR-0056). `create-user` and `reset-passkeys` also issue a setup code (table `setup_codes`, migration 0020). The server stores the code as a SHA-256 hash. The code works once, expires after 24 hours and prints once to standard output, so it lands in the operator's terminal scrollback.
 
 `reset-passkeys` deletes the user's passkeys and sessions, revokes their API tokens and replaces any open setup code. The reserved `bootstrap` user cannot be targeted. The audit `operator` is the `$USER` of the caller, which is advisory. A failed command rolls back and leaves no audit row. `admin_audit` has no append-only trigger. Database access is the trust boundary: anyone who can write the database can already do all of this. Lookalike usernames are allowed.
 
