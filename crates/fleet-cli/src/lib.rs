@@ -408,6 +408,7 @@ struct Session {
     query: QueryClient,
     profiles: profile::ProfilesClient,
     batches: batch::BatchesClient,
+    redactor: fleet_core::Redactor,
 }
 
 /// Adds the bearer token to every request.
@@ -533,7 +534,11 @@ async fn session(
     }
     let channel = open_channel(&config, timeouts).await?;
     let token = bearer(&config)?;
+    let bearer_value = config.bearer();
+    let redactor =
+        fleet_core::Redactor::new(bearer_value.strip_prefix("Bearer ").map(str::to_owned));
     Ok(Session {
+        redactor,
         jobs: FleetJobsClient::with_interceptor(channel.clone(), token.clone())
             .max_decoding_message_size(MAX_DECODE_BYTES),
         query: FleetQueryClient::with_interceptor(channel.clone(), token.clone())
@@ -666,6 +671,35 @@ pub async fn run(
     run_with(cli, lookup, true, stdin, out).await
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    clippy::fn_params_excessive_bools,
+    reason = "the flags and arguments of run_with, passed through"
+)]
+async fn run_timing(
+    job: &str,
+    commands: bool,
+    follow: Option<String>,
+    json: bool,
+    server: Option<String>,
+    insecure: bool,
+    lookup: impl Fn(&str) -> Option<String>,
+    timeouts: bool,
+    out: &mut impl Write,
+) -> Result<(), CliError> {
+    if let Some(c) = &follow {
+        timing::check_command_id(c)?;
+    }
+    let session = session(server, insecure, lookup, timeouts).await?;
+    let redactor = session.redactor;
+    let mut client = session.jobs;
+    match follow {
+        Some(c) => timing::follow(&mut client, job, &c, json, out).await,
+        None if commands => timing::list_commands(&mut client, &redactor, job, json, out).await,
+        None => timing::show(&mut client, &redactor, job, json, out).await,
+    }
+}
+
 /// Like [`run`], with request timeouts and keepalive pings switched by `timeouts`.
 ///
 /// Test seam for paused-time tests over real sockets. Not part of the stable interface.
@@ -753,15 +787,10 @@ pub async fn run_with(
             follow,
             json,
         } => {
-            if let Some(c) = &follow {
-                timing::check_command_id(c)?;
-            }
-            let mut client = session(server, insecure, lookup, timeouts).await?.jobs;
-            match follow {
-                Some(c) => timing::follow(&mut client, &job, &c, json, out).await?,
-                None if commands => timing::list_commands(&mut client, &job, json, out).await?,
-                None => timing::show(&mut client, &job, json, out).await?,
-            }
+            run_timing(
+                &job, commands, follow, json, server, insecure, lookup, timeouts, out,
+            )
+            .await?;
         }
         Command::Catalog { action } => catalog::run(&action)?,
         Command::UserCap { area } => catalog::run_user(&area)?,

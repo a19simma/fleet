@@ -5,7 +5,8 @@ use std::future::Future;
 use std::io::Write;
 use std::time::Duration;
 
-use fleet_core::timing::{Summary, TimingView};
+use fleet_core::Redactor;
+use fleet_core::timing::{CommandInput, CommandRow, Summary, TimingView};
 use fleet_proto::v1::{
     GetJobTimingRequest, ShellCommand, ShellStatus, StreamShellLogChunk, StreamShellLogRequest,
 };
@@ -30,72 +31,16 @@ pub const MAX_STREAM_MESSAGES: usize = MAX_SHELL_LOG_CHUNKS * 4;
 /// The server cap of 600 s plus a margin.
 pub const FOLLOW_DEADLINE: Duration = Duration::from_secs(630);
 
+/// Most characters of one command log this command prints. A longer log is cut here.
+pub const MAX_LOG_CHARS: usize = 512;
+
+const COMMANDS_KEY: &str = "commands";
+const LOG_CUT_MARKER: &str = "-- log cut --";
 const CUT_MARKER: &str = "-- log output cut --";
 const DEADLINE_MARKER: &str = "-- follow stopped: time limit --";
 
-/// Writes the five-part breakdown of `job` from `view`.
-///
-/// Every time is milliseconds on the job clock, where the job window is `0` to the total.
-/// The table rows are `label`, milliseconds and the share of the total with one decimal; a
-/// zero total shows `0.0%`. With `json` the output is one object holding `unit`, `job`,
-/// `total_ms` and the parts with their `permille`. The job id is echoed through [`sanitize`].
-///
-/// # Errors
-/// Returns [`CliError::Io`] when the output fails.
-pub fn write_breakdown(
-    out: &mut impl Write,
-    job: &str,
-    view: &TimingView,
-    json: bool,
-) -> Result<(), CliError> {
-    let job = sanitize(job);
-    let labels = fleet_core::timing::FIELDS;
-    if json {
-        let mut parts = String::new();
-        for row in &view.rows {
-            if !parts.is_empty() {
-                parts.push(',');
-            }
-            let _ = write!(
-                parts,
-                "{{\"key\":{},\"ms\":{},\"permille\":{}}}",
-                json_text(row.key),
-                row.ms,
-                row.permille,
-            );
-        }
-        writeln!(
-            out,
-            "{{\"unit\":\"ms\",\"job\":{},\"total_ms\":{},\"parts\":[{parts}]}}",
-            json_text(&job),
-            view.total_ms,
-        )?;
-        return Ok(());
-    }
-    writeln!(out, "job: {job}")?;
-    writeln!(out, "unit: ms, job-relative (0 is the claim)")?;
-    for row in &view.rows {
-        let label = labels
-            .iter()
-            .find(|f| f.key == row.key)
-            .map_or(row.key, |f| f.label);
-        writeln!(out, "{label}\t{}ms\t{}", row.ms, row.percent_label())?;
-    }
-    let permille = view
-        .rows
-        .iter()
-        .fold(0u16, |sum, row| sum.saturating_add(row.permille));
-    writeln!(
-        out,
-        "Total\t{}ms\t{}.{}%",
-        view.total_ms,
-        permille / 10,
-        permille % 10
-    )?;
-    Ok(())
-}
-
-/// Fetches the timing of job `job` and writes its breakdown with [`write_breakdown`].
+/// Fetches the timing of job `job` and writes its report with [`write_report`], without the
+/// command list in the plain form.
 ///
 /// # Errors
 /// Returns [`CliError::Rpc`] on a server error, including the identical not-found answer for a
@@ -103,7 +48,33 @@ pub fn write_breakdown(
 /// report, and [`CliError::Io`] on an output failure.
 pub(crate) async fn show(
     client: &mut Client,
+    redactor: &Redactor,
     job: &str,
+    json: bool,
+    out: &mut impl Write,
+) -> Result<(), CliError> {
+    fetch_report(client, redactor, job, false, json, out).await
+}
+
+/// Like [`show`], and the plain form also lists every command with its duration and log.
+///
+/// # Errors
+/// The errors of [`show`].
+pub(crate) async fn list_commands(
+    client: &mut Client,
+    redactor: &Redactor,
+    job: &str,
+    json: bool,
+    out: &mut impl Write,
+) -> Result<(), CliError> {
+    fetch_report(client, redactor, job, true, json, out).await
+}
+
+async fn fetch_report(
+    client: &mut Client,
+    redactor: &Redactor,
+    job: &str,
+    commands: bool,
     json: bool,
     out: &mut impl Write,
 ) -> Result<(), CliError> {
@@ -114,7 +85,9 @@ pub(crate) async fn show(
         .await?
         .into_inner();
     let summary = reply.summary.ok_or(CliError::NoTimingReport)?;
-    let view = TimingView::new(
+    write_report(
+        out,
+        job,
         &Summary {
             api_wait_ms: summary.api_wait_ms,
             tool_ms: summary.tool_ms,
@@ -122,9 +95,11 @@ pub(crate) async fn show(
             idle_ms: summary.idle_ms,
             overhead_ms: summary.overhead_ms,
         },
-        &[],
-    );
-    write_breakdown(out, job, &view, json)
+        &reply.shell_commands,
+        redactor,
+        commands,
+        json,
+    )
 }
 
 /// A source of live log chunks: the gRPC stream, or a script in a test.
@@ -170,62 +145,214 @@ fn json_text(text: &str) -> String {
     out
 }
 
-/// Writes the command list: one row per command with id, status, exit code, duration, kind
-/// and the command line, or one JSON object per line.
-///
-/// # Errors
-/// Returns [`CliError::Io`] when the output fails.
-pub fn write_commands(
+struct Detail {
+    id: String,
+    status: &'static str,
+    background: bool,
+    log: String,
+    log_cut: bool,
+    ended_by: Option<String>,
+}
+
+fn strip_keeping_lines(text: &str) -> String {
+    text.chars()
+        .filter(|c| matches!(c, '\n' | '\t') || !is_hostile(*c))
+        .collect()
+}
+
+fn scrub(redactor: &Redactor, text: &str) -> String {
+    let stripped = strip_keeping_lines(text);
+    strip_keeping_lines(&redactor.redact_str(&stripped))
+}
+
+fn clean_log(redactor: &Redactor, log: &str, upstream_cut: bool) -> (String, bool) {
+    let mut kept: String = scrub(redactor, log)
+        .chars()
+        .take(MAX_LOG_CHARS + 1)
+        .collect();
+    let over = kept.chars().count() > MAX_LOG_CHARS;
+    if over {
+        kept = kept.chars().take(MAX_LOG_CHARS).collect();
+    }
+    (kept, over || upstream_cut)
+}
+
+fn detail(command: &ShellCommand, redactor: &Redactor) -> Detail {
+    let (log, log_cut) = clean_log(redactor, &command.log, command.log_truncated);
+    Detail {
+        id: sanitize(&command.id),
+        status: command_status(command),
+        background: command.background,
+        log,
+        log_cut,
+        ended_by: command
+            .ended_by
+            .as_deref()
+            .map(|by| sanitize_free(&scrub(redactor, by))),
+    }
+}
+
+fn json_report(job: &str, view: &TimingView, rows: &[(&CommandRow, &Detail)]) -> String {
+    let mut parts = String::new();
+    for row in &view.rows {
+        if !parts.is_empty() {
+            parts.push(',');
+        }
+        let _ = write!(
+            parts,
+            "{{\"key\":{},\"ms\":{},\"permille\":{}}}",
+            json_text(row.key),
+            row.ms,
+            row.permille,
+        );
+    }
+    let mut commands = String::new();
+    for (row, d) in rows {
+        if !commands.is_empty() {
+            commands.push(',');
+        }
+        let exit = row
+            .exit
+            .map_or_else(|| "null".to_owned(), |c| c.to_string());
+        let ended_by = d
+            .ended_by
+            .as_deref()
+            .map_or_else(|| "null".to_owned(), json_text);
+        let _ = write!(
+            commands,
+            "{{\"id\":{},\"status\":\"{}\",\"background\":{},\"command\":{},\"start_ms\":{},\"duration_ms\":{},\"exit_code\":{exit},\"truncated\":{},\"log\":{},\"log_truncated\":{},\"ended_by\":{ended_by}}}",
+            json_text(&d.id),
+            d.status,
+            d.background,
+            json_text(&row.command),
+            row.start_ms,
+            row.duration_ms,
+            row.truncated,
+            json_text(&d.log),
+            d.log_cut,
+        );
+    }
+    format!(
+        "{{\"unit\":\"ms\",\"job\":{},\"total_ms\":{},\"parts\":[{parts}],\"commands\":[{commands}],\"commands_omitted\":{}}}",
+        json_text(job),
+        view.total_ms,
+        view.commands_omitted,
+    )
+}
+
+fn write_commands(
     out: &mut impl Write,
-    commands: &[ShellCommand],
-    json: bool,
+    view: &TimingView,
+    rows: &[(&CommandRow, &Detail)],
 ) -> Result<(), CliError> {
-    for command in commands {
-        let status = command_status(command);
-        let id = sanitize(&command.id);
-        let line = sanitize_free(&command.command);
-        let exit = command.exit_code.map(|c| c.to_string());
-        if json {
-            let exit = exit.unwrap_or_else(|| "null".to_owned());
-            writeln!(
-                out,
-                "{{\"id\":{},\"status\":\"{status}\",\"exit_code\":{exit},\"duration_ms\":{},\"background\":{},\"command\":{}}}",
-                json_text(&id),
-                command.duration_ms,
-                command.background,
-                json_text(&line),
-            )?;
-        } else {
-            writeln!(
-                out,
-                "{id}\t{status}\t{}\t{}ms\t{}\t{line}",
-                exit.as_deref().unwrap_or("-"),
-                command.duration_ms,
-                if command.background { "bg" } else { "fg" },
-            )?;
+    let label = fleet_core::timing::FIELDS
+        .iter()
+        .find(|f| f.key == COMMANDS_KEY)
+        .map_or(COMMANDS_KEY, |f| f.label);
+    writeln!(
+        out,
+        "{label}: {} shown, {} omitted",
+        rows.len(),
+        view.commands_omitted
+    )?;
+    for (row, d) in rows {
+        write!(
+            out,
+            "{}\t{}\t{}\t{}ms\t{}\t{}",
+            d.id,
+            d.status,
+            row.exit.map_or_else(|| "-".to_owned(), |c| c.to_string()),
+            row.duration_ms,
+            if d.background { "bg" } else { "fg" },
+            row.command,
+        )?;
+        if row.truncated {
+            write!(out, "\t(command cut)")?;
+        }
+        if let Some(by) = &d.ended_by {
+            write!(out, "\tended_by={by}")?;
+        }
+        writeln!(out)?;
+        for line in d.log.lines() {
+            writeln!(out, "    | {line}")?;
+        }
+        if d.log_cut {
+            writeln!(out, "    {LOG_CUT_MARKER}")?;
         }
     }
     Ok(())
 }
 
-/// Fetches the shell commands of job `job` and writes them with [`write_commands`].
+/// Writes the timing report of `job`.
+///
+/// Every time is milliseconds on the job clock, where the job window is `0` to the total.
+/// The table rows are `label`, milliseconds and the share of the total with one decimal; a
+/// zero total shows `0.0%`. With `with_commands` the plain form adds one row per command and
+/// its log, indented. With `json` the output is one object: `unit`, `job`, `total_ms`, the
+/// `parts` with their `permille`, `commands` and `commands_omitted`, always whole. The command
+/// text goes through the shared [`TimingView`] display rules, at most
+/// [`fleet_core::timing::MAX_COMMAND_ROWS`] commands show. Every text from the server is
+/// redacted with `redactor` first, then stripped of control and bidirectional characters, then
+/// cut: a log to [`MAX_LOG_CHARS`] characters, with a marker, an `ended_by` to 200.
 ///
 /// # Errors
-/// Returns [`CliError::Rpc`] on a server error, including the identical not-found answer for
-/// a job that is missing or not yours, and [`CliError::Io`] on an output failure.
-pub(crate) async fn list_commands(
-    client: &mut Client,
-    job: &str,
-    json: bool,
+/// Returns [`CliError::Io`] when the output fails.
+pub fn write_report(
     out: &mut impl Write,
+    job: &str,
+    summary: &Summary,
+    commands: &[ShellCommand],
+    redactor: &Redactor,
+    with_commands: bool,
+    json: bool,
 ) -> Result<(), CliError> {
-    let reply = client
-        .get_job_timing(GetJobTimingRequest {
-            job_id: job.to_owned(),
+    let job = sanitize(job);
+    let inputs: Vec<CommandInput> = commands
+        .iter()
+        .map(|c| CommandInput {
+            command: scrub(redactor, &c.command),
+            duration_ms: c.duration_ms,
+            start_ms: c.started_ms,
+            exit: c.exit_code,
+            truncated: false,
         })
-        .await?
-        .into_inner();
-    write_commands(out, &reply.shell_commands, json)
+        .collect();
+    let view = TimingView::new(summary, &inputs);
+    let details: Vec<Detail> = commands
+        .iter()
+        .take(view.commands.len())
+        .map(|c| detail(c, redactor))
+        .collect();
+    let rows: Vec<(&CommandRow, &Detail)> = view.commands.iter().zip(&details).collect();
+    if json {
+        writeln!(out, "{}", json_report(&job, &view, &rows))?;
+        return Ok(());
+    }
+    let labels = fleet_core::timing::FIELDS;
+    writeln!(out, "job: {job}")?;
+    writeln!(out, "unit: ms, job-relative (0 is the claim)")?;
+    for row in &view.rows {
+        let label = labels
+            .iter()
+            .find(|f| f.key == row.key)
+            .map_or(row.key, |f| f.label);
+        writeln!(out, "{label}\t{}ms\t{}", row.ms, row.percent_label())?;
+    }
+    let permille = view
+        .rows
+        .iter()
+        .fold(0u16, |sum, row| sum.saturating_add(row.permille));
+    writeln!(
+        out,
+        "Total\t{}ms\t{}.{}%",
+        view.total_ms,
+        permille / 10,
+        permille % 10
+    )?;
+    if with_commands {
+        write_commands(out, &view, &rows)?;
+    }
+    Ok(())
 }
 
 fn utf8_boundary(buf: &[u8]) -> usize {

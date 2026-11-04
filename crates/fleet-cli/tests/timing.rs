@@ -5,10 +5,12 @@ use std::future::Future;
 
 use clap::Parser;
 use fleet_cli::timing::{
-    ChunkSource, FOLLOW_DEADLINE, MAX_PRINT_CHUNK_BYTES, MAX_PRINT_TOTAL_BYTES,
-    MAX_STREAM_MESSAGES, print_log, write_commands,
+    ChunkSource, FOLLOW_DEADLINE, MAX_LOG_CHARS, MAX_PRINT_CHUNK_BYTES, MAX_PRINT_TOTAL_BYTES,
+    MAX_STREAM_MESSAGES, print_log, write_report,
 };
 use fleet_cli::{Cli, CliError, Command};
+use fleet_core::Redactor;
+use fleet_core::timing::{FIELDS, MAX_COMMAND_CHARS, MAX_COMMAND_ROWS, Summary};
 use fleet_proto::v1::{ShellCommand, ShellStatus, StreamShellLogChunk};
 use tonic::{Code, Status};
 
@@ -430,48 +432,255 @@ async fn a_silent_stream_stops_at_the_deadline() {
     assert!(String::from_utf8_lossy(&out).contains("time limit"));
 }
 
-fn command(id: &str, ended: Option<u64>, exit: Option<i32>) -> ShellCommand {
+const HOSTILE: &str = "x\r\nCRLF\u{85}NEL\u{2028}LS\u{202e}BIDI\u{1b}[31mANSI\0NUL\u{2192}\u{e9}";
+const SECRET: &str = "tok-secret-value-1234";
+
+fn assert_clean(text: &str) {
+    for c in text.chars() {
+        let bad = (c.is_control() && c != '\n' && c != '\t')
+            || matches!(c, '\u{2028}' | '\u{2029}' | '\u{202e}');
+        assert!(!bad, "hostile char {c:?} in {text:?}");
+    }
+}
+
+fn hostile_command() -> ShellCommand {
     ShellCommand {
-        id: id.into(),
-        command: "make \u{1b}[2Jtest".into(),
-        background: ended.is_none(),
-        started_ms: 1,
-        ended_ms: ended,
-        duration_ms: 1500,
-        exit_code: exit,
+        id: format!("id{HOSTILE}"),
+        command: format!("cmd{HOSTILE}"),
+        log: format!("log{HOSTILE}\nfake\tdone\t0"),
+        ended_by: Some(format!("by{HOSTILE}")),
+        ended_ms: Some(9),
+        exit_code: Some(1),
+        duration_ms: 5,
+        ..ShellCommand::default()
+    }
+}
+
+#[expect(clippy::unwrap_used, reason = "a test helper over an in-memory writer")]
+fn report(
+    commands: &[ShellCommand],
+    redactor: &Redactor,
+    with_commands: bool,
+    json: bool,
+) -> String {
+    let mut out = Vec::new();
+    write_report(
+        &mut out,
+        "job-1",
+        &Summary::default(),
+        commands,
+        redactor,
+        with_commands,
+        json,
+    )
+    .unwrap();
+    String::from_utf8(out).unwrap()
+}
+
+fn logged(log: String) -> ShellCommand {
+    ShellCommand {
+        id: "c".into(),
+        log,
         ..ShellCommand::default()
     }
 }
 
 #[test]
-fn the_status_list_shows_running_done_and_failed_rows() {
-    let mut out = Vec::new();
-    write_commands(
-        &mut out,
-        &[
-            command("a", None, None),
-            command("b", Some(9), Some(0)),
-            command("c", Some(9), Some(2)),
-        ],
-        false,
-    )
-    .unwrap();
-    assert_eq!(
-        String::from_utf8_lossy(&out),
-        "a\trunning\t-\t1500ms\tbg\tmake [2Jtest\n\
-         b\tdone\t0\t1500ms\tfg\tmake [2Jtest\n\
-         c\tfailed\t2\t1500ms\tfg\tmake [2Jtest\n"
-    );
+fn hostile_values_in_every_field_stay_clean_in_plain_output() {
+    let text = report(&[hostile_command()], &Redactor::default(), true, false);
+    assert_clean(&text);
+    assert!(text.contains("idxCRLF"));
+    assert!(text.contains("cmd"));
+    assert!(text.contains("\\u{2192}"));
+    assert!(text.contains("ended_by=byxCRLF"));
+    assert!(text.contains("    | logx\n    | CRLF"));
+    assert!(!text.lines().any(|l| l.starts_with("fake")));
+    assert!(text.contains("    | fake"));
 }
 
 #[test]
-fn the_status_list_json_is_one_object_per_command() {
-    let mut out = Vec::new();
-    write_commands(&mut out, &[command("a", None, None)], true).unwrap();
-    assert_eq!(
-        String::from_utf8_lossy(&out),
-        "{\"id\":\"a\",\"status\":\"running\",\"exit_code\":null,\"duration_ms\":1500,\"background\":true,\"command\":\"make [2Jtest\"}\n"
+fn hostile_values_in_every_field_stay_clean_in_json_output() {
+    let text = report(&[hostile_command()], &Redactor::default(), false, true);
+    assert_clean(&text);
+    assert_eq!(text.matches('\n').count(), 1);
+    assert!(!text.contains('\t'));
+    assert!(text.contains("\"ended_by\":\"byxCRLF"));
+    assert!(text.contains("\"log\":\"logx\\nCRLF"));
+    assert!(text.contains("\\n"));
+}
+
+#[test]
+fn a_log_just_over_the_cap_is_cut_with_a_marker() {
+    let at = report(
+        &[logged("a".repeat(MAX_LOG_CHARS))],
+        &Redactor::default(),
+        true,
+        false,
     );
+    assert!(!at.contains("log cut"));
+    let over = report(
+        &[logged("a".repeat(MAX_LOG_CHARS + 1))],
+        &Redactor::default(),
+        true,
+        false,
+    );
+    assert!(over.contains(&format!("    | {}\n", "a".repeat(MAX_LOG_CHARS))));
+    assert!(!over.contains(&"a".repeat(MAX_LOG_CHARS + 1)));
+    assert!(over.contains("    -- log cut --\n"));
+    let json = report(
+        &[logged("a".repeat(MAX_LOG_CHARS + 1))],
+        &Redactor::default(),
+        false,
+        true,
+    );
+    assert!(json.contains("\"log_truncated\":true"));
+    let json_at = report(
+        &[logged("a".repeat(MAX_LOG_CHARS))],
+        &Redactor::default(),
+        false,
+        true,
+    );
+    assert!(json_at.contains("\"log_truncated\":false"));
+}
+
+#[test]
+fn a_secret_straddling_the_log_cap_is_redacted_before_the_cut() {
+    let redactor = Redactor::new([SECRET]);
+    let log = format!("{}{SECRET}tail", "a".repeat(MAX_LOG_CHARS - 4));
+    for json in [false, true] {
+        let text = report(&[logged(log.clone())], &redactor, true, json);
+        assert!(!text.contains("tok-"), "{text}");
+        assert!(text.contains("[RED"));
+    }
+}
+
+#[test]
+fn a_secret_in_the_command_and_ended_by_is_redacted() {
+    let redactor = Redactor::new([SECRET]);
+    let command = ShellCommand {
+        id: "c".into(),
+        command: format!("{}{SECRET}", "a".repeat(250)),
+        ended_by: Some(format!("{}{SECRET}", "b".repeat(195))),
+        ..ShellCommand::default()
+    };
+    for json in [false, true] {
+        let text = report(std::slice::from_ref(&command), &redactor, true, json);
+        assert!(!text.contains("tok-"), "{text}");
+    }
+}
+
+const SPLIT_AT: usize = 8;
+
+fn split_secret(inside: char) -> String {
+    let (head, tail) = SECRET.split_at(SPLIT_AT);
+    format!("{head}{inside}{tail}")
+}
+
+const INSIDE: [char; 6] = [
+    '\u{200B}', '\u{202E}', '\u{1b}', '\0', '\u{2028}', '\u{2066}',
+];
+
+#[test]
+fn a_secret_split_by_a_hostile_char_is_redacted_in_every_field() {
+    let redactor = Redactor::new([SECRET]);
+    for inside in INSIDE {
+        let split = split_secret(inside);
+        let command = ShellCommand {
+            id: "c".into(),
+            command: format!("run {split}"),
+            log: format!("out {split}\n"),
+            ended_by: Some(format!("by {split}")),
+            ..ShellCommand::default()
+        };
+        for json in [false, true] {
+            let text = report(std::slice::from_ref(&command), &redactor, true, json);
+            assert!(!text.contains("tok-"), "{inside:?} {text}");
+            assert!(!text.contains("secret-value"), "{inside:?} {text}");
+            assert!(!text.contains("1234"), "{inside:?} {text}");
+            assert!(text.matches("[RED").count() >= 3, "{inside:?} {text}");
+            assert_clean(&text);
+        }
+    }
+}
+
+#[test]
+fn a_split_secret_straddling_the_log_cap_is_redacted_before_the_cut() {
+    let redactor = Redactor::new([SECRET]);
+    for inside in INSIDE {
+        let log = format!(
+            "{}{}tail",
+            "a".repeat(MAX_LOG_CHARS - 4),
+            split_secret(inside)
+        );
+        for json in [false, true] {
+            let text = report(&[logged(log.clone())], &redactor, true, json);
+            assert!(!text.contains("tok-"), "{inside:?} {text}");
+            assert!(text.contains("[RED"), "{inside:?} {text}");
+        }
+    }
+}
+
+#[test]
+fn hostile_padding_does_not_eat_the_log_cap() {
+    let padded = format!("{}{}", "\u{200B}".repeat(2000), "b".repeat(MAX_LOG_CHARS));
+    let text = report(&[logged(padded)], &Redactor::default(), true, false);
+    assert!(text.contains(&format!("    | {}\n", "b".repeat(MAX_LOG_CHARS))));
+    assert!(!text.contains("log cut"));
+}
+
+#[test]
+fn commands_past_the_row_cap_count_as_omitted_and_a_long_command_is_cut() {
+    let many: Vec<ShellCommand> = (0..=MAX_COMMAND_ROWS)
+        .map(|n| ShellCommand {
+            id: format!("c{n}"),
+            command: "z".repeat(MAX_COMMAND_CHARS + 1),
+            ..ShellCommand::default()
+        })
+        .collect();
+    let text = report(&many, &Redactor::default(), true, false);
+    assert!(text.contains(&format!("Commands: {MAX_COMMAND_ROWS} shown, 1 omitted\n")));
+    assert!(text.contains("\t(command cut)"));
+    assert!(!text.contains(&format!("c{MAX_COMMAND_ROWS}\t")));
+    let json = report(&many, &Redactor::default(), false, true);
+    assert!(json.contains("\"commands_omitted\":1"));
+    assert!(json.contains("\"truncated\":true"));
+}
+
+#[test]
+fn the_json_names_follow_the_core_fields() {
+    let json = report(&[hostile_command()], &Redactor::default(), false, true);
+    let Some((parts_fields, rest)) = FIELDS.split_at_checked(5) else {
+        unreachable!("FIELDS holds the five parts")
+    };
+    for field in parts_fields {
+        assert!(
+            json.contains(&format!("\"key\":\"{}\"", field.key)),
+            "{json}"
+        );
+    }
+    for field in rest {
+        let wanted = if field.key == "commands" {
+            format!("\"{}\":[", field.key)
+        } else {
+            format!("\"{}_ms\":", field.key)
+        };
+        assert!(json.contains(&wanted), "{json}");
+    }
+    for name in [
+        "id",
+        "status",
+        "background",
+        "command",
+        "start_ms",
+        "duration_ms",
+        "exit_code",
+        "truncated",
+        "log",
+        "log_truncated",
+        "ended_by",
+    ] {
+        assert!(json.contains(&format!("\"{name}\":")), "{name}");
+    }
 }
 
 mod served {
@@ -586,6 +795,17 @@ mod served {
     }
 
     async fn cli(url: &str, args: &[&str]) -> (Result<(), CliError>, String) {
+        cli_with(url, args, |name| {
+            (name == "FLEET_CLIENT_TOKEN").then(|| TOKEN.to_owned())
+        })
+        .await
+    }
+
+    async fn cli_with(
+        url: &str,
+        args: &[&str],
+        lookup: impl Fn(&str) -> Option<String>,
+    ) -> (Result<(), CliError>, String) {
         let mut full = vec!["fleet", "--server", url];
         full.extend_from_slice(args);
         let Ok(parsed) = Cli::try_parse_from(full) else {
@@ -594,12 +814,7 @@ mod served {
         let mut out = Vec::new();
         let result = tokio::time::timeout(
             Duration::from_secs(10),
-            run(
-                parsed,
-                |name| (name == "FLEET_CLIENT_TOKEN").then(|| TOKEN.to_owned()),
-                &mut &b""[..],
-                &mut out,
-            ),
+            run(parsed, lookup, &mut &b""[..], &mut out),
         )
         .await
         .unwrap_or_else(|_| Err(CliError::Usage("timed out".into())));
@@ -669,28 +884,145 @@ mod served {
     }
 
     #[tokio::test]
-    async fn commands_lists_the_status_rows_and_json() -> TestResult {
-        let stub = Stub {
+    async fn commands_lists_each_command_with_duration_and_log() -> TestResult {
+        let run = |id: &str, ended: Option<u64>, exit: Option<i32>| ShellCommand {
+            id: id.to_owned(),
+            command: "make test".to_owned(),
+            ended_ms: ended,
+            exit_code: exit,
+            duration_ms: 7,
+            background: ended.is_none(),
+            log: "one\ntwo\n".to_owned(),
+            ..ShellCommand::default()
+        };
+        let url = serve(Stub {
+            commands: vec![
+                run("a", None, None),
+                run("b", Some(9), Some(0)),
+                run("c", Some(9), Some(2)),
+            ],
+            summary: Some(summary([0; 5])),
+            ..Stub::default()
+        })
+        .await?;
+        let (result, text) = cli(&url, &["timing", "job-1", "--commands"]).await;
+        result?;
+        let tail = text
+            .split_once("Commands: ")
+            .map(|(_, t)| t)
+            .unwrap_or_default();
+        assert_eq!(
+            tail,
+            "3 shown, 0 omitted\n\
+             a\trunning\t-\t7ms\tbg\tmake test\n    | one\n    | two\n\
+             b\tdone\t0\t7ms\tfg\tmake test\n    | one\n    | two\n\
+             c\tfailed\t2\t7ms\tfg\tmake test\n    | one\n    | two\n"
+        );
+        let (_, plain) = cli(&url, &["timing", "job-1"]).await;
+        assert!(!plain.contains("Commands:"));
+        Ok(())
+    }
+
+    fn leaking_command() -> ShellCommand {
+        ShellCommand {
+            id: "c".to_owned(),
+            command: format!("curl -H {TOKEN}"),
+            log: format!("auth {TOKEN} sent\n"),
+            ended_by: Some(format!("killed {TOKEN}")),
+            ended_ms: Some(9),
+            exit_code: Some(1),
+            ..ShellCommand::default()
+        }
+    }
+
+    async fn assert_token_redacted(
+        lookup: impl Fn(&str) -> Option<String> + Copy,
+        leaked: &str,
+    ) -> TestResult {
+        let url = serve(Stub {
+            commands: vec![leaking_command()],
+            summary: Some(summary([0; 5])),
+            ..Stub::default()
+        })
+        .await?;
+        for args in [
+            &["timing", "job-1", "--commands"][..],
+            &["timing", "job-1", "--json"][..],
+        ] {
+            let (result, text) = cli_with(&url, args, lookup).await;
+            result?;
+            assert!(!text.contains(leaked), "{text}");
+            assert!(text.contains("[RED"), "{text}");
+            assert!(text.matches("[RED").count() >= 3, "{text}");
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_file_token_with_the_env_unset_is_redacted_everywhere() -> TestResult {
+        let dir = tempfile::tempdir()?;
+        let fleet = dir.path().join("fleet");
+        std::fs::create_dir_all(&fleet)?;
+        let file = fleet.join("token");
+        std::fs::write(&file, format!("  {TOKEN}  \nsecond-line\n"))?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o600))?;
+        }
+        let base = dir.path().to_string_lossy().into_owned();
+        assert_token_redacted(
+            |name| (name == "XDG_CONFIG_HOME").then(|| base.clone()),
+            TOKEN,
+        )
+        .await
+    }
+
+    #[tokio::test]
+    async fn an_env_token_is_redacted_everywhere() -> TestResult {
+        assert_token_redacted(
+            |name| (name == "FLEET_CLIENT_TOKEN").then(|| TOKEN.to_owned()),
+            TOKEN,
+        )
+        .await
+    }
+
+    #[tokio::test]
+    async fn an_env_token_with_trailing_whitespace_is_redacted_trimmed() -> TestResult {
+        assert_token_redacted(
+            |name| (name == "FLEET_CLIENT_TOKEN").then(|| format!("{TOKEN} \t\n")),
+            TOKEN,
+        )
+        .await
+    }
+
+    #[tokio::test]
+    async fn json_emits_the_full_view_with_or_without_commands() -> TestResult {
+        let url = serve(Stub {
             commands: vec![ShellCommand {
                 id: "cmd-1".to_owned(),
                 command: "make test".to_owned(),
+                started_ms: 3,
                 ended_ms: Some(9),
                 exit_code: Some(0),
                 duration_ms: 7,
+                log: "ok\n".to_owned(),
+                ended_by: Some("exit".to_owned()),
                 ..ShellCommand::default()
             }],
+            summary: Some(summary([0; 5])),
             ..Stub::default()
-        };
-        let url = serve(stub).await?;
-        let (result, text) = cli(&url, &["timing", "job-1", "--commands"]).await;
-        result?;
-        assert_eq!(text, "cmd-1\tdone\t0\t7ms\tfg\tmake test\n");
-        let (result, text) = cli(&url, &["timing", "job-1", "--commands", "--json"]).await;
-        result?;
-        assert_eq!(
-            text,
-            "{\"id\":\"cmd-1\",\"status\":\"done\",\"exit_code\":0,\"duration_ms\":7,\"background\":false,\"command\":\"make test\"}\n"
-        );
+        })
+        .await?;
+        let want = "{\"unit\":\"ms\",\"job\":\"job-1\",\"total_ms\":0,\"parts\":[{\"key\":\"api_wait\",\"ms\":0,\"permille\":0},{\"key\":\"tool\",\"ms\":0,\"permille\":0},{\"key\":\"shell\",\"ms\":0,\"permille\":0},{\"key\":\"idle\",\"ms\":0,\"permille\":0},{\"key\":\"overhead\",\"ms\":0,\"permille\":0}],\"commands\":[{\"id\":\"cmd-1\",\"status\":\"done\",\"background\":false,\"command\":\"make test\",\"start_ms\":3,\"duration_ms\":7,\"exit_code\":0,\"truncated\":false,\"log\":\"ok\\n\",\"log_truncated\":false,\"ended_by\":\"exit\"}],\"commands_omitted\":0}\n";
+        for args in [
+            &["timing", "job-1", "--json"][..],
+            &["timing", "job-1", "--commands", "--json"][..],
+        ] {
+            let (result, text) = cli(&url, args).await;
+            result?;
+            assert_eq!(text, want);
+        }
         Ok(())
     }
 
@@ -849,7 +1181,7 @@ mod served {
         result?;
         assert_eq!(
             text,
-            "{\"unit\":\"ms\",\"job\":\"job-1\",\"total_ms\":10000,\"parts\":[{\"key\":\"api_wait\",\"ms\":1000,\"permille\":100},{\"key\":\"tool\",\"ms\":2000,\"permille\":200},{\"key\":\"shell\",\"ms\":3000,\"permille\":300},{\"key\":\"idle\",\"ms\":1000,\"permille\":100},{\"key\":\"overhead\",\"ms\":3000,\"permille\":300}]}\n"
+            "{\"unit\":\"ms\",\"job\":\"job-1\",\"total_ms\":10000,\"parts\":[{\"key\":\"api_wait\",\"ms\":1000,\"permille\":100},{\"key\":\"tool\",\"ms\":2000,\"permille\":200},{\"key\":\"shell\",\"ms\":3000,\"permille\":300},{\"key\":\"idle\",\"ms\":1000,\"permille\":100},{\"key\":\"overhead\",\"ms\":3000,\"permille\":300}],\"commands\":[],\"commands_omitted\":0}\n"
         );
         Ok(())
     }
