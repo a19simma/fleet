@@ -947,12 +947,13 @@ impl<R: Reporter> AgentRunner<R> {
                 tracing::warn!(code = ?status.code(), "profile blob fetch failed");
                 LoadError::Fetch
             })?;
-        let applied = profile_apply::load_checked(
+        let applied = profile_apply::load_stamped(
             reference,
             &reply,
             &self.config.bundle,
             &self.ceilings(),
             self.config.model_allowlist.as_ref(),
+            job.profile_tools_granted,
             &job.prompt,
         )?;
         if !applied.dropped_allows.is_empty() {
@@ -3143,6 +3144,31 @@ mod tests {
         assert!(!runner.has_profile(&job));
         assert_eq!(runner.load_profile(&test_job(), "b").await, Ok(()));
         assert!(!runner.has_profile(&test_job()));
+    }
+
+    fn tool_profile() -> Profile {
+        Profile {
+            tools: vec![fleet_core::tools::ToolSpec::new("jq", "1.7.1").unwrap()],
+            ..Profile::default()
+        }
+    }
+
+    #[tokio::test]
+    async fn profile_tools_load_only_with_the_job_stamp() {
+        let (mut job, reply) = profile_job(&tool_profile());
+        let runner = AgentRunner::new(
+            test_config(Path::new("/jobs")),
+            Served(reply),
+            Redactor::default(),
+        );
+        assert_eq!(
+            runner.load_profile(&job, "b").await,
+            Err(LoadError::ToolsNotGranted)
+        );
+        assert!(!runner.has_profile(&job));
+        job.profile_tools_granted = true;
+        assert_eq!(runner.load_profile(&job, "b").await, Ok(()));
+        assert!(runner.has_profile(&job));
     }
 
     #[tokio::test]

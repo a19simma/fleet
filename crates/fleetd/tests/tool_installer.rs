@@ -436,6 +436,7 @@ fn job(profile: &Profile) -> Job {
         r#box: "boxa".into(),
         prompt: "go".into(),
         profile: Some(reference(profile)),
+        profile_tools_granted: true,
         ..Job::default()
     }
 }

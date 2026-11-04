@@ -123,6 +123,7 @@ fn job(profile: &Profile) -> Job {
         r#box: "boxa".into(),
         prompt: "go".into(),
         profile: Some(reference(profile)),
+        profile_tools_granted: true,
         ..Job::default()
     }
 }
@@ -209,6 +210,19 @@ async fn run_agent(rig: &Rig, job: &Job) -> (AgentOutcome, Option<String>) {
     let (_trigger, shutdown) = Shutdown::channel();
     let outcome = rig.runner.run(job, &cwd, shutdown).await.unwrap();
     (outcome, fs::read_to_string(cwd.join("seen-path")).ok())
+}
+
+#[tokio::test]
+async fn unstamped_profile_tools_are_refused_before_any_install_or_workdir() {
+    let rig = rig(tool_profile(), false, true);
+    let mut job = job(&rig.server.profile);
+    job.profile_tools_granted = false;
+    let err = rig.runner.load_profile(&job, "boxa").await.unwrap_err();
+    assert_eq!(err.reason(), fleetd::floor::TOOLS_DENIED_REASON);
+    assert_eq!(rig.mise.calls.load(Ordering::SeqCst), 0);
+    assert!(!rig.mise.log.exists());
+    assert!(!rig.dir.path().join("jobs").exists());
+    assert!(!rig.dir.path().join("work").exists());
 }
 
 #[tokio::test]

@@ -1,6 +1,6 @@
 # Fleet
 
-Fleet runs coding-agent Jobs on Boxes and records what each Job did. This file defines the terms of the ADRs on telemetry and metrics (0029, 0030), profiles (0034, 0035), the job socket, broker and registration (0036, 0037, 0039), fetch policy (0038), credentials and users (0040, 0042, 0043), agent runners and forges (0044, 0045) the mirror key (0046) and the update trust root (0047, 0050).
+Fleet runs coding-agent Jobs on Boxes and records what each Job did. This file defines the terms of the ADRs on telemetry and metrics (0029, 0030), profiles (0034, 0035, 0057), the job socket, broker and registration (0036, 0037, 0039), fetch policy (0038), credentials and users (0040, 0042, 0043), agent runners and forges (0044, 0045) the mirror key (0046) and the update trust root (0047, 0050).
 
 ## Language
 
@@ -24,8 +24,16 @@ _Avoid_: loop detector, watchdog
 A named, versioned, immutable config that overlays a **Bundle** for one Job: `claude_md`, context files, prompt template, skills, allow and deny rules, model, caps and settings. It holds no MCP, hooks or secrets (ADR-0034).
 _Avoid_: preset, template
 
+**Profile identity**:
+The `profile.id` of a **Profile**. Version streams, the Job pin and every Profile RPC key on it (ADR-0057).
+_Avoid_: profile name as key
+
+**Profile name**:
+A per-owner label for a **Profile**, resolved to a **Profile identity** by an owner-scoped lookup. Two owners can use the same name (ADR-0057).
+_Avoid_: profile id
+
 **Profile version**:
-One numbered entry of a named **Profile**, pointing at one **Profile hash**.
+One numbered entry of a **Profile** (by **Profile identity**), pointing at one **Profile hash**.
 _Avoid_: revision
 
 **Profile hash**:
@@ -103,6 +111,9 @@ _Avoid_: egress allowlist, proxy policy
 **User**:
 A person who owns **Credentials** and submits Jobs. Built in fleet-server (ADR-0042). Jobs without an owner default to the **Bootstrap user**.
 _Avoid_: account, tenant
+
+**Admin**:
+A user with `users.is_admin` set. The first user created by setup is admin, and `fleet-server admin grant-admin` and `revoke-admin` change the flag. The bootstrap user is never admin (ADR-0056).
 
 **Bootstrap user**:
 The reserved legacy owner `bootstrap`, created lazily. `FLEET_CLIENT_TOKEN` and Jobs submitted without an owner act as it. It has no passkey, so it can never log in, and no one can create or reset a user with that name in any letter case (`BOOTSTRAP_USERNAME` in `crates/fleet-server/src/cred/users.rs`, ADR-0042).
