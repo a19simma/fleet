@@ -8,8 +8,9 @@ use fleet_core::catalog::{
 };
 use fleet_proto::v1::{CatalogKind, SetCatalogItemEnabledRequest, UpsertCatalogItemRequest};
 use fleet_server::catalog::{
-    REASON_ADMIN_REQUIRED, REASON_IDENTITY_CHANGE, REASON_NAME_TAKEN, REASON_NOT_FOUND, Scope,
-    set_enabled, upsert_item,
+    DEFAULT_CATALOG_PAGE, MAX_CATALOG_PAGE, REASON_ADMIN_REQUIRED, REASON_IDENTITY_CHANGE,
+    REASON_KIND_UNKNOWN, REASON_NAME_TAKEN, REASON_NOT_FOUND, Scope, list_enabled,
+    list_enabled_capped, set_enabled, upsert_item,
 };
 use sqlx::PgPool;
 use tonic::Code;
@@ -334,4 +335,140 @@ async fn concurrent_upserts_of_one_id_cannot_flip_kind_or_name(pool: PgPool) {
         assert!(wire.ends_with(&kind.to_uppercase()), "{wire} {kind}");
         assert_eq!(winners[0].name, name);
     }
+}
+
+async fn seed(pool: &PgPool, id: &str, kind: CatalogKind, enabled: bool) {
+    let (name, content) = if kind == CatalogKind::Tool {
+        ("node", "22.1.0")
+    } else {
+        (id, "body")
+    };
+    upsert_item(pool, Scope::Admin, &upsert(id, kind, name, content))
+        .await
+        .unwrap();
+    if enabled {
+        set_enabled(pool, Scope::Admin, &enable(id, true))
+            .await
+            .unwrap();
+    }
+}
+
+fn ids(page: &fleet_server::catalog::CatalogPage) -> Vec<&str> {
+    page.items.iter().map(|i| i.id.as_str()).collect()
+}
+
+#[sqlx::test(migrations = false)]
+async fn list_returns_only_enabled_items_in_id_order(pool: PgPool) {
+    migrated(&pool).await;
+    seed(&pool, "c", CatalogKind::Skill, true).await;
+    seed(&pool, "a", CatalogKind::Tool, true).await;
+    seed(&pool, "b", CatalogKind::Skill, false).await;
+
+    let page = list_enabled(&pool, 0, "", 0).await.unwrap();
+    assert_eq!(ids(&page), ["a", "c"]);
+    assert_eq!(page.next_id, "c");
+}
+
+#[sqlx::test(migrations = false)]
+async fn a_disabled_item_is_hidden_even_when_the_filter_names_its_kind(pool: PgPool) {
+    migrated(&pool).await;
+    seed(&pool, "a", CatalogKind::Skill, true).await;
+    seed(&pool, "b", CatalogKind::Skill, false).await;
+    seed(&pool, "c", CatalogKind::Tool, false).await;
+
+    let page = list_enabled(&pool, CatalogKind::Skill as i32, "", 0)
+        .await
+        .unwrap();
+    assert_eq!(ids(&page), ["a"]);
+    let page = list_enabled(&pool, CatalogKind::Tool as i32, "", 0)
+        .await
+        .unwrap();
+    assert_eq!(ids(&page), Vec::<&str>::new());
+}
+
+#[sqlx::test(migrations = false)]
+async fn the_kind_filter_matches_one_kind(pool: PgPool) {
+    migrated(&pool).await;
+    seed(&pool, "a", CatalogKind::Skill, true).await;
+    seed(&pool, "b", CatalogKind::Tool, true).await;
+    seed(&pool, "c", CatalogKind::Context, true).await;
+
+    let page = list_enabled(&pool, CatalogKind::Tool as i32, "", 0)
+        .await
+        .unwrap();
+    assert_eq!(ids(&page), ["b"]);
+}
+
+#[sqlx::test(migrations = false)]
+async fn an_unknown_kind_fails_closed(pool: PgPool) {
+    migrated(&pool).await;
+    seed(&pool, "a", CatalogKind::Skill, true).await;
+
+    for kind in [5, 99, -1, i32::MAX, i32::MIN] {
+        let err = list_enabled(&pool, kind, "", 0).await.unwrap_err();
+        assert_eq!(
+            (err.code(), err.message()),
+            (Code::InvalidArgument, REASON_KIND_UNKNOWN)
+        );
+    }
+}
+
+#[sqlx::test(migrations = false)]
+async fn the_cursor_resumes_after_the_last_id(pool: PgPool) {
+    migrated(&pool).await;
+    for id in ["a", "b", "c"] {
+        seed(&pool, id, CatalogKind::Skill, true).await;
+    }
+
+    let first = list_enabled_capped(&pool, 0, "", 2, 2).await.unwrap();
+    assert_eq!(ids(&first), ["a", "b"]);
+    let second = list_enabled_capped(&pool, 0, &first.next_id, 2, 2)
+        .await
+        .unwrap();
+    assert_eq!(ids(&second), ["c"]);
+    let third = list_enabled_capped(&pool, 0, &second.next_id, 2, 2)
+        .await
+        .unwrap();
+    assert_eq!(ids(&third), Vec::<&str>::new());
+    assert_eq!(third.next_id, "c");
+}
+
+#[sqlx::test(migrations = false)]
+async fn a_shrunk_cap_cuts_a_page_just_over_it(pool: PgPool) {
+    migrated(&pool).await;
+    for id in ["a", "b", "c", "d"] {
+        seed(&pool, id, CatalogKind::Skill, true).await;
+    }
+
+    let at = list_enabled_capped(&pool, 0, "", 3, 3).await.unwrap();
+    assert_eq!(at.items.len(), 3);
+    let over = list_enabled_capped(&pool, 0, "", 4, 3).await.unwrap();
+    assert_eq!(over.items.len(), 3);
+    let default = list_enabled_capped(&pool, 0, "", 0, 3).await.unwrap();
+    assert_eq!(default.items.len(), 3);
+}
+
+#[sqlx::test(migrations = false)]
+async fn the_real_cap_holds_at_and_just_over(pool: PgPool) {
+    migrated(&pool).await;
+    sqlx::query(
+        "INSERT INTO catalog_items (id, kind, name, content, digest, admin_enabled) \
+         SELECT 'i' || lpad(g::text, 4, '0'), 'skill', 'i' || lpad(g::text, 4, '0'), 'body', \
+         decode(repeat('00', 32), 'hex'), true FROM generate_series(1, $1) g",
+    )
+    .bind(i32::try_from(MAX_CATALOG_PAGE).unwrap() + 1)
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    let at = list_enabled(&pool, 0, "", MAX_CATALOG_PAGE).await.unwrap();
+    assert_eq!(at.items.len(), MAX_CATALOG_PAGE as usize);
+    let over = list_enabled(&pool, 0, "", MAX_CATALOG_PAGE + 1)
+        .await
+        .unwrap();
+    assert_eq!(over.items.len(), MAX_CATALOG_PAGE as usize);
+    let max = list_enabled(&pool, 0, "", u32::MAX).await.unwrap();
+    assert_eq!(max.items.len(), MAX_CATALOG_PAGE as usize);
+    let default = list_enabled(&pool, 0, "", 0).await.unwrap();
+    assert_eq!(default.items.len(), DEFAULT_CATALOG_PAGE as usize);
 }

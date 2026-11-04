@@ -34,6 +34,18 @@ const SET_ENABLED: &str = "UPDATE catalog_items SET admin_enabled = $2, updated_
     WHERE id = $1 \
     RETURNING id, kind, name, content, digest, admin_enabled";
 
+const LIST_ENABLED: &str = "SELECT id, kind, name, content, digest, admin_enabled \
+    FROM catalog_items \
+    WHERE admin_enabled AND id > $1 AND ($2::text IS NULL OR kind = $2) \
+    ORDER BY id LIMIT $3";
+
+/// Page size used when a list request asks for 0.
+pub const DEFAULT_CATALOG_PAGE: u32 = 50;
+/// Largest page a list returns, for the store and every handler.
+pub const MAX_CATALOG_PAGE: u32 = 200;
+/// Refusal reason for a list filter naming a kind outside the closed set.
+pub const REASON_KIND_UNKNOWN: &str = "the catalog item kind is unknown";
+
 const UNIQUE_VIOLATION: &str = "23505";
 
 type Row = (String, String, String, String, Vec<u8>, bool);
@@ -150,6 +162,71 @@ pub async fn set_enabled(
         .map_err(|err| store_error(&err))?
         .ok_or_else(|| Status::not_found(REASON_NOT_FOUND))?;
     item_of(row)
+}
+
+/// One page of enabled catalog items.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CatalogPage {
+    /// The items, ordered by id.
+    pub items: Vec<CatalogItem>,
+    /// The id of the last item returned, else the `after_id` of the request.
+    pub next_id: String,
+}
+
+/// Lists one page of admin-enabled catalog items for any user.
+///
+/// `kind` is the wire value of [`CatalogKind`]: 0 lists every kind, 1 to 4 filter. `after_id` is
+/// exclusive and empty starts at the first item. A `limit` of 0 means [`DEFAULT_CATALOG_PAGE`];
+/// larger values are cut to [`MAX_CATALOG_PAGE`]. A client keeps `next_id` as its cursor and
+/// stops on an empty page. The list takes no owner and no admin override: a disabled item never
+/// appears.
+///
+/// # Errors
+/// `INVALID_ARGUMENT` for a kind outside the closed set, `INTERNAL` on a storage failure.
+pub async fn list_enabled(
+    pool: &PgPool,
+    kind: i32,
+    after_id: &str,
+    limit: u32,
+) -> Result<CatalogPage, Status> {
+    list_enabled_capped(pool, kind, after_id, limit, MAX_CATALOG_PAGE).await
+}
+
+/// [`list_enabled`] with an injected page cap, so tests can shrink it.
+///
+/// # Errors
+/// The errors of [`list_enabled`].
+pub async fn list_enabled_capped(
+    pool: &PgPool,
+    kind: i32,
+    after_id: &str,
+    limit: u32,
+    cap: u32,
+) -> Result<CatalogPage, Status> {
+    let kind = match CatalogKind::try_from(kind) {
+        Ok(CatalogKind::Unspecified) => None,
+        Ok(known) => core_kind(known).map(CoreKind::as_str),
+        Err(_) => return Err(Status::invalid_argument(REASON_KIND_UNKNOWN)),
+    };
+    let limit = match limit {
+        0 => DEFAULT_CATALOG_PAGE.min(cap),
+        n => n.min(cap),
+    };
+    let rows = sqlx::query_as::<_, Row>(LIST_ENABLED)
+        .bind(after_id)
+        .bind(kind)
+        .bind(i64::from(limit))
+        .fetch_all(pool)
+        .await
+        .map_err(|err| store_error(&err))?;
+    let items = rows
+        .into_iter()
+        .map(item_of)
+        .collect::<Result<Vec<_>, _>>()?;
+    let next_id = items
+        .last()
+        .map_or_else(|| after_id.to_owned(), |item| item.id.clone());
+    Ok(CatalogPage { items, next_id })
 }
 
 /// Lists the catalog items a client may see.
