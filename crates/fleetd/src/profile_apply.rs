@@ -377,21 +377,6 @@ impl fmt::Display for LoadError {
 
 impl std::error::Error for LoadError {}
 
-/// [`load_checked`] with no box allowlist: the box trusts the server's model check.
-///
-/// # Errors
-///
-/// Returns the [`LoadError`] of the first check that fails.
-pub fn load(
-    expected: &ProfileRef,
-    reply: &GetProfileBlobReply,
-    default: &Bundle,
-    ceilings: &BoxCeilings,
-    job_prompt: &str,
-) -> Result<Applied, LoadError> {
-    load_checked(expected, reply, default, ceilings, None, job_prompt)
-}
-
 /// Checks the blob `reply` against the Job's `expected` reference, then lays the Profile over
 /// `default` with [`apply_profile`].
 ///
@@ -401,33 +386,14 @@ pub fn load(
 /// re-checks the Profile model with [`floor::check_model`], before the overlay is built, so a
 /// refused model leaves no bundle, argv or prompt behind (ADR-0054).
 ///
-/// # Errors
-///
-/// Returns the [`LoadError`] of the first check that fails, [`LoadError::ModelDenied`] for a
-/// model outside `allowlist`.
-pub fn load_checked(
-    expected: &ProfileRef,
-    reply: &GetProfileBlobReply,
-    default: &Bundle,
-    ceilings: &BoxCeilings,
-    allowlist: Option<&ModelAllowlist>,
-    job_prompt: &str,
-) -> Result<Applied, LoadError> {
-    load_stamped(
-        expected, reply, default, ceilings, allowlist, true, job_prompt,
-    )
-}
-
-/// [`load_checked`] plus the server stamp on profile tools (ADR-0054).
-///
 /// `tools_granted` is the Job's `profile_tools_granted`. A Profile with tools and `false` is
 /// refused with [`LoadError::ToolsNotGranted`] after the validator and before the model check,
-/// the overlay or any install. [`load_checked`] passes `true` and trusts the caller; the Job
-/// path must call this with the Job's own stamp.
+/// the overlay or any install.
 ///
 /// # Errors
 ///
-/// Returns the [`LoadError`] of the first check that fails.
+/// Returns the [`LoadError`] of the first check that fails, [`LoadError::ToolsNotGranted`] for
+/// unstamped tools and [`LoadError::ModelDenied`] for a model outside `allowlist`.
 pub fn load_stamped(
     expected: &ProfileRef,
     reply: &GetProfileBlobReply,
@@ -783,7 +749,7 @@ mod tests {
     }
 
     fn loaded(reference: &ProfileRef, reply: &GetProfileBlobReply) -> Result<Applied, LoadError> {
-        load(reference, reply, &Bundle::default(), &ceilings(), "fix it")
+        stamped(reference, reply, true)
     }
 
     fn loaded_with(
@@ -791,12 +757,13 @@ mod tests {
         reply: &GetProfileBlobReply,
         allowlist: Option<&ModelAllowlist>,
     ) -> Result<Applied, LoadError> {
-        load_checked(
+        load_stamped(
             reference,
             reply,
             &Bundle::default(),
             &ceilings(),
             allowlist,
+            true,
             "fix it",
         )
     }

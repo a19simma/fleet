@@ -1517,6 +1517,7 @@ mod tests {
                 version: 3,
                 hash: profile.hash().to_string(),
             }),
+            profile_tools_granted: !profile.tools.is_empty(),
             ..sample_job()
         }
     }
