@@ -36,6 +36,9 @@ pub fn unshare_profile(_request: &UnshareProfileRequest) -> Result<WireProfile, 
 
 const INSERT_BLOB: &str = "INSERT INTO profile_blob (hash, content, size) VALUES ($1, $2, $3) \
      ON CONFLICT (hash) DO NOTHING";
+const LOCK_OWNER: &str = "SELECT id FROM users WHERE id = $1 FOR SHARE";
+const INSERT_OWNER: &str = "INSERT INTO profile (owner_user_id, name) VALUES ($1, $2) \
+     ON CONFLICT (owner_user_id, name) DO NOTHING";
 const LOCK_NAME: &str = "SELECT pg_advisory_xact_lock(hashtextextended($1, 0))";
 const SELECT_VERSION_BY_HASH: &str =
     "SELECT version FROM profile_version WHERE name = $1 AND hash = $2";
@@ -72,6 +75,8 @@ pub enum ProfileFault {
     ToolsDisabled,
     /// The request set both or neither of the JSON and TOML content.
     ContentChoice,
+    /// The caller is not a stored user. The handler maps this to `PERMISSION_DENIED`.
+    Unowned,
 }
 
 impl fmt::Display for ProfileFault {
@@ -83,6 +88,7 @@ impl fmt::Display for ProfileFault {
             Self::Invalid(err) => err.fmt(f),
             Self::ToolsDisabled => f.write_str(ERR_PROFILE_TOOLS_DISABLED),
             Self::ContentChoice => f.write_str(ERR_PROFILE_CONTENT_CHOICE),
+            Self::Unowned => f.write_str("profile create needs a user token"),
         }
     }
 }
@@ -208,6 +214,75 @@ pub(crate) async fn create(
         .execute(&mut *tx)
         .await?;
     sqlx::query(LOCK_NAME)
+        .bind(&new.name)
+        .execute(&mut *tx)
+        .await?;
+    let existing = sqlx::query(SELECT_VERSION_BY_HASH)
+        .bind(&new.name)
+        .bind(new.hash.as_bytes().as_slice())
+        .fetch_optional(&mut *tx)
+        .await?;
+    let (version, created) = if let Some(row) = existing {
+        (row.try_get::<i32, _>("version")?, false)
+    } else {
+        let row = sqlx::query(INSERT_VERSION)
+            .bind(&new.name)
+            .bind(new.hash.as_bytes().as_slice())
+            .fetch_one(&mut *tx)
+            .await?;
+        (row.try_get::<i32, _>("version")?, true)
+    };
+    tx.commit().await?;
+    Ok(ProfileVersion {
+        name: new.name,
+        version: version_of(version)?,
+        hash: new.hash.to_string(),
+        content_json: text_of(new.canonical)?,
+        created,
+    })
+}
+
+/// Stores a profile for the authenticated caller and records the caller as owner.
+///
+/// `caller` is the user id [`crate::auth::Caller`] carries. The owner is never read from the
+/// request. A `None` caller (the box token, or no user store) is refused before validation
+/// or any query. The owner row is locked `FOR SHARE` for the transaction, so a user deleted
+/// meanwhile cannot gain a profile, and a caller that is not a stored user is refused. The
+/// first create of a name by this owner inserts the `profile` row; a repeat leaves it as is.
+///
+/// # Errors
+///
+/// Returns [`ProfileFault::Unowned`] with nothing written when `caller` is `None` or not a
+/// stored user, any validation fault of [`validate_create`], and a database error.
+pub async fn create_owned(
+    pool: &PgPool,
+    caller: Option<i64>,
+    name: &str,
+    content: ProfileContent<'_>,
+    allow_tools: bool,
+) -> Result<ProfileVersion, StoreError> {
+    let owner = caller.ok_or(ProfileFault::Unowned)?;
+    let new = validate_create(name, content, allow_tools)?;
+    let size = i32::try_from(new.canonical.len())
+        .map_err(|_| StoreError::OutOfRange("profile content"))?;
+    let mut tx = pool.begin().await?;
+    sqlx::query(LOCK_OWNER)
+        .bind(owner)
+        .fetch_optional(&mut *tx)
+        .await?
+        .ok_or(ProfileFault::Unowned)?;
+    sqlx::query(INSERT_BLOB)
+        .bind(new.hash.as_bytes().as_slice())
+        .bind(new.canonical.as_slice())
+        .bind(size)
+        .execute(&mut *tx)
+        .await?;
+    sqlx::query(LOCK_NAME)
+        .bind(&new.name)
+        .execute(&mut *tx)
+        .await?;
+    sqlx::query(INSERT_OWNER)
+        .bind(owner)
         .bind(&new.name)
         .execute(&mut *tx)
         .await?;
