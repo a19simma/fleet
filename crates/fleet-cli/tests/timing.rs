@@ -485,7 +485,7 @@ mod served {
         CancelJobRequest, GetJobRequest, GetJobTimingReply, GetJobTimingRequest, GetStatsReply,
         GetStatsRequest, Job, ListJobsReply, ListJobsRequest, ReadJobEventsReply,
         ReadJobEventsRequest, ReadTranscriptReply, ReadTranscriptRequest, ShellCommand,
-        ShellStatus, StreamShellLogChunk, StreamShellLogRequest, SubmitJobRequest,
+        ShellStatus, StreamShellLogChunk, StreamShellLogRequest, SubmitJobRequest, TimingSummary,
     };
     use tokio::net::TcpListener;
     use tokio_stream::wrappers::TcpListenerStream;
@@ -499,6 +499,8 @@ mod served {
     struct Stub {
         chunks: Vec<StreamShellLogChunk>,
         commands: Vec<ShellCommand>,
+        summary: Option<TimingSummary>,
+        refuse: Option<tonic::Code>,
         follows: Arc<Mutex<Vec<StreamShellLogRequest>>>,
     }
 
@@ -561,8 +563,12 @@ mod served {
             &self,
             _: Request<GetJobTimingRequest>,
         ) -> Result<Response<GetJobTimingReply>, Status> {
+            if let Some(code) = self.refuse {
+                return Err(Status::new(code, "job not found"));
+            }
             Ok(Response::new(GetJobTimingReply {
                 shell_commands: self.commands.clone(),
+                summary: self.summary,
                 ..GetJobTimingReply::default()
             }))
         }
@@ -739,12 +745,12 @@ mod served {
     }
 
     #[tokio::test]
-    async fn the_plain_summary_opens_no_session() -> TestResult {
+    async fn the_plain_summary_needs_a_token() -> TestResult {
         let result = run_no_token("http://127.0.0.1:1", &["timing", "job-1"]).await;
-        let Err(CliError::Rpc(status)) = result else {
-            panic!("expected an rpc error, got {result:?}");
+        let Err(err @ CliError::Config(_)) = result else {
+            panic!("expected a config error, got {result:?}");
         };
-        assert_eq!(status.code(), tonic::Code::Unimplemented);
+        assert_eq!(err.exit_code(), 2);
         Ok(())
     }
 
@@ -765,15 +771,136 @@ mod served {
         Ok(())
     }
 
+    fn summary(parts: [u64; 5]) -> TimingSummary {
+        TimingSummary {
+            wall_ms: 0,
+            api_wait_ms: parts[0],
+            tool_ms: parts[1],
+            shell_ms: parts[2],
+            idle_ms: parts[3],
+            overhead_ms: parts[4],
+        }
+    }
+
+    async fn plain(
+        summary: Option<TimingSummary>,
+        args: &[&str],
+    ) -> Result<(Result<(), CliError>, String), Box<dyn std::error::Error>> {
+        let url = serve(Stub {
+            summary,
+            ..Stub::default()
+        })
+        .await?;
+        let mut full = vec!["timing", "job-1"];
+        full.extend_from_slice(args);
+        Ok(cli(&url, &full).await)
+    }
+
     #[tokio::test]
-    async fn the_plain_summary_is_still_not_implemented() -> TestResult {
-        let url = serve(Stub::default()).await?;
-        let (result, _) = cli(&url, &["timing", "job-1"]).await;
-        let Err(CliError::Rpc(status)) = result else {
+    async fn the_summary_prints_five_parts_and_shares_in_job_relative_ms() -> TestResult {
+        let (result, text) = plain(Some(summary([1000, 2000, 3000, 1000, 3000])), &[]).await?;
+        result?;
+        assert_eq!(
+            text,
+            "job: job-1\nunit: ms, job-relative (0 is the claim)\nAPI wait\t1000ms\t10.0%\nTools\t2000ms\t20.0%\nShell\t3000ms\t30.0%\nIdle\t1000ms\t10.0%\nOverhead\t3000ms\t30.0%\nTotal\t10000ms\t100.0%\n"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn shares_sum_to_one_hundred_percent_when_parts_do_not_divide() -> TestResult {
+        let (result, text) = plain(Some(summary([1, 1, 1, 0, 0])), &[]).await?;
+        result?;
+        assert!(text.contains("API wait\t1ms\t33.4%\n"), "{text}");
+        assert!(text.contains("Tools\t1ms\t33.3%\n"), "{text}");
+        assert!(text.contains("Shell\t1ms\t33.3%\n"), "{text}");
+        assert!(text.ends_with("Total\t3ms\t100.0%\n"), "{text}");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_zero_wall_prints_zero_shares_and_no_division() -> TestResult {
+        let (result, text) = plain(Some(summary([0; 5])), &[]).await?;
+        result?;
+        assert_eq!(text.matches("0ms\t0.0%\n").count(), 6, "{text}");
+        assert!(!text.contains("NaN") && !text.contains("100.0%"), "{text}");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn the_largest_parts_print_without_overflow() -> TestResult {
+        let (result, text) = plain(Some(summary([u64::MAX; 5])), &[]).await?;
+        result?;
+        assert!(
+            text.contains("API wait\t18446744073709551615ms\t20.0%\n"),
+            "{text}"
+        );
+        assert!(
+            text.ends_with("Total\t18446744073709551615ms\t100.0%\n"),
+            "{text}"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn json_carries_unit_total_and_the_five_parts() -> TestResult {
+        let (result, text) =
+            plain(Some(summary([1000, 2000, 3000, 1000, 3000])), &["--json"]).await?;
+        result?;
+        assert_eq!(
+            text,
+            "{\"unit\":\"ms\",\"job\":\"job-1\",\"total_ms\":10000,\"parts\":[{\"key\":\"api_wait\",\"ms\":1000,\"permille\":100},{\"key\":\"tool\",\"ms\":2000,\"permille\":200},{\"key\":\"shell\",\"ms\":3000,\"permille\":300},{\"key\":\"idle\",\"ms\":1000,\"permille\":100},{\"key\":\"overhead\",\"ms\":3000,\"permille\":300}]}\n"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn an_absent_report_exits_three_and_prints_nothing() -> TestResult {
+        let (result, text) = plain(None, &[]).await?;
+        let Err(err @ CliError::NoTimingReport) = result else {
+            panic!("expected no timing report, got {result:?}");
+        };
+        assert_eq!(err.exit_code(), 3);
+        assert_eq!(err.to_string(), "no timing report for this job");
+        assert_eq!(text, "");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_missing_job_is_an_rpc_not_found_that_exits_one() -> TestResult {
+        let url = serve(Stub {
+            refuse: Some(tonic::Code::NotFound),
+            ..Stub::default()
+        })
+        .await?;
+        let (result, text) = cli(&url, &["timing", "job-1"]).await;
+        let Err(err @ CliError::Rpc(_)) = result else {
             panic!("expected an rpc error, got {result:?}");
         };
-        assert_eq!(status.code(), tonic::Code::Unimplemented);
-        assert_eq!(CliError::Rpc(status).exit_code(), 1);
+        assert_eq!(err.exit_code(), 1);
+        assert_eq!(text, "");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn the_echoed_job_id_loses_control_and_bidi_characters() -> TestResult {
+        let url = serve(Stub {
+            summary: Some(summary([1, 0, 0, 0, 0])),
+            ..Stub::default()
+        })
+        .await?;
+        let hostile = "j\u{1b}[31m\u{202e}\r\u{2028}x";
+        for args in [&["timing", hostile][..], &["timing", hostile, "--json"][..]] {
+            let (result, text) = cli(&url, args).await;
+            result?;
+            assert!(text.contains("j[31mx"), "{text:?}");
+            assert!(
+                !text
+                    .chars()
+                    .any(|c| matches!(c, '\u{1b}' | '\u{202e}' | '\r' | '\u{2028}')),
+                "{text:?}"
+            );
+        }
         Ok(())
     }
 }

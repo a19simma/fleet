@@ -280,13 +280,17 @@ pub enum CliError {
     Io(std::io::Error),
     /// A watched or followed job ended in a state other than succeeded.
     JobEnded(&'static str),
+    /// The job exists but no timing report was stored for it.
+    NoTimingReport,
 }
 
 impl CliError {
-    /// Process exit code: 2 for usage and configuration errors, 1 for everything else.
+    /// Process exit code: 2 for usage and configuration errors, 3 for a job with no timing
+    /// report, 1 for everything else.
     pub fn exit_code(&self) -> u8 {
         match self {
             Self::Config(_) | Self::Usage(_) => 2,
+            Self::NoTimingReport => 3,
             Self::Connect(_) | Self::Rpc(_) | Self::Io(_) | Self::JobEnded(_) => 1,
         }
     }
@@ -371,6 +375,7 @@ impl fmt::Display for CliError {
             ),
             Self::Io(e) => write!(f, "{e}"),
             Self::JobEnded(state) => write!(f, "job ended {state}"),
+            Self::NoTimingReport => write!(f, "no timing report for this job"),
         }
     }
 }
@@ -747,18 +752,17 @@ pub async fn run_with(
             commands,
             follow,
             json,
-        } => match follow {
-            Some(c) => {
-                timing::check_command_id(&c)?;
-                let mut client = session(server, insecure, lookup, timeouts).await?.jobs;
-                timing::follow(&mut client, &job, &c, json, out).await?;
+        } => {
+            if let Some(c) = &follow {
+                timing::check_command_id(c)?;
             }
-            None if commands => {
-                let mut client = session(server, insecure, lookup, timeouts).await?.jobs;
-                timing::list_commands(&mut client, &job, json, out).await?;
+            let mut client = session(server, insecure, lookup, timeouts).await?.jobs;
+            match follow {
+                Some(c) => timing::follow(&mut client, &job, &c, json, out).await?,
+                None if commands => timing::list_commands(&mut client, &job, json, out).await?,
+                None => timing::show(&mut client, &job, json, out).await?,
             }
-            None => timing::run(&job, commands, json)?,
-        },
+        }
         Command::Catalog { action } => catalog::run(&action)?,
         Command::UserCap { area } => catalog::run_user(&area)?,
         Command::Batch { action } => {
@@ -934,6 +938,7 @@ mod tests {
         assert_eq!(CliError::Connect("x".into()).exit_code(), 1);
         assert_eq!(CliError::Rpc(Status::internal("x")).exit_code(), 1);
         assert_eq!(CliError::Io(std::io::Error::other("x")).exit_code(), 1);
+        assert_eq!(CliError::NoTimingReport.exit_code(), 3);
     }
 
     #[test]

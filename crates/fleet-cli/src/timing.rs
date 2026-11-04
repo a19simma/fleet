@@ -5,6 +5,7 @@ use std::future::Future;
 use std::io::Write;
 use std::time::Duration;
 
+use fleet_core::timing::{Summary, TimingView};
 use fleet_proto::v1::{
     GetJobTimingRequest, ShellCommand, ShellStatus, StreamShellLogChunk, StreamShellLogRequest,
 };
@@ -32,14 +33,98 @@ pub const FOLLOW_DEADLINE: Duration = Duration::from_secs(630);
 const CUT_MARKER: &str = "-- log output cut --";
 const DEADLINE_MARKER: &str = "-- follow stopped: time limit --";
 
-/// Shows the timing breakdown of one job.
+/// Writes the five-part breakdown of `job` from `view`.
+///
+/// Every time is milliseconds on the job clock, where the job window is `0` to the total.
+/// The table rows are `label`, milliseconds and the share of the total with one decimal; a
+/// zero total shows `0.0%`. With `json` the output is one object holding `unit`, `job`,
+/// `total_ms` and the parts with their `permille`. The job id is echoed through [`sanitize`].
 ///
 /// # Errors
-/// Returns an `UNIMPLEMENTED` [`CliError::Rpc`] until the command is built.
-pub(crate) fn run(_job: &str, _commands: bool, _json: bool) -> Result<(), CliError> {
-    Err(CliError::Rpc(Status::unimplemented(
-        "fleet timing is not implemented",
-    )))
+/// Returns [`CliError::Io`] when the output fails.
+pub fn write_breakdown(
+    out: &mut impl Write,
+    job: &str,
+    view: &TimingView,
+    json: bool,
+) -> Result<(), CliError> {
+    let job = sanitize(job);
+    let labels = fleet_core::timing::FIELDS;
+    if json {
+        let mut parts = String::new();
+        for row in &view.rows {
+            if !parts.is_empty() {
+                parts.push(',');
+            }
+            let _ = write!(
+                parts,
+                "{{\"key\":{},\"ms\":{},\"permille\":{}}}",
+                json_text(row.key),
+                row.ms,
+                row.permille,
+            );
+        }
+        writeln!(
+            out,
+            "{{\"unit\":\"ms\",\"job\":{},\"total_ms\":{},\"parts\":[{parts}]}}",
+            json_text(&job),
+            view.total_ms,
+        )?;
+        return Ok(());
+    }
+    writeln!(out, "job: {job}")?;
+    writeln!(out, "unit: ms, job-relative (0 is the claim)")?;
+    for row in &view.rows {
+        let label = labels
+            .iter()
+            .find(|f| f.key == row.key)
+            .map_or(row.key, |f| f.label);
+        writeln!(out, "{label}\t{}ms\t{}", row.ms, row.percent_label())?;
+    }
+    let permille = view
+        .rows
+        .iter()
+        .fold(0u16, |sum, row| sum.saturating_add(row.permille));
+    writeln!(
+        out,
+        "Total\t{}ms\t{}.{}%",
+        view.total_ms,
+        permille / 10,
+        permille % 10
+    )?;
+    Ok(())
+}
+
+/// Fetches the timing of job `job` and writes its breakdown with [`write_breakdown`].
+///
+/// # Errors
+/// Returns [`CliError::Rpc`] on a server error, including the identical not-found answer for a
+/// job that is missing or not yours, [`CliError::NoTimingReport`] when the job has no stored
+/// report, and [`CliError::Io`] on an output failure.
+pub(crate) async fn show(
+    client: &mut Client,
+    job: &str,
+    json: bool,
+    out: &mut impl Write,
+) -> Result<(), CliError> {
+    let reply = client
+        .get_job_timing(GetJobTimingRequest {
+            job_id: job.to_owned(),
+        })
+        .await?
+        .into_inner();
+    let summary = reply.summary.ok_or(CliError::NoTimingReport)?;
+    let view = TimingView::new(
+        &Summary {
+            api_wait_ms: summary.api_wait_ms,
+            tool_ms: summary.tool_ms,
+            shell_ms: summary.shell_ms,
+            idle_ms: summary.idle_ms,
+            overhead_ms: summary.overhead_ms,
+        },
+        &[],
+    );
+    write_breakdown(out, job, &view, json)
 }
 
 /// A source of live log chunks: the gRPC stream, or a script in a test.
