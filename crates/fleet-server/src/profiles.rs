@@ -41,6 +41,11 @@ const INSERT_PROFILE: &str = "INSERT INTO profile (owner_user_id, name, visibili
      VALUES ($1, $2, $3) ON CONFLICT (owner_user_id, name) DO NOTHING";
 const LOCK_PROFILE: &str =
     "SELECT id FROM profile WHERE owner_user_id = $1 AND name = $2 FOR SHARE";
+const LOCK_PROFILE_FOR_WRITE: &str =
+    "SELECT owner_user_id, visibility, name FROM profile WHERE id = $1 FOR UPDATE";
+const PROFILE_HAS_VERSIONS: &str =
+    "SELECT EXISTS (SELECT 1 FROM profile_version WHERE profile_id = $1)";
+const DELETE_PROFILE: &str = "DELETE FROM profile WHERE id = $1";
 const LOCK_PROFILE_ID: &str = "SELECT pg_advisory_xact_lock($1)";
 const SELECT_SYSTEM_USER: &str = "SELECT system_user_id()";
 const SELECT_VERSION_BY_HASH: &str =
@@ -84,6 +89,11 @@ pub enum ProfileFault {
     ContentChoice,
     /// The caller is not a stored user. The handler maps this to `PERMISSION_DENIED`.
     Unowned,
+    /// The caller can read this shared profile but does not own it. The handler maps this
+    /// to `PERMISSION_DENIED`. A private foreign profile is [`StoreError::NotFound`] instead.
+    NotOwner,
+    /// The profile has versions, which are insert-only, so the row cannot be removed.
+    HasVersions,
 }
 
 impl fmt::Display for ProfileFault {
@@ -96,6 +106,8 @@ impl fmt::Display for ProfileFault {
             Self::ToolsDisabled => f.write_str(ERR_PROFILE_TOOLS_DISABLED),
             Self::ContentChoice => f.write_str(ERR_PROFILE_CONTENT_CHOICE),
             Self::Unowned => f.write_str("profile create needs a user token"),
+            Self::NotOwner => f.write_str("only the owner can change this profile"),
+            Self::HasVersions => f.write_str("profile has versions and cannot be deleted"),
         }
     }
 }
@@ -140,6 +152,12 @@ pub struct NewProfile {
     hash: ProfileHash,
 }
 
+/// A validated Profile body without a name: the canonical JSON and its hash.
+struct Body {
+    canonical: Vec<u8>,
+    hash: ProfileHash,
+}
+
 /// Validates a profile name.
 ///
 /// # Errors
@@ -169,6 +187,15 @@ pub fn validate_create(
     allow_tools: bool,
 ) -> Result<NewProfile, ProfileFault> {
     validate_name(name)?;
+    let Body { canonical, hash } = validate_body(content, allow_tools)?;
+    Ok(NewProfile {
+        name: name.to_owned(),
+        canonical,
+        hash,
+    })
+}
+
+fn validate_body(content: ProfileContent<'_>, allow_tools: bool) -> Result<Body, ProfileFault> {
     if content.text().len() > MAX_PROFILE_JSON_BYTES {
         return Err(ProfileFault::TooLarge);
     }
@@ -181,8 +208,7 @@ pub fn validate_create(
         return Err(ProfileFault::ToolsDisabled);
     }
     profile.validate().map_err(ProfileFault::Invalid)?;
-    Ok(NewProfile {
-        name: name.to_owned(),
+    Ok(Body {
         canonical: profile.canonical_json(),
         hash: profile.hash(),
     })
@@ -274,13 +300,44 @@ async fn store_version(
         .bind(&new.name)
         .fetch_one(&mut *tx)
         .await?;
+    let NewProfile {
+        name,
+        canonical,
+        hash,
+    } = new;
+    let stored = push_version(&mut tx, profile_id, Body { canonical, hash }).await?;
+    tx.commit().await?;
+    version_reply(name, stored)
+}
+
+struct Stored {
+    version: i32,
+    created: bool,
+    body: Body,
+}
+
+fn version_reply(name: String, stored: Stored) -> Result<ProfileVersion, StoreError> {
+    Ok(ProfileVersion {
+        name,
+        version: version_of(stored.version)?,
+        hash: stored.body.hash.to_string(),
+        content_json: text_of(stored.body.canonical)?,
+        created: stored.created,
+    })
+}
+
+async fn push_version(
+    tx: &mut sqlx::PgConnection,
+    profile_id: i64,
+    body: Body,
+) -> Result<Stored, StoreError> {
     sqlx::query(LOCK_PROFILE_ID)
         .bind(profile_id)
         .execute(&mut *tx)
         .await?;
     let existing = sqlx::query(SELECT_VERSION_BY_HASH)
         .bind(profile_id)
-        .bind(new.hash.as_bytes().as_slice())
+        .bind(body.hash.as_bytes().as_slice())
         .fetch_optional(&mut *tx)
         .await?;
     let (version, created) = if let Some(row) = existing {
@@ -288,19 +345,112 @@ async fn store_version(
     } else {
         let row = sqlx::query(INSERT_VERSION)
             .bind(profile_id)
-            .bind(new.hash.as_bytes().as_slice())
+            .bind(body.hash.as_bytes().as_slice())
             .fetch_one(&mut *tx)
             .await?;
         (row.try_get::<i32, _>("version")?, true)
     };
-    tx.commit().await?;
-    Ok(ProfileVersion {
-        name: new.name,
-        version: version_of(version)?,
-        hash: new.hash.to_string(),
-        content_json: text_of(new.canonical)?,
+    Ok(Stored {
+        version,
         created,
+        body,
     })
+}
+
+struct Locked {
+    name: String,
+}
+
+async fn lock_for_owner(
+    tx: &mut sqlx::PgConnection,
+    caller: i64,
+    profile_id: i64,
+) -> Result<Locked, StoreError> {
+    let row = sqlx::query(LOCK_PROFILE_FOR_WRITE)
+        .bind(profile_id)
+        .fetch_optional(&mut *tx)
+        .await?
+        .ok_or(StoreError::NotFound)?;
+    if row.try_get::<i64, _>("owner_user_id")? != caller {
+        return Err(if row.try_get::<String, _>("visibility")? == "shared" {
+            ProfileFault::NotOwner.into()
+        } else {
+            StoreError::NotFound
+        });
+    }
+    Ok(Locked {
+        name: row.try_get("name")?,
+    })
+}
+
+/// Adds a version to the profile `profile_id`, which only its owner may do.
+///
+/// The content is validated before any query. The profile row is then locked `FOR UPDATE`
+/// inside the transaction and its owner compared with `caller`. Identical content returns
+/// the existing version with `created` false.
+///
+/// # Errors
+///
+/// Returns [`ProfileFault::Unowned`] for a `None` caller, any validation fault of the
+/// content, [`StoreError::NotFound`] for an absent profile or a private one owned by someone
+/// else, [`ProfileFault::NotOwner`] for a shared one owned by someone else, and a database
+/// error. Every refusal writes nothing.
+pub async fn update_owned(
+    pool: &PgPool,
+    caller: Option<i64>,
+    profile_id: i64,
+    content: ProfileContent<'_>,
+    allow_tools: bool,
+) -> Result<ProfileVersion, StoreError> {
+    let caller = caller.ok_or(ProfileFault::Unowned)?;
+    let body = validate_body(content, allow_tools)?;
+    let size = i32::try_from(body.canonical.len())
+        .map_err(|_| StoreError::OutOfRange("profile content"))?;
+    let mut tx = pool.begin().await?;
+    let locked = lock_for_owner(&mut tx, caller, profile_id).await?;
+    sqlx::query(INSERT_BLOB)
+        .bind(body.hash.as_bytes().as_slice())
+        .bind(body.canonical.as_slice())
+        .bind(size)
+        .execute(&mut *tx)
+        .await?;
+    let stored = push_version(&mut tx, profile_id, body).await?;
+    tx.commit().await?;
+    version_reply(locked.name, stored)
+}
+
+/// Removes the profile `profile_id`, which only its owner may do.
+///
+/// The profile row is locked `FOR UPDATE` before the owner check. Versions are insert-only,
+/// so a profile that has any is refused with [`ProfileFault::HasVersions`].
+///
+/// # Errors
+///
+/// Returns [`ProfileFault::Unowned`] for a `None` caller, [`StoreError::NotFound`] for an
+/// absent profile or a private one owned by someone else, [`ProfileFault::NotOwner`] for a
+/// shared one owned by someone else, [`ProfileFault::HasVersions`] and a database error.
+/// Every refusal writes nothing.
+pub async fn delete_owned(
+    pool: &PgPool,
+    caller: Option<i64>,
+    profile_id: i64,
+) -> Result<(), StoreError> {
+    let caller = caller.ok_or(ProfileFault::Unowned)?;
+    let mut tx = pool.begin().await?;
+    lock_for_owner(&mut tx, caller, profile_id).await?;
+    let has_versions: bool = sqlx::query_scalar(PROFILE_HAS_VERSIONS)
+        .bind(profile_id)
+        .fetch_one(&mut *tx)
+        .await?;
+    if has_versions {
+        return Err(ProfileFault::HasVersions.into());
+    }
+    sqlx::query(DELETE_PROFILE)
+        .bind(profile_id)
+        .execute(&mut *tx)
+        .await?;
+    tx.commit().await?;
+    Ok(())
 }
 
 pub(crate) async fn get(
