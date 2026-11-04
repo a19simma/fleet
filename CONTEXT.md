@@ -1,6 +1,6 @@
 # Fleet
 
-Fleet runs coding-agent Jobs on Boxes and records what each Job did. This file defines the terms of the ADRs on telemetry and metrics (0029, 0030), profiles (0034, 0035), the job socket, broker and registration (0036, 0037, 0039), fetch policy (0038), credentials and users (0040, 0042, 0043), agent runners and forges (0044, 0045) the mirror key (0046) and the update trust root (0047, 0050).
+Fleet runs coding-agent Jobs on Boxes and records what each Job did. This file defines the terms of the ADRs on telemetry and metrics (0029, 0030), profiles (0034, 0035, 0057), the job socket, broker and registration (0036, 0037, 0039), fetch policy (0038), credentials and users (0040, 0042, 0043), agent runners and forges (0044, 0045) the mirror key (0046) and the update trust root (0047, 0050).
 
 ## Language
 
@@ -24,8 +24,16 @@ _Avoid_: loop detector, watchdog
 A named, versioned, immutable config that overlays a **Bundle** for one Job: `claude_md`, context files, prompt template, skills, allow and deny rules, model, caps and settings. It holds no MCP, hooks or secrets (ADR-0034).
 _Avoid_: preset, template
 
+**Profile identity**:
+The `profile.id` of a **Profile**. Version streams, the Job pin and every Profile RPC key on it (ADR-0057).
+_Avoid_: profile name as key
+
+**Profile name**:
+A per-owner label for a **Profile**, resolved to a **Profile identity** by an owner-scoped lookup. Two owners can use the same name (ADR-0057).
+_Avoid_: profile id
+
 **Profile version**:
-One numbered entry of a named **Profile**, pointing at one **Profile hash**.
+One numbered entry of a **Profile** (by **Profile identity**), pointing at one **Profile hash**.
 _Avoid_: revision
 
 **Profile hash**:
