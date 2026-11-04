@@ -25,6 +25,7 @@ use tonic::transport::server::TcpIncoming;
 const WAIT: Duration = Duration::from_secs(20);
 const ORIGIN: &str = "https://fleet.example.com";
 const REPO: &str = "https://example.com/org/repo.git";
+const MAX_LOG_LINE: usize = 2048;
 const HOSTILE: &str = "<script>alert('log-xss')</script> & \"quoted\"";
 
 struct Reply {
@@ -156,6 +157,38 @@ impl Harness {
         .bind(job_id)
         .bind(command)
         .bind(text)
+        .execute(&self.pool)
+        .await
+        .unwrap();
+    }
+
+    #[expect(clippy::too_many_arguments, reason = "one column per argument")]
+    async fn full_command(
+        &self,
+        job_id: &str,
+        id: &str,
+        command: &str,
+        times: (i64, Option<i64>, i64),
+        log: (&str, bool),
+        ended_by: Option<&str>,
+        background: bool,
+    ) {
+        sqlx::query(
+            "INSERT INTO job_shell_commands (job_id, seq, id, command, background, started_ms, \
+             ended_ms, duration_ms, exit_code, log, log_truncated, ended_by) \
+             VALUES ($1, (SELECT count(*) FROM job_shell_commands WHERE job_id = $1), $2, $3, \
+             $4, $5, $6, $7, 0, $8, $9, $10)",
+        )
+        .bind(job_id)
+        .bind(id)
+        .bind(command)
+        .bind(background)
+        .bind(times.0)
+        .bind(times.1)
+        .bind(times.2)
+        .bind(log.0)
+        .bind(log.1)
+        .bind(ended_by)
         .execute(&self.pool)
         .await
         .unwrap();
@@ -569,5 +602,99 @@ async fn the_job_page_links_to_the_timing_page(pool: PgPool) {
     let reply = h.get(Some(&alice), &format!("/jobs/{job}"), &[]).await;
     assert_eq!(reply.status, 200);
     assert!(reply.body.contains(&format!("href=\"/jobs/{job}/timing\"")));
+    h.finish().await;
+}
+
+const HOSTILE_RAW: [char; 9] = [
+    '<', '\r', '\u{85}', '\u{2028}', '\u{202e}', '\u{1b}', '\u{2029}', '\u{200f}', '\u{7}',
+];
+
+#[sqlx::test]
+async fn each_command_shows_its_fields_and_log_in_an_escaped_pre(pool: PgPool) {
+    let h = Harness::start(pool, true).await;
+    let alice = h.session("alice", 'a').await;
+    let job = h.job(&alice, "k1").await;
+    h.report(&job, [1000, 2000, 3000, 4000, 5000]).await;
+    h.full_command(
+        &job,
+        "t1",
+        "echo [REDACTED] done",
+        (1500, Some(4500), 3000),
+        ("line one\nline two", false),
+        Some("timeout"),
+        true,
+    )
+    .await;
+    h.full_command(&job, "t2", "ls", (0, None, 0), ("", false), None, false)
+        .await;
+    let reply = h
+        .get(Some(&alice), &format!("/jobs/{job}/timing"), &[])
+        .await;
+    assert_eq!(reply.status, 200);
+    let body = &reply.body;
+    let first = body
+        .split("<tbody data-command")
+        .nth(1)
+        .unwrap()
+        .split("</tbody>")
+        .next()
+        .unwrap();
+    assert!(first.contains("echo [REDACTED] done"), "{first}");
+    assert!(first.contains("1.5s") && first.contains("4.5s") && first.contains("3.0s"));
+    assert!(first.contains("<td>yes</td>") && first.contains(">timeout</td>"));
+    assert!(first.contains("<pre") && first.contains("line one\nline two</pre>"));
+    assert!(!first.contains("data-truncated"));
+    let second = body.split("<tbody data-command").nth(2).unwrap();
+    assert!(second.contains("<td>no</td>"));
+    assert!(second.contains("<td>-</td>"));
+    h.finish().await;
+}
+
+#[sqlx::test]
+async fn hostile_fields_of_one_command_render_inert_and_show_truncation(pool: PgPool) {
+    let h = Harness::start(pool, true).await;
+    let alice = h.session("alice", 'a').await;
+    let job = h.job(&alice, "k1").await;
+    h.report(&job, [1, 1, 1, 1, 1]).await;
+    let hostile: String = HOSTILE_RAW.iter().collect();
+    let command = format!("{HOSTILE}{hostile}{}", "c".repeat(400));
+    let log = format!(
+        "<img src=x onerror=1>\r\n{hostile}\n{}[REDACTED]tail",
+        "l".repeat(MAX_LOG_LINE - 4)
+    );
+    let ended_by = format!("<b>{hostile}</b>");
+    h.full_command(
+        &job,
+        "t1",
+        &command,
+        (i64::MAX, Some(i64::MAX), i64::MAX),
+        (&log, true),
+        Some(&ended_by),
+        true,
+    )
+    .await;
+    let reply = h
+        .get(Some(&alice), &format!("/jobs/{job}/timing"), &[])
+        .await;
+    assert_eq!(reply.status, 200);
+    let body = &reply.body;
+    let block = body
+        .split("<tbody data-command")
+        .nth(1)
+        .unwrap()
+        .split("</tbody>")
+        .next()
+        .unwrap();
+    for bad in HOSTILE_RAW.iter().skip(1) {
+        assert!(!block.contains(*bad), "raw {bad:?}");
+    }
+    assert!(!block.contains("<script") && !block.contains("<img") && !block.contains("<b>"));
+    assert!(block.contains("&lt;script&gt;") && block.contains("&lt;img"));
+    assert!(block.contains("&lt;b&gt;"));
+    assert!(block.contains("data-truncated=\"command\""));
+    assert!(block.contains("data-truncated=\"log\""));
+    assert!(block.contains("[log truncated]"));
+    assert!(!block.contains("tail"));
+    assert!(block.contains('\u{2026}'));
     h.finish().await;
 }

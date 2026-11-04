@@ -21,7 +21,9 @@
 use std::convert::Infallible;
 
 use fleet_core::timing::{CommandInput, FIELDS, Summary, TimingView};
-use fleet_proto::v1::{GetJobTimingRequest, StreamShellLogChunk, StreamShellLogRequest};
+use fleet_proto::v1::{
+    GetJobTimingRequest, ShellCommand, StreamShellLogChunk, StreamShellLogRequest,
+};
 use fleet_proto::{
     shell_status_name, validate_shell_log_command_id, validate_shell_log_seq,
     validate_shell_log_status,
@@ -157,9 +159,40 @@ struct Breakdown {
 
 struct CommandLine {
     command: String,
+    cut: bool,
     start: String,
+    end: String,
     duration: String,
     exit: String,
+    background: &'static str,
+    ended_by: String,
+    log: String,
+    log_cut: bool,
+}
+
+struct Extra {
+    ended_ms: Option<u64>,
+    background: bool,
+    ended_by: String,
+    log: String,
+    log_cut: bool,
+}
+
+fn plain(text: &str) -> String {
+    let mut pane = Pane::new();
+    pane.push(text.as_bytes())
+}
+
+fn extra(command: &ShellCommand) -> Extra {
+    let mut pane = Pane::new();
+    let log = pane.push(command.log.as_bytes());
+    Extra {
+        ended_ms: command.ended_ms,
+        background: command.background,
+        ended_by: plain(command.ended_by.as_deref().unwrap_or("")),
+        log,
+        log_cut: command.log_truncated || pane.cut,
+    }
 }
 
 fn fill_class(key: &str) -> &'static str {
@@ -183,7 +216,7 @@ fn swatch_class(key: &str) -> &'static str {
     }
 }
 
-fn breakdown(summary: &Summary, commands: &[CommandInput]) -> Breakdown {
+fn breakdown(summary: &Summary, commands: &[CommandInput], extras: &[Extra]) -> Breakdown {
     let view = TimingView::new(summary, commands);
     let mut lines = Vec::new();
     let mut segments = Vec::new();
@@ -227,13 +260,22 @@ fn breakdown(summary: &Summary, commands: &[CommandInput]) -> Breakdown {
         commands: view
             .commands
             .iter()
-            .map(|row| CommandLine {
+            .zip(extras)
+            .map(|(row, more)| CommandLine {
                 command: row.command.clone(),
+                cut: row.truncated,
                 start: fleet_core::timing::human_duration_ms(row.start_ms),
+                end: more
+                    .ended_ms
+                    .map_or_else(|| "-".to_owned(), fleet_core::timing::human_duration_ms),
                 duration: fleet_core::timing::human_duration_ms(row.duration_ms),
                 exit: row
                     .exit
                     .map_or_else(|| "-".to_owned(), |code| code.to_string()),
+                background: if more.background { "yes" } else { "no" },
+                ended_by: more.ended_by.clone(),
+                log: more.log.clone(),
+                log_cut: more.log_cut,
             })
             .collect(),
         omitted: view.commands_omitted,
@@ -270,7 +312,8 @@ async fn timing_breakdown(store: &Store, user_id: i64, job_id: &str) -> Result<O
             truncated: false,
         })
         .collect();
-    Ok(Some(breakdown(&summary, &inputs)))
+    let extras: Vec<Extra> = reply.shell_commands.iter().map(extra).collect();
+    Ok(Some(breakdown(&summary, &inputs, &extras)))
 }
 
 fn store(cx: &Cx) -> Result<&Store> {
@@ -366,20 +409,39 @@ async fn timing_panel(timing: Option<Breakdown>) -> Result<impl View> {
                                     <tr>
                                         <th>"Command"</th>
                                         <th>"Start"</th>
+                                        <th>"End"</th>
                                         <th>"Duration"</th>
                                         <th>"Exit"</th>
+                                        <th>"Background"</th>
+                                        <th>"Ended by"</th>
                                     </tr>
                                 </thead>
-                                <tbody>
-                                    for command in timing.commands {
+                                for command in timing.commands {
+                                    <tbody data-command="">
                                         <tr>
-                                            <td class="break-all">(command.command.as_str())</td>
+                                            <td class="break-all">
+                                                (command.command.as_str())
+                                                if command.cut {
+                                                    " " <span class="badge badge-xs" data-truncated="command">"truncated"</span>
+                                                }
+                                            </td>
                                             <td>(command.start.as_str())</td>
+                                            <td>(command.end.as_str())</td>
                                             <td>(command.duration.as_str())</td>
                                             <td>(command.exit.as_str())</td>
+                                            <td>(command.background)</td>
+                                            <td class="break-all">(command.ended_by.as_str())</td>
                                         </tr>
-                                    }
-                                </tbody>
+                                        <tr>
+                                            <td colspan="7">
+                                                <pre class="command-log max-h-48 overflow-auto whitespace-pre-wrap border border-base-300 bg-base-300 p-2 text-xs">(command.log.as_str())</pre>
+                                                if command.log_cut {
+                                                    <p class="text-xs text-base-content/60" data-truncated="log">"[log truncated]"</p>
+                                                }
+                                            </td>
+                                        </tr>
+                                    </tbody>
+                                }
                             </table>
                         }
                         if timing.omitted > 0 {
@@ -461,6 +523,7 @@ async fn log_script() -> Result<([(header::HeaderName, &'static str); 1], &'stat
 
 /// Decodes, cleans and bounds the log text of one command for display.
 struct Pane {
+    cut: bool,
     carry: Vec<u8>,
     column: usize,
     skipping: bool,
@@ -484,6 +547,7 @@ fn is_dropped(ch: char) -> bool {
 impl Pane {
     fn new() -> Self {
         Self {
+            cut: false,
             carry: Vec::new(),
             column: 0,
             skipping: false,
@@ -531,6 +595,7 @@ impl Pane {
     fn clean(&mut self, text: &str, out: &mut String) {
         for ch in text.chars() {
             if self.full() {
+                self.cut = true;
                 return;
             }
             if ch == '\n' {
@@ -543,6 +608,7 @@ impl Pane {
                 out.push('\u{2026}');
                 self.sent += '\u{2026}'.len_utf8();
                 self.skipping = true;
+                self.cut = true;
             } else {
                 out.push(ch);
                 self.sent += ch.len_utf8();
