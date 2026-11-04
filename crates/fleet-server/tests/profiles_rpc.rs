@@ -11,6 +11,7 @@ use fleet_proto::v1::fleet_profiles_client::FleetProfilesClient;
 use fleet_proto::v1::{CreateProfileRequest, GetProfileRequest, ListProfilesRequest};
 use fleet_server::auth::BearerAuth;
 use fleet_server::config::Token;
+use fleet_server::profiles::{self, ProfileContent};
 use fleet_server::service::router;
 use fleet_server::store::Store;
 use sqlx::PgPool;
@@ -480,4 +481,75 @@ async fn update_delete_and_truncate_are_rejected(pool: PgPool) {
         .await
         .unwrap();
     assert_eq!((blobs, versions), (1, 1));
+}
+
+const OWNED: &str = r#"{"claude_md":"owned"}"#;
+
+async fn user(pool: &PgPool, name: &str) -> i64 {
+    sqlx::query_scalar("INSERT INTO users (username) VALUES ($1) RETURNING id")
+        .bind(name)
+        .fetch_one(pool)
+        .await
+        .unwrap()
+}
+
+async fn owners(pool: &PgPool) -> Vec<(i64, String)> {
+    sqlx::query_as("SELECT owner_user_id, name FROM profile ORDER BY id")
+        .fetch_all(pool)
+        .await
+        .unwrap()
+}
+
+async fn owned(pool: &PgPool, caller: Option<i64>, name: &str, json: &str) -> Result<(), String> {
+    profiles::create_owned(pool, caller, name, ProfileContent::Json(json), false)
+        .await
+        .map(|_| ())
+        .map_err(|err| err.to_string())
+}
+
+#[sqlx::test]
+async fn create_owned_sets_the_owner_from_the_caller(pool: PgPool) {
+    store(pool.clone()).await;
+    let alice = user(&pool, "alice").await;
+    let bob = user(&pool, "bob").await;
+    owned(&pool, Some(alice), "alpha", OWNED).await.unwrap();
+    owned(&pool, Some(alice), "alpha", OWNED).await.unwrap();
+    assert_eq!(owners(&pool).await, [(alice, "alpha".to_owned())]);
+    owned(&pool, Some(bob), "alpha", r#"{"claude_md":"two"}"#)
+        .await
+        .unwrap();
+    assert_eq!(
+        owners(&pool).await,
+        [(alice, "alpha".to_owned()), (bob, "alpha".to_owned())]
+    );
+}
+
+#[sqlx::test]
+async fn create_owned_refuses_without_a_user_and_writes_nothing(pool: PgPool) {
+    store(pool.clone()).await;
+    let ghost = i64::MAX;
+    let refusal = "profile create needs a user token".to_owned();
+    for caller in [None, Some(ghost), Some(-1)] {
+        assert_eq!(
+            owned(&pool, caller, "alpha", OWNED).await,
+            Err(refusal.clone())
+        );
+    }
+    assert_eq!(owned(&pool, None, "bad name", "{").await, Err(refusal));
+    assert_eq!(counts(&pool).await, (0, 0));
+    assert_eq!(owners(&pool).await, Vec::<(i64, String)>::new());
+}
+
+#[sqlx::test]
+async fn forged_owner_in_the_content_does_not_stick(pool: PgPool) {
+    store(pool.clone()).await;
+    let alice = user(&pool, "alice").await;
+    let bob = user(&pool, "bob").await;
+    let forged = format!(r#"{{"claude_md":"x","owner_user_id":{bob}}}"#);
+    let err = owned(&pool, Some(alice), "alpha", &forged)
+        .await
+        .unwrap_err();
+    assert!(!err.contains(&bob.to_string()));
+    assert_eq!(counts(&pool).await, (0, 0));
+    assert_eq!(owners(&pool).await, Vec::<(i64, String)>::new());
 }

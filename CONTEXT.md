@@ -104,6 +104,9 @@ _Avoid_: egress allowlist, proxy policy
 A person who owns **Credentials** and submits Jobs. Built in fleet-server (ADR-0042). Jobs without an owner default to the **Bootstrap user**.
 _Avoid_: account, tenant
 
+**Admin**:
+A user with `users.is_admin` set. The first user created by setup is admin, and `fleet-server admin grant-admin` and `revoke-admin` change the flag. The bootstrap user is never admin (ADR-0056).
+
 **Bootstrap user**:
 The reserved legacy owner `bootstrap`, created lazily. `FLEET_CLIENT_TOKEN` and Jobs submitted without an owner act as it. It has no passkey, so it can never log in, and no one can create or reset a user with that name in any letter case (`BOOTSTRAP_USERNAME` in `crates/fleet-server/src/cred/users.rs`, ADR-0042).
 _Avoid_: admin, root user
