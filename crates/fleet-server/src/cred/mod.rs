@@ -2,6 +2,7 @@
 
 pub mod admin;
 pub mod api;
+pub mod capability;
 pub mod github;
 pub mod limiter;
 pub mod password;

@@ -167,6 +167,19 @@ pub enum Command {
         #[command(subcommand)]
         action: BatchAction,
     },
+    /// List the global catalog and, as an admin, add and switch items.
+    Catalog {
+        /// The catalog action.
+        #[command(subcommand)]
+        action: catalog::CatalogAction,
+    },
+    /// Manage users.
+    #[command(name = "user")]
+    UserCap {
+        /// The user area.
+        #[command(subcommand)]
+        area: catalog::UserArea,
+    },
     /// Create, list and show named agent profiles.
     Profile {
         /// The profile action.
@@ -746,6 +759,8 @@ pub async fn run_with(
             }
             None => timing::run(&job, commands, json)?,
         },
+        Command::Catalog { action } => catalog::run(&action)?,
+        Command::UserCap { area } => catalog::run_user(&area)?,
         Command::Batch { action } => {
             run_batch(action, server, insecure, lookup, timeouts, stdin, out).await?;
         }

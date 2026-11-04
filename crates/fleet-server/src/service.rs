@@ -6,6 +6,11 @@ use std::time::Duration;
 
 use fleet_core::Envelope;
 use fleet_proto::v1::fleet_batches_server::{FleetBatches, FleetBatchesServer};
+use fleet_proto::v1::fleet_capability_admin_server::{
+    FleetCapabilityAdmin, FleetCapabilityAdminServer,
+};
+use fleet_proto::v1::fleet_catalog_admin_server::{FleetCatalogAdmin, FleetCatalogAdminServer};
+use fleet_proto::v1::fleet_catalog_server::{FleetCatalog, FleetCatalogServer};
 use fleet_proto::v1::fleet_credentials_server::{FleetCredentials, FleetCredentialsServer};
 use fleet_proto::v1::fleet_ingest_server::{FleetIngest, FleetIngestServer};
 use fleet_proto::v1::fleet_jobs_server::{FleetJobs, FleetJobsServer};
@@ -14,19 +19,22 @@ use fleet_proto::v1::fleet_profiles_server::{FleetProfiles, FleetProfilesServer}
 use fleet_proto::v1::fleet_query_server::{FleetQuery, FleetQueryServer};
 use fleet_proto::v1::fleet_worker_server::{FleetWorker, FleetWorkerServer};
 use fleet_proto::v1::{
-    CancelJobRequest, ClaimJobReply, ClaimJobRequest, CreateProfileRequest, CredentialInfo,
-    DeleteCredentialReply, DeleteCredentialRequest, GetBatchReply, GetBatchRequest,
+    CancelJobRequest, CatalogItem, ClaimJobReply, ClaimJobRequest, CreateProfileRequest,
+    CredentialInfo, DeleteCredentialReply, DeleteCredentialRequest, GetBatchReply, GetBatchRequest,
     GetJobCredentialsReply, GetJobCredentialsRequest, GetJobRequest, GetJobTimingReply,
     GetJobTimingRequest, GetJobTranscriptReply, GetJobTranscriptRequest, GetProfileBlobReply,
-    GetProfileBlobRequest, GetProfileRequest, GetStatsReply, GetStatsRequest, HeartbeatReply,
-    HeartbeatRequest, Job, ListCredentialsReply, ListCredentialsRequest, ListFleetReply,
-    ListFleetRequest, ListJobsReply, ListJobsRequest, ListProfilesReply, ListProfilesRequest,
-    Profile, ProfileVersion, PushEventsReply, PushEventsRequest, PutCredentialRequest, QueuedEvent,
-    ReadJobEventsReply, ReadJobEventsRequest, ReadTranscriptReply, ReadTranscriptRequest,
-    Rejection, ReportJobReply, ReportJobRequest, ReportShellLogReply, ReportShellLogRequest,
-    ReportTimingReply, ReportTimingRequest, ShareProfileRequest, StreamShellLogChunk,
-    StreamShellLogRequest, SubmitBatchReply, SubmitBatchRequest, SubmitJobRequest,
-    SubmitJudgeRequest, UnshareProfileRequest, VerifyCredentialReply, VerifyCredentialRequest,
+    GetProfileBlobRequest, GetProfileRequest, GetStatsReply, GetStatsRequest,
+    GrantCapabilityRequest, HeartbeatReply, HeartbeatRequest, Job, ListCapabilitiesReply,
+    ListCapabilitiesRequest, ListCatalogReply, ListCatalogRequest, ListCredentialsReply,
+    ListCredentialsRequest, ListFleetReply, ListFleetRequest, ListJobsReply, ListJobsRequest,
+    ListProfilesReply, ListProfilesRequest, Profile, ProfileVersion, PushEventsReply,
+    PushEventsRequest, PutCredentialRequest, QueuedEvent, ReadJobEventsReply, ReadJobEventsRequest,
+    ReadTranscriptReply, ReadTranscriptRequest, Rejection, ReportJobReply, ReportJobRequest,
+    ReportShellLogReply, ReportShellLogRequest, ReportTimingReply, ReportTimingRequest,
+    RevokeCapabilityReply, RevokeCapabilityRequest, SetCatalogItemEnabledRequest,
+    ShareProfileRequest, StreamShellLogChunk, StreamShellLogRequest, SubmitBatchReply,
+    SubmitBatchRequest, SubmitJobRequest, SubmitJudgeRequest, UnshareProfileRequest,
+    UpsertCatalogItemRequest, UserCapability, VerifyCredentialReply, VerifyCredentialRequest,
 };
 use fleet_proto::{ConvertError, validate_box};
 use tonic::codegen::BoxStream;
@@ -38,9 +46,10 @@ use tonic_prost::prost::Message;
 use tower::layer::util::{Identity, Stack};
 
 use crate::auth::{BearerAuth, Caller};
-use crate::cred::CredentialService;
+use crate::catalog;
+use crate::cred::{CredentialService, capability};
 use crate::jobs::validate_job_id;
-use crate::profiles::ProfileContent;
+use crate::profiles::{self, ProfileContent};
 use crate::store::{Store, StoreError};
 use crate::timing;
 use crate::web::{Dispatch, HEADER_READ_TIMEOUT, Web, serve};
@@ -649,16 +658,67 @@ impl FleetProfiles for FleetService {
 
     async fn share_profile(
         &self,
-        _request: Request<ShareProfileRequest>,
+        request: Request<ShareProfileRequest>,
     ) -> Result<Response<Profile>, Status> {
-        Err(Status::unimplemented("profile sharing is not implemented"))
+        profiles::share_profile(request.get_ref()).map(Response::new)
     }
 
     async fn unshare_profile(
         &self,
-        _request: Request<UnshareProfileRequest>,
+        request: Request<UnshareProfileRequest>,
     ) -> Result<Response<Profile>, Status> {
-        Err(Status::unimplemented("profile sharing is not implemented"))
+        profiles::unshare_profile(request.get_ref()).map(Response::new)
+    }
+}
+
+#[tonic::async_trait]
+impl FleetCatalog for FleetService {
+    async fn list_catalog(
+        &self,
+        request: Request<ListCatalogRequest>,
+    ) -> Result<Response<ListCatalogReply>, Status> {
+        catalog::list_catalog(request.get_ref()).map(Response::new)
+    }
+}
+
+#[tonic::async_trait]
+impl FleetCatalogAdmin for FleetService {
+    async fn upsert_catalog_item(
+        &self,
+        request: Request<UpsertCatalogItemRequest>,
+    ) -> Result<Response<CatalogItem>, Status> {
+        catalog::upsert_catalog_item(request.get_ref()).map(Response::new)
+    }
+
+    async fn set_catalog_item_enabled(
+        &self,
+        request: Request<SetCatalogItemEnabledRequest>,
+    ) -> Result<Response<CatalogItem>, Status> {
+        catalog::set_catalog_item_enabled(request.get_ref()).map(Response::new)
+    }
+}
+
+#[tonic::async_trait]
+impl FleetCapabilityAdmin for FleetService {
+    async fn grant_capability(
+        &self,
+        request: Request<GrantCapabilityRequest>,
+    ) -> Result<Response<UserCapability>, Status> {
+        capability::grant(request.get_ref()).map(Response::new)
+    }
+
+    async fn revoke_capability(
+        &self,
+        request: Request<RevokeCapabilityRequest>,
+    ) -> Result<Response<RevokeCapabilityReply>, Status> {
+        capability::revoke(request.get_ref()).map(Response::new)
+    }
+
+    async fn list_capabilities(
+        &self,
+        request: Request<ListCapabilitiesRequest>,
+    ) -> Result<Response<ListCapabilitiesReply>, Status> {
+        capability::list(request.get_ref()).map(Response::new)
     }
 }
 
@@ -942,6 +1002,10 @@ fn routes(store: &Store, credentials: Option<CredentialService>, update: UpdateR
         FleetBatchesServer::new(service.clone()).max_decoding_message_size(MAX_MESSAGE_BYTES);
     let credentials = FleetCredentialsServer::new(service.clone())
         .max_decoding_message_size(MAX_CREDENTIAL_MESSAGE_BYTES);
+    let catalog = FleetCatalogServer::new(service.clone());
+    let catalog_admin = FleetCatalogAdminServer::new(service.clone())
+        .max_decoding_message_size(MAX_PROFILE_MESSAGE_BYTES);
+    let capability_admin = FleetCapabilityAdminServer::new(service.clone());
     let profiles =
         FleetProfilesServer::new(service).max_decoding_message_size(MAX_PROFILE_MESSAGE_BYTES);
     Routes::new(ingest)
@@ -952,6 +1016,9 @@ fn routes(store: &Store, credentials: Option<CredentialService>, update: UpdateR
         .add_service(profiles)
         .add_service(batches)
         .add_service(credentials)
+        .add_service(catalog)
+        .add_service(catalog_admin)
+        .add_service(capability_admin)
 }
 
 #[cfg(test)]

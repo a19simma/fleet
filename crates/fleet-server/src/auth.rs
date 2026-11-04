@@ -2,7 +2,8 @@
 //!
 //! Two tokens, scoped by gRPC path: the box token covers `FleetIngest` and `FleetWorker`,
 //! the client token covers `FleetQuery`, `FleetJobs`, `FleetProfiles`, `FleetBatches` and
-//! `FleetCredentials`. Any other path is denied.
+//! `FleetCredentials` and `FleetCatalog`. Any other path is denied, which closes
+//! `FleetCatalogAdmin` and `FleetCapabilityAdmin` to both tokens.
 //!
 //! With a [`Users`] store the layer also resolves the caller: a per-user API token maps to its
 //! user, `FLEET_CLIENT_TOKEN` maps to the `bootstrap` user, and the result rides the request
@@ -31,6 +32,7 @@ const JUDGE: &str = "/fleet.v1.FleetJudge/";
 const PROFILES: &str = "/fleet.v1.FleetProfiles/";
 const BATCHES: &str = "/fleet.v1.FleetBatches/";
 const CREDENTIALS: &str = "/fleet.v1.FleetCredentials/";
+const CATALOG: &str = "/fleet.v1.FleetCatalog/";
 
 /// The user a request acts as, set by [`BearerAuth`] on every client-scope request when it has a
 /// [`Users`] store.
@@ -96,7 +98,7 @@ impl BearerAuth {
 
     /// Allow-lists paths per scope: the box token takes `FleetIngest` and `FleetWorker`,
     /// the client token takes `FleetQuery`, `FleetJobs`, `FleetJudge`, `FleetProfiles`,
-    /// `FleetBatches` and `FleetCredentials`.
+    /// `FleetBatches`, `FleetCredentials` and `FleetCatalog`.
     /// Every other path is denied.
     fn allows(scope: Scope, path: &str) -> bool {
         match scope {
@@ -108,6 +110,7 @@ impl BearerAuth {
                     || path.starts_with(PROFILES)
                     || path.starts_with(BATCHES)
                     || path.starts_with(CREDENTIALS)
+                    || path.starts_with(CATALOG)
             }
         }
     }

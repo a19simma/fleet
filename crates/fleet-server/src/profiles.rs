@@ -4,15 +4,35 @@ use std::fmt::{self, Write};
 
 use fleet_core::{Profile, ProfileError, ProfileHash, ProfileInvalid};
 use fleet_proto::v1::{
-    GetProfileBlobReply, ListProfilesReply, ProfileRef, ProfileSummary, ProfileVersion,
+    GetProfileBlobReply, ListProfilesReply, Profile as WireProfile, ProfileRef, ProfileSummary,
+    ProfileVersion, ShareProfileRequest, UnshareProfileRequest,
 };
 use fleet_proto::{ERR_PROFILE_CONTENT_CHOICE, ERR_PROFILE_TOOLS_DISABLED, MAX_PROFILE_JSON_BYTES};
 use sqlx::{PgPool, Row};
+use tonic::Status;
 
 use crate::store::{DEFAULT_LIST_LIMIT, MAX_LIST_LIMIT, StoreError};
 
 /// Longest accepted profile name, in bytes.
 pub const MAX_NAME_BYTES: usize = 64;
+
+const SHARING_NOT_IMPLEMENTED: &str = "profile sharing is not implemented";
+
+/// Makes a profile visible to every user.
+///
+/// # Errors
+/// Returns `UNIMPLEMENTED` until sharing is built.
+pub fn share_profile(_request: &ShareProfileRequest) -> Result<WireProfile, Status> {
+    Err(Status::unimplemented(SHARING_NOT_IMPLEMENTED))
+}
+
+/// Takes a profile back from the shared list.
+///
+/// # Errors
+/// Returns `UNIMPLEMENTED` until sharing is built.
+pub fn unshare_profile(_request: &UnshareProfileRequest) -> Result<WireProfile, Status> {
+    Err(Status::unimplemented(SHARING_NOT_IMPLEMENTED))
+}
 
 const INSERT_BLOB: &str = "INSERT INTO profile_blob (hash, content, size) VALUES ($1, $2, $3) \
      ON CONFLICT (hash) DO NOTHING";

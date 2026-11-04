@@ -8,6 +8,9 @@ mod tests {
     use std::time::Duration;
 
     use fleet_proto::v1::fleet_batches_client::FleetBatchesClient;
+    use fleet_proto::v1::fleet_capability_admin_client::FleetCapabilityAdminClient;
+    use fleet_proto::v1::fleet_catalog_admin_client::FleetCatalogAdminClient;
+    use fleet_proto::v1::fleet_catalog_client::FleetCatalogClient;
     use fleet_proto::v1::fleet_credentials_client::FleetCredentialsClient;
     use fleet_proto::v1::fleet_ingest_client::FleetIngestClient;
     use fleet_proto::v1::fleet_jobs_client::FleetJobsClient;
@@ -239,6 +242,28 @@ mod tests {
                 .get_stats(GetStatsRequest::default())
                 .await
                 .map(|_| ()),
+            "share_profile" => {
+                FleetProfilesClient::with_interceptor(chan, move |r| header.apply(r))
+                    .share_profile(fleet_proto::v1::ShareProfileRequest::default())
+                    .await
+                    .map(|_| ())
+            }
+            "catalog" => FleetCatalogClient::with_interceptor(chan, move |r| header.apply(r))
+                .list_catalog(fleet_proto::v1::ListCatalogRequest {})
+                .await
+                .map(|_| ()),
+            "catalog_admin" => {
+                FleetCatalogAdminClient::with_interceptor(chan, move |r| header.apply(r))
+                    .upsert_catalog_item(fleet_proto::v1::UpsertCatalogItemRequest::default())
+                    .await
+                    .map(|_| ())
+            }
+            "capability_admin" => {
+                FleetCapabilityAdminClient::with_interceptor(chan, move |r| header.apply(r))
+                    .grant_capability(fleet_proto::v1::GrantCapabilityRequest::default())
+                    .await
+                    .map(|_| ())
+            }
             _ => FleetJobsClient::with_interceptor(chan, move |r| header.apply(r))
                 .list_jobs(ListJobsRequest::default())
                 .await
@@ -264,6 +289,10 @@ mod tests {
             ("job_credentials", true, false),
             ("report_timing", true, false),
             ("get_job_timing", false, true),
+            ("share_profile", false, true),
+            ("catalog", false, true),
+            ("catalog_admin", false, false),
+            ("capability_admin", false, false),
         ] {
             for (name, token, ok) in [("box", TOKEN, box_ok), ("client", CLIENT, client_ok)] {
                 let status = status_of(addr, service, Some(token)).await;
