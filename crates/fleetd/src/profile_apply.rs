@@ -291,6 +291,9 @@ pub enum LoadError {
     Invalid(ProfileInvalid),
     /// The Profile model is outside the box allowlist, [`floor::MODEL_DENIED_REASON`].
     ModelDenied,
+    /// The Profile holds tools and the server did not stamp them granted,
+    /// [`floor::TOOLS_DENIED_REASON`].
+    ToolsNotGranted,
     /// The Profile could not be laid over the bundle.
     Apply(ApplyError),
 }
@@ -354,6 +357,7 @@ impl LoadError {
             Self::HashMismatch => "profile invalid: profile hash does not match the job",
             Self::Invalid(err) => invalid_reason(*err),
             Self::ModelDenied => floor::MODEL_DENIED_REASON,
+            Self::ToolsNotGranted => floor::TOOLS_DENIED_REASON,
             Self::Apply(ApplyError::Collision) => {
                 "profile invalid: profile paths collide when compared without case"
             }
@@ -409,6 +413,30 @@ pub fn load_checked(
     allowlist: Option<&ModelAllowlist>,
     job_prompt: &str,
 ) -> Result<Applied, LoadError> {
+    load_stamped(
+        expected, reply, default, ceilings, allowlist, true, job_prompt,
+    )
+}
+
+/// [`load_checked`] plus the server stamp on profile tools (ADR-0054).
+///
+/// `tools_granted` is the Job's `profile_tools_granted`. A Profile with tools and `false` is
+/// refused with [`LoadError::ToolsNotGranted`] after the validator and before the model check,
+/// the overlay or any install. [`load_checked`] passes `true` and trusts the caller; the Job
+/// path must call this with the Job's own stamp.
+///
+/// # Errors
+///
+/// Returns the [`LoadError`] of the first check that fails.
+pub fn load_stamped(
+    expected: &ProfileRef,
+    reply: &GetProfileBlobReply,
+    default: &Bundle,
+    ceilings: &BoxCeilings,
+    allowlist: Option<&ModelAllowlist>,
+    tools_granted: bool,
+    job_prompt: &str,
+) -> Result<Applied, LoadError> {
     if reply.profile.as_ref() != Some(expected) {
         return Err(LoadError::Mismatch);
     }
@@ -430,6 +458,10 @@ pub fn load_checked(
         return Err(LoadError::HashMismatch);
     }
     profile.validate().map_err(LoadError::Invalid)?;
+    floor::check_tools_stamp(!profile.tools.is_empty(), tools_granted).map_err(|_| {
+        tracing::warn!("profile tools carry no server stamp");
+        LoadError::ToolsNotGranted
+    })?;
     floor::check_model(allowlist, profile.model.as_deref()).map_err(|denied| {
         tracing::warn!(
             model = denied.model(),
@@ -447,6 +479,22 @@ mod tests {
     use fleet_core::{ContextFile, Skill};
 
     use super::*;
+
+    fn stamped(
+        reference: &ProfileRef,
+        reply: &GetProfileBlobReply,
+        granted: bool,
+    ) -> Result<Applied, LoadError> {
+        load_stamped(
+            reference,
+            reply,
+            &Bundle::default(),
+            &ceilings(),
+            None,
+            granted,
+            "fix it",
+        )
+    }
 
     fn ceilings() -> BoxCeilings {
         BoxCeilings {
@@ -973,6 +1021,56 @@ mod tests {
             ]
         );
         Ok(())
+    }
+
+    #[test]
+    fn tools_with_the_stamp_load() -> Result<(), LoadError> {
+        let (reference, reply) = blob(&tool_profile(&[("jq", "1.7.1")]));
+        assert_eq!(stamped(&reference, &reply, true)?.tools.len(), 1);
+        Ok(())
+    }
+
+    #[test]
+    fn tools_without_the_stamp_are_refused_with_the_fixed_reason() {
+        let (reference, reply) = blob(&tool_profile(&[("jq", "1.7.1")]));
+        let out = stamped(&reference, &reply, false);
+        assert_eq!(out, Err(LoadError::ToolsNotGranted));
+        assert_eq!(
+            LoadError::ToolsNotGranted.reason(),
+            "profile invalid: profile tools are not granted by the server"
+        );
+    }
+
+    #[test]
+    fn no_tools_load_with_or_without_the_stamp() -> Result<(), LoadError> {
+        let (reference, reply) = blob(&full());
+        assert_eq!(
+            stamped(&reference, &reply, false)?.tools,
+            Vec::<ToolSpec>::new()
+        );
+        assert_eq!(
+            stamped(&reference, &reply, true)?.tools,
+            Vec::<ToolSpec>::new()
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn the_stamp_check_runs_before_the_model_check() {
+        let mut profile = tool_profile(&[("jq", "1.7.1")]);
+        profile.model = Some("haiku".to_owned());
+        let (reference, reply) = blob(&profile);
+        let list = allow(&["opus"]);
+        let out = load_stamped(
+            &reference,
+            &reply,
+            &Bundle::default(),
+            &ceilings(),
+            Some(&list),
+            false,
+            "fix it",
+        );
+        assert_eq!(out, Err(LoadError::ToolsNotGranted));
     }
 
     #[test]

@@ -77,6 +77,30 @@ pub fn check_model(
     }
 }
 
+/// The fixed reason a Job reports when it carries profile tools without the server stamp.
+pub const TOOLS_DENIED_REASON: &str =
+    "profile invalid: profile tools are not granted by the server";
+
+/// A Job carried profile tools and the server did not stamp them granted.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ToolsNotGranted;
+
+/// Refuses profile tools the server did not stamp `profile_tools_granted` (ADR-0054).
+///
+/// Fail closed: a Job with tools passes only on an explicit `true`. The stamp defaults to
+/// `false` on the wire, so a missing stamp is a refusal. A Job with no tools passes either way.
+///
+/// # Errors
+///
+/// Returns [`ToolsNotGranted`] when `tools_present` and `granted` is `false`.
+pub fn check_tools_stamp(tools_present: bool, granted: bool) -> Result<(), ToolsNotGranted> {
+    if tools_present && !granted {
+        Err(ToolsNotGranted)
+    } else {
+        Ok(())
+    }
+}
+
 /// Per-box limits and defaults. Budgets are whole US cents.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct BoxCeilings {
@@ -543,6 +567,22 @@ mod tests {
         assert_eq!(
             MODEL_DENIED_REASON,
             "profile invalid: profile model is not in the box allowlist"
+        );
+    }
+
+    #[test]
+    fn tools_pass_only_with_the_stamp() {
+        assert!(check_tools_stamp(true, true).is_ok());
+        assert_eq!(check_tools_stamp(true, false), Err(ToolsNotGranted));
+        assert!(check_tools_stamp(false, false).is_ok());
+        assert!(check_tools_stamp(false, true).is_ok());
+    }
+
+    #[test]
+    fn tools_denied_reason_is_fixed() {
+        assert_eq!(
+            TOOLS_DENIED_REASON,
+            "profile invalid: profile tools are not granted by the server"
         );
     }
 
