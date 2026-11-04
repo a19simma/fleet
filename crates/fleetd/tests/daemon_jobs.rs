@@ -75,6 +75,7 @@ struct Worker {
 struct Served {
     reference: ProfileRef,
     content: Vec<u8>,
+    tools_granted: bool,
 }
 
 fn served(profile: &Profile, content: Vec<u8>) -> Served {
@@ -85,6 +86,7 @@ fn served(profile: &Profile, content: Vec<u8>) -> Served {
             hash: profile.hash().to_string(),
         },
         content,
+        tools_granted: false,
     }
 }
 
@@ -280,6 +282,7 @@ async fn launch_full(
             open_pr: true,
             attempt: 1,
             profile: profile.as_ref().map(|served| served.reference.clone()),
+            profile_tools_granted: profile.as_ref().is_some_and(|served| served.tools_granted),
             ..Job::default()
         })),
         reports,
@@ -578,6 +581,61 @@ async fn a_model_outside_the_config_allowlist_spawns_no_agent() -> TestResult {
             Some("profile invalid: profile model is not in the box allowlist")
         );
         assert!(!ran);
+        Ok(())
+    }))
+    .await
+}
+
+async fn tools_run(
+    granted: bool,
+) -> Result<(bool, Option<String>, bool, String), Box<dyn std::error::Error>> {
+    let dir = TempDir::new()?;
+    let ran = dir.path().join("agent-ran");
+    let agent = format!(
+        "#!/bin/sh\n[ \"$1\" = --version ] && {{ echo '2.0.0 (Claude Code)'; exit 0; }}\ntouch '{}'\n",
+        ran.display()
+    );
+    let profile = Profile {
+        tools: vec![fleet_core::tools::ToolSpec::new("jq", "1.7.1")?],
+        ..Profile::default()
+    };
+    let mut blob = served(&profile, profile.canonical_json());
+    blob.tools_granted = granted;
+    let Launched {
+        mut inbox,
+        stop,
+        daemon,
+        server,
+        origin,
+        ..
+    } = launch_full(&dir, &agent, None, "", Some(blob)).await?;
+    let terminal = terminal_of(&mut inbox).await?;
+    let _ = stop.send(());
+    tokio::time::timeout(Duration::from_secs(30), daemon).await???;
+    server.abort();
+    let branches = git(&origin, &["branch", "--list", "swarm/*"])?;
+    let workdir = dir.path().join("jobs").join("job1").exists();
+    Ok((ran.exists(), terminal.error, workdir, branches))
+}
+
+#[tokio::test]
+async fn unstamped_profile_tools_spawn_no_agent_and_create_no_workdir() -> TestResult {
+    common::bounded(Box::pin(async {
+        let (ran, error, workdir, branches) = tools_run(false).await?;
+        assert_eq!(error.as_deref(), Some(fleetd::floor::TOOLS_DENIED_REASON));
+        assert!(!ran);
+        assert!(!workdir);
+        assert_eq!(branches.trim(), "");
+        Ok(())
+    }))
+    .await
+}
+
+#[tokio::test]
+async fn stamped_profile_tools_are_not_refused_by_the_stamp_check() -> TestResult {
+    common::bounded(Box::pin(async {
+        let (_, error, _, _) = tools_run(true).await?;
+        assert_ne!(error.as_deref(), Some(fleetd::floor::TOOLS_DENIED_REASON));
         Ok(())
     }))
     .await
