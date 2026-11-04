@@ -202,7 +202,8 @@ async fn job_page(cx: &Cx) -> Result<impl View> {
                 <header class="mb-3 flex items-center gap-3 border-b border-base-300 pb-2 text-xs">
                     <span class="text-primary">"$"</span>
                     <h1 class="text-sm font-bold">(job.job_id.as_str())</h1>
-                    <a class="link link-hover ml-auto" href="/jobs">"Jobs"</a>
+                    <a class="link link-hover ml-auto" id="timing-link" href=(format!("/jobs/{}/timing", job.job_id))>"Timing"</a>
+                    <a class="link link-hover" href="/jobs">"Jobs"</a>
                 </header>
                 <div class="grid gap-3 lg:grid-cols-[22rem_1fr]">
                     <section class="flex flex-col gap-3">
