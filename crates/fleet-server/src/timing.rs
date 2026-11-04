@@ -3,7 +3,7 @@
 use std::time::Duration;
 
 use fleet_core::BoxName;
-use fleet_core::timing::Summary;
+use fleet_core::timing::{Interval, Span, Summary, aggregate};
 use fleet_proto::v1::{
     GetJobTimingReply, GetJobTimingRequest, ReportShellLogReply, ReportShellLogRequest,
     ReportTimingReply, ReportTimingRequest, ShellCommand, StreamShellLogChunk,
@@ -49,6 +49,13 @@ pub const REASON_SPAN_OUTSIDE: &str = "timing span lies outside the job window";
 
 /// Refusal when the reported wall window ends after the server clock.
 pub const REASON_WINDOW_AHEAD: &str = "timing wall time runs past the present";
+
+/// Refusal when the agent window is reversed or ends after the job window.
+pub const REASON_AGENT_WINDOW: &str = "timing agent window lies outside the job window";
+
+/// Refusal when the summary differs from the one the core aggregate gives for the spans and
+/// the reported windows.
+pub const REASON_SUMMARY_MISMATCH: &str = "timing summary does not match its spans";
 
 const STREAM_BATCH: i64 = 64;
 const STREAM_QUEUE: usize = 16;
@@ -137,6 +144,27 @@ fn check_window(
     Ok(())
 }
 
+fn check_summary(
+    claimed: &Summary,
+    spans: &[TimingSpanRecord],
+    wall_ms: u64,
+    agent_start_ms: u64,
+    agent_end_ms: u64,
+) -> Result<(), Status> {
+    let job =
+        Interval::new(0, wall_ms).map_err(|_| Status::invalid_argument(REASON_AGENT_WINDOW))?;
+    let agent = Interval::new(agent_start_ms, agent_end_ms)
+        .ok()
+        .filter(|agent| agent.end_ms() <= wall_ms)
+        .ok_or_else(|| Status::invalid_argument(REASON_AGENT_WINDOW))?;
+    let core: Vec<Span> = spans.iter().map(|record| record.span).collect();
+    if aggregate(&core, job, agent) == *claimed {
+        Ok(())
+    } else {
+        Err(Status::invalid_argument(REASON_SUMMARY_MISMATCH))
+    }
+}
+
 fn kind_name(record: &TimingSpanRecord) -> Result<&'static str, Status> {
     use fleet_core::timing::SpanKind;
     match record.span.kind {
@@ -164,8 +192,12 @@ fn kind_name(record: &TimingSpanRecord) -> Result<&'static str, Status> {
 /// ([`REASON_PARTS_SUM`]); that the window from the claim time to `wall_ms` after it ends no
 /// later than now plus [`WINDOW_TOLERANCE_MS`] ([`REASON_WINDOW_AHEAD`]); and that every span,
 /// in job-relative milliseconds, ends within [`WINDOW_TOLERANCE_MS`] of `wall_ms`
-/// ([`REASON_SPAN_OUTSIDE`]). The wire has no agent window, so the server does not recompute
-/// the summary from the spans.
+/// ([`REASON_SPAN_OUTSIDE`]). It then checks the agent window, `agent_start_ms <=
+/// agent_end_ms <= wall_ms` in job-relative milliseconds ([`REASON_AGENT_WINDOW`]), and runs the
+/// core aggregate over the received spans with the job window `0..wall_ms` and exactly that
+/// agent window. A summary that differs is refused ([`REASON_SUMMARY_MISMATCH`]). A reporter
+/// that sends no window carries `0..0`, the agent never ran, so only an all-overhead summary
+/// matches. Nothing is written on a refusal.
 ///
 /// # Errors
 /// `INVALID_ARGUMENT` for a missing summary, a fixed reason above or any value a converter
@@ -209,6 +241,13 @@ pub async fn store_timing(
     let spans = spans_from_wire(request.spans.clone()).map_err(invalid)?;
     let commands = shell_commands_from_wire(request.shell_commands.clone()).map_err(invalid)?;
     check_window(wall, &spans, claimed, now)?;
+    check_summary(
+        &summary,
+        &spans,
+        wall,
+        request.agent_start_ms,
+        request.agent_end_ms,
+    )?;
     sqlx::query(UPSERT_TIMING)
         .bind(&request.job_id)
         .bind(stored(wall)?)

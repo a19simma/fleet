@@ -854,7 +854,9 @@ impl Gathered {
     /// Builds the request for a job whose window is `0..wall_ms` on the job clock.
     ///
     /// Spans from the receiver, the wire log and pueue are clamped to the job window, and the
-    /// core aggregate fills the five parts, so the parts sum to `wall_ms` by construction. A
+    /// core aggregate over the spans that go on the wire fills the five parts, so the parts sum
+    /// to `wall_ms` by construction and the server recompute over the same spans and the carried
+    /// agent window reproduces them. All times are job-relative milliseconds. A
     /// record that would fail server validation is dropped and noted, so one bad record never
     /// costs the whole report. Background commands come first when the shell command cap cuts.
     ///
@@ -882,8 +884,6 @@ impl Gathered {
             }
         }
         let mut commands = self.commands(&mut named, wall_ms, agent_end);
-        let core: Vec<Span> = named.iter().map(|s| s.span).collect();
-        let summary = aggregate(&core, job, agent);
         let mut rejected = false;
         let mut spans: Vec<TimingSpan> = Vec::new();
         for s in &named {
@@ -901,6 +901,12 @@ impl Gathered {
                 None => rejected = true,
             }
         }
+        let core: Vec<Span> = spans
+            .iter()
+            .filter_map(|wire| TimingSpanRecord::try_from(wire.clone()).ok())
+            .map(|record| record.span)
+            .collect();
+        let summary = aggregate(&core, job, agent);
         let before = commands.len();
         commands.retain(|c| ShellCommandRecord::try_from(c.clone()).is_ok());
         rejected |= commands.len() != before;
@@ -921,6 +927,8 @@ impl Gathered {
                 summary: Some(TimingSummary::from(&summary)),
                 spans,
                 shell_commands: commands,
+                agent_start_ms: agent.start_ms(),
+                agent_end_ms: agent.end_ms(),
             },
             notes,
         }
@@ -1194,6 +1202,127 @@ mod tests {
         assert_eq!(built.request.r#box, "the-box");
         assert_eq!(built.request.shell_commands.len(), 1);
         assert!(built.request.shell_commands.len() <= MAX_SHELL_COMMANDS);
+    }
+
+    fn gathered_with(spans: Vec<super::NamedSpan>, start: u64, end: u64) -> super::Gathered {
+        super::Gathered {
+            t0: Instant::now(),
+            unix_start_ms: 0,
+            agent_start_ms: start,
+            agent_end_ms: end,
+            spans,
+            foreground: Vec::new(),
+            background: Vec::new(),
+            notes: Vec::new(),
+        }
+    }
+
+    fn named(kind: SpanKind, start: u64, end: u64) -> super::NamedSpan {
+        super::NamedSpan {
+            span: fleet_core::timing::Span {
+                kind,
+                interval: fleet_core::timing::Interval::new(start, end).expect("interval"),
+            },
+            name: "n".to_owned(),
+            tool_use_id: None,
+        }
+    }
+
+    fn recomputed(request: &fleet_proto::v1::ReportTimingRequest) -> fleet_core::timing::Summary {
+        let wall = request.summary.expect("summary").wall_ms;
+        let core: Vec<fleet_core::timing::Span> = request
+            .spans
+            .iter()
+            .map(|wire| {
+                fleet_proto::TimingSpanRecord::try_from(wire.clone())
+                    .expect("record")
+                    .span
+            })
+            .collect();
+        fleet_core::timing::aggregate(
+            &core,
+            fleet_core::timing::Interval::new(0, wall).expect("job"),
+            fleet_core::timing::Interval::new(request.agent_start_ms, request.agent_end_ms)
+                .expect("agent"),
+        )
+    }
+
+    #[test]
+    fn the_request_carries_the_clamped_agent_window_in_job_relative_ms() {
+        let spans = vec![named(SpanKind::Tool, 2_000, 3_000)];
+        let built = gathered_with(spans.clone(), 1_000, 9_000).request("j", 1, "b", 10_000);
+        assert_eq!(
+            (built.request.agent_start_ms, built.request.agent_end_ms),
+            (1_000, 9_000)
+        );
+        let past = gathered_with(spans.clone(), 1_000, 99_000).request("j", 1, "b", 10_000);
+        assert_eq!(
+            (past.request.agent_start_ms, past.request.agent_end_ms),
+            (1_000, 10_000)
+        );
+        let after = gathered_with(spans, 99_000, 120_000).request("j", 1, "b", 10_000);
+        assert_eq!(
+            (after.request.agent_start_ms, after.request.agent_end_ms),
+            (10_000, 10_000)
+        );
+    }
+
+    #[test]
+    fn the_summary_is_the_recompute_over_the_spans_that_go_on_the_wire() {
+        let count = MAX_SPANS + 5;
+        let spans: Vec<super::NamedSpan> = (0..count)
+            .map(|i| {
+                let start = 500 + 2 * u64::try_from(i).expect("index");
+                named(SpanKind::Tool, start, start + 1)
+            })
+            .collect();
+        let built = gathered_with(spans, 500, 9_500).request("j", 1, "b", 10_000);
+        assert_eq!(built.request.spans.len(), MAX_SPANS);
+        assert!(built.notes.contains(&Note::SpansCapped));
+        let summary = fleet_core::timing::Summary::try_from(built.request.summary.expect("s"))
+            .expect("summary");
+        assert_eq!(summary, recomputed(&built.request));
+    }
+
+    #[sqlx::test(migrations = false)]
+    async fn a_producer_report_with_idle_time_at_both_ends_is_accepted_by_the_server(
+        pool: sqlx::PgPool,
+    ) {
+        let store = fleet_server::store::Store::new(pool.clone());
+        store.migrate().await.expect("migrate");
+        let box_name = fleet_core::BoxName::new(&format!("box-{}", 1)).expect("box");
+        sqlx::query(
+            "INSERT INTO jobs (job_id, prompt, repo, base_ref, branch, open_pr, state, attempt, \
+             box, lease_expires_at, claimed_at) \
+             VALUES ('01JTIMINGPRODUCER000000000', 't', 'r', 'main', 'b', false, 'RUNNING', 1, $1, \
+             now() + interval '1 hour', now() - interval '1 minute')",
+        )
+        .bind(box_name.as_str())
+        .execute(&pool)
+        .await
+        .expect("job");
+        let spans = vec![
+            named(SpanKind::ApiWait, 2_000, 3_000),
+            named(SpanKind::Tool, 3_000, 4_000),
+            named(SpanKind::Shell, 4_000, 5_000),
+        ];
+        let built = gathered_with(spans, 1_000, 9_000).request(
+            "01JTIMINGPRODUCER000000000",
+            1,
+            box_name.as_str(),
+            10_000,
+        );
+        let summary = built.request.summary.expect("summary");
+        assert_eq!((summary.idle_ms, summary.overhead_ms), (5_000, 2_000));
+        fleet_server::timing::store_timing(&pool, &box_name, &built.request)
+            .await
+            .expect("accepted");
+        let mut tampered = built.request.clone();
+        tampered.agent_start_ms = 0;
+        let err = fleet_server::timing::store_timing(&pool, &box_name, &tampered)
+            .await
+            .expect_err("refused");
+        assert_eq!(err.message(), fleet_server::timing::REASON_SUMMARY_MISMATCH);
     }
 
     fn body(records: &[serde_json::Value]) -> Vec<u8> {
