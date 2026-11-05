@@ -863,10 +863,21 @@ message CatalogItem {
   bool admin_enabled = 6;
 }
 
-message ListCatalogRequest {}
+// kind filters by CatalogKind: UNSPECIFIED lists every kind, any value outside 0 to 4 is
+// refused. page_size 0 means DEFAULT_CATALOG_PAGE and larger values are cut to
+// MAX_CATALOG_PAGE. after_id is an exclusive cursor: empty starts at the first item, else it is
+// at most MAX_CATALOG_CURSOR_BYTES bytes of [a-z0-9_-].
+message ListCatalogRequest {
+  CatalogKind kind = 1;
+  uint32 page_size = 2;
+  string after_id = 3;
+}
 
+// next_id is the id of the last item returned, else the request after_id. A client keeps it as
+// the next after_id and stops on an empty page.
 message ListCatalogReply {
   repeated CatalogItem items = 1;
+  string next_id = 2;
 }
 
 // Creates the item, or replaces the content of the item with this id. kind and name of an
