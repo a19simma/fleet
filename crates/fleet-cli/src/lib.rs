@@ -974,7 +974,9 @@ async fn dispatch(
         } => {
             run_timing(&job, commands, follow, json, env, timeouts, out).await?;
         }
-        Command::Catalog { action } => catalog::run(&action)?,
+        Command::Catalog { action } => {
+            Box::pin(catalog::run(action, env, timeouts, stdin, out)).await?;
+        }
         Command::UserCap { area } => catalog::run_user(&area)?,
         Command::Batch { action } => {
             run_batch(action, env, timeouts, stdin, out).await?;
