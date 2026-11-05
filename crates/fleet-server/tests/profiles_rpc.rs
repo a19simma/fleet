@@ -11,9 +11,9 @@ use fleet_proto::v1::fleet_profiles_client::FleetProfilesClient;
 use fleet_proto::v1::{CreateProfileRequest, GetProfileRequest, ListProfilesRequest};
 use fleet_server::auth::BearerAuth;
 use fleet_server::config::Token;
-use fleet_server::profiles::{self, ProfileContent};
+use fleet_server::profiles::{self, ProfileContent, ProfileFault};
 use fleet_server::service::router;
-use fleet_server::store::Store;
+use fleet_server::store::{Store, StoreError};
 use sqlx::PgPool;
 use tokio::time::timeout;
 use tonic::metadata::MetadataValue;
@@ -461,7 +461,7 @@ async fn update_delete_and_truncate_are_rejected(pool: PgPool) {
         "UPDATE profile_blob SET size = size",
         "UPDATE profile_blob SET content = '\\x7b7d'",
         "UPDATE profile_version SET version = 9",
-        "UPDATE profile_version SET name = 'other'",
+        "UPDATE profile_version SET profile_id = profile_id + 1",
         "DELETE FROM profile_blob",
         "DELETE FROM profile_version",
         "TRUNCATE profile_blob CASCADE",
@@ -552,4 +552,261 @@ async fn forged_owner_in_the_content_does_not_stick(pool: PgPool) {
     assert!(!err.contains(&bob.to_string()));
     assert_eq!(counts(&pool).await, (0, 0));
     assert_eq!(owners(&pool).await, Vec::<(i64, String)>::new());
+}
+
+async fn put(pool: &PgPool, caller: i64, json: &str) -> fleet_proto::v1::ProfileVersion {
+    profiles::create_owned(
+        pool,
+        Some(caller),
+        "alpha",
+        ProfileContent::Json(json),
+        false,
+    )
+    .await
+    .unwrap()
+}
+
+const SHARED_CONTENT: &str = r#"{"claude_md":"same"}"#;
+
+#[sqlx::test]
+async fn two_owners_of_one_name_keep_independent_version_streams(pool: PgPool) {
+    store(pool.clone()).await;
+    let alice = user(&pool, "alice").await;
+    let bob = user(&pool, "bob").await;
+    let a1 = put(&pool, alice, r#"{"claude_md":"a1"}"#).await;
+    let a2 = put(&pool, alice, SHARED_CONTENT).await;
+    let b1 = put(&pool, bob, SHARED_CONTENT).await;
+    let b2 = put(&pool, bob, SHARED_CONTENT).await;
+    assert_eq!((a1.version, a1.created), (1, true));
+    assert_eq!((a2.version, a2.created), (2, true));
+    assert_eq!((b1.version, b1.created), (1, true));
+    assert_eq!((b2.version, b2.created), (1, false));
+    assert_eq!(a2.hash, b1.hash);
+}
+
+#[sqlx::test]
+async fn a_private_profile_reads_as_not_found_for_another_user(pool: PgPool) {
+    store(pool.clone()).await;
+    let alice = user(&pool, "alice").await;
+    let bob = user(&pool, "bob").await;
+    owned(&pool, Some(alice), "alpha", OWNED).await.unwrap();
+    let get = |viewer, name: &'static str, version| {
+        let pool = pool.clone();
+        async move { profiles::get_for(&pool, viewer, name, version).await }
+    };
+    assert_eq!(get(Some(alice), "alpha", None).await.unwrap().version, 1);
+    assert_eq!(get(Some(alice), "alpha", Some(1)).await.unwrap().version, 1);
+    for version in [None, Some(1)] {
+        let foreign = get(Some(bob), "alpha", version).await.unwrap_err();
+        let absent = get(Some(bob), "ghost", version).await.unwrap_err();
+        assert_eq!(foreign.to_string(), absent.to_string());
+        assert!(matches!(foreign, StoreError::NotFound));
+        assert!(matches!(
+            get(None, "alpha", version).await,
+            Err(StoreError::NotFound)
+        ));
+    }
+    let listed = profiles::list_for(&pool, Some(bob), 0, None).await.unwrap();
+    assert_eq!(
+        listed.profiles,
+        Vec::<fleet_proto::v1::ProfileSummary>::new()
+    );
+    let own = profiles::list_for(&pool, Some(alice), 0, None)
+        .await
+        .unwrap();
+    assert_eq!(own.profiles.len(), 1);
+}
+
+async fn profile_id(pool: &PgPool, owner: i64, name: &str) -> i64 {
+    sqlx::query_scalar("SELECT id FROM profile WHERE owner_user_id = $1 AND name = $2")
+        .bind(owner)
+        .bind(name)
+        .fetch_one(pool)
+        .await
+        .unwrap()
+}
+
+async fn share(pool: &PgPool, id: i64) {
+    sqlx::query("UPDATE profile SET visibility = 'shared' WHERE id = $1")
+        .bind(id)
+        .execute(pool)
+        .await
+        .unwrap();
+}
+
+async fn snapshot(pool: &PgPool) -> String {
+    sqlx::query_scalar(
+        "SELECT jsonb_build_object(\
+         'profiles', (SELECT coalesce(jsonb_agg(to_jsonb(p) ORDER BY id), '[]') FROM profile p),\
+         'versions', (SELECT coalesce(jsonb_agg(to_jsonb(v) - 'created_at' ORDER BY profile_id, version), '[]') FROM profile_version v),\
+         'blobs', (SELECT count(*) FROM profile_blob))::text",
+    )
+    .fetch_one(pool)
+    .await
+    .unwrap()
+}
+
+async fn update(
+    pool: &PgPool,
+    caller: Option<i64>,
+    id: i64,
+    json: &str,
+) -> Result<fleet_proto::v1::ProfileVersion, StoreError> {
+    profiles::update_owned(pool, caller, id, ProfileContent::Json(json), false).await
+}
+
+const NEXT: &str = r#"{"claude_md":"next"}"#;
+
+fn is_not_owner(err: &StoreError) -> bool {
+    matches!(err, StoreError::InvalidProfile(ProfileFault::NotOwner))
+}
+
+#[sqlx::test]
+async fn update_is_owner_only_and_refusals_write_nothing(pool: PgPool) {
+    store(pool.clone()).await;
+    let alice = user(&pool, "alice").await;
+    let bob = user(&pool, "bob").await;
+    owned(&pool, Some(alice), "alpha", OWNED).await.unwrap();
+    let id = profile_id(&pool, alice, "alpha").await;
+    let before = snapshot(&pool).await;
+
+    let foreign = update(&pool, Some(bob), id, NEXT).await.unwrap_err();
+    let absent = update(&pool, Some(bob), id + 1000, NEXT).await.unwrap_err();
+    assert!(matches!(foreign, StoreError::NotFound));
+    assert_eq!(foreign.to_string(), absent.to_string());
+    assert!(matches!(
+        update(&pool, None, id, NEXT).await,
+        Err(StoreError::InvalidProfile(ProfileFault::Unowned))
+    ));
+    assert_eq!(snapshot(&pool).await, before);
+
+    share(&pool, id).await;
+    let before = snapshot(&pool).await;
+    let reader = update(&pool, Some(bob), id, NEXT).await.unwrap_err();
+    assert!(is_not_owner(&reader), "{reader}");
+    assert_eq!(snapshot(&pool).await, before);
+
+    let done = update(&pool, Some(alice), id, NEXT).await.unwrap();
+    assert_eq!(
+        (done.name.as_str(), done.version, done.created),
+        ("alpha", 2, true)
+    );
+    let repeat = update(&pool, Some(alice), id, NEXT).await.unwrap();
+    assert_eq!((repeat.version, repeat.created), (2, false));
+    let versions: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM profile_version WHERE profile_id = $1")
+            .bind(id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(versions, 2);
+}
+
+#[sqlx::test]
+async fn update_validates_before_any_lookup(pool: PgPool) {
+    store(pool.clone()).await;
+    let alice = user(&pool, "alice").await;
+    let bob = user(&pool, "bob").await;
+    owned(&pool, Some(alice), "alpha", OWNED).await.unwrap();
+    let id = profile_id(&pool, alice, "alpha").await;
+    let before = snapshot(&pool).await;
+    for caller in [alice, bob] {
+        let err = update(&pool, Some(caller), id, "not json")
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            StoreError::InvalidProfile(ProfileFault::Malformed(_))
+        ));
+    }
+    let err = update(&pool, Some(bob), id, "not json").await.unwrap_err();
+    assert!(!err.to_string().contains("not json"));
+    assert_eq!(snapshot(&pool).await, before);
+}
+
+#[sqlx::test]
+async fn update_takes_the_profile_row_lock(pool: PgPool) {
+    store(pool.clone()).await;
+    let alice = user(&pool, "alice").await;
+    owned(&pool, Some(alice), "alpha", OWNED).await.unwrap();
+    let id = profile_id(&pool, alice, "alpha").await;
+    let mut held = pool.begin().await.unwrap();
+    sqlx::query("SELECT id FROM profile WHERE id = $1 FOR UPDATE")
+        .bind(id)
+        .fetch_one(&mut *held)
+        .await
+        .unwrap();
+    let racing = pool.clone();
+    let task = tokio::spawn(async move { update(&racing, Some(alice), id, NEXT).await });
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    assert!(!task.is_finished());
+    held.commit().await.unwrap();
+    let done = timeout(WAIT, task).await.unwrap().unwrap().unwrap();
+    assert_eq!(done.version, 2);
+}
+
+async fn bare_profile(pool: &PgPool, owner: i64, name: &str) -> i64 {
+    sqlx::query_scalar(
+        "INSERT INTO profile (owner_user_id, name, visibility) VALUES ($1, $2, 'private') RETURNING id",
+    )
+    .bind(owner)
+    .bind(name)
+    .fetch_one(pool)
+    .await
+    .unwrap()
+}
+
+#[sqlx::test]
+async fn delete_is_owner_only_and_refusals_write_nothing(pool: PgPool) {
+    store(pool.clone()).await;
+    let alice = user(&pool, "alice").await;
+    let bob = user(&pool, "bob").await;
+    let bare = bare_profile(&pool, alice, "bare").await;
+    owned(&pool, Some(alice), "alpha", OWNED).await.unwrap();
+    let kept = profile_id(&pool, alice, "alpha").await;
+    let before = snapshot(&pool).await;
+
+    let foreign = profiles::delete_owned(&pool, Some(bob), bare)
+        .await
+        .unwrap_err();
+    let absent = profiles::delete_owned(&pool, Some(bob), bare + 1000)
+        .await
+        .unwrap_err();
+    assert!(matches!(foreign, StoreError::NotFound));
+    assert_eq!(foreign.to_string(), absent.to_string());
+    assert!(matches!(
+        profiles::delete_owned(&pool, None, bare).await,
+        Err(StoreError::InvalidProfile(ProfileFault::Unowned))
+    ));
+    assert_eq!(snapshot(&pool).await, before);
+
+    share(&pool, bare).await;
+    let before = snapshot(&pool).await;
+    let reader = profiles::delete_owned(&pool, Some(bob), bare)
+        .await
+        .unwrap_err();
+    assert!(is_not_owner(&reader), "{reader}");
+    assert_eq!(snapshot(&pool).await, before);
+
+    let versioned = profiles::delete_owned(&pool, Some(alice), kept)
+        .await
+        .unwrap_err();
+    assert!(matches!(
+        versioned,
+        StoreError::InvalidProfile(ProfileFault::HasVersions)
+    ));
+    assert_eq!(snapshot(&pool).await, before);
+
+    profiles::delete_owned(&pool, Some(alice), bare)
+        .await
+        .unwrap();
+    let left: Vec<i64> = sqlx::query_scalar("SELECT id FROM profile ORDER BY id")
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+    assert_eq!(left, [kept]);
+    assert!(matches!(
+        profiles::delete_owned(&pool, Some(alice), bare).await,
+        Err(StoreError::NotFound)
+    ));
 }

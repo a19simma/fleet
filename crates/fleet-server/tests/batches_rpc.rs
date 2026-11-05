@@ -11,6 +11,7 @@ use fleet_proto::v1::fleet_jobs_client::FleetJobsClient;
 use fleet_proto::v1::{GetBatchRequest, ListJobsRequest, SubmitBatchRequest};
 use fleet_server::auth::BearerAuth;
 use fleet_server::config::Token;
+use fleet_server::profiles::{self, ProfileContent};
 use fleet_server::service::router;
 use fleet_server::store::Store;
 use sqlx::PgPool;
@@ -796,4 +797,101 @@ async fn a_batch_resubmitted_with_another_agent_conflicts(pool: PgPool) {
         other,
         Err(fleet_server::store::StoreError::KeyConflict)
     ));
+}
+
+#[sqlx::test]
+async fn a_batch_pins_the_submitters_own_profile_and_never_a_foreign_private_one(pool: PgPool) {
+    let store = store(pool.clone()).await;
+    let alice = user(&pool, "alice").await;
+    let bob = user(&pool, "bob").await;
+    let make = |owner, json: &'static str| {
+        let pool = pool.clone();
+        async move {
+            profiles::create_owned(
+                &pool,
+                Some(owner),
+                "alpha",
+                ProfileContent::Json(json),
+                false,
+            )
+            .await
+            .unwrap()
+        }
+    };
+    let a = make(alice, ONE).await;
+    let b = make(bob, TWO).await;
+    let pinned = |batch: String| {
+        let pool = pool.clone();
+        async move {
+            sqlx::query_as::<_, (i32, String)>(
+                "SELECT j.profile_version, p.owner_user_id::text FROM jobs j \
+                 JOIN profile p ON p.id = j.profile_id WHERE j.batch_id = $1",
+            )
+            .bind(batch)
+            .fetch_one(&pool)
+            .await
+            .unwrap()
+        }
+    };
+    let by_alice = store
+        .submit_batch_for(Some(alice), &request("ka", &["alpha"]))
+        .await
+        .unwrap();
+    let by_bob = store
+        .submit_batch_for(Some(bob), &request("kb", &["alpha"]))
+        .await
+        .unwrap();
+    assert_eq!(pinned(by_alice.batch_id).await, (1, alice.to_string()));
+    assert_eq!(pinned(by_bob.batch_id).await, (1, bob.to_string()));
+    assert_ne!(a.content_json, b.content_json);
+    let carol = user(&pool, "carol").await;
+    let foreign = store
+        .submit_batch_for(Some(carol), &request("kc", &["alpha"]))
+        .await
+        .unwrap_err();
+    let absent = store
+        .submit_batch_for(Some(carol), &request("kd", &["ghost"]))
+        .await
+        .unwrap_err();
+    assert_eq!(foreign.to_string(), absent.to_string());
+    assert!(matches!(
+        foreign,
+        fleet_server::store::StoreError::UnknownProfile
+    ));
+    assert_eq!(count(&pool, "batch").await, 2);
+}
+
+#[sqlx::test]
+async fn a_private_profile_wins_over_a_shared_one_of_the_same_name(pool: PgPool) {
+    let store = store(pool.clone()).await;
+    let shared = store.create_profile("alpha", TWO).await.unwrap();
+    let alice = user(&pool, "alice").await;
+    let own = profiles::create_owned(
+        &pool,
+        Some(alice),
+        "alpha",
+        ProfileContent::Json(ONE),
+        false,
+    )
+    .await
+    .unwrap();
+    let batch = store
+        .submit_batch_for(Some(alice), &request("ka", &["alpha"]))
+        .await
+        .unwrap();
+    let owner: i64 = sqlx::query_scalar(
+        "SELECT p.owner_user_id FROM jobs j \
+         JOIN profile p ON p.id = j.profile_id WHERE j.batch_id = $1",
+    )
+    .bind(batch.batch_id)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(owner, alice);
+    assert_ne!(own.hash, shared.hash);
+    let read = profiles::get_for(&pool, Some(alice), "alpha", None)
+        .await
+        .unwrap();
+    assert_eq!(read.content_json, own.content_json);
+    assert_eq!(read.hash, own.hash);
 }

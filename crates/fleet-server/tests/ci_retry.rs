@@ -449,14 +449,16 @@ async fn a_batch_or_profile_job_is_ineligible(pool: PgPool) {
     let root = running(&store, "do it").await;
     for sql in [
         "INSERT INTO profile_blob (hash, content, size) VALUES (decode(repeat('ab', 32), 'hex'), 'x'::bytea, 1)",
-        "INSERT INTO profile_version (name, version, hash) VALUES ('p', 1, decode(repeat('ab', 32), 'hex'))",
+        "INSERT INTO profile (owner_user_id, name) VALUES (system_user_id(), 'p')",
+        "INSERT INTO profile_version (profile_id, version, hash) \
+         SELECT id, 1, decode(repeat('ab', 32), 'hex') FROM profile WHERE name = 'p'",
         "INSERT INTO batch (batch_id, idempotency_key, prompt, repo, base_sha) VALUES ('b1', 'bk', 'p', 'https://example.com/r', repeat('a', 40))",
     ] {
         sqlx::query(sql).execute(&pool).await.unwrap();
     }
     sqlx::query(
         "UPDATE jobs SET batch_id = 'b1', repeat_idx = 0, batch_pos = 0, profile_name = 'p', \
-         profile_version = 1, profile_hash = decode(repeat('ab', 32), 'hex') WHERE job_id = $1",
+         profile_id = (SELECT id FROM profile WHERE name = 'p'), profile_version = 1, profile_hash = decode(repeat('ab', 32), 'hex') WHERE job_id = $1",
     )
     .bind(&root.job_id)
     .execute(&pool)
