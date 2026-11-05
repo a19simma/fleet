@@ -47,7 +47,8 @@ use tower::layer::util::{Identity, Stack};
 
 use crate::auth::{ADMIN_REQUIRED, BearerAuth, Caller};
 use crate::catalog;
-use crate::cred::{CredentialService, capability};
+use crate::cred::CredentialService;
+use crate::cred::capability::{self, Capabilities};
 use crate::jobs::validate_job_id;
 use crate::profiles::{self, ProfileContent, ProfileFault, Viewer};
 use crate::store::{Store, StoreError};
@@ -199,6 +200,7 @@ fn no_nul(field: &str, value: &str) -> Result<(), Status> {
 pub struct FleetService {
     store: Store,
     credentials: Option<CredentialService>,
+    capabilities: Capabilities,
     update: UpdateRelay,
     timing_reply_cap: usize,
 }
@@ -207,6 +209,7 @@ impl FleetService {
     /// Builds the handler over `store`. The credential RPCs answer `FAILED_PRECONDITION`.
     pub fn new(store: Store) -> Self {
         Self {
+            capabilities: Capabilities::new(store.pool().clone()),
             store,
             credentials: None,
             update: UpdateRelay::default(),
@@ -728,24 +731,30 @@ impl FleetCapabilityAdmin for FleetService {
         &self,
         request: Request<GrantCapabilityRequest>,
     ) -> Result<Response<UserCapability>, Status> {
-        admin_of(&request)?;
-        capability::grant(request.get_ref()).map(Response::new)
+        let actor = admin_of(&request)?;
+        capability::grant(&self.capabilities, actor, request.get_ref())
+            .await
+            .map(Response::new)
     }
 
     async fn revoke_capability(
         &self,
         request: Request<RevokeCapabilityRequest>,
     ) -> Result<Response<RevokeCapabilityReply>, Status> {
-        admin_of(&request)?;
-        capability::revoke(request.get_ref()).map(Response::new)
+        let actor = admin_of(&request)?;
+        capability::revoke(&self.capabilities, actor, request.get_ref())
+            .await
+            .map(Response::new)
     }
 
     async fn list_capabilities(
         &self,
         request: Request<ListCapabilitiesRequest>,
     ) -> Result<Response<ListCapabilitiesReply>, Status> {
-        admin_of(&request)?;
-        capability::list(request.get_ref()).map(Response::new)
+        let actor = admin_of(&request)?;
+        capability::list(&self.capabilities, actor, request.get_ref())
+            .await
+            .map(Response::new)
     }
 }
 

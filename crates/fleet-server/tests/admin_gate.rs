@@ -133,9 +133,8 @@ async fn call(rig: &Rig, rpc: Rpc, token: &str) -> Result<(), tonic::Status> {
 
 fn reached(rpc: Rpc) -> Code {
     match rpc {
-        Rpc::Upsert => Code::InvalidArgument,
-        Rpc::SetEnabled => Code::NotFound,
-        Rpc::Grant | Rpc::Revoke | Rpc::List => Code::Unimplemented,
+        Rpc::Upsert | Rpc::Grant | Rpc::Revoke => Code::InvalidArgument,
+        Rpc::SetEnabled | Rpc::List => Code::NotFound,
     }
 }
 
@@ -314,7 +313,7 @@ async fn the_handlers_deny_a_missing_or_non_admin_caller(pool: PgPool) {
     }));
     assert_eq!(
         svc.grant_capability(grant).await.unwrap_err().code(),
-        Code::Unimplemented
+        Code::InvalidArgument
     );
 }
 

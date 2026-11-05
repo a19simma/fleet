@@ -5,8 +5,8 @@
 use std::time::Duration;
 
 use fleet_server::cred::capability::{
-    Capabilities, CapabilityError, PROFILE_TOOLS, REASON_NO_SUCH_ACTOR, REASON_NO_SUCH_USER,
-    REASON_UNKNOWN_CAPABILITY,
+    Capabilities, CapabilityError, PROFILE_TOOLS, REASON_ADMIN_REQUIRED, REASON_NO_SUCH_ACTOR,
+    REASON_NO_SUCH_USER, REASON_UNKNOWN_CAPABILITY,
 };
 use sqlx::PgPool;
 
@@ -14,8 +14,9 @@ const BAND: Duration = Duration::from_millis(400);
 const OUTER: Duration = Duration::from_secs(20);
 
 async fn user(pool: &PgPool, name: &str) -> i64 {
-    sqlx::query_scalar("INSERT INTO users (username) VALUES ($1) RETURNING id")
+    sqlx::query_scalar("INSERT INTO users (username, is_admin) VALUES ($1, $2) RETURNING id")
         .bind(name)
+        .bind(name.starts_with("admin"))
         .fetch_one(pool)
         .await
         .unwrap()
@@ -215,4 +216,106 @@ async fn grant_waits_for_the_actor_row_and_fails_when_it_is_deleted(pool: PgPool
     let out = tokio::time::timeout(OUTER, task).await.unwrap().unwrap();
     assert!(matches!(out, Err(CapabilityError::NoSuchActor)));
     assert_eq!(rows(&pool).await, 0);
+}
+
+#[sqlx::test]
+async fn a_non_admin_actor_is_refused_and_writes_nothing(pool: PgPool) {
+    let caps = Capabilities::new(pool.clone());
+    let (alice, bob, admin) = (
+        user(&pool, "alice").await,
+        user(&pool, "bob").await,
+        user(&pool, "admin").await,
+    );
+    caps.grant(admin, bob, PROFILE_TOOLS).await.unwrap();
+    let grant = caps.grant(alice, alice, PROFILE_TOOLS).await.unwrap_err();
+    assert!(matches!(grant, CapabilityError::NotAdmin), "{grant}");
+    assert_eq!(grant.to_string(), REASON_ADMIN_REQUIRED);
+    let revoke = caps.revoke(alice, bob, PROFILE_TOOLS).await.unwrap_err();
+    assert!(matches!(revoke, CapabilityError::NotAdmin), "{revoke}");
+    let list = caps.list(alice, bob).await.unwrap_err();
+    assert!(matches!(list, CapabilityError::NotAdmin), "{list}");
+    assert!(caps.has(bob, PROFILE_TOOLS).await.unwrap());
+    assert!(!caps.has(alice, PROFILE_TOOLS).await.unwrap());
+    assert_eq!(rows(&pool).await, 1);
+}
+
+#[sqlx::test]
+async fn a_grant_waits_for_a_demotion_in_flight_then_is_refused(pool: PgPool) {
+    let caps = Capabilities::new(pool.clone());
+    let (alice, admin) = (user(&pool, "alice").await, user(&pool, "admin").await);
+    let mut demotion = pool.begin().await.unwrap();
+    sqlx::query("UPDATE users SET is_admin = false WHERE id = $1")
+        .bind(admin)
+        .execute(&mut *demotion)
+        .await
+        .unwrap();
+    let mut task = tokio::spawn(async move { caps.grant(admin, alice, PROFILE_TOOLS).await });
+    assert!(tokio::time::timeout(BAND, &mut task).await.is_err());
+    demotion.commit().await.unwrap();
+    let out = tokio::time::timeout(OUTER, task).await.unwrap().unwrap();
+    assert!(matches!(out, Err(CapabilityError::NotAdmin)), "{out:?}");
+    assert_eq!(rows(&pool).await, 0);
+}
+
+#[sqlx::test]
+async fn a_revoke_waits_for_a_demotion_in_flight_then_is_refused(pool: PgPool) {
+    let caps = Capabilities::new(pool.clone());
+    let (alice, admin) = (user(&pool, "alice").await, user(&pool, "admin").await);
+    caps.grant(admin, alice, PROFILE_TOOLS).await.unwrap();
+    let mut demotion = pool.begin().await.unwrap();
+    sqlx::query("UPDATE users SET is_admin = false WHERE id = $1")
+        .bind(admin)
+        .execute(&mut *demotion)
+        .await
+        .unwrap();
+    let writer = caps.clone();
+    let mut task = tokio::spawn(async move { writer.revoke(admin, alice, PROFILE_TOOLS).await });
+    assert!(tokio::time::timeout(BAND, &mut task).await.is_err());
+    demotion.commit().await.unwrap();
+    let out = tokio::time::timeout(OUTER, task).await.unwrap().unwrap();
+    assert!(matches!(out, Err(CapabilityError::NotAdmin)), "{out:?}");
+    assert!(caps.has(alice, PROFILE_TOOLS).await.unwrap());
+}
+
+#[sqlx::test]
+async fn list_returns_only_the_targets_grants_with_audit_fields(pool: PgPool) {
+    let caps = Capabilities::new(pool.clone());
+    let (alice, bob, admin) = (
+        user(&pool, "alice").await,
+        user(&pool, "bob").await,
+        user(&pool, "admin").await,
+    );
+    assert_eq!(caps.list(admin, alice).await.unwrap(), vec![]);
+    caps.grant(admin, alice, PROFILE_TOOLS).await.unwrap();
+    caps.grant(admin, bob, PROFILE_TOOLS).await.unwrap();
+    let listed = caps.list(admin, alice).await.unwrap();
+    assert_eq!(listed.len(), 1);
+    assert_eq!(
+        (
+            listed[0].user_id,
+            listed[0].capability.as_str(),
+            listed[0].granted_by
+        ),
+        (alice, PROFILE_TOOLS, admin)
+    );
+    assert!(listed[0].granted_at_ms > 0);
+    let err = caps.list(admin, 9_999).await.unwrap_err();
+    assert!(matches!(err, CapabilityError::NoSuchUser));
+    let err = caps.list(9_999, alice).await.unwrap_err();
+    assert!(matches!(err, CapabilityError::NoSuchActor));
+}
+
+#[sqlx::test]
+async fn grant_stored_echoes_the_row_for_a_repeat_grant(pool: PgPool) {
+    let caps = Capabilities::new(pool.clone());
+    let (alice, a1, a2) = (
+        user(&pool, "alice").await,
+        user(&pool, "admin1").await,
+        user(&pool, "admin2").await,
+    );
+    let first = caps.grant_stored(a1, alice, PROFILE_TOOLS).await.unwrap();
+    let again = caps.grant_stored(a2, alice, PROFILE_TOOLS).await.unwrap();
+    assert!(first.created && !again.created);
+    assert_eq!(again.grant, first.grant);
+    assert_eq!(again.grant.granted_by, a1);
 }
