@@ -1,17 +1,21 @@
 //! Catalog store and RPC logic.
 
+use fleet_core::ItemId;
 use fleet_core::catalog::{CatalogItem as CoreItem, CatalogKind as CoreKind};
 use fleet_proto::v1::{
     CatalogItem, CatalogKind, ListCatalogReply, ListCatalogRequest, SetCatalogItemEnabledRequest,
     UpsertCatalogItemRequest,
 };
-use sqlx::PgPool;
+pub use fleet_proto::{DEFAULT_CATALOG_PAGE, MAX_CATALOG_CURSOR_BYTES, MAX_CATALOG_PAGE};
+use sqlx::{PgPool, Postgres, Transaction};
 use tonic::Status;
 
-const NOT_IMPLEMENTED: &str = "the catalog is not implemented";
+use crate::auth::ADMIN_REQUIRED;
 
-/// Refusal reason for a caller without the admin scope.
-pub const REASON_ADMIN_REQUIRED: &str = "the catalog admin scope is required";
+/// Refusal reason for a caller that is not an admin.
+pub const REASON_ADMIN_REQUIRED: &str = ADMIN_REQUIRED;
+/// Refusal reason for an `after_id` that is not a legal item id cursor.
+pub const REASON_CURSOR_INVALID: &str = "the catalog cursor is invalid";
 /// Refusal reason for an upsert that changes the kind or name of an existing id.
 pub const REASON_IDENTITY_CHANGE: &str = "the kind and name of a catalog item cannot change";
 /// Refusal reason for an upsert whose kind and name belong to another id.
@@ -39,10 +43,6 @@ const LIST_ENABLED: &str = "SELECT id, kind, name, content, digest, admin_enable
     WHERE admin_enabled AND id > $1 AND ($2::text IS NULL OR kind = $2) \
     ORDER BY id LIMIT $3";
 
-/// Page size used when a list request asks for 0.
-pub const DEFAULT_CATALOG_PAGE: u32 = 50;
-/// Largest page a list returns, for the store and every handler.
-pub const MAX_CATALOG_PAGE: u32 = 200;
 /// Refusal reason for a list filter naming a kind outside the closed set.
 pub const REASON_KIND_UNKNOWN: &str = "the catalog item kind is unknown";
 
@@ -50,19 +50,35 @@ const UNIQUE_VIOLATION: &str = "23505";
 
 type Row = (String, String, String, String, Vec<u8>, bool);
 
-/// The scope a catalog write runs under. Only [`Scope::Admin`] may write.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Scope {
-    /// A catalog administrator.
-    Admin,
-    /// Any other caller, including an unidentified one.
-    Client,
+const LOCK_ACTOR: &str = "SELECT is_admin FROM users WHERE id = $1 FOR SHARE";
+
+async fn begin_admin(pool: &PgPool, actor: i64) -> Result<Transaction<'static, Postgres>, Status> {
+    let mut tx = pool.begin().await.map_err(|err| store_error(&err))?;
+    let admin: Option<bool> = sqlx::query_scalar(LOCK_ACTOR)
+        .bind(actor)
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(|err| store_error(&err))?;
+    if admin == Some(true) {
+        Ok(tx)
+    } else {
+        Err(Status::permission_denied(REASON_ADMIN_REQUIRED))
+    }
 }
 
-fn require_admin(scope: Scope) -> Result<(), Status> {
-    match scope {
-        Scope::Admin => Ok(()),
-        Scope::Client => Err(Status::permission_denied(REASON_ADMIN_REQUIRED)),
+/// Checks an `after_id` cursor: empty, or a legal item id of at most
+/// [`MAX_CATALOG_CURSOR_BYTES`] bytes. The handler and the store both call it.
+///
+/// # Errors
+/// `INVALID_ARGUMENT` with [`REASON_CURSOR_INVALID`] for NUL, any byte outside `[a-z0-9_-]`, a
+/// leading `_` or `-`, or a cursor over the cap.
+pub fn validate_after_id(after_id: &str) -> Result<(), Status> {
+    let legal = after_id.is_empty()
+        || (fleet_proto::validate_catalog_cursor(after_id) && ItemId::new(after_id).is_ok());
+    if legal {
+        Ok(())
+    } else {
+        Err(Status::invalid_argument(REASON_CURSOR_INVALID))
     }
 }
 
@@ -110,22 +126,25 @@ fn store_error(err: &sqlx::Error) -> Status {
     }
 }
 
-/// Creates a catalog item or replaces the content of an existing one, as an admin.
+/// Creates a catalog item or replaces the content of an existing one, as the admin `actor`.
+///
+/// The transaction first takes `SELECT is_admin FROM users WHERE id = $1 FOR SHARE` on the actor
+/// row, so an admin demoted after authenticating is refused and a demotion waits for the write.
 ///
 /// The item is validated by [`CoreItem::new`] before any SQL runs, and the stored digest is
 /// computed from the validated content. The kind and name of an existing id cannot change, the
 /// statement matches no row in that case. `admin_enabled` is never touched.
 ///
 /// # Errors
-/// `PERMISSION_DENIED` without the admin scope, `INVALID_ARGUMENT` for an invalid item,
+/// `PERMISSION_DENIED` when `actor` is not an admin, `INVALID_ARGUMENT` for an invalid item,
 /// `FAILED_PRECONDITION` when the kind or name of an existing id would change,
 /// `ALREADY_EXISTS` when another id holds the kind and name, `INTERNAL` on a storage failure.
 pub async fn upsert_item(
     pool: &PgPool,
-    scope: Scope,
+    actor: i64,
     request: &UpsertCatalogItemRequest,
 ) -> Result<CatalogItem, Status> {
-    require_admin(scope)?;
+    let mut tx = begin_admin(pool, actor).await?;
     let kind =
         core_kind(request.kind()).ok_or_else(|| Status::invalid_argument(REASON_KIND_REQUIRED))?;
     let item = CoreItem::new(kind, &request.id, &request.name, &request.content)
@@ -136,31 +155,34 @@ pub async fn upsert_item(
         .bind(item.name())
         .bind(item.body())
         .bind(item.digest().as_slice())
-        .fetch_optional(pool)
+        .fetch_optional(&mut *tx)
         .await
         .map_err(|err| store_error(&err))?
         .ok_or_else(|| Status::failed_precondition(REASON_IDENTITY_CHANGE))?;
+    tx.commit().await.map_err(|err| store_error(&err))?;
     item_of(row)
 }
 
-/// Switches a catalog item on or off, as an admin.
+/// Switches a catalog item on or off, as the admin `actor`, under the same actor-row
+/// `FOR SHARE` lock as [`upsert_item`].
 ///
 /// # Errors
-/// `PERMISSION_DENIED` without the admin scope, `NOT_FOUND` for an unknown id, `INTERNAL` on a
+/// `PERMISSION_DENIED` when `actor` is not an admin, `NOT_FOUND` for an unknown id, `INTERNAL` on a
 /// storage failure.
 pub async fn set_enabled(
     pool: &PgPool,
-    scope: Scope,
+    actor: i64,
     request: &SetCatalogItemEnabledRequest,
 ) -> Result<CatalogItem, Status> {
-    require_admin(scope)?;
+    let mut tx = begin_admin(pool, actor).await?;
     let row = sqlx::query_as::<_, Row>(SET_ENABLED)
         .bind(&request.id)
         .bind(request.enabled)
-        .fetch_optional(pool)
+        .fetch_optional(&mut *tx)
         .await
         .map_err(|err| store_error(&err))?
         .ok_or_else(|| Status::not_found(REASON_NOT_FOUND))?;
+    tx.commit().await.map_err(|err| store_error(&err))?;
     item_of(row)
 }
 
@@ -182,7 +204,8 @@ pub struct CatalogPage {
 /// appears.
 ///
 /// # Errors
-/// `INVALID_ARGUMENT` for a kind outside the closed set, `INTERNAL` on a storage failure.
+/// `INVALID_ARGUMENT` for a kind outside the closed set or an illegal `after_id` (see
+/// [`validate_after_id`]), `INTERNAL` on a storage failure.
 pub async fn list_enabled(
     pool: &PgPool,
     kind: i32,
@@ -203,6 +226,7 @@ pub async fn list_enabled_capped(
     limit: u32,
     cap: u32,
 ) -> Result<CatalogPage, Status> {
+    validate_after_id(after_id)?;
     let kind = match CatalogKind::try_from(kind) {
         Ok(CatalogKind::Unspecified) => None,
         Ok(known) => core_kind(known).map(CoreKind::as_str),
@@ -229,28 +253,18 @@ pub async fn list_enabled_capped(
     Ok(CatalogPage { items, next_id })
 }
 
-/// Lists the catalog items a client may see.
+/// Answers a `ListCatalog` request: validates `kind` and `after_id` at the edge, then lists.
 ///
 /// # Errors
-/// Returns `UNIMPLEMENTED` until the store is built.
-pub fn list_catalog(_request: &ListCatalogRequest) -> Result<ListCatalogReply, Status> {
-    Err(Status::unimplemented(NOT_IMPLEMENTED))
-}
-
-/// Creates a catalog item or adds a version of an existing one.
-///
-/// # Errors
-/// Returns `UNIMPLEMENTED` until the store is built.
-pub fn upsert_catalog_item(_request: &UpsertCatalogItemRequest) -> Result<CatalogItem, Status> {
-    Err(Status::unimplemented(NOT_IMPLEMENTED))
-}
-
-/// Switches a catalog item on or off.
-///
-/// # Errors
-/// Returns `UNIMPLEMENTED` until the store is built.
-pub fn set_catalog_item_enabled(
-    _request: &SetCatalogItemEnabledRequest,
-) -> Result<CatalogItem, Status> {
-    Err(Status::unimplemented(NOT_IMPLEMENTED))
+/// The errors of [`list_enabled`].
+pub async fn list_catalog(
+    pool: &PgPool,
+    request: &ListCatalogRequest,
+) -> Result<ListCatalogReply, Status> {
+    validate_after_id(&request.after_id)?;
+    let page = list_enabled(pool, request.kind, &request.after_id, request.page_size).await?;
+    Ok(ListCatalogReply {
+        items: page.items,
+        next_id: page.next_id,
+    })
 }

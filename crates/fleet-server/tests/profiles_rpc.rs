@@ -964,9 +964,10 @@ async fn a_caller_that_is_no_stored_user_maps_to_permission_denied(pool: PgPool)
 
     let svc = FleetService::new(store(pool.clone()).await);
     let mut request = Request::new(create("alpha", ONE));
-    request
-        .extensions_mut()
-        .insert(Caller { user_id: i64::MAX });
+    request.extensions_mut().insert(Caller {
+        user_id: i64::MAX,
+        is_admin: false,
+    });
     let err = svc.create_profile(request).await.unwrap_err();
     assert_eq!(err.code(), Code::PermissionDenied);
     assert_eq!(err.message(), UNOWNED);

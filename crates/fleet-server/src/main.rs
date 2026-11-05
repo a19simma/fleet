@@ -253,15 +253,22 @@ async fn admin(args: &[String]) -> Result<(), AdminError> {
         .filter(|name| !name.is_empty())
         .unwrap_or_else(|| "unknown".to_owned());
     let done = run_admin(&pool, &cmd, &operator).await?;
-    let report = format!(
-        "user: {}\npasskeys removed: {}\nsessions revoked: {}\napi tokens revoked: {}\nsetup code: {}\nthe code works once and expires in {} hours\n",
-        done.username,
-        done.passkeys_removed,
-        done.sessions_revoked,
-        done.tokens_revoked,
-        String::from_utf8_lossy(done.setup_code.expose()),
-        SETUP_CODE_TTL_HOURS
-    );
+    let report = match (&done.setup_code, done.admin) {
+        (Some(code), _) => format!(
+            "user: {}\npasskeys removed: {}\nsessions revoked: {}\napi tokens revoked: {}\nsetup code: {}\nthe code works once and expires in {} hours\n",
+            done.username,
+            done.passkeys_removed,
+            done.sessions_revoked,
+            done.tokens_revoked,
+            String::from_utf8_lossy(code.expose()),
+            SETUP_CODE_TTL_HOURS
+        ),
+        (None, flag) => format!(
+            "user: {}\nadmin: {}\n",
+            done.username,
+            flag.unwrap_or(false)
+        ),
+    };
     std::io::stdout()
         .write_all(report.as_bytes())
         .map_err(|_| AdminError::Output)
