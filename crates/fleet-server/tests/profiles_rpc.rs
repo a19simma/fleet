@@ -1087,3 +1087,245 @@ async fn an_authenticated_caller_reads_and_lists_their_private_profile(pool: PgP
         Vec::<fleet_proto::v1::ProfileSummary>::new()
     );
 }
+
+struct Matrix {
+    pool: PgPool,
+    alice: i64,
+    bob: i64,
+}
+
+fn body(owner: &str, name: &str) -> String {
+    format!(r#"{{"claude_md":"{owner}-{name}"}}"#)
+}
+
+async fn matrix(pool: PgPool) -> Matrix {
+    store(pool.clone()).await;
+    let alice = user(&pool, "alice").await;
+    let bob = user(&pool, "bob").await;
+    for (caller, owner, name, shared) in [
+        (alice, "alice", "apple", false),
+        (alice, "alice", "cherry", true),
+        (alice, "alice", "dup", false),
+        (bob, "bob", "alpha", true),
+        (bob, "bob", "banana", false),
+        (bob, "bob", "dup", true),
+    ] {
+        owned(&pool, Some(caller), name, &body(owner, name))
+            .await
+            .unwrap();
+        if shared {
+            share(&pool, profile_id(&pool, caller, name).await).await;
+        }
+    }
+    Matrix { pool, alice, bob }
+}
+
+impl Matrix {
+    async fn read(&self, viewer: Viewer, name: &str) -> Result<String, StoreError> {
+        profiles::get_for(&self.pool, viewer, name, None)
+            .await
+            .map(|read| read.content_json)
+    }
+
+    async fn names(&self, viewer: Viewer) -> Vec<String> {
+        profiles::list_for(&self.pool, viewer, 0, None)
+            .await
+            .unwrap()
+            .profiles
+            .into_iter()
+            .map(|summary| summary.name)
+            .collect()
+    }
+
+    async fn id(&self, owner: i64, name: &str) -> i64 {
+        profile_id(&self.pool, owner, name).await
+    }
+}
+
+fn names(list: &[&str]) -> Vec<String> {
+    list.iter().map(|name| (*name).to_owned()).collect()
+}
+
+#[sqlx::test]
+async fn matrix_get_owner_reads_own_private_and_own_shared(pool: PgPool) {
+    let m = matrix(pool).await;
+    let own = Viewer::User(m.alice);
+    for name in ["apple", "cherry", "dup"] {
+        let read = m.read(own, name).await.unwrap();
+        assert!(read.contains(&format!("alice-{name}")), "{read}");
+    }
+}
+
+#[sqlx::test]
+async fn matrix_get_other_user_reads_shared_and_private_is_not_found(pool: PgPool) {
+    let m = matrix(pool).await;
+    let bob = Viewer::User(m.bob);
+    assert!(
+        m.read(bob, "cherry")
+            .await
+            .unwrap()
+            .contains("alice-cherry")
+    );
+    assert!(m.read(bob, "dup").await.unwrap().contains("bob-dup"));
+    let foreign = m.read(bob, "apple").await.unwrap_err();
+    let absent = m.read(bob, "ghost").await.unwrap_err();
+    assert!(matches!(foreign, StoreError::NotFound));
+    assert_eq!(foreign.to_string(), absent.to_string());
+}
+
+#[sqlx::test]
+async fn matrix_get_no_caller_reads_shared_only(pool: PgPool) {
+    let m = matrix(pool).await;
+    let none = Viewer::from(None);
+    assert!(
+        m.read(none, "cherry")
+            .await
+            .unwrap()
+            .contains("alice-cherry")
+    );
+    assert!(m.read(none, "alpha").await.unwrap().contains("bob-alpha"));
+    assert!(m.read(none, "dup").await.unwrap().contains("bob-dup"));
+    for name in ["apple", "banana", "ghost"] {
+        assert!(matches!(
+            m.read(none, name).await,
+            Err(StoreError::NotFound)
+        ));
+    }
+}
+
+#[sqlx::test]
+async fn matrix_list_owner_gets_own_plus_shared_in_name_order(pool: PgPool) {
+    let m = matrix(pool).await;
+    assert_eq!(
+        m.names(Viewer::User(m.alice)).await,
+        names(&["alpha", "apple", "cherry", "dup"])
+    );
+    let listed = profiles::list_for(&m.pool, Viewer::User(m.alice), 0, None)
+        .await
+        .unwrap();
+    let dup = listed.profiles.iter().find(|p| p.name == "dup").unwrap();
+    let own = profiles::get_for(&m.pool, Viewer::User(m.alice), "dup", None)
+        .await
+        .unwrap();
+    assert_eq!(dup.hash, own.hash);
+}
+
+#[sqlx::test]
+async fn matrix_list_other_user_gets_own_plus_shared_without_foreign_private(pool: PgPool) {
+    let m = matrix(pool).await;
+    assert_eq!(
+        m.names(Viewer::User(m.bob)).await,
+        names(&["alpha", "banana", "cherry", "dup"])
+    );
+}
+
+#[sqlx::test]
+async fn matrix_list_no_caller_gets_shared_only(pool: PgPool) {
+    let m = matrix(pool).await;
+    assert_eq!(
+        m.names(Viewer::from(None)).await,
+        names(&["alpha", "cherry", "dup"])
+    );
+}
+
+#[sqlx::test]
+async fn matrix_update_owner_adds_a_version_to_private_and_shared(pool: PgPool) {
+    let m = matrix(pool).await;
+    for name in ["apple", "cherry"] {
+        let id = m.id(m.alice, name).await;
+        let done = update(&m.pool, Some(m.alice), id, NEXT).await.unwrap();
+        assert_eq!((done.version, done.created), (2, true), "{name}");
+    }
+}
+
+#[sqlx::test]
+async fn matrix_update_other_user_is_not_found_private_and_permission_denied_shared(pool: PgPool) {
+    let m = matrix(pool).await;
+    let private = m.id(m.alice, "apple").await;
+    let shared = m.id(m.alice, "cherry").await;
+    let before = snapshot(&m.pool).await;
+    let hidden = update(&m.pool, Some(m.bob), private, NEXT)
+        .await
+        .unwrap_err();
+    let absent = update(&m.pool, Some(m.bob), private + 1000, NEXT)
+        .await
+        .unwrap_err();
+    assert!(matches!(hidden, StoreError::NotFound));
+    assert_eq!(hidden.to_string(), absent.to_string());
+    let reader = update(&m.pool, Some(m.bob), shared, NEXT)
+        .await
+        .unwrap_err();
+    assert!(is_not_owner(&reader), "{reader}");
+    assert_eq!(snapshot(&m.pool).await, before);
+}
+
+#[sqlx::test]
+async fn matrix_update_no_caller_is_unowned_and_writes_nothing(pool: PgPool) {
+    let m = matrix(pool).await;
+    let before = snapshot(&m.pool).await;
+    for name in ["apple", "cherry"] {
+        let id = m.id(m.alice, name).await;
+        assert!(matches!(
+            update(&m.pool, None, id, NEXT).await,
+            Err(StoreError::InvalidProfile(ProfileFault::Unowned))
+        ));
+    }
+    assert_eq!(snapshot(&m.pool).await, before);
+}
+
+#[sqlx::test]
+async fn matrix_delete_owner_removes_private_and_shared(pool: PgPool) {
+    let m = matrix(pool).await;
+    let private = bare_profile(&m.pool, m.alice, "bare-private").await;
+    let shared = bare_profile(&m.pool, m.alice, "bare-shared").await;
+    share(&m.pool, shared).await;
+    for id in [private, shared] {
+        profiles::delete_owned(&m.pool, Some(m.alice), id)
+            .await
+            .unwrap();
+        let left: i64 = sqlx::query_scalar("SELECT count(*) FROM profile WHERE id = $1")
+            .bind(id)
+            .fetch_one(&m.pool)
+            .await
+            .unwrap();
+        assert_eq!(left, 0);
+    }
+}
+
+#[sqlx::test]
+async fn matrix_delete_other_user_is_not_found_private_and_permission_denied_shared(pool: PgPool) {
+    let m = matrix(pool).await;
+    let private = bare_profile(&m.pool, m.alice, "bare-private").await;
+    let shared = bare_profile(&m.pool, m.alice, "bare-shared").await;
+    share(&m.pool, shared).await;
+    let before = snapshot(&m.pool).await;
+    let hidden = profiles::delete_owned(&m.pool, Some(m.bob), private)
+        .await
+        .unwrap_err();
+    let absent = profiles::delete_owned(&m.pool, Some(m.bob), private + 1000)
+        .await
+        .unwrap_err();
+    assert!(matches!(hidden, StoreError::NotFound));
+    assert_eq!(hidden.to_string(), absent.to_string());
+    let reader = profiles::delete_owned(&m.pool, Some(m.bob), shared)
+        .await
+        .unwrap_err();
+    assert!(is_not_owner(&reader), "{reader}");
+    assert_eq!(snapshot(&m.pool).await, before);
+}
+
+#[sqlx::test]
+async fn matrix_delete_no_caller_is_unowned_and_writes_nothing(pool: PgPool) {
+    let m = matrix(pool).await;
+    let private = bare_profile(&m.pool, m.alice, "bare-private").await;
+    let shared = bare_profile(&m.pool, m.alice, "bare-shared").await;
+    share(&m.pool, shared).await;
+    let before = snapshot(&m.pool).await;
+    for id in [private, shared] {
+        assert!(matches!(
+            profiles::delete_owned(&m.pool, None, id).await,
+            Err(StoreError::InvalidProfile(ProfileFault::Unowned))
+        ));
+    }
+    assert_eq!(snapshot(&m.pool).await, before);
+}
