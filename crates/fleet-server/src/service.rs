@@ -49,7 +49,7 @@ use crate::auth::{BearerAuth, Caller};
 use crate::catalog;
 use crate::cred::{CredentialService, capability};
 use crate::jobs::validate_job_id;
-use crate::profiles::{self, ProfileContent};
+use crate::profiles::{self, ProfileContent, ProfileFault, Viewer};
 use crate::store::{Store, StoreError};
 use crate::timing;
 use crate::web::{Dispatch, HEADER_READ_TIMEOUT, Web, serve};
@@ -564,6 +564,9 @@ fn jobs_error(err: &StoreError) -> Status {
 
 fn profiles_error(err: &StoreError) -> Status {
     match err {
+        StoreError::InvalidProfile(ProfileFault::Unowned) => {
+            Status::permission_denied(profiles::ERR_PROFILE_UNOWNED)
+        }
         StoreError::InvalidProfile(fault) => Status::invalid_argument(fault.to_string()),
         StoreError::NotFound => Status::not_found("profile not found"),
         other => storage_unavailable(other),
@@ -619,12 +622,14 @@ impl FleetProfiles for FleetService {
         &self,
         request: Request<CreateProfileRequest>,
     ) -> Result<Response<ProfileVersion>, Status> {
+        let caller = caller_of(&request)
+            .ok_or_else(|| Status::permission_denied(profiles::ERR_PROFILE_UNOWNED))?;
         let request = request.into_inner();
         let content = ProfileContent::select(&request.content_json, &request.content_toml)
             .map_err(|fault| Status::invalid_argument(fault.to_string()))?;
         let reply = self
             .store
-            .create_profile_content(&request.name, content)
+            .create_profile_content(Some(caller), &request.name, content)
             .await
             .map_err(|err| profiles_error(&err))?;
         Ok(Response::new(reply))
@@ -634,10 +639,11 @@ impl FleetProfiles for FleetService {
         &self,
         request: Request<GetProfileRequest>,
     ) -> Result<Response<ProfileVersion>, Status> {
+        let viewer = Viewer::from(caller_of(&request));
         let request = request.into_inner();
         let reply = self
             .store
-            .get_profile(&request.name, request.version)
+            .get_profile(viewer, &request.name, request.version)
             .await
             .map_err(|err| profiles_error(&err))?;
         Ok(Response::new(reply))
@@ -647,10 +653,11 @@ impl FleetProfiles for FleetService {
         &self,
         request: Request<ListProfilesRequest>,
     ) -> Result<Response<ListProfilesReply>, Status> {
+        let viewer = Viewer::from(caller_of(&request));
         let request = request.into_inner();
         let reply = self
             .store
-            .list_profiles(request.limit, request.after_name.as_deref())
+            .list_profiles(viewer, request.limit, request.after_name.as_deref())
             .await
             .map_err(|err| profiles_error(&err))?;
         Ok(Response::new(reply))
