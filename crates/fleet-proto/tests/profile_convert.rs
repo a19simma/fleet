@@ -387,3 +387,28 @@ fn errors_carry_no_input() {
     let err = catalog_entry_from_wire(&wire).err().map(|e| e.to_string());
     assert!(err.is_some_and(|m| !m.contains(secret)));
 }
+
+#[test]
+fn a_blob_reply_catalog_round_trips_through_encode_and_convert() {
+    use prost::Message;
+    let entries: Vec<CatalogEntry> = [CatalogKind::Skill, CatalogKind::Subagent, CatalogKind::Tool]
+        .into_iter()
+        .zip([true, false, true])
+        .map(|(kind, enabled)| CatalogEntry::new(sample!(kind), enabled))
+        .collect();
+    let reply = v1::GetProfileBlobReply {
+        profile: None,
+        content: b"{}".to_vec(),
+        catalog: entries.iter().map(catalog_entry_to_wire).collect(),
+    };
+    let decoded = v1::GetProfileBlobReply::decode(reply.encode_to_vec().as_slice())
+        .unwrap_or_else(|e| panic!("{e}"));
+    assert_eq!(decoded, reply);
+    let back: Result<Vec<CatalogEntry>, ProfileConvertError> = decoded
+        .catalog
+        .iter()
+        .map(catalog_entry_from_wire)
+        .collect();
+    assert_eq!(back, Ok(entries));
+    assert!(fleet_proto::validate_blob_catalog(&decoded.catalog));
+}

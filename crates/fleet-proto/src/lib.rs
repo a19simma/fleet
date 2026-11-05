@@ -154,6 +154,35 @@ pub fn validate_catalog_cursor(after_id: &str) -> bool {
             .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || matches!(b, b'_' | b'-'))
 }
 
+/// Most catalog items a `GetProfileBlobReply` snapshot carries.
+pub const MAX_BLOB_CATALOG_ITEMS: usize = 256;
+
+/// Most total catalog item content bytes a `GetProfileBlobReply` snapshot carries.
+pub const MAX_BLOB_CATALOG_BYTES: usize = 4 * 1024 * 1024;
+
+const BLOB_CATALOG_ITEM_OVERHEAD_BYTES: usize = 1024;
+
+const _: () = assert!(
+    MAX_BLOB_CATALOG_BYTES
+        + MAX_BLOB_CATALOG_ITEMS * BLOB_CATALOG_ITEM_OVERHEAD_BYTES
+        + 4 * 1024 * 1024
+        <= MAX_PROFILE_MESSAGE_BYTES
+);
+
+/// Whether a catalog snapshot fits `max_items` items and `max_bytes` total content bytes.
+pub fn blob_catalog_within(items: &[v1::CatalogItem], max_items: usize, max_bytes: usize) -> bool {
+    items.len() <= max_items
+        && items
+            .iter()
+            .try_fold(0usize, |sum, item| sum.checked_add(item.content.len()))
+            .is_some_and(|total| total <= max_bytes)
+}
+
+/// Whether a catalog snapshot fits [`MAX_BLOB_CATALOG_ITEMS`] and [`MAX_BLOB_CATALOG_BYTES`].
+pub fn validate_blob_catalog(items: &[v1::CatalogItem]) -> bool {
+    blob_catalog_within(items, MAX_BLOB_CATALOG_ITEMS, MAX_BLOB_CATALOG_BYTES)
+}
+
 /// Longest credential login, in bytes.
 pub const MAX_CREDENTIAL_LOGIN_BYTES: usize = 256;
 

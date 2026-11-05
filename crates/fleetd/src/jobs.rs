@@ -1526,6 +1526,7 @@ mod tests {
         GetProfileBlobReply {
             profile: job.profile.clone(),
             content,
+            catalog: Vec::new(),
         }
     }
 

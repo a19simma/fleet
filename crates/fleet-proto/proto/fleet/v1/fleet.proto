@@ -345,9 +345,13 @@ message GetProfileBlobRequest {
   string box = 3;
 }
 
+// catalog is the catalog snapshot taken when the job was submitted, not the live catalog: later
+// admin edits do not change it. It holds at most MAX_BLOB_CATALOG_ITEMS items whose content
+// totals at most MAX_BLOB_CATALOG_BYTES bytes.
 message GetProfileBlobReply {
   ProfileRef profile = 1;
   bytes content = 2;
+  repeated CatalogItem catalog = 3;
 }
 
 message SubmitJobRequest {

@@ -744,6 +744,7 @@ mod tests {
         let reply = GetProfileBlobReply {
             profile: Some(reference.clone()),
             content: profile.canonical_json(),
+            catalog: Vec::new(),
         };
         (reference, reply)
     }
@@ -958,6 +959,7 @@ mod tests {
         let reply = GetProfileBlobReply {
             profile: Some(reference.clone()),
             content,
+            catalog: Vec::new(),
         };
         (reference, reply)
     }

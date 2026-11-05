@@ -3051,6 +3051,7 @@ mod tests {
         let reply = GetProfileBlobReply {
             profile: Some(reference),
             content: profile.canonical_json(),
+            catalog: Vec::new(),
         };
         (job, reply)
     }

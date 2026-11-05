@@ -291,6 +291,7 @@ async fn launch_full(
         blob: profile.map(|served| GetProfileBlobReply {
             profile: Some(served.reference),
             content: served.content,
+            catalog: Vec::new(),
         }),
         blob_requests: Mutex::new(Vec::new()),
     });

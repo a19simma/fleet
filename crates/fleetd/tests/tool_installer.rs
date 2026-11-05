@@ -417,6 +417,7 @@ impl Reporter for Handle {
         ready(Ok(GetProfileBlobReply {
             profile: Some(reference(&self.0.profile)),
             content: self.0.profile.canonical_json(),
+            catalog: Vec::new(),
         }))
     }
 }

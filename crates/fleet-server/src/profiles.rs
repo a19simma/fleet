@@ -552,6 +552,7 @@ pub(crate) async fn blob_for_lease(
             hash: hex(&pinned),
         }),
         content,
+        catalog: Vec::new(),
     })
 }
 

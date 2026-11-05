@@ -1,10 +1,13 @@
 //! The catalog contract: kind values, the shared content limit and the migration that backs it.
 
 use fleet_core::catalog::{CatalogItem as CoreItem, CatalogKind as CoreKind};
-use fleet_proto::v1::{CatalogItem, CatalogKind, ListCatalogReply, ListCatalogRequest};
+use fleet_proto::v1::{
+    CatalogItem, CatalogKind, GetProfileBlobReply, ListCatalogReply, ListCatalogRequest,
+};
 use fleet_proto::{
-    DEFAULT_CATALOG_PAGE, MAX_CATALOG_CONTENT_BYTES, MAX_CATALOG_CURSOR_BYTES, MAX_CATALOG_PAGE,
-    validate_catalog_content, validate_catalog_cursor,
+    DEFAULT_CATALOG_PAGE, MAX_BLOB_CATALOG_BYTES, MAX_BLOB_CATALOG_ITEMS,
+    MAX_CATALOG_CONTENT_BYTES, MAX_CATALOG_CURSOR_BYTES, MAX_CATALOG_PAGE, blob_catalog_within,
+    validate_blob_catalog, validate_catalog_content, validate_catalog_cursor,
 };
 use prost::Message;
 
@@ -205,4 +208,66 @@ fn cursor_hostile_input_table() {
     for input in refused {
         assert!(!validate_catalog_cursor(input), "{input:?}");
     }
+}
+
+fn item_with(content: &str) -> CatalogItem {
+    CatalogItem {
+        id: "s".to_owned(),
+        kind: CatalogKind::Skill as i32,
+        name: "s".to_owned(),
+        content: content.to_owned(),
+        digest: Vec::new(),
+        admin_enabled: true,
+    }
+}
+
+#[test]
+fn the_blob_reply_catalog_is_field_three_on_the_wire() {
+    let reply = GetProfileBlobReply {
+        profile: None,
+        content: Vec::new(),
+        catalog: vec![item_with("b")],
+    };
+    let inner = item_with("b").encode_to_vec();
+    let mut expected = vec![0x1a, u8::try_from(inner.len()).unwrap_or(0)];
+    expected.extend_from_slice(&inner);
+    assert_eq!(reply.encode_to_vec(), expected);
+    let decoded = GetProfileBlobReply::decode(expected.as_slice()).unwrap_or_default();
+    assert_eq!(decoded, reply);
+    assert!(PROTO.contains("repeated CatalogItem catalog = 3;"));
+}
+
+#[test]
+fn the_blob_catalog_caps_are_pinned() {
+    assert_eq!(MAX_BLOB_CATALOG_ITEMS, 256);
+    assert_eq!(MAX_BLOB_CATALOG_BYTES, 4 * 1024 * 1024);
+}
+
+#[test]
+fn the_blob_catalog_item_cap_is_exact() {
+    let items: Vec<CatalogItem> = (0..4).map(|_| item_with("a")).collect();
+    assert!(blob_catalog_within(&items, 4, 100));
+    assert!(!blob_catalog_within(&items, 3, 100));
+    assert!(blob_catalog_within(&[], 0, 0));
+    let full: Vec<CatalogItem> = (0..MAX_BLOB_CATALOG_ITEMS)
+        .map(|_| item_with("a"))
+        .collect();
+    assert!(validate_blob_catalog(&full));
+    let mut over = full;
+    over.push(item_with("a"));
+    assert!(!validate_blob_catalog(&over));
+}
+
+#[test]
+fn the_blob_catalog_byte_cap_is_exact() {
+    let items = vec![item_with("abc"), item_with("de")];
+    assert!(blob_catalog_within(&items, 2, 5));
+    assert!(!blob_catalog_within(&items, 2, 4));
+    let big = "a".repeat(MAX_CATALOG_CONTENT_BYTES);
+    let fit = MAX_BLOB_CATALOG_BYTES / MAX_CATALOG_CONTENT_BYTES;
+    let at: Vec<CatalogItem> = (0..fit).map(|_| item_with(&big)).collect();
+    assert!(validate_blob_catalog(&at));
+    let mut over = at;
+    over.push(item_with("a"));
+    assert!(!validate_blob_catalog(&over));
 }
