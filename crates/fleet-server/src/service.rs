@@ -567,6 +567,10 @@ fn jobs_error(err: &StoreError) -> Status {
             Status::already_exists("idempotency key already used with other parameters")
         }
         StoreError::NotFound => Status::not_found("job not found"),
+        StoreError::UnknownProfile => Status::not_found("profile not found"),
+        StoreError::InvalidProfile(ProfileFault::Unowned) => {
+            Status::permission_denied(profiles::ERR_PROFILE_SUBMIT_UNOWNED)
+        }
         StoreError::InvalidJob(_) | StoreError::InvalidChunk => {
             Status::invalid_argument("invalid job request")
         }

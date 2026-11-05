@@ -20,7 +20,7 @@ use sqlx::{PgPool, Postgres, Row, Transaction};
 use crate::batches::{self, BatchInvalid};
 use crate::jobs::{
     JobInvalid, MAX_CHUNKS_PER_REPORT, MAX_PHASE_CHARS, MAX_PROGRESS_CHARS, MAX_TRANSCRIPT_BYTES,
-    MAX_TRANSCRIPT_ROWS, MIN_CHUNK_COST_BYTES, NewJob, validate_ci, validate_job_id,
+    MAX_TRANSCRIPT_ROWS, MIN_CHUNK_COST_BYTES, NewJob, runner_kind, validate_ci, validate_job_id,
     validate_judge, validate_submit, validate_terminal, validate_verdict,
 };
 use crate::profiles::{self, ProfileContent, ProfileFault, Viewer};
@@ -150,6 +150,15 @@ const SELECT_JOB_BY_KEY: &str = concat!(
 const INSERT_JOB: &str = "\
 INSERT INTO jobs (job_id, idempotency_key, prompt, repo, base_ref, branch, open_pr, user_id, agent) \
 VALUES ($1, $2, $3, $4, $5, 'swarm/' || $1, $6, $7, $8) \
+ON CONFLICT (idempotency_key) DO NOTHING \
+RETURNING job_id";
+
+const KEY_EXISTS: &str = "SELECT EXISTS (SELECT 1 FROM jobs WHERE idempotency_key = $1)";
+
+const INSERT_JOB_WITH_PROFILE: &str = "\
+INSERT INTO jobs (job_id, idempotency_key, prompt, repo, base_ref, branch, open_pr, user_id, agent, \
+profile_name, profile_id, profile_version, profile_hash, snapshot_catalog, snapshot_notes, snapshot_hash) \
+VALUES ($1, $2, $3, $4, $5, 'swarm/' || $1, $6, $7, $8, $9, $10, $11, $12, $13::text::jsonb, $14::text::jsonb, $15) \
 ON CONFLICT (idempotency_key) DO NOTHING \
 RETURNING job_id";
 
@@ -934,6 +943,12 @@ impl Store {
 
     /// Queues a job, or returns the one already stored under the same idempotency key.
     ///
+    /// A request that names a profile needs a user: the profile is read as that user, its
+    /// effective catalog set is resolved for the job's runner, and the set, its notes and
+    /// its hash are stored on the job in the insert transaction under `FOR SHARE` locks on the
+    /// profile and catalog rows. Later catalog edits never change a stored job. A repeat under
+    /// the same key skips the resolution and returns the stored job.
+    ///
     /// The request is validated once, by [`validate_submit`]. The job id is a fresh
     /// ULID-shaped [`EventId`]. The insert uses `ON CONFLICT (idempotency_key) DO NOTHING`,
     /// so concurrent submits with one key create one row. The stored row is then compared
@@ -942,7 +957,9 @@ impl Store {
     ///
     /// # Errors
     ///
-    /// Returns [`StoreError::InvalidJob`] when the request fails validation,
+    /// Returns [`StoreError::InvalidJob`] when the request fails validation or its profile
+    /// set cannot be frozen, [`ProfileFault::Unowned`] for a profile with no user,
+    /// [`StoreError::UnknownProfile`] when the user cannot read the profile,
     /// [`StoreError::KeyConflict`] when the key exists with different parameters, and
     /// [`StoreError::Database`] when a query fails.
     pub async fn submit_job(&self, request: &SubmitJobRequest) -> Result<Job, StoreError> {
@@ -1003,6 +1020,9 @@ impl Store {
 
     async fn insert_job(&self, owner: Option<i64>, job: NewJob) -> Result<Job, StoreError> {
         let scoped = owner;
+        if job.profile.is_some() && scoped.is_none() {
+            return Err(ProfileFault::Unowned.into());
+        }
         let owner = match owner {
             Some(owner) => owner,
             None => {
@@ -1036,6 +1056,35 @@ impl Store {
                 .fetch_optional(&mut *tx)
                 .await?;
             tx.commit().await?;
+        } else if let (Some(name), Some(caller)) = (&job.profile, scoped) {
+            let runner = runner_kind(job.agent).ok_or(JobInvalid::Agent)?;
+            let mut tx = self.pool.begin().await?;
+            let stored: bool = sqlx::query_scalar(KEY_EXISTS)
+                .bind(&job.key)
+                .fetch_one(&mut *tx)
+                .await?;
+            if !stored {
+                let pinned = profiles::pin_for_submit(&mut tx, caller, name, runner).await?;
+                sqlx::query(INSERT_JOB_WITH_PROFILE)
+                    .bind(id)
+                    .bind(&job.key)
+                    .bind(&job.prompt)
+                    .bind(&job.repo)
+                    .bind(&job.base_ref)
+                    .bind(job.open_pr)
+                    .bind(owner)
+                    .bind(job.agent)
+                    .bind(name)
+                    .bind(pinned.profile_id)
+                    .bind(pinned.version)
+                    .bind(pinned.hash)
+                    .bind(pinned.snapshot.catalog_json())
+                    .bind(pinned.snapshot.notes_json())
+                    .bind(pinned.snapshot.hash().as_slice())
+                    .fetch_optional(&mut *tx)
+                    .await?;
+            }
+            tx.commit().await?;
         } else {
             sqlx::query(INSERT_JOB)
                 .bind(id)
@@ -1062,6 +1111,7 @@ impl Store {
             || stored.base_ref != job.base_ref
             || stored.open_pr != job.open_pr
             || stored.target_job_id != job.target_job_id
+            || stored.profile.as_ref().map(|p| p.name.as_str()) != job.profile.as_deref()
         {
             return Err(StoreError::KeyConflict);
         }

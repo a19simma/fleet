@@ -2,14 +2,16 @@
 
 use std::fmt::{self, Write};
 
+use fleet_core::catalog::{CatalogEntry, CatalogItem, MAX_CATALOG, RunnerKind, resolve};
 use fleet_core::{Profile, ProfileError, ProfileHash, ProfileInvalid};
 use fleet_proto::v1::{
     GetProfileBlobReply, ListProfilesReply, Profile as WireProfile, ProfileRef, ProfileSummary,
     ProfileVersion, ProfileVisibility,
 };
 use fleet_proto::{ERR_PROFILE_CONTENT_CHOICE, ERR_PROFILE_TOOLS_DISABLED, MAX_PROFILE_JSON_BYTES};
-use sqlx::{PgPool, Row};
+use sqlx::{PgConnection, PgPool, Row};
 
+use crate::jobs::{JobInvalid, Snapshot, kind_of};
 use crate::store::{DEFAULT_LIST_LIMIT, MAX_LIST_LIMIT, StoreError};
 
 /// Longest accepted profile name, in bytes.
@@ -45,6 +47,10 @@ impl From<Option<i64>> for Viewer {
         caller.map_or(Self::Shared, Self::User)
     }
 }
+
+/// The refusal text for a profile submit without a stored user, shared by the handler and
+/// [`ProfileFault::Unowned`].
+pub const ERR_PROFILE_SUBMIT_UNOWNED: &str = "profile submit needs a user token";
 
 const LOCK_OWN_PROFILE_FOR_UPDATE: &str =
     "SELECT id, visibility FROM profile WHERE owner_user_id = $1 AND name = $2 FOR UPDATE";
@@ -159,8 +165,17 @@ const SELECT_VISIBLE: &str = "SELECT v.version, v.hash, b.content FROM \
      JOIN profile_version v ON v.profile_id = p.id \
      JOIN profile_blob b ON b.hash = v.hash \
      WHERE $3::int IS NULL OR v.version = $3 ORDER BY v.version DESC LIMIT 1";
+const SELECT_PINNED_FOR_SUBMIT: &str = "SELECT p.id, v.version, v.hash, b.content FROM \
+     (SELECT id FROM profile WHERE name = $1 AND (owner_user_id = $2 OR visibility = 'shared') \
+      ORDER BY (owner_user_id = $2) DESC NULLS LAST, id LIMIT 1 FOR SHARE) p \
+     JOIN profile_version v ON v.profile_id = p.id \
+     JOIN profile_blob b ON b.hash = v.hash \
+     ORDER BY v.version DESC LIMIT 1";
+const LOCK_CATALOG: &str = "SELECT id, kind, name, content, admin_enabled FROM catalog_items \
+     ORDER BY id LIMIT $1 FOR SHARE";
 const SELECT_LEASED_BLOB: &str = "SELECT j.profile_name, j.profile_version, j.profile_hash, \
-     v.hash AS version_hash, b.content FROM jobs j \
+     j.snapshot_catalog::text AS snapshot_catalog, j.snapshot_notes::text AS snapshot_notes, \
+     j.snapshot_hash, v.hash AS version_hash, b.content FROM jobs j \
      LEFT JOIN profile_version v ON v.profile_id = j.profile_id AND v.version = j.profile_version \
      LEFT JOIN profile_blob b ON b.hash = j.profile_hash \
      WHERE j.job_id = $1 AND j.attempt = $2 AND j.box = $3 AND j.state = 'RUNNING' \
@@ -413,7 +428,7 @@ fn version_reply(name: String, stored: Stored) -> Result<ProfileVersion, StoreEr
 }
 
 async fn push_version(
-    tx: &mut sqlx::PgConnection,
+    tx: &mut PgConnection,
     profile_id: i64,
     body: Body,
 ) -> Result<Stored, StoreError> {
@@ -448,7 +463,7 @@ struct Locked {
 }
 
 async fn lock_for_owner(
-    tx: &mut sqlx::PgConnection,
+    tx: &mut PgConnection,
     caller: i64,
     profile_id: i64,
 ) -> Result<Locked, StoreError> {
@@ -615,6 +630,17 @@ pub(crate) async fn blob_for_lease(
     {
         return Err(corrupt());
     }
+    let catalog = match (
+        row.try_get::<Option<String>, _>("snapshot_catalog")?,
+        row.try_get::<Option<String>, _>("snapshot_notes")?,
+        row.try_get::<Option<Vec<u8>>, _>("snapshot_hash")?,
+    ) {
+        (None, None, None) => Vec::new(),
+        (Some(catalog), Some(notes), Some(hash)) => Snapshot::from_stored(&catalog, &notes, &hash)
+            .ok_or_else(corrupt)?
+            .wire_items(),
+        _ => return Err(corrupt()),
+    };
     Ok(GetProfileBlobReply {
         profile: Some(ProfileRef {
             name,
@@ -622,7 +648,81 @@ pub(crate) async fn blob_for_lease(
             hash: hex(&pinned),
         }),
         content,
-        catalog: Vec::new(),
+        catalog,
+    })
+}
+
+/// The profile version a job pins, with the effective catalog set frozen for it.
+pub(crate) struct Pinned {
+    pub(crate) profile_id: i64,
+    pub(crate) version: i32,
+    pub(crate) hash: Vec<u8>,
+    pub(crate) snapshot: Snapshot,
+}
+
+async fn lock_catalog(conn: &mut PgConnection) -> Result<Vec<CatalogEntry>, StoreError> {
+    let corrupt = || StoreError::OutOfRange("catalog item");
+    let limit = i64::try_from(MAX_CATALOG + 1).map_err(|_| corrupt())?;
+    let rows = sqlx::query(LOCK_CATALOG)
+        .bind(limit)
+        .fetch_all(conn)
+        .await?;
+    rows.iter()
+        .map(|row| {
+            let kind = kind_of(&row.try_get::<String, _>("kind")?).ok_or_else(corrupt)?;
+            let item = CatalogItem::new(
+                kind,
+                &row.try_get::<String, _>("id")?,
+                &row.try_get::<String, _>("name")?,
+                &row.try_get::<String, _>("content")?,
+            )
+            .map_err(|_| corrupt())?;
+            Ok(CatalogEntry::new(item, row.try_get("admin_enabled")?))
+        })
+        .collect()
+}
+
+/// Reads the latest version of the profile `name` as the user `caller` and freezes the
+/// catalog set it resolves to for `runner`, in the caller's transaction.
+///
+/// The name resolves like [`get_for`]: the caller's own profile first, then a shared one. The
+/// chosen profile row and every catalog row are locked `FOR SHARE` until the transaction ends,
+/// so a concurrent unshare, version rewrite or catalog edit waits for the job insert.
+///
+/// # Errors
+///
+/// [`StoreError::UnknownProfile`] when the caller cannot read a profile of that name, whether
+/// it is absent or someone else's private one. [`JobInvalid::Snapshot`] when the selection
+/// names an item the catalog lacks or the set passes the blob catalog caps. A stored profile
+/// or catalog row that fails its own validation is [`StoreError::OutOfRange`]. A database
+/// error.
+pub(crate) async fn pin_for_submit(
+    conn: &mut PgConnection,
+    caller: i64,
+    name: &str,
+    runner: RunnerKind,
+) -> Result<Pinned, StoreError> {
+    validate_name(name)?;
+    let row = sqlx::query(SELECT_PINNED_FOR_SUBMIT)
+        .bind(name)
+        .bind(caller)
+        .fetch_optional(&mut *conn)
+        .await?
+        .ok_or(StoreError::UnknownProfile)?;
+    let corrupt = || StoreError::OutOfRange("profile blob");
+    let hash: Vec<u8> = row.try_get("hash")?;
+    let content: Vec<u8> = row.try_get("content")?;
+    let profile = Profile::from_stored_json(&content).map_err(|_| corrupt())?;
+    if profile.hash().as_bytes().as_slice() != hash.as_slice() {
+        return Err(corrupt());
+    }
+    let entries = lock_catalog(conn).await?;
+    let set = resolve(runner, &profile.selection, &entries).map_err(|_| JobInvalid::Snapshot)?;
+    Ok(Pinned {
+        profile_id: row.try_get("id")?,
+        version: row.try_get("version")?,
+        hash,
+        snapshot: Snapshot::freeze(&set)?,
     })
 }
 

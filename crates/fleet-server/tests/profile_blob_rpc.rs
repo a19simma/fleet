@@ -449,3 +449,105 @@ async fn the_blob_follows_the_pin_of_either_owner(pool: PgPool) {
         assert_eq!(reply.content, expected);
     }
 }
+
+async fn submitted_job(pool: &PgPool, store: &Store) -> (String, fleet_proto::v1::CatalogItem) {
+    let user: i64 = sqlx::query_scalar("INSERT INTO users (username) VALUES ('ann') RETURNING id")
+        .fetch_one(pool)
+        .await
+        .unwrap();
+    fleet_server::profiles::create_owned(
+        pool,
+        Some(user),
+        "alpha",
+        ProfileContent::Json(r#"{"claude_md":"one","selection":[{"item_id":"s2"}]}"#),
+        false,
+    )
+    .await
+    .unwrap();
+    for (id, body) in [("s1", "skill one"), ("s2", "skill two")] {
+        sqlx::query(
+            "INSERT INTO catalog_items (id, kind, name, content, digest, admin_enabled) \
+             VALUES ($1, 'skill', $1, $2, decode(repeat('00', 32), 'hex'), true)",
+        )
+        .bind(id)
+        .bind(body)
+        .execute(pool)
+        .await
+        .unwrap();
+    }
+    let job = store
+        .submit_job_for(
+            Some(user),
+            &fleet_proto::v1::SubmitJobRequest {
+                idempotency_key: "key-1".to_owned(),
+                prompt: "fix the bug".to_owned(),
+                repo: REPO.to_owned(),
+                base_ref: "main".to_owned(),
+                open_pr: false,
+                agent: String::new(),
+                profile: "alpha".to_owned(),
+            },
+        )
+        .await
+        .unwrap();
+    let item = fleet_core::catalog::CatalogItem::new(
+        fleet_core::catalog::CatalogKind::Skill,
+        "s1",
+        "s1",
+        "skill one",
+    )
+    .unwrap();
+    let expected = fleet_proto::v1::CatalogItem {
+        id: "s1".to_owned(),
+        kind: fleet_proto::v1::CatalogKind::Skill as i32,
+        name: "s1".to_owned(),
+        content: "skill one".to_owned(),
+        digest: item.digest().to_vec(),
+        admin_enabled: true,
+    };
+    (job.job_id, expected)
+}
+
+#[sqlx::test]
+async fn the_blob_carries_the_frozen_catalog_with_bodies(pool: PgPool) {
+    let store = store(pool.clone()).await;
+    let (id, expected) = submitted_job(&pool, &store).await;
+    let mut worker = worker(serve(&store), as_box);
+    let job = claim(&mut worker, &name(1)).await;
+    let reply = worker
+        .get_profile_blob(blob(&id, job.attempt, &name(1)))
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(reply.catalog, vec![expected.clone()]);
+    sqlx::query("UPDATE catalog_items SET content = 'edited'")
+        .execute(&pool)
+        .await
+        .unwrap();
+    let again = worker
+        .get_profile_blob(blob(&id, job.attempt, &name(1)))
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(again.catalog, vec![expected]);
+}
+
+#[sqlx::test]
+async fn a_tampered_snapshot_is_refused_and_never_served(pool: PgPool) {
+    let store = store(pool.clone()).await;
+    let (id, _) = submitted_job(&pool, &store).await;
+    let mut worker = worker(serve(&store), as_box);
+    let job = claim(&mut worker, &name(1)).await;
+    for tamper in [
+        "UPDATE jobs SET snapshot_catalog = replace(snapshot_catalog::text, 'skill one', 'evil')::jsonb",
+        "UPDATE jobs SET snapshot_hash = decode(repeat('11', 32), 'hex')",
+    ] {
+        sqlx::query(tamper).execute(&pool).await.unwrap();
+        let err = worker
+            .get_profile_blob(blob(&id, job.attempt, &name(1)))
+            .await
+            .unwrap_err();
+        assert_eq!(err.code(), Code::Unavailable, "{tamper}");
+        assert!(!err.message().contains("evil"));
+    }
+}
