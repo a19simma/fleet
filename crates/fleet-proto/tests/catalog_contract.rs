@@ -1,8 +1,11 @@
 //! The catalog contract: kind values, the shared content limit and the migration that backs it.
 
 use fleet_core::catalog::{CatalogItem as CoreItem, CatalogKind as CoreKind};
-use fleet_proto::v1::{CatalogItem, CatalogKind};
-use fleet_proto::{MAX_CATALOG_CONTENT_BYTES, validate_catalog_content};
+use fleet_proto::v1::{CatalogItem, CatalogKind, ListCatalogReply, ListCatalogRequest};
+use fleet_proto::{
+    DEFAULT_CATALOG_PAGE, MAX_CATALOG_CONTENT_BYTES, MAX_CATALOG_CURSOR_BYTES, MAX_CATALOG_PAGE,
+    validate_catalog_content, validate_catalog_cursor,
+};
 use prost::Message;
 
 const MIGRATION: &str = include_str!("../../fleet-server/migrations/0024_catalog_items.sql");
@@ -124,4 +127,82 @@ fn the_proto_splits_read_and_admin_services() {
 fn the_migration_pins_uniqueness_and_default_off() {
     assert!(MIGRATION.contains("UNIQUE (kind, name)"));
     assert!(MIGRATION.contains("admin_enabled boolean NOT NULL DEFAULT false"));
+}
+
+const SERVER_CATALOG: &str = include_str!("../../fleet-server/src/catalog.rs");
+
+fn server_const(name: &str) -> u32 {
+    SERVER_CATALOG
+        .split(&format!("pub const {name}: u32 = "))
+        .nth(1)
+        .and_then(|rest| rest.split(';').next())
+        .and_then(|text| text.trim().parse().ok())
+        .unwrap_or(0)
+}
+
+#[test]
+fn list_request_and_reply_field_numbers_are_pinned() {
+    let request = ListCatalogRequest {
+        kind: CatalogKind::Context as i32,
+        page_size: 7,
+        after_id: "abc".to_owned(),
+    };
+    assert_eq!(
+        request.encode_to_vec(),
+        [0x08, 4, 0x10, 7, 0x1a, 3, b'a', b'b', b'c']
+    );
+    let reply = ListCatalogReply {
+        items: Vec::new(),
+        next_id: "z".to_owned(),
+    };
+    assert_eq!(reply.encode_to_vec(), [0x12, 1, b'z']);
+}
+
+#[test]
+fn page_caps_have_their_values_and_match_the_server() {
+    assert_eq!(DEFAULT_CATALOG_PAGE, 50);
+    assert_eq!(MAX_CATALOG_PAGE, 200);
+    assert_eq!(server_const("DEFAULT_CATALOG_PAGE"), DEFAULT_CATALOG_PAGE);
+    assert_eq!(server_const("MAX_CATALOG_PAGE"), MAX_CATALOG_PAGE);
+}
+
+#[test]
+fn cursor_cap_is_the_item_id_cap() {
+    assert_eq!(MAX_CATALOG_CURSOR_BYTES, 64);
+    assert!(validate_catalog_cursor(
+        &"a".repeat(MAX_CATALOG_CURSOR_BYTES)
+    ));
+    assert!(!validate_catalog_cursor(
+        &"a".repeat(MAX_CATALOG_CURSOR_BYTES + 1)
+    ));
+}
+
+#[test]
+fn cursor_hostile_input_table() {
+    let accepted = ["", "a", "skill-1", "a_b-c9", "0"];
+    for input in accepted {
+        assert!(validate_catalog_cursor(input), "{input:?}");
+    }
+    let refused = [
+        "a\0b",
+        "\0",
+        "a\rb",
+        "a\r\nb",
+        "a\nb",
+        "a\u{85}b",
+        "a\u{2028}b",
+        "a\u{2029}b",
+        " ",
+        "a b",
+        "A",
+        "a/b",
+        "a\\b",
+        "a%00",
+        "caf\u{e9}",
+        "\u{1F600}",
+        "a\u{200B}",
+    ];
+    for input in refused {
+        assert!(!validate_catalog_cursor(input), "{input:?}");
+    }
 }
