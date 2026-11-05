@@ -47,7 +47,8 @@ use tower::layer::util::{Identity, Stack};
 
 use crate::auth::{ADMIN_REQUIRED, BearerAuth, Caller};
 use crate::catalog;
-use crate::cred::{CredentialService, capability};
+use crate::cred::CredentialService;
+use crate::cred::capability::{self, Capabilities};
 use crate::jobs::validate_job_id;
 use crate::profiles::{self, ProfileContent, ProfileFault, Viewer};
 use crate::store::{Store, StoreError};
@@ -199,6 +200,7 @@ fn no_nul(field: &str, value: &str) -> Result<(), Status> {
 pub struct FleetService {
     store: Store,
     credentials: Option<CredentialService>,
+    capabilities: Capabilities,
     update: UpdateRelay,
     timing_reply_cap: usize,
 }
@@ -207,6 +209,7 @@ impl FleetService {
     /// Builds the handler over `store`. The credential RPCs answer `FAILED_PRECONDITION`.
     pub fn new(store: Store) -> Self {
         Self {
+            capabilities: Capabilities::new(store.pool().clone()),
             store,
             credentials: None,
             update: UpdateRelay::default(),
@@ -576,6 +579,9 @@ fn profiles_error(err: &StoreError) -> Status {
         StoreError::InvalidProfile(ProfileFault::Unowned) => {
             Status::permission_denied(profiles::ERR_PROFILE_UNOWNED)
         }
+        StoreError::InvalidProfile(fault @ ProfileFault::NotOwner) => {
+            Status::permission_denied(fault.to_string())
+        }
         StoreError::InvalidProfile(fault) => Status::invalid_argument(fault.to_string()),
         StoreError::NotFound => Status::not_found("profile not found"),
         other => storage_unavailable(other),
@@ -676,14 +682,22 @@ impl FleetProfiles for FleetService {
         &self,
         request: Request<ShareProfileRequest>,
     ) -> Result<Response<Profile>, Status> {
-        profiles::share_profile(request.get_ref()).map(Response::new)
+        let caller = caller_of(&request);
+        profiles::share_owned(self.store.pool(), caller, &request.get_ref().name)
+            .await
+            .map(Response::new)
+            .map_err(|err| profiles_error(&err))
     }
 
     async fn unshare_profile(
         &self,
         request: Request<UnshareProfileRequest>,
     ) -> Result<Response<Profile>, Status> {
-        profiles::unshare_profile(request.get_ref()).map(Response::new)
+        let caller = caller_of(&request);
+        profiles::unshare_owned(self.store.pool(), caller, &request.get_ref().name)
+            .await
+            .map(Response::new)
+            .map_err(|err| profiles_error(&err))
     }
 }
 
@@ -728,24 +742,30 @@ impl FleetCapabilityAdmin for FleetService {
         &self,
         request: Request<GrantCapabilityRequest>,
     ) -> Result<Response<UserCapability>, Status> {
-        admin_of(&request)?;
-        capability::grant(request.get_ref()).map(Response::new)
+        let actor = admin_of(&request)?;
+        capability::grant(&self.capabilities, actor, request.get_ref())
+            .await
+            .map(Response::new)
     }
 
     async fn revoke_capability(
         &self,
         request: Request<RevokeCapabilityRequest>,
     ) -> Result<Response<RevokeCapabilityReply>, Status> {
-        admin_of(&request)?;
-        capability::revoke(request.get_ref()).map(Response::new)
+        let actor = admin_of(&request)?;
+        capability::revoke(&self.capabilities, actor, request.get_ref())
+            .await
+            .map(Response::new)
     }
 
     async fn list_capabilities(
         &self,
         request: Request<ListCapabilitiesRequest>,
     ) -> Result<Response<ListCapabilitiesReply>, Status> {
-        admin_of(&request)?;
-        capability::list(request.get_ref()).map(Response::new)
+        let actor = admin_of(&request)?;
+        capability::list(&self.capabilities, actor, request.get_ref())
+            .await
+            .map(Response::new)
     }
 }
 

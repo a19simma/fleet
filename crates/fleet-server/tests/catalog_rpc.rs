@@ -1,6 +1,6 @@
 //! The profile sharing, catalog and capability RPCs over a real tonic server on a loopback
-//! port, and the capability handlers called directly. The sharing and capability handlers are
-//! stubs that answer `UNIMPLEMENTED` for the caller that reaches them. The client token lists the
+//! port. The sharing handlers are stubs that answer `UNIMPLEMENTED` for the caller that reaches
+//! them. The client token lists the
 //! catalog and shares profiles, the box token reaches neither, and no static token reaches an
 //! admin service. The tests need
 //! a Postgres superuser URL in `DATABASE_URL` and live in their own binary because each one binds
@@ -11,7 +11,6 @@
 use std::net::SocketAddr;
 
 use fleet_proto::v1::fleet_capability_admin_client::FleetCapabilityAdminClient;
-use fleet_proto::v1::fleet_capability_admin_server::FleetCapabilityAdmin;
 use fleet_proto::v1::fleet_catalog_admin_client::FleetCatalogAdminClient;
 use fleet_proto::v1::fleet_catalog_client::FleetCatalogClient;
 use fleet_proto::v1::fleet_profiles_client::FleetProfilesClient;
@@ -22,7 +21,7 @@ use fleet_proto::v1::{
 };
 use fleet_server::auth::BearerAuth;
 use fleet_server::config::Token;
-use fleet_server::service::{FleetService, router};
+use fleet_server::service::router;
 use fleet_server::store::Store;
 use sqlx::PgPool;
 use tonic::metadata::MetadataValue;
@@ -132,7 +131,7 @@ async fn the_box_token_cannot_list_the_catalog(pool: PgPool) {
 }
 
 #[sqlx::test]
-async fn share_and_unshare_are_unimplemented_for_the_client_token(pool: PgPool) {
+async fn share_and_unshare_need_a_user_token_for_the_static_client_token(pool: PgPool) {
     let (addr, _) = start(pool).await;
     let mut client = profiles(addr, as_client);
     let share = client
@@ -144,8 +143,8 @@ async fn share_and_unshare_are_unimplemented_for_the_client_token(pool: PgPool) 
         .await
         .unwrap_err();
     for err in [share, unshare] {
-        assert_eq!(err.code(), Code::Unimplemented);
-        assert_eq!(err.message(), "profile sharing is not implemented");
+        assert_eq!(err.code(), Code::PermissionDenied);
+        assert_eq!(err.message(), fleet_server::profiles::ERR_PROFILE_UNOWNED);
     }
 }
 
@@ -204,29 +203,5 @@ async fn no_token_reaches_an_admin_service(pool: PgPool) {
                 .await
                 .unwrap_err(),
         );
-    }
-}
-
-#[sqlx::test]
-async fn the_capability_handlers_are_stubs_for_an_admin_caller(pool: PgPool) {
-    let store = Store::new(pool);
-    store.migrate().await.unwrap();
-    let svc = FleetService::new(store);
-    let admin = fleet_server::auth::Caller {
-        user_id: 1,
-        is_admin: true,
-    };
-    let mut grant = Request::new(GrantCapabilityRequest::default());
-    grant.extensions_mut().insert(admin);
-    let mut revoke = Request::new(RevokeCapabilityRequest::default());
-    revoke.extensions_mut().insert(admin);
-    let mut list = Request::new(ListCapabilitiesRequest::default());
-    list.extensions_mut().insert(admin);
-    let grant = svc.grant_capability(grant).await.unwrap_err();
-    let revoke = svc.revoke_capability(revoke).await.unwrap_err();
-    let list = svc.list_capabilities(list).await.unwrap_err();
-    for err in [grant, revoke, list] {
-        assert_eq!(err.code(), Code::Unimplemented);
-        assert_eq!(err.message(), "capabilities are not implemented");
     }
 }

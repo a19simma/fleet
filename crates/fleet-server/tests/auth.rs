@@ -304,6 +304,13 @@ mod tests {
                         "credentials need a user token",
                         "{name} on {service}"
                     );
+                } else if ok && service == "share_profile" {
+                    assert_eq!(code, Code::PermissionDenied, "{name} on {service}");
+                    assert_eq!(
+                        status.message(),
+                        fleet_server::profiles::ERR_PROFILE_UNOWNED,
+                        "{name} on {service}"
+                    );
                 } else if ok && service == "get_job_timing" {
                     assert_eq!(code, Code::PermissionDenied, "{name} on {service}");
                     assert_eq!(
