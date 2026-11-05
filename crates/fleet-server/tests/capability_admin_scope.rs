@@ -26,6 +26,7 @@ fn box_and_client_tokens_are_denied_on_every_capability_rpc() {
             let header = format!("Bearer {token}");
             let status = auth().check(&path, Some(header.as_bytes())).unwrap_err();
             assert_eq!(status.code(), Code::PermissionDenied, "{path}");
+            assert_eq!(status.message(), "admin required", "{path}");
         }
     }
 }

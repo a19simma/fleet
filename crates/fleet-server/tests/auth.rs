@@ -23,7 +23,7 @@ mod tests {
         ListProfilesRequest, PushEventsRequest, QueuedEvent, ReadJobEventsRequest,
         ReportTimingRequest,
     };
-    use fleet_server::auth::BearerAuth;
+    use fleet_server::auth::{ADMIN_REQUIRED, BearerAuth};
     use fleet_server::config::Token;
     use fleet_server::service::router;
     use fleet_server::store::Store;
@@ -315,11 +315,12 @@ mod tests {
                     assert!(scoped(code), "{name} on {service}: {code:?}");
                 } else {
                     assert_eq!(code, Code::PermissionDenied, "{name} on {service}");
-                    assert_eq!(
-                        status.message(),
-                        "bearer token not valid for this service",
-                        "{name} on {service}"
-                    );
+                    let reason = if service.ends_with("_admin") {
+                        ADMIN_REQUIRED
+                    } else {
+                        "bearer token not valid for this service"
+                    };
+                    assert_eq!(status.message(), reason, "{name} on {service}");
                 }
             }
             for token in [None, Some("wrong-token-0123456789abcdef01234567")] {

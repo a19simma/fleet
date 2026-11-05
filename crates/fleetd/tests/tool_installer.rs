@@ -145,6 +145,18 @@ impl Fx {
             .count()
     }
 
+    async fn wait_for(&self, verb: &str, want: usize) {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while self.count(verb) < want {
+            assert!(
+                Instant::now() < deadline,
+                "no {verb} logged: {:?}",
+                self.log()
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }
+
     fn installer(&self) -> SystemdToolInstaller {
         SystemdToolInstaller::new(&self.ctl, covering(&[ToolName::Jq, ToolName::Node]))
             .with_run_dir(&self.run)
@@ -381,7 +393,10 @@ async fn a_dropped_install_kills_the_unit_and_removes_the_run_dir() {
     let installer = fx.installer();
     let tools = [jq()];
     let pending = installer.install(ID, &tools);
-    let _ = tokio::time::timeout(Duration::from_millis(300), pending).await;
+    tokio::select! {
+        _ = pending => panic!("install finished before it was dropped"),
+        () = fx.wait_for("start", 1) => {}
+    }
     assert_eq!(fx.count("start"), 1);
     assert_eq!(fx.count("kill"), 1, "{:?}", fx.log());
     assert_eq!(fx.count("reset-failed"), 1);

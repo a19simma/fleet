@@ -842,9 +842,12 @@ async fn an_active_running_unit_keeps_waiting() -> TestResult {
     let case = Case::new("t_remain_running")?;
     case.last(&show_sub("active", "running", "success", 1, 0))?;
     let mut launched = case.launch()?;
-    let waiting = tokio::time::timeout(Duration::from_millis(500), launched.proc.wait()).await;
-    assert!(waiting.is_err());
-    assert!(show_count(&case) >= 3);
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while show_count(&case) < 3 {
+        assert!(Instant::now() < deadline, "fewer than 3 shows");
+        let waiting = tokio::time::timeout(Duration::from_millis(50), launched.proc.wait()).await;
+        assert!(waiting.is_err());
+    }
     assert!(!case.log().iter().any(|l| l.starts_with("stop ")));
     assert!(case.dir().exists());
     Ok(())
