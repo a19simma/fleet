@@ -5,9 +5,7 @@ use std::time::Duration;
 
 use fleet_proto::v1::{GetJobRequest, Job, JobState};
 
-use super::{
-    CliError, Client, free_or_dash, or_dash, require_success, sanitize, sanitize_free, state_name,
-};
+use super::{CliError, Client, Scrub, free_or_dash, ident_or_dash, require_success, state_name};
 
 /// Delay between polls of `GetJob`.
 const POLL_INTERVAL: Duration = Duration::from_secs(2);
@@ -23,13 +21,13 @@ fn snapshot(job: &Job) -> (i32, String, String) {
     (job.state, job.phase.clone(), job.progress.clone())
 }
 
-fn write_change(out: &mut impl Write, job: &Job) -> std::io::Result<()> {
+fn write_change(out: &mut impl Write, scrub: &Scrub, job: &Job) -> std::io::Result<()> {
     writeln!(
         out,
         "{}\t{}\t{}",
         state_name(job),
-        sanitize(&job.phase),
-        sanitize_free(&job.progress)
+        scrub.ident(&job.phase),
+        scrub.free(&job.progress)
     )
 }
 
@@ -43,6 +41,7 @@ fn write_change(out: &mut impl Write, job: &Job) -> std::io::Result<()> {
 /// failure, a server error status or an output failure.
 pub(crate) async fn watch(
     client: &mut Client,
+    scrub: &Scrub,
     id: &str,
     out: &mut impl Write,
 ) -> Result<(), CliError> {
@@ -56,12 +55,12 @@ pub(crate) async fn watch(
             .into_inner();
         let current = snapshot(&job);
         if last.as_ref() != Some(&current) {
-            write_change(out, &job)?;
+            write_change(out, scrub, &job)?;
             last = Some(current);
         }
         if is_terminal(&job) {
-            writeln!(out, "pr_url: {}", or_dash(job.pr_url.as_ref()))?;
-            writeln!(out, "error: {}", free_or_dash(job.error.as_ref()))?;
+            writeln!(out, "pr_url: {}", ident_or_dash(scrub, job.pr_url.as_ref()))?;
+            writeln!(out, "error: {}", free_or_dash(scrub, job.error.as_ref()))?;
             return require_success(&job);
         }
         tokio::time::sleep(POLL_INTERVAL).await;
@@ -80,13 +79,58 @@ mod tests {
             ..Job::default()
         };
         let mut out = Vec::new();
-        write_change(&mut out, &job)?;
+        write_change(&mut out, &Scrub::default(), &job)?;
         let text = String::from_utf8_lossy(&out).into_owned();
         assert!(
             text.ends_with(&format!("{}\u{2026}\n", "x".repeat(200))),
             "{text}"
         );
         assert!(!text.contains('\u{202E}'), "{text:?}");
+        Ok(())
+    }
+
+    #[test]
+    fn progress_is_scrubbed_of_the_token() -> Result<(), std::io::Error> {
+        let job = Job {
+            phase: "run".into(),
+            progress: "pushing client-token-0123456789 now".into(),
+            ..Job::default()
+        };
+        let mut out = Vec::new();
+        write_change(&mut out, &Scrub::new(Some("client-token-0123456789")), &job)?;
+        let text = String::from_utf8_lossy(&out).into_owned();
+        assert!(!text.contains("client-token"), "{text:?}");
+        assert!(text.contains("[REDACTED]"), "{text:?}");
+        Ok(())
+    }
+
+    #[test]
+    fn terminal_error_line_is_scrubbed_of_the_token() {
+        let scrub = Scrub::new(Some("client-token-0123456789"));
+        let error = Some("died client-token-0123456789".to_owned());
+        assert_eq!(free_or_dash(&scrub, error.as_ref()), "died [REDACTED]");
+    }
+
+    #[test]
+    fn terminal_pr_url_is_scrubbed_of_the_token() {
+        let scrub = Scrub::new(Some("client-token-0123456789"));
+        let url = Some("https://client-token-0123456789@host.example/pr".to_owned());
+        assert_eq!(
+            ident_or_dash(&scrub, url.as_ref()),
+            "https://[REDACTED]@host.example/pr"
+        );
+    }
+
+    #[test]
+    fn phase_is_scrubbed_of_the_token() -> Result<(), std::io::Error> {
+        let job = Job {
+            phase: "run client-token-0123456789".into(),
+            ..Job::default()
+        };
+        let mut out = Vec::new();
+        write_change(&mut out, &Scrub::new(Some("client-token-0123456789")), &job)?;
+        let text = String::from_utf8_lossy(&out).into_owned();
+        assert!(text.contains("run [REDACTED]"), "{text:?}");
         Ok(())
     }
 }

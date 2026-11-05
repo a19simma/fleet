@@ -10,7 +10,7 @@ use fleet_proto::v1::{
 use tonic::service::interceptor::InterceptedService;
 use tonic::transport::Channel;
 
-use super::{Bearer, CliError, sanitize};
+use super::{Bearer, CliError, Scrub};
 
 /// A `FleetProfiles` client carrying the bearer token.
 pub(crate) type ProfilesClient = FleetProfilesClient<InterceptedService<Channel, Bearer>>;
@@ -74,15 +74,20 @@ pub(crate) fn read_source(path: &str, stdin: &mut impl Read) -> Result<String, C
     }
 }
 
-fn write_version(out: &mut impl Write, reply: &ProfileVersion) -> std::io::Result<()> {
-    writeln!(out, "name: {}", sanitize(&reply.name))?;
+fn write_version(
+    out: &mut impl Write,
+    scrub: &Scrub,
+    reply: &ProfileVersion,
+) -> std::io::Result<()> {
+    writeln!(out, "name: {}", scrub.ident(&reply.name))?;
     writeln!(out, "version: {}", reply.version)?;
-    writeln!(out, "hash: {}", sanitize(&reply.hash))
+    writeln!(out, "hash: {}", scrub.ident(&reply.hash))
 }
 
 /// `fleet profile create`: sends the raw JSON and prints the stored version.
 pub(crate) async fn create(
     client: &mut ProfilesClient,
+    scrub: &Scrub,
     name: String,
     content_json: String,
     out: &mut impl Write,
@@ -95,7 +100,7 @@ pub(crate) async fn create(
         })
         .await?
         .into_inner();
-    write_version(out, &reply)?;
+    write_version(out, scrub, &reply)?;
     writeln!(out, "created: {}", if reply.created { "yes" } else { "no" })?;
     Ok(())
 }
@@ -107,6 +112,7 @@ pub(crate) async fn create(
 )]
 pub(crate) async fn list(
     client: &mut ProfilesClient,
+    scrub: &Scrub,
     out: &mut impl Write,
 ) -> Result<(), CliError> {
     list_pages(
@@ -123,6 +129,7 @@ pub(crate) async fn list(
                     .profiles)
             }
         },
+        scrub,
         out,
     )
     .await
@@ -130,7 +137,11 @@ pub(crate) async fn list(
 
 /// Follows pages from `fetch` until an empty one, a page that does not advance, or
 /// `MAX_LIST_PAGES`.
-async fn list_pages<F, Fut>(mut fetch: F, out: &mut impl Write) -> Result<(), CliError>
+async fn list_pages<F, Fut>(
+    mut fetch: F,
+    scrub: &Scrub,
+    out: &mut impl Write,
+) -> Result<(), CliError>
 where
     F: FnMut(Option<String>) -> Fut,
     Fut: Future<Output = Result<Vec<ProfileSummary>, CliError>>,
@@ -150,9 +161,9 @@ where
             writeln!(
                 out,
                 "{}\t{}\t{}",
-                sanitize(&profile.name),
+                scrub.ident(&profile.name),
                 profile.latest_version,
-                sanitize(&profile.hash)
+                scrub.ident(&profile.hash)
             )?;
         }
         after_name = Some(last.name.clone());
@@ -165,6 +176,7 @@ where
 /// No job references a profile yet, so `used-by` prints `-`: the count is unknown, never zero.
 pub(crate) async fn show(
     client: &mut ProfilesClient,
+    scrub: &Scrub,
     name: String,
     version: Option<u32>,
     out: &mut impl Write,
@@ -173,10 +185,18 @@ pub(crate) async fn show(
         .get_profile(GetProfileRequest { name, version })
         .await?
         .into_inner();
-    write_version(out, &reply)?;
+    write_version(out, scrub, &reply)?;
     writeln!(out, "used-by: -")?;
-    writeln!(out, "content: {}", sanitize(&reply.content_json))?;
+    write_content(out, scrub, &reply)?;
     Ok(())
+}
+
+fn write_content(
+    out: &mut impl Write,
+    scrub: &Scrub,
+    reply: &ProfileVersion,
+) -> std::io::Result<()> {
+    writeln!(out, "content: {}", scrub.ident(&reply.content_json))
 }
 
 #[cfg(test)]
@@ -255,6 +275,7 @@ mod tests {
                     hash: String::new(),
                 }]))
             },
+            &Scrub::default(),
             &mut out,
         )
         .await
@@ -262,5 +283,74 @@ mod tests {
         assert_eq!(calls, MAX_LIST_PAGES);
         assert!(!matches!(err, CliError::Io(_)));
         assert_eq!(err.to_string(), TOO_MANY_PAGES);
+    }
+
+    const TOKEN: &str = "client-token-0123456789";
+
+    fn laden() -> String {
+        format!("v-{TOKEN}")
+    }
+
+    fn version_text(set: impl FnOnce(&mut ProfileVersion)) -> String {
+        let mut reply = ProfileVersion {
+            name: "n".into(),
+            hash: "h".into(),
+            ..ProfileVersion::default()
+        };
+        set(&mut reply);
+        let mut out = Vec::new();
+        write_version(&mut out, &Scrub::new(Some(TOKEN)), &reply).expect("write to a Vec");
+        String::from_utf8(out).expect("utf8")
+    }
+
+    #[test]
+    fn profile_version_name_is_scrubbed_of_the_token() {
+        let text = version_text(|r| r.name = laden());
+        assert!(text.contains("name: v-[REDACTED]\n"), "{text}");
+    }
+
+    #[test]
+    fn profile_version_hash_is_scrubbed_of_the_token() {
+        let text = version_text(|r| r.hash = laden());
+        assert!(text.contains("hash: v-[REDACTED]\n"), "{text}");
+    }
+
+    #[tokio::test]
+    async fn profile_list_name_and_hash_are_scrubbed_of_the_token() {
+        let mut done = false;
+        let mut out = Vec::new();
+        list_pages(
+            |_| {
+                let page = if done {
+                    vec![]
+                } else {
+                    vec![ProfileSummary {
+                        name: laden(),
+                        latest_version: 1,
+                        hash: laden(),
+                    }]
+                };
+                done = true;
+                std::future::ready(Ok(page))
+            },
+            &Scrub::new(Some(TOKEN)),
+            &mut out,
+        )
+        .await
+        .expect("list");
+        let text = String::from_utf8(out).expect("utf8");
+        assert_eq!(text, "v-[REDACTED]\t1\tv-[REDACTED]\n");
+    }
+
+    #[test]
+    fn profile_show_content_is_scrubbed_of_the_token() {
+        let reply = ProfileVersion {
+            content_json: format!("{{\"k\":\"{TOKEN}\"}}"),
+            ..ProfileVersion::default()
+        };
+        let mut out = Vec::new();
+        write_content(&mut out, &Scrub::new(Some(TOKEN)), &reply).expect("write to a Vec");
+        let text = String::from_utf8(out).expect("utf8");
+        assert_eq!(text, "content: {\"k\":\"[REDACTED]\"}\n");
     }
 }

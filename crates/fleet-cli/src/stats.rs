@@ -7,7 +7,7 @@ use fleet_proto::v1::{
     GetStatsReply, GetStatsRequest, Quantiles, StatsGroup, StatsGroupBy, StuckOutcomes, Total,
 };
 
-use super::{CliError, Client, StatsBy, sanitize};
+use super::{CliError, Client, Scrub, StatsBy};
 
 const SINCE_USAGE: &str =
     "invalid --since: use a duration such as 45s, 90m, 24h or 7d, or a unix time in seconds";
@@ -140,8 +140,8 @@ fn stuck(group: &StatsGroup) -> String {
     format!("{}/{}", group.stuck_jobs, group.with_summary)
 }
 
-fn group_label(group: &StatsGroup) -> String {
-    let key = sanitize(&group.key);
+fn group_label(scrub: &Scrub, group: &StatsGroup) -> String {
+    let key = scrub.ident(&group.key);
     if group.unknown {
         "unknown".into()
     } else if key.is_empty() {
@@ -153,6 +153,7 @@ fn group_label(group: &StatsGroup) -> String {
 
 fn write_stuck_row(
     out: &mut impl Write,
+    scrub: &Scrub,
     key: &str,
     rule: &str,
     outcomes: &StuckOutcomes,
@@ -165,7 +166,7 @@ fn write_stuck_row(
     writeln!(
         out,
         "{key}\t{}\t{}\t{}\t{}\t{}\t{ok}",
-        sanitize(rule),
+        scrub.free(rule),
         outcomes.jobs,
         outcomes.succeeded,
         outcomes.failed,
@@ -173,7 +174,11 @@ fn write_stuck_row(
     )
 }
 
-fn write_stuck_rules(out: &mut impl Write, groups: &[StatsGroup]) -> std::io::Result<()> {
+fn write_stuck_rules(
+    out: &mut impl Write,
+    scrub: &Scrub,
+    groups: &[StatsGroup],
+) -> std::io::Result<()> {
     if groups
         .iter()
         .all(|g| g.stuck_rules.is_empty() && g.clean.is_none())
@@ -182,14 +187,14 @@ fn write_stuck_rules(out: &mut impl Write, groups: &[StatsGroup]) -> std::io::Re
     }
     writeln!(out, "{STUCK_HEADER}")?;
     for group in groups {
-        let key = group_label(group);
+        let key = group_label(scrub, group);
         for rule in &group.stuck_rules {
             if let Some(outcomes) = &rule.outcomes {
-                write_stuck_row(out, &key, &rule.rule, outcomes)?;
+                write_stuck_row(out, scrub, &key, &rule.rule, outcomes)?;
             }
         }
         if let Some(clean) = &group.clean {
-            write_stuck_row(out, &key, CLEAN_LABEL, clean)?;
+            write_stuck_row(out, scrub, &key, CLEAN_LABEL, clean)?;
         }
     }
     Ok(())
@@ -204,7 +209,7 @@ fn phase_figures(group: &StatsGroup) -> [Option<&Quantiles>; 4] {
     ]
 }
 
-fn write_phases(out: &mut impl Write, groups: &[StatsGroup]) -> std::io::Result<()> {
+fn write_phases(out: &mut impl Write, scrub: &Scrub, groups: &[StatsGroup]) -> std::io::Result<()> {
     if groups
         .iter()
         .all(|g| phase_figures(g).iter().all(Option::is_none))
@@ -225,7 +230,7 @@ fn write_phases(out: &mut impl Write, groups: &[StatsGroup]) -> std::io::Result<
         writeln!(
             out,
             "{}\t{}\tclone={clone_n} push={push_n} pr={pr_n} queue={queue_n}",
-            group_label(group),
+            group_label(scrub, group),
             cells.join("\t"),
         )?;
     }
@@ -234,13 +239,17 @@ fn write_phases(out: &mut impl Write, groups: &[StatsGroup]) -> std::io::Result<
 
 /// Writes the verdict table: per group the judge score mean, p50 and p95, its own `n` and
 /// the `model_graded` label. Absent when no group has a verdict figure.
-fn write_verdicts(out: &mut impl Write, groups: &[StatsGroup]) -> std::io::Result<()> {
+fn write_verdicts(
+    out: &mut impl Write,
+    scrub: &Scrub,
+    groups: &[StatsGroup],
+) -> std::io::Result<()> {
     if groups.iter().all(|g| g.verdict.is_none()) {
         return Ok(());
     }
     writeln!(out, "{VERDICT_HEADER}")?;
     for group in groups {
-        let label = group_label(group);
+        let label = group_label(scrub, group);
         match group.verdict.as_ref() {
             Some(v) => writeln!(
                 out,
@@ -257,8 +266,8 @@ fn write_verdicts(out: &mut impl Write, groups: &[StatsGroup]) -> std::io::Resul
     Ok(())
 }
 
-fn write_row(out: &mut impl Write, group: &StatsGroup) -> std::io::Result<()> {
-    let key = group_label(group);
+fn write_row(out: &mut impl Write, scrub: &Scrub, group: &StatsGroup) -> std::io::Result<()> {
+    let key = group_label(scrub, group);
     let (p50, p95) = median_and_tail(group.duration_ms.as_ref());
     let cost = group
         .cost_est_usd
@@ -289,7 +298,11 @@ fn write_row(out: &mut impl Write, group: &StatsGroup) -> std::io::Result<()> {
 ///
 /// # Errors
 /// Returns the output error.
-pub(crate) fn write_stats(out: &mut impl Write, reply: &GetStatsReply) -> std::io::Result<()> {
+pub(crate) fn write_stats(
+    out: &mut impl Write,
+    scrub: &Scrub,
+    reply: &GetStatsReply,
+) -> std::io::Result<()> {
     writeln!(
         out,
         "window: {} to {} (unix seconds)",
@@ -303,11 +316,11 @@ pub(crate) fn write_stats(out: &mut impl Write, reply: &GetStatsReply) -> std::i
     } else {
         writeln!(out, "{HEADER}")?;
         for group in &reply.groups {
-            write_row(out, group)?;
+            write_row(out, scrub, group)?;
         }
-        write_phases(out, &reply.groups)?;
-        write_verdicts(out, &reply.groups)?;
-        write_stuck_rules(out, &reply.groups)?;
+        write_phases(out, scrub, &reply.groups)?;
+        write_verdicts(out, scrub, &reply.groups)?;
+        write_stuck_rules(out, scrub, &reply.groups)?;
     }
     if reply.truncated {
         writeln!(
@@ -324,6 +337,7 @@ pub(crate) fn write_stats(out: &mut impl Write, reply: &GetStatsReply) -> std::i
 /// Returns [`CliError`] on a server error status or an output failure.
 pub(crate) async fn stats(
     client: &mut Client,
+    scrub: &Scrub,
     since: i64,
     repo: Option<String>,
     box_name: Option<String>,
@@ -340,7 +354,7 @@ pub(crate) async fn stats(
         })
         .await?
         .into_inner();
-    write_stats(out, &reply)?;
+    write_stats(out, scrub, &reply)?;
     Ok(())
 }
 
@@ -360,5 +374,45 @@ mod tests {
     fn a_bare_number_is_taken_as_a_unix_time_whatever_the_clock() {
         assert!(matches!(parse_since("0", 5), Ok(0)));
         assert!(matches!(parse_since("1700000000", 5), Ok(1_700_000_000)));
+    }
+
+    const TOKEN: &str = "client-token-0123456789";
+
+    fn laden() -> String {
+        format!("v-{TOKEN}")
+    }
+
+    fn render(group: StatsGroup) -> String {
+        let reply = GetStatsReply {
+            groups: vec![group],
+            ..GetStatsReply::default()
+        };
+        let mut out = Vec::new();
+        write_stats(&mut out, &Scrub::new(Some(TOKEN)), &reply).expect("write to a Vec");
+        String::from_utf8(out).expect("utf8")
+    }
+
+    #[test]
+    fn stats_group_key_is_scrubbed_of_the_token() {
+        let text = render(StatsGroup {
+            key: laden(),
+            ..StatsGroup::default()
+        });
+        assert!(text.contains("\nv-[REDACTED]\t"), "{text}");
+        assert!(!text.contains("client-token"), "{text}");
+    }
+
+    #[test]
+    fn stats_stuck_rule_is_scrubbed_of_the_token() {
+        let text = render(StatsGroup {
+            key: "g".into(),
+            stuck_rules: vec![fleet_proto::v1::StuckRuleStats {
+                rule: laden(),
+                outcomes: Some(StuckOutcomes::default()),
+            }],
+            ..StatsGroup::default()
+        });
+        assert!(text.contains("\ng\tv-[REDACTED]\t"), "{text}");
+        assert!(!text.contains("client-token"), "{text}");
     }
 }

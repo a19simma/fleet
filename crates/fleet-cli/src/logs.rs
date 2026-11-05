@@ -8,7 +8,7 @@ use fleet_proto::v1::{GetJobRequest, ReadTranscriptRequest, TranscriptChunk};
 use tokio::time::sleep;
 use tonic::{Code, Response, Status};
 
-use crate::{CliError, Client, is_hostile, require_success};
+use crate::{CliError, Client, Scrub, ScrubStream, require_success};
 
 /// Wait between polls when a follow read returns no chunks.
 pub const POLL_INTERVAL: Duration = Duration::from_secs(1);
@@ -20,13 +20,6 @@ pub const RETRY_DELAY: Duration = Duration::from_secs(1);
 pub const MAX_ATTEMPTS: u32 = 5;
 
 const TRUNCATED_MARKER: &str = "-- transcript truncated --";
-
-/// Drops control and bidirectional characters, keeping newline and tab.
-fn strip_controls(text: &str) -> String {
-    text.chars()
-        .filter(|c| matches!(c, '\n' | '\t') || !is_hostile(*c))
-        .collect()
-}
 
 fn is_transient(status: &Status) -> bool {
     matches!(
@@ -55,17 +48,27 @@ where
     }
 }
 
-/// Writes one chunk, adding a newline when its text lacks one, then the truncation marker
-/// when the chunk is flagged truncated.
-fn write_chunk(out: &mut impl Write, chunk: &TranscriptChunk) -> std::io::Result<()> {
-    let text = strip_controls(&chunk.text);
+fn write_text(out: &mut impl Write, text: &str) -> std::io::Result<()> {
     if !text.is_empty() {
         out.write_all(text.as_bytes())?;
         if !text.ends_with('\n') {
             out.write_all(b"\n")?;
         }
     }
+    Ok(())
+}
+
+/// Writes one chunk, adding a newline when its scrubbed text lacks one, then the truncation
+/// marker when the chunk is flagged truncated. A text suffix that could start the token is
+/// held for the next chunk, so a token split across chunks is redacted.
+fn write_chunk(
+    out: &mut impl Write,
+    stream: &mut ScrubStream<'_>,
+    chunk: &TranscriptChunk,
+) -> std::io::Result<()> {
+    write_text(out, &stream.push(&chunk.text))?;
     if chunk.truncated {
+        write_text(out, &stream.finish_cut())?;
         writeln!(out, "{TRUNCATED_MARKER}")?;
     }
     Ok(())
@@ -76,7 +79,32 @@ fn write_chunk(out: &mut impl Write, chunk: &TranscriptChunk) -> std::io::Result
 /// earlier page are skipped. Two chunks that share a `seq` inside one page both print.
 pub(crate) async fn logs(
     client: &Client,
+    scrub: &Scrub,
     id: String,
+    follow: bool,
+    out: &mut impl Write,
+) -> Result<(), CliError> {
+    let mut stream = scrub.stream();
+    let read = pages(client, &mut stream, &id, follow, out).await;
+    let tail = stream.finish();
+    write_text(out, &tail)?;
+    read?;
+    if !follow {
+        return Ok(());
+    }
+    let job = with_retry(|| {
+        let mut client = client.clone();
+        let request = GetJobRequest { job_id: id.clone() };
+        async move { client.get_job(request).await }
+    })
+    .await?;
+    require_success(&job)
+}
+
+async fn pages(
+    client: &Client,
+    stream: &mut ScrubStream<'_>,
+    id: &str,
     follow: bool,
     out: &mut impl Write,
 ) -> Result<(), CliError> {
@@ -85,7 +113,7 @@ pub(crate) async fn logs(
         let mut reply = with_retry(|| {
             let mut client = client.clone();
             let request = ReadTranscriptRequest {
-                job_id: id.clone(),
+                job_id: id.to_owned(),
                 after_seq,
                 limit: 0,
             };
@@ -96,7 +124,7 @@ pub(crate) async fn logs(
         let mut printed = false;
         let floor = after_seq;
         for chunk in reply.chunks.iter().filter(|c| c.seq > floor) {
-            write_chunk(out, chunk)?;
+            write_chunk(out, stream, chunk)?;
             after_seq = chunk.seq;
             printed = true;
         }
@@ -111,14 +139,5 @@ pub(crate) async fn logs(
             sleep(POLL_INTERVAL).await;
         }
     }
-    if !follow {
-        return Ok(());
-    }
-    let job = with_retry(|| {
-        let mut client = client.clone();
-        let request = GetJobRequest { job_id: id.clone() };
-        async move { client.get_job(request).await }
-    })
-    .await?;
-    require_success(&job)
+    Ok(())
 }

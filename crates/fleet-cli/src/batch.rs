@@ -10,7 +10,7 @@ use fleet_proto::v1::{
 use tonic::service::interceptor::InterceptedService;
 use tonic::transport::Channel;
 
-use super::{Bearer, CliError, Client, ELLIPSIS, or_dash, sanitize, sanitize_free, state_name};
+use super::{Bearer, CliError, Client, ELLIPSIS, Scrub, or_dash, state_name};
 
 /// A `FleetBatches` client carrying the bearer token.
 pub(crate) type BatchesClient = FleetBatchesClient<InterceptedService<Channel, Bearer>>;
@@ -47,14 +47,14 @@ fn duration(ms: Option<u64>) -> String {
     )
 }
 
-fn stamp(value: Option<&String>) -> String {
-    value.map_or_else(|| UNKNOWN.into(), |v| sanitize_free(v))
+fn stamp(scrub: &Scrub, value: Option<&String>) -> String {
+    value.map_or_else(|| UNKNOWN.into(), |v| scrub.free(v))
 }
 
-fn column(job: &Job) -> String {
+fn column(scrub: &Scrub, job: &Job) -> String {
     job.profile.as_ref().map_or_else(
         || "-".into(),
-        |profile| format!("{}@{}", sanitize_free(&profile.name), profile.version),
+        |profile| format!("{}@{}", scrub.free(&profile.name), profile.version),
     )
 }
 
@@ -66,7 +66,7 @@ fn complete(job: &Job) -> String {
     from_summary(job, |s| if s.complete { "yes" } else { "no" }.into())
 }
 
-fn missing(job: &Job) -> String {
+fn missing(scrub: &Scrub, job: &Job) -> String {
     job.summary.as_ref().map_or_else(
         || NO_SUMMARY.into(),
         |s| {
@@ -75,7 +75,7 @@ fn missing(job: &Job) -> String {
             } else {
                 s.missing
                     .iter()
-                    .map(|name| sanitize_free(name))
+                    .map(|name| scrub.free(name))
                     .collect::<Vec<_>>()
                     .join(", ")
             }
@@ -91,11 +91,11 @@ fn span(job: &Job, pick: impl Fn(&JobSummary) -> Option<u64>) -> String {
     from_summary(job, |s| duration(pick(s)))
 }
 
-fn stuck(job: &Job) -> String {
+fn stuck(scrub: &Scrub, job: &Job) -> String {
     from_summary(job, |s| {
         s.stuck_rule
             .as_ref()
-            .map_or_else(|| "-".into(), |rule| sanitize_free(rule))
+            .map_or_else(|| "-".into(), |rule| scrub.free(rule))
     })
 }
 
@@ -106,14 +106,14 @@ fn cost(job: &Job) -> String {
     })
 }
 
-fn profile_hash(job: &Job) -> String {
+fn profile_hash(scrub: &Scrub, job: &Job) -> String {
     job.profile
         .as_ref()
-        .map_or_else(|| "-".into(), |p| sanitize(&p.hash))
+        .map_or_else(|| "-".into(), |p| scrub.ident(&p.hash))
 }
 
-fn stamp_of(job: &Job, pick: impl Fn(&JobSummary) -> Option<&String>) -> String {
-    stamp(job.summary.as_ref().and_then(pick))
+fn stamp_of(scrub: &Scrub, job: &Job, pick: impl Fn(&JobSummary) -> Option<&String>) -> String {
+    stamp(scrub, job.summary.as_ref().and_then(pick))
 }
 
 fn row(
@@ -129,8 +129,8 @@ fn row(
     writeln!(out)
 }
 
-fn command(cmd: Option<&String>) -> String {
-    let clean = cmd.map_or_else(|| "-".into(), |cmd| sanitize(cmd));
+fn command(scrub: &Scrub, cmd: Option<&String>) -> String {
+    let clean = cmd.map_or_else(|| "-".into(), |cmd| scrub.ident(cmd));
     if clean.chars().count() > CMD_WIDTH {
         let mut cut: String = clean.chars().take(CMD_WIDTH - 1).collect();
         cut.push(ELLIPSIS);
@@ -155,14 +155,15 @@ fn is_bash(event: &JobEvent) -> bool {
 /// Returns the output error.
 pub(crate) fn write_batch(
     out: &mut impl Write,
+    scrub: &Scrub,
     reply: &GetBatchReply,
     events: &[Vec<JobEvent>],
 ) -> std::io::Result<()> {
     let jobs = &reply.jobs;
-    writeln!(out, "batch: {}", sanitize(&reply.batch_id))?;
-    writeln!(out, "repo: {}", sanitize(&reply.repo))?;
-    writeln!(out, "base_sha: {}", sanitize(&reply.base_sha))?;
-    row(out, "profile", jobs, column)?;
+    writeln!(out, "batch: {}", scrub.ident(&reply.batch_id))?;
+    writeln!(out, "repo: {}", scrub.ident(&reply.repo))?;
+    writeln!(out, "base_sha: {}", scrub.ident(&reply.base_sha))?;
+    row(out, "profile", jobs, |job| column(scrub, job))?;
     row(out, "outcome", jobs, |job| state_name(job).into())?;
     row(out, "cost_est_usd", jobs, cost)?;
     row(out, "turns", jobs, |job| count(job, |s| s.turns))?;
@@ -176,28 +177,28 @@ pub(crate) fn write_batch(
         count(job, |s| s.tool_errors)
     })?;
     row(out, "denials", jobs, |job| count(job, |s| s.denials))?;
-    row(out, "stuck_rule", jobs, stuck)?;
+    row(out, "stuck_rule", jobs, |job| stuck(scrub, job))?;
     row(out, "bundle_sha", jobs, |job| {
-        stamp_of(job, |s| s.bundle_sha.as_ref())
+        stamp_of(scrub, job, |s| s.bundle_sha.as_ref())
     })?;
     row(out, "claude_version", jobs, |job| {
-        stamp_of(job, |s| s.claude_version.as_ref())
+        stamp_of(scrub, job, |s| s.claude_version.as_ref())
     })?;
     row(out, "model", jobs, |job| {
-        stamp_of(job, |s| s.model.as_ref())
+        stamp_of(scrub, job, |s| s.model.as_ref())
     })?;
-    row(out, "profile_hash", jobs, profile_hash)?;
+    row(out, "profile_hash", jobs, |job| profile_hash(scrub, job))?;
     row(out, "complete", jobs, complete)?;
-    row(out, "missing", jobs, missing)?;
+    row(out, "missing", jobs, |job| missing(scrub, job))?;
     for (job, job_events) in jobs.iter().zip(events) {
-        writeln!(out, "commands ({}):", column(job))?;
+        writeln!(out, "commands ({}):", column(scrub, job))?;
         let mut shown = 0_usize;
         for event in job_events.iter().filter(|event| is_bash(event)) {
             writeln!(
                 out,
                 "  {}\t{}",
                 duration(event.dur_ms),
-                command(event.cmd.as_ref())
+                command(scrub, event.cmd.as_ref())
             )?;
             shown += 1;
         }
@@ -240,6 +241,7 @@ async fn read_events(client: &mut Client, id: &str) -> Result<Vec<JobEvent>, Cli
 pub(crate) async fn show(
     batches: &mut BatchesClient,
     jobs: &mut Client,
+    scrub: &Scrub,
     id: String,
     out: &mut impl Write,
 ) -> Result<(), CliError> {
@@ -251,7 +253,7 @@ pub(crate) async fn show(
     for job in &reply.jobs {
         events.push(read_events(jobs, &job.job_id).await?);
     }
-    write_batch(out, &reply, &events)?;
+    write_batch(out, scrub, &reply, &events)?;
     Ok(())
 }
 
@@ -348,15 +350,16 @@ pub(crate) fn prepare(args: Submit, stdin: &mut impl Read) -> Result<SubmitBatch
 /// `fleet batch submit`: creates one job per profile and prints the batch and job ids.
 pub(crate) async fn submit(
     client: &mut BatchesClient,
+    scrub: &Scrub,
     request: SubmitBatchRequest,
     out: &mut impl Write,
 ) -> Result<(), CliError> {
     let names = request.profiles.clone();
     let reply = client.submit_batch(request).await?.into_inner();
-    writeln!(out, "batch: {}", sanitize(&reply.batch_id))?;
+    writeln!(out, "batch: {}", scrub.ident(&reply.batch_id))?;
     writeln!(out, "created: {}", if reply.created { "yes" } else { "no" })?;
     for (name, id) in names.iter().zip(&reply.job_ids) {
-        writeln!(out, "job: {}\t{}", sanitize(name), sanitize(id))?;
+        writeln!(out, "job: {}\t{}", scrub.ident(name), scrub.ident(id))?;
     }
     Ok(())
 }
@@ -460,7 +463,7 @@ mod tests {
             ..GetBatchReply::default()
         };
         let mut out = Vec::new();
-        write_batch(&mut out, &reply, &events).expect("write to a Vec");
+        write_batch(&mut out, &Scrub::default(), &reply, &events).expect("write to a Vec");
         String::from_utf8(out).expect("utf8")
     }
 
@@ -579,5 +582,155 @@ mod tests {
             !text.contains('\u{1b}') && !text.contains('\u{202E}'),
             "{text:?}"
         );
+    }
+
+    #[test]
+    fn commands_and_stuck_rule_are_scrubbed_of_the_token() {
+        let secret = "client-token-0123456789";
+        let (mut job, mut events) = complete_job();
+        if let Some(summary) = job.summary.as_mut() {
+            summary.stuck_rule = Some(format!("loop {secret}"));
+        }
+        events.push(bash(None, &format!("curl -H {secret}")));
+        events.push(bash(None, "curl cli\u{200B}ent-token-\u{202E}0123456789"));
+        let reply = GetBatchReply {
+            batch_id: "b".into(),
+            jobs: vec![job],
+            ..GetBatchReply::default()
+        };
+        let mut out = Vec::new();
+        write_batch(&mut out, &Scrub::new(Some(secret)), &reply, &[events]).expect("write");
+        let text = String::from_utf8(out).expect("utf8");
+        assert!(!text.contains("client-token"), "{text}");
+        assert_eq!(text.matches("[REDACTED]").count(), 3, "{text}");
+    }
+
+    const TOKEN: &str = "client-token-0123456789";
+
+    fn laden() -> String {
+        format!("v-{TOKEN}")
+    }
+
+    fn render_laden(job: Job, reply: GetBatchReply, events: Vec<JobEvent>) -> String {
+        let reply = GetBatchReply {
+            jobs: vec![job],
+            ..reply
+        };
+        let mut out = Vec::new();
+        write_batch(&mut out, &Scrub::new(Some(TOKEN)), &reply, &[events]).expect("write to a Vec");
+        String::from_utf8(out).expect("utf8")
+    }
+
+    fn summary_job(set: impl FnOnce(&mut JobSummary)) -> Job {
+        let mut summary = JobSummary::default();
+        set(&mut summary);
+        job("p", 1, HASH_A, JobState::Failed, Some(summary))
+    }
+
+    fn assert_row(text: &str, expected: &str) {
+        assert!(!text.contains("client-token"), "{text}");
+        assert!(text.contains(expected), "{expected:?} not in {text}");
+    }
+
+    #[test]
+    fn batch_bundle_sha_is_scrubbed_of_the_token() {
+        let job = summary_job(|s| s.bundle_sha = Some(laden()));
+        assert_row(
+            &render_laden(job, GetBatchReply::default(), vec![]),
+            "bundle_sha\tv-[REDACTED]\n",
+        );
+    }
+
+    #[test]
+    fn batch_model_is_scrubbed_of_the_token() {
+        let job = summary_job(|s| s.model = Some(laden()));
+        assert_row(
+            &render_laden(job, GetBatchReply::default(), vec![]),
+            "model\tv-[REDACTED]\n",
+        );
+    }
+
+    #[test]
+    fn batch_claude_version_is_scrubbed_of_the_token() {
+        let job = summary_job(|s| s.claude_version = Some(laden()));
+        assert_row(
+            &render_laden(job, GetBatchReply::default(), vec![]),
+            "claude_version\tv-[REDACTED]\n",
+        );
+    }
+
+    #[test]
+    fn batch_stuck_rule_is_scrubbed_of_the_token() {
+        let job = summary_job(|s| s.stuck_rule = Some(laden()));
+        assert_row(
+            &render_laden(job, GetBatchReply::default(), vec![]),
+            "stuck_rule\tv-[REDACTED]\n",
+        );
+    }
+
+    #[test]
+    fn batch_missing_names_are_scrubbed_of_the_token() {
+        let job = summary_job(|s| s.missing = vec![laden()]);
+        assert_row(
+            &render_laden(job, GetBatchReply::default(), vec![]),
+            "missing\tv-[REDACTED]\n",
+        );
+    }
+
+    #[test]
+    fn batch_profile_name_is_scrubbed_of_the_token() {
+        let job = job(&laden(), 1, HASH_A, JobState::Failed, None);
+        assert_row(
+            &render_laden(job, GetBatchReply::default(), vec![]),
+            "profile\tv-[REDACTED]@1\n",
+        );
+    }
+
+    #[test]
+    fn batch_profile_hash_is_scrubbed_of_the_token() {
+        let job = job("p", 1, &laden(), JobState::Failed, None);
+        assert_row(
+            &render_laden(job, GetBatchReply::default(), vec![]),
+            "profile_hash\tv-[REDACTED]\n",
+        );
+    }
+
+    #[test]
+    fn batch_header_fields_are_scrubbed_of_the_token() {
+        let reply = GetBatchReply {
+            batch_id: laden(),
+            repo: laden(),
+            base_sha: laden(),
+            ..GetBatchReply::default()
+        };
+        let text = render_laden(job("p", 1, HASH_A, JobState::Failed, None), reply, vec![]);
+        assert_row(&text, "batch: v-[REDACTED]\n");
+        assert_row(&text, "repo: v-[REDACTED]\n");
+        assert_row(&text, "base_sha: v-[REDACTED]\n");
+    }
+
+    #[test]
+    fn batch_command_is_scrubbed_of_the_token() {
+        let text = render_laden(
+            job("p", 1, HASH_A, JobState::Failed, None),
+            GetBatchReply::default(),
+            vec![bash(Some(1), &format!("curl {TOKEN}"))],
+        );
+        assert_row(&text, "\tcurl [REDACTED]\n");
+    }
+
+    #[test]
+    fn batch_command_cut_at_width_does_not_leak_a_token_prefix() {
+        let cmd = format!("{}{TOKEN}", "x".repeat(55));
+        let shown = command(&Scrub::new(Some(TOKEN)), Some(&cmd));
+        assert!(!shown.contains("cli"), "{shown}");
+        assert_eq!(shown.chars().count(), CMD_WIDTH);
+    }
+
+    #[test]
+    fn batch_stamp_cut_at_200_does_not_leak_a_token_prefix() {
+        let value = format!("{}{TOKEN}", "x".repeat(197));
+        let shown = stamp(&Scrub::new(Some(TOKEN)), Some(&value));
+        assert!(!shown.contains("cli"), "{shown}");
     }
 }
