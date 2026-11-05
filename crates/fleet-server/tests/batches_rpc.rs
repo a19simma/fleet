@@ -99,15 +99,40 @@ async fn count(pool: &PgPool, table: &str) -> i64 {
     sqlx::query_scalar(sql).fetch_one(pool).await.unwrap()
 }
 
-async fn two_profiles(store: &Store) {
-    store.create_profile("alpha", ONE).await.unwrap();
-    store.create_profile("beta", TWO).await.unwrap();
+async fn shared_with(
+    pool: &PgPool,
+    name: &str,
+    content: ProfileContent<'_>,
+) -> fleet_proto::v1::ProfileVersion {
+    let system: i64 = sqlx::query_scalar("SELECT system_user_id()")
+        .fetch_one(pool)
+        .await
+        .unwrap();
+    let made = profiles::create_owned(pool, Some(system), name, content, true)
+        .await
+        .unwrap();
+    sqlx::query("UPDATE profile SET visibility = 'shared' WHERE owner_user_id = $1 AND name = $2")
+        .bind(system)
+        .bind(name)
+        .execute(pool)
+        .await
+        .unwrap();
+    made
+}
+
+async fn shared(pool: &PgPool, name: &str, json: &str) -> fleet_proto::v1::ProfileVersion {
+    shared_with(pool, name, ProfileContent::Json(json)).await
+}
+
+async fn two_profiles(pool: &PgPool) {
+    shared(pool, "alpha", ONE).await;
+    shared(pool, "beta", TWO).await;
 }
 
 #[sqlx::test]
 async fn submit_creates_batch_and_jobs_in_profile_order(pool: PgPool) {
     let store = store(pool.clone()).await;
-    two_profiles(&store).await;
+    two_profiles(&pool).await;
     let addr = serve(&store);
     let reply = batches(addr, as_client)
         .submit_batch(request("k1", &["beta", "alpha"]))
@@ -146,7 +171,7 @@ async fn submit_creates_batch_and_jobs_in_profile_order(pool: PgPool) {
 #[sqlx::test]
 async fn a_failing_second_job_leaves_nothing(pool: PgPool) {
     let store = store(pool.clone()).await;
-    two_profiles(&store).await;
+    two_profiles(&pool).await;
     sqlx::query(
         "CREATE FUNCTION fail_beta() RETURNS trigger LANGUAGE plpgsql AS $$ \
          BEGIN IF NEW.profile_name = 'beta' THEN RAISE EXCEPTION 'forced'; END IF; RETURN NEW; END; $$",
@@ -174,7 +199,7 @@ async fn a_failing_second_job_leaves_nothing(pool: PgPool) {
 #[sqlx::test]
 async fn an_unknown_second_profile_leaves_nothing(pool: PgPool) {
     let store = store(pool.clone()).await;
-    store.create_profile("alpha", ONE).await.unwrap();
+    shared(&pool, "alpha", ONE).await;
     let addr = serve(&store);
     let err = batches(addr, as_client)
         .submit_batch(request("k1", &["alpha", "ghost"]))
@@ -190,7 +215,7 @@ async fn an_unknown_second_profile_leaves_nothing(pool: PgPool) {
 #[sqlx::test]
 async fn resubmit_returns_the_same_batch_and_jobs(pool: PgPool) {
     let store = store(pool.clone()).await;
-    two_profiles(&store).await;
+    two_profiles(&pool).await;
     let addr = serve(&store);
     let mut client = batches(addr, as_client);
     let first = client
@@ -212,7 +237,7 @@ async fn resubmit_returns_the_same_batch_and_jobs(pool: PgPool) {
 #[sqlx::test]
 async fn resubmit_after_a_new_version_keeps_the_batch(pool: PgPool) {
     let store = store(pool.clone()).await;
-    two_profiles(&store).await;
+    two_profiles(&pool).await;
     let addr = serve(&store);
     let mut client = batches(addr, as_client);
     let first = client
@@ -220,10 +245,7 @@ async fn resubmit_after_a_new_version_keeps_the_batch(pool: PgPool) {
         .await
         .unwrap()
         .into_inner();
-    store
-        .create_profile("alpha", r#"{"claude_md":"three"}"#)
-        .await
-        .unwrap();
+    shared(&pool, "alpha", r#"{"claude_md":"three"}"#).await;
     let again = client
         .submit_batch(request("k1", &["alpha"]))
         .await
@@ -236,7 +258,7 @@ async fn resubmit_after_a_new_version_keeps_the_batch(pool: PgPool) {
 #[sqlx::test]
 async fn same_key_with_other_parameters_is_refused(pool: PgPool) {
     let store = store(pool.clone()).await;
-    two_profiles(&store).await;
+    two_profiles(&pool).await;
     let addr = serve(&store);
     let mut client = batches(addr, as_client);
     client
@@ -272,7 +294,7 @@ async fn same_key_with_other_parameters_is_refused(pool: PgPool) {
 #[sqlx::test]
 async fn repeats_two_is_refused_and_zero_and_one_pass(pool: PgPool) {
     let store = store(pool.clone()).await;
-    two_profiles(&store).await;
+    two_profiles(&pool).await;
     let addr = serve(&store);
     let mut client = batches(addr, as_client);
     let mut two = request("k2", &["alpha"]);
@@ -297,7 +319,7 @@ async fn repeats_two_is_refused_and_zero_and_one_pass(pool: PgPool) {
 #[sqlx::test]
 async fn bad_base_sha_is_refused_and_the_check_holds_in_the_database(pool: PgPool) {
     let store = store(pool.clone()).await;
-    two_profiles(&store).await;
+    two_profiles(&pool).await;
     let addr = serve(&store);
     let mut client = batches(addr, as_client);
     let upper = SHA.to_uppercase();
@@ -351,7 +373,7 @@ async fn unknown_profile_is_not_found_without_echo(pool: PgPool) {
 #[sqlx::test]
 async fn bad_lists_and_names_are_refused_without_echo(pool: PgPool) {
     let store = store(pool.clone()).await;
-    two_profiles(&store).await;
+    two_profiles(&pool).await;
     let addr = serve(&store);
     let mut client = batches(addr, as_client);
     let err = client
@@ -387,7 +409,7 @@ async fn bad_lists_and_names_are_refused_without_echo(pool: PgPool) {
 #[sqlx::test]
 async fn jobs_stay_pinned_to_the_version_at_submit(pool: PgPool) {
     let store = store(pool.clone()).await;
-    let v1 = store.create_profile("alpha", ONE).await.unwrap();
+    let v1 = shared(&pool, "alpha", ONE).await;
     let addr = serve(&store);
     let mut client = batches(addr, as_client);
     let first = client
@@ -395,7 +417,7 @@ async fn jobs_stay_pinned_to_the_version_at_submit(pool: PgPool) {
         .await
         .unwrap()
         .into_inner();
-    let v2 = store.create_profile("alpha", TWO).await.unwrap();
+    let v2 = shared(&pool, "alpha", TWO).await;
     assert_eq!(v2.version, 2);
     let second = client
         .submit_batch(request("k2", &["alpha"]))
@@ -421,7 +443,7 @@ async fn jobs_stay_pinned_to_the_version_at_submit(pool: PgPool) {
 #[sqlx::test]
 async fn batch_profile_repeat_is_unique(pool: PgPool) {
     let store = store(pool.clone()).await;
-    two_profiles(&store).await;
+    two_profiles(&pool).await;
     let addr = serve(&store);
     let reply = batches(addr, as_client)
         .submit_batch(request("k1", &["alpha"]))
@@ -444,7 +466,7 @@ async fn batch_profile_repeat_is_unique(pool: PgPool) {
 #[sqlx::test]
 async fn a_job_cannot_pin_a_hash_the_profile_never_held(pool: PgPool) {
     let store = store(pool.clone()).await;
-    two_profiles(&store).await;
+    two_profiles(&pool).await;
     let addr = serve(&store);
     let reply = batches(addr, as_client)
         .submit_batch(request("k1", &["alpha"]))
@@ -467,7 +489,7 @@ async fn a_job_cannot_pin_a_hash_the_profile_never_held(pool: PgPool) {
 #[sqlx::test]
 async fn plain_jobs_keep_working_beside_batch_jobs(pool: PgPool) {
     let store = store(pool.clone()).await;
-    two_profiles(&store).await;
+    two_profiles(&pool).await;
     let addr = serve(&store);
     batches(addr, as_client)
         .submit_batch(request("k1", &["alpha", "beta"]))
@@ -505,7 +527,7 @@ async fn plain_jobs_keep_working_beside_batch_jobs(pool: PgPool) {
 #[sqlx::test]
 async fn box_token_is_denied_and_anonymous_is_unauthenticated(pool: PgPool) {
     let store = store(pool.clone()).await;
-    two_profiles(&store).await;
+    two_profiles(&pool).await;
     let addr = serve(&store);
     let err = batches(addr, as_box)
         .submit_batch(request("k1", &["alpha"]))
@@ -523,7 +545,7 @@ async fn box_token_is_denied_and_anonymous_is_unauthenticated(pool: PgPool) {
 #[sqlx::test]
 async fn concurrent_submits_with_one_key_make_one_batch(pool: PgPool) {
     let store = store(pool.clone()).await;
-    two_profiles(&store).await;
+    two_profiles(&pool).await;
     let addr = serve(&store);
     let mut tasks = Vec::new();
     for _ in 0..6 {
@@ -554,7 +576,7 @@ fn get(batch_id: &str) -> GetBatchRequest {
 #[sqlx::test]
 async fn get_batch_returns_jobs_in_profile_order_with_summary_and_no_prompt(pool: PgPool) {
     let store = store(pool.clone()).await;
-    two_profiles(&store).await;
+    two_profiles(&pool).await;
     let addr = serve(&store);
     let mut client = batches(addr, as_client);
     let made = client
@@ -604,7 +626,7 @@ async fn get_batch_returns_jobs_in_profile_order_with_summary_and_no_prompt(pool
 #[sqlx::test]
 async fn get_batch_refuses_unknown_bad_and_wrong_scope_without_echo(pool: PgPool) {
     let store = store(pool.clone()).await;
-    two_profiles(&store).await;
+    two_profiles(&pool).await;
     let addr = serve(&store);
     let made = batches(addr, as_client)
         .submit_batch(request("k1", &["alpha"]))
@@ -662,7 +684,7 @@ async fn owners(pool: &PgPool, batch_id: &str) -> Vec<(i64, String)> {
 async fn every_batch_job_records_the_owner_and_agent_explicitly(pool: PgPool) {
     let store = store(pool.clone()).await;
     drop_owner_default(&pool).await;
-    two_profiles(&store).await;
+    two_profiles(&pool).await;
     let alice = user(&pool, "alice").await;
     let reply = store
         .submit_batch_for(Some(alice), &request("k1", &["alpha", "beta"]))
@@ -679,7 +701,7 @@ async fn every_batch_job_records_the_owner_and_agent_explicitly(pool: PgPool) {
 async fn the_legacy_batch_path_stamps_the_bootstrap_user(pool: PgPool) {
     let store = store(pool.clone()).await;
     drop_owner_default(&pool).await;
-    two_profiles(&store).await;
+    two_profiles(&pool).await;
     let reply = store
         .submit_batch(&request("k1", &["alpha", "beta"]))
         .await
@@ -696,7 +718,7 @@ async fn the_legacy_batch_path_stamps_the_bootstrap_user(pool: PgPool) {
 #[sqlx::test]
 async fn a_batch_key_stored_for_another_owner_conflicts(pool: PgPool) {
     let store = store(pool.clone()).await;
-    two_profiles(&store).await;
+    two_profiles(&pool).await;
     let alice = user(&pool, "alice").await;
     let bob = user(&pool, "bob").await;
     let first = store
@@ -722,7 +744,7 @@ async fn a_batch_key_stored_for_another_owner_conflicts(pool: PgPool) {
 #[sqlx::test]
 async fn a_batch_agent_other_than_the_default_conflicts_on_resubmit(pool: PgPool) {
     let store = store(pool.clone()).await;
-    two_profiles(&store).await;
+    two_profiles(&pool).await;
     let reply = store
         .submit_batch(&request("k1", &["alpha", "beta"]))
         .await
@@ -742,7 +764,7 @@ async fn a_batch_agent_other_than_the_default_conflicts_on_resubmit(pool: PgPool
 #[sqlx::test]
 async fn a_client_token_batch_stamps_the_bootstrap_user_over_rpc(pool: PgPool) {
     let store = store(pool.clone()).await;
-    two_profiles(&store).await;
+    two_profiles(&pool).await;
     let addr = serve(&store);
     let reply = batches(addr, as_client)
         .submit_batch(request("k1", &["alpha", "beta"]))
@@ -760,7 +782,7 @@ async fn a_client_token_batch_stamps_the_bootstrap_user_over_rpc(pool: PgPool) {
 #[sqlx::test]
 async fn a_batch_names_its_agent_and_an_unknown_one_is_refused(pool: PgPool) {
     let store = store(pool.clone()).await;
-    two_profiles(&store).await;
+    two_profiles(&pool).await;
     let addr = serve(&store);
     let mut client = batches(addr, as_client);
     for (key, agent, stored) in [("k1", "", "claude"), ("k2", "codex", "codex")] {
@@ -785,8 +807,8 @@ async fn a_batch_names_its_agent_and_an_unknown_one_is_refused(pool: PgPool) {
 
 #[sqlx::test]
 async fn a_batch_resubmitted_with_another_agent_conflicts(pool: PgPool) {
-    let store = store(pool).await;
-    two_profiles(&store).await;
+    let store = store(pool.clone()).await;
+    two_profiles(&pool).await;
     let mut codex = request("k1", &["alpha", "beta"]);
     codex.agent = "codex".to_owned();
     store.submit_batch(&codex).await.unwrap();
@@ -864,7 +886,7 @@ async fn a_batch_pins_the_submitters_own_profile_and_never_a_foreign_private_one
 #[sqlx::test]
 async fn a_private_profile_wins_over_a_shared_one_of_the_same_name(pool: PgPool) {
     let store = store(pool.clone()).await;
-    let shared = store.create_profile("alpha", TWO).await.unwrap();
+    let theirs = shared(&pool, "alpha", TWO).await;
     let alice = user(&pool, "alice").await;
     let own = profiles::create_owned(
         &pool,
@@ -888,8 +910,8 @@ async fn a_private_profile_wins_over_a_shared_one_of_the_same_name(pool: PgPool)
     .await
     .unwrap();
     assert_eq!(owner, alice);
-    assert_ne!(own.hash, shared.hash);
-    let read = profiles::get_for(&pool, Some(alice), "alpha", None)
+    assert_ne!(own.hash, theirs.hash);
+    let read = profiles::get_for(&pool, profiles::Viewer::User(alice), "alpha", None)
         .await
         .unwrap();
     assert_eq!(read.content_json, own.content_json);

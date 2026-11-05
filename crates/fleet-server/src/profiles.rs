@@ -16,6 +16,37 @@ use crate::store::{DEFAULT_LIST_LIMIT, MAX_LIST_LIMIT, StoreError};
 /// Longest accepted profile name, in bytes.
 pub const MAX_NAME_BYTES: usize = 64;
 
+/// The refusal text for a create without a stored user, shared by the handler and
+/// [`ProfileFault::Unowned`].
+pub const ERR_PROFILE_UNOWNED: &str = "profile create needs a user token";
+
+/// Who reads a profile: one user's own and shared profiles, or shared profiles only.
+///
+/// A required type instead of `Option<i64>`, so a caller that has a user id cannot pass the
+/// shared-only view by leaving the id out.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Viewer {
+    /// Shared profiles only.
+    Shared,
+    /// This user's own profiles first, then shared ones.
+    User(i64),
+}
+
+impl Viewer {
+    fn id(self) -> Option<i64> {
+        match self {
+            Self::Shared => None,
+            Self::User(id) => Some(id),
+        }
+    }
+}
+
+impl From<Option<i64>> for Viewer {
+    fn from(caller: Option<i64>) -> Self {
+        caller.map_or(Self::Shared, Self::User)
+    }
+}
+
 const SHARING_NOT_IMPLEMENTED: &str = "profile sharing is not implemented";
 
 /// Makes a profile visible to every user.
@@ -47,7 +78,6 @@ const PROFILE_HAS_VERSIONS: &str =
     "SELECT EXISTS (SELECT 1 FROM profile_version WHERE profile_id = $1)";
 const DELETE_PROFILE: &str = "DELETE FROM profile WHERE id = $1";
 const LOCK_PROFILE_ID: &str = "SELECT pg_advisory_xact_lock($1)";
-const SELECT_SYSTEM_USER: &str = "SELECT system_user_id()";
 const SELECT_VERSION_BY_HASH: &str =
     "SELECT version FROM profile_version WHERE profile_id = $1 AND hash = $2";
 const INSERT_VERSION: &str = "INSERT INTO profile_version (profile_id, version, hash) \
@@ -105,7 +135,7 @@ impl fmt::Display for ProfileFault {
             Self::Invalid(err) => err.fmt(f),
             Self::ToolsDisabled => f.write_str(ERR_PROFILE_TOOLS_DISABLED),
             Self::ContentChoice => f.write_str(ERR_PROFILE_CONTENT_CHOICE),
-            Self::Unowned => f.write_str("profile create needs a user token"),
+            Self::Unowned => f.write_str(ERR_PROFILE_UNOWNED),
             Self::NotOwner => f.write_str("only the owner can change this profile"),
             Self::HasVersions => f.write_str("profile has versions and cannot be deleted"),
         }
@@ -230,19 +260,6 @@ fn text_of(bytes: Vec<u8>) -> Result<String, StoreError> {
     String::from_utf8(bytes).map_err(|_| StoreError::OutOfRange("profile content"))
 }
 
-pub(crate) async fn create(
-    pool: &PgPool,
-    name: &str,
-    content: ProfileContent<'_>,
-    allow_tools: bool,
-) -> Result<ProfileVersion, StoreError> {
-    let new = validate_create(name, content, allow_tools)?;
-    let system: i64 = sqlx::query_scalar(SELECT_SYSTEM_USER)
-        .fetch_one(pool)
-        .await?;
-    store_version(pool, system, "shared", new).await
-}
-
 /// Stores a profile for the authenticated caller and records the caller as owner.
 ///
 /// `caller` is the user id [`crate::auth::Caller`] carries. The owner is never read from the
@@ -266,13 +283,12 @@ pub async fn create_owned(
 ) -> Result<ProfileVersion, StoreError> {
     let owner = caller.ok_or(ProfileFault::Unowned)?;
     let new = validate_create(name, content, allow_tools)?;
-    store_version(pool, owner, "private", new).await
+    store_version(pool, owner, new).await
 }
 
 async fn store_version(
     pool: &PgPool,
     owner: i64,
-    visibility: &str,
     new: NewProfile,
 ) -> Result<ProfileVersion, StoreError> {
     let size = i32::try_from(new.canonical.len())
@@ -292,7 +308,7 @@ async fn store_version(
     sqlx::query(INSERT_PROFILE)
         .bind(owner)
         .bind(&new.name)
-        .bind(visibility)
+        .bind("private")
         .execute(&mut *tx)
         .await?;
     let profile_id: i64 = sqlx::query_scalar(LOCK_PROFILE)
@@ -453,26 +469,18 @@ pub async fn delete_owned(
     Ok(())
 }
 
-pub(crate) async fn get(
-    pool: &PgPool,
-    name: &str,
-    version: Option<u32>,
-) -> Result<ProfileVersion, StoreError> {
-    get_for(pool, None, name, version).await
-}
-
 /// Reads a profile version as `viewer`, or the latest one when `version` is `None`.
 ///
 /// The name resolves to the viewer's own profile first, then to a shared one. A profile
 /// owned by someone else and private is [`StoreError::NotFound`], the same as an absent name.
-/// A `None` viewer sees shared profiles only.
+/// [`Viewer::Shared`] sees shared profiles only.
 ///
 /// # Errors
 ///
 /// [`StoreError::InvalidProfile`] for a bad name, [`StoreError::NotFound`] and a database error.
 pub async fn get_for(
     pool: &PgPool,
-    viewer: Option<i64>,
+    viewer: Viewer,
     name: &str,
     version: Option<u32>,
 ) -> Result<ProfileVersion, StoreError> {
@@ -482,7 +490,7 @@ pub async fn get_for(
         .transpose()?;
     let row = sqlx::query(SELECT_VISIBLE)
         .bind(name)
-        .bind(viewer)
+        .bind(viewer.id())
         .bind(wanted)
         .fetch_optional(pool)
         .await?
@@ -547,26 +555,18 @@ pub(crate) async fn blob_for_lease(
     })
 }
 
-/// Lists profiles after `after_name`. A zero `limit` means the default and a larger one is cut.
-///
-/// `after_name` is passed to the query as is: a NUL byte fails in Postgres and surfaces as
-/// `UNAVAILABLE`, and a long value is accepted up to the message cap.
-pub(crate) async fn list(
-    pool: &PgPool,
-    limit: u32,
-    after_name: Option<&str>,
-) -> Result<ListProfilesReply, StoreError> {
-    list_for(pool, None, limit, after_name).await
-}
-
 /// Lists the profiles `viewer` may read: their own and shared ones, own first on a name clash.
+///
+/// A zero `limit` means the default and a larger one is cut. `after_name` is passed to the
+/// query as is: a NUL byte fails in Postgres and surfaces as `UNAVAILABLE`, and a long value
+/// is accepted up to the message cap.
 ///
 /// # Errors
 ///
 /// A database error.
 pub async fn list_for(
     pool: &PgPool,
-    viewer: Option<i64>,
+    viewer: Viewer,
     limit: u32,
     after_name: Option<&str>,
 ) -> Result<ListProfilesReply, StoreError> {
@@ -577,7 +577,7 @@ pub async fn list_for(
     let rows = sqlx::query(LIST)
         .bind(after_name)
         .bind(i64::from(limit))
-        .bind(viewer)
+        .bind(viewer.id())
         .fetch_all(pool)
         .await?;
     let profiles = rows

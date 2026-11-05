@@ -50,6 +50,28 @@ fn job_request(key: &str) -> SubmitJobRequest {
     }
 }
 
+async fn shared(pool: &PgPool, name: &str, json: &str) {
+    let system: i64 = sqlx::query_scalar("SELECT system_user_id()")
+        .fetch_one(pool)
+        .await
+        .unwrap();
+    fleet_server::profiles::create_owned(
+        pool,
+        Some(system),
+        name,
+        fleet_server::profiles::ProfileContent::Json(json),
+        false,
+    )
+    .await
+    .unwrap();
+    sqlx::query("UPDATE profile SET visibility = 'shared' WHERE owner_user_id = $1 AND name = $2")
+        .bind(system)
+        .bind(name)
+        .execute(pool)
+        .await
+        .unwrap();
+}
+
 async fn user(pool: &PgPool, name: &str) -> i64 {
     sqlx::query_scalar("INSERT INTO users (username) VALUES ($1) RETURNING id")
         .bind(name)
@@ -79,7 +101,7 @@ async fn world(pool: PgPool) -> World {
     .execute(&pool)
     .await
     .unwrap();
-    store.create_profile("alpha", PROFILE).await.unwrap();
+    shared(&pool, "alpha", PROFILE).await;
     let batch = store
         .submit_batch_for(
             Some(alice),
@@ -267,7 +289,7 @@ async fn a_judge_may_target_only_an_owned_job(pool: PgPool) {
 async fn a_batch_lists_only_the_callers_jobs(pool: PgPool) {
     let w = world(pool.clone()).await;
     let store = Store::new(pool.clone());
-    store.create_profile("beta", PROFILE).await.unwrap();
+    shared(&pool, "beta", PROFILE).await;
     let batch = store
         .submit_batch_for(
             Some(w.alice),
