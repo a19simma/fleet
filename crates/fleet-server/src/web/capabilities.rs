@@ -1,19 +1,30 @@
 //! Admin capability pages.
 
+use std::collections::HashMap;
+
 use topcoat::{
     Result,
     context::Cx,
-    router::{StatusCode, error::see_other, route},
+    router::{StatusCode, content::Form, route},
 };
 
-use super::pages::{auth, current};
+use super::catalog::{admin_gate, admin_post_gate};
 
 #[route(GET "/users/{user_id}/capabilities")]
 async fn capabilities_page(cx: &Cx) -> Result<(StatusCode, &'static str)> {
-    let auth = auth(cx)?;
-    if current(cx, auth).await?.is_none() {
-        return Err(see_other("/login").into());
-    }
+    admin_gate(cx).await?;
+    Ok((
+        StatusCode::NOT_IMPLEMENTED,
+        "the capability page is not implemented",
+    ))
+}
+
+#[route(POST "/users/{user_id}/capabilities")]
+async fn capabilities_post(
+    cx: &Cx,
+    Form(form): Form<HashMap<String, String>>,
+) -> Result<(StatusCode, &'static str)> {
+    admin_post_gate(cx, &form).await?;
     Ok((
         StatusCode::NOT_IMPLEMENTED,
         "the capability page is not implemented",
