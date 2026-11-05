@@ -926,6 +926,7 @@ async fn dispatch(
                     base_ref: base,
                     open_pr: !no_pr,
                     agent: agent.unwrap_or_default(),
+                    profile: String::new(),
                 })
                 .await?
                 .into_inner();

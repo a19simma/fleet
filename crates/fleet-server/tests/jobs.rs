@@ -70,6 +70,7 @@ fn request(key: &str) -> SubmitJobRequest {
         base_ref: "main".to_owned(),
         open_pr: true,
         agent: String::new(),
+        profile: String::new(),
     }
 }
 

@@ -50,14 +50,16 @@ pub const ERR_PROFILE_TOOLS_DISABLED: &str = "profile tools are disabled on this
 pub const ERR_PROFILE_CONTENT_CHOICE: &str = "set exactly one of content_json and content_toml";
 
 /// Largest profile-carrying message either side encodes or decodes, in bytes: the profile
-/// JSON plus 1 MiB for the rest of the message.
+/// JSON, a full catalog snapshot ([`MAX_BLOB_CATALOG_WIRE_BYTES`]) and 1 MiB for the rest of
+/// the message.
 ///
 /// It applies to `FleetProfiles` on the server, to the `FleetWorker` reply of
 /// `GetProfileBlob` on the server (encode) and on every `FleetWorker` client (decode), and to
 /// the `FleetProfiles` client. The tonic client default of 4 MiB is below the largest profile.
 /// It also bounds the `GetJobTranscript` reply on the same server and clients: the transcript
 /// text plus 2 MiB for the per-chunk fields of up to 50 000 rows stays below it.
-pub const MAX_PROFILE_MESSAGE_BYTES: usize = MAX_PROFILE_JSON_BYTES + 1024 * 1024;
+pub const MAX_PROFILE_MESSAGE_BYTES: usize =
+    MAX_PROFILE_JSON_BYTES + MAX_BLOB_CATALOG_WIRE_BYTES + 1024 * 1024;
 
 /// Transcript bytes stored per job. Chunks past this are dropped after one marker row. The
 /// server enforces it on ingest and on the `GetJobTranscript` reply, and fleetd on the reply it
@@ -162,12 +164,13 @@ pub const MAX_BLOB_CATALOG_BYTES: usize = 4 * 1024 * 1024;
 
 const BLOB_CATALOG_ITEM_OVERHEAD_BYTES: usize = 1024;
 
-const _: () = assert!(
-    MAX_BLOB_CATALOG_BYTES
-        + MAX_BLOB_CATALOG_ITEMS * BLOB_CATALOG_ITEM_OVERHEAD_BYTES
-        + 4 * 1024 * 1024
-        <= MAX_PROFILE_MESSAGE_BYTES
-);
+/// Largest encoded catalog snapshot in a `GetProfileBlobReply`, in bytes: the content cap plus
+/// the per-item fields of [`MAX_BLOB_CATALOG_ITEMS`] items.
+pub const MAX_BLOB_CATALOG_WIRE_BYTES: usize =
+    MAX_BLOB_CATALOG_BYTES + MAX_BLOB_CATALOG_ITEMS * BLOB_CATALOG_ITEM_OVERHEAD_BYTES;
+
+const _: () =
+    assert!(MAX_PROFILE_JSON_BYTES + MAX_BLOB_CATALOG_WIRE_BYTES <= MAX_PROFILE_MESSAGE_BYTES);
 
 /// Whether a catalog snapshot fits `max_items` items and `max_bytes` total content bytes.
 pub fn blob_catalog_within(items: &[v1::CatalogItem], max_items: usize, max_bytes: usize) -> bool {
