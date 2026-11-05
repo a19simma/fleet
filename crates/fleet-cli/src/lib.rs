@@ -285,6 +285,17 @@ pub enum CliError {
 }
 
 impl CliError {
+    /// Redacts the message of a server status. Without a scrubber no connection was opened,
+    /// so the status is local and its message is fixed text.
+    fn scrubbed(self, scrub: Option<&Scrub>) -> Self {
+        match (self, scrub) {
+            (Self::Rpc(status), Some(scrub)) => {
+                Self::Rpc(Status::new(status.code(), scrub.text(status.message())))
+            }
+            (other, _) => other,
+        }
+    }
+
     /// Process exit code: 2 for usage and configuration errors, 3 for a job with no timing
     /// report, 1 for everything else.
     pub fn exit_code(&self) -> u8 {
@@ -339,6 +350,136 @@ pub(crate) fn is_hostile(c: char) -> bool {
             }
         })
         .is_ok()
+}
+
+/// Strips hostile characters except newline and tab.
+pub(crate) fn strip_keeping_lines(text: &str) -> String {
+    text.chars()
+        .filter(|c| matches!(c, '\n' | '\t') || !is_hostile(*c))
+        .collect()
+}
+
+/// Strips, redacts, then strips again, keeping newline and tab.
+///
+/// The first strip removes characters an attacker slipped into a secret to dodge the match.
+/// The second removes any a replacement could have joined into view.
+pub(crate) fn scrub(redactor: &fleet_core::Redactor, text: &str) -> String {
+    let stripped = strip_keeping_lines(text);
+    strip_keeping_lines(&redactor.redact_str(&stripped))
+}
+
+/// Scrubs server text of the client token. Every path that prints server-supplied job text
+/// goes through one of these.
+#[derive(Clone, Debug, Default)]
+pub struct Scrub {
+    redactor: fleet_core::Redactor,
+    secret: String,
+}
+
+impl Scrub {
+    /// A scrubber for `secret`. A secret [`fleet_core::Redactor`] ignores scrubs nothing.
+    #[must_use]
+    pub fn new(secret: Option<&str>) -> Self {
+        let redactor = fleet_core::Redactor::new(secret.map(str::to_owned));
+        let secret = if redactor.is_empty() {
+            String::new()
+        } else {
+            secret.unwrap_or_default().to_owned()
+        };
+        Self { redactor, secret }
+    }
+
+    fn of(config: &Config) -> Self {
+        let bearer = config.bearer();
+        Self::new(bearer.strip_prefix("Bearer "))
+    }
+
+    pub(crate) fn redactor(&self) -> &fleet_core::Redactor {
+        &self.redactor
+    }
+
+    /// Strips, redacts and strips `text`, keeping newline and tab.
+    #[must_use]
+    pub fn text(&self, text: &str) -> String {
+        scrub(&self.redactor, text)
+    }
+
+    /// Scrubs `text` and strips newline and tab too, for a field printed whole on one line.
+    #[must_use]
+    pub fn ident(&self, text: &str) -> String {
+        sanitize(&self.text(text))
+    }
+
+    /// Scrubs free-form `text` and cuts it to 200 characters.
+    #[must_use]
+    pub fn free(&self, text: &str) -> String {
+        sanitize_free(&self.text(text))
+    }
+
+    /// Starts scrubbing one stream that arrives in pieces.
+    #[must_use]
+    pub fn stream(&self) -> ScrubStream<'_> {
+        ScrubStream {
+            scrub: self,
+            tail: String::new(),
+        }
+    }
+
+    fn held_len(&self, text: &str) -> usize {
+        self.secret
+            .char_indices()
+            .skip(1)
+            .map(|(at, _)| at)
+            .filter(|at| text.ends_with(&self.secret[..*at]))
+            .max()
+            .unwrap_or(0)
+    }
+}
+
+/// Scrubs a stream piece by piece. A suffix that could start the token is held back until the
+/// next piece or [`ScrubStream::finish`], so a token split across pieces is still redacted.
+#[derive(Debug)]
+pub struct ScrubStream<'a> {
+    scrub: &'a Scrub,
+    tail: String,
+}
+
+impl ScrubStream<'_> {
+    /// Adds `text` and returns the part that is safe to print.
+    pub fn push(&mut self, text: &str) -> String {
+        let mut whole = std::mem::take(&mut self.tail);
+        whole.push_str(&strip_keeping_lines(text));
+        let hold = self.scrub.held_len(&whole);
+        let split = whole.len() - hold;
+        let (ready, kept) = whole.split_at(split);
+        let redactor = &self.scrub.redactor;
+        let ready_clean = redactor.redact_str(ready);
+        let all = redactor.redact_str(&whole);
+        if format!("{ready_clean}{kept}") == all {
+            kept.clone_into(&mut self.tail);
+            return strip_keeping_lines(&ready_clean);
+        }
+        let all = all.into_owned();
+        let end = all
+            .rfind(fleet_core::PLACEHOLDER)
+            .map_or(0, |at| at + fleet_core::PLACEHOLDER.len());
+        all[end..].clone_into(&mut self.tail);
+        strip_keeping_lines(&all[..end])
+    }
+
+    /// Ends a stream the caller cut short. A held suffix that could start the token is dropped,
+    /// because the rest of the token may have been cut off with the stream.
+    pub fn finish_cut(&mut self) -> String {
+        let tail = std::mem::take(&mut self.tail);
+        let hold = self.scrub.held_len(&tail);
+        self.scrub.text(&tail[..tail.len() - hold])
+    }
+
+    /// Returns the held text, scrubbed.
+    pub fn finish(&mut self) -> String {
+        let tail = std::mem::take(&mut self.tail);
+        self.scrub.text(&tail)
+    }
 }
 
 /// Strips hostile characters from server text. The text is not shortened.
@@ -408,7 +549,7 @@ struct Session {
     query: QueryClient,
     profiles: profile::ProfilesClient,
     batches: batch::BatchesClient,
-    redactor: fleet_core::Redactor,
+    scrub: Scrub,
 }
 
 /// Adds the bearer token to every request.
@@ -482,8 +623,12 @@ fn or_dash<T: fmt::Display>(value: Option<&T>) -> String {
     value.map_or_else(|| "-".into(), |v| sanitize(&v.to_string()))
 }
 
-fn free_or_dash(value: Option<&String>) -> String {
-    value.map_or_else(|| "-".into(), |v| sanitize_free(v))
+fn ident_or_dash(scrub: &Scrub, value: Option<&String>) -> String {
+    value.map_or_else(|| "-".into(), |v| scrub.ident(v))
+}
+
+fn free_or_dash(scrub: &Scrub, value: Option<&String>) -> String {
+    value.map_or_else(|| "-".into(), |v| scrub.free(v))
 }
 
 fn require_success(job: &Job) -> Result<(), CliError> {
@@ -494,16 +639,16 @@ fn require_success(job: &Job) -> Result<(), CliError> {
     }
 }
 
-fn write_status(out: &mut impl Write, job: &Job) -> std::io::Result<()> {
-    writeln!(out, "id: {}", sanitize(&job.job_id))?;
+fn write_status(out: &mut impl Write, scrub: &Scrub, job: &Job) -> std::io::Result<()> {
+    writeln!(out, "id: {}", scrub.ident(&job.job_id))?;
     writeln!(out, "state: {}", state_name(job))?;
-    writeln!(out, "phase: {}", sanitize(&job.phase))?;
-    writeln!(out, "branch: {}", or_dash(job.branch.as_ref()))?;
-    writeln!(out, "pr_url: {}", or_dash(job.pr_url.as_ref()))?;
+    writeln!(out, "phase: {}", scrub.ident(&job.phase))?;
+    writeln!(out, "branch: {}", ident_or_dash(scrub, job.branch.as_ref()))?;
+    writeln!(out, "pr_url: {}", ident_or_dash(scrub, job.pr_url.as_ref()))?;
     writeln!(out, "exit_code: {}", or_dash(job.exit_code.as_ref()))?;
-    writeln!(out, "error: {}", free_or_dash(job.error.as_ref()))?;
+    writeln!(out, "error: {}", free_or_dash(scrub, job.error.as_ref()))?;
     if let Some(summary) = &job.summary {
-        telemetry::write_summary(out, summary)?;
+        telemetry::write_summary(out, scrub, summary)?;
     }
     Ok(())
 }
@@ -522,23 +667,36 @@ fn read_prompt(prompt: String, stdin: &mut impl Read) -> Result<String, CliError
     Ok(text)
 }
 
-async fn session(
+struct Resolved {
+    config: Config,
+    scrub: Scrub,
+}
+
+/// The outcome of resolving the flags and the variable lookup once per run. Every command and
+/// the error scrubber share it, so the token is read once.
+type Resolution = Result<Resolved, ConfigError>;
+
+fn resolve(
     server: Option<String>,
     insecure: bool,
     lookup: impl Fn(&str) -> Option<String>,
-    timeouts: bool,
-) -> Result<Session, CliError> {
-    let config = Config::from_lookup(server, insecure, lookup)?;
+) -> Resolution {
+    Config::from_lookup(server, insecure, lookup).map(|config| {
+        let scrub = Scrub::of(&config);
+        Resolved { config, scrub }
+    })
+}
+
+async fn session(env: &Resolution, timeouts: bool) -> Result<Session, CliError> {
+    let resolved = env.as_ref().map_err(Clone::clone)?;
+    let config = &resolved.config;
     if let Some(warning) = config.token_warning() {
         let _ = writeln!(std::io::stderr(), "fleet: warning: {warning}");
     }
-    let channel = open_channel(&config, timeouts).await?;
-    let token = bearer(&config)?;
-    let bearer_value = config.bearer();
-    let redactor =
-        fleet_core::Redactor::new(bearer_value.strip_prefix("Bearer ").map(str::to_owned));
+    let channel = open_channel(config, timeouts).await?;
+    let token = bearer(config)?;
     Ok(Session {
-        redactor,
+        scrub: resolved.scrub.clone(),
         jobs: FleetJobsClient::with_interceptor(channel.clone(), token.clone())
             .max_decoding_message_size(MAX_DECODE_BYTES),
         query: FleetQueryClient::with_interceptor(channel.clone(), token.clone())
@@ -550,17 +708,23 @@ async fn session(
     })
 }
 
-async fn cancel(mut client: Client, id: String, out: &mut impl Write) -> Result<(), CliError> {
+async fn cancel(
+    mut client: Client,
+    scrub: &Scrub,
+    id: String,
+    out: &mut impl Write,
+) -> Result<(), CliError> {
     let job = client
         .cancel_job(CancelJobRequest { job_id: id })
         .await?
         .into_inner();
-    writeln!(out, "{}\t{}", sanitize(&job.job_id), state_name(&job))?;
+    writeln!(out, "{}\t{}", scrub.ident(&job.job_id), state_name(&job))?;
     Ok(())
 }
 
 async fn list_jobs(
     client: &mut Client,
+    scrub: &Scrub,
     state: Option<JobState>,
     limit: u32,
     out: &mut impl Write,
@@ -576,10 +740,10 @@ async fn list_jobs(
         writeln!(
             out,
             "{}\t{}\t{}\t{}",
-            sanitize(&job.job_id),
+            scrub.ident(&job.job_id),
             state_name(job),
-            sanitize(&job.repo),
-            sanitize(&job.phase)
+            scrub.ident(&job.repo),
+            scrub.ident(&job.phase)
         )?;
     }
     if usize::try_from(limit).is_ok_and(|n| n == reply.jobs.len()) {
@@ -593,9 +757,7 @@ async fn list_jobs(
 
 async fn run_batch(
     action: BatchAction,
-    server: Option<String>,
-    insecure: bool,
-    lookup: impl Fn(&str) -> Option<String>,
+    env: &Resolution,
     timeouts: bool,
     stdin: &mut impl Read,
     out: &mut impl Write,
@@ -620,21 +782,26 @@ async fn run_batch(
                 },
                 stdin,
             )?;
-            let mut client = session(server, insecure, lookup, timeouts).await?.batches;
-            batch::submit(&mut client, request, out).await
+            let mut session = session(env, timeouts).await?;
+            batch::submit(&mut session.batches, &session.scrub, request, out).await
         }
         BatchAction::Show { id } => {
-            let mut session = session(server, insecure, lookup, timeouts).await?;
-            batch::show(&mut session.batches, &mut session.jobs, id, out).await
+            let mut session = session(env, timeouts).await?;
+            batch::show(
+                &mut session.batches,
+                &mut session.jobs,
+                &session.scrub,
+                id,
+                out,
+            )
+            .await
         }
     }
 }
 
 async fn run_profile(
     action: ProfileAction,
-    server: Option<String>,
-    insecure: bool,
-    lookup: impl Fn(&str) -> Option<String>,
+    env: &Resolution,
     timeouts: bool,
     stdin: &mut impl Read,
     out: &mut impl Write,
@@ -642,17 +809,20 @@ async fn run_profile(
     match action {
         ProfileAction::Create { name, file } => {
             let content = profile::read_source(&file, stdin)?;
-            let mut client = session(server, insecure, lookup, timeouts).await?.profiles;
-            profile::create(&mut client, name, content, out).await
+            let session = session(env, timeouts).await?;
+            let mut client = session.profiles;
+            profile::create(&mut client, &session.scrub, name, content, out).await
         }
         ProfileAction::List => {
-            let mut client = session(server, insecure, lookup, timeouts).await?.profiles;
-            profile::list(&mut client, out).await
+            let session = session(env, timeouts).await?;
+            let mut client = session.profiles;
+            profile::list(&mut client, &session.scrub, out).await
         }
         ProfileAction::Show { target } => {
             let (name, version) = profile::split_target(&target)?;
-            let mut client = session(server, insecure, lookup, timeouts).await?.profiles;
-            profile::show(&mut client, name.to_owned(), version, out).await
+            let session = session(env, timeouts).await?;
+            let mut client = session.profiles;
+            profile::show(&mut client, &session.scrub, name.to_owned(), version, out).await
         }
     }
 }
@@ -671,32 +841,27 @@ pub async fn run(
     run_with(cli, lookup, true, stdin, out).await
 }
 
-#[expect(
-    clippy::too_many_arguments,
-    clippy::fn_params_excessive_bools,
-    reason = "the flags and arguments of run_with, passed through"
-)]
 async fn run_timing(
     job: &str,
     commands: bool,
     follow: Option<String>,
     json: bool,
-    server: Option<String>,
-    insecure: bool,
-    lookup: impl Fn(&str) -> Option<String>,
+    env: &Resolution,
     timeouts: bool,
     out: &mut impl Write,
 ) -> Result<(), CliError> {
     if let Some(c) = &follow {
         timing::check_command_id(c)?;
     }
-    let session = session(server, insecure, lookup, timeouts).await?;
-    let redactor = session.redactor;
+    let session = session(env, timeouts).await?;
+    let scrub = session.scrub;
     let mut client = session.jobs;
     match follow {
-        Some(c) => timing::follow(&mut client, job, &c, json, out).await,
-        None if commands => timing::list_commands(&mut client, &redactor, job, json, out).await,
-        None => timing::show(&mut client, &redactor, job, json, out).await,
+        Some(c) => timing::follow(&mut client, job, &c, json, &scrub, out).await,
+        None if commands => {
+            timing::list_commands(&mut client, scrub.redactor(), job, json, out).await
+        }
+        None => timing::show(&mut client, scrub.redactor(), job, json, out).await,
     }
 }
 
@@ -719,14 +884,27 @@ pub async fn run_with(
         insecure,
         command,
     } = cli;
+    let env = resolve(server, insecure, lookup);
+    dispatch(command, &env, timeouts, stdin, out)
+        .await
+        .map_err(|e| e.scrubbed(env.as_ref().ok().map(|resolved| &resolved.scrub)))
+}
+
+async fn dispatch(
+    command: Command,
+    env: &Resolution,
+    timeouts: bool,
+    stdin: &mut impl Read,
+    out: &mut impl Write,
+) -> Result<(), CliError> {
     match command {
         Command::List => {
-            let mut session = session(server, insecure, lookup, timeouts).await?;
+            let mut session = session(env, timeouts).await?;
             list::list(&mut session, out).await?;
         }
         Command::Watch { id } => {
-            let mut session = session(server, insecure, lookup, timeouts).await?;
-            watch::watch(&mut session.jobs, &id, out).await?;
+            let mut session = session(env, timeouts).await?;
+            watch::watch(&mut session.jobs, &session.scrub, &id, out).await?;
         }
         Command::Submit {
             repo,
@@ -737,7 +915,9 @@ pub async fn run_with(
             prompt,
         } => {
             let prompt = read_prompt(prompt, stdin)?;
-            let mut client = session(server, insecure, lookup, timeouts).await?.jobs;
+            let session = session(env, timeouts).await?;
+            let scrub = session.scrub;
+            let mut client = session.jobs;
             let job = client
                 .submit_job(SubmitJobRequest {
                     idempotency_key: idempotency_key.unwrap_or_default(),
@@ -749,27 +929,31 @@ pub async fn run_with(
                 })
                 .await?
                 .into_inner();
-            writeln!(out, "{}", sanitize(&job.job_id))?;
+            writeln!(out, "{}", scrub.ident(&job.job_id))?;
         }
         Command::Jobs { state, limit } => {
             let state = state.as_deref().map(parse_state).transpose()?;
-            let mut client = session(server, insecure, lookup, timeouts).await?.jobs;
-            list_jobs(&mut client, state, limit, out).await?;
+            let session = session(env, timeouts).await?;
+            let scrub = session.scrub;
+            let mut client = session.jobs;
+            list_jobs(&mut client, &scrub, state, limit, out).await?;
         }
         Command::Status { id, tools } => {
-            let mut client = session(server, insecure, lookup, timeouts).await?.jobs;
+            let session = session(env, timeouts).await?;
+            let scrub = session.scrub;
+            let mut client = session.jobs;
             let job = client
                 .get_job(GetJobRequest { job_id: id.clone() })
                 .await?
                 .into_inner();
-            write_status(out, &job)?;
+            write_status(out, &scrub, &job)?;
             if tools {
-                telemetry::write_tools(&mut client, &id, out).await?;
+                telemetry::write_tools(&mut client, &scrub, &id, out).await?;
             }
         }
         Command::Logs { id, follow } => {
-            let client = session(server, insecure, lookup, timeouts).await?.jobs;
-            logs::logs(&client, id, follow, out).await?;
+            let session = session(env, timeouts).await?;
+            logs::logs(&session.jobs, &session.scrub, id, follow, out).await?;
         }
         Command::Stats {
             since,
@@ -778,8 +962,9 @@ pub async fn run_with(
             by,
         } => {
             let since = stats::parse_since(&since, stats::now_seconds())?;
-            let mut client = session(server, insecure, lookup, timeouts).await?.jobs;
-            stats::stats(&mut client, since, repo, box_name, by, out).await?;
+            let session = session(env, timeouts).await?;
+            let mut client = session.jobs;
+            stats::stats(&mut client, &session.scrub, since, repo, box_name, by, out).await?;
         }
         Command::Timing {
             job,
@@ -787,22 +972,19 @@ pub async fn run_with(
             follow,
             json,
         } => {
-            run_timing(
-                &job, commands, follow, json, server, insecure, lookup, timeouts, out,
-            )
-            .await?;
+            run_timing(&job, commands, follow, json, env, timeouts, out).await?;
         }
         Command::Catalog { action } => catalog::run(&action)?,
         Command::UserCap { area } => catalog::run_user(&area)?,
         Command::Batch { action } => {
-            run_batch(action, server, insecure, lookup, timeouts, stdin, out).await?;
+            run_batch(action, env, timeouts, stdin, out).await?;
         }
         Command::Profile { action } => {
-            run_profile(action, server, insecure, lookup, timeouts, stdin, out).await?;
+            run_profile(action, env, timeouts, stdin, out).await?;
         }
         Command::Cancel { id } => {
-            let client = session(server, insecure, lookup, timeouts).await?.jobs;
-            cancel(client, id, out).await?;
+            let session = session(env, timeouts).await?;
+            cancel(session.jobs, &session.scrub, id, out).await?;
         }
     }
     Ok(())
@@ -935,7 +1117,7 @@ mod tests {
     #[test]
     fn status_cuts_free_form_error_and_keeps_ids_and_urls_whole() -> Result<(), std::io::Error> {
         let mut out = Vec::new();
-        write_status(&mut out, &failed_job())?;
+        write_status(&mut out, &Scrub::default(), &failed_job())?;
         let text = String::from_utf8_lossy(&out).into_owned();
         assert!(
             text.contains(&format!("branch: {}\n", "b".repeat(300))),
@@ -984,5 +1166,228 @@ mod tests {
         }
         assert!(parse_state("unspecified").is_err());
         assert!(parse_state("bogus").is_err());
+    }
+
+    const TOKEN: &str = "client-token-0123456789";
+
+    #[test]
+    fn status_error_is_scrubbed_of_the_token() -> Result<(), std::io::Error> {
+        let job = Job {
+            job_id: "j".into(),
+            state: JobState::Failed as i32,
+            error: Some(format!(
+                "boom cli\u{200B}ent-token-\u{202E}0123456789 {TOKEN}"
+            )),
+            ..Job::default()
+        };
+        let mut out = Vec::new();
+        write_status(&mut out, &Scrub::new(Some(TOKEN)), &job)?;
+        let text = String::from_utf8_lossy(&out).into_owned();
+        assert!(
+            text.contains("error: boom [REDACTED] [REDACTED]\n"),
+            "{text:?}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn rpc_status_message_in_error_display_is_scrubbed() {
+        let error = CliError::Rpc(Status::internal(format!("bad {TOKEN} x")))
+            .scrubbed(Some(&Scrub::new(Some(TOKEN))));
+        let shown = error.to_string();
+        assert!(!shown.contains(TOKEN), "{shown}");
+        assert!(shown.contains("[REDACTED]"), "{shown}");
+        assert!(matches!(error, CliError::Rpc(s) if s.code() == tonic::Code::Internal));
+    }
+
+    #[test]
+    fn scrub_stream_redacts_a_token_split_across_pieces() {
+        let scrub = Scrub::new(Some(TOKEN));
+        let mut stream = scrub.stream();
+        let mut out = String::new();
+        for piece in ["ab client-tok", "en-0123", "456789 cd"] {
+            out.push_str(&stream.push(piece));
+        }
+        out.push_str(&stream.finish());
+        assert_eq!(out, "ab [REDACTED] cd");
+    }
+
+    #[test]
+    fn scrub_stream_splits_with_hostile_characters_inside() {
+        let scrub = Scrub::new(Some(TOKEN));
+        let mut stream = scrub.stream();
+        let mut out = String::new();
+        for piece in [
+            "x client-\u{200B}to",
+            "\u{202E}ken-01\u{FEFF}2345",
+            "6789\u{2028}y",
+        ] {
+            out.push_str(&stream.push(piece));
+        }
+        out.push_str(&stream.finish());
+        assert_eq!(out, "x [REDACTED]y");
+    }
+
+    #[test]
+    fn scrub_stream_releases_a_held_prefix_that_never_completes() {
+        let scrub = Scrub::new(Some(TOKEN));
+        let mut stream = scrub.stream();
+        assert_eq!(stream.push("end client-to"), "end ");
+        assert_eq!(stream.push("xyz"), "client-toxyz");
+        assert_eq!(stream.push("tail client-tok"), "tail ");
+        assert_eq!(stream.finish(), "client-tok");
+    }
+
+    #[test]
+    fn scrub_without_a_usable_secret_only_strips() {
+        let scrub = Scrub::new(Some("short"));
+        let mut stream = scrub.stream();
+        assert_eq!(stream.push("a\u{200B}b short"), "ab short");
+        assert_eq!(stream.finish(), "");
+        assert_eq!(Scrub::default().text("p\u{202E}q"), "pq");
+    }
+
+    use fleet_proto::v1::JobSummary;
+
+    fn laden_job() -> Job {
+        let laden = |field: &str| format!("{field}-{TOKEN}");
+        Job {
+            job_id: laden("id"),
+            state: JobState::Failed as i32,
+            phase: laden("phase"),
+            branch: Some(laden("branch")),
+            pr_url: Some(format!("https://{TOKEN}@host.example/pr/1")),
+            ..Job::default()
+        }
+    }
+
+    fn status_of(job: &Job) -> String {
+        let mut out = Vec::new();
+        write_status(&mut out, &Scrub::new(Some(TOKEN)), job).expect("write to a Vec");
+        String::from_utf8(out).expect("utf8")
+    }
+
+    #[test]
+    fn status_job_id_is_scrubbed_of_the_token() {
+        assert!(status_of(&laden_job()).contains("id: id-[REDACTED]\n"));
+    }
+
+    #[test]
+    fn status_phase_is_scrubbed_of_the_token() {
+        assert!(status_of(&laden_job()).contains("phase: phase-[REDACTED]\n"));
+    }
+
+    #[test]
+    fn status_branch_is_scrubbed_of_the_token() {
+        assert!(status_of(&laden_job()).contains("branch: branch-[REDACTED]\n"));
+    }
+
+    #[test]
+    fn status_pr_url_userinfo_is_scrubbed_of_the_token() {
+        let text = status_of(&laden_job());
+        assert!(
+            text.contains("pr_url: https://[REDACTED]@host.example/pr/1\n"),
+            "{text}"
+        );
+        assert!(!text.contains("client-token"), "{text}");
+    }
+
+    fn summary_text(summary: JobSummary) -> String {
+        let job = Job {
+            summary: Some(summary),
+            ..Job::default()
+        };
+        status_of(&job)
+    }
+
+    fn laden_summary(set: impl FnOnce(&mut JobSummary, String)) -> JobSummary {
+        let mut summary = JobSummary::default();
+        set(&mut summary, format!("v-{TOKEN}"));
+        summary
+    }
+
+    #[test]
+    fn summary_stop_reason_is_scrubbed_of_the_token() {
+        let text = summary_text(laden_summary(|s, v| s.stop_reason = Some(v)));
+        assert!(text.contains("stop_reason: v-[REDACTED]\n"), "{text}");
+    }
+
+    #[test]
+    fn summary_stuck_rule_is_scrubbed_of_the_token() {
+        let text = summary_text(laden_summary(|s, v| s.stuck_rule = Some(v)));
+        assert!(text.contains("stuck (shadow): v-[REDACTED] at"), "{text}");
+    }
+
+    #[test]
+    fn summary_missing_names_are_scrubbed_of_the_token() {
+        let text = summary_text(laden_summary(|s, v| s.missing = vec![v]));
+        assert!(text.contains("(missing: v-[REDACTED])"), "{text}");
+    }
+
+    #[test]
+    fn summary_model_is_scrubbed_of_the_token() {
+        let text = summary_text(laden_summary(|s, v| s.model = Some(v)));
+        assert!(text.contains("model: v-[REDACTED]\n"), "{text}");
+    }
+
+    #[test]
+    fn summary_claude_version_is_scrubbed_of_the_token() {
+        let text = summary_text(laden_summary(|s, v| s.claude_version = Some(v)));
+        assert!(text.contains("claude_version: v-[REDACTED]\n"), "{text}");
+    }
+
+    #[test]
+    fn summary_bundle_sha_is_scrubbed_of_the_token() {
+        let text = summary_text(laden_summary(|s, v| s.bundle_sha = Some(v)));
+        assert!(text.contains("bundle_sha: v-[REDACTED]\n"), "{text}");
+    }
+
+    #[test]
+    fn ident_strips_newlines_and_redacts() {
+        let scrub = Scrub::new(Some(TOKEN));
+        assert_eq!(scrub.ident(&format!("a\nb{TOKEN}\tc")), "ab[REDACTED]c");
+    }
+
+    #[test]
+    fn free_cut_at_200_does_not_leak_a_token_prefix() {
+        let scrub = Scrub::new(Some(TOKEN));
+        let text = format!("{}{TOKEN}", "x".repeat(197));
+        let shown = scrub.free(&text);
+        assert!(!shown.contains("cli"), "{shown}");
+        assert_eq!(shown.chars().count(), 201);
+    }
+
+    #[test]
+    fn rpc_display_cut_at_200_does_not_leak_a_token_prefix() {
+        let status = Status::internal(format!("{}{TOKEN}", "x".repeat(197)));
+        let shown = CliError::Rpc(status)
+            .scrubbed(Some(&Scrub::new(Some(TOKEN))))
+            .to_string();
+        assert!(!shown.contains("cli"), "{shown}");
+    }
+
+    #[test]
+    fn scrub_stream_push_collapses_a_token_the_holdback_overlaps() {
+        let secret = "abababababab";
+        let scrub = Scrub::new(Some(secret));
+        let mut stream = scrub.stream();
+        assert_eq!(stream.push(secret), "[REDACTED]");
+        assert_eq!(stream.finish(), "");
+        let mut stream = scrub.stream();
+        let mut out = stream.push("x ababab");
+        out.push_str(&stream.push("ababab y"));
+        out.push_str(&stream.finish());
+        assert_eq!(out, "x [REDACTED] y");
+    }
+
+    #[test]
+    fn scrub_stream_finish_cut_drops_a_held_token_prefix() {
+        let scrub = Scrub::new(Some(TOKEN));
+        let mut stream = scrub.stream();
+        assert_eq!(stream.push("end client-tok"), "end ");
+        assert_eq!(stream.finish_cut(), "");
+        let mut stream = scrub.stream();
+        assert_eq!(stream.push("end client-tok"), "end ");
+        assert_eq!(stream.finish(), "client-tok");
     }
 }

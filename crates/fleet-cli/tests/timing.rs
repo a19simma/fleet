@@ -8,7 +8,7 @@ use fleet_cli::timing::{
     ChunkSource, FOLLOW_DEADLINE, MAX_LOG_CHARS, MAX_PRINT_CHUNK_BYTES, MAX_PRINT_TOTAL_BYTES,
     MAX_STREAM_MESSAGES, print_log, write_report,
 };
-use fleet_cli::{Cli, CliError, Command};
+use fleet_cli::{Cli, CliError, Command, Scrub};
 use fleet_core::Redactor;
 use fleet_core::timing::{FIELDS, MAX_COMMAND_CHARS, MAX_COMMAND_ROWS, Summary};
 use fleet_proto::v1::{ShellCommand, ShellStatus, StreamShellLogChunk};
@@ -100,7 +100,7 @@ fn script(chunks: Vec<StreamShellLogChunk>) -> Script {
 
 async fn printed(mut source: Script, json: bool) -> (Result<(), CliError>, String) {
     let mut out = Vec::new();
-    let result = print_log(&mut source, "c1", json, &mut out).await;
+    let result = print_log(&mut source, "c1", json, &Scrub::default(), &mut out).await;
     (result, String::from_utf8_lossy(&out).into_owned())
 }
 
@@ -375,7 +375,7 @@ async fn a_stream_error_is_returned() {
         Err(Status::not_found("no such job")),
     ]));
     let mut out = Vec::new();
-    let result = print_log(&mut source, "c1", false, &mut out).await;
+    let result = print_log(&mut source, "c1", false, &Scrub::default(), &mut out).await;
     let Err(CliError::Rpc(status)) = result else {
         panic!("expected an rpc error, got {result:?}");
     };
@@ -423,7 +423,7 @@ async fn a_silent_stream_stops_at_the_deadline() {
     }
     let mut out = Vec::new();
     let started = tokio::time::Instant::now();
-    let result = print_log(&mut Silent, "c1", false, &mut out).await;
+    let result = print_log(&mut Silent, "c1", false, &Scrub::default(), &mut out).await;
     assert!(
         matches!(result, Err(CliError::JobEnded("timed out"))),
         "{result:?}"
@@ -1235,4 +1235,136 @@ mod served {
         }
         Ok(())
     }
+}
+
+const TOKEN: &str = "client-token-0123456789";
+
+async fn scrubbed(pieces: &[&[u8]], json: bool) -> String {
+    let mut chunks: Vec<_> = pieces
+        .iter()
+        .enumerate()
+        .map(|(i, bytes)| chunk(u32::try_from(i).unwrap_or(0), bytes, ShellStatus::Running))
+        .collect();
+    if let Some(last) = chunks.last_mut() {
+        last.status = ShellStatus::Done as i32;
+    }
+    let mut source = script(chunks);
+    let mut out = Vec::new();
+    let result = print_log(&mut source, "c1", json, &Scrub::new(Some(TOKEN)), &mut out).await;
+    assert!(result.is_ok(), "{result:?}");
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+#[tokio::test]
+async fn follow_redacts_a_token_split_across_chunks() {
+    let text = scrubbed(&[b"a client-tok", b"en-0123", b"456789 b\n"], false).await;
+    assert!(!text.contains("client-tok"), "{text:?}");
+    assert!(text.contains("[REDACTED] b"), "{text:?}");
+}
+
+#[tokio::test]
+async fn follow_redacts_a_token_with_hidden_characters() {
+    let text = scrubbed(
+        &["k=client-\u{200B}token\u{202E}-0123456789\n".as_bytes()],
+        false,
+    )
+    .await;
+    assert_eq!(text, "k=[REDACTED]\n");
+}
+
+#[tokio::test]
+async fn follow_json_redacts_a_token_split_across_chunks() {
+    let text = scrubbed(&[b"a client-tok", b"en-0123456789 b\n"], true).await;
+    assert!(!text.contains("client-tok"), "{text:?}");
+    assert!(text.contains("[REDACTED]"), "{text:?}");
+}
+
+#[tokio::test]
+async fn follow_prints_a_held_prefix_at_the_end() {
+    let text = scrubbed(&[b"tail client-tok"], false).await;
+    assert_eq!(text, "tail client-tok\n");
+}
+
+#[tokio::test]
+async fn print_chunk_cut_at_the_byte_cap_does_not_leak_a_token_prefix() {
+    let mut bytes = vec![b'x'; MAX_PRINT_CHUNK_BYTES - 5];
+    bytes.extend_from_slice(TOKEN.as_bytes());
+    for json in [false, true] {
+        let mut source = script(vec![chunk(0, &bytes, ShellStatus::Done)]);
+        let mut out = Vec::new();
+        let result = print_log(&mut source, "c1", json, &Scrub::new(Some(TOKEN)), &mut out).await;
+        let text = String::from_utf8_lossy(&out).into_owned();
+        assert!(result.is_ok(), "{result:?}");
+        assert!(text.contains("-- log output cut --"), "json={json}");
+        assert!(
+            !text.contains("cli"),
+            "json={json}: {:?}",
+            &text[text.len() - 60..]
+        );
+    }
+}
+
+#[test]
+fn log_cut_at_the_char_cap_does_not_leak_a_token_prefix() {
+    let command = ShellCommand {
+        id: "c".to_owned(),
+        command: "make".to_owned(),
+        log: format!("{}{TOKEN}", "x".repeat(MAX_LOG_CHARS - 5)),
+        ended_ms: Some(9),
+        exit_code: Some(0),
+        ..ShellCommand::default()
+    };
+    let mut out = Vec::new();
+    let summary = Summary {
+        api_wait_ms: 0,
+        tool_ms: 0,
+        shell_ms: 0,
+        idle_ms: 0,
+        overhead_ms: 0,
+    };
+    write_report(
+        &mut out,
+        "job-1",
+        &summary,
+        &[command],
+        &Redactor::new([TOKEN]),
+        true,
+        false,
+    )
+    .expect("write to a Vec");
+    let text = String::from_utf8_lossy(&out).into_owned();
+    assert!(text.contains("-- log cut --"), "{text}");
+    assert!(!text.contains("cli"), "{text}");
+}
+
+#[test]
+fn command_id_is_scrubbed_of_the_token() {
+    let command = ShellCommand {
+        id: format!("c-{TOKEN}"),
+        command: "make".to_owned(),
+        ended_ms: Some(9),
+        exit_code: Some(0),
+        ..ShellCommand::default()
+    };
+    let mut out = Vec::new();
+    let summary = Summary {
+        api_wait_ms: 0,
+        tool_ms: 0,
+        shell_ms: 0,
+        idle_ms: 0,
+        overhead_ms: 0,
+    };
+    write_report(
+        &mut out,
+        "job-1",
+        &summary,
+        &[command],
+        &Redactor::new([TOKEN]),
+        true,
+        false,
+    )
+    .expect("write to a Vec");
+    let text = String::from_utf8_lossy(&out).into_owned();
+    assert!(!text.contains("client-token"), "{text}");
+    assert!(text.contains("c-[REDACTED]\tdone"), "{text}");
 }

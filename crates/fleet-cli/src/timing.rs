@@ -16,7 +16,7 @@ use fleet_proto::{
 };
 use tonic::{Status, Streaming};
 
-use super::{CliError, Client, is_hostile, sanitize, sanitize_free};
+use super::{CliError, Client, Scrub, sanitize, sanitize_free, scrub};
 
 /// Most bytes of one chunk this command prints. A longer chunk is cut here.
 pub const MAX_PRINT_CHUNK_BYTES: usize = MAX_SHELL_LOG_CHUNK_BYTES;
@@ -154,17 +154,6 @@ struct Detail {
     ended_by: Option<String>,
 }
 
-fn strip_keeping_lines(text: &str) -> String {
-    text.chars()
-        .filter(|c| matches!(c, '\n' | '\t') || !is_hostile(*c))
-        .collect()
-}
-
-fn scrub(redactor: &Redactor, text: &str) -> String {
-    let stripped = strip_keeping_lines(text);
-    strip_keeping_lines(&redactor.redact_str(&stripped))
-}
-
 fn clean_log(redactor: &Redactor, log: &str, upstream_cut: bool) -> (String, bool) {
     let mut kept: String = scrub(redactor, log)
         .chars()
@@ -180,7 +169,7 @@ fn clean_log(redactor: &Redactor, log: &str, upstream_cut: bool) -> (String, boo
 fn detail(command: &ShellCommand, redactor: &Redactor) -> Detail {
     let (log, log_cut) = clean_log(redactor, &command.log, command.log_truncated);
     Detail {
-        id: sanitize(&command.id),
+        id: sanitize(&scrub(redactor, &command.id)),
         status: command_status(command),
         background: command.background,
         log,
@@ -371,19 +360,49 @@ fn utf8_boundary(buf: &[u8]) -> usize {
     len
 }
 
-fn clean_text(bytes: &[u8]) -> String {
-    String::from_utf8_lossy(bytes)
-        .chars()
-        .filter(|c| *c == '\n' || *c == '\t' || !is_hostile(*c))
-        .collect()
+fn write_json_chunk(
+    out: &mut impl Write,
+    command_id: &str,
+    seq: u32,
+    status: &str,
+    text: &str,
+) -> std::io::Result<()> {
+    writeln!(
+        out,
+        "{{\"command_id\":{},\"seq\":{seq},\"status\":\"{status}\",\"text\":{}}}",
+        json_text(command_id),
+        json_text(text),
+    )
+}
+
+fn write_rest(
+    out: &mut impl Write,
+    json: bool,
+    command_id: &str,
+    seq: u32,
+    status: &str,
+    text: &str,
+) -> std::io::Result<bool> {
+    if text.is_empty() {
+        return Ok(false);
+    }
+    if json {
+        write_json_chunk(out, command_id, seq, status, text)?;
+    } else {
+        out.write_all(text.as_bytes())?;
+    }
+    Ok(text.ends_with('\n'))
 }
 
 async fn print_chunks<S: ChunkSource>(
     source: &mut S,
     command_id: &str,
     json: bool,
+    scrub: &Scrub,
     out: &mut impl Write,
 ) -> Result<(), CliError> {
+    let mut stream = scrub.stream();
+    let mut last = (0u32, "unknown");
     let mut pending: Vec<u8> = Vec::new();
     let mut next_seq: u32 = 0;
     let mut total = 0usize;
@@ -432,24 +451,25 @@ async fn print_chunks<S: ChunkSource>(
             pending.extend_from_slice(chunk.bytes.get(..take).unwrap_or_default());
             let whole = utf8_boundary(&pending);
             let ready: Vec<u8> = pending.drain(..whole).collect();
-            let text = clean_text(&ready);
+            let text = stream.push(&String::from_utf8_lossy(&ready));
+            let status = ShellStatus::try_from(chunk.status)
+                .ok()
+                .and_then(shell_status_name)
+                .unwrap_or("unknown");
+            last = (chunk.seq, status);
             if json {
-                let status = ShellStatus::try_from(chunk.status)
-                    .ok()
-                    .and_then(shell_status_name)
-                    .unwrap_or("unknown");
-                writeln!(
-                    out,
-                    "{{\"command_id\":{},\"seq\":{},\"status\":\"{status}\",\"text\":{}}}",
-                    json_text(command_id),
-                    chunk.seq,
-                    json_text(&text),
-                )?;
+                write_json_chunk(out, command_id, chunk.seq, status, &text)?;
             } else if !text.is_empty() {
                 out.write_all(text.as_bytes())?;
                 last_newline = text.ends_with('\n');
             }
             if take < chunk.bytes.len() || total >= MAX_PRINT_TOTAL_BYTES {
+                let rest = stream.finish_cut();
+                if write_rest(out, json, command_id, last.0, last.1, &rest)? {
+                    last_newline = true;
+                } else if !json && !rest.is_empty() {
+                    last_newline = false;
+                }
                 writeln!(out, "{CUT_MARKER}")?;
                 cut = true;
             }
@@ -458,11 +478,12 @@ async fn print_chunks<S: ChunkSource>(
             break;
         }
     }
-    if !pending.is_empty() {
-        let text = clean_text(&pending);
+    let mut rest = stream.push(&String::from_utf8_lossy(&pending));
+    rest.push_str(&stream.finish());
+    if !rest.is_empty() {
+        let ends = write_rest(out, json, command_id, last.0, last.1, &rest)?;
         if !json {
-            out.write_all(text.as_bytes())?;
-            last_newline = text.ends_with('\n');
+            last_newline = ends;
         }
     }
     if !json && !last_newline {
@@ -493,10 +514,14 @@ pub async fn print_log<S: ChunkSource>(
     source: &mut S,
     command_id: &str,
     json: bool,
+    scrub: &Scrub,
     out: &mut impl Write,
 ) -> Result<(), CliError> {
-    if let Ok(result) =
-        tokio::time::timeout(FOLLOW_DEADLINE, print_chunks(source, command_id, json, out)).await
+    if let Ok(result) = tokio::time::timeout(
+        FOLLOW_DEADLINE,
+        print_chunks(source, command_id, json, scrub, out),
+    )
+    .await
     {
         result
     } else {
@@ -529,6 +554,7 @@ pub(crate) async fn follow(
     job: &str,
     command_id: &str,
     json: bool,
+    scrub: &Scrub,
     out: &mut impl Write,
 ) -> Result<(), CliError> {
     check_command_id(command_id)?;
@@ -546,5 +572,5 @@ pub(crate) async fn follow(
         return Err(CliError::JobEnded("timed out"));
     };
     let mut stream = opened?.into_inner();
-    print_log(&mut stream, command_id, json, out).await
+    print_log(&mut stream, command_id, json, scrub, out).await
 }

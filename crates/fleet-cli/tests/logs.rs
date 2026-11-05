@@ -150,23 +150,25 @@ async fn serve(
 }
 
 async fn logs(url: &str, args: &[&str]) -> (Result<(), CliError>, String) {
+    logs_with(url, args, |name| match name {
+        "FLEET_CLIENT_TOKEN" => Some(TOKEN.to_owned()),
+        _ => None,
+    })
+    .await
+}
+
+async fn logs_with(
+    url: &str,
+    args: &[&str],
+    lookup: impl Fn(&str) -> Option<String>,
+) -> (Result<(), CliError>, String) {
     let mut full = vec!["fleet", "--server", url, "logs"];
     full.extend_from_slice(args);
     let Ok(parsed) = Cli::try_parse_from(full) else {
         return (Err(CliError::Usage("parse".into())), String::new());
     };
     let mut out = Vec::new();
-    let result = run_with(
-        parsed,
-        |name| match name {
-            "FLEET_CLIENT_TOKEN" => Some(TOKEN.to_owned()),
-            _ => None,
-        },
-        false,
-        &mut std::io::empty(),
-        &mut out,
-    )
-    .await;
+    let result = run_with(parsed, lookup, false, &mut std::io::empty(), &mut out).await;
     (result, String::from_utf8_lossy(&out).into_owned())
 }
 
@@ -319,5 +321,109 @@ async fn a_transcript_page_above_the_default_decode_limit_is_accepted() -> TestR
     let (res, out) = logs(&url, &["job-1"]).await;
     res?;
     assert_eq!(out.len(), big.len() + 1);
+    Ok(())
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_file_token_with_the_env_unset_is_redacted_from_logs() -> TestResult {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = tempfile::tempdir()?;
+    let fleet_dir = dir.path().join("fleet");
+    std::fs::create_dir_all(&fleet_dir)?;
+    let file = fleet_dir.join("token");
+    std::fs::write(&file, format!("{TOKEN}\n"))?;
+    std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o600))?;
+    let base = dir.path().display().to_string();
+    let (url, _) = serve(
+        vec![reply(vec![chunk(1, &format!("key={TOKEN}\n"))], true)],
+        JobState::Succeeded,
+    )
+    .await?;
+    let (res, out) = logs_with(&url, &["job-1", "--follow"], |name| {
+        (name == "XDG_CONFIG_HOME").then(|| base.clone())
+    })
+    .await;
+    res?;
+    assert_eq!(out, "key=[REDACTED]\n");
+    Ok(())
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_token_with_zero_width_and_bidi_characters_is_redacted_from_logs() -> TestResult {
+    let (url, _) = serve(
+        vec![reply(
+            vec![chunk(
+                1,
+                "k=client-\u{200B}token\u{202E}-0123\u{FEFF}456789\u{2028}!\n",
+            )],
+            true,
+        )],
+        JobState::Succeeded,
+    )
+    .await?;
+    let (res, out) = logs(&url, &["job-1", "--follow"]).await;
+    res?;
+    assert_eq!(out, "k=[REDACTED]!\n");
+    Ok(())
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_token_straddling_chunk_and_page_boundaries_is_redacted() -> TestResult {
+    let (url, _) = serve(
+        vec![
+            reply(vec![chunk(1, "a client-tok"), chunk(2, "en-0123")], false),
+            reply(vec![chunk(3, "456789 b\n")], true),
+        ],
+        JobState::Succeeded,
+    )
+    .await?;
+    let (res, out) = logs(&url, &["job-1", "--follow"]).await;
+    res?;
+    assert!(!out.contains("client-tok"), "{out:?}");
+    assert!(out.contains("a "), "{out:?}");
+    assert!(out.contains("[REDACTED] b"), "{out:?}");
+    Ok(())
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_held_prefix_is_printed_when_the_stream_ends() -> TestResult {
+    let (url, _) = serve(
+        vec![reply(vec![chunk(1, "tail client-tok")], true)],
+        JobState::Succeeded,
+    )
+    .await?;
+    let (res, out) = logs(&url, &["job-1", "--follow"]).await;
+    res?;
+    assert_eq!(out, "tail \nclient-tok\n");
+    Ok(())
+}
+
+#[tokio::test(start_paused = true)]
+async fn an_rpc_status_message_carrying_the_token_is_redacted_in_the_error() -> TestResult {
+    let (url, _) = serve(
+        vec![Err(Status::failed_precondition(format!(
+            "bad {TOKEN} here"
+        )))],
+        JobState::Succeeded,
+    )
+    .await?;
+    let (res, _) = logs(&url, &["job-1"]).await;
+    let Err(error) = res else {
+        return Err("expected an error".into());
+    };
+    let shown = error.to_string();
+    assert!(!shown.contains(TOKEN), "{shown}");
+    assert!(shown.contains("bad [REDACTED] here"), "{shown}");
+    Ok(())
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_token_prefix_held_at_a_server_cut_is_dropped() -> TestResult {
+    let mut cut = chunk(1, "ok client-tok");
+    cut.truncated = true;
+    let (url, _) = serve(vec![reply(vec![cut], true)], JobState::Succeeded).await?;
+    let (res, out) = logs(&url, &["job-1"]).await;
+    res?;
+    assert_eq!(out, "ok \n-- transcript truncated --\n");
     Ok(())
 }
