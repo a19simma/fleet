@@ -862,6 +862,18 @@ impl WebAuth {
         }))
     }
 
+    /// Reads the admin flag of `user_id` from the database, never from a session row.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AuthError::Internal`] for a database failure.
+    pub(super) async fn is_admin(&self, user_id: i64) -> Result<bool, AuthError> {
+        self.users
+            .is_admin(user_id)
+            .await
+            .map_err(|_| AuthError::Internal)
+    }
+
     /// Deletes the session behind a cookie value.
     ///
     /// # Errors

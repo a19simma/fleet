@@ -45,7 +45,7 @@ use tonic::{Request, Response, Status};
 use tonic_prost::prost::Message;
 use tower::layer::util::{Identity, Stack};
 
-use crate::auth::{BearerAuth, Caller};
+use crate::auth::{ADMIN_REQUIRED, BearerAuth, Caller};
 use crate::catalog;
 use crate::cred::{CredentialService, capability};
 use crate::jobs::validate_job_id;
@@ -549,6 +549,15 @@ fn caller_of<T>(request: &Request<T>) -> Option<i64> {
         .map(|caller| caller.user_id)
 }
 
+fn admin_of<T>(request: &Request<T>) -> Result<i64, Status> {
+    let caller = request
+        .extensions()
+        .get::<Caller>()
+        .ok_or_else(|| Status::permission_denied(ADMIN_REQUIRED))?;
+    caller.require_admin()?;
+    Ok(caller.user_id)
+}
+
 fn jobs_error(err: &StoreError) -> Status {
     match err {
         StoreError::KeyConflict => {
@@ -684,7 +693,9 @@ impl FleetCatalog for FleetService {
         &self,
         request: Request<ListCatalogRequest>,
     ) -> Result<Response<ListCatalogReply>, Status> {
-        catalog::list_catalog(request.get_ref()).map(Response::new)
+        catalog::list_catalog(self.store.pool(), request.get_ref())
+            .await
+            .map(Response::new)
     }
 }
 
@@ -694,14 +705,20 @@ impl FleetCatalogAdmin for FleetService {
         &self,
         request: Request<UpsertCatalogItemRequest>,
     ) -> Result<Response<CatalogItem>, Status> {
-        catalog::upsert_catalog_item(request.get_ref()).map(Response::new)
+        let actor = admin_of(&request)?;
+        catalog::upsert_item(self.store.pool(), actor, request.get_ref())
+            .await
+            .map(Response::new)
     }
 
     async fn set_catalog_item_enabled(
         &self,
         request: Request<SetCatalogItemEnabledRequest>,
     ) -> Result<Response<CatalogItem>, Status> {
-        catalog::set_catalog_item_enabled(request.get_ref()).map(Response::new)
+        let actor = admin_of(&request)?;
+        catalog::set_enabled(self.store.pool(), actor, request.get_ref())
+            .await
+            .map(Response::new)
     }
 }
 
@@ -711,6 +728,7 @@ impl FleetCapabilityAdmin for FleetService {
         &self,
         request: Request<GrantCapabilityRequest>,
     ) -> Result<Response<UserCapability>, Status> {
+        admin_of(&request)?;
         capability::grant(request.get_ref()).map(Response::new)
     }
 
@@ -718,6 +736,7 @@ impl FleetCapabilityAdmin for FleetService {
         &self,
         request: Request<RevokeCapabilityRequest>,
     ) -> Result<Response<RevokeCapabilityReply>, Status> {
+        admin_of(&request)?;
         capability::revoke(request.get_ref()).map(Response::new)
     }
 
@@ -725,6 +744,7 @@ impl FleetCapabilityAdmin for FleetService {
         &self,
         request: Request<ListCapabilitiesRequest>,
     ) -> Result<Response<ListCapabilitiesReply>, Status> {
+        admin_of(&request)?;
         capability::list(request.get_ref()).map(Response::new)
     }
 }

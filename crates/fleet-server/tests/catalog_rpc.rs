@@ -1,7 +1,8 @@
 //! The profile sharing, catalog and capability RPCs over a real tonic server on a loopback
-//! port, and the admin handlers called directly. Every handler is a stub that answers
-//! `UNIMPLEMENTED` for the token that reaches it. The client token reads the catalog and shares
-//! profiles, the box token reaches neither, and no token reaches an admin service. The tests need
+//! port, and the capability handlers called directly. The sharing and capability handlers are
+//! stubs that answer `UNIMPLEMENTED` for the caller that reaches them. The client token lists the
+//! catalog and shares profiles, the box token reaches neither, and no static token reaches an
+//! admin service. The tests need
 //! a Postgres superuser URL in `DATABASE_URL` and live in their own binary because each one binds
 //! a socket.
 
@@ -12,7 +13,6 @@ use std::net::SocketAddr;
 use fleet_proto::v1::fleet_capability_admin_client::FleetCapabilityAdminClient;
 use fleet_proto::v1::fleet_capability_admin_server::FleetCapabilityAdmin;
 use fleet_proto::v1::fleet_catalog_admin_client::FleetCatalogAdminClient;
-use fleet_proto::v1::fleet_catalog_admin_server::FleetCatalogAdmin;
 use fleet_proto::v1::fleet_catalog_client::FleetCatalogClient;
 use fleet_proto::v1::fleet_profiles_client::FleetProfilesClient;
 use fleet_proto::v1::{
@@ -99,20 +99,26 @@ fn capability_admin(
     FleetCapabilityAdminClient::with_interceptor(channel(addr), i)
 }
 
+fn admin_denied(err: &Status) {
+    assert_eq!(err.code(), Code::PermissionDenied);
+    assert_eq!(err.message(), "admin required");
+}
+
 fn denied(err: &Status) {
     assert_eq!(err.code(), Code::PermissionDenied);
     assert_eq!(err.message(), DENIED);
 }
 
 #[sqlx::test]
-async fn list_catalog_is_unimplemented_for_the_client_token(pool: PgPool) {
+async fn list_catalog_answers_an_empty_page_for_the_client_token(pool: PgPool) {
     let (addr, _) = start(pool).await;
-    let err = catalog(addr, as_client)
+    let reply = catalog(addr, as_client)
         .list_catalog(ListCatalogRequest::default())
         .await
-        .unwrap_err();
-    assert_eq!(err.code(), Code::Unimplemented);
-    assert_eq!(err.message(), "the catalog is not implemented");
+        .unwrap()
+        .into_inner();
+    assert_eq!(reply.items.len(), 0);
+    assert_eq!(reply.next_id, "");
 }
 
 #[sqlx::test]
@@ -167,32 +173,32 @@ async fn no_token_reaches_an_admin_service(pool: PgPool) {
     let tokens: [Interceptor; 2] = [as_box, as_client];
     for i in tokens {
         let mut catalog = catalog_admin(addr, i);
-        denied(
+        admin_denied(
             &catalog
                 .upsert_catalog_item(UpsertCatalogItemRequest::default())
                 .await
                 .unwrap_err(),
         );
-        denied(
+        admin_denied(
             &catalog
                 .set_catalog_item_enabled(SetCatalogItemEnabledRequest::default())
                 .await
                 .unwrap_err(),
         );
         let mut caps = capability_admin(addr, i);
-        denied(
+        admin_denied(
             &caps
                 .grant_capability(GrantCapabilityRequest::default())
                 .await
                 .unwrap_err(),
         );
-        denied(
+        admin_denied(
             &caps
                 .revoke_capability(RevokeCapabilityRequest::default())
                 .await
                 .unwrap_err(),
         );
-        denied(
+        admin_denied(
             &caps
                 .list_capabilities(ListCapabilitiesRequest::default())
                 .await
@@ -202,34 +208,23 @@ async fn no_token_reaches_an_admin_service(pool: PgPool) {
 }
 
 #[sqlx::test]
-async fn the_admin_handlers_are_stubs(pool: PgPool) {
+async fn the_capability_handlers_are_stubs_for_an_admin_caller(pool: PgPool) {
     let store = Store::new(pool);
     store.migrate().await.unwrap();
     let svc = FleetService::new(store);
-    let upsert = svc
-        .upsert_catalog_item(Request::new(UpsertCatalogItemRequest::default()))
-        .await
-        .unwrap_err();
-    let enable = svc
-        .set_catalog_item_enabled(Request::new(SetCatalogItemEnabledRequest::default()))
-        .await
-        .unwrap_err();
-    for err in [upsert, enable] {
-        assert_eq!(err.code(), Code::Unimplemented);
-        assert_eq!(err.message(), "the catalog is not implemented");
-    }
-    let grant = svc
-        .grant_capability(Request::new(GrantCapabilityRequest::default()))
-        .await
-        .unwrap_err();
-    let revoke = svc
-        .revoke_capability(Request::new(RevokeCapabilityRequest::default()))
-        .await
-        .unwrap_err();
-    let list = svc
-        .list_capabilities(Request::new(ListCapabilitiesRequest::default()))
-        .await
-        .unwrap_err();
+    let admin = fleet_server::auth::Caller {
+        user_id: 1,
+        is_admin: true,
+    };
+    let mut grant = Request::new(GrantCapabilityRequest::default());
+    grant.extensions_mut().insert(admin);
+    let mut revoke = Request::new(RevokeCapabilityRequest::default());
+    revoke.extensions_mut().insert(admin);
+    let mut list = Request::new(ListCapabilitiesRequest::default());
+    list.extensions_mut().insert(admin);
+    let grant = svc.grant_capability(grant).await.unwrap_err();
+    let revoke = svc.revoke_capability(revoke).await.unwrap_err();
+    let list = svc.list_capabilities(list).await.unwrap_err();
     for err in [grant, revoke, list] {
         assert_eq!(err.code(), Code::Unimplemented);
         assert_eq!(err.message(), "capabilities are not implemented");

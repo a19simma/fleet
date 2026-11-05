@@ -35,7 +35,8 @@ const BOOTSTRAP_ID: &str = "SELECT bootstrap_user_id()";
 const INSERT_TOKEN: &str = "\
 INSERT INTO api_tokens (user_id, hash, label) VALUES ($1, sha256($2::bytea), $3) RETURNING id";
 const FIND_TOKEN: &str = "\
-SELECT user_id FROM api_tokens WHERE hash = sha256($1::bytea) AND revoked_at IS NULL";
+SELECT t.user_id, u.is_admin FROM api_tokens t JOIN users u ON u.id = t.user_id \
+WHERE t.hash = sha256($1::bytea) AND t.revoked_at IS NULL";
 const FIND_USER_CODE: &str = "\
 SELECT user_id FROM setup_codes \
 WHERE hash = sha256($1::bytea) AND used_at IS NULL AND expires_at > now()";
@@ -53,6 +54,15 @@ INSERT INTO admin_audit (action, user_id, username, operator) \
 VALUES ('bootstrap_password_revoked', $1, $2, 'server')";
 const REVOKE_TOKEN: &str = "\
 UPDATE api_tokens SET revoked_at = now() WHERE id = $1 AND user_id = $2 AND revoked_at IS NULL";
+
+/// The user an API token belongs to and whether that user is an admin right now.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TokenOwner {
+    /// The user's row id.
+    pub user_id: i64,
+    /// The `users.is_admin` flag at the time of the lookup.
+    pub is_admin: bool,
+}
 
 /// Why a user operation failed. Messages are fixed text.
 #[derive(Debug)]
@@ -566,10 +576,21 @@ impl Users {
     ///
     /// Returns [`UserError::Db`] for a database failure.
     pub async fn authenticate(&self, token: &[u8]) -> Result<Option<i64>, UserError> {
-        Ok(sqlx::query_scalar(FIND_TOKEN)
+        Ok(self.resolve_token(token).await?.map(|owner| owner.user_id))
+    }
+
+    /// Resolves a bearer value to its user and that user's admin flag in one query, read live
+    /// with no cache. `None` for an unknown or revoked token.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`UserError::Db`] for a database failure.
+    pub async fn resolve_token(&self, token: &[u8]) -> Result<Option<TokenOwner>, UserError> {
+        let row: Option<(i64, bool)> = sqlx::query_as(FIND_TOKEN)
             .bind(token)
             .fetch_optional(&self.pool)
-            .await?)
+            .await?;
+        Ok(row.map(|(user_id, is_admin)| TokenOwner { user_id, is_admin }))
     }
 }
 
