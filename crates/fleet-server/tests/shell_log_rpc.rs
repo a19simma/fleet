@@ -66,6 +66,7 @@ async fn world(pool: PgPool) -> World {
                 base_ref: "main".to_owned(),
                 open_pr: false,
                 agent: String::new(),
+                profile: String::new(),
             },
         )
         .await

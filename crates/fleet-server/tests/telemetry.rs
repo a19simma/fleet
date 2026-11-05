@@ -38,6 +38,7 @@ async fn claimed(store: &Store) -> Job {
             base_ref: "main".to_owned(),
             open_pr: true,
             agent: String::new(),
+            profile: String::new(),
         })
         .await
         .unwrap();

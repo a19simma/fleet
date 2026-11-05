@@ -361,6 +361,7 @@ message SubmitJobRequest {
   string base_ref = 4;
   bool open_pr = 5;
   string agent = 6;
+  string profile = 7;
 }
 
 message SubmitJudgeRequest {

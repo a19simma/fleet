@@ -115,6 +115,7 @@ pub fn validate_batch(request: &SubmitBatchRequest) -> Result<NewBatch, StoreErr
         base_ref: request.base_sha.clone(),
         open_pr: false,
         agent: request.agent.clone(),
+        profile: String::new(),
     })?;
     Ok(NewBatch {
         key: job.key,

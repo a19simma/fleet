@@ -203,6 +203,7 @@ async fn a_job_without_a_profile_carries_none_and_has_no_blob(pool: PgPool) {
             base_ref: "main".to_owned(),
             open_pr: false,
             agent: String::new(),
+            profile: String::new(),
         })
         .await
         .unwrap();
