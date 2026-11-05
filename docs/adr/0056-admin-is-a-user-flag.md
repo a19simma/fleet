@@ -9,15 +9,15 @@ ADR-0042 creates "the admin" at setup but stores no admin concept: the first use
 ### Storage
 
 - `users.is_admin boolean NOT NULL DEFAULT false` is the only admin concept.
-- The user created by setup redemption (`begin_redeem_setup`) is the first admin.
+- The user created by setup redemption is the first admin, through either first-admin path: `begin_redeem_setup` and `begin_redeem_password`. `create-user` inserts a non-admin.
 - The reserved `bootstrap` user can never be admin. A migration CHECK enforces it.
 - The migration lands as 0028. Migration 0027 is taken by the profile-id migration (ADR-0057).
 
 ### Promotion
 
 - `fleet-server admin grant-admin <username>` and `fleet-server admin revoke-admin <username>` run with direct database access like `create-user`, in one transaction, with an `admin_audit` row. The actions are `admin_grant` and `admin_revoke`.
-- Grant refuses `bootstrap` and unknown users.
-- Revoke refuses the last admin. It takes `FOR UPDATE` on the target row and counts admins in the same transaction.
+- Grant and revoke refuse `bootstrap` and unknown users with the same `no such user` error. Granting an admin or revoking a non-admin succeeds and writes an audit row.
+- Revoke refuses the last admin with exit code 7. In one transaction it locks every admin row `FOR UPDATE` in id order, locks the target row, then counts admins, so two concurrent revokes serialise and the second sees the first's result.
 - No RPC and no web route promotes anyone, so a stolen admin token cannot mint admins.
 
 ### RPC

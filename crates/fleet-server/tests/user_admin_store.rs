@@ -77,7 +77,7 @@ async fn insert_path_enroll_inserts_no_row_and_keeps_the_flag(pool: PgPool) {
         .await
         .unwrap();
     let id = users
-        .redeem_user_setup(outcome.setup_code.expose())
+        .redeem_user_setup(outcome.setup_code.as_ref().unwrap().expose())
         .await
         .unwrap();
     let after: i64 = sqlx::query_scalar("SELECT count(*) FROM users")

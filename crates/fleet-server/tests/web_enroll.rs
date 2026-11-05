@@ -184,7 +184,7 @@ fn authenticator() -> Authenticator {
 
 async fn issue(pool: &PgPool, cmd: &AdminCommand) -> (i64, String) {
     let outcome = run(pool, cmd, "test").await.unwrap();
-    let code = String::from_utf8(outcome.setup_code.expose().to_vec()).unwrap();
+    let code = String::from_utf8(outcome.setup_code.as_ref().unwrap().expose().to_vec()).unwrap();
     (outcome.user_id, code)
 }
 
