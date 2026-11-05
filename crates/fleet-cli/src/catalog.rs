@@ -3,14 +3,15 @@
 use std::io::{Read, Write};
 
 use clap::Subcommand;
+use fleet_proto::v1::fleet_capability_admin_client::FleetCapabilityAdminClient;
 use fleet_proto::v1::fleet_catalog_admin_client::FleetCatalogAdminClient;
 use fleet_proto::v1::fleet_catalog_client::FleetCatalogClient;
 use fleet_proto::v1::{
-    CatalogItem, CatalogKind, ListCatalogRequest, SetCatalogItemEnabledRequest,
-    UpsertCatalogItemRequest,
+    CatalogItem, CatalogKind, GrantCapabilityRequest, ListCapabilitiesRequest, ListCatalogRequest,
+    RevokeCapabilityRequest, SetCatalogItemEnabledRequest, UpsertCatalogItemRequest,
+    UserCapability,
 };
 use fleet_proto::{DEFAULT_CATALOG_PAGE, MAX_CATALOG_CONTENT_BYTES, validate_catalog_content};
-use tonic::Status;
 use tonic::service::interceptor::InterceptedService;
 use tonic::transport::Channel;
 
@@ -21,6 +22,9 @@ pub(crate) type CatalogClient = FleetCatalogClient<InterceptedService<Channel, B
 
 /// A `FleetCatalogAdmin` client carrying the bearer token.
 pub(crate) type CatalogAdminClient = FleetCatalogAdminClient<InterceptedService<Channel, Bearer>>;
+
+/// A `FleetCapabilityAdmin` client carrying the bearer token.
+pub(crate) type CapabilityClient = FleetCapabilityAdminClient<InterceptedService<Channel, Bearer>>;
 
 /// Most pages `list` follows. A server that keeps returning new cursors past this is treated
 /// as hostile.
@@ -77,7 +81,7 @@ pub enum UserArea {
 /// A `fleet user cap` action.
 #[derive(Debug, Subcommand)]
 pub enum CapAction {
-    /// List the capabilities a user holds.
+    /// List the capabilities a user holds, in the order the server returns them.
     List {
         /// User id.
         user: u64,
@@ -273,12 +277,80 @@ pub(crate) async fn run(
     }
 }
 
+async fn capability(
+    env: &Resolution,
+    timeouts: bool,
+) -> Result<(CapabilityClient, Scrub), CliError> {
+    let (channel, token, scrub) = connect(env, timeouts).await?;
+    let client = FleetCapabilityAdminClient::with_interceptor(channel, token)
+        .max_decoding_message_size(MAX_DECODE_BYTES);
+    Ok((client, scrub))
+}
+
+fn write_capability(
+    out: &mut impl Write,
+    scrub: &Scrub,
+    row: &UserCapability,
+) -> std::io::Result<()> {
+    writeln!(
+        out,
+        "{}\t{}\t{}\t{}",
+        row.user_id,
+        scrub.ident(&row.capability),
+        row.granted_by,
+        row.granted_at_ms,
+    )
+}
+
 /// Runs a `fleet user` area.
 ///
+/// `list` and `grant` print one `user, capability, granted_by, granted_at_ms` row per
+/// capability, tab separated, in the order the server returns them. `revoke` prints
+/// `revoked` or `not held`, a tab, the user id and the capability. The acting admin is the
+/// caller's token.
+///
 /// # Errors
-/// Returns an `UNIMPLEMENTED` [`CliError::Rpc`] until the command is built.
-pub(crate) fn run_user(_area: &UserArea) -> Result<(), CliError> {
-    Err(CliError::Rpc(Status::unimplemented(
-        "fleet user cap is not implemented",
-    )))
+/// Returns [`CliError::Io`] when the output cannot be written and [`CliError::Rpc`] for a
+/// server refusal such as `admin required`, an unknown user or an unknown capability.
+pub(crate) async fn run_user(
+    area: UserArea,
+    env: &Resolution,
+    timeouts: bool,
+    out: &mut impl Write,
+) -> Result<(), CliError> {
+    let UserArea::Cap { action } = area;
+    let (mut client, scrub) = capability(env, timeouts).await?;
+    match action {
+        CapAction::List { user } => {
+            let reply = client
+                .list_capabilities(ListCapabilitiesRequest { user_id: user })
+                .await?
+                .into_inner();
+            for row in &reply.capabilities {
+                write_capability(out, &scrub, row)?;
+            }
+        }
+        CapAction::Grant { user, capability } => {
+            let row = client
+                .grant_capability(GrantCapabilityRequest {
+                    user_id: user,
+                    capability,
+                })
+                .await?
+                .into_inner();
+            write_capability(out, &scrub, &row)?;
+        }
+        CapAction::Revoke { user, capability } => {
+            let reply = client
+                .revoke_capability(RevokeCapabilityRequest {
+                    user_id: user,
+                    capability: capability.clone(),
+                })
+                .await?
+                .into_inner();
+            let verdict = if reply.removed { "revoked" } else { "not held" };
+            writeln!(out, "{verdict}\t{user}\t{}", scrub.ident(&capability))?;
+        }
+    }
+    Ok(())
 }

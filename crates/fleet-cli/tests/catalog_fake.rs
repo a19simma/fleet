@@ -1,5 +1,5 @@
-//! `fleet catalog` against in-process `FleetCatalog` and `FleetCatalogAdmin` stubs: paging,
-//! the loop cap, request fields and the scrubbing of every printed server field.
+//! `fleet catalog` and `fleet user cap` against in-process stubs: paging, the loop cap, request
+//! fields, server row order and the scrubbing of every printed server field.
 
 #![expect(clippy::unwrap_used, reason = "test code asserts by panicking")]
 
@@ -8,11 +8,16 @@ use std::sync::{Arc, Mutex};
 use clap::Parser;
 use fleet_cli::{Cli, CliError, run};
 use fleet_proto::DEFAULT_CATALOG_PAGE;
+use fleet_proto::v1::fleet_capability_admin_server::{
+    FleetCapabilityAdmin, FleetCapabilityAdminServer,
+};
 use fleet_proto::v1::fleet_catalog_admin_server::{FleetCatalogAdmin, FleetCatalogAdminServer};
 use fleet_proto::v1::fleet_catalog_server::{FleetCatalog, FleetCatalogServer};
 use fleet_proto::v1::{
-    CatalogItem, CatalogKind, ListCatalogReply, ListCatalogRequest, SetCatalogItemEnabledRequest,
-    UpsertCatalogItemRequest,
+    CatalogItem, CatalogKind, GrantCapabilityRequest, ListCapabilitiesReply,
+    ListCapabilitiesRequest, ListCatalogReply, ListCatalogRequest, RevokeCapabilityReply,
+    RevokeCapabilityRequest, SetCatalogItemEnabledRequest, UpsertCatalogItemRequest,
+    UserCapability,
 };
 use tokio::net::TcpListener;
 use tokio_stream::wrappers::TcpListenerStream;
@@ -29,6 +34,11 @@ struct Stub {
     item: Option<CatalogItem>,
     upserts: Arc<Mutex<Vec<UpsertCatalogItemRequest>>>,
     toggles: Arc<Mutex<Vec<SetCatalogItemEnabledRequest>>>,
+    rows: Vec<UserCapability>,
+    removed: bool,
+    grants: Arc<Mutex<Vec<GrantCapabilityRequest>>>,
+    revokes: Arc<Mutex<Vec<RevokeCapabilityRequest>>>,
+    lists: Arc<Mutex<Vec<ListCapabilitiesRequest>>>,
 }
 
 fn item(id: &str, name: &str) -> CatalogItem {
@@ -86,13 +96,58 @@ impl FleetCatalogAdmin for Stub {
     }
 }
 
+#[tonic::async_trait]
+impl FleetCapabilityAdmin for Stub {
+    async fn grant_capability(
+        &self,
+        request: Request<GrantCapabilityRequest>,
+    ) -> Result<Response<UserCapability>, Status> {
+        locked(&self.grants)?.push(request.into_inner());
+        self.rows
+            .first()
+            .cloned()
+            .map(Response::new)
+            .ok_or_else(|| Status::internal("no row"))
+    }
+
+    async fn revoke_capability(
+        &self,
+        request: Request<RevokeCapabilityRequest>,
+    ) -> Result<Response<RevokeCapabilityReply>, Status> {
+        locked(&self.revokes)?.push(request.into_inner());
+        Ok(Response::new(RevokeCapabilityReply {
+            removed: self.removed,
+        }))
+    }
+
+    async fn list_capabilities(
+        &self,
+        request: Request<ListCapabilitiesRequest>,
+    ) -> Result<Response<ListCapabilitiesReply>, Status> {
+        locked(&self.lists)?.push(request.into_inner());
+        Ok(Response::new(ListCapabilitiesReply {
+            capabilities: self.rows.clone(),
+        }))
+    }
+}
+
+fn cap(user: u64, name: &str) -> UserCapability {
+    UserCapability {
+        user_id: user,
+        capability: name.into(),
+        granted_by: 1,
+        granted_at_ms: 5,
+    }
+}
+
 async fn serve(stub: Stub) -> Result<String, Box<dyn std::error::Error>> {
     let listener = TcpListener::bind("127.0.0.1:0").await?;
     let url = format!("http://{}", listener.local_addr()?);
     tokio::spawn(
         tonic::transport::Server::builder()
             .add_service(FleetCatalogServer::new(stub.clone()))
-            .add_service(FleetCatalogAdminServer::new(stub))
+            .add_service(FleetCatalogAdminServer::new(stub.clone()))
+            .add_service(FleetCapabilityAdminServer::new(stub))
             .serve_with_incoming(TcpListenerStream::new(listener)),
     );
     Ok(url)
@@ -268,5 +323,102 @@ async fn enable_and_disable_send_the_flag_and_print_the_item() -> TestResult {
         let last = toggles.last().ok_or("no toggle")?;
         assert_eq!((last.id.as_str(), last.enabled), ("tdd", flag), "{verb}");
     }
+    Ok(())
+}
+
+#[tokio::test]
+async fn cap_commands_send_the_user_and_capability_and_never_an_actor() -> TestResult {
+    let stub = Stub {
+        rows: vec![cap(7, "profile:tools")],
+        removed: true,
+        ..Stub::default()
+    };
+    let (grants, revokes, lists) = (
+        stub.grants.clone(),
+        stub.revokes.clone(),
+        stub.lists.clone(),
+    );
+    let url = serve(stub).await?;
+    let (r, out) = cli(&url, &["user", "cap", "grant", "7", "profile:tools"], b"").await;
+    r?;
+    assert_eq!(out, "7\tprofile:tools\t1\t5\n");
+    let (r, out) = cli(&url, &["user", "cap", "revoke", "7", "profile:tools"], b"").await;
+    r?;
+    assert_eq!(out, "revoked\t7\tprofile:tools\n");
+    let (r, out) = cli(&url, &["user", "cap", "list", "7"], b"").await;
+    r?;
+    assert_eq!(out, "7\tprofile:tools\t1\t5\n");
+    let grants = locked(&grants)?.clone();
+    assert_eq!(grants.len(), 1);
+    assert_eq!(
+        (grants[0].user_id, grants[0].capability.as_str()),
+        (7, "profile:tools")
+    );
+    let revokes = locked(&revokes)?.clone();
+    assert_eq!(revokes.len(), 1);
+    assert_eq!(
+        (revokes[0].user_id, revokes[0].capability.as_str()),
+        (7, "profile:tools")
+    );
+    let lists = locked(&lists)?.clone();
+    assert_eq!(lists.len(), 1);
+    assert_eq!(lists[0].user_id, 7);
+    Ok(())
+}
+
+#[tokio::test]
+async fn cap_list_keeps_the_server_row_order() -> TestResult {
+    let stub = Stub {
+        rows: vec![cap(7, "b"), cap(7, "a"), cap(7, "c")],
+        ..Stub::default()
+    };
+    let url = serve(stub).await?;
+    let (r, out) = cli(&url, &["user", "cap", "list", "7"], b"").await;
+    r?;
+    let names: Vec<&str> = out.lines().filter_map(|l| l.split('\t').nth(1)).collect();
+    assert_eq!(names, ["b", "a", "c"]);
+    Ok(())
+}
+
+#[tokio::test]
+async fn revoke_of_an_absent_grant_says_not_held() -> TestResult {
+    let url = serve(Stub::default()).await?;
+    let (r, out) = cli(&url, &["user", "cap", "revoke", "7", "profile:tools"], b"").await;
+    r?;
+    assert_eq!(out, "not held\t7\tprofile:tools\n");
+    Ok(())
+}
+
+#[tokio::test]
+async fn every_printed_cap_field_is_scrubbed_one_hostile_value_per_field() -> TestResult {
+    let hostile = format!("a\u{1b}[31m{TOKEN}\u{202e}\r\nb\u{2028}c");
+    let stub = Stub {
+        rows: vec![cap(7, &hostile)],
+        ..Stub::default()
+    };
+    let url = serve(stub).await?;
+    for args in [
+        &["user", "cap", "list", "7"][..],
+        &["user", "cap", "grant", "7", "x"],
+    ] {
+        let (r, out) = cli(&url, args, b"").await;
+        r?;
+        assert!(!out.contains(TOKEN), "{out:?}");
+        assert!(!out.contains("client-tok"), "{out:?}");
+        assert_eq!(out.lines().count(), 1, "{out:?}");
+        assert!(
+            !out.chars()
+                .any(|c| (c.is_control() && c != '\n' && c != '\t')
+                    || "\u{202e}\u{2028}".contains(c)),
+            "{out:?}"
+        );
+        assert_eq!(out.split('\t').count(), 4, "{out:?}");
+    }
+    let (r, out) = cli(&url, &["user", "cap", "revoke", "7", &hostile], b"").await;
+    r?;
+    assert!(!out.contains(TOKEN), "{out:?}");
+    assert!(!out.contains('\u{1b}'), "{out:?}");
+    assert_eq!(out.lines().count(), 1, "{out:?}");
+    assert_eq!(out.split('\t').count(), 3, "{out:?}");
     Ok(())
 }
