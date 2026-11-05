@@ -36,7 +36,10 @@ struct World {
 
 fn as_user<T>(user_id: i64, message: T) -> Request<T> {
     let mut request = Request::new(message);
-    request.extensions_mut().insert(Caller { user_id });
+    request.extensions_mut().insert(Caller {
+        user_id,
+        is_admin: false,
+    });
     request
 }
 

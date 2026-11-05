@@ -166,7 +166,10 @@ async fn a_worst_case_list_jobs_reply_is_not_capped_to_the_timing_limit(pool: Pg
 
 fn as_user<T>(user_id: i64, message: T) -> Request<T> {
     let mut request = Request::new(message);
-    request.extensions_mut().insert(Caller { user_id });
+    request.extensions_mut().insert(Caller {
+        user_id,
+        is_admin: false,
+    });
     request
 }
 

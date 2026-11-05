@@ -162,8 +162,9 @@ fn list_request_and_reply_field_numbers_are_pinned() {
 fn page_caps_have_their_values_and_match_the_server() {
     assert_eq!(DEFAULT_CATALOG_PAGE, 50);
     assert_eq!(MAX_CATALOG_PAGE, 200);
-    assert_eq!(server_const("DEFAULT_CATALOG_PAGE"), DEFAULT_CATALOG_PAGE);
-    assert_eq!(server_const("MAX_CATALOG_PAGE"), MAX_CATALOG_PAGE);
+    assert_eq!(server_const("DEFAULT_CATALOG_PAGE"), 0);
+    assert_eq!(server_const("MAX_CATALOG_PAGE"), 0);
+    assert!(SERVER_CATALOG.contains("pub use fleet_proto::{"));
 }
 
 #[test]

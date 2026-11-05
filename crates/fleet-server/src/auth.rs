@@ -1,13 +1,22 @@
 //! Bearer token check, applied once as a tower layer around the whole gRPC router.
 //!
-//! Two tokens, scoped by gRPC path: the box token covers `FleetIngest` and `FleetWorker`,
-//! the client token covers `FleetQuery`, `FleetJobs`, `FleetProfiles`, `FleetBatches` and
-//! `FleetCredentials` and `FleetCatalog`. Any other path is denied, which closes
-//! `FleetCatalogAdmin` and `FleetCapabilityAdmin` to both tokens.
+//! Two static tokens plus per-user API tokens, scoped by gRPC path. The box token covers
+//! `FleetIngest` and `FleetWorker`. The client scope covers `FleetQuery`, `FleetJobs`,
+//! `FleetJudge`, `FleetProfiles`, `FleetBatches`, `FleetCredentials` and `FleetCatalog`. Any
+//! other path is denied.
 //!
-//! With a [`Users`] store the layer also resolves the caller: a per-user API token maps to its
-//! user, `FLEET_CLIENT_TOKEN` maps to the `bootstrap` user, and the result rides the request
-//! as a [`Caller`] extension. The box token carries no user.
+//! The two admin services, `FleetCatalogAdmin` and `FleetCapabilityAdmin`, sit outside both
+//! static scopes. A request reaches one of their five RPCs only with a per-user API token whose
+//! user has `users.is_admin` set. The box token, `FLEET_CLIENT_TOKEN` (the `bootstrap` user,
+//! never admin) and a non-admin API token get `PERMISSION_DENIED` with the fixed reason
+//! [`ADMIN_REQUIRED`], and so does any admin-service path that names none of the five RPCs. A
+//! bad or revoked token is `UNAUTHENTICATED` before the path is looked at.
+//!
+//! With a [`Users`] store the layer resolves the caller: one joined query maps an API token to
+//! its user and that user's admin flag, read on every request with no cache, so a demotion bites
+//! on the next call. `FLEET_CLIENT_TOKEN` maps to the `bootstrap` user and the box token carries
+//! no user. The result rides the request as a [`Caller`] extension, and an admin handler
+//! re-checks it with [`Caller::require_admin`]; a request with no [`Caller`] is denied there.
 
 use std::convert::Infallible;
 use std::future::Future;
@@ -23,6 +32,7 @@ use tower::{Layer, Service};
 
 use crate::config::{Secret, Token};
 use crate::cred::Users;
+use crate::cred::users::TokenOwner;
 
 const INGEST: &str = "/fleet.v1.FleetIngest/";
 const WORKER: &str = "/fleet.v1.FleetWorker/";
@@ -33,6 +43,23 @@ const PROFILES: &str = "/fleet.v1.FleetProfiles/";
 const BATCHES: &str = "/fleet.v1.FleetBatches/";
 const CREDENTIALS: &str = "/fleet.v1.FleetCredentials/";
 const CATALOG: &str = "/fleet.v1.FleetCatalog/";
+const CATALOG_ADMIN: &str = "/fleet.v1.FleetCatalogAdmin/";
+
+/// The fixed `PERMISSION_DENIED` reason for every refusal of an admin RPC.
+pub const ADMIN_REQUIRED: &str = "admin required";
+
+/// The five admin RPC paths. An admin-service path outside this list is denied to everyone.
+pub const ADMIN_RPCS: [&str; 5] = [
+    "/fleet.v1.FleetCatalogAdmin/UpsertCatalogItem",
+    "/fleet.v1.FleetCatalogAdmin/SetCatalogItemEnabled",
+    "/fleet.v1.FleetCapabilityAdmin/GrantCapability",
+    "/fleet.v1.FleetCapabilityAdmin/RevokeCapability",
+    "/fleet.v1.FleetCapabilityAdmin/ListCapabilities",
+];
+
+fn is_admin_path(path: &str) -> bool {
+    path.starts_with(CATALOG_ADMIN) || path.starts_with(fleet_proto::CAPABILITY_ADMIN_PATH)
+}
 
 /// The user a request acts as, set by [`BearerAuth`] on every client-scope request when it has a
 /// [`Users`] store.
@@ -40,6 +67,23 @@ const CATALOG: &str = "/fleet.v1.FleetCatalog/";
 pub struct Caller {
     /// The user's row id.
     pub user_id: i64,
+    /// The user's `users.is_admin` flag, read in this request's token lookup.
+    pub is_admin: bool,
+}
+
+impl Caller {
+    /// Refuses a caller that is not an admin.
+    ///
+    /// # Errors
+    ///
+    /// Returns `PERMISSION_DENIED` with [`ADMIN_REQUIRED`].
+    pub fn require_admin(&self) -> Result<(), Status> {
+        if self.is_admin {
+            Ok(())
+        } else {
+            Err(Status::permission_denied(ADMIN_REQUIRED))
+        }
+    }
 }
 
 /// Which token a request carried.
@@ -120,11 +164,15 @@ impl BearerAuth {
     /// # Errors
     ///
     /// Returns `UNAUTHENTICATED` when the header is missing or matches no token, and
-    /// `PERMISSION_DENIED` when it matches a token whose scope excludes `path`.
+    /// `PERMISSION_DENIED` when it matches a token whose scope excludes `path`. Without a user
+    /// store no token is an admin, so every admin path is denied with [`ADMIN_REQUIRED`].
     pub fn check(&self, path: &str, header: Option<&[u8]>) -> Result<(), Status> {
         let scope = self
             .scope_of(header.unwrap_or_default())
             .ok_or_else(|| Status::unauthenticated("missing or invalid bearer token"))?;
+        if is_admin_path(path) {
+            return Err(Status::permission_denied(ADMIN_REQUIRED));
+        }
         if Self::allows(scope, path) {
             Ok(())
         } else {
@@ -139,12 +187,15 @@ impl BearerAuth {
     /// Authenticates a request and resolves its caller.
     ///
     /// A value that matches neither static token is looked up as an API token when a
-    /// [`Users`] store is set. The caller is `None` for the box token and when no store is set.
+    /// [`Users`] store is set, together with its user's admin flag. The caller is `None` for the
+    /// box token and when no store is set. An admin RPC path passes only for an API token whose
+    /// user is an admin.
     ///
     /// # Errors
     ///
     /// Returns `UNAUTHENTICATED` for a missing, unknown or revoked token, `PERMISSION_DENIED`
-    /// when the scope excludes `path`, and `UNAVAILABLE` when the user lookup fails.
+    /// when the scope excludes `path` (with [`ADMIN_REQUIRED`] on an admin path), and
+    /// `UNAVAILABLE` when the user lookup fails.
     pub async fn authenticate(
         &self,
         path: &str,
@@ -160,15 +211,21 @@ impl BearerAuth {
                 let token = header.strip_prefix(b"Bearer ");
                 let found = match (users, token) {
                     (Some(users), Some(token)) => {
-                        users.authenticate(token).await.map_err(unavailable)?
+                        users.resolve_token(token).await.map_err(unavailable)?
                     }
                     _ => None,
                 };
-                let user_id = found
+                let TokenOwner { user_id, is_admin } = found
                     .ok_or_else(|| Status::unauthenticated("missing or invalid bearer token"))?;
-                (Scope::Client, Some(Caller { user_id }))
+                (Scope::Client, Some(Caller { user_id, is_admin }))
             }
         };
+        if is_admin_path(path) {
+            return match caller {
+                Some(caller) if caller.is_admin && ADMIN_RPCS.contains(&path) => Ok(Some(caller)),
+                _ => Err(Status::permission_denied(ADMIN_REQUIRED)),
+            };
+        }
         if !Self::allows(scope, path) {
             return Err(Status::permission_denied(
                 "bearer token not valid for this service",
@@ -176,7 +233,10 @@ impl BearerAuth {
         }
         if let (Scope::Client, None, Some(users)) = (scope, caller, self.users.as_ref()) {
             let user_id = users.bootstrap_user().await.map_err(unavailable)?;
-            return Ok(Some(Caller { user_id }));
+            return Ok(Some(Caller {
+                user_id,
+                is_admin: false,
+            }));
         }
         Ok(caller)
     }

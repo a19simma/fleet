@@ -8,10 +8,12 @@ use fleet_core::catalog::{
 };
 use fleet_proto::v1::{CatalogKind, SetCatalogItemEnabledRequest, UpsertCatalogItemRequest};
 use fleet_server::catalog::{
-    DEFAULT_CATALOG_PAGE, MAX_CATALOG_PAGE, REASON_ADMIN_REQUIRED, REASON_IDENTITY_CHANGE,
-    REASON_KIND_UNKNOWN, REASON_NAME_TAKEN, REASON_NOT_FOUND, Scope, list_enabled,
-    list_enabled_capped, set_enabled, upsert_item,
+    DEFAULT_CATALOG_PAGE, MAX_CATALOG_CURSOR_BYTES, MAX_CATALOG_PAGE, REASON_ADMIN_REQUIRED,
+    REASON_CURSOR_INVALID, REASON_IDENTITY_CHANGE, REASON_KIND_UNKNOWN, REASON_NAME_TAKEN,
+    REASON_NOT_FOUND, list_enabled, list_enabled_capped, set_enabled, upsert_item,
 };
+use fleet_server::cred::admin::{AdminCommand, run};
+use fleet_server::cred::users::Users;
 use sqlx::PgPool;
 use tonic::Code;
 
@@ -44,12 +46,45 @@ async fn migrated(pool: &PgPool) {
     sqlx::migrate!("./migrations").run(pool).await.unwrap();
 }
 
+async fn user(pool: &PgPool, name: &str, admin: bool) -> i64 {
+    let id = run(pool, &AdminCommand::CreateUser(name.into()), "op")
+        .await
+        .unwrap()
+        .user_id;
+    if admin {
+        Users::new(pool.clone()).set_admin(id, true).await.unwrap();
+    }
+    id
+}
+
+async fn admin(pool: &PgPool) -> i64 {
+    match sqlx::query_scalar("SELECT id FROM users WHERE username = 'root'")
+        .fetch_optional(pool)
+        .await
+        .unwrap()
+    {
+        Some(id) => id,
+        None => user(pool, "root", true).await,
+    }
+}
+
+async fn plain(pool: &PgPool) -> i64 {
+    match sqlx::query_scalar("SELECT id FROM users WHERE username = 'plain'")
+        .fetch_optional(pool)
+        .await
+        .unwrap()
+    {
+        Some(id) => id,
+        None => user(pool, "plain", false).await,
+    }
+}
+
 #[sqlx::test(migrations = false)]
 async fn a_non_admin_is_refused_and_no_row_changes(pool: PgPool) {
     migrated(&pool).await;
     upsert_item(
         &pool,
-        Scope::Admin,
+        admin(&pool).await,
         &upsert("a", CatalogKind::Skill, "a", "body"),
     )
     .await
@@ -58,7 +93,7 @@ async fn a_non_admin_is_refused_and_no_row_changes(pool: PgPool) {
 
     let err = upsert_item(
         &pool,
-        Scope::Client,
+        plain(&pool).await,
         &upsert("a", CatalogKind::Skill, "a", "other"),
     )
     .await
@@ -69,7 +104,7 @@ async fn a_non_admin_is_refused_and_no_row_changes(pool: PgPool) {
     );
     let err = upsert_item(
         &pool,
-        Scope::Client,
+        plain(&pool).await,
         &upsert("b", CatalogKind::Skill, "b", "body"),
     )
     .await
@@ -78,7 +113,7 @@ async fn a_non_admin_is_refused_and_no_row_changes(pool: PgPool) {
         (err.code(), err.message()),
         (Code::PermissionDenied, REASON_ADMIN_REQUIRED)
     );
-    let err = set_enabled(&pool, Scope::Client, &enable("a", true))
+    let err = set_enabled(&pool, plain(&pool).await, &enable("a", true))
         .await
         .unwrap_err();
     assert_eq!(
@@ -94,7 +129,7 @@ async fn an_admin_upsert_stores_the_recomputed_digest_and_stays_disabled(pool: P
     migrated(&pool).await;
     let item = upsert_item(
         &pool,
-        Scope::Admin,
+        admin(&pool).await,
         &upsert("a", CatalogKind::Skill, "a", "body"),
     )
     .await
@@ -126,7 +161,7 @@ async fn a_forged_stored_digest_is_replaced_and_enabled_survives_an_upsert(pool:
     .unwrap();
     let item = upsert_item(
         &pool,
-        Scope::Admin,
+        admin(&pool).await,
         &upsert("a", CatalogKind::Skill, "a", "new"),
     )
     .await
@@ -146,7 +181,7 @@ async fn a_kind_or_name_change_on_an_existing_id_is_refused(pool: PgPool) {
     migrated(&pool).await;
     upsert_item(
         &pool,
-        Scope::Admin,
+        admin(&pool).await,
         &upsert("a", CatalogKind::Skill, "a", "body"),
     )
     .await
@@ -156,7 +191,7 @@ async fn a_kind_or_name_change_on_an_existing_id_is_refused(pool: PgPool) {
         upsert("a", CatalogKind::Subagent, "a", "changed"),
         upsert("a", CatalogKind::Skill, "renamed", "changed"),
     ] {
-        let err = upsert_item(&pool, Scope::Admin, &request)
+        let err = upsert_item(&pool, admin(&pool).await, &request)
             .await
             .unwrap_err();
         assert_eq!(
@@ -172,7 +207,7 @@ async fn a_kind_and_name_held_by_another_id_is_refused(pool: PgPool) {
     migrated(&pool).await;
     upsert_item(
         &pool,
-        Scope::Admin,
+        admin(&pool).await,
         &upsert("a", CatalogKind::Skill, "a", "body"),
     )
     .await
@@ -180,7 +215,7 @@ async fn a_kind_and_name_held_by_another_id_is_refused(pool: PgPool) {
     let before = snapshot(&pool).await;
     let err = upsert_item(
         &pool,
-        Scope::Admin,
+        admin(&pool).await,
         &upsert("b", CatalogKind::Skill, "a", "body"),
     )
     .await
@@ -201,7 +236,7 @@ async fn an_item_the_core_refuses_never_reaches_sql(pool: PgPool) {
         upsert("Bad Id", CatalogKind::Skill, "a", "body"),
     ];
     for request in cases {
-        let err = upsert_item(&pool, Scope::Admin, &request)
+        let err = upsert_item(&pool, admin(&pool).await, &request)
             .await
             .unwrap_err();
         assert_eq!(err.code(), Code::InvalidArgument);
@@ -214,16 +249,16 @@ async fn an_admin_flips_enabled_both_ways_and_an_unknown_id_is_not_found(pool: P
     migrated(&pool).await;
     upsert_item(
         &pool,
-        Scope::Admin,
+        admin(&pool).await,
         &upsert("a", CatalogKind::Skill, "a", "body"),
     )
     .await
     .unwrap();
-    let on = set_enabled(&pool, Scope::Admin, &enable("a", true))
+    let on = set_enabled(&pool, admin(&pool).await, &enable("a", true))
         .await
         .unwrap();
     assert!(on.admin_enabled);
-    let off = set_enabled(&pool, Scope::Admin, &enable("a", false))
+    let off = set_enabled(&pool, admin(&pool).await, &enable("a", false))
         .await
         .unwrap();
     assert!(!off.admin_enabled);
@@ -233,7 +268,7 @@ async fn an_admin_flips_enabled_both_ways_and_an_unknown_id_is_not_found(pool: P
             .unwrap()
             .digest()
     );
-    let err = set_enabled(&pool, Scope::Admin, &enable("zz", true))
+    let err = set_enabled(&pool, admin(&pool).await, &enable("zz", true))
         .await
         .unwrap_err();
     assert_eq!(
@@ -284,7 +319,7 @@ async fn every_hostile_string_field_is_refused_before_sql(pool: PgPool) {
     cases.push(upsert("a", CatalogKind::Skill, "a", &long_body));
     cases.push(upsert("a", CatalogKind::Tool, "a", "not a version"));
     for request in cases {
-        let err = upsert_item(&pool, Scope::Admin, &request)
+        let err = upsert_item(&pool, admin(&pool).await, &request)
             .await
             .unwrap_err();
         assert_eq!(err.code(), Code::InvalidArgument, "{request:?}");
@@ -309,10 +344,10 @@ async fn concurrent_upserts_of_one_id_cannot_flip_kind_or_name(pool: PgPool) {
             upsert(&id, CatalogKind::Context, &third, "four"),
         ];
         let results: [Result<_, tonic::Status>; 4] = tokio::join!(
-            upsert_item(&pool, Scope::Admin, &requests[0]),
-            upsert_item(&pool, Scope::Admin, &requests[1]),
-            upsert_item(&pool, Scope::Admin, &requests[2]),
-            upsert_item(&pool, Scope::Admin, &requests[3]),
+            upsert_item(&pool, admin(&pool).await, &requests[0]),
+            upsert_item(&pool, admin(&pool).await, &requests[1]),
+            upsert_item(&pool, admin(&pool).await, &requests[2]),
+            upsert_item(&pool, admin(&pool).await, &requests[3]),
         )
         .into();
         let winners: Vec<_> = results.iter().filter_map(|r| r.as_ref().ok()).collect();
@@ -343,11 +378,11 @@ async fn seed(pool: &PgPool, id: &str, kind: CatalogKind, enabled: bool) {
     } else {
         (id, "body")
     };
-    upsert_item(pool, Scope::Admin, &upsert(id, kind, name, content))
+    upsert_item(pool, admin(pool).await, &upsert(id, kind, name, content))
         .await
         .unwrap();
     if enabled {
-        set_enabled(pool, Scope::Admin, &enable(id, true))
+        set_enabled(pool, admin(pool).await, &enable(id, true))
             .await
             .unwrap();
     }
@@ -471,4 +506,120 @@ async fn the_real_cap_holds_at_and_just_over(pool: PgPool) {
     assert_eq!(max.items.len(), MAX_CATALOG_PAGE as usize);
     let default = list_enabled(&pool, 0, "", 0).await.unwrap();
     assert_eq!(default.items.len(), DEFAULT_CATALOG_PAGE as usize);
+}
+
+#[sqlx::test(migrations = false)]
+async fn a_demoted_or_unknown_actor_is_refused_and_no_row_changes(pool: PgPool) {
+    migrated(&pool).await;
+    let root = admin(&pool).await;
+    upsert_item(&pool, root, &upsert("a", CatalogKind::Skill, "a", "body"))
+        .await
+        .unwrap();
+    let before = snapshot(&pool).await;
+    Users::new(pool.clone())
+        .set_admin(root, false)
+        .await
+        .unwrap();
+
+    for actor in [root, i64::MAX] {
+        let err = upsert_item(&pool, actor, &upsert("a", CatalogKind::Skill, "a", "other"))
+            .await
+            .unwrap_err();
+        assert_eq!(
+            (err.code(), err.message()),
+            (Code::PermissionDenied, REASON_ADMIN_REQUIRED)
+        );
+        let err = set_enabled(&pool, actor, &enable("a", true))
+            .await
+            .unwrap_err();
+        assert_eq!(
+            (err.code(), err.message()),
+            (Code::PermissionDenied, REASON_ADMIN_REQUIRED)
+        );
+    }
+    assert_eq!(snapshot(&pool).await, before);
+}
+
+#[sqlx::test(migrations = false)]
+async fn a_write_waits_for_a_demotion_in_flight_then_is_refused(pool: PgPool) {
+    migrated(&pool).await;
+    let root = admin(&pool).await;
+    let mut demotion = pool.begin().await.unwrap();
+    sqlx::query("UPDATE users SET is_admin = false WHERE id = $1")
+        .bind(root)
+        .execute(&mut *demotion)
+        .await
+        .unwrap();
+
+    let writer = {
+        let pool = pool.clone();
+        tokio::spawn(async move {
+            upsert_item(&pool, root, &upsert("a", CatalogKind::Skill, "a", "body")).await
+        })
+    };
+    let waiting = tokio::time::timeout(std::time::Duration::from_millis(500), async {
+        while !writer.is_finished() {
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+    })
+    .await;
+    assert!(waiting.is_err(), "the write did not wait on the actor row");
+
+    demotion.commit().await.unwrap();
+    let err = tokio::time::timeout(std::time::Duration::from_secs(10), writer)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap_err();
+    assert_eq!(
+        (err.code(), err.message()),
+        (Code::PermissionDenied, REASON_ADMIN_REQUIRED)
+    );
+    assert_eq!(snapshot(&pool).await, "[]");
+}
+
+fn hostile_cursors() -> Vec<(&'static str, String)> {
+    vec![
+        ("nul", "a\0b".to_owned()),
+        ("lone nul", "\0".to_owned()),
+        ("over the cap", "a".repeat(MAX_CATALOG_CURSOR_BYTES + 1)),
+        ("leading dash", "-a".to_owned()),
+        ("leading underscore", "_a".to_owned()),
+        ("uppercase", "A".to_owned()),
+        ("space", "a b".to_owned()),
+        ("leading space", " a".to_owned()),
+        ("lf", "a\n".to_owned()),
+        ("crlf", "a\r\n".to_owned()),
+        ("nel", "a\u{85}".to_owned()),
+        ("line separator", "a\u{2028}".to_owned()),
+        ("slash", "a/b".to_owned()),
+        ("backslash", "a\\b".to_owned()),
+        ("percent", "a%41".to_owned()),
+        ("non ascii", "\u{e9}".to_owned()),
+        ("wildcard", "a%".to_owned()),
+    ]
+}
+
+#[sqlx::test(migrations = false)]
+async fn a_hostile_after_id_is_refused_with_the_fixed_reason(pool: PgPool) {
+    migrated(&pool).await;
+    seed(&pool, "a", CatalogKind::Skill, true).await;
+    for (label, cursor) in hostile_cursors() {
+        let err = list_enabled(&pool, 0, &cursor, 0).await.unwrap_err();
+        assert_eq!(
+            (err.code(), err.message()),
+            (Code::InvalidArgument, REASON_CURSOR_INVALID),
+            "{label}"
+        );
+    }
+}
+
+#[sqlx::test(migrations = false)]
+async fn a_legal_after_id_passes_including_the_cap_exactly(pool: PgPool) {
+    migrated(&pool).await;
+    seed(&pool, "b", CatalogKind::Skill, true).await;
+    let at_cap = "a".repeat(MAX_CATALOG_CURSOR_BYTES);
+    for cursor in ["", "a", "a-b_c9", "0", at_cap.as_str()] {
+        list_enabled(&pool, 0, cursor, 0).await.unwrap();
+    }
 }
