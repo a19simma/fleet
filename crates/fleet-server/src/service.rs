@@ -576,6 +576,9 @@ fn profiles_error(err: &StoreError) -> Status {
         StoreError::InvalidProfile(ProfileFault::Unowned) => {
             Status::permission_denied(profiles::ERR_PROFILE_UNOWNED)
         }
+        StoreError::InvalidProfile(fault @ ProfileFault::NotOwner) => {
+            Status::permission_denied(fault.to_string())
+        }
         StoreError::InvalidProfile(fault) => Status::invalid_argument(fault.to_string()),
         StoreError::NotFound => Status::not_found("profile not found"),
         other => storage_unavailable(other),
@@ -676,14 +679,22 @@ impl FleetProfiles for FleetService {
         &self,
         request: Request<ShareProfileRequest>,
     ) -> Result<Response<Profile>, Status> {
-        profiles::share_profile(request.get_ref()).map(Response::new)
+        let caller = caller_of(&request);
+        profiles::share_owned(self.store.pool(), caller, &request.get_ref().name)
+            .await
+            .map(Response::new)
+            .map_err(|err| profiles_error(&err))
     }
 
     async fn unshare_profile(
         &self,
         request: Request<UnshareProfileRequest>,
     ) -> Result<Response<Profile>, Status> {
-        profiles::unshare_profile(request.get_ref()).map(Response::new)
+        let caller = caller_of(&request);
+        profiles::unshare_owned(self.store.pool(), caller, &request.get_ref().name)
+            .await
+            .map(Response::new)
+            .map_err(|err| profiles_error(&err))
     }
 }
 

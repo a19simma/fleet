@@ -132,7 +132,7 @@ async fn the_box_token_cannot_list_the_catalog(pool: PgPool) {
 }
 
 #[sqlx::test]
-async fn share_and_unshare_are_unimplemented_for_the_client_token(pool: PgPool) {
+async fn share_and_unshare_need_a_user_token_for_the_static_client_token(pool: PgPool) {
     let (addr, _) = start(pool).await;
     let mut client = profiles(addr, as_client);
     let share = client
@@ -144,8 +144,8 @@ async fn share_and_unshare_are_unimplemented_for_the_client_token(pool: PgPool) 
         .await
         .unwrap_err();
     for err in [share, unshare] {
-        assert_eq!(err.code(), Code::Unimplemented);
-        assert_eq!(err.message(), "profile sharing is not implemented");
+        assert_eq!(err.code(), Code::PermissionDenied);
+        assert_eq!(err.message(), fleet_server::profiles::ERR_PROFILE_UNOWNED);
     }
 }
 
