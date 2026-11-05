@@ -5,11 +5,10 @@ use std::fmt::{self, Write};
 use fleet_core::{Profile, ProfileError, ProfileHash, ProfileInvalid};
 use fleet_proto::v1::{
     GetProfileBlobReply, ListProfilesReply, Profile as WireProfile, ProfileRef, ProfileSummary,
-    ProfileVersion, ShareProfileRequest, UnshareProfileRequest,
+    ProfileVersion, ProfileVisibility,
 };
 use fleet_proto::{ERR_PROFILE_CONTENT_CHOICE, ERR_PROFILE_TOOLS_DISABLED, MAX_PROFILE_JSON_BYTES};
 use sqlx::{PgPool, Row};
-use tonic::Status;
 
 use crate::store::{DEFAULT_LIST_LIMIT, MAX_LIST_LIMIT, StoreError};
 
@@ -47,22 +46,93 @@ impl From<Option<i64>> for Viewer {
     }
 }
 
-const SHARING_NOT_IMPLEMENTED: &str = "profile sharing is not implemented";
+const LOCK_OWN_PROFILE_FOR_UPDATE: &str =
+    "SELECT id, visibility FROM profile WHERE owner_user_id = $1 AND name = $2 FOR UPDATE";
+const SET_VISIBILITY: &str = "UPDATE profile SET visibility = $2 WHERE id = $1";
+const FOREIGN_SHARED_EXISTS: &str = "SELECT EXISTS (SELECT 1 FROM profile \
+     WHERE name = $1 AND owner_user_id <> $2 AND visibility = 'shared')";
 
-/// Makes a profile visible to every user.
-///
-/// # Errors
-/// Returns `UNIMPLEMENTED` until sharing is built.
-pub fn share_profile(_request: &ShareProfileRequest) -> Result<WireProfile, Status> {
-    Err(Status::unimplemented(SHARING_NOT_IMPLEMENTED))
+async fn set_visibility(
+    pool: &PgPool,
+    caller: Option<i64>,
+    name: &str,
+    shared: bool,
+) -> Result<WireProfile, StoreError> {
+    let caller = caller.ok_or(ProfileFault::Unowned)?;
+    validate_name(name)?;
+    let (word, wire) = if shared {
+        ("shared", ProfileVisibility::Shared)
+    } else {
+        ("private", ProfileVisibility::Private)
+    };
+    let mut tx = pool.begin().await?;
+    let Some(row) = sqlx::query(LOCK_OWN_PROFILE_FOR_UPDATE)
+        .bind(caller)
+        .bind(name)
+        .fetch_optional(&mut *tx)
+        .await?
+    else {
+        let foreign: bool = sqlx::query_scalar(FOREIGN_SHARED_EXISTS)
+            .bind(name)
+            .bind(caller)
+            .fetch_one(&mut *tx)
+            .await?;
+        return Err(if foreign {
+            ProfileFault::NotOwner.into()
+        } else {
+            StoreError::NotFound
+        });
+    };
+    if row.try_get::<String, _>("visibility")? != word {
+        sqlx::query(SET_VISIBILITY)
+            .bind(row.try_get::<i64, _>("id")?)
+            .bind(word)
+            .execute(&mut *tx)
+            .await?;
+    }
+    tx.commit().await?;
+    Ok(WireProfile {
+        name: name.to_owned(),
+        owner_user_id: u64::try_from(caller).map_err(|_| StoreError::OutOfRange("user id"))?,
+        visibility: wire as i32,
+        selection: Vec::new(),
+        authored_prompt: String::new(),
+    })
 }
 
-/// Takes a profile back from the shared list.
+/// Makes the caller's own profile `name` visible to every user. Sharing a shared profile
+/// changes nothing and succeeds.
+///
+/// The profile row is locked `FOR UPDATE` before the visibility is read and written. Jobs
+/// keep their own snapshot of the version and hash, so a change here never alters a job.
 ///
 /// # Errors
-/// Returns `UNIMPLEMENTED` until sharing is built.
-pub fn unshare_profile(_request: &UnshareProfileRequest) -> Result<WireProfile, Status> {
-    Err(Status::unimplemented(SHARING_NOT_IMPLEMENTED))
+/// Returns [`ProfileFault::Unowned`] for a `None` caller, [`ProfileFault::Name`] for a bad
+/// name, [`StoreError::NotFound`] when the caller owns no such profile and no one else
+/// shares one by that name, [`ProfileFault::NotOwner`] when only someone else's shared
+/// profile has that name, and a database error. Every refusal writes nothing.
+pub async fn share_owned(
+    pool: &PgPool,
+    caller: Option<i64>,
+    name: &str,
+) -> Result<WireProfile, StoreError> {
+    set_visibility(pool, caller, name, true).await
+}
+
+/// Takes the caller's own profile `name` back from the shared list. Unsharing a private
+/// profile changes nothing and succeeds.
+///
+/// Locking, snapshots and errors are those of [`share_owned`]. A queued or running job that
+/// uses the profile keeps its stored version and hash and still runs.
+///
+/// # Errors
+/// As [`share_owned`].
+pub async fn unshare_owned(
+    pool: &PgPool,
+    caller: Option<i64>,
+    name: &str,
+) -> Result<WireProfile, StoreError> {
+    set_visibility(pool, caller, name, false).await
 }
 
 const INSERT_BLOB: &str = "INSERT INTO profile_blob (hash, content, size) VALUES ($1, $2, $3) \
