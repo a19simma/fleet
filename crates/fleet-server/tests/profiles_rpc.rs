@@ -1330,3 +1330,232 @@ async fn matrix_delete_no_caller_is_unowned_and_writes_nothing(pool: PgPool) {
     }
     assert_eq!(snapshot(&m.pool).await, before);
 }
+
+const BATCH_REPO: &str = "https://example.com/org/repo.git";
+const BATCH_SHA: &str = "0123456789abcdef0123456789abcdef01234567";
+
+async fn visibility_of(pool: &PgPool, id: i64) -> String {
+    sqlx::query_scalar("SELECT visibility FROM profile WHERE id = $1")
+        .bind(id)
+        .fetch_one(pool)
+        .await
+        .unwrap()
+}
+
+#[sqlx::test]
+async fn share_and_unshare_flip_visibility_and_are_idempotent(pool: PgPool) {
+    let m = matrix(pool).await;
+    let id = m.id(m.alice, "apple").await;
+    for _ in 0..2 {
+        let reply = profiles::share_owned(&m.pool, Some(m.alice), "apple")
+            .await
+            .unwrap();
+        assert_eq!(reply.name, "apple");
+        assert_eq!(reply.owner_user_id, u64::try_from(m.alice).unwrap());
+        assert_eq!(
+            reply.visibility,
+            fleet_proto::v1::ProfileVisibility::Shared as i32
+        );
+        assert_eq!(visibility_of(&m.pool, id).await, "shared");
+    }
+    for _ in 0..2 {
+        let reply = profiles::unshare_owned(&m.pool, Some(m.alice), "apple")
+            .await
+            .unwrap();
+        assert_eq!(
+            reply.visibility,
+            fleet_proto::v1::ProfileVisibility::Private as i32
+        );
+        assert_eq!(visibility_of(&m.pool, id).await, "private");
+    }
+}
+
+#[sqlx::test]
+async fn share_and_unshare_refusals_write_nothing(pool: PgPool) {
+    let m = matrix(pool).await;
+    let before = snapshot(&m.pool).await;
+    for shared in [true, false] {
+        let call = |caller: Option<i64>, name: &'static str| {
+            let pool = m.pool.clone();
+            async move {
+                if shared {
+                    profiles::share_owned(&pool, caller, name).await
+                } else {
+                    profiles::unshare_owned(&pool, caller, name).await
+                }
+            }
+        };
+        let hidden = call(Some(m.bob), "apple").await.unwrap_err();
+        let absent = call(Some(m.bob), "nothing").await.unwrap_err();
+        assert!(matches!(hidden, StoreError::NotFound));
+        assert_eq!(hidden.to_string(), absent.to_string());
+        let reader = call(Some(m.bob), "cherry").await.unwrap_err();
+        assert!(is_not_owner(&reader), "{reader}");
+        assert!(matches!(
+            call(None, "apple").await,
+            Err(StoreError::InvalidProfile(ProfileFault::Unowned))
+        ));
+        for bad in ["", "bad name", "a/b"] {
+            assert!(matches!(
+                call(Some(m.alice), bad).await,
+                Err(StoreError::InvalidProfile(ProfileFault::Name))
+            ));
+        }
+        let long = "n".repeat(profiles::MAX_NAME_BYTES + 1);
+        assert!(matches!(
+            profiles::share_owned(&m.pool, Some(m.alice), &long).await,
+            Err(StoreError::InvalidProfile(ProfileFault::Name))
+        ));
+    }
+    assert_eq!(snapshot(&m.pool).await, before);
+}
+
+#[sqlx::test]
+async fn a_name_owned_by_both_users_resolves_to_the_callers_own(pool: PgPool) {
+    let m = matrix(pool).await;
+    let alice_dup = m.id(m.alice, "dup").await;
+    let bob_dup = m.id(m.bob, "dup").await;
+    profiles::share_owned(&m.pool, Some(m.alice), "dup")
+        .await
+        .unwrap();
+    assert_eq!(visibility_of(&m.pool, alice_dup).await, "shared");
+    assert_eq!(visibility_of(&m.pool, bob_dup).await, "shared");
+    profiles::unshare_owned(&m.pool, Some(m.alice), "dup")
+        .await
+        .unwrap();
+    assert_eq!(visibility_of(&m.pool, alice_dup).await, "private");
+    assert_eq!(visibility_of(&m.pool, bob_dup).await, "shared");
+}
+
+#[sqlx::test]
+async fn unshare_leaves_a_queued_jobs_snapshot_intact(pool: PgPool) {
+    let m = matrix(pool).await;
+    let store = Store::new(m.pool.clone());
+    let reply = store
+        .submit_batch_for(
+            Some(m.bob),
+            &fleet_proto::v1::SubmitBatchRequest {
+                idempotency_key: "snapshot-key".to_owned(),
+                prompt: "fix the bug".to_owned(),
+                repo: BATCH_REPO.to_owned(),
+                base_sha: BATCH_SHA.to_owned(),
+                repeats: 0,
+                profiles: vec!["cherry".to_owned()],
+                agent: String::new(),
+            },
+        )
+        .await
+        .unwrap();
+    let job_id = reply.job_ids[0].clone();
+    let row = |pool: PgPool, job_id: String| async move {
+        sqlx::query_scalar::<_, String>("SELECT to_jsonb(j)::text FROM jobs j WHERE job_id = $1")
+            .bind(job_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap()
+    };
+    let before = row(m.pool.clone(), job_id.clone()).await;
+    let state: String = sqlx::query_scalar("SELECT state FROM jobs WHERE job_id = $1")
+        .bind(&job_id)
+        .fetch_one(&m.pool)
+        .await
+        .unwrap();
+    assert_eq!(state, "QUEUED");
+    profiles::unshare_owned(&m.pool, Some(m.alice), "cherry")
+        .await
+        .unwrap();
+    assert_eq!(row(m.pool.clone(), job_id).await, before);
+    let hidden = store
+        .get_profile(Viewer::User(m.bob), "cherry", None)
+        .await
+        .unwrap_err();
+    assert!(matches!(hidden, StoreError::NotFound));
+}
+
+#[sqlx::test]
+async fn share_waits_on_the_profile_row_lock(pool: PgPool) {
+    let m = matrix(pool).await;
+    let id = m.id(m.alice, "apple").await;
+    let mut holder = m.pool.begin().await.unwrap();
+    sqlx::query("SELECT id FROM profile WHERE id = $1 FOR UPDATE")
+        .bind(id)
+        .fetch_one(&mut *holder)
+        .await
+        .unwrap();
+    let pool = m.pool.clone();
+    let alice = m.alice;
+    let task =
+        tokio::spawn(async move { profiles::share_owned(&pool, Some(alice), "apple").await });
+    timeout(WAIT, async {
+        loop {
+            let waiting: i64 = sqlx::query_scalar(
+                "SELECT count(*) FROM pg_stat_activity \
+                 WHERE wait_event_type = 'Lock' AND query LIKE '%FROM profile WHERE owner_user_id%'",
+            )
+            .fetch_one(&m.pool)
+            .await
+            .unwrap();
+            if waiting > 0 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+    assert!(!task.is_finished());
+    assert_eq!(visibility_of(&m.pool, id).await, "private");
+    holder.commit().await.unwrap();
+    timeout(WAIT, task).await.unwrap().unwrap().unwrap();
+    assert_eq!(visibility_of(&m.pool, id).await, "shared");
+}
+
+#[sqlx::test]
+async fn share_rpc_maps_owner_not_owner_and_missing(pool: PgPool) {
+    let store = store(pool.clone()).await;
+    let alice = user(&pool, "alice").await;
+    let bob = user(&pool, "bob").await;
+    let addr = serve(&pool, &store);
+    let mut as_alice = bearer_client(addr, api_token(&pool, alice).await);
+    let mut as_bob = bearer_client(addr, api_token(&pool, bob).await);
+    as_alice.create_profile(create("alpha", ONE)).await.unwrap();
+    let shared = as_alice
+        .share_profile(fleet_proto::v1::ShareProfileRequest {
+            name: "alpha".to_owned(),
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(
+        shared.visibility,
+        fleet_proto::v1::ProfileVisibility::Shared as i32
+    );
+    let denied = as_bob
+        .unshare_profile(fleet_proto::v1::UnshareProfileRequest {
+            name: "alpha".to_owned(),
+        })
+        .await
+        .unwrap_err();
+    assert_eq!(denied.code(), Code::PermissionDenied);
+    assert_eq!(denied.message(), "only the owner can change this profile");
+    let missing = as_bob
+        .share_profile(fleet_proto::v1::ShareProfileRequest {
+            name: "nothing".to_owned(),
+        })
+        .await
+        .unwrap_err();
+    assert_eq!(missing.code(), Code::NotFound);
+    let unshared = as_alice
+        .unshare_profile(fleet_proto::v1::UnshareProfileRequest {
+            name: "alpha".to_owned(),
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(
+        unshared.visibility,
+        fleet_proto::v1::ProfileVisibility::Private as i32
+    );
+    let id = profile_id(&pool, alice, "alpha").await;
+    assert_eq!(visibility_of(&pool, id).await, "private");
+}
