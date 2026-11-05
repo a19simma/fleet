@@ -136,6 +136,24 @@ pub fn validate_catalog_content(content: &str) -> bool {
     (1..=MAX_CATALOG_CONTENT_BYTES).contains(&content.len())
 }
 
+/// Page size a catalog list uses when the request asks for 0.
+pub const DEFAULT_CATALOG_PAGE: u32 = 50;
+
+/// Largest catalog list page. The server cuts a larger `page_size` to this.
+pub const MAX_CATALOG_PAGE: u32 = 200;
+
+/// Longest catalog list cursor in bytes: the longest item id.
+pub const MAX_CATALOG_CURSOR_BYTES: usize = fleet_core::ItemId::MAX_LEN;
+
+/// Whether `after_id` is a legal catalog list cursor: empty, or at most
+/// [`MAX_CATALOG_CURSOR_BYTES`] bytes of ASCII lowercase letters, digits, `_` and `-`.
+pub fn validate_catalog_cursor(after_id: &str) -> bool {
+    after_id.len() <= MAX_CATALOG_CURSOR_BYTES
+        && after_id
+            .bytes()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || matches!(b, b'_' | b'-'))
+}
+
 /// Longest credential login, in bytes.
 pub const MAX_CREDENTIAL_LOGIN_BYTES: usize = 256;
 

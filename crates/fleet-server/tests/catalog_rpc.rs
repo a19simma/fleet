@@ -108,7 +108,7 @@ fn denied(err: &Status) {
 async fn list_catalog_is_unimplemented_for_the_client_token(pool: PgPool) {
     let (addr, _) = start(pool).await;
     let err = catalog(addr, as_client)
-        .list_catalog(ListCatalogRequest {})
+        .list_catalog(ListCatalogRequest::default())
         .await
         .unwrap_err();
     assert_eq!(err.code(), Code::Unimplemented);
@@ -119,7 +119,7 @@ async fn list_catalog_is_unimplemented_for_the_client_token(pool: PgPool) {
 async fn the_box_token_cannot_list_the_catalog(pool: PgPool) {
     let (addr, _) = start(pool).await;
     let err = catalog(addr, as_box)
-        .list_catalog(ListCatalogRequest {})
+        .list_catalog(ListCatalogRequest::default())
         .await
         .unwrap_err();
     denied(&err);

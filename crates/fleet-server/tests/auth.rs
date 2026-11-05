@@ -249,7 +249,7 @@ mod tests {
                     .map(|_| ())
             }
             "catalog" => FleetCatalogClient::with_interceptor(chan, move |r| header.apply(r))
-                .list_catalog(fleet_proto::v1::ListCatalogRequest {})
+                .list_catalog(fleet_proto::v1::ListCatalogRequest::default())
                 .await
                 .map(|_| ()),
             "catalog_admin" => {
