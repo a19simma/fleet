@@ -11,6 +11,7 @@ use clap::Parser;
 use fleet_cli::{Cli, CliError, run};
 use fleet_server::auth::BearerAuth;
 use fleet_server::config::Token;
+use fleet_server::cred::Users;
 use fleet_server::service::router;
 use fleet_server::store::Store;
 use sqlx::PgPool;
@@ -25,12 +26,13 @@ const ONE_REORDERED: &str = r#"{ "max_turns": 5, "claude_md": "one" }"#;
 const TWO: &str = r#"{"claude_md":"two"}"#;
 
 async fn serve(pool: PgPool) -> SocketAddr {
-    let store = Store::new(pool);
+    let store = Store::new(pool.clone());
     store.migrate().await.unwrap();
     let auth = BearerAuth::new(
         &Token::new(BOX.to_owned()).unwrap(),
         Some(&Token::new(CLIENT.to_owned()).unwrap()),
-    );
+    )
+    .with_users(Users::new(pool));
     let incoming = TcpIncoming::bind("127.0.0.1:0".parse().unwrap()).unwrap();
     let addr = incoming.local_addr().unwrap();
     tokio::spawn(router(&store, &auth).serve_with_incoming(incoming));

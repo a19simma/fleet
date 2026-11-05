@@ -23,7 +23,7 @@ use crate::jobs::{
     MAX_TRANSCRIPT_ROWS, MIN_CHUNK_COST_BYTES, NewJob, validate_ci, validate_job_id,
     validate_judge, validate_submit, validate_terminal, validate_verdict,
 };
-use crate::profiles::{self, ProfileContent, ProfileFault};
+use crate::profiles::{self, ProfileContent, ProfileFault, Viewer};
 use crate::projection::{Projection, State, project};
 use crate::stats;
 use crate::telemetry;
@@ -1330,25 +1330,26 @@ impl Store {
         stats::stats(&self.pool, owner, request).await
     }
 
-    /// Stores a profile under `name` and returns its version.
+    /// Stores a profile under `name` for `caller` and returns its version.
     ///
-    /// The request is validated once, by [`profiles::validate_create`]. The canonical
-    /// content is inserted as a blob keyed by its hash, so one blob serves every name that
-    /// holds the same content. Under a per-name advisory lock, content already stored under
-    /// the name returns that version with `created` false, and new content gets the next
-    /// version.
+    /// Delegates to [`profiles::create_owned`]: the request is validated once, the caller is
+    /// recorded as the private owner, and content already stored under the name returns that
+    /// version with `created` false.
     ///
     /// # Errors
     ///
-    /// Returns [`StoreError::InvalidProfile`] when the name or content fails validation and
+    /// Returns [`StoreError::InvalidProfile`] when the name or content fails validation or
+    /// `caller` is `None` or not a stored user ([`ProfileFault::Unowned`]), and
     /// [`StoreError::Database`] when a query fails.
     pub async fn create_profile(
         &self,
+        caller: Option<i64>,
         name: &str,
         content_json: &str,
     ) -> Result<fleet_proto::v1::ProfileVersion, StoreError> {
-        profiles::create(
+        profiles::create_owned(
             &self.pool,
+            caller,
             name,
             ProfileContent::Json(content_json),
             self.allow_profile_tools,
@@ -1366,13 +1367,14 @@ impl Store {
     /// [`ProfileFault::ToolsDisabled`] when tools are present and the gate is off.
     pub async fn create_profile_content(
         &self,
+        caller: Option<i64>,
         name: &str,
         content: ProfileContent<'_>,
     ) -> Result<fleet_proto::v1::ProfileVersion, StoreError> {
-        profiles::create(&self.pool, name, content, self.allow_profile_tools).await
+        profiles::create_owned(&self.pool, caller, name, content, self.allow_profile_tools).await
     }
 
-    /// Reads a profile version, or the latest one when `version` is `None`.
+    /// Reads a profile version as `viewer`, or the latest one when `version` is `None`.
     ///
     /// # Errors
     ///
@@ -1380,13 +1382,14 @@ impl Store {
     /// the name or version is missing and [`StoreError::Database`] when a query fails.
     pub async fn get_profile(
         &self,
+        viewer: Viewer,
         name: &str,
         version: Option<u32>,
     ) -> Result<fleet_proto::v1::ProfileVersion, StoreError> {
-        profiles::get(&self.pool, name, version).await
+        profiles::get_for(&self.pool, viewer, name, version).await
     }
 
-    /// Lists profile names in order with their latest version and hash.
+    /// Lists the profile names `viewer` may read, in order, with their latest version and hash.
     ///
     /// A `limit` of 0 means [`DEFAULT_LIST_LIMIT`] and any limit is capped at
     /// [`MAX_LIST_LIMIT`]. `after_name` resumes after that name.
@@ -1396,10 +1399,11 @@ impl Store {
     /// Returns [`StoreError::Database`] when the query fails.
     pub async fn list_profiles(
         &self,
+        viewer: Viewer,
         limit: u32,
         after_name: Option<&str>,
     ) -> Result<fleet_proto::v1::ListProfilesReply, StoreError> {
-        profiles::list(&self.pool, limit, after_name).await
+        profiles::list_for(&self.pool, viewer, limit, after_name).await
     }
 
     /// Queues one job per named profile as one batch, or returns the stored batch.

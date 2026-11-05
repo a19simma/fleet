@@ -11,7 +11,8 @@ use fleet_proto::v1::fleet_profiles_client::FleetProfilesClient;
 use fleet_proto::v1::{CreateProfileRequest, GetProfileRequest, ListProfilesRequest};
 use fleet_server::auth::BearerAuth;
 use fleet_server::config::Token;
-use fleet_server::profiles::{self, ProfileContent, ProfileFault};
+use fleet_server::cred::Users;
+use fleet_server::profiles::{self, ProfileContent, ProfileFault, Viewer};
 use fleet_server::service::router;
 use fleet_server::store::{Store, StoreError};
 use sqlx::PgPool;
@@ -50,11 +51,19 @@ async fn store(pool: PgPool) -> Store {
     store
 }
 
-fn serve(store: &Store) -> SocketAddr {
+fn serve(pool: &PgPool, store: &Store) -> SocketAddr {
+    serve_as(store, Some(Users::new(pool.clone())))
+}
+
+fn serve_as(store: &Store, users: Option<Users>) -> SocketAddr {
     let auth = BearerAuth::new(
         &Token::new(BOX.to_owned()).unwrap(),
         Some(&Token::new(CLIENT.to_owned()).unwrap()),
     );
+    let auth = match users {
+        Some(users) => auth.with_users(users),
+        None => auth,
+    };
     let incoming = TcpIncoming::bind("127.0.0.1:0".parse().unwrap()).unwrap();
     let addr = incoming.local_addr().unwrap();
     tokio::spawn(router(store, &auth).serve_with_incoming(incoming));
@@ -68,8 +77,8 @@ fn client_for(addr: SocketAddr, interceptor: Interceptor) -> Profiles {
     FleetProfilesClient::with_interceptor(channel, interceptor)
 }
 
-fn spawn(store: &Store) -> Profiles {
-    client_for(serve(store), as_client)
+fn spawn(pool: &PgPool, store: &Store) -> Profiles {
+    client_for(serve(pool, store), as_client)
 }
 
 fn create(name: &str, content: &str) -> CreateProfileRequest {
@@ -106,7 +115,7 @@ async fn counts(pool: &PgPool) -> (i64, i64) {
 #[sqlx::test]
 async fn gate_off_refuses_tools_and_stores_nothing(pool: PgPool) {
     let store = store(pool.clone()).await;
-    let mut profiles = spawn(&store);
+    let mut profiles = spawn(&pool, &store);
     let err = profiles
         .create_profile(create_toml("alpha", TOOLS_TOML))
         .await
@@ -127,7 +136,7 @@ async fn gate_off_refuses_tools_and_stores_nothing(pool: PgPool) {
 #[sqlx::test]
 async fn gate_on_accepts_tools_and_the_hash_round_trips(pool: PgPool) {
     let store = store(pool.clone()).await.with_profile_tools(true);
-    let mut profiles = spawn(&store);
+    let mut profiles = spawn(&pool, &store);
     let created = profiles
         .create_profile(create_toml("alpha", TOOLS_TOML))
         .await
@@ -158,7 +167,7 @@ async fn profiles_without_tools_ignore_the_gate(pool: PgPool) {
     let mut hashes = Vec::new();
     for allow in [false, true] {
         let store = store(pool.clone()).await.with_profile_tools(allow);
-        let mut profiles = spawn(&store);
+        let mut profiles = spawn(&pool, &store);
         for request in [create("alpha", ONE), create_toml("beta", PLAIN_TOML)] {
             let reply = profiles.create_profile(request).await.unwrap().into_inner();
             hashes.push(reply.hash);
@@ -172,7 +181,7 @@ async fn profiles_without_tools_ignore_the_gate(pool: PgPool) {
 #[sqlx::test]
 async fn exactly_one_content_field_must_be_set(pool: PgPool) {
     let store = store(pool.clone()).await.with_profile_tools(true);
-    let mut profiles = spawn(&store);
+    let mut profiles = spawn(&pool, &store);
     let both = CreateProfileRequest {
         name: "alpha".to_owned(),
         content_json: ONE.to_owned(),
@@ -204,8 +213,8 @@ const TWO: &str = r#"{"claude_md":"two"}"#;
 
 #[sqlx::test]
 async fn same_content_same_version(pool: PgPool) {
-    let store = store(pool).await;
-    let mut profiles = spawn(&store);
+    let store = store(pool.clone()).await;
+    let mut profiles = spawn(&pool, &store);
     let first = timeout(WAIT, profiles.create_profile(create("alpha", ONE)))
         .await
         .unwrap()
@@ -228,8 +237,8 @@ async fn same_content_same_version(pool: PgPool) {
 
 #[sqlx::test]
 async fn different_content_gets_a_new_version(pool: PgPool) {
-    let store = store(pool).await;
-    let mut profiles = spawn(&store);
+    let store = store(pool.clone()).await;
+    let mut profiles = spawn(&pool, &store);
     let first = profiles
         .create_profile(create("alpha", ONE))
         .await
@@ -254,7 +263,7 @@ async fn different_content_gets_a_new_version(pool: PgPool) {
 #[sqlx::test]
 async fn same_content_under_two_names_shares_one_blob(pool: PgPool) {
     let store = store(pool.clone()).await;
-    let mut profiles = spawn(&store);
+    let mut profiles = spawn(&pool, &store);
     let a = profiles
         .create_profile(create("alpha", ONE))
         .await
@@ -282,7 +291,7 @@ async fn same_content_under_two_names_shares_one_blob(pool: PgPool) {
 #[sqlx::test]
 async fn concurrent_creates_of_one_content_make_one_version(pool: PgPool) {
     let store = store(pool.clone()).await;
-    let addr = serve(&store);
+    let addr = serve(&pool, &store);
     let mut calls = Vec::new();
     for _ in 0..8 {
         let mut profiles = client_for(addr, as_client);
@@ -303,8 +312,8 @@ async fn concurrent_creates_of_one_content_make_one_version(pool: PgPool) {
 
 #[sqlx::test]
 async fn get_by_name_and_by_version(pool: PgPool) {
-    let store = store(pool).await;
-    let mut profiles = spawn(&store);
+    let store = store(pool.clone()).await;
+    let mut profiles = spawn(&pool, &store);
     let one = profiles
         .create_profile(create("alpha", ONE))
         .await
@@ -353,8 +362,8 @@ async fn get_by_name_and_by_version(pool: PgPool) {
 
 #[sqlx::test]
 async fn list_returns_latest_per_name(pool: PgPool) {
-    let store = store(pool).await;
-    let mut profiles = spawn(&store);
+    let store = store(pool.clone()).await;
+    let mut profiles = spawn(&pool, &store);
     profiles.create_profile(create("beta", ONE)).await.unwrap();
     profiles.create_profile(create("alpha", ONE)).await.unwrap();
     let alpha2 = profiles
@@ -390,7 +399,7 @@ async fn list_returns_latest_per_name(pool: PgPool) {
 #[sqlx::test]
 async fn invalid_input_is_invalid_argument_and_never_echoed(pool: PgPool) {
     let store = store(pool.clone()).await;
-    let mut profiles = spawn(&store);
+    let mut profiles = spawn(&pool, &store);
     let secret = "zzz-private-input";
     let cases = [
         create("alpha", &format!("{{\"{secret}\":1}}")),
@@ -419,8 +428,8 @@ async fn invalid_input_is_invalid_argument_and_never_echoed(pool: PgPool) {
 
 #[sqlx::test]
 async fn box_token_is_denied_on_every_profile_rpc(pool: PgPool) {
-    let store = store(pool).await;
-    let mut profiles = client_for(serve(&store), as_box);
+    let store = store(pool.clone()).await;
+    let mut profiles = client_for(serve(&pool, &store), as_box);
     let denied = [
         profiles
             .create_profile(create("alpha", ONE))
@@ -443,8 +452,8 @@ async fn box_token_is_denied_on_every_profile_rpc(pool: PgPool) {
 
 #[sqlx::test]
 async fn missing_token_is_unauthenticated(pool: PgPool) {
-    let store = store(pool).await;
-    let mut profiles = client_for(serve(&store), Ok);
+    let store = store(pool.clone()).await;
+    let mut profiles = client_for(serve(&pool, &store), Ok);
     let err = profiles
         .list_profiles(ListProfilesRequest::default())
         .await
@@ -455,7 +464,7 @@ async fn missing_token_is_unauthenticated(pool: PgPool) {
 #[sqlx::test]
 async fn update_delete_and_truncate_are_rejected(pool: PgPool) {
     let store = store(pool.clone()).await;
-    let mut profiles = spawn(&store);
+    let mut profiles = spawn(&pool, &store);
     profiles.create_profile(create("alpha", ONE)).await.unwrap();
     let statements = [
         "UPDATE profile_blob SET size = size",
@@ -590,7 +599,8 @@ async fn a_private_profile_reads_as_not_found_for_another_user(pool: PgPool) {
     let alice = user(&pool, "alice").await;
     let bob = user(&pool, "bob").await;
     owned(&pool, Some(alice), "alpha", OWNED).await.unwrap();
-    let get = |viewer, name: &'static str, version| {
+    let get = |viewer: Option<i64>, name: &'static str, version| {
+        let viewer = Viewer::from(viewer);
         let pool = pool.clone();
         async move { profiles::get_for(&pool, viewer, name, version).await }
     };
@@ -606,12 +616,14 @@ async fn a_private_profile_reads_as_not_found_for_another_user(pool: PgPool) {
             Err(StoreError::NotFound)
         ));
     }
-    let listed = profiles::list_for(&pool, Some(bob), 0, None).await.unwrap();
+    let listed = profiles::list_for(&pool, Viewer::User(bob), 0, None)
+        .await
+        .unwrap();
     assert_eq!(
         listed.profiles,
         Vec::<fleet_proto::v1::ProfileSummary>::new()
     );
-    let own = profiles::list_for(&pool, Some(alice), 0, None)
+    let own = profiles::list_for(&pool, Viewer::User(alice), 0, None)
         .await
         .unwrap();
     assert_eq!(own.profiles.len(), 1);
@@ -809,4 +821,269 @@ async fn delete_is_owner_only_and_refusals_write_nothing(pool: PgPool) {
         profiles::delete_owned(&pool, Some(alice), bare).await,
         Err(StoreError::NotFound)
     ));
+}
+
+const UNOWNED: &str = "profile create needs a user token";
+
+async fn api_token(pool: &PgPool, user_id: i64) -> String {
+    let made = Users::new(pool.clone())
+        .create_api_token(user_id, "test")
+        .await
+        .unwrap();
+    String::from_utf8(made.token.expose().to_vec()).unwrap()
+}
+
+#[derive(Clone)]
+struct Bearer(String);
+
+impl tonic::service::Interceptor for Bearer {
+    fn call(&mut self, request: Request<()>) -> Result<Request<()>, Status> {
+        with_token(request, &self.0)
+    }
+}
+
+fn bearer_client(
+    addr: SocketAddr,
+    token: String,
+) -> FleetProfilesClient<InterceptedService<Channel, Bearer>> {
+    let channel = Endpoint::from_shared(format!("http://{addr}"))
+        .unwrap()
+        .connect_lazy();
+    FleetProfilesClient::with_interceptor(channel, Bearer(token))
+}
+
+async fn nothing_written(pool: &PgPool) {
+    assert_eq!(counts(pool).await, (0, 0));
+    assert_eq!(owners(pool).await, Vec::<(i64, String)>::new());
+}
+
+#[sqlx::test]
+async fn user_token_create_records_the_caller_as_owner(pool: PgPool) {
+    let store = store(pool.clone()).await;
+    let alice = user(&pool, "alice").await;
+    let bob = user(&pool, "bob").await;
+    let addr = serve(&pool, &store);
+    let mut as_alice = bearer_client(addr, api_token(&pool, alice).await);
+    let mut as_bob = bearer_client(addr, api_token(&pool, bob).await);
+    let made = as_alice
+        .create_profile(create("alpha", ONE))
+        .await
+        .unwrap()
+        .into_inner();
+    assert!(made.created);
+    assert_eq!(owners(&pool).await, [(alice, "alpha".to_owned())]);
+    as_bob.create_profile(create("alpha", ONE)).await.unwrap();
+    assert_eq!(
+        owners(&pool).await,
+        [(alice, "alpha".to_owned()), (bob, "alpha".to_owned())]
+    );
+}
+
+#[sqlx::test]
+async fn client_token_create_records_the_bootstrap_user_as_owner(pool: PgPool) {
+    let store = store(pool.clone()).await;
+    let mut profiles = spawn(&pool, &store);
+    profiles.create_profile(create("alpha", ONE)).await.unwrap();
+    let bootstrap = Users::new(pool.clone()).bootstrap_user().await.unwrap();
+    assert_eq!(owners(&pool).await, [(bootstrap, "alpha".to_owned())]);
+}
+
+#[sqlx::test]
+async fn box_token_create_is_refused_and_writes_nothing(pool: PgPool) {
+    let store = store(pool.clone()).await;
+    let mut profiles = client_for(serve(&pool, &store), as_box);
+    let err = profiles
+        .create_profile(create("alpha", ONE))
+        .await
+        .unwrap_err();
+    assert_eq!(err.code(), Code::PermissionDenied);
+    nothing_written(&pool).await;
+}
+
+#[sqlx::test]
+async fn no_token_create_is_refused_and_writes_nothing(pool: PgPool) {
+    let store = store(pool.clone()).await;
+    let mut profiles = client_for(serve(&pool, &store), Ok);
+    let err = profiles
+        .create_profile(create("alpha", ONE))
+        .await
+        .unwrap_err();
+    assert_eq!(err.code(), Code::Unauthenticated);
+    nothing_written(&pool).await;
+}
+
+#[sqlx::test]
+async fn no_caller_create_is_refused_with_one_reason_before_the_body_is_read(pool: PgPool) {
+    let store = store(pool.clone()).await;
+    let mut profiles = client_for(serve_as(&store, None), as_client);
+    let both = CreateProfileRequest {
+        name: "bad name".to_owned(),
+        content_json: "{".to_owned(),
+        content_toml: "x".to_owned(),
+    };
+    for request in [create("alpha", ONE), create("bad name", "{"), both] {
+        let err = profiles.create_profile(request).await.unwrap_err();
+        assert_eq!(err.code(), Code::PermissionDenied);
+        assert_eq!(err.message(), UNOWNED);
+    }
+    nothing_written(&pool).await;
+}
+
+#[sqlx::test]
+async fn a_deleted_users_token_is_refused_and_writes_nothing(pool: PgPool) {
+    let store = store(pool.clone()).await;
+    let alice = user(&pool, "alice").await;
+    let token = api_token(&pool, alice).await;
+    let mut profiles = bearer_client(serve(&pool, &store), token);
+    sqlx::query("DELETE FROM api_tokens WHERE user_id = $1")
+        .bind(alice)
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query("DELETE FROM users WHERE id = $1")
+        .bind(alice)
+        .execute(&pool)
+        .await
+        .unwrap();
+    let err = profiles
+        .create_profile(create("beta", ONE))
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(err.code(), Code::Unauthenticated | Code::PermissionDenied),
+        "{err:?}"
+    );
+    assert_eq!(owners(&pool).await, Vec::<(i64, String)>::new());
+}
+
+#[sqlx::test]
+async fn a_caller_that_is_no_stored_user_maps_to_permission_denied(pool: PgPool) {
+    use fleet_proto::v1::fleet_profiles_server::FleetProfiles;
+    use fleet_server::auth::Caller;
+    use fleet_server::service::FleetService;
+
+    let svc = FleetService::new(store(pool.clone()).await);
+    let mut request = Request::new(create("alpha", ONE));
+    request
+        .extensions_mut()
+        .insert(Caller { user_id: i64::MAX });
+    let err = svc.create_profile(request).await.unwrap_err();
+    assert_eq!(err.code(), Code::PermissionDenied);
+    assert_eq!(err.message(), UNOWNED);
+    assert_eq!(
+        ProfileFault::Unowned.to_string(),
+        profiles::ERR_PROFILE_UNOWNED
+    );
+    assert_eq!(UNOWNED, profiles::ERR_PROFILE_UNOWNED);
+    nothing_written(&pool).await;
+}
+
+#[sqlx::test]
+async fn an_owner_in_the_content_is_refused_and_a_clean_create_ignores_it(pool: PgPool) {
+    let store = store(pool.clone()).await;
+    let alice = user(&pool, "alice").await;
+    let bob = user(&pool, "bob").await;
+    let mut profiles = bearer_client(serve(&pool, &store), api_token(&pool, alice).await);
+    let forged = format!(r#"{{"claude_md":"x","owner_user_id":{bob}}}"#);
+    let err = profiles
+        .create_profile(create("alpha", &forged))
+        .await
+        .unwrap_err();
+    assert_eq!(err.code(), Code::InvalidArgument);
+    assert!(!err.message().contains(&bob.to_string()));
+    nothing_written(&pool).await;
+    profiles.create_profile(create("alpha", ONE)).await.unwrap();
+    assert_eq!(owners(&pool).await, [(alice, "alpha".to_owned())]);
+}
+
+#[sqlx::test]
+async fn create_waits_for_a_concurrent_user_delete_and_is_then_refused(pool: PgPool) {
+    store(pool.clone()).await;
+    let alice = user(&pool, "alice").await;
+    let mut tx = pool.begin().await.unwrap();
+    sqlx::query("DELETE FROM users WHERE id = $1")
+        .bind(alice)
+        .execute(&mut *tx)
+        .await
+        .unwrap();
+    let task = tokio::spawn({
+        let pool = pool.clone();
+        async move {
+            profiles::create_owned(
+                &pool,
+                Some(alice),
+                "alpha",
+                ProfileContent::Json(ONE),
+                false,
+            )
+            .await
+        }
+    });
+    tokio::time::sleep(Duration::from_millis(400)).await;
+    assert!(!task.is_finished());
+    tx.commit().await.unwrap();
+    let result = timeout(Duration::from_secs(20), task)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(
+        matches!(
+            result,
+            Err(StoreError::InvalidProfile(ProfileFault::Unowned))
+        ),
+        "{result:?}"
+    );
+    nothing_written(&pool).await;
+}
+
+#[test]
+fn a_caller_id_is_never_the_shared_only_viewer() {
+    assert_eq!(Viewer::from(Some(7)), Viewer::User(7));
+    assert_eq!(Viewer::from(None), Viewer::Shared);
+}
+
+#[sqlx::test]
+async fn an_authenticated_caller_reads_and_lists_their_private_profile(pool: PgPool) {
+    let store = store(pool.clone()).await;
+    let alice = user(&pool, "alice").await;
+    let bob = user(&pool, "bob").await;
+    let addr = serve(&pool, &store);
+    let mut as_alice = bearer_client(addr, api_token(&pool, alice).await);
+    let mut as_bob = bearer_client(addr, api_token(&pool, bob).await);
+    let mut no_caller = client_for(serve_as(&store, None), as_client);
+    as_alice.create_profile(create("alpha", ONE)).await.unwrap();
+    let read = as_alice
+        .get_profile(get("alpha", None))
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(read.version, 1);
+    let listed = as_alice
+        .list_profiles(ListProfilesRequest::default())
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(listed.profiles.len(), 1);
+    let hidden = as_bob.get_profile(get("alpha", None)).await.unwrap_err();
+    assert_eq!(hidden.code(), Code::NotFound);
+    let shared_only = no_caller.get_profile(get("alpha", None)).await.unwrap_err();
+    assert_eq!(shared_only.code(), Code::NotFound);
+    let by_bob = as_bob
+        .list_profiles(ListProfilesRequest::default())
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(
+        by_bob.profiles,
+        Vec::<fleet_proto::v1::ProfileSummary>::new()
+    );
+    let by_none = no_caller
+        .list_profiles(ListProfilesRequest::default())
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(
+        by_none.profiles,
+        Vec::<fleet_proto::v1::ProfileSummary>::new()
+    );
 }

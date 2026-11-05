@@ -65,17 +65,33 @@ async fn cli_in(
     (result, String::from_utf8_lossy(&out).into_owned())
 }
 
+async fn shared(pool: &PgPool, name: &str, json: &str) {
+    let system: i64 = sqlx::query_scalar("SELECT system_user_id()")
+        .fetch_one(pool)
+        .await
+        .unwrap();
+    fleet_server::profiles::create_owned(
+        pool,
+        Some(system),
+        name,
+        fleet_server::profiles::ProfileContent::Json(json),
+        false,
+    )
+    .await
+    .unwrap();
+    sqlx::query("UPDATE profile SET visibility = 'shared' WHERE owner_user_id = $1 AND name = $2")
+        .bind(system)
+        .bind(name)
+        .execute(pool)
+        .await
+        .unwrap();
+}
+
 async fn submitted(pool: &PgPool) -> (Store, String, Vec<String>) {
     let store = Store::new(pool.clone());
     store.migrate().await.unwrap();
-    store
-        .create_profile("alpha", r#"{"claude_md":"one"}"#)
-        .await
-        .unwrap();
-    store
-        .create_profile("beta", r#"{"claude_md":"two"}"#)
-        .await
-        .unwrap();
+    shared(pool, "alpha", r#"{"claude_md":"one"}"#).await;
+    shared(pool, "beta", r#"{"claude_md":"two"}"#).await;
     let reply = store
         .submit_batch(&SubmitBatchRequest {
             idempotency_key: "k1".into(),
@@ -157,7 +173,7 @@ async fn migrated(pool: &PgPool) -> Store {
         ("alpha", r#"{"claude_md":"one"}"#),
         ("beta", r#"{"claude_md":"two"}"#),
     ] {
-        store.create_profile(name, body).await.unwrap();
+        shared(pool, name, body).await;
     }
     store
 }

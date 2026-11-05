@@ -80,6 +80,31 @@ fn worker(addr: SocketAddr, interceptor: Interceptor) -> Worker {
         .max_decoding_message_size(MAX_PROFILE_MESSAGE_BYTES)
 }
 
+async fn shared_with(
+    pool: &PgPool,
+    name: &str,
+    content: ProfileContent<'_>,
+) -> fleet_proto::v1::ProfileVersion {
+    let system: i64 = sqlx::query_scalar("SELECT system_user_id()")
+        .fetch_one(pool)
+        .await
+        .unwrap();
+    let made = fleet_server::profiles::create_owned(pool, Some(system), name, content, true)
+        .await
+        .unwrap();
+    sqlx::query("UPDATE profile SET visibility = 'shared' WHERE owner_user_id = $1 AND name = $2")
+        .bind(system)
+        .bind(name)
+        .execute(pool)
+        .await
+        .unwrap();
+    made
+}
+
+async fn shared(pool: &PgPool, name: &str, json: &str) -> fleet_proto::v1::ProfileVersion {
+    shared_with(pool, name, ProfileContent::Json(json)).await
+}
+
 async fn batch_job(store: &Store, profile: &str) -> String {
     let reply = store
         .submit_batch(&SubmitBatchRequest {
@@ -118,8 +143,8 @@ fn blob(job_id: &str, attempt: u32, box_name: &str) -> GetProfileBlobRequest {
 
 #[sqlx::test]
 async fn the_lease_holder_reads_the_pinned_blob(pool: PgPool) {
-    let store = store(pool).await;
-    let created = store.create_profile("alpha", ONE).await.unwrap();
+    let store = store(pool.clone()).await;
+    let created = shared(&pool, "alpha", ONE).await;
     let id = batch_job(&store, "alpha").await;
     let mut worker = worker(serve(&store), as_box);
     let job = claim(&mut worker, &name(1)).await;
@@ -141,11 +166,8 @@ const TOOLS_TOML: &str = "[[tools]]\nname = \"node\"\nversion = \"20.11.1\"\n";
 
 #[sqlx::test]
 async fn a_profile_with_tools_is_served_only_while_the_gate_is_on(pool: PgPool) {
-    let on = store(pool).await.with_profile_tools(true);
-    let created = on
-        .create_profile_content("alpha", ProfileContent::Toml(TOOLS_TOML))
-        .await
-        .unwrap();
+    let on = store(pool.clone()).await.with_profile_tools(true);
+    let created = shared_with(&pool, "alpha", ProfileContent::Toml(TOOLS_TOML)).await;
     let id = batch_job(&on, "alpha").await;
     let mut worker = worker(serve(&on), as_box);
     let job = claim(&mut worker, &name(1)).await;
@@ -172,7 +194,7 @@ async fn a_profile_with_tools_is_served_only_while_the_gate_is_on(pool: PgPool) 
 
 #[sqlx::test]
 async fn a_job_without_a_profile_carries_none_and_has_no_blob(pool: PgPool) {
-    let store = store(pool).await;
+    let store = store(pool.clone()).await;
     store
         .submit_job(&fleet_proto::v1::SubmitJobRequest {
             idempotency_key: "plain".to_owned(),
@@ -198,8 +220,8 @@ async fn a_job_without_a_profile_carries_none_and_has_no_blob(pool: PgPool) {
 
 #[sqlx::test]
 async fn a_wrong_box_is_denied(pool: PgPool) {
-    let store = store(pool).await;
-    store.create_profile("alpha", ONE).await.unwrap();
+    let store = store(pool.clone()).await;
+    shared(&pool, "alpha", ONE).await;
     let id = batch_job(&store, "alpha").await;
     let mut worker = worker(serve(&store), as_box);
     let job = claim(&mut worker, &name(1)).await;
@@ -213,8 +235,8 @@ async fn a_wrong_box_is_denied(pool: PgPool) {
 
 #[sqlx::test]
 async fn a_wrong_attempt_is_denied(pool: PgPool) {
-    let store = store(pool).await;
-    store.create_profile("alpha", ONE).await.unwrap();
+    let store = store(pool.clone()).await;
+    shared(&pool, "alpha", ONE).await;
     let id = batch_job(&store, "alpha").await;
     let mut worker = worker(serve(&store), as_box);
     let job = claim(&mut worker, &name(1)).await;
@@ -230,7 +252,7 @@ async fn a_wrong_attempt_is_denied(pool: PgPool) {
 
 #[sqlx::test]
 async fn a_missing_job_looks_like_a_wrong_box(pool: PgPool) {
-    let store = store(pool).await;
+    let store = store(pool.clone()).await;
     let mut worker = worker(serve(&store), as_box);
     let err = worker
         .get_profile_blob(blob("01ARZ3NDEKTSV4RRFFQ69G5FAV", 1, &name(1)))
@@ -243,7 +265,7 @@ async fn a_missing_job_looks_like_a_wrong_box(pool: PgPool) {
 #[sqlx::test]
 async fn a_queued_or_finished_job_has_no_lease(pool: PgPool) {
     let store = store(pool.clone()).await;
-    store.create_profile("alpha", ONE).await.unwrap();
+    shared(&pool, "alpha", ONE).await;
     let id = batch_job(&store, "alpha").await;
     let mut worker = worker(serve(&store), as_box);
     let err = worker
@@ -276,8 +298,8 @@ async fn a_queued_or_finished_job_has_no_lease(pool: PgPool) {
 
 #[sqlx::test]
 async fn the_client_token_is_out_of_scope(pool: PgPool) {
-    let store = store(pool).await;
-    store.create_profile("alpha", ONE).await.unwrap();
+    let store = store(pool.clone()).await;
+    shared(&pool, "alpha", ONE).await;
     let id = batch_job(&store, "alpha").await;
     let addr = serve(&store);
     let mut holder = worker(addr, as_box);
@@ -291,8 +313,8 @@ async fn the_client_token_is_out_of_scope(pool: PgPool) {
 
 #[sqlx::test]
 async fn no_hash_or_name_reaches_a_blob(pool: PgPool) {
-    let store = store(pool).await;
-    let created = store.create_profile("alpha", ONE).await.unwrap();
+    let store = store(pool.clone()).await;
+    let created = shared(&pool, "alpha", ONE).await;
     batch_job(&store, "alpha").await;
     let mut worker = worker(serve(&store), as_box);
     let job = claim(&mut worker, &name(1)).await;
@@ -311,8 +333,8 @@ async fn no_hash_or_name_reaches_a_blob(pool: PgPool) {
 #[sqlx::test]
 async fn a_pinned_hash_that_does_not_match_the_version_fails_closed(pool: PgPool) {
     let store = store(pool.clone()).await;
-    store.create_profile("alpha", ONE).await.unwrap();
-    store.create_profile("alpha", TWO).await.unwrap();
+    shared(&pool, "alpha", ONE).await;
+    shared(&pool, "alpha", TWO).await;
     let id = batch_job(&store, "alpha").await;
     let mut worker = worker(serve(&store), as_box);
     let job = claim(&mut worker, &name(1)).await;
@@ -350,8 +372,8 @@ fn large_profile() -> String {
 
 #[sqlx::test]
 async fn a_blob_over_the_default_client_limit_round_trips(pool: PgPool) {
-    let store = store(pool).await;
-    let created = store.create_profile("big", &large_profile()).await.unwrap();
+    let store = store(pool.clone()).await;
+    let created = shared(&pool, "big", &large_profile()).await;
     let size = created.content_json.len();
     assert!(size > 4 * 1024 * 1024 && size < MAX_PROFILE_MESSAGE_BYTES);
     let id = batch_job(&store, "big").await;
