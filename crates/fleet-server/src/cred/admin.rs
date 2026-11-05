@@ -15,7 +15,7 @@ pub const SETUP_CODE_TTL_HOURS: i32 = 24;
 
 const FIND_USER: &str = "\
 SELECT id, username FROM users WHERE lower(username) = lower($1) AND lower(username) <> 'bootstrap' FOR UPDATE";
-const INSERT_USER: &str = "INSERT INTO users (username) VALUES ($1) RETURNING id";
+const INSERT_USER: &str = "INSERT INTO users (username, is_admin) VALUES ($1, false) RETURNING id";
 const DELETE_PASSKEYS: &str = "DELETE FROM passkeys WHERE user_id = $1";
 const DELETE_SESSIONS: &str = "DELETE FROM web_sessions WHERE user_id = $1";
 const REVOKE_TOKENS: &str =

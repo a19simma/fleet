@@ -54,12 +54,21 @@ async fn audit(pool: &PgPool, action: &str) -> Result<(), sqlx::Error> {
 #[sqlx::test(migrations = false)]
 async fn rows_written_by_the_previous_release_survive_with_no_admin(pool: PgPool) {
     migrate_before(&pool).await;
-    run(&pool, &AdminCommand::CreateUser("alice".into()), "op")
+    for name in ["alice", "bob"] {
+        sqlx::query("INSERT INTO users (username) VALUES ($1)")
+            .bind(name)
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query(
+            "INSERT INTO admin_audit (action, user_id, username, operator) \
+             SELECT 'user_create', id, username, 'op' FROM users WHERE username = $1",
+        )
+        .bind(name)
+        .execute(&pool)
         .await
         .unwrap();
-    run(&pool, &AdminCommand::CreateUser("bob".into()), "op")
-        .await
-        .unwrap();
+    }
     run(&pool, &AdminCommand::ResetPasskeys("alice".into()), "op")
         .await
         .unwrap();

@@ -25,7 +25,11 @@ const SETUP_LOCK: i64 = 0x4655_5345_5253;
 
 const HAS_REAL_USERS: &str =
     "SELECT EXISTS (SELECT 1 FROM users WHERE lower(username) <> 'bootstrap')";
-const INSERT_USER: &str = "INSERT INTO users (username) VALUES ($1) RETURNING id";
+const INSERT_ADMIN_USER: &str =
+    "INSERT INTO users (username, is_admin) VALUES ($1, true) RETURNING id";
+const LOCK_TARGET: &str = "SELECT username FROM users WHERE id = $1 FOR UPDATE";
+const SET_ADMIN: &str = "UPDATE users SET is_admin = $2 WHERE id = $1";
+const READ_ADMIN: &str = "SELECT is_admin FROM users WHERE id = $1";
 const LOCK: &str = "SELECT pg_advisory_xact_lock($1)";
 const BOOTSTRAP_ID: &str = "SELECT bootstrap_user_id()";
 const INSERT_TOKEN: &str = "\
@@ -65,6 +69,10 @@ pub enum UserError {
     SetupClosed,
     /// No such token, or it belongs to another user.
     NotFound,
+    /// No user has this id.
+    NoSuchUser,
+    /// The reserved `bootstrap` user can never be admin.
+    BootstrapNotAdmin,
     /// The database failed.
     Db(sqlx::Error),
 }
@@ -78,6 +86,8 @@ impl fmt::Display for UserError {
             Self::BadSetupCode => "invalid setup code",
             Self::SetupClosed => "setup is closed",
             Self::NotFound => "token not found",
+            Self::NoSuchUser => "no such user",
+            Self::BootstrapNotAdmin => "the bootstrap user cannot be admin",
             Self::Db(_) => "user store database error",
         })
     }
@@ -266,7 +276,7 @@ impl Users {
         }
     }
 
-    /// Creates the admin user when `code` matches the issued setup code.
+    /// Creates the first admin user (flag set) when `code` matches the issued setup code.
     ///
     /// The code is spent on success. A wrong code leaves it in place. Once any user exists
     /// this always fails with [`UserError::SetupClosed`] and drops the code.
@@ -318,7 +328,7 @@ impl Users {
             *slot = None;
             return Err(UserError::SetupClosed);
         }
-        let id: i64 = sqlx::query_scalar(INSERT_USER)
+        let id: i64 = sqlx::query_scalar(INSERT_ADMIN_USER)
             .bind(username)
             .fetch_one(&mut *tx)
             .await
@@ -373,7 +383,7 @@ impl Users {
         if closed {
             return Err(UserError::SetupClosed);
         }
-        let id: i64 = sqlx::query_scalar(INSERT_USER)
+        let id: i64 = sqlx::query_scalar(INSERT_ADMIN_USER)
             .bind(username)
             .fetch_one(&mut *tx)
             .await
@@ -407,6 +417,50 @@ impl Users {
             })
             .await
             .copied()
+    }
+
+    /// Sets or clears the admin flag of `user_id`.
+    ///
+    /// The target row is locked `FOR UPDATE` before the check, so a concurrent call waits and
+    /// the `bootstrap` refusal never races a rename. Clearing the flag of `bootstrap` is a
+    /// no-op that succeeds.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`UserError::NoSuchUser`], [`UserError::BootstrapNotAdmin`] when promoting
+    /// the reserved user (refused before any write), or [`UserError::Db`].
+    pub async fn set_admin(&self, user_id: i64, admin: bool) -> Result<(), UserError> {
+        let mut tx = self.pool.begin().await?;
+        let username: String = sqlx::query_scalar(LOCK_TARGET)
+            .bind(user_id)
+            .fetch_optional(&mut *tx)
+            .await?
+            .ok_or(UserError::NoSuchUser)?;
+        if admin && username.eq_ignore_ascii_case(BOOTSTRAP_USERNAME) {
+            return Err(UserError::BootstrapNotAdmin);
+        }
+        sqlx::query(SET_ADMIN)
+            .bind(user_id)
+            .bind(admin)
+            .execute(&mut *tx)
+            .await?;
+        tx.commit().await?;
+        Ok(())
+    }
+
+    /// Reads the admin flag of `user_id` fresh from the database, with no cache.
+    ///
+    /// An unknown id reads as not admin.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`UserError::Db`] for a database failure.
+    pub async fn is_admin(&self, user_id: i64) -> Result<bool, UserError> {
+        Ok(sqlx::query_scalar(READ_ADMIN)
+            .bind(user_id)
+            .fetch_optional(&self.pool)
+            .await?
+            .unwrap_or(false))
     }
 
     /// Spends an admin-issued setup code and returns the user it was issued for.
