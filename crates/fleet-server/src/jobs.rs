@@ -2,13 +2,20 @@
 
 use std::fmt;
 
+use fleet_core::catalog::{
+    CatalogItem, CatalogKind, EffectiveSet, NoteReason, ResolveNote, RunnerKind, validate_id,
+};
+use fleet_core::constant_time_eq;
 use fleet_proto::v1::{
-    CiState, JobCi, JobState, JobVerdict, ReportJobRequest, SubmitJobRequest, SubmitJudgeRequest,
+    CatalogItem as WireItem, CatalogKind as WireKind, CiState, JobCi, JobState, JobVerdict,
+    ReportJobRequest, SubmitJobRequest, SubmitJudgeRequest,
 };
 use fleet_proto::{
-    CI_RETRY_KEY_PREFIX, MAX_MODEL_BYTES, MAX_VERDICT_REASON_BYTES, MAX_VERDICT_SCORE, is_ci_log,
-    is_ci_url, is_plain_text, is_swarm_branch,
+    CI_RETRY_KEY_PREFIX, MAX_BLOB_CATALOG_ITEMS, MAX_MODEL_BYTES, MAX_VERDICT_REASON_BYTES,
+    MAX_VERDICT_SCORE, is_ci_log, is_ci_url, is_plain_text, is_swarm_branch, validate_blob_catalog,
 };
+use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
 
 /// Longest accepted idempotency key, in bytes.
 pub const MAX_KEY_BYTES: usize = 128;
@@ -81,6 +88,11 @@ pub enum JobInvalid {
     /// The verdict score, reason or model is out of range, or the report is not a
     /// successful judge ending.
     Verdict,
+    /// The profile name breaks the profile name rule.
+    Profile,
+    /// The profile's effective catalog set cannot be frozen: the selection names an item the
+    /// catalog lacks, or the set passes the blob catalog caps.
+    Snapshot,
 }
 
 impl fmt::Display for JobInvalid {
@@ -102,6 +114,8 @@ impl fmt::Display for JobInvalid {
             Self::Agent => "invalid agent",
             Self::Target => "invalid target job",
             Self::Verdict => "invalid verdict",
+            Self::Profile => "invalid profile",
+            Self::Snapshot => "profile catalog set cannot be frozen",
         })
     }
 }
@@ -118,6 +132,7 @@ pub struct NewJob {
     pub(crate) open_pr: bool,
     pub(crate) agent: &'static str,
     pub(crate) target_job_id: Option<String>,
+    pub(crate) profile: Option<String>,
 }
 
 /// A validated final report: the state a box ends its job in and the result fields.
@@ -215,7 +230,8 @@ pub(crate) fn validate_job_id(job_id: &str) -> Result<(), JobInvalid> {
 
 /// Validates a submit request. This is the only check on these fields.
 ///
-/// The agent goes through [`validate_agent`]: empty means [`DEFAULT_AGENT`].
+/// The agent goes through [`validate_agent`]: empty means [`DEFAULT_AGENT`]. An empty profile
+/// means no profile, any other one must pass the profile name rule.
 ///
 /// # Errors
 ///
@@ -238,6 +254,12 @@ pub fn validate_submit(request: &SubmitJobRequest) -> Result<NewJob, JobInvalid>
         return Err(JobInvalid::BaseRef);
     }
     let agent = validate_agent(&request.agent)?;
+    let profile = if request.profile.is_empty() {
+        None
+    } else {
+        crate::profiles::validate_name(&request.profile).map_err(|_| JobInvalid::Profile)?;
+        Some(request.profile.clone())
+    };
     Ok(NewJob {
         key: request.idempotency_key.clone(),
         prompt: request.prompt.clone(),
@@ -246,6 +268,7 @@ pub fn validate_submit(request: &SubmitJobRequest) -> Result<NewJob, JobInvalid>
         open_pr: request.open_pr,
         agent,
         target_job_id: None,
+        profile,
     })
 }
 
@@ -298,6 +321,7 @@ pub fn validate_judge(request: &SubmitJudgeRequest) -> Result<NewJob, JobInvalid
         open_pr: false,
         agent: DEFAULT_AGENT,
         target_job_id: Some(request.target_job_id.clone()),
+        profile: None,
     })
 }
 
@@ -390,4 +414,337 @@ pub(crate) fn validate_terminal(
         exit_code: request.exit_code,
         branch: request.branch.clone(),
     }))
+}
+
+/// Maps a validated agent name to the runner kind the catalog resolves for.
+pub(crate) fn runner_kind(agent: &str) -> Option<RunnerKind> {
+    match agent {
+        "claude" => Some(RunnerKind::Claude),
+        "codex" => Some(RunnerKind::Codex),
+        "kimi" => Some(RunnerKind::Kimi),
+        _ => None,
+    }
+}
+
+const SNAPSHOT_DOMAIN: &[u8] = b"fleet-job-snapshot-v1";
+
+pub(crate) fn kind_of(name: &str) -> Option<CatalogKind> {
+    [
+        CatalogKind::Skill,
+        CatalogKind::Subagent,
+        CatalogKind::Tool,
+        CatalogKind::Context,
+    ]
+    .into_iter()
+    .find(|kind| kind.as_str() == name)
+}
+
+const fn wire_kind(kind: CatalogKind) -> WireKind {
+    match kind {
+        CatalogKind::Skill => WireKind::Skill,
+        CatalogKind::Subagent => WireKind::Subagent,
+        CatalogKind::Tool => WireKind::Tool,
+        CatalogKind::Context => WireKind::Context,
+    }
+}
+
+const fn reason_name(reason: NoteReason) -> Option<&'static str> {
+    match reason {
+        NoteReason::AdminDisabled => Some("admin_disabled"),
+        NoteReason::RunnerUnsupported => Some("runner_unsupported"),
+        _ => None,
+    }
+}
+
+fn reason_of(name: &str) -> Option<NoteReason> {
+    [NoteReason::AdminDisabled, NoteReason::RunnerUnsupported]
+        .into_iter()
+        .find(|reason| reason_name(*reason) == Some(name))
+}
+
+fn feed(hasher: &mut Sha256, field: &[u8]) {
+    hasher.update(u64::try_from(field.len()).unwrap_or(u64::MAX).to_be_bytes());
+    hasher.update(field);
+}
+
+/// The effective catalog set of a job, frozen at submit: item versions with their bodies, the
+/// notes for dropped items, and a digest over both.
+///
+/// The digest is sha256 over a domain tag, the item count, each item as length-prefixed kind,
+/// id, name and body, the note count and each note as length-prefixed kind, id and reason.
+/// Any change to a body, a name, the order or the membership changes it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Snapshot {
+    items: Vec<CatalogItem>,
+    notes: Vec<ResolveNote>,
+    hash: [u8; 32],
+}
+
+impl Snapshot {
+    /// Freezes a resolved set.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`JobInvalid::Snapshot`] when the set passes [`MAX_BLOB_CATALOG_ITEMS`] items
+    /// or the blob catalog byte cap, or a note carries a reason this server cannot store.
+    pub fn freeze(set: &EffectiveSet) -> Result<Self, JobInvalid> {
+        Self::build(set.items().to_vec(), set.notes().to_vec())
+    }
+
+    fn build(items: Vec<CatalogItem>, notes: Vec<ResolveNote>) -> Result<Self, JobInvalid> {
+        if items.len() > MAX_BLOB_CATALOG_ITEMS
+            || notes.iter().any(|n| reason_name(n.reason).is_none())
+        {
+            return Err(JobInvalid::Snapshot);
+        }
+        let snapshot = Self {
+            hash: digest(&items, &notes),
+            items,
+            notes,
+        };
+        if validate_blob_catalog(&snapshot.wire_items()) {
+            Ok(snapshot)
+        } else {
+            Err(JobInvalid::Snapshot)
+        }
+    }
+
+    /// The 32-byte digest of the snapshot content.
+    #[must_use]
+    pub const fn hash(&self) -> &[u8; 32] {
+        &self.hash
+    }
+
+    /// The frozen items, in resolve order.
+    #[must_use]
+    pub fn items(&self) -> &[CatalogItem] {
+        &self.items
+    }
+
+    /// The notes for dropped items, in resolve order.
+    #[must_use]
+    pub fn notes(&self) -> &[ResolveNote] {
+        &self.notes
+    }
+
+    /// The items as the wire catalog a `GetProfileBlobReply` carries.
+    #[must_use]
+    pub fn wire_items(&self) -> Vec<WireItem> {
+        self.items
+            .iter()
+            .map(|item| WireItem {
+                id: item.id().as_str().to_owned(),
+                kind: wire_kind(item.kind()) as i32,
+                name: item.name().to_owned(),
+                content: item.body().to_owned(),
+                digest: item.digest().to_vec(),
+                admin_enabled: true,
+            })
+            .collect()
+    }
+
+    /// The items as the JSON array stored in `jobs.snapshot_catalog`.
+    #[must_use]
+    pub fn catalog_json(&self) -> String {
+        Value::Array(
+            self.items
+                .iter()
+                .map(|item| {
+                    json!({
+                        "id": item.id().as_str(),
+                        "kind": item.kind().as_str(),
+                        "name": item.name(),
+                        "content": item.body(),
+                    })
+                })
+                .collect(),
+        )
+        .to_string()
+    }
+
+    /// The notes as the JSON array stored in `jobs.snapshot_notes`.
+    #[must_use]
+    pub fn notes_json(&self) -> String {
+        Value::Array(
+            self.notes
+                .iter()
+                .filter_map(|note| {
+                    reason_name(note.reason).map(|reason| {
+                        json!({
+                            "id": note.id.as_str(),
+                            "kind": note.kind.as_str(),
+                            "reason": reason,
+                        })
+                    })
+                })
+                .collect(),
+        )
+        .to_string()
+    }
+
+    /// Rebuilds a snapshot from its stored columns and checks every item, the caps and the
+    /// stored digest.
+    ///
+    /// Returns `None` for any malformed, oversized or tampered column.
+    #[must_use]
+    pub fn from_stored(catalog: &str, notes: &str, hash: &[u8]) -> Option<Self> {
+        let catalog: Value = serde_json::from_str(catalog).ok()?;
+        let notes: Value = serde_json::from_str(notes).ok()?;
+        let (catalog, notes) = (catalog.as_array()?, notes.as_array()?);
+        if catalog.len() > MAX_BLOB_CATALOG_ITEMS {
+            return None;
+        }
+        let text = |value: &'_ Value, key: &str| value.get(key)?.as_str().map(str::to_owned);
+        let items = catalog
+            .iter()
+            .map(|entry| {
+                CatalogItem::new(
+                    kind_of(&text(entry, "kind")?)?,
+                    &text(entry, "id")?,
+                    &text(entry, "name")?,
+                    &text(entry, "content")?,
+                )
+                .ok()
+            })
+            .collect::<Option<Vec<_>>>()?;
+        let notes = notes
+            .iter()
+            .map(|entry| {
+                Some(ResolveNote {
+                    kind: kind_of(&text(entry, "kind")?)?,
+                    id: validate_id(&text(entry, "id")?).ok()?,
+                    reason: reason_of(&text(entry, "reason")?)?,
+                })
+            })
+            .collect::<Option<Vec<_>>>()?;
+        let snapshot = Self::build(items, notes).ok()?;
+        constant_time_eq(snapshot.hash(), hash).then_some(snapshot)
+    }
+}
+
+fn digest(items: &[CatalogItem], notes: &[ResolveNote]) -> [u8; 32] {
+    let mut hasher = Sha256::new();
+    hasher.update(SNAPSHOT_DOMAIN);
+    hasher.update(u64::try_from(items.len()).unwrap_or(u64::MAX).to_be_bytes());
+    for item in items {
+        for field in [
+            item.kind().as_str(),
+            item.id().as_str(),
+            item.name(),
+            item.body(),
+        ] {
+            feed(&mut hasher, field.as_bytes());
+        }
+    }
+    hasher.update(u64::try_from(notes.len()).unwrap_or(u64::MAX).to_be_bytes());
+    for note in notes {
+        for field in [
+            note.kind.as_str(),
+            note.id.as_str(),
+            reason_name(note.reason).unwrap_or(""),
+        ] {
+            feed(&mut hasher, field.as_bytes());
+        }
+    }
+    hasher.finalize().into()
+}
+
+#[cfg(test)]
+mod tests {
+    use fleet_core::Selection;
+    use fleet_core::catalog::{CatalogEntry, resolve};
+
+    use super::*;
+
+    fn entries(bodies: [&str; 2]) -> Vec<CatalogEntry> {
+        let skill = |id: &str, body: &str, on: bool| {
+            CatalogEntry::new(
+                CatalogItem::new(CatalogKind::Skill, id, id, body).unwrap(),
+                on,
+            )
+        };
+        vec![
+            skill("a", bodies[0], true),
+            skill("b", bodies[1], true),
+            skill("c", "off", false),
+        ]
+    }
+
+    fn frozen(bodies: [&str; 2], selection: &[u8]) -> Snapshot {
+        let selection = Selection::from_json(selection).unwrap();
+        let set = resolve(RunnerKind::Claude, &selection, &entries(bodies)).unwrap();
+        Snapshot::freeze(&set).unwrap()
+    }
+
+    #[test]
+    fn equal_input_gives_one_hash() {
+        let one = frozen(["x", "y"], b"[]");
+        assert_eq!(one.hash(), frozen(["x", "y"], b"[]").hash());
+        assert_eq!(one.hash().len(), 32);
+    }
+
+    #[test]
+    fn a_changed_body_changes_the_hash() {
+        let base = frozen(["x", "y"], b"[]");
+        assert_ne!(base.hash(), frozen(["x2", "y"], b"[]").hash());
+        assert_ne!(base.hash(), frozen(["x", "y2"], b"[]").hash());
+    }
+
+    #[test]
+    fn membership_and_notes_change_the_hash() {
+        let base = frozen(["x", "y"], b"[]");
+        let without_b = frozen(["x", "y"], br#"[{"item_id":"b"}]"#);
+        assert_ne!(base.hash(), without_b.hash());
+        assert_ne!(
+            frozen(["x", "y"], br#"[{"item_id":"a"}]"#).hash(),
+            without_b.hash()
+        );
+    }
+
+    #[test]
+    fn the_kind_and_the_note_reason_change_the_digest() {
+        let item = |kind| vec![CatalogItem::new(kind, "a", "a", "x").unwrap()];
+        assert_ne!(
+            digest(&item(CatalogKind::Skill), &[]),
+            digest(&item(CatalogKind::Subagent), &[])
+        );
+        let note = |reason| {
+            vec![ResolveNote {
+                kind: CatalogKind::Skill,
+                id: validate_id("a").unwrap(),
+                reason,
+            }]
+        };
+        assert_ne!(
+            digest(&[], &note(NoteReason::AdminDisabled)),
+            digest(&[], &note(NoteReason::RunnerUnsupported))
+        );
+    }
+
+    #[test]
+    fn every_agent_maps_to_its_own_runner() {
+        assert_eq!(runner_kind("claude"), Some(RunnerKind::Claude));
+        assert_eq!(runner_kind("codex"), Some(RunnerKind::Codex));
+        assert_eq!(runner_kind("kimi"), Some(RunnerKind::Kimi));
+        assert_eq!(runner_kind("Claude"), None);
+        assert_eq!(runner_kind(""), None);
+    }
+
+    #[test]
+    fn stored_form_round_trips_and_rejects_tampering() {
+        let snap = frozen(["x", "y"], b"[]");
+        let (catalog, notes) = (snap.catalog_json(), snap.notes_json());
+        assert_eq!(
+            Snapshot::from_stored(&catalog, &notes, snap.hash()),
+            Some(snap.clone())
+        );
+        assert!(
+            Snapshot::from_stored(&catalog.replace("\"x\"", "\"z\""), &notes, snap.hash())
+                .is_none()
+        );
+        assert!(Snapshot::from_stored(&catalog, "[]", snap.hash()).is_none());
+        assert!(Snapshot::from_stored(&catalog, &notes, &[0; 32]).is_none());
+        assert!(Snapshot::from_stored(&catalog, &notes, &snap.hash()[..31]).is_none());
+        assert!(Snapshot::from_stored("{}", &notes, snap.hash()).is_none());
+    }
 }

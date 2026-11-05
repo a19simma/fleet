@@ -942,6 +942,7 @@ dependencies = [
  "openssl",
  "rustls",
  "serde_json",
+ "sha2 0.10.9",
  "sqlx",
  "tokio",
  "tokio-rustls",
