@@ -1,13 +1,18 @@
-//! `/profiles` is registered, needs a session and answers 501 until the page is built. The tests need a Postgres superuser URL in `DATABASE_URL` for `#[sqlx::test]` and
-//! live in their own binary because each one binds a socket.
+//! The profile pages over HTTP: session and CSRF gates, owner-only share buttons, read-only
+//! views for others, escaping and refusals that leave the profile unchanged. The tests need
+//! a Postgres superuser URL in `DATABASE_URL` for `#[sqlx::test]` and live in their own
+//! binary because each one binds a socket.
 
 #![expect(clippy::unwrap_used, reason = "test code asserts by panicking")]
 
+use std::fmt::Write as _;
+use std::net::SocketAddr;
 use std::time::Duration;
 
 use fleet_server::auth::BearerAuth;
 use fleet_server::config::Token;
 use fleet_server::cred::Users;
+use fleet_server::profiles::{self, ProfileContent};
 use fleet_server::service::serve_with_web;
 use fleet_server::store::Store;
 use fleet_server::web::{SESSION_COOKIE, Web, WebAuth};
@@ -19,91 +24,356 @@ use tonic::transport::server::TcpIncoming;
 
 const WAIT: Duration = Duration::from_secs(20);
 const ORIGIN: &str = "https://fleet.example.com";
-const PATHS: [&str; 1] = ["/profiles"];
+const FORM: (&str, &str) = ("Content-Type", "application/x-www-form-urlencoded");
+const HOSTILE: &str = "<script>alert('x')</script>\"'&\r\n\u{2028}";
 
-async fn send(addr: std::net::SocketAddr, path: &str, cookie: Option<&str>) -> (u16, String) {
-    let mut stream = TcpStream::connect(addr).await.unwrap();
-    let cookie = cookie.map_or_else(String::new, |c| format!("Cookie: {c}\r\n"));
-    let request = format!(
-        "GET {path} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\nOrigin: {ORIGIN}\r\n{cookie}\r\n"
-    );
-    stream.write_all(request.as_bytes()).await.unwrap();
-    let mut raw = Vec::new();
-    let _ = tokio::time::timeout(WAIT, stream.read_to_end(&mut raw))
-        .await
-        .unwrap();
-    let raw = String::from_utf8_lossy(&raw).into_owned();
-    let (head, _) = raw.split_once("\r\n\r\n").unwrap();
-    let status = head.split(' ').nth(1).unwrap().parse().unwrap();
-    let location = head
-        .lines()
-        .find_map(|line| {
-            let (key, value) = line.split_once(':')?;
-            key.eq_ignore_ascii_case("location")
-                .then(|| value.trim().to_owned())
-        })
-        .unwrap_or_default();
-    (status, location)
+struct Reply {
+    status: u16,
+    head: String,
+    body: String,
 }
 
-async fn session(pool: &PgPool) -> String {
-    let user_id: i64 =
-        sqlx::query_scalar("INSERT INTO users (username) VALUES ('alice') RETURNING id")
-            .fetch_one(pool)
+impl Reply {
+    fn location(&self) -> String {
+        self.head
+            .lines()
+            .find_map(|line| {
+                let (key, value) = line.split_once(':')?;
+                key.eq_ignore_ascii_case("location")
+                    .then(|| value.trim().to_owned())
+            })
+            .unwrap_or_default()
+    }
+}
+
+struct Session {
+    cookie: String,
+    csrf: String,
+    user_id: i64,
+}
+
+struct Harness {
+    addr: SocketAddr,
+    pool: PgPool,
+    stop: Option<oneshot::Sender<()>>,
+    task: tokio::task::JoinHandle<std::io::Result<()>>,
+}
+
+impl Harness {
+    async fn start(pool: PgPool) -> Self {
+        Self::start_with(pool, true).await
+    }
+
+    async fn start_with(pool: PgPool, configured: bool) -> Self {
+        let store = Store::new(pool.clone());
+        store.migrate().await.unwrap();
+        let users = Users::new(pool.clone());
+        let auth = WebAuth::new(pool.clone(), users, ORIGIN, Some("example.com")).unwrap();
+        let web = if configured {
+            Web::with_console(auth, None, store.clone())
+        } else {
+            Web::with_auth(auth)
+        };
+        let bearer = BearerAuth::new(
+            &Token::new("box-token-0123456789abcdef0123456789".to_owned()).unwrap(),
+            None,
+        );
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (stop, rx) = oneshot::channel::<()>();
+        let task = tokio::spawn(async move {
+            serve_with_web(&store, &bearer, web, TcpIncoming::from(listener), async {
+                let _ = rx.await;
+            })
+            .await
+        });
+        Self {
+            addr,
+            pool,
+            stop: Some(stop),
+            task,
+        }
+    }
+
+    async fn session(&self, name: &str, seed: char) -> Session {
+        let user_id: i64 =
+            sqlx::query_scalar("INSERT INTO users (username) VALUES ($1) RETURNING id")
+                .bind(name)
+                .fetch_one(&self.pool)
+                .await
+                .unwrap();
+        let id = seed.to_string().repeat(64);
+        let csrf = format!("csrf-{seed}-token");
+        sqlx::query(
+            "INSERT INTO web_sessions (id_hash, user_id, csrf, expires_at) \
+             VALUES (sha256($1::bytea), $2, $3, now() + interval '1 hour')",
+        )
+        .bind(id.as_bytes())
+        .bind(user_id)
+        .bind(&csrf)
+        .execute(&self.pool)
+        .await
+        .unwrap();
+        Session {
+            cookie: format!("{SESSION_COOKIE}={id}"),
+            csrf,
+            user_id,
+        }
+    }
+
+    async fn profile(&self, owner: &Session, name: &str, json: &str, shared: bool) -> i64 {
+        profiles::create_owned(
+            &self.pool,
+            Some(owner.user_id),
+            name,
+            ProfileContent::Json(json),
+            false,
+        )
+        .await
+        .unwrap();
+        sqlx::query_scalar(
+            "UPDATE profile SET visibility = $3 WHERE owner_user_id = $1 AND name = $2 RETURNING id",
+        )
+        .bind(owner.user_id)
+        .bind(name)
+        .bind(if shared { "shared" } else { "private" })
+        .fetch_one(&self.pool)
+        .await
+        .unwrap()
+    }
+
+    async fn visibility(&self, id: i64) -> String {
+        sqlx::query_scalar("SELECT visibility FROM profile WHERE id = $1")
+            .bind(id)
+            .fetch_one(&self.pool)
+            .await
+            .unwrap()
+    }
+
+    async fn send(&self, method: &str, path: &str, extra: &[(&str, &str)], body: &[u8]) -> Reply {
+        let mut stream = TcpStream::connect(self.addr).await.unwrap();
+        let mut request = format!(
+            "{method} {path} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\nContent-Length: {}\r\nOrigin: {ORIGIN}\r\n",
+            body.len()
+        );
+        for (key, value) in extra {
+            let _ = write!(request, "{key}: {value}\r\n");
+        }
+        request.push_str("\r\n");
+        stream.write_all(request.as_bytes()).await.unwrap();
+        let _ = stream.write_all(body).await;
+        let mut raw = Vec::new();
+        let _ = tokio::time::timeout(WAIT, stream.read_to_end(&mut raw))
             .await
             .unwrap();
-    let id = "a".repeat(64);
-    sqlx::query(
-        "INSERT INTO web_sessions (id_hash, user_id, csrf, expires_at) \
-         VALUES (sha256($1::bytea), $2, 'csrf-alice-token', now() + interval '1 hour')",
-    )
-    .bind(id.as_bytes())
-    .bind(user_id)
-    .execute(pool)
-    .await
-    .unwrap();
-    format!("{SESSION_COOKIE}={id}")
+        let raw = String::from_utf8_lossy(&raw).into_owned();
+        let (head, body) = raw.split_once("\r\n\r\n").unwrap();
+        let status = head.split(' ').nth(1).unwrap().parse().unwrap();
+        Reply {
+            status,
+            head: head.to_owned(),
+            body: body.to_owned(),
+        }
+    }
+
+    async fn get(&self, who: &Session, path: &str) -> Reply {
+        self.send("GET", path, &[("Cookie", &who.cookie)], b"")
+            .await
+    }
+
+    async fn post(&self, who: &Session, path: &str, body: &str) -> Reply {
+        self.send(
+            "POST",
+            path,
+            &[("Cookie", &who.cookie), FORM],
+            body.as_bytes(),
+        )
+        .await
+    }
+
+    async fn post_csrf(&self, who: &Session, path: &str) -> Reply {
+        self.post(who, path, &format!("csrf={}", who.csrf)).await
+    }
+
+    async fn finish(mut self) {
+        let _ = self.stop.take().unwrap().send(());
+        tokio::time::timeout(WAIT, self.task)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+    }
 }
 
 #[sqlx::test]
-async fn the_profiles_route_needs_a_session_and_answers_501(pool: PgPool) {
-    let store = Store::new(pool.clone());
-    store.migrate().await.unwrap();
-    let users = Users::new(pool.clone());
-    let auth = WebAuth::new(pool.clone(), users, ORIGIN, Some("example.com")).unwrap();
-    let bearer = BearerAuth::new(
-        &Token::new("box-token-0123456789abcdef0123456789".to_owned()).unwrap(),
-        None,
-    );
-    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let addr = listener.local_addr().unwrap();
-    let (stop, rx) = oneshot::channel::<()>();
-    let serving = store.clone();
-    let task = tokio::spawn(async move {
-        serve_with_web(
-            &serving,
-            &bearer,
-            Web::with_auth(auth),
-            TcpIncoming::from(listener),
-            async {
-                let _ = rx.await;
-            },
-        )
-        .await
-    });
-    let cookie = session(&pool).await;
-    for path in PATHS {
-        let (status, location) = send(addr, path, None).await;
-        assert_eq!((status, location.as_str()), (303, "/login"), "{path}");
-        let (status, _) = send(addr, path, Some(&cookie)).await;
-        assert_eq!(status, 501, "{path}");
+async fn the_pages_need_a_session_and_the_console(pool: PgPool) {
+    let h = Harness::start(pool.clone()).await;
+    for path in ["/profiles", "/profiles/1"] {
+        let reply = h.send("GET", path, &[], b"").await;
+        assert_eq!(
+            (reply.status, reply.location().as_str()),
+            (303, "/login"),
+            "{path}"
+        );
     }
-    let (status, _) = send(addr, "/profiles/nope/nope", Some(&cookie)).await;
-    assert_eq!(status, 404);
-    let _ = stop.send(());
-    tokio::time::timeout(WAIT, task)
-        .await
-        .unwrap()
-        .unwrap()
-        .unwrap();
+    for path in ["/profiles/1/share", "/profiles/1/unshare"] {
+        let reply = h.send("POST", path, &[FORM], b"csrf=x").await;
+        assert_eq!(reply.status, 403, "{path}");
+    }
+    h.finish().await;
+    let h = Harness::start_with(pool, false).await;
+    let alice = h.session("alice", 'a').await;
+    for path in ["/profiles", "/profiles/1"] {
+        assert_eq!(h.get(&alice, path).await.status, 404, "{path}");
+    }
+    assert_eq!(h.post_csrf(&alice, "/profiles/1/share").await.status, 404);
+    h.finish().await;
+}
+
+#[sqlx::test]
+async fn the_list_shows_own_and_shared_profiles_only(pool: PgPool) {
+    let h = Harness::start(pool).await;
+    let alice = h.session("alice", 'a').await;
+    let bob = h.session("bob", 'b').await;
+    h.profile(&alice, "alice-private", "{}", false).await;
+    h.profile(&alice, "alice-shared", "{}", true).await;
+    h.profile(&bob, "aaa-shared", "{}", true).await;
+    h.profile(&bob, "bob-private", "{}", false).await;
+    let page = h.get(&alice, "/profiles").await;
+    assert_eq!(page.status, 200);
+    for shown in ["alice-private", "alice-shared", "aaa-shared"] {
+        assert!(page.body.contains(shown), "{shown}");
+    }
+    assert!(!page.body.contains("bob-private"));
+    assert!(page.body.contains("read-only"));
+    assert!(page.body.contains("owner"));
+    assert!(page.body.find("alice-shared").unwrap() < page.body.find("aaa-shared").unwrap());
+    h.finish().await;
+}
+
+#[sqlx::test]
+async fn buttons_show_for_the_owner_and_a_read_only_view_for_others(pool: PgPool) {
+    let h = Harness::start(pool).await;
+    let alice = h.session("alice", 'a').await;
+    let bob = h.session("bob", 'b').await;
+    let private = h.profile(&alice, "mine", "{}", false).await;
+    let shared = h.profile(&alice, "open", "{}", true).await;
+    let page = h.get(&alice, &format!("/profiles/{private}")).await;
+    assert_eq!(page.status, 200);
+    assert!(page.body.contains("id=\"share\""));
+    assert!(!page.body.contains("id=\"unshare\""));
+    assert!(page.body.contains(&format!("/profiles/{private}/share")));
+    assert!(page.body.contains("name=\"csrf\" value=\"csrf-a-token\""));
+    let page = h.get(&alice, &format!("/profiles/{shared}")).await;
+    assert!(page.body.contains("id=\"unshare\""));
+    assert!(!page.body.contains("id=\"share\""));
+    let page = h.get(&bob, &format!("/profiles/{shared}")).await;
+    assert_eq!(page.status, 200);
+    assert!(page.body.contains("id=\"read-only\""));
+    assert!(
+        !page
+            .body
+            .contains("<form method=\"post\" action=\"/profiles")
+    );
+    assert_eq!(
+        h.get(&bob, &format!("/profiles/{private}")).await.status,
+        404
+    );
+    for path in [
+        "/profiles/nope",
+        "/profiles/0",
+        "/profiles/99999999",
+        "/profiles/nope/nope",
+    ] {
+        assert_eq!(h.get(&alice, path).await.status, 404, "{path}");
+    }
+    h.finish().await;
+}
+
+#[sqlx::test]
+async fn the_owner_shares_and_unshares(pool: PgPool) {
+    let h = Harness::start(pool).await;
+    let alice = h.session("alice", 'a').await;
+    let id = h.profile(&alice, "mine", "{}", false).await;
+    let reply = h.post_csrf(&alice, &format!("/profiles/{id}/share")).await;
+    assert_eq!(
+        (reply.status, reply.location()),
+        (303, format!("/profiles/{id}"))
+    );
+    assert_eq!(h.visibility(id).await, "shared");
+    let reply = h
+        .post_csrf(&alice, &format!("/profiles/{id}/unshare"))
+        .await;
+    assert_eq!(reply.status, 303);
+    assert_eq!(h.visibility(id).await, "private");
+    h.finish().await;
+}
+
+#[sqlx::test]
+async fn a_non_owner_post_is_refused_and_the_profile_is_unchanged(pool: PgPool) {
+    let h = Harness::start(pool).await;
+    let alice = h.session("alice", 'a').await;
+    let bob = h.session("bob", 'b').await;
+    let open = h.profile(&alice, "open", "{}", true).await;
+    let closed = h.profile(&alice, "closed", "{}", false).await;
+    let own_twin = h.profile(&bob, "open", "{}", false).await;
+    let reply = h
+        .post_csrf(&bob, &format!("/profiles/{open}/unshare"))
+        .await;
+    assert_eq!(reply.status, 403);
+    assert_eq!(h.visibility(open).await, "shared");
+    assert_eq!(h.visibility(own_twin).await, "private");
+    let reply = h.post_csrf(&bob, &format!("/profiles/{open}/share")).await;
+    assert_eq!(reply.status, 403);
+    assert_eq!(h.visibility(own_twin).await, "private");
+    let reply = h
+        .post_csrf(&bob, &format!("/profiles/{closed}/share"))
+        .await;
+    assert_eq!(reply.status, 404);
+    assert_eq!(h.visibility(closed).await, "private");
+    let forged = format!(
+        "csrf={}&owner={}&owner_user_id={}",
+        bob.csrf, alice.user_id, alice.user_id
+    );
+    let reply = h
+        .post(&bob, &format!("/profiles/{closed}/share"), &forged)
+        .await;
+    assert_eq!(reply.status, 404);
+    assert_eq!(h.visibility(closed).await, "private");
+    h.finish().await;
+}
+
+#[sqlx::test]
+async fn a_post_without_the_csrf_token_is_refused(pool: PgPool) {
+    let h = Harness::start(pool).await;
+    let alice = h.session("alice", 'a').await;
+    let id = h.profile(&alice, "mine", "{}", false).await;
+    let path = format!("/profiles/{id}/share");
+    for body in ["", "csrf=", "csrf=wrong", "other=csrf-a-token"] {
+        let reply = h.post(&alice, &path, body).await;
+        assert_eq!(reply.status, 403, "{body}");
+        assert_eq!(h.visibility(id).await, "private", "{body}");
+    }
+    h.finish().await;
+}
+
+#[sqlx::test]
+async fn every_rendered_value_is_escaped(pool: PgPool) {
+    let h = Harness::start(pool).await;
+    let alice = h.session("alice", 'a').await;
+    let hostile = h.session(HOSTILE, 'b').await;
+    let prefix = format!("content-marker <b onclick=\"y\">{HOSTILE}");
+    let json = serde_json::json!({ "prompt_prefix": prefix }).to_string();
+    let id = h.profile(&hostile, "evil", &json, true).await;
+    let list = h.get(&alice, "/profiles").await;
+    let detail = h.get(&alice, &format!("/profiles/{id}")).await;
+    for page in [&list, &detail] {
+        assert_eq!(page.status, 200);
+        assert!(!page.body.contains("<script>alert"));
+        assert!(!page.body.contains("'&\r\n"));
+        assert!(page.body.contains("&lt;script&gt;alert"));
+    }
+    assert!(detail.body.contains("content-marker"));
+    assert!(!detail.body.contains("<b onclick"));
+    h.finish().await;
 }

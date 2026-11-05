@@ -15,13 +15,15 @@ use super::pages::STYLE_PATH;
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(super) enum Nav {
     Jobs,
+    Profiles,
     Tokens,
     Credentials,
     Account,
 }
 
-const NAV_ITEMS: [(Nav, &str, &str); 4] = [
+const NAV_ITEMS: [(Nav, &str, &str); 5] = [
     (Nav::Jobs, "/jobs", "Jobs"),
+    (Nav::Profiles, "/profiles", "Profiles"),
     (Nav::Tokens, "/tokens", "Tokens"),
     (Nav::Credentials, "/credentials", "Credentials"),
     (Nav::Account, "/account", "Account"),
