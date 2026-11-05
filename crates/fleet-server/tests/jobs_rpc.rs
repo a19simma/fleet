@@ -17,6 +17,7 @@ use fleet_proto::v1::{
 use fleet_server::auth::BearerAuth;
 use fleet_server::config::Token;
 use fleet_server::cred::Users;
+use fleet_server::profiles::{self, ProfileContent};
 use fleet_server::service::router;
 use fleet_server::store::Store;
 use sqlx::PgPool;
@@ -878,4 +879,586 @@ async fn a_key_resubmitted_with_another_agent_conflicts(pool: PgPool) {
     jobs.submit_job(first).await.unwrap();
     let again = jobs.submit_job(submit_request("k1")).await.unwrap_err();
     assert_eq!(again.code(), Code::AlreadyExists);
+}
+
+const NO_SNAPSHOT: &str = "SELECT snapshot_catalog IS NULL AND snapshot_notes IS NULL \
+     AND snapshot_hash IS NULL FROM jobs WHERE job_id = $1";
+const SNAPSHOT_TEXT: &str = "SELECT snapshot_catalog::text, snapshot_notes::text, \
+     encode(snapshot_hash, 'hex') FROM jobs WHERE job_id = $1";
+
+#[derive(Clone)]
+struct UserBearer(String);
+
+impl tonic::service::Interceptor for UserBearer {
+    fn call(&mut self, mut request: Request<()>) -> Result<Request<()>, Status> {
+        let value = MetadataValue::try_from(format!("Bearer {}", self.0))
+            .map_err(|err| Status::internal(err.to_string()))?;
+        request.metadata_mut().insert("authorization", value);
+        Ok(request)
+    }
+}
+
+type UserJobs = FleetJobsClient<InterceptedService<Channel, UserBearer>>;
+
+fn serve_users(pool: &PgPool, store: &Store) -> SocketAddr {
+    let auth = BearerAuth::new(
+        &Token::new("box-token-0123456789abcdef0123456789".to_owned()).unwrap(),
+        Some(&Token::new(TOKEN.to_owned()).unwrap()),
+    )
+    .with_users(Users::new(pool.clone()));
+    let incoming = TcpIncoming::bind("127.0.0.1:0".parse().unwrap()).unwrap();
+    let addr: SocketAddr = incoming.local_addr().unwrap();
+    tokio::spawn(router(store, &auth).serve_with_incoming(incoming));
+    addr
+}
+
+fn client(addr: SocketAddr, token: &str) -> UserJobs {
+    let channel = Endpoint::from_shared(format!("http://{addr}"))
+        .unwrap()
+        .connect_lazy();
+    FleetJobsClient::with_interceptor(channel, UserBearer(token.to_owned()))
+}
+
+async fn user_with_token(pool: &PgPool, name: &str) -> (i64, String) {
+    let id: i64 = sqlx::query_scalar("INSERT INTO users (username) VALUES ($1) RETURNING id")
+        .bind(name)
+        .fetch_one(pool)
+        .await
+        .unwrap();
+    let made = Users::new(pool.clone())
+        .create_api_token(id, "test")
+        .await
+        .unwrap();
+    (id, String::from_utf8(made.token.expose().to_vec()).unwrap())
+}
+
+async fn item(pool: &PgPool, id: &str, kind: &str, content: &str, enabled: bool) {
+    sqlx::query(
+        "INSERT INTO catalog_items (id, kind, name, content, digest, admin_enabled) \
+         VALUES ($1, $2, $1, $3, decode(repeat('00', 32), 'hex'), $4)",
+    )
+    .bind(id)
+    .bind(kind)
+    .bind(content)
+    .bind(enabled)
+    .execute(pool)
+    .await
+    .unwrap();
+}
+
+async fn profile(pool: &PgPool, owner: i64, name: &str, json: &str) {
+    profiles::create_owned(pool, Some(owner), name, ProfileContent::Json(json), false)
+        .await
+        .unwrap();
+}
+
+async fn seed(pool: &PgPool) {
+    item(pool, "s1", "skill", "skill one", true).await;
+    item(pool, "s2", "skill", "skill two", true).await;
+    item(pool, "d1", "skill", "disabled", false).await;
+    item(pool, "sub1", "subagent", "agent one", true).await;
+}
+
+fn with_profile(key: &str, profile: &str, agent: &str) -> SubmitJobRequest {
+    SubmitJobRequest {
+        profile: profile.to_owned(),
+        agent: agent.to_owned(),
+        ..submit_request(key)
+    }
+}
+
+async fn job_count(pool: &PgPool) -> i64 {
+    sqlx::query_scalar("SELECT count(*) FROM jobs")
+        .fetch_one(pool)
+        .await
+        .unwrap()
+}
+
+async fn stored(pool: &PgPool, job_id: &str) -> (String, String, String) {
+    sqlx::query_as(SNAPSHOT_TEXT)
+        .bind(job_id)
+        .fetch_one(pool)
+        .await
+        .unwrap()
+}
+
+const SELECT_S2_OFF: &str = r#"{"claude_md":"x","selection":[{"item_id":"s2","enabled":false}]}"#;
+
+#[sqlx::test]
+async fn submit_with_a_profile_stores_the_frozen_set(pool: PgPool) {
+    let store = store(pool.clone()).await;
+    seed(&pool).await;
+    let (user, token) = user_with_token(&pool, "ann").await;
+    profile(&pool, user, "alpha", SELECT_S2_OFF).await;
+    let mut jobs = client(serve_users(&pool, &store), &token);
+    let job = jobs
+        .submit_job(with_profile("k1", "alpha", ""))
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(job.profile.as_ref().unwrap().name, "alpha");
+    let (catalog, notes, hash) = stored(&pool, &job.job_id).await;
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(&catalog).unwrap(),
+        serde_json::json!([
+            {"id": "s1", "kind": "skill", "name": "s1", "content": "skill one"},
+            {"id": "sub1", "kind": "subagent", "name": "sub1", "content": "agent one"},
+        ])
+    );
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(&notes).unwrap(),
+        serde_json::json!([{"id": "d1", "kind": "skill", "reason": "admin_disabled"}])
+    );
+    assert_eq!(hash.len(), 64);
+    let pinned: (Option<i64>, Option<i32>) =
+        sqlx::query_as("SELECT profile_id, profile_version FROM jobs WHERE job_id = $1")
+            .bind(&job.job_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(pinned.1, Some(1));
+    assert!(pinned.0.is_some());
+}
+
+#[sqlx::test]
+async fn the_runner_kind_decides_what_is_dropped(pool: PgPool) {
+    let store = store(pool.clone()).await;
+    seed(&pool).await;
+    let (user, token) = user_with_token(&pool, "ann").await;
+    profile(&pool, user, "alpha", SELECT_S2_OFF).await;
+    let mut jobs = client(serve_users(&pool, &store), &token);
+    let job = jobs
+        .submit_job(with_profile("k1", "alpha", "kimi"))
+        .await
+        .unwrap()
+        .into_inner();
+    let (catalog, notes, _) = stored(&pool, &job.job_id).await;
+    let ids = |text: &str| -> Vec<(String, Option<String>)> {
+        serde_json::from_str::<Vec<serde_json::Value>>(text)
+            .unwrap()
+            .iter()
+            .map(|v| {
+                (
+                    v["id"].as_str().unwrap().to_owned(),
+                    v["reason"].as_str().map(str::to_owned),
+                )
+            })
+            .collect()
+    };
+    assert_eq!(ids(&catalog), vec![("s1".to_owned(), None)]);
+    assert_eq!(
+        ids(&notes),
+        vec![
+            ("d1".to_owned(), Some("admin_disabled".to_owned())),
+            ("sub1".to_owned(), Some("runner_unsupported".to_owned())),
+        ]
+    );
+}
+
+#[sqlx::test]
+async fn later_catalog_edits_do_not_change_a_queued_job(pool: PgPool) {
+    let store = store(pool.clone()).await;
+    seed(&pool).await;
+    let (user, token) = user_with_token(&pool, "ann").await;
+    profile(&pool, user, "alpha", SELECT_S2_OFF).await;
+    let mut jobs = client(serve_users(&pool, &store), &token);
+    let job = jobs
+        .submit_job(with_profile("k1", "alpha", ""))
+        .await
+        .unwrap()
+        .into_inner();
+    let before = stored(&pool, &job.job_id).await;
+    sqlx::query("UPDATE catalog_items SET content = 'edited', admin_enabled = NOT admin_enabled")
+        .execute(&pool)
+        .await
+        .unwrap();
+    assert_eq!(stored(&pool, &job.job_id).await, before);
+    let again = jobs
+        .submit_job(with_profile("k1", "alpha", ""))
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(again.job_id, job.job_id);
+    assert_eq!(stored(&pool, &job.job_id).await, before);
+    let fresh = jobs
+        .submit_job(with_profile("k2", "alpha", ""))
+        .await
+        .unwrap()
+        .into_inner();
+    assert_ne!(stored(&pool, &fresh.job_id).await, before);
+}
+
+#[sqlx::test]
+async fn an_omitted_profile_stores_no_snapshot_and_stays_idempotent(pool: PgPool) {
+    let store = store(pool.clone()).await;
+    seed(&pool).await;
+    let (_, token) = user_with_token(&pool, "ann").await;
+    let mut jobs = client(serve_users(&pool, &store), &token);
+    let first = jobs
+        .submit_job(submit_request("k1"))
+        .await
+        .unwrap()
+        .into_inner();
+    let again = jobs
+        .submit_job(submit_request("k1"))
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(first.job_id, again.job_id);
+    assert!(first.profile.is_none());
+    let none: bool = sqlx::query_scalar(NO_SNAPSHOT)
+        .bind(&first.job_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert!(none);
+}
+
+#[sqlx::test]
+async fn a_repeat_key_with_another_profile_is_a_conflict(pool: PgPool) {
+    let store = store(pool.clone()).await;
+    seed(&pool).await;
+    let (user, token) = user_with_token(&pool, "ann").await;
+    profile(&pool, user, "alpha", SELECT_S2_OFF).await;
+    profile(&pool, user, "beta", r#"{"claude_md":"y"}"#).await;
+    let mut jobs = client(serve_users(&pool, &store), &token);
+    jobs.submit_job(with_profile("k1", "alpha", ""))
+        .await
+        .unwrap();
+    for other in [with_profile("k1", "beta", ""), submit_request("k1")] {
+        let err = jobs.submit_job(other).await.unwrap_err();
+        assert_eq!(err.code(), Code::AlreadyExists);
+    }
+    jobs.submit_job(submit_request("k2")).await.unwrap();
+    let err = jobs
+        .submit_job(with_profile("k2", "alpha", ""))
+        .await
+        .unwrap_err();
+    assert_eq!(err.code(), Code::AlreadyExists);
+    assert_eq!(job_count(&pool).await, 2);
+}
+
+#[sqlx::test]
+async fn a_private_profile_of_another_user_looks_like_an_absent_one(pool: PgPool) {
+    let store = store(pool.clone()).await;
+    seed(&pool).await;
+    let (ann, _) = user_with_token(&pool, "ann").await;
+    let (_, bob) = user_with_token(&pool, "bob").await;
+    profile(&pool, ann, "alpha", SELECT_S2_OFF).await;
+    let mut jobs = client(serve_users(&pool, &store), &bob);
+    let private = jobs
+        .submit_job(with_profile("k1", "alpha", ""))
+        .await
+        .unwrap_err();
+    let absent = jobs
+        .submit_job(with_profile("k2", "missing", ""))
+        .await
+        .unwrap_err();
+    assert_eq!(private.code(), Code::NotFound);
+    assert_eq!(absent.code(), Code::NotFound);
+    assert_eq!(private.message(), absent.message());
+    assert_eq!(job_count(&pool).await, 0);
+    sqlx::query("UPDATE profile SET visibility = 'shared'")
+        .execute(&pool)
+        .await
+        .unwrap();
+    let job = jobs
+        .submit_job(with_profile("k3", "alpha", ""))
+        .await
+        .unwrap()
+        .into_inner();
+    let owner: i64 = sqlx::query_scalar("SELECT user_id FROM jobs WHERE job_id = $1")
+        .bind(&job.job_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_ne!(owner, ann);
+}
+
+#[sqlx::test]
+async fn a_caller_without_a_user_cannot_submit_a_profile(pool: PgPool) {
+    let store = store(pool.clone()).await;
+    seed(&pool).await;
+    let (user, _) = user_with_token(&pool, "ann").await;
+    profile(&pool, user, "alpha", SELECT_S2_OFF).await;
+    sqlx::query("UPDATE profile SET visibility = 'shared'")
+        .execute(&pool)
+        .await
+        .unwrap();
+    let mut jobs = spawn(&store);
+    let err = jobs
+        .submit_job(with_profile("k1", "alpha", ""))
+        .await
+        .unwrap_err();
+    assert_eq!(err.code(), Code::PermissionDenied);
+    assert_eq!(err.message(), profiles::ERR_PROFILE_SUBMIT_UNOWNED);
+    assert_eq!(job_count(&pool).await, 0);
+    jobs.submit_job(submit_request("k2")).await.unwrap();
+}
+
+#[sqlx::test]
+async fn hostile_profile_names_are_refused_before_any_write(pool: PgPool) {
+    let store = store(pool.clone()).await;
+    seed(&pool).await;
+    let (user, token) = user_with_token(&pool, "ann").await;
+    profile(&pool, user, "alpha", SELECT_S2_OFF).await;
+    let mut jobs = client(serve_users(&pool, &store), &token);
+    let hostile = [
+        "a\r".to_owned(),
+        "alpha\r\n".to_owned(),
+        "alpha\u{85}".to_owned(),
+        "alpha\u{2028}".to_owned(),
+        "alpha\u{2029}".to_owned(),
+        "al\\pha".to_owned(),
+        " ".to_owned(),
+        " alpha".to_owned(),
+        "alpha ".to_owned(),
+        "alpha\0".to_owned(),
+        "alph\u{e1}".to_owned(),
+        "\u{ff41}lpha".to_owned(),
+        "al/pha".to_owned(),
+        "a".repeat(65),
+    ];
+    for (n, name) in hostile.iter().enumerate() {
+        let err = jobs
+            .submit_job(with_profile(&format!("h{n}"), name, ""))
+            .await
+            .unwrap_err();
+        assert_eq!(err.code(), Code::InvalidArgument, "{name:?}");
+        assert!(!err.message().contains("alph"), "{name:?}");
+    }
+    for case in ["Alpha", "ALPHA"] {
+        let err = jobs
+            .submit_job(with_profile(case, case, ""))
+            .await
+            .unwrap_err();
+        assert_eq!(err.code(), Code::NotFound, "{case}");
+    }
+    assert_eq!(job_count(&pool).await, 0);
+    let ok = jobs
+        .submit_job(with_profile("edge", &"a".repeat(64), ""))
+        .await
+        .unwrap_err();
+    assert_eq!(ok.code(), Code::NotFound);
+    jobs.submit_job(with_profile("empty", "", ""))
+        .await
+        .unwrap();
+    assert_eq!(job_count(&pool).await, 1);
+}
+
+async fn bulk(pool: &PgPool, count: usize, each: usize) {
+    for n in 0..count {
+        item(pool, &format!("b{n:03}"), "skill", &"x".repeat(each), true).await;
+    }
+}
+
+#[sqlx::test]
+async fn a_set_past_the_item_cap_is_refused_and_the_cap_itself_passes(pool: PgPool) {
+    let store = store(pool.clone()).await;
+    let (user, token) = user_with_token(&pool, "ann").await;
+    profile(&pool, user, "alpha", r#"{"claude_md":"x"}"#).await;
+    bulk(&pool, fleet_proto::MAX_BLOB_CATALOG_ITEMS, 1).await;
+    let mut jobs = client(serve_users(&pool, &store), &token);
+    let job = jobs
+        .submit_job(with_profile("k1", "alpha", ""))
+        .await
+        .unwrap()
+        .into_inner();
+    let (catalog, _, _) = stored(&pool, &job.job_id).await;
+    assert_eq!(
+        serde_json::from_str::<Vec<serde_json::Value>>(&catalog)
+            .unwrap()
+            .len(),
+        fleet_proto::MAX_BLOB_CATALOG_ITEMS
+    );
+    item(&pool, "zzz", "skill", "one more", true).await;
+    let err = jobs
+        .submit_job(with_profile("k2", "alpha", ""))
+        .await
+        .unwrap_err();
+    assert_eq!(err.code(), Code::InvalidArgument);
+    assert_eq!(job_count(&pool).await, 1);
+}
+
+#[sqlx::test]
+async fn a_set_past_the_byte_cap_is_refused_and_the_cap_itself_passes(pool: PgPool) {
+    let store = store(pool.clone()).await;
+    let (user, token) = user_with_token(&pool, "ann").await;
+    profile(&pool, user, "alpha", r#"{"claude_md":"x"}"#).await;
+    let each = 256 * 1024;
+    bulk(&pool, fleet_proto::MAX_BLOB_CATALOG_BYTES / each, each).await;
+    let mut jobs = client(serve_users(&pool, &store), &token);
+    jobs.submit_job(with_profile("k1", "alpha", ""))
+        .await
+        .unwrap();
+    item(&pool, "zzz", "skill", "x", true).await;
+    let err = jobs
+        .submit_job(with_profile("k2", "alpha", ""))
+        .await
+        .unwrap_err();
+    assert_eq!(err.code(), Code::InvalidArgument);
+    assert_eq!(job_count(&pool).await, 1);
+}
+
+#[sqlx::test]
+async fn a_selection_naming_a_missing_item_is_refused(pool: PgPool) {
+    let store = store(pool.clone()).await;
+    seed(&pool).await;
+    let (user, token) = user_with_token(&pool, "ann").await;
+    profile(
+        &pool,
+        user,
+        "alpha",
+        r#"{"claude_md":"x","selection":[{"item_id":"gone","enabled":false}]}"#,
+    )
+    .await;
+    let mut jobs = client(serve_users(&pool, &store), &token);
+    let err = jobs
+        .submit_job(with_profile("k1", "alpha", ""))
+        .await
+        .unwrap_err();
+    assert_eq!(err.code(), Code::InvalidArgument);
+    assert_eq!(job_count(&pool).await, 0);
+}
+
+async fn wait_for_lock(pool: &PgPool, needle: &str) {
+    let deadline = std::time::Instant::now() + WAIT;
+    loop {
+        let waiting: bool = sqlx::query_scalar(
+            "SELECT EXISTS (SELECT 1 FROM pg_stat_activity \
+             WHERE wait_event_type = 'Lock' AND query LIKE $1)",
+        )
+        .bind(format!("%{needle}%"))
+        .fetch_one(pool)
+        .await
+        .unwrap();
+        if waiting {
+            return;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "no lock wait on {needle}"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
+#[sqlx::test]
+async fn submit_waits_on_the_catalog_and_profile_rows(pool: PgPool) {
+    let store = store(pool.clone()).await;
+    seed(&pool).await;
+    let (user, token) = user_with_token(&pool, "ann").await;
+    profile(&pool, user, "alpha", SELECT_S2_OFF).await;
+    let addr = serve_users(&pool, &store);
+    for (n, (hold, needle)) in [
+        (
+            "UPDATE catalog_items SET content = 'held' WHERE id = 's1'",
+            "FROM catalog_items",
+        ),
+        (
+            "UPDATE profile SET visibility = 'private'",
+            "FROM profile WHERE name",
+        ),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let mut tx = pool.begin().await.unwrap();
+        sqlx::query(hold).execute(&mut *tx).await.unwrap();
+        let mut jobs = client(addr, &token);
+        let key = format!("k{n}");
+        let pending =
+            tokio::spawn(async move { jobs.submit_job(with_profile(&key, "alpha", "")).await });
+        wait_for_lock(&pool, needle).await;
+        assert!(!pending.is_finished());
+        tx.commit().await.unwrap();
+        let job = timeout(WAIT, pending)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap()
+            .into_inner();
+        if n == 0 {
+            let (catalog, _, _) = stored(&pool, &job.job_id).await;
+            assert!(catalog.contains("held"));
+        }
+    }
+}
+
+#[sqlx::test]
+async fn the_pin_and_snapshot_columns_keep_their_all_or_none_rules(pool: PgPool) {
+    store(pool.clone()).await;
+    let (user, _) = user_with_token(&pool, "ann").await;
+    profile(&pool, user, "alpha", SELECT_S2_OFF).await;
+    let pid: i64 = sqlx::query_scalar("SELECT id FROM profile")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    let hash: Vec<u8> = sqlx::query_scalar("SELECT hash FROM profile_version")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    let cases = [
+        (
+            "profile_name, profile_id, profile_version",
+            "'alpha', $1, 1",
+            "jobs_profile_columns_together",
+        ),
+        (
+            "profile_name, profile_version, profile_hash",
+            "'alpha', 1, $2",
+            "jobs_profile_columns_together",
+        ),
+        (
+            "batch_id, repeat_idx, batch_pos",
+            "'b', 0, 0",
+            "jobs_batch_columns_together",
+        ),
+    ];
+    for (n, (columns, values, constraint)) in cases.into_iter().enumerate() {
+        let text = format!(
+            "INSERT INTO jobs (job_id, prompt, repo, base_ref, branch, open_pr, {columns}) \
+             VALUES ('p{n}', 'x', 'https://example.com/r.git', 'main', 'swarm/p{n}', false, {values})"
+        );
+        let err = sqlx::query(sqlx::AssertSqlSafe(text))
+            .bind(pid)
+            .bind(&hash)
+            .execute(&pool)
+            .await
+            .unwrap_err();
+        assert_eq!(
+            err.as_database_error().and_then(|e| e.constraint()),
+            Some(constraint),
+            "{columns}: {err}"
+        );
+    }
+}
+
+#[sqlx::test]
+async fn the_callers_own_profile_beats_a_shared_one_of_the_same_name(pool: PgPool) {
+    let store = store(pool.clone()).await;
+    seed(&pool).await;
+    let (ann, _) = user_with_token(&pool, "ann").await;
+    let (bob, token) = user_with_token(&pool, "bob").await;
+    profile(&pool, ann, "alpha", r#"{"claude_md":"theirs"}"#).await;
+    sqlx::query("UPDATE profile SET visibility = 'shared'")
+        .execute(&pool)
+        .await
+        .unwrap();
+    profile(&pool, bob, "alpha", r#"{"claude_md":"mine"}"#).await;
+    let mut jobs = client(serve_users(&pool, &store), &token);
+    let job = jobs
+        .submit_job(with_profile("k1", "alpha", ""))
+        .await
+        .unwrap()
+        .into_inner();
+    let pinned: i64 = sqlx::query_scalar(
+        "SELECT p.owner_user_id FROM jobs j JOIN profile p ON p.id = j.profile_id \
+         WHERE j.job_id = $1",
+    )
+    .bind(&job.job_id)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(pinned, bob);
 }
