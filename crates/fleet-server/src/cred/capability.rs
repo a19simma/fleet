@@ -268,12 +268,13 @@ impl Capabilities {
 
     /// Revokes `capability` from `target` on behalf of `actor`.
     ///
-    /// Reads `is_admin` on the actor row under `FOR SHARE` and refuses a non-admin, then takes
-    /// `FOR UPDATE` on the grant row. Returns `false` and writes nothing when no grant exists.
+    /// Reads `is_admin` on the actor row under `FOR SHARE` and refuses a non-admin, takes
+    /// `FOR SHARE` on the target row, then `FOR UPDATE` on the grant row. Returns `false` and
+    /// writes nothing when the user holds no grant.
     ///
     /// # Errors
     /// [`CapabilityError::UnknownCapability`], [`CapabilityError::NoSuchActor`],
-    /// [`CapabilityError::NotAdmin`] or [`CapabilityError::Db`].
+    /// [`CapabilityError::NotAdmin`], [`CapabilityError::NoSuchUser`] or [`CapabilityError::Db`].
     pub async fn revoke(
         &self,
         actor: i64,
@@ -285,6 +286,13 @@ impl Capabilities {
         }
         let mut tx = self.pool.begin().await?;
         lock_admin(&mut tx, actor).await?;
+        let target_row = sqlx::query(LOCK_USER)
+            .bind(target)
+            .fetch_optional(&mut *tx)
+            .await?;
+        if target_row.is_none() {
+            return Err(CapabilityError::NoSuchUser);
+        }
         let held = sqlx::query(LOCK_GRANT)
             .bind(target)
             .bind(capability)
@@ -351,8 +359,8 @@ pub async fn grant(
 /// Revokes a capability from a user as the admin `actor`.
 ///
 /// # Errors
-/// `INVALID_ARGUMENT` for a user id over `i64::MAX` or an unknown capability,
-/// `PERMISSION_DENIED` when `actor` is not an admin, `INTERNAL` on a storage failure.
+/// `INVALID_ARGUMENT` for a user id over `i64::MAX` or an unknown capability, `NOT_FOUND` for an
+/// unknown user, `PERMISSION_DENIED` when `actor` is not an admin, `INTERNAL` on a storage failure.
 pub async fn revoke(
     caps: &Capabilities,
     actor: i64,

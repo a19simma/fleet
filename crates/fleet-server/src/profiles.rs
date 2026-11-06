@@ -75,6 +75,8 @@ pub const ERR_BLOB_CATALOG_TOO_LARGE: &str = "profile catalog snapshot too large
 
 const LOCK_OWN_PROFILE_FOR_UPDATE: &str =
     "SELECT id, visibility FROM profile WHERE owner_user_id = $1 AND name = $2 FOR UPDATE";
+const OWN_EXISTS: &str =
+    "SELECT EXISTS (SELECT 1 FROM profile WHERE owner_user_id = $1 AND name = $2)";
 const SET_VISIBILITY: &str = "UPDATE profile SET visibility = $2 WHERE id = $1";
 const FOREIGN_SHARED_EXISTS: &str = "SELECT EXISTS (SELECT 1 FROM profile \
      WHERE name = $1 AND owner_user_id <> $2 AND visibility = 'shared')";
@@ -444,6 +446,46 @@ pub async fn create_owned(
     let owner = caller.ok_or(ProfileFault::Unowned)?;
     let new = validate_create(name, content)?;
     require_model(allowlist, new.model.as_deref())?;
+    store_version(pool, owner, new).await
+}
+
+/// Saves a new version of the caller's own profile `name`, and never creates one.
+///
+/// Checks the content like [`create_owned`], then refuses before any write when the caller owns
+/// no profile of that name. A profile with versions cannot be deleted, so an owned row seen here
+/// stays.
+///
+/// # Errors
+///
+/// Those of [`create_owned`], plus [`ProfileFault::NotOwner`] when only someone else's shared
+/// profile has the name and [`StoreError::NotFound`] when no profile the caller can see has it.
+pub async fn edit_owned(
+    pool: &PgPool,
+    caller: Option<i64>,
+    allowlist: Option<&ModelAllowlist>,
+    name: &str,
+    content: ProfileContent<'_>,
+) -> Result<ProfileVersion, StoreError> {
+    let owner = caller.ok_or(ProfileFault::Unowned)?;
+    let new = validate_create(name, content)?;
+    require_model(allowlist, new.model.as_deref())?;
+    let own: bool = sqlx::query_scalar(OWN_EXISTS)
+        .bind(owner)
+        .bind(&new.name)
+        .fetch_one(pool)
+        .await?;
+    if !own {
+        let foreign: bool = sqlx::query_scalar(FOREIGN_SHARED_EXISTS)
+            .bind(&new.name)
+            .bind(owner)
+            .fetch_one(pool)
+            .await?;
+        return Err(if foreign {
+            ProfileFault::NotOwner.into()
+        } else {
+            StoreError::NotFound
+        });
+    }
     store_version(pool, owner, new).await
 }
 

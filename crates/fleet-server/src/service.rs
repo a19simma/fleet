@@ -663,12 +663,16 @@ impl FleetProfiles for FleetService {
         let request = request.into_inner();
         let content = ProfileContent::select(&request.content_json, &request.content_toml)
             .map_err(|fault| Status::invalid_argument(fault.to_string()))?;
-        let reply = self
-            .store
-            .create_profile_content(Some(caller), &request.name, content)
-            .await
-            .map_err(|err| profiles_error(&err))?;
-        Ok(Response::new(reply))
+        let saved = if request.edit {
+            self.store
+                .edit_profile_content(Some(caller), &request.name, content)
+                .await
+        } else {
+            self.store
+                .create_profile_content(Some(caller), &request.name, content)
+                .await
+        };
+        saved.map(Response::new).map_err(|err| profiles_error(&err))
     }
 
     async fn get_profile(
@@ -728,6 +732,7 @@ impl FleetCatalog for FleetService {
         &self,
         request: Request<ListCatalogRequest>,
     ) -> Result<Response<ListCatalogReply>, Status> {
+        admin_of(&request)?;
         catalog::list_catalog(self.store.pool(), request.get_ref())
             .await
             .map(Response::new)

@@ -74,7 +74,10 @@ async fn revoke_of_an_absent_grant_is_a_noop(pool: PgPool) {
     assert!(caps.revoke(admin, alice, PROFILE_TOOLS).await.unwrap());
     assert!(!caps.revoke(admin, alice, PROFILE_TOOLS).await.unwrap());
     assert_eq!(rows(&pool).await, 0);
-    assert!(!caps.revoke(admin, 9_999, PROFILE_TOOLS).await.unwrap());
+    let err = caps.revoke(admin, 9_999, PROFILE_TOOLS).await.unwrap_err();
+    assert!(matches!(err, CapabilityError::NoSuchUser));
+    assert_eq!(err.to_string(), REASON_NO_SUCH_USER);
+    assert_eq!(rows(&pool).await, 0);
 }
 
 #[sqlx::test]

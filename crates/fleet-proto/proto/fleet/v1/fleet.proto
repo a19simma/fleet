@@ -31,7 +31,7 @@ service FleetProfiles {
   rpc UnshareProfile(UnshareProfileRequest) returns (Profile);
 }
 
-// Read side of the global catalog (ADR-0053). Client scope.
+// Read side of the global catalog (ADR-0053). Passes the client scope, then the handler admits only an admin user and lists every item, admin-disabled ones included.
 service FleetCatalog {
   rpc ListCatalog(ListCatalogRequest) returns (ListCatalogReply);
 }
@@ -775,10 +775,14 @@ message VerdictStats {
   bool model_graded = 5;
 }
 
+// edit true saves a new version of a profile the caller already owns and never creates one: a
+// name the caller does not own is NOT_FOUND, or PERMISSION_DENIED when only someone else's shared
+// profile has it. edit false creates the caller's own profile or adds a version to it.
 message CreateProfileRequest {
   string name = 1;
   string content_json = 2;
   string content_toml = 3;
+  bool edit = 4;
 }
 
 message GetProfileRequest {
@@ -883,7 +887,7 @@ message CatalogItem {
 // kind filters by CatalogKind: UNSPECIFIED lists every kind, any value outside 0 to 4 is
 // refused. page_size 0 means DEFAULT_CATALOG_PAGE and larger values are cut to
 // MAX_CATALOG_PAGE. after_id is an exclusive cursor: empty starts at the first item, else it is
-// at most MAX_CATALOG_CURSOR_BYTES bytes of [a-z0-9_-].
+// at most MAX_CATALOG_CURSOR_BYTES bytes of [a-z0-9_-]. A non-admin caller gets PERMISSION_DENIED.
 message ListCatalogRequest {
   CatalogKind kind = 1;
   uint32 page_size = 2;

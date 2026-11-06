@@ -1475,6 +1475,29 @@ impl Store {
         .await
     }
 
+    /// Saves a new version of the caller's own profile, checked like [`Store::create_profile`].
+    ///
+    /// # Errors
+    ///
+    /// Same as [`Store::create_profile_content`], plus [`ProfileFault::NotOwner`] when only
+    /// someone else's shared profile has the name and [`StoreError::NotFound`] when the caller
+    /// owns none and can see none. Nothing is written on a refusal.
+    pub async fn edit_profile_content(
+        &self,
+        caller: Option<i64>,
+        name: &str,
+        content: ProfileContent<'_>,
+    ) -> Result<fleet_proto::v1::ProfileVersion, StoreError> {
+        profiles::edit_owned(
+            &self.pool,
+            caller,
+            self.model_allowlist.as_ref(),
+            name,
+            content,
+        )
+        .await
+    }
+
     /// Reads a profile version as `viewer`, or the latest one when `version` is `None`.
     ///
     /// # Errors

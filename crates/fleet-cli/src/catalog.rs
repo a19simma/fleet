@@ -37,7 +37,7 @@ const BAD_KIND: &str = "invalid kind: use skill, subagent, tool or context";
 /// A `fleet catalog` action.
 #[derive(Debug, Subcommand)]
 pub enum CatalogAction {
-    /// List the catalog items.
+    /// List the catalog items, admin-disabled ones included. Admin only.
     List {
         /// Only items of this kind: skill, subagent, tool or context.
         #[arg(long)]

@@ -1,8 +1,7 @@
 //! The profile sharing, catalog and capability RPCs over a real tonic server on a loopback
 //! port. The sharing handlers are stubs that answer `UNIMPLEMENTED` for the caller that reaches
-//! them. The client token lists the
-//! catalog and shares profiles, the box token reaches neither, and no static token reaches an
-//! admin service. The tests need
+//! them. The client token shares profiles but cannot list the catalog, the box token reaches
+//! neither, and no static token reaches an admin service. The tests need
 //! a Postgres superuser URL in `DATABASE_URL` and live in their own binary because each one binds
 //! a socket.
 
@@ -109,15 +108,13 @@ fn denied(err: &Status) {
 }
 
 #[sqlx::test]
-async fn list_catalog_answers_an_empty_page_for_the_client_token(pool: PgPool) {
+async fn the_client_token_cannot_list_the_catalog(pool: PgPool) {
     let (addr, _) = start(pool).await;
-    let reply = catalog(addr, as_client)
+    let err = catalog(addr, as_client)
         .list_catalog(ListCatalogRequest::default())
         .await
-        .unwrap()
-        .into_inner();
-    assert_eq!(reply.items.len(), 0);
-    assert_eq!(reply.next_id, "");
+        .unwrap_err();
+    admin_denied(&err);
 }
 
 #[sqlx::test]

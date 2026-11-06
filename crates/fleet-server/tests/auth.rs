@@ -290,7 +290,7 @@ mod tests {
             ("report_timing", true, false),
             ("get_job_timing", false, true),
             ("share_profile", false, true),
-            ("catalog", false, true),
+            ("catalog", false, false),
             ("catalog_admin", false, false),
             ("capability_admin", false, false),
         ] {
@@ -322,7 +322,9 @@ mod tests {
                     assert!(scoped(code), "{name} on {service}: {code:?}");
                 } else {
                     assert_eq!(code, Code::PermissionDenied, "{name} on {service}");
-                    let reason = if service.ends_with("_admin") {
+                    let reason = if service.ends_with("_admin")
+                        || (service == "catalog" && name == "client")
+                    {
                         ADMIN_REQUIRED
                     } else {
                         "bearer token not valid for this service"

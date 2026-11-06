@@ -32,7 +32,7 @@ Visibility is `private` or `shared`. A new Profile is `private`.
 
 A non-owner `GetProfile` of a `private` Profile returns `NOT_FOUND` with the same fixed message as an unknown name. It never returns `PERMISSION_DENIED`, so a caller cannot probe which names exist. This matches the rule for another user's Job in ADR-0042.
 
-`PERMISSION_DENIED` stays for one case: a non-owner who can see a `shared` Profile and tries to mutate it. The caller already knows the name, so nothing leaks.
+`PERMISSION_DENIED` stays for one case: a non-owner who can see a `shared` Profile and tries to mutate it. The caller already knows the name, so nothing leaks. `fleet profile item` and `fleet profile prompt` send `CreateProfile` with `edit` set, so the same refusal applies to them: the CLI does not save a copy under the caller's own name, and the web selection post refuses the same way. A user who wants a copy creates one explicitly under a new name.
 
 ### Box and legacy callers
 

@@ -8,7 +8,7 @@ ADR-0048 gates Profile `tools` with one server switch, `FLEET_ALLOW_PROFILE_TOOL
 
 ### Capability `profile:tools`
 
-- `profile:tools` is a capability on a User. An admin grants and revokes it.
+- `profile:tools` is a capability on a User. An admin grants and revokes it. Grant, revoke and list of an unknown user all answer `NOT_FOUND` with `no such user`, on the RPC and on the web page.
 - The server checks it at profile save (`CreateProfile` with a `tools` list, or a selection that names a `tool` Catalog item, ADR-0053), at Job submit and batch submit when a pinned Profile has `tools`, and when it serves the pinned blob to a leased Box. The blob check uses the job owner's (`jobs.user_id`) grant, read live in the same transaction.
 - A User without the capability gets a fixed refusal that names `profile:tools`. The store is not written.
 - A revoke refuses a leased Job that has not yet fetched its blob. A Job whose Box already holds the blob keeps running.

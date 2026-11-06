@@ -17,6 +17,8 @@ The **Catalog** is one global list of items, curated by an admin. An item has a 
 
 Items are insert-only and versioned like Profile blobs (ADR-0035). Changing an item adds a version. An admin disables an item by clearing `enabled`, never by deleting it.
 
+Only an admin lists the Catalog, on both surfaces: `ListCatalog` answers `PERMISSION_DENIED` with `admin required` to any other caller, and the admin page answers 403. Both show every item, admin-disabled ones included.
+
 ### Selection is opt-out
 
 A Profile does not list the items it wants. It inherits every item that is enabled in the Catalog. The Profile stores only:

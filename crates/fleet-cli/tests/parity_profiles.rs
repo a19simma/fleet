@@ -143,17 +143,11 @@ struct Row {
     class: Class,
 }
 
-const D_ADMIN_LIST: &str = "the web catalog page lists every item including admin-disabled ones; the CLI list shows enabled items only";
-const D_NON_ADMIN_LIST: &str =
-    "the CLI list is open to any user token; the web catalog page is admin only";
 const D_UPSERT_EXISTING: &str = "the CLI upsert replaces the content of an existing id; the web add form refuses an existing id";
-const D_FORK: &str = "a CLI edit of someone else's shared profile saves a copy under the caller's own name; the web refuses the post";
 const D_UNKNOWN_ITEM: &str = "the CLI can name any item id and the server refuses an unknown one; the web form only offers catalog rows, so an unknown id cannot be sent";
 const D_DISABLED_ITEM: &str = "the CLI can name an admin-disabled item; the web form renders it without a toggle so it cannot be switched";
 const D_HOSTILE_PROMPT: &str =
     "both refuse a control character in the prompt, with different message text";
-const D_REVOKE_UNKNOWN_USER: &str =
-    "the CLI revoke of an unknown user succeeds and reports not held; the web refuses with 404";
 const D_UNKNOWN_CAP: &str =
     "the CLI names the capability; the web capability form only grants or revokes profile:tools";
 
@@ -216,7 +210,7 @@ const ROWS: &[Row] = &[
     Row {
         name: "item-off/non-owner-shared",
         op: "item-off",
-        class: Class::Differs(D_FORK, Shape::Done, Shape::Refused(Refusal::Forbidden)),
+        class: Class::Same,
     },
     Row {
         name: "item-off/non-owner-private",
@@ -259,7 +253,7 @@ const ROWS: &[Row] = &[
     Row {
         name: "set-prompt/non-owner-shared",
         op: "set-prompt",
-        class: Class::Differs(D_FORK, Shape::Done, Shape::Refused(Refusal::Forbidden)),
+        class: Class::Same,
     },
     Row {
         name: "set-prompt/hostile",
@@ -273,16 +267,12 @@ const ROWS: &[Row] = &[
     Row {
         name: "catalog-list/admin",
         op: "catalog-list",
-        class: Class::Differs(D_ADMIN_LIST, Shape::Done, Shape::Done),
+        class: Class::Same,
     },
     Row {
         name: "catalog-list/non-admin",
         op: "catalog-list",
-        class: Class::Differs(
-            D_NON_ADMIN_LIST,
-            Shape::Done,
-            Shape::Refused(Refusal::Forbidden),
-        ),
+        class: Class::Same,
     },
     Row {
         name: "admin-upsert/admin",
@@ -355,11 +345,7 @@ const ROWS: &[Row] = &[
     Row {
         name: "revoke/unknown-user",
         op: "revoke",
-        class: Class::Differs(
-            D_REVOKE_UNKNOWN_USER,
-            Shape::Done,
-            Shape::Refused(Refusal::NotFound),
-        ),
+        class: Class::Same,
     },
     Row {
         name: "revoke/unknown-capability",
@@ -371,6 +357,22 @@ const ROWS: &[Row] = &[
         ),
     },
 ];
+
+const REASON_NOT_OWNER: &str = "only the owner can change this profile";
+const REASON_ADMIN_REQUIRED: &str = "admin required";
+const REASON_NO_SUCH_USER: &str = "no such user";
+
+/// The exact refusal the CLI must give on a row closed by the stricter policy.
+fn pinned(name: &str) -> Option<(Refusal, &'static str)> {
+    match name {
+        "item-off/non-owner-shared" | "set-prompt/non-owner-shared" => {
+            Some((Refusal::Forbidden, REASON_NOT_OWNER))
+        }
+        "catalog-list/non-admin" => Some((Refusal::Forbidden, REASON_ADMIN_REQUIRED)),
+        "revoke/unknown-user" => Some((Refusal::NotFound, REASON_NO_SUCH_USER)),
+        _ => None,
+    }
+}
 
 type State = (Vec<String>, Option<String>);
 
@@ -970,12 +972,11 @@ async fn effect(
             "{surface} wrote to the owner's profile: {outcome:?}"
         );
         if !case.as_owner {
-            let forked = matches!(outcome, Outcome::Done(_));
-            assert_eq!(
-                rig.profile_count().await,
-                count + i64::from(forked),
+            assert!(
+                matches!(outcome, Outcome::Refused(..)),
                 "{surface} {outcome:?}"
             );
+            assert_eq!(rig.profile_count().await, count, "{surface} forked a copy");
         }
     }
 }
@@ -987,7 +988,11 @@ async fn catalog_list_row(rig: &Rig, surface: Surface, as_admin: bool) -> Outcom
         Surface::Cli => {
             let (result, out) = rig.cli(who, &["catalog", "list"], b"").await;
             let ids = cli_first_column(&out);
-            assert_eq!(ids, [ON, SECOND], "enabled items only");
+            if as_admin {
+                assert_eq!(ids, [ON, SECOND, GONE], "every item");
+            } else {
+                assert!(ids.is_empty(), "{ids:?}");
+            }
             cli_outcome(&result, ids)
         }
         Surface::Web => {
@@ -1155,7 +1160,16 @@ where
         "{name}: unexpected outcome: cli {cli:?} web {web:?}"
     );
     match row.class {
-        Class::Same => assert!(agree(&cli, &web), "{name}: cli {cli:?} web {web:?}"),
+        Class::Same => {
+            assert!(agree(&cli, &web), "{name}: cli {cli:?} web {web:?}");
+            if let Some((kind, reason)) = pinned(name) {
+                assert_eq!(
+                    cli,
+                    Outcome::Refused(kind, reason.to_owned()),
+                    "{name}: cli reason"
+                );
+            }
+        }
         Class::Differs(why, want_cli, want_web) => {
             assert!(
                 !agree(&cli, &web),

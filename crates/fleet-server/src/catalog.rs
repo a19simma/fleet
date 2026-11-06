@@ -43,6 +43,11 @@ const LIST_ENABLED: &str = "SELECT id, kind, name, content, digest, admin_enable
     WHERE admin_enabled AND id > $1 AND ($2::text IS NULL OR kind = $2) \
     ORDER BY id LIMIT $3";
 
+const LIST_ALL: &str = "SELECT id, kind, name, content, digest, admin_enabled \
+    FROM catalog_items \
+    WHERE id > $1 AND ($2::text IS NULL OR kind = $2) \
+    ORDER BY id LIMIT $3";
+
 /// Refusal reason for a list filter naming a kind outside the closed set.
 pub const REASON_KIND_UNKNOWN: &str = "the catalog item kind is unknown";
 
@@ -195,7 +200,8 @@ pub struct CatalogPage {
     pub next_id: String,
 }
 
-/// Lists one page of admin-enabled catalog items for any user.
+/// Lists one page of admin-enabled catalog items. The RPC does not use it: `list_all` answers an
+/// admin.
 ///
 /// `kind` is the wire value of [`CatalogKind`]: 0 lists every kind, 1 to 4 filter. `after_id` is
 /// exclusive and empty starts at the first item. A `limit` of 0 means [`DEFAULT_CATALOG_PAGE`];
@@ -226,6 +232,32 @@ pub async fn list_enabled_capped(
     limit: u32,
     cap: u32,
 ) -> Result<CatalogPage, Status> {
+    list_page(pool, LIST_ENABLED, kind, after_id, limit, cap).await
+}
+
+/// Lists one page of every catalog item, admin-disabled ones included, like the admin web page.
+///
+/// Paging and errors are those of [`list_enabled`]. The caller must already be an admin.
+///
+/// # Errors
+/// The errors of [`list_enabled`].
+pub async fn list_all(
+    pool: &PgPool,
+    kind: i32,
+    after_id: &str,
+    limit: u32,
+) -> Result<CatalogPage, Status> {
+    list_page(pool, LIST_ALL, kind, after_id, limit, MAX_CATALOG_PAGE).await
+}
+
+async fn list_page(
+    pool: &PgPool,
+    query: &'static str,
+    kind: i32,
+    after_id: &str,
+    limit: u32,
+    cap: u32,
+) -> Result<CatalogPage, Status> {
     validate_after_id(after_id)?;
     let kind = match CatalogKind::try_from(kind) {
         Ok(CatalogKind::Unspecified) => None,
@@ -236,7 +268,7 @@ pub async fn list_enabled_capped(
         0 => DEFAULT_CATALOG_PAGE.min(cap),
         n => n.min(cap),
     };
-    let rows = sqlx::query_as::<_, Row>(LIST_ENABLED)
+    let rows = sqlx::query_as::<_, Row>(query)
         .bind(after_id)
         .bind(kind)
         .bind(i64::from(limit))
@@ -253,16 +285,17 @@ pub async fn list_enabled_capped(
     Ok(CatalogPage { items, next_id })
 }
 
-/// Answers a `ListCatalog` request: validates `kind` and `after_id` at the edge, then lists.
+/// Answers a `ListCatalog` request for an admin: validates `kind` and `after_id` at the edge, then
+/// lists every item, as the admin catalog page does. The handler refuses a non-admin first.
 ///
 /// # Errors
-/// The errors of [`list_enabled`].
+/// The errors of [`list_all`].
 pub async fn list_catalog(
     pool: &PgPool,
     request: &ListCatalogRequest,
 ) -> Result<ListCatalogReply, Status> {
     validate_after_id(&request.after_id)?;
-    let page = list_enabled(pool, request.kind, &request.after_id, request.page_size).await?;
+    let page = list_all(pool, request.kind, &request.after_id, request.page_size).await?;
     Ok(ListCatalogReply {
         items: page.items,
         next_id: page.next_id,

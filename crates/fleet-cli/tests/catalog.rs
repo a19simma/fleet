@@ -129,7 +129,14 @@ async fn an_admin_upserts_lists_enables_and_disables(pool: PgPool) {
     r.unwrap();
     let (r, out) = cli_as(rig.addr, a, &["catalog", "list"], b"").await;
     r.unwrap();
-    assert_eq!(out, "", "disabled items are not listed");
+    assert_eq!(
+        rows(&out),
+        [
+            ["node", "tool", "node", "disabled"],
+            ["tdd", "skill", "tdd", "disabled"]
+        ],
+        "an admin sees disabled items"
+    );
     for id in ["tdd", "node"] {
         let (r, out) = cli_as(rig.addr, a, &["catalog", "enable", id], b"").await;
         r.unwrap();
@@ -146,7 +153,7 @@ async fn an_admin_upserts_lists_enables_and_disables(pool: PgPool) {
     assert_eq!(rows(&out), [["tdd", "skill", "tdd", "disabled"]]);
     let (r, out) = cli_as(rig.addr, a, &["catalog", "list", "--kind", "skill"], b"").await;
     r.unwrap();
-    assert_eq!(out, "");
+    assert_eq!(rows(&out), [["tdd", "skill", "tdd", "disabled"]]);
 }
 
 #[sqlx::test]
@@ -184,7 +191,7 @@ async fn a_non_admin_token_is_refused_and_the_server_is_unchanged(pool: PgPool) 
 }
 
 #[sqlx::test]
-async fn a_non_admin_can_still_list(pool: PgPool) {
+async fn a_non_admin_cannot_list(pool: PgPool) {
     let rig = serve(pool).await;
     cli_as(rig.addr, &rig.admin, &UPSERT, b"body")
         .await
@@ -194,9 +201,11 @@ async fn a_non_admin_can_still_list(pool: PgPool) {
         .await
         .0
         .unwrap();
-    let (r, out) = cli_as(rig.addr, &rig.plain, &["catalog", "list"], b"").await;
-    r.unwrap();
-    assert_eq!(rows(&out).len(), 1);
+    for token in [rig.plain.as_str(), CLIENT] {
+        let (r, out) = cli_as(rig.addr, token, &["catalog", "list"], b"").await;
+        assert_denied(r);
+        assert_eq!(out, "");
+    }
 }
 
 #[sqlx::test]
@@ -409,6 +418,10 @@ async fn unknown_targets_and_capabilities_are_server_refusals(pool: PgPool) {
         ),
         (vec!["user", "cap", "list", &missing], Code::NotFound),
         (
+            vec!["user", "cap", "revoke", &missing, "profile:tools"],
+            Code::NotFound,
+        ),
+        (
             vec!["user", "cap", "grant", &id, "profile:nothing"],
             Code::InvalidArgument,
         ),
@@ -426,14 +439,5 @@ async fn unknown_targets_and_capabilities_are_server_refusals(pool: PgPool) {
         assert_eq!(err.exit_code(), 1);
         assert_eq!(out, "");
     }
-    let (r, out) = cli_as(
-        rig.addr,
-        a,
-        &["user", "cap", "revoke", &missing, "profile:tools"],
-        b"",
-    )
-    .await;
-    r.unwrap();
-    assert_eq!(out, format!("not held\t{missing}\tprofile:tools\n"));
     assert_eq!(caps(&rig, rig.plain_id).await, "");
 }

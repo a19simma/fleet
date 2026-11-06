@@ -317,20 +317,66 @@ async fn the_handlers_deny_a_missing_or_non_admin_caller(pool: PgPool) {
     );
 }
 
-async fn list(rig: &Rig, request: ListCatalogRequest) -> Result<(), tonic::Status> {
+async fn list(
+    rig: &Rig,
+    token: &str,
+    request: ListCatalogRequest,
+) -> Result<Vec<CatalogItem>, tonic::Status> {
     FleetCatalogClient::new(channel(rig.addr))
-        .list_catalog(bearer(request, CLIENT))
+        .list_catalog(bearer(request, token))
         .await
-        .map(drop)
+        .map(|reply| reply.into_inner().items)
+}
+
+#[sqlx::test(migrations = false)]
+async fn list_is_admin_only_and_shows_every_item(pool: PgPool) {
+    let rig = start(pool).await;
+    let (_, _, admin) = make_user(&rig, "root", true).await;
+    let (_, _, plain) = make_user(&rig, "plain", false).await;
+    for (id, enabled) in [("on", true), ("off", false)] {
+        sqlx::query(
+            "INSERT INTO catalog_items (id, kind, name, content, digest, admin_enabled) \
+             VALUES ($1, 'skill', $1, 'body', sha256('body'::bytea), $2)",
+        )
+        .bind(id)
+        .bind(enabled)
+        .execute(&rig.pool)
+        .await
+        .unwrap();
+    }
+    let ids: Vec<String> = list(&rig, &admin, ListCatalogRequest::default())
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|item| item.id)
+        .collect();
+    assert_eq!(ids, ["off", "on"]);
+    for token in [plain.as_str(), CLIENT] {
+        let err = list(&rig, token, ListCatalogRequest::default())
+            .await
+            .unwrap_err();
+        assert_eq!(
+            (err.code(), err.message()),
+            (Code::PermissionDenied, ADMIN_REQUIRED)
+        );
+    }
+    let err = list(&rig, BOX, ListCatalogRequest::default())
+        .await
+        .unwrap_err();
+    assert_eq!(err.code(), Code::PermissionDenied);
 }
 
 #[sqlx::test(migrations = false)]
 async fn list_refuses_a_kind_outside_the_closed_set(pool: PgPool) {
     let rig = start(pool).await;
-    list(&rig, ListCatalogRequest::default()).await.unwrap();
+    let (_, _, token) = make_user(&rig, "root", true).await;
+    list(&rig, &token, ListCatalogRequest::default())
+        .await
+        .unwrap();
     for kind in [5, 99, -1, i32::MAX, i32::MIN] {
         let err = list(
             &rig,
+            &token,
             ListCatalogRequest {
                 kind,
                 ..Default::default()
@@ -349,6 +395,7 @@ async fn list_refuses_a_kind_outside_the_closed_set(pool: PgPool) {
 #[sqlx::test(migrations = false)]
 async fn list_refuses_each_cursor_rule_with_the_fixed_reason(pool: PgPool) {
     let rig = start(pool).await;
+    let (_, _, token) = make_user(&rig, "root", true).await;
     let cases = [
         ("nul", "a\0b".to_owned()),
         ("over the cap", "a".repeat(MAX_CATALOG_CURSOR_BYTES + 1)),
@@ -361,6 +408,7 @@ async fn list_refuses_each_cursor_rule_with_the_fixed_reason(pool: PgPool) {
     for (label, after_id) in cases {
         let err = list(
             &rig,
+            &token,
             ListCatalogRequest {
                 after_id,
                 ..Default::default()
@@ -377,6 +425,7 @@ async fn list_refuses_each_cursor_rule_with_the_fixed_reason(pool: PgPool) {
     for after_id in ["", "a", &"a".repeat(MAX_CATALOG_CURSOR_BYTES)] {
         list(
             &rig,
+            &token,
             ListCatalogRequest {
                 after_id: after_id.to_owned(),
                 ..Default::default()

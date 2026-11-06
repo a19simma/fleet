@@ -166,8 +166,9 @@ fn canonical(profile: &Profile) -> Result<String, CliError> {
 }
 
 /// `fleet profile item` and `prompt`: reads the latest version, applies `change` to its
-/// content and saves the result through `CreateProfile`, so the server checks the
-/// selection and keeps the version when the content hash is unchanged. Prints the version.
+/// content and saves the result through `CreateProfile` with `edit` set, so the server checks the
+/// selection, keeps the version when the content hash is unchanged and refuses a profile the
+/// caller does not own instead of saving a copy under the caller's name. Prints the version.
 /// An edit equal to an older version makes that version the latest again.
 ///
 /// Selection is keyed by item id only: the kind is not part of the stored entry.
@@ -175,6 +176,10 @@ fn canonical(profile: &Profile) -> Result<String, CliError> {
 /// Another save between the read and the write is overwritten: the last writer wins.
 ///
 /// A profile that sets `tools` cannot be saved as JSON, so the server refuses it.
+///
+/// # Errors
+/// `CliError::Rpc` for `PERMISSION_DENIED` (a shared profile owned by another user) and
+/// `NOT_FOUND` (an unknown name or someone else's private profile).
 pub(crate) async fn edit(
     client: &mut ProfilesClient,
     scrub: &Scrub,
@@ -195,6 +200,7 @@ pub(crate) async fn edit(
             name,
             content_json,
             content_toml: String::new(),
+            edit: true,
         })
         .await?
         .into_inner();
@@ -226,6 +232,7 @@ pub(crate) async fn create(
             name,
             content_json,
             content_toml: String::new(),
+            edit: false,
         })
         .await?
         .into_inner();

@@ -3,7 +3,7 @@
 //! Two static tokens plus per-user API tokens, scoped by gRPC path. The box token covers
 //! `FleetIngest` and `FleetWorker`. The client scope covers `FleetQuery`, `FleetJobs`,
 //! `FleetJudge`, `FleetProfiles`, `FleetBatches`, `FleetCredentials` and `FleetCatalog`. Any
-//! other path is denied.
+//! other path is denied. `FleetCatalog` passes the scope, then its handler requires an admin user.
 //!
 //! The two admin services, `FleetCatalogAdmin` and `FleetCapabilityAdmin`, sit outside both
 //! static scopes. A request reaches one of their five RPCs only with a per-user API token whose

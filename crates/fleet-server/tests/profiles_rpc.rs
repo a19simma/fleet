@@ -87,6 +87,7 @@ fn create(name: &str, content: &str) -> CreateProfileRequest {
         name: name.to_owned(),
         content_json: content.to_owned(),
         content_toml: String::new(),
+        edit: false,
     }
 }
 
@@ -95,6 +96,7 @@ fn create_toml(name: &str, content: &str) -> CreateProfileRequest {
         name: name.to_owned(),
         content_json: String::new(),
         content_toml: content.to_owned(),
+        edit: false,
     }
 }
 
@@ -152,11 +154,13 @@ async fn exactly_one_content_field_must_be_set(pool: PgPool) {
         name: "alpha".to_owned(),
         content_json: ONE.to_owned(),
         content_toml: PLAIN_TOML.to_owned(),
+        edit: false,
     };
     let neither = CreateProfileRequest {
         name: "alpha".to_owned(),
         content_json: String::new(),
         content_toml: String::new(),
+        edit: false,
     };
     for request in [both, neither] {
         let err = profiles.create_profile(request).await.unwrap_err();
@@ -947,6 +951,7 @@ async fn no_caller_create_is_refused_with_one_reason_before_the_body_is_read(poo
         name: "bad name".to_owned(),
         content_json: "{".to_owned(),
         content_toml: "x".to_owned(),
+        edit: false,
     };
     for request in [create("alpha", ONE), create("bad name", "{"), both] {
         let err = profiles.create_profile(request).await.unwrap_err();
@@ -2335,4 +2340,75 @@ async fn a_save_waits_for_an_admin_disable_in_flight_and_is_then_refused(pool: P
     let err = timeout(WAIT, save).await.unwrap().unwrap().unwrap_err();
     assert_eq!(err.to_string(), DISABLED_ITEM);
     nothing_written(&pool).await;
+}
+
+fn edit_request(name: &str, content: &str) -> CreateProfileRequest {
+    CreateProfileRequest {
+        edit: true,
+        ..create(name, content)
+    }
+}
+
+#[sqlx::test]
+async fn edit_saves_a_version_of_the_callers_own_profile(pool: PgPool) {
+    let store = store(pool.clone()).await;
+    let alice = user(&pool, "alice").await;
+    let addr = serve(&pool, &store);
+    let mut as_alice = bearer_client(addr, api_token(&pool, alice).await);
+    as_alice.create_profile(create("alpha", ONE)).await.unwrap();
+    let saved = as_alice
+        .create_profile(edit_request("alpha", TWO))
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(saved.version, 2);
+    assert_eq!(counts(&pool).await, (2, 2));
+    assert_eq!(owners(&pool).await, vec![(alice, "alpha".to_owned())]);
+}
+
+#[sqlx::test]
+async fn edit_of_a_shared_foreign_profile_is_denied_and_forks_nothing(pool: PgPool) {
+    let store = store(pool.clone()).await;
+    let alice = user(&pool, "alice").await;
+    let bob = user(&pool, "bob").await;
+    let addr = serve(&pool, &store);
+    let mut as_alice = bearer_client(addr, api_token(&pool, alice).await);
+    let mut as_bob = bearer_client(addr, api_token(&pool, bob).await);
+    as_alice.create_profile(create("alpha", ONE)).await.unwrap();
+    as_alice
+        .share_profile(fleet_proto::v1::ShareProfileRequest {
+            name: "alpha".to_owned(),
+        })
+        .await
+        .unwrap();
+    let before = counts(&pool).await;
+    let denied = as_bob
+        .create_profile(edit_request("alpha", TWO))
+        .await
+        .unwrap_err();
+    assert_eq!(denied.code(), Code::PermissionDenied);
+    assert_eq!(denied.message(), "only the owner can change this profile");
+    assert_eq!(counts(&pool).await, before);
+    assert_eq!(owners(&pool).await, vec![(alice, "alpha".to_owned())]);
+}
+
+#[sqlx::test]
+async fn edit_of_a_private_foreign_or_missing_profile_is_not_found(pool: PgPool) {
+    let store = store(pool.clone()).await;
+    let alice = user(&pool, "alice").await;
+    let bob = user(&pool, "bob").await;
+    let addr = serve(&pool, &store);
+    let mut as_alice = bearer_client(addr, api_token(&pool, alice).await);
+    let mut as_bob = bearer_client(addr, api_token(&pool, bob).await);
+    as_alice.create_profile(create("alpha", ONE)).await.unwrap();
+    let before = counts(&pool).await;
+    for name in ["alpha", "nothing"] {
+        let err = as_bob
+            .create_profile(edit_request(name, TWO))
+            .await
+            .unwrap_err();
+        assert_eq!(err.code(), Code::NotFound, "{name}");
+        assert_eq!(err.message(), "profile not found", "{name}");
+    }
+    assert_eq!(counts(&pool).await, before);
 }

@@ -550,7 +550,7 @@ const CLASSIFIED: &[(&str, &str)] = &[
     ("FleetProfiles", "ListProfiles:global"),
     ("FleetProfiles", "ShareProfile:global"),
     ("FleetProfiles", "UnshareProfile:global"),
-    ("FleetCatalog", "ListCatalog:global"),
+    ("FleetCatalog", "ListCatalog:admin-only"),
     ("FleetCatalogAdmin", "UpsertCatalogItem:admin-only"),
     ("FleetCatalogAdmin", "SetCatalogItemEnabled:admin-only"),
     ("FleetCapabilityAdmin", "GrantCapability:admin-only"),
