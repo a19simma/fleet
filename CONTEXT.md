@@ -1,6 +1,6 @@
 # Fleet
 
-Fleet runs coding-agent Jobs on Boxes and records what each Job did. This file defines the terms of the ADRs on telemetry and metrics (0029, 0030), profiles (0034, 0035, 0057), the job socket, broker and registration (0036, 0037, 0039), fetch policy (0038), credentials and users (0040, 0042, 0043), agent runners and forges (0044, 0045) the mirror key (0046) and the update trust root (0047, 0050).
+Fleet runs coding-agent Jobs on Boxes and records what each Job did. This file defines the terms of the ADRs on telemetry and metrics (0029, 0030), profiles (0034, 0035, 0052, 0053, 0057), capabilities and the model allowlist (0054), job timing (0055), the job socket, broker and registration (0036, 0037, 0039), fetch policy (0038), credentials and users (0040, 0042, 0043), agent runners and forges (0044, 0045) the mirror key (0046) and the update trust root (0047, 0050).
 
 ## Language
 
@@ -21,7 +21,7 @@ One of `repeat_action_observation`, `repeat_error`, `alternating` and `monologue
 _Avoid_: loop detector, watchdog
 
 **Profile**:
-A named, versioned, immutable config that overlays a **Bundle** for one Job: `claude_md`, context files, prompt template, skills, allow and deny rules, model, caps and settings. It holds no MCP, hooks or secrets (ADR-0034).
+A named, versioned, immutable config that overlays a **Bundle** for one Job: `claude_md`, context files, prompt template, skills, allow and deny rules, model, caps and settings. It holds no MCP, hooks or secrets (ADR-0034). It can also carry a **Selection** of **Catalog items** to switch off (ADR-0053, Proposed and partly built).
 _Avoid_: preset, template
 
 **Profile identity**:
@@ -37,7 +37,7 @@ One numbered entry of a **Profile** (by **Profile identity**), pointing at one *
 _Avoid_: revision
 
 **Profile hash**:
-The `sha256("fleet-profile-v1\0" + canonical JSON)` content hash of a **Profile**, recorded on each Job.
+The `sha256("fleet-profile-v1\0" + canonical JSON)` content hash of a **Profile**, recorded on each Job. A Profile with a **Selection** or an authored prompt hashes under the `fleet-profile-v3\0` prefix (ADR-0053, Proposed and partly built).
 _Avoid_: etag
 
 **Batch**:
@@ -192,7 +192,7 @@ The `(user, repo)` pair that names a repository mirror, so each user fetches int
 _Avoid_: deploy key
 
 **Owner**:
-The **User** a **Credential** or Job belongs to (`jobs.user_id`, ADR-0042).
+The **User** a **Credential**, Job or **Profile** belongs to (`jobs.user_id`, ADR-0042).
 _Avoid_: creator, tenant
 
 **Box token**:
@@ -218,6 +218,50 @@ _Avoid_: skin, dark mode
 **Generated stylesheet**:
 `crates/fleet-server/assets/ui.css`, built from `ui/input.css` by `mise run css` and committed. CI rebuilds it and fails on any diff (ADR-0051).
 _Avoid_: style.css, build output
+
+**Catalog**:
+The admin-curated global set of **Catalog items** that **Profiles** inherit from and switch off through a **Selection** (ADR-0053).
+_Avoid_: library, registry
+
+**Catalog item**:
+One entry of the admin-curated global Catalog: a kind (`skill`, `subagent`, `tool` or `context`), an id, a body and an `enabled` flag only an Admin sets. Items are insert-only and versioned; an Admin disables one by clearing `enabled`, never by deleting it (ADR-0053).
+_Avoid_: plugin, library entry
+
+**Selection**:
+The sorted, duplicate-free list of **Catalog item** ids a **Profile** switches off (`disabled`). A Profile inherits every enabled item it does not list, and the list holds at most `MAX_SELECTION` (256) ids (ADR-0053).
+_Avoid_: opt-in list, enabled list
+
+**Visibility**:
+The `private` or `shared` setting of a **Profile**. A new Profile is `private`, seen by its **Owner** alone; `shared` lets every User list, read and submit its published versions. It is not part of the **Profile hash** (ADR-0052).
+_Avoid_: access level, sharing mode
+
+**Capability**:
+A grant an **Admin** gives a **User**. The only one is `profile:tools`, needed to save or submit a **Profile** that lists `tools` or selects a `tool` **Catalog item**. A request under the **Client token** acts as the **Bootstrap user**, which holds the Capability only if an Admin grants it (ADR-0054).
+_Avoid_: role, permission
+
+**Model allowlist**:
+The exact, case-sensitive list of model ids a Job may use. The server reads it from `FLEET_MODEL_ALLOWLIST` and checks at profile save, submit and blob serve; fleetd re-checks before spawn against its own `model_allowlist`. An unset list restricts nothing (ADR-0054).
+_Avoid_: model whitelist, model policy
+
+**Span**:
+One timed interval of a Job with a kind (`Shell`, `BgShell`, `Tool` or `ApiWait`), in job-relative milliseconds (ADR-0055).
+_Avoid_: trace span
+
+**Timing summary**:
+The five parts `api_wait`, `tool`, `shell`, `idle` and `overhead` that sum to a Job's wall time. fleetd reconciles **Spans** into it with `fleet_core::timing::aggregate` and reports it with `ReportTiming`. The server recomputes it from the spans and refuses a report that differs (ADR-0055).
+_Avoid_: timing report, time breakdown
+
+**Idle**:
+Part of the **Timing summary**: agent window time covered by no **Span** (ADR-0055).
+_Avoid_: wait time
+
+**Overhead**:
+Part of the **Timing summary**: wall time outside the agent window, spent on clone, setup, push, pull request and teardown (ADR-0055).
+_Avoid_: setup time
+
+**Background command**:
+A shell command with no completion event. fleetd measures it as a `BgShell` **Span**. `BgWatcher` polls `pueue status --json` for tasks created after the Job started, and a pueue task still open at Job exit ends with `ended_by=job_exit` (ADR-0055).
+_Avoid_: detached command, async shell
 
 ## Relationships
 

@@ -45,7 +45,7 @@ ADRs for fleetd, the Fleet server and the `fleet` CLI. The plan is in `../plan.m
 | [0052](0052-profile-ownership-and-visibility.md) | Profile ownership and visibility | Proposed 2026-11-02, not built, amends 0034, 0035 and 0048, builds on 0042 |
 | [0053](0053-global-catalog-and-profile-selection.md) | Global catalog and profile selection | Proposed 2026-11-02, save-time selection validation, `fleet profile item` and `prompt`, Kimi dropped-subagent job notes, and the web selection editor built, rest not built, amends 0034 and 0035, builds on 0044, 0048 and 0054 |
 | [0054](0054-user-capabilities-and-model-allowlist.md) | User capabilities and model allowlist | Proposed 2026-11-02, built, amends 0048, builds on 0035, 0042 and 0044, amended by 0056 |
-| [0055](0055-job-timing-breakdown.md) | Job timing breakdown and loopback OTLP receiver | Proposed 2026-11-02, not built, loopback probe not run on a live host, supersedes in part and amends 0029, amends 0031 |
+| [0055](0055-job-timing-breakdown.md) | Job timing breakdown and loopback OTLP receiver | Proposed 2026-11-02, built in fleetd and the server except pushing pueue logs, live end-to-end run unverified, supersedes in part and amends 0029, amends 0031 |
 | [0056](0056-admin-is-a-user-flag.md) | Admin is a user flag | Proposed 2026-11-04, not built, amends 0023, 0042 and 0054, builds on 0042 |
 | [0057](0057-profile-version-streams-keyed-by-profile-id.md) | Profile version streams are keyed by profile id | Proposed 2026-11-04, migration written, store not built, amends 0035, builds on 0052 |
 
