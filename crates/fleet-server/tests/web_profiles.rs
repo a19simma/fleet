@@ -9,6 +9,7 @@ use std::fmt::Write as _;
 use std::net::SocketAddr;
 use std::time::Duration;
 
+use fleet_core::model_allowlist::ModelAllowlist;
 use fleet_server::auth::BearerAuth;
 use fleet_server::config::Token;
 use fleet_server::cred::Users;
@@ -64,8 +65,17 @@ impl Harness {
         Self::start_with(pool, true).await
     }
 
+    async fn start_allowing(pool: PgPool, models: &str) -> Self {
+        Self::launch(pool, true, Some(models)).await
+    }
+
     async fn start_with(pool: PgPool, configured: bool) -> Self {
-        let store = Store::new(pool.clone());
+        Self::launch(pool, configured, None).await
+    }
+
+    async fn launch(pool: PgPool, configured: bool, models: Option<&str>) -> Self {
+        let allowlist = models.map(|raw| ModelAllowlist::parse(raw).unwrap());
+        let store = Store::new(pool.clone()).with_model_allowlist(allowlist);
         store.migrate().await.unwrap();
         let users = Users::new(pool.clone());
         let auth = WebAuth::new(pool.clone(), users, ORIGIN, Some("example.com")).unwrap();
@@ -140,6 +150,32 @@ impl Harness {
         .fetch_one(&self.pool)
         .await
         .unwrap()
+    }
+
+    async fn item(&self, id: &str, kind: &str, enabled: bool) {
+        sqlx::query(
+            "INSERT INTO catalog_items (id, kind, name, content, digest, admin_enabled) \
+             VALUES ($1, $2, $1, 'body', sha256('x'::bytea), $3)",
+        )
+        .bind(id)
+        .bind(kind)
+        .bind(enabled)
+        .execute(&self.pool)
+        .await
+        .unwrap();
+    }
+
+    async fn latest(&self, id: i64) -> (i32, serde_json::Value) {
+        let (version, content): (i32, Vec<u8>) = sqlx::query_as(
+            "SELECT v.version, b.content FROM profile_version v \
+             JOIN profile_blob b ON b.hash = v.hash \
+             WHERE v.profile_id = $1 ORDER BY v.version DESC LIMIT 1",
+        )
+        .bind(id)
+        .fetch_one(&self.pool)
+        .await
+        .unwrap();
+        (version, serde_json::from_slice(&content).unwrap())
     }
 
     async fn visibility(&self, id: i64) -> String {
@@ -375,5 +411,198 @@ async fn every_rendered_value_is_escaped(pool: PgPool) {
     }
     assert!(detail.body.contains("content-marker"));
     assert!(!detail.body.contains("<b onclick"));
+    h.finish().await;
+}
+
+fn checkbox<'a>(body: &'a str, name: &str) -> &'a str {
+    let key = format!("name=\"{name}\"");
+    let at = body.find(&key).unwrap();
+    let start = body[..at].rfind("<input").unwrap();
+    let end = at + body[at..].find('>').unwrap();
+    &body[start..end]
+}
+
+#[sqlx::test]
+async fn the_editor_lists_catalog_items_per_kind_with_toggles(pool: PgPool) {
+    let h = Harness::start(pool).await;
+    let alice = h.session("alice", 'a').await;
+    h.item("sk-on", "skill", true).await;
+    h.item("sk-off", "skill", true).await;
+    h.item("sk-admin", "skill", false).await;
+    h.item("ag-one", "subagent", true).await;
+    h.item("cx-one", "context", true).await;
+    h.item("tl-one", "tool", true).await;
+    let json = r#"{"selection":[{"item_id":"sk-off","enabled":false}]}"#;
+    let id = h.profile(&alice, "mine", json, false).await;
+    let page = h.get(&alice, &format!("/profiles/{id}")).await;
+    assert_eq!(page.status, 200);
+    for kind in ["skill", "subagent", "tool", "context"] {
+        assert!(page.body.contains(&format!("id=\"kind-{kind}\"")), "{kind}");
+    }
+    assert!(page.body.contains(&format!("/profiles/{id}/selection")));
+    let on = checkbox(&page.body, "on_sk-on");
+    assert!(on.contains("checked") && !on.contains("disabled"));
+    let off = checkbox(&page.body, "on_sk-off");
+    assert!(!off.contains("checked") && !off.contains("disabled"));
+    let admin = checkbox(&page.body, "on_sk-admin");
+    assert!(admin.contains("disabled") && !admin.contains("checked"));
+    assert!(page.body.contains("disabled by admin"));
+    assert!(page.body.contains("id=\"note-ag-one\""));
+    assert!(page.body.contains("Kimi"));
+    assert!(!page.body.contains("id=\"note-sk-on\""));
+    assert!(page.body.contains("<textarea"));
+    h.finish().await;
+}
+
+#[sqlx::test]
+async fn a_non_owner_sees_no_editor(pool: PgPool) {
+    let h = Harness::start(pool).await;
+    let alice = h.session("alice", 'a').await;
+    let bob = h.session("bob", 'b').await;
+    h.item("sk-on", "skill", true).await;
+    let id = h.profile(&alice, "open", "{}", true).await;
+    let page = h.get(&bob, &format!("/profiles/{id}")).await;
+    assert_eq!(page.status, 200);
+    assert!(!page.body.contains("<textarea"));
+    assert!(!page.body.contains("/selection"));
+    assert!(!page.body.contains("on_sk-on"));
+    h.finish().await;
+}
+
+#[sqlx::test]
+async fn the_prompt_is_escaped_in_the_textarea(pool: PgPool) {
+    let h = Harness::start(pool).await;
+    let alice = h.session("alice", 'a').await;
+    let hostile = "</textarea><script>alert(1)</script><b onclick=\"y\">'&amp;";
+    let json = serde_json::json!({ "authored_prompt": hostile }).to_string();
+    let id = h.profile(&alice, "mine", &json, false).await;
+    let page = h.get(&alice, &format!("/profiles/{id}")).await;
+    assert_eq!(page.status, 200);
+    assert!(!page.body.contains("<script>alert"));
+    assert!(!page.body.contains("</textarea><script"));
+    assert!(!page.body.contains("<b onclick"));
+    assert!(page.body.contains("&lt;/textarea&gt;&lt;script&gt;"));
+    assert!(page.body.contains("&amp;amp;"));
+    h.finish().await;
+}
+
+#[sqlx::test]
+async fn saving_stores_the_switched_off_items_and_the_prompt(pool: PgPool) {
+    let h = Harness::start(pool).await;
+    let alice = h.session("alice", 'a').await;
+    h.item("sk-on", "skill", true).await;
+    h.item("sk-off", "skill", true).await;
+    h.item("sk-admin", "skill", false).await;
+    let id = h.profile(&alice, "mine", "{}", false).await;
+    let body = format!(
+        "csrf={}&on_sk-on=1&on_sk-admin=1&on_nope=1&prompt=be%20brief%0D%0Aplease",
+        alice.csrf
+    );
+    let reply = h
+        .post(&alice, &format!("/profiles/{id}/selection"), &body)
+        .await;
+    assert_eq!(
+        (reply.status, reply.location()),
+        (303, format!("/profiles/{id}"))
+    );
+    let (version, json) = h.latest(id).await;
+    assert_eq!(version, 2);
+    assert_eq!(json["authored_prompt"], "be brief\nplease");
+    assert_eq!(
+        json["selection"],
+        serde_json::json!([{"item_id": "sk-off", "enabled": false}])
+    );
+    let body = format!("csrf={}&on_sk-on=1&prompt=", alice.csrf);
+    let reply = h
+        .post(&alice, &format!("/profiles/{id}/selection"), &body)
+        .await;
+    assert_eq!(reply.status, 303);
+    let (version, json) = h.latest(id).await;
+    assert_eq!(version, 3);
+    assert!(json.get("authored_prompt").is_none());
+    assert_eq!(
+        json["selection"],
+        serde_json::json!([{"item_id": "sk-off", "enabled": false}])
+    );
+    let body = format!("csrf={}&on_sk-off=1&prompt=", alice.csrf);
+    let reply = h
+        .post(&alice, &format!("/profiles/{id}/selection"), &body)
+        .await;
+    assert_eq!(reply.status, 303);
+    let (version, json) = h.latest(id).await;
+    assert_eq!(version, 4);
+    assert_eq!(
+        json["selection"],
+        serde_json::json!([{"item_id": "sk-on", "enabled": false}])
+    );
+    assert!(json.get("authored_prompt").is_none());
+    h.finish().await;
+}
+
+#[sqlx::test]
+async fn a_refused_save_writes_nothing(pool: PgPool) {
+    let h = Harness::start(pool).await;
+    let alice = h.session("alice", 'a').await;
+    let bob = h.session("bob", 'b').await;
+    h.item("sk-on", "skill", true).await;
+    let mine = h.profile(&alice, "mine", "{}", false).await;
+    let open = h.profile(&alice, "open", "{}", true).await;
+    let path = format!("/profiles/{mine}/selection");
+    for body in ["", "csrf=", "csrf=wrong", "prompt=x"] {
+        assert_eq!(h.post(&alice, &path, body).await.status, 403, "{body}");
+    }
+    let forbidden = format!("csrf={}&prompt=a%0Db", alice.csrf);
+    assert_eq!(h.post(&alice, &path, &forbidden).await.status, 400);
+    let over = format!("csrf={}&prompt={}", alice.csrf, "x".repeat(70_000));
+    assert_eq!(h.post(&alice, &path, &over).await.status, 413);
+    let body = format!("csrf={}&prompt=hi", bob.csrf);
+    assert_eq!(h.post(&bob, &path, &body).await.status, 404);
+    let shared = format!("/profiles/{open}/selection");
+    assert_eq!(h.post(&bob, &shared, &body).await.status, 403);
+    assert_eq!(h.latest(mine).await.0, 1);
+    assert_eq!(h.latest(open).await.0, 1);
+    h.finish().await;
+}
+
+#[sqlx::test]
+async fn a_save_for_a_tool_item_needs_the_grant(pool: PgPool) {
+    let h = Harness::start(pool).await;
+    let alice = h.session("alice", 'a').await;
+    h.item("tl-one", "tool", true).await;
+    let id = h.profile(&alice, "mine", "{}", false).await;
+    let body = format!("csrf={}&prompt=", alice.csrf);
+    let reply = h
+        .post(&alice, &format!("/profiles/{id}/selection"), &body)
+        .await;
+    assert_eq!(reply.status, 403);
+    assert_eq!(h.latest(id).await.0, 1);
+    h.finish().await;
+}
+
+#[sqlx::test]
+async fn a_save_obeys_the_model_allowlist(pool: PgPool) {
+    let h = Harness::start_allowing(pool, "opus").await;
+    let alice = h.session("alice", 'a').await;
+    let id = h
+        .profile(&alice, "mine", r#"{"model":"sonnet"}"#, false)
+        .await;
+    let body = format!("csrf={}&prompt=hi", alice.csrf);
+    let reply = h
+        .post(&alice, &format!("/profiles/{id}/selection"), &body)
+        .await;
+    assert_eq!(reply.status, 403);
+    assert_eq!(h.latest(id).await.0, 1);
+    h.finish().await;
+}
+
+#[sqlx::test]
+async fn empty_kinds_are_not_rendered(pool: PgPool) {
+    let h = Harness::start(pool).await;
+    let alice = h.session("alice", 'a').await;
+    h.item("sk-on", "skill", true).await;
+    let id = h.profile(&alice, "mine", "{}", false).await;
+    let page = h.get(&alice, &format!("/profiles/{id}")).await;
+    assert!(page.body.contains("id=\"kind-skill\""));
+    assert!(!page.body.contains("id=\"kind-tool\""));
     h.finish().await;
 }

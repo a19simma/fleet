@@ -6,16 +6,24 @@
 //! token: the owner is always the session user, and a non-owner of a shared profile gets
 //! 403 with nothing written. Every stored string is passed to the view as text, which
 //! escapes it.
+//!
+//! The owner's page also holds the selection editor: per catalog kind, one checkbox per item
+//! (checked means on), admin-disabled items greyed and not togglable, a note on items a Kimi
+//! job drops, and a textarea for the authored prompt. The save posts to
+//! `/profiles/{id}/selection` and writes a new version through
+//! [`profiles::update_owned`], which re-checks the selection against the catalog.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
+use fleet_core::catalog::{CatalogKind, RunnerKind};
+use fleet_core::{Profile, PromptText, Selection};
 use sqlx::{PgPool, Row as _};
 use topcoat::{
     Result,
     context::{Cx, app_context},
     router::{
         content::Form,
-        error::{SeeOther, forbidden, not_found, see_other},
+        error::{SeeOther, bad_request, forbidden, not_found, see_other},
         page, path_param, route,
     },
     view::{View, view},
@@ -25,10 +33,20 @@ use super::jobs::ConsoleSlot;
 use super::layout::{Nav, shell};
 use super::pages::{auth, csrf_matches, current, fail, signed_in};
 use super::passkeys::AuthError;
-use crate::profiles::{self, ProfileFault};
+use crate::profiles::{self, ProfileContent, ProfileFault};
 use crate::store::StoreError;
 
 const LIST_LIMIT: i64 = 200;
+const ITEM_LIMIT: i64 = 2000;
+const ITEMS: &str = "SELECT id, kind, name, admin_enabled FROM catalog_items \
+     ORDER BY kind, name, id LIMIT $1";
+const KIND_ORDER: [CatalogKind; 4] = [
+    CatalogKind::Skill,
+    CatalogKind::Subagent,
+    CatalogKind::Tool,
+    CatalogKind::Context,
+];
+const KIMI_NOTE: &str = "A Kimi job drops this item: Kimi has no subagent mechanism.";
 
 const LIST: &str = "SELECT p.id, p.name, u.username, p.owner_user_id = $1 AS mine, \
      p.visibility = 'shared' AS shared, \
@@ -74,6 +92,67 @@ fn entry(row: &sqlx::postgres::PgRow, with_content: bool) -> Result<Entry, sqlx:
         latest: latest.map_or_else(String::new, |v| v.to_string()),
         content,
     })
+}
+
+struct Row {
+    id: String,
+    name: String,
+    admin_enabled: bool,
+    on: bool,
+    note: Option<&'static str>,
+}
+
+struct Group {
+    kind: &'static str,
+    rows: Vec<Row>,
+}
+
+fn editor_state(content: &str) -> Option<(HashSet<String>, String)> {
+    let profile = Profile::from_json(content.as_bytes()).ok()?;
+    let off = profile.selection.ids().map(ToString::to_string).collect();
+    let prompt = profile
+        .authored_prompt
+        .map(|text| text.as_str().to_owned())
+        .unwrap_or_default();
+    Some((off, prompt))
+}
+
+async fn groups(pool: &PgPool, off: &HashSet<String>) -> Result<Vec<Group>> {
+    let rows = sqlx::query(ITEMS)
+        .bind(ITEM_LIMIT)
+        .fetch_all(pool)
+        .await
+        .map_err(|err| internal(&err))?;
+    let mut items = Vec::with_capacity(rows.len());
+    for row in &rows {
+        let kind: String = row.try_get("kind").map_err(|err| internal(&err))?;
+        let id: String = row.try_get("id").map_err(|err| internal(&err))?;
+        let name: String = row.try_get("name").map_err(|err| internal(&err))?;
+        let admin_enabled: bool = row.try_get("admin_enabled").map_err(|err| internal(&err))?;
+        items.push((kind, id, name, admin_enabled));
+    }
+    let mut out = Vec::new();
+    for kind in KIND_ORDER {
+        let note = (!RunnerKind::Kimi.supports(kind)).then_some(KIMI_NOTE);
+        let rows: Vec<Row> = items
+            .iter()
+            .filter(|(word, ..)| word == kind.as_str())
+            .map(|(_, id, name, admin_enabled)| Row {
+                on: !off.contains(id),
+                id: id.clone(),
+                name: name.clone(),
+                admin_enabled: *admin_enabled,
+                note,
+            })
+            .collect();
+        if !rows.is_empty() {
+            out.push(Group {
+                kind: kind.as_str(),
+                rows,
+            });
+        }
+    }
+    Ok(out)
 }
 
 fn pool(cx: &Cx) -> Result<&PgPool> {
@@ -183,6 +262,15 @@ async fn profile_page(cx: &Cx) -> Result<impl View> {
         .map_err(|_| topcoat::Error::from(not_found()))?;
     let found = load(pool, session.user_id, id).await?;
     let csrf = String::from_utf8_lossy(session.csrf.expose()).into_owned();
+    let editor = if found.mine {
+        match editor_state(&found.content) {
+            Some((off, prompt)) => Some((groups(pool, &off).await?, prompt)),
+            None => None,
+        }
+    } else {
+        None
+    };
+    let selection_action = format!("/profiles/{}/selection", found.id);
     let share_action = format!("/profiles/{}/share", found.id);
     let unshare_action = format!("/profiles/{}/unshare", found.id);
     Ok(view! {
@@ -212,6 +300,40 @@ async fn profile_page(cx: &Cx) -> Result<impl View> {
                     }
                 } else {
                     <p id="read-only" class="mb-3 text-xs text-base-content/60">"Read-only: shared by its owner."</p>
+                }
+                if let Some((groups, prompt)) = editor {
+                    <form id="selection" method="post" action=(selection_action.as_str()) class="mb-3 max-w-xl text-xs">
+                        <input type="hidden" name="csrf" value=(csrf.as_str())>
+                        for group in groups {
+                            <fieldset id=(format!("kind-{}", group.kind)) class="mb-2 border border-base-300 p-2">
+                                <legend class="px-1 font-bold uppercase text-base-content/60">(group.kind)</legend>
+                                for row in group.rows {
+                                    if row.admin_enabled {
+                                        <label class="flex items-center gap-2">
+                                            if row.on {
+                                                <input type="checkbox" class="toggle toggle-xs" name=(format!("on_{}", row.id)) value="1" checked="checked">
+                                            } else {
+                                                <input type="checkbox" class="toggle toggle-xs" name=(format!("on_{}", row.id)) value="1">
+                                            }
+                                            <span>(row.name.as_str())</span>
+                                        </label>
+                                    } else {
+                                        <label class="flex items-center gap-2 opacity-50">
+                                            <input type="checkbox" class="toggle toggle-xs" name=(format!("on_{}", row.id)) value="1" disabled="disabled">
+                                            <span>(row.name.as_str())</span>
+                                            <span class="badge badge-sm badge-ghost">"disabled by admin"</span>
+                                        </label>
+                                    }
+                                    if let Some(note) = row.note {
+                                        <p id=(format!("note-{}", row.id)) class="ml-8 text-base-content/60">(note)</p>
+                                    }
+                                }
+                            </fieldset>
+                        }
+                        <label class="mb-1 block font-bold uppercase text-base-content/60" for="prompt">"Authored prompt"</label>
+                        <textarea id="prompt" class="textarea textarea-bordered w-full text-xs" name="prompt" rows="8">(prompt.as_str())</textarea>
+                        <button id="save-selection" class="btn btn-primary btn-xs mt-2" type="submit">"Save"</button>
+                    </form>
                 }
                 <h2 class="mb-1 text-xs font-bold uppercase text-base-content/60">"Content"</h2>
                 <pre id="content" class="overflow-auto whitespace-pre-wrap border border-base-300 bg-base-200 p-2 text-xs">(found.content.as_str())</pre>
@@ -255,4 +377,72 @@ async fn share_post(cx: &Cx, Form(form): Form<HashMap<String, String>>) -> Resul
 #[route(POST "/profiles/{profile_id}/unshare")]
 async fn unshare_post(cx: &Cx, Form(form): Form<HashMap<String, String>>) -> Result<SeeOther> {
     change(cx, &form, false).await
+}
+
+/// Rebuilds the profile text from the stored one: `off` are the switched-off ids and `prompt`
+/// is the authored prompt, where empty text removes it.
+fn rebuilt(stored: &str, off: &[String], prompt: &str) -> Result<String> {
+    let mut profile = Profile::from_json(stored.as_bytes())
+        .map_err(|_| topcoat::Error::from(bad_request("this profile cannot be edited here")))?;
+    let entries: Vec<_> = off
+        .iter()
+        .map(|id| serde_json::json!({ "item_id": id, "enabled": false }))
+        .collect();
+    let raw = serde_json::to_vec(&entries).map_err(|err| internal(&err))?;
+    profile.selection = Selection::from_json(&raw)
+        .map_err(|err| topcoat::Error::from(bad_request(err.to_string())))?;
+    profile.authored_prompt = PromptText::new(prompt)
+        .map_err(|err| topcoat::Error::from(bad_request(err.to_string())))?;
+    String::from_utf8(profile.canonical_json()).map_err(|err| internal(&err))
+}
+
+#[route(POST "/profiles/{profile_id}/selection")]
+async fn selection_post(cx: &Cx, Form(form): Form<HashMap<String, String>>) -> Result<SeeOther> {
+    let auth = auth(cx)?;
+    let pool = pool(cx)?;
+    let session = signed_in(cx, auth).await?;
+    if !csrf_matches(&session, form.get("csrf").map(String::as_str)) {
+        return Err(forbidden().into());
+    }
+    let id = path_param::<ProfileId>(cx)
+        .parse::<i64>()
+        .map_err(|_| topcoat::Error::from(not_found()))?;
+    let found = load(pool, session.user_id, id).await?;
+    let rows = sqlx::query(ITEMS)
+        .bind(ITEM_LIMIT)
+        .fetch_all(pool)
+        .await
+        .map_err(|err| internal(&err))?;
+    let mut off = Vec::new();
+    for row in &rows {
+        let item: String = row.try_get("id").map_err(|err| internal(&err))?;
+        let enabled: bool = row.try_get("admin_enabled").map_err(|err| internal(&err))?;
+        if enabled && !form.contains_key(&format!("on_{item}")) {
+            off.push(item);
+        }
+    }
+    let prompt = form
+        .get("prompt")
+        .map(|text| text.replace("\r\n", "\n"))
+        .unwrap_or_default();
+    let text = rebuilt(&found.content, &off, &prompt)?;
+    let store = app_context::<ConsoleSlot>(cx).0.as_deref();
+    let allowlist = store.and_then(crate::store::Store::model_allowlist);
+    match profiles::update_owned(
+        pool,
+        Some(session.user_id),
+        allowlist,
+        found.id,
+        ProfileContent::Json(&text),
+    )
+    .await
+    {
+        Ok(_) => Ok(see_other(format!("/profiles/{}", found.id))),
+        Err(
+            StoreError::InvalidProfile(ProfileFault::NotOwner)
+            | StoreError::ToolsNotGranted
+            | StoreError::ModelDenied(_),
+        ) => Err(forbidden().into()),
+        Err(err) => Err(internal(&err)),
+    }
 }

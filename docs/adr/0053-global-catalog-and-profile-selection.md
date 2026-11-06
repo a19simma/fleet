@@ -1,6 +1,6 @@
 # Global catalog and profile selection
 
-Status: Proposed 2026-11-02. Save-time selection validation, the `fleet profile item` and `fleet profile prompt` commands, and the Kimi dropped-subagent notes in the job event stream are built, the rest is not. Amends ADR-0034 (what a Profile holds) and ADR-0035 (what the hash covers). Builds on ADR-0044 and ADR-0048. Tool items need the owner capability `profile:tools` of ADR-0054.
+Status: Proposed 2026-11-02. Save-time selection validation, the `fleet profile item` and `fleet profile prompt` commands, the Kimi dropped-subagent notes in the job event stream, and the web profile page selection editor (toggles per kind, authored prompt) are built, the rest is not. Amends ADR-0034 (what a Profile holds) and ADR-0035 (what the hash covers). Builds on ADR-0044 and ADR-0048. Tool items need the owner capability `profile:tools` of ADR-0054.
 
 ADR-0034 defines a Profile as a bundle of content: `claude_md`, inline skills, context files and rules. Every Profile repeats the content it needs, and nothing says which skills, subagents or tools exist on the server. This ADR adds a server-managed catalog and turns a Profile into a selection over it.
 
