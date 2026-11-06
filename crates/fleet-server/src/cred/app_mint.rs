@@ -11,7 +11,8 @@
 //! validation revokes the token before it is discarded (SEC-010), also when the 201 body does
 //! not parse but its `token` field reads. No error carries text from the network.
 //!
-//! Built, not wired: no runtime path calls this module yet.
+//! The release path in `cred::store` calls the client after the capability check and the
+//! transaction commit (SEC-011).
 //!
 //! Not zeroized: the `HeaderValue` copy of the bearer value inside hyper and the TLS buffers.
 
@@ -226,7 +227,7 @@ impl AppClient {
     }
 
     #[cfg(test)]
-    fn plain(addr: std::net::SocketAddr, limits: Limits) -> Self {
+    pub(crate) fn plain(addr: std::net::SocketAddr, limits: Limits) -> Self {
         Self {
             endpoint: Endpoint::Plain(addr),
             limits,

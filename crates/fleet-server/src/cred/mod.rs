@@ -10,6 +10,8 @@ pub mod limiter;
 pub mod password;
 pub mod seal;
 pub mod store;
+#[cfg(test)]
+mod store_app_tests;
 pub mod users;
 
 pub use api::CredentialService;

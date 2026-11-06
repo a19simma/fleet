@@ -2,8 +2,8 @@
 //!
 //! The signed JWT is an [`AppJwt`]: `Debug` is redacted and the text is wiped on drop.
 //!
-//! Built, not wired: startup loads the key through [`AppKey::load`]; no runtime path calls
-//! [`AppKey::sign`] yet.
+//! Startup loads the key through [`AppKey::load`]; the release path signs with
+//! [`AppKey::sign`] before each mint (SEC-011).
 //!
 //! Key bytes are read into a preallocated `Zeroizing` buffer so growth never leaves unwiped
 //! copies, and the DER moves out of the parsed PEM into a `Zeroizing` buffer. Not zeroized: the

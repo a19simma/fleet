@@ -48,6 +48,7 @@ fn store_status(err: &StoreError) -> Status {
         StoreError::CapabilityDenied => {
             Status::permission_denied(super::capability::ERR_CAPABILITY_NOT_GRANTED)
         }
+        StoreError::MintFailed => Status::failed_precondition(fleet_proto::PRECONDITION_APP_MINT),
         StoreError::Seal(_) => {
             tracing::error!(%err, "credential sealing failed");
             Status::internal("credential store error")
@@ -74,6 +75,14 @@ fn info(summary: CredentialSummary) -> CredentialInfo {
         fingerprint: summary.fingerprint,
         login: summary.login,
         expires_at_ms: summary.expires_at_ms.and_then(|ms| u64::try_from(ms).ok()),
+    }
+}
+
+fn wire_kind(kind: CredentialKind) -> &'static str {
+    if kind == CredentialKind::GithubApp {
+        fleet_proto::GITHUB_INSTALLATION_TOKEN_KIND
+    } else {
+        kind.wire_name()
     }
 }
 
@@ -199,9 +208,9 @@ impl CredentialService {
     ///
     /// `PERMISSION_DENIED` with `lease does not match` for any lease mismatch, and with
     /// `ERR_CAPABILITY_NOT_GRANTED` when the owner lost the capability a stored kind needs,
-    /// `FAILED_PRECONDITION`
-    /// when the owner has no GitHub credential, no credential the agent accepts, or a needed
-    /// credential is expired, `UNAVAILABLE` when storage fails. Nothing is recorded on error.
+    /// `FAILED_PRECONDITION` with `PRECONDITION_APP_MINT` when the App token cannot be minted,
+    /// and with another message when the owner has no GitHub credential, no credential the
+    /// agent accepts, or a needed credential is expired, `UNAVAILABLE` when storage fails. Nothing is recorded on error.
     pub async fn job_credentials(
         &self,
         job_id: &str,
@@ -220,7 +229,7 @@ impl CredentialService {
                 Status::internal("credential store error")
             })?;
             credentials.push(JobCredential {
-                kind: item.kind.wire_name().to_owned(),
+                kind: wire_kind(item.kind).to_owned(),
                 shape: item.shape.wire_name().to_owned(),
                 value,
             });

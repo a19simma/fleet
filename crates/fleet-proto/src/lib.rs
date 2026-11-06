@@ -198,6 +198,14 @@ pub const PRECONDITION_NO_AGENT: &str = "no agent credential";
 /// `FAILED_PRECONDITION` message: a credential the job needs has expired.
 pub const PRECONDITION_EXPIRED: &str = "credential expired";
 
+/// Wire kind of the minted GitHub App installation token in a `GetJobCredentials` reply
+/// (ADR-0058). It is never a stored kind.
+pub const GITHUB_INSTALLATION_TOKEN_KIND: &str = "github_installation_token";
+
+/// `FAILED_PRECONDITION` message: the GitHub App token could not be minted. One text covers
+/// every cause.
+pub const PRECONDITION_APP_MINT: &str = "github app token unavailable";
+
 /// `FAILED_PRECONDITION` message: the server runs without a credential store.
 pub const PRECONDITION_NOT_CONFIGURED: &str = "credentials are not configured";
 

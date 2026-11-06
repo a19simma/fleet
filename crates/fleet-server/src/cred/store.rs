@@ -4,6 +4,7 @@
 
 use std::fmt;
 use std::sync::Arc;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use fleet_core::capability::Capability;
 use fleet_core::credential::{
@@ -12,6 +13,8 @@ use fleet_core::credential::{
 use fleet_proto::MAX_CREDENTIALS_PER_USER;
 use sqlx::{PgPool, Row};
 
+use super::app_jwt::AppKey;
+use super::app_mint::{AppClient, InstallationToken};
 use super::capability::ERR_CAPABILITY_NOT_GRANTED;
 use super::github::MAX_EXPIRY_MS;
 use super::seal::{Aad, SealError, Sealer};
@@ -40,7 +43,7 @@ const SELECT_FOR_USE: &str = "\
 SELECT kind, ciphertext, key_id FROM credentials WHERE id = $1 AND user_id = $2 AND tombstoned_at IS NULL FOR SHARE";
 
 const SELECT_LEASE: &str = "\
-SELECT user_id, agent FROM jobs \
+SELECT user_id, agent, repo FROM jobs \
 WHERE job_id = $1 AND attempt = $2 AND box = $3 AND state = 'RUNNING' \
 AND lease_expires_at > now() FOR SHARE";
 
@@ -52,6 +55,92 @@ const READ_CAPABILITY: &str =
     "SELECT user_id FROM user_capabilities WHERE user_id = $1 AND capability = $2 FOR SHARE";
 
 const INSERT_USE: &str = "INSERT INTO credential_use (credential_id, job_id) VALUES ($1, $2)";
+
+/// The GitHub App mint lane: the parsed key, the App id and the token client (ADR-0058).
+pub struct AppLane {
+    key: AppKey,
+    app_id: String,
+    client: AppClient,
+}
+
+impl AppLane {
+    async fn mint(
+        &self,
+        released: &[ReleasedCredential],
+        repo: &str,
+    ) -> Result<InstallationToken, StoreError> {
+        let installation = released
+            .iter()
+            .find(|c| c.kind == CredentialKind::GithubApp)
+            .and_then(|c| std::str::from_utf8(c.value.expose()).ok())
+            .and_then(|text| text.parse::<u64>().ok())
+            .ok_or(StoreError::MintFailed)?;
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_err(|_| StoreError::MintFailed)?
+            .as_secs();
+        let jwt = self
+            .key
+            .sign(&self.app_id, now)
+            .map_err(|_| StoreError::MintFailed)?;
+        match self
+            .client
+            .mint(&jwt, installation, repo_name(repo), now)
+            .await
+        {
+            Ok(token) => Ok(token),
+            Err(err) => {
+                tracing::warn!(error = %err, "github app token mint failed");
+                Err(StoreError::MintFailed)
+            }
+        }
+    }
+
+    async fn revoke(&self, token: &InstallationToken) {
+        if let Err(err) = self.client.revoke(token).await {
+            tracing::warn!(error = %err, "github app token revoke failed");
+        }
+    }
+
+    /// Builds the lane. `app_id` is the JWT `iss` text.
+    pub fn new(key: AppKey, app_id: String, client: AppClient) -> Self {
+        Self {
+            key,
+            app_id,
+            client,
+        }
+    }
+}
+
+impl fmt::Debug for AppLane {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("AppLane(..)")
+    }
+}
+
+pub(super) fn repo_name(repo: &str) -> &str {
+    let last = repo
+        .trim_end_matches('/')
+        .rsplit('/')
+        .next()
+        .unwrap_or(repo);
+    last.strip_suffix(".git").unwrap_or(last)
+}
+
+async fn record_uses(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    ids: &[i64],
+    job_id: &str,
+) -> Result<(), StoreError> {
+    for id in ids {
+        sqlx::query(INSERT_USE)
+            .bind(id)
+            .bind(job_id)
+            .execute(&mut **tx)
+            .await?;
+    }
+    Ok(())
+}
 
 /// One credential released to a Box for a leased Job.
 pub struct ReleasedCredential {
@@ -144,6 +233,8 @@ pub enum StoreError {
     Expired,
     /// The owner lacks the capability the credential kind needs.
     CapabilityDenied,
+    /// The GitHub App token could not be minted. One fixed error covers every cause.
+    MintFailed,
     /// The database failed.
     Db(sqlx::Error),
 }
@@ -160,6 +251,7 @@ impl fmt::Display for StoreError {
             Self::NoAgentCredential => f.write_str("no agent credential"),
             Self::Expired => f.write_str("credential expired"),
             Self::CapabilityDenied => f.write_str(ERR_CAPABILITY_NOT_GRANTED),
+            Self::MintFailed => f.write_str(fleet_proto::PRECONDITION_APP_MINT),
             Self::Seal(e) => e.fmt(f),
             Self::Db(_) => f.write_str("credential store database error"),
         }
@@ -193,6 +285,7 @@ pub struct CredentialStore {
     sealer: Arc<dyn Sealer>,
     limit: usize,
     gate: fn(CredentialKind) -> Option<Capability>,
+    app: Option<Arc<AppLane>>,
 }
 
 impl fmt::Debug for CredentialStore {
@@ -226,7 +319,16 @@ impl CredentialStore {
             sealer,
             limit,
             gate: required_capability,
+            app: None,
         }
+    }
+
+    /// Attaches the GitHub App mint lane. Without it a release for a User holding a
+    /// `github_app` credential fails with [`StoreError::MintFailed`].
+    #[must_use]
+    pub fn with_github_app(mut self, lane: AppLane) -> Self {
+        self.app = Some(Arc::new(lane));
+        self
     }
 
     /// Replaces the map from credential kind to the capability it needs.
@@ -408,13 +510,22 @@ impl CredentialStore {
     ///
     /// The lease must match on job, attempt and box, and the job must be `RUNNING` with an
     /// unexpired lease. The owner and the agent come from the job row, never from the request.
-    /// The reply holds every stored credential of a kind the agent accepts, plus the GitHub
-    /// token. One use row is written per credential, in the same transaction as the reads.
+    /// The reply holds every stored credential of a kind the agent accepts, plus one forge
+    /// credential. One use row is written per credential, in the same transaction as the reads
+    /// on the PAT path.
     ///
     /// The lease read takes `FOR SHARE` on the job row. A reclaim, a finish or any other write
     /// to that row waits until this transaction commits or rolls back, so the credentials are
     /// released against a lease that stays valid for the whole transaction. The lease expiring
     /// by the clock is not prevented: it is checked once, when the row is read.
+    ///
+    /// The forge kinds are `github_pat` and `github_app`. When the owner holds both, the App wins
+    /// and the PAT is never released, even when the App path fails (ADR-0058, SEC-008). The App
+    /// token is minted after the capability check and after the first transaction commits, so no
+    /// row lock is held across the network call. A second transaction then re-reads the lease
+    /// and the capability and writes the use rows, only after the mint succeeded. If that fails
+    /// the token is revoked best effort. Any mint failure returns [`StoreError::MintFailed`]
+    /// and writes no use row. A wrong lease never reaches the mint.
     ///
     /// Expired credentials of an agent kind are skipped. The release fails with
     /// [`StoreError::Expired`] only when the GitHub credential is expired or when every
@@ -427,11 +538,12 @@ impl CredentialStore {
     ///
     /// # Errors
     ///
-    /// Returns [`StoreError::LeaseDenied`] when no job matches the lease,
+    /// Returns [`StoreError::LeaseDenied`] when no job matches the lease (also after the mint, when the recheck fails),
     /// [`StoreError::NoGithub`] when the owner has no GitHub credential,
     /// [`StoreError::Expired`] when a needed credential is past its expiry,
-    /// [`StoreError::CapabilityDenied`] when the owner lacks the capability a stored kind needs,
+    /// [`StoreError::CapabilityDenied`] when the owner lacks the capability a stored kind needs (also after the mint, when the recheck fails),
     /// [`StoreError::NoAgentCredential`] when the owner has none the agent accepts,
+    /// [`StoreError::MintFailed`] when the App token cannot be minted,
     /// [`StoreError::Seal`] when a value cannot be opened and [`StoreError::Db`] for a
     /// database failure. No use row is written on any error.
     pub async fn release_for_job(
@@ -451,11 +563,17 @@ impl CredentialStore {
             .ok_or(StoreError::LeaseDenied)?;
         let user_id: i64 = lease.try_get("user_id")?;
         let agent: String = lease.try_get("agent")?;
+        let repo: String = lease.try_get("repo")?;
         let mut wanted: Vec<&str> = agent_kinds(&agent)
             .iter()
             .map(|kind| kind.wire_name())
             .collect();
-        wanted.push(CredentialKind::GithubPat.wire_name());
+        wanted.extend(
+            CredentialKind::ALL
+                .into_iter()
+                .filter(|kind| kind.is_forge())
+                .map(CredentialKind::wire_name),
+        );
         let rows = sqlx::query(SELECT_RELEASABLE)
             .bind(user_id)
             .bind(&wanted)
@@ -470,45 +588,80 @@ impl CredentialStore {
         for (_, kind, _) in &found {
             self.require_capability(&mut tx, user_id, *kind).await?;
         }
-        if !found
+        let forge = found
             .iter()
-            .any(|(_, kind, _)| *kind == CredentialKind::GithubPat)
-        {
+            .map(|(_, kind, _)| *kind)
+            .filter(|kind| kind.is_forge())
+            .min_by_key(|kind| *kind != CredentialKind::GithubApp);
+        let Some(forge) = forge else {
             return Err(StoreError::NoGithub);
-        }
-        if found
-            .iter()
-            .all(|(_, kind, _)| *kind == CredentialKind::GithubPat)
-        {
+        };
+        found.retain(|(_, kind, _)| !kind.is_forge() || *kind == forge);
+        if found.iter().all(|(_, kind, _)| kind.is_forge()) {
             return Err(StoreError::NoAgentCredential);
         }
-        let github_expired = found
+        let forge_expired = found
             .iter()
-            .any(|(_, kind, expired)| *kind == CredentialKind::GithubPat && *expired);
-        found.retain(|(_, kind, expired)| *kind == CredentialKind::GithubPat || !*expired);
-        if github_expired
-            || found
-                .iter()
-                .all(|(_, kind, _)| *kind == CredentialKind::GithubPat)
-        {
+            .any(|(_, kind, expired)| kind.is_forge() && *expired);
+        found.retain(|(_, kind, expired)| kind.is_forge() || !*expired);
+        if forge_expired || found.iter().all(|(_, kind, _)| kind.is_forge()) {
             return Err(StoreError::Expired);
         }
         let mut released = Vec::with_capacity(found.len());
+        let mut ids = Vec::with_capacity(found.len());
         for (id, _, _) in found {
             let (kind, value) = self.unseal(&mut tx, user_id, id).await?;
-            sqlx::query(INSERT_USE)
-                .bind(id)
-                .bind(job_id)
-                .execute(&mut *tx)
-                .await?;
+            ids.push(id);
             released.push(ReleasedCredential {
                 kind,
                 shape: CredentialShape::StaticSecret,
                 value,
             });
         }
+        if forge != CredentialKind::GithubApp {
+            record_uses(&mut tx, &ids, job_id).await?;
+            tx.commit().await?;
+            return Ok(released);
+        }
+        let lane = self.app.clone().ok_or(StoreError::MintFailed)?;
         tx.commit().await?;
+        let token = lane.mint(&released, &repo).await?;
+        let rechecked = self
+            .record_after_mint(job_id, attempt, box_name, user_id, &ids)
+            .await;
+        if let Err(err) = rechecked {
+            lane.revoke(&token).await;
+            return Err(err);
+        }
+        for credential in &mut released {
+            if credential.kind == CredentialKind::GithubApp {
+                credential.value = Secret::new(token.expose().to_owned());
+            }
+        }
         Ok(released)
+    }
+
+    async fn record_after_mint(
+        &self,
+        job_id: &str,
+        attempt: i32,
+        box_name: &str,
+        user_id: i64,
+        ids: &[i64],
+    ) -> Result<(), StoreError> {
+        let mut tx = self.pool.begin().await?;
+        sqlx::query(SELECT_LEASE)
+            .bind(job_id)
+            .bind(attempt)
+            .bind(box_name)
+            .fetch_optional(&mut *tx)
+            .await?
+            .ok_or(StoreError::LeaseDenied)?;
+        self.require_capability(&mut tx, user_id, CredentialKind::GithubApp)
+            .await?;
+        record_uses(&mut tx, ids, job_id).await?;
+        tx.commit().await?;
+        Ok(())
     }
 
     /// Unseals the user's credential for `job_id` and records the use in the same transaction.

@@ -12,10 +12,11 @@ use fleet_server::auth::BearerAuth;
 use fleet_server::config::{Config, CredentialsState, GithubAppConfig, exposed_binds, is_loopback};
 use fleet_server::cred::admin::{AdminError, SETUP_CODE_TTL_HOURS, parse_args, run as run_admin};
 use fleet_server::cred::app_jwt::AppKey;
+use fleet_server::cred::app_mint::AppClient;
 use fleet_server::cred::github::HttpsGithub;
 use fleet_server::cred::limiter::Limiter;
 use fleet_server::cred::password::BootstrapPassword;
-use fleet_server::cred::store::CredentialStore;
+use fleet_server::cred::store::{AppLane, CredentialStore};
 use fleet_server::cred::{CredentialService, Users};
 use fleet_server::reaper::{DEFAULT_REAP_PERIOD, run_reaper};
 use fleet_server::retention::run_retention;
@@ -103,6 +104,7 @@ async fn bootstrap_password(config: &Config, users: &Users) -> Result<BootstrapP
 async fn credential_service(
     config: &Config,
     pool: &sqlx::PgPool,
+    github_app: Option<AppKey>,
 ) -> Result<Option<CredentialService>, BoxError> {
     let rows_exist: bool = sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM credentials)")
         .fetch_one(pool)
@@ -114,10 +116,11 @@ async fn credential_service(
     };
     tracing::info!("credential master key loaded");
     let github = HttpsGithub::new()?;
-    Ok(Some(CredentialService::new(
-        CredentialStore::new(pool.clone(), sealer),
-        Arc::new(github),
-    )))
+    let mut store = CredentialStore::new(pool.clone(), sealer);
+    if let (Some(key), Some(app)) = (github_app, config.github_app.as_ref()) {
+        store = store.with_github_app(AppLane::new(key, app.app_id_text(), AppClient::new()?));
+    }
+    Ok(Some(CredentialService::new(store, Arc::new(github))))
 }
 
 fn configured_store(pool: sqlx::PgPool, config: &Config) -> Store {
@@ -151,7 +154,7 @@ fn load_github_app(config: &Config) -> Result<Option<AppKey>, BoxError> {
 
 async fn run() -> Result<(), BoxError> {
     let config = Config::from_env()?;
-    let _github_app = load_github_app(&config)?;
+    let github_app = load_github_app(&config)?;
     let options = PgConnectOptions::from_str(config.database_url.expose())?
         .options([("statement_timeout", STATEMENT_TIMEOUT_MS)]);
     let pool = PgPoolOptions::new()
@@ -162,7 +165,7 @@ async fn run() -> Result<(), BoxError> {
     let store = configured_store(pool.clone(), &config);
     store.migrate().await?;
 
-    let credential_service = credential_service(&config, &pool).await?;
+    let credential_service = credential_service(&config, &pool, github_app).await?;
 
     let users = Users::new(pool.clone());
     log_setup_path(&users).await?;
