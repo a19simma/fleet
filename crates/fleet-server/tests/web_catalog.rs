@@ -1,6 +1,7 @@
-//! `/catalog` and `/users/{id}/capabilities` stubs behind `admin_gate`: GET and POST against
-//! no session, a non-admin, an admin, an admin demoted after login, and a missing or wrong
-//! CSRF token. The tests need a Postgres superuser URL in `DATABASE_URL` for
+//! The `/catalog` pages and the `/users/{id}/capabilities` stub behind `admin_gate`: GET and
+//! POST against no session, a non-admin, an admin, an admin demoted after login, and a
+//! missing or wrong CSRF token on every route; then add, edit, enable and disable as an admin
+//! with one hostile value per field. The tests need a Postgres superuser URL in `DATABASE_URL` for
 //! `#[sqlx::test]` and live in their own binary because each one binds a socket.
 
 #![expect(clippy::unwrap_used, reason = "test code asserts by panicking")]
@@ -24,7 +25,16 @@ use tonic::transport::server::TcpIncoming;
 const WAIT: Duration = Duration::from_secs(20);
 const ORIGIN: &str = "https://fleet.example.com";
 const FORM: (&str, &str) = ("Content-Type", "application/x-www-form-urlencoded");
-const PATHS: [&str; 2] = ["/catalog", "/users/1/capabilities"];
+const GET_ROUTES: [&str; 3] = ["/catalog", "/catalog/greet", "/users/1/capabilities"];
+const POST_ROUTES: [&str; 5] = [
+    "/catalog",
+    "/catalog/greet",
+    "/catalog/greet/enable",
+    "/catalog/greet/disable",
+    "/users/1/capabilities",
+];
+const STUB: [&str; 1] = ["/users/1/capabilities"];
+const HOSTILE: &str = "<script>alert('x')</script>\"'&\r\n\u{2028}";
 
 struct Session {
     cookie: String,
@@ -40,7 +50,12 @@ struct Harness {
     task: tokio::task::JoinHandle<std::io::Result<()>>,
 }
 
-type Snapshot = (Vec<(i64, bool)>, i64, i64);
+type Snapshot = (
+    Vec<(i64, bool)>,
+    i64,
+    i64,
+    Vec<(String, String, String, String, bool)>,
+);
 
 impl Harness {
     async fn start(pool: PgPool) -> Self {
@@ -55,7 +70,7 @@ impl Harness {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         let (stop, rx) = oneshot::channel::<()>();
-        let web = Web::with_auth(auth);
+        let web = Web::with_console(auth, None, store.clone());
         let task = tokio::spawn(async move {
             serve_with_web(&store, &bearer, web, TcpIncoming::from(listener), async {
                 let _ = rx.await;
@@ -113,7 +128,13 @@ impl Harness {
             .fetch_one(&self.pool)
             .await
             .unwrap();
-        (flags, audit, sessions)
+        let items = sqlx::query_as(
+            "SELECT id, kind, name, content, admin_enabled FROM catalog_items ORDER BY id",
+        )
+        .fetch_all(&self.pool)
+        .await
+        .unwrap();
+        (flags, audit, sessions, items)
     }
 
     async fn send(
@@ -123,6 +144,17 @@ impl Harness {
         cookie: Option<&str>,
         body: Option<&str>,
     ) -> (u16, String) {
+        let (status, location, _) = self.fetch(method, path, cookie, body).await;
+        (status, location)
+    }
+
+    async fn fetch(
+        &self,
+        method: &str,
+        path: &str,
+        cookie: Option<&str>,
+        body: Option<&str>,
+    ) -> (u16, String, String) {
         let mut stream = TcpStream::connect(self.addr).await.unwrap();
         let body = body.unwrap_or_default();
         let mut request = format!(
@@ -143,7 +175,7 @@ impl Harness {
             .await
             .unwrap();
         let raw = String::from_utf8_lossy(&raw).into_owned();
-        let (head, _) = raw.split_once("\r\n\r\n").unwrap();
+        let (head, page) = raw.split_once("\r\n\r\n").unwrap();
         let status = head.split(' ').nth(1).unwrap().parse().unwrap();
         let location = head
             .lines()
@@ -153,7 +185,7 @@ impl Harness {
                     .then(|| value.trim().to_owned())
             })
             .unwrap_or_default();
-        (status, location)
+        (status, location, page.to_owned())
     }
 
     async fn expect(
@@ -163,14 +195,61 @@ impl Harness {
         body: Option<&str>,
         want: (u16, &str),
     ) {
+        let paths: &[&str] = if method == "GET" {
+            &GET_ROUTES
+        } else {
+            &POST_ROUTES
+        };
+        self.expect_on(paths, method, who, body, want).await;
+    }
+
+    async fn expect_on(
+        &self,
+        paths: &[&str],
+        method: &str,
+        who: Option<&Session>,
+        body: Option<&str>,
+        want: (u16, &str),
+    ) {
         let before = self.snapshot().await;
-        for path in PATHS {
+        for path in paths {
             let (status, location) = self
                 .send(method, path, who.map(|s| s.cookie.as_str()), body)
                 .await;
             assert_eq!((status, location.as_str()), want, "{method} {path}");
         }
         assert_eq!(self.snapshot().await, before);
+    }
+
+    async fn post(&self, who: &Session, path: &str, fields: &[(&str, &str)]) -> (u16, String) {
+        let mut body = format!("csrf={}", who.csrf);
+        for (key, value) in fields {
+            let _ = write!(body, "&{key}={}", encode(value));
+        }
+        self.send("POST", path, Some(&who.cookie), Some(&body))
+            .await
+    }
+
+    async fn item(&self, id: &str) -> Option<(String, String, String, bool)> {
+        sqlx::query_as("SELECT kind, name, content, admin_enabled FROM catalog_items WHERE id = $1")
+            .bind(id)
+            .fetch_optional(&self.pool)
+            .await
+            .unwrap()
+    }
+
+    async fn add(&self, who: &Session, id: &str, kind: &str, content: &str) -> (u16, String) {
+        self.post(
+            who,
+            "/catalog",
+            &[
+                ("id", id),
+                ("kind", kind),
+                ("name", id),
+                ("content", content),
+            ],
+        )
+        .await
     }
 
     async fn finish(mut self) {
@@ -181,6 +260,17 @@ impl Harness {
             .unwrap()
             .unwrap();
     }
+}
+
+fn encode(value: &str) -> String {
+    value.bytes().fold(String::new(), |mut out, byte| {
+        if byte.is_ascii_alphanumeric() {
+            out.push(char::from(byte));
+        } else {
+            let _ = write!(out, "%{byte:02X}");
+        }
+        out
+    })
 }
 
 fn csrf_body(session: &Session) -> String {
@@ -203,10 +293,11 @@ async fn get_as_a_non_admin_is_forbidden(pool: PgPool) {
 }
 
 #[sqlx::test]
-async fn get_as_an_admin_renders_the_stub(pool: PgPool) {
+async fn get_as_an_admin_reaches_the_capability_stub(pool: PgPool) {
     let h = Harness::start(pool).await;
     let root = h.session("root", 'b', true).await;
-    h.expect("GET", Some(&root), None, (501, "")).await;
+    h.expect_on(&STUB, "GET", Some(&root), None, (501, ""))
+        .await;
     let (status, _) = h
         .send("GET", "/users/1/nope", Some(&root.cookie), None)
         .await;
@@ -218,7 +309,8 @@ async fn get_as_an_admin_renders_the_stub(pool: PgPool) {
 async fn get_after_demotion_is_forbidden_on_the_same_session(pool: PgPool) {
     let h = Harness::start(pool).await;
     let root = h.session("root", 'b', true).await;
-    h.expect("GET", Some(&root), None, (501, "")).await;
+    h.expect_on(&STUB, "GET", Some(&root), None, (501, ""))
+        .await;
     h.users.set_admin(root.user_id, false).await.unwrap();
     h.expect("GET", Some(&root), None, (403, "")).await;
     h.finish().await;
@@ -246,7 +338,8 @@ async fn post_as_an_admin_with_a_valid_csrf_reaches_the_stub(pool: PgPool) {
     let h = Harness::start(pool).await;
     let root = h.session("root", 'b', true).await;
     let body = csrf_body(&root);
-    h.expect("POST", Some(&root), Some(&body), (501, "")).await;
+    h.expect_on(&STUB, "POST", Some(&root), Some(&body), (501, ""))
+        .await;
     h.finish().await;
 }
 
@@ -255,7 +348,8 @@ async fn post_after_demotion_with_a_valid_csrf_is_forbidden(pool: PgPool) {
     let h = Harness::start(pool).await;
     let root = h.session("root", 'b', true).await;
     let body = csrf_body(&root);
-    h.expect("POST", Some(&root), Some(&body), (501, "")).await;
+    h.expect_on(&STUB, "POST", Some(&root), Some(&body), (501, ""))
+        .await;
     h.users.set_admin(root.user_id, false).await.unwrap();
     h.expect("POST", Some(&root), Some(&body), (403, "")).await;
     h.finish().await;
@@ -276,5 +370,299 @@ async fn post_as_an_admin_with_a_wrong_csrf_is_forbidden(pool: PgPool) {
     let root = h.session("root", 'b', true).await;
     h.expect("POST", Some(&root), Some("csrf=wrong"), (403, ""))
         .await;
+    h.finish().await;
+}
+
+#[sqlx::test]
+async fn admin_adds_an_item_and_the_list_shows_it(pool: PgPool) {
+    let h = Harness::start(pool).await;
+    let root = h.session("root", 'b', true).await;
+    let (status, location) = h.add(&root, "greet", "skill", "say hello").await;
+    assert_eq!((status, location.as_str()), (303, "/catalog"));
+    let item = h.item("greet").await.unwrap();
+    assert_eq!(
+        item,
+        ("skill".into(), "greet".into(), "say hello".into(), false)
+    );
+    let (status, _, page) = h.fetch("GET", "/catalog", Some(&root.cookie), None).await;
+    assert_eq!(status, 200);
+    assert!(page.contains("greet") && page.contains("disabled") && page.contains("Enable"));
+    assert!(page.contains("/catalog/greet/enable"));
+    assert_eq!(page.matches("name=\"csrf\"").count(), 3);
+    assert!(page.contains(&format!("value=\"{}\"", root.csrf)));
+    h.finish().await;
+}
+
+#[sqlx::test]
+async fn admin_edits_content_only(pool: PgPool) {
+    let h = Harness::start(pool).await;
+    let root = h.session("root", 'b', true).await;
+    h.add(&root, "greet", "skill", "say hello").await;
+    let (status, location) = h
+        .post(
+            &root,
+            "/catalog/greet",
+            &[
+                ("content", "say goodbye"),
+                ("kind", "context"),
+                ("name", "other"),
+                ("id", "other"),
+            ],
+        )
+        .await;
+    assert_eq!((status, location.as_str()), (303, "/catalog/greet"));
+    assert_eq!(
+        h.item("greet").await.unwrap(),
+        ("skill".into(), "greet".into(), "say goodbye".into(), false)
+    );
+    assert!(h.item("other").await.is_none());
+    let (status, _, page) = h
+        .fetch("GET", "/catalog/greet", Some(&root.cookie), None)
+        .await;
+    assert_eq!(status, 200);
+    assert!(page.contains("say goodbye"));
+    assert_eq!(page.matches("name=\"csrf\"").count(), 2);
+    h.finish().await;
+}
+
+#[sqlx::test]
+async fn admin_enables_and_disables_an_item(pool: PgPool) {
+    let h = Harness::start(pool).await;
+    let root = h.session("root", 'b', true).await;
+    h.add(&root, "greet", "skill", "say hello").await;
+    let (status, location) = h.post(&root, "/catalog/greet/enable", &[]).await;
+    assert_eq!((status, location.as_str()), (303, "/catalog"));
+    assert!(h.item("greet").await.unwrap().3);
+    let (_, _, page) = h.fetch("GET", "/catalog", Some(&root.cookie), None).await;
+    assert!(page.contains("Disable"));
+    assert!(page.contains("/catalog/greet/disable"));
+    let (status, _) = h.post(&root, "/catalog/greet/disable", &[]).await;
+    assert_eq!(status, 303);
+    assert!(!h.item("greet").await.unwrap().3);
+    let (status, _) = h.post(&root, "/catalog/missing/enable", &[]).await;
+    assert_eq!(status, 404);
+    h.finish().await;
+}
+
+#[sqlx::test]
+async fn every_post_route_refuses_a_missing_csrf_and_writes_nothing(pool: PgPool) {
+    let h = Harness::start(pool).await;
+    let root = h.session("root", 'b', true).await;
+    h.add(&root, "greet", "skill", "say hello").await;
+    let before = h.snapshot().await;
+    for path in &POST_ROUTES[..4] {
+        let body = "id=other&kind=skill&name=other&content=x";
+        let (status, _) = h.send("POST", path, Some(&root.cookie), Some(body)).await;
+        assert_eq!(status, 403, "{path}");
+    }
+    assert_eq!(h.snapshot().await, before);
+    h.finish().await;
+}
+
+#[sqlx::test]
+async fn a_hostile_value_in_each_field_is_refused_and_writes_nothing(pool: PgPool) {
+    let h = Harness::start(pool).await;
+    let root = h.session("root", 'b', true).await;
+    let before = h.snapshot().await;
+    let cases: [(&str, &str, &str, &str, &str); 7] = [
+        (HOSTILE, "skill", "ok", "body", "id"),
+        ("ok", "skill", HOSTILE, "body", "name"),
+        ("ok", HOSTILE, "ok", "body", "kind"),
+        ("ok", "skill", "ok", "", "empty content"),
+        ("ok", "tool", "not-a-tool", "1.0.0", "unknown tool"),
+        ("Ok", "skill", "ok", "body", "uppercase id"),
+        ("ok\u{85}", "skill", "ok", "body", "nel id"),
+    ];
+    for (id, kind, name, content, label) in cases {
+        let (status, _) = h
+            .post(
+                &root,
+                "/catalog",
+                &[
+                    ("id", id),
+                    ("kind", kind),
+                    ("name", name),
+                    ("content", content),
+                ],
+            )
+            .await;
+        assert_eq!(status, 400, "{label}");
+    }
+    assert_eq!(h.snapshot().await, before);
+    h.finish().await;
+}
+
+#[sqlx::test]
+async fn hostile_content_is_stored_and_rendered_escaped(pool: PgPool) {
+    let h = Harness::start(pool).await;
+    let root = h.session("root", 'b', true).await;
+    let (status, _) = h.add(&root, "greet", "skill", HOSTILE).await;
+    assert_eq!(status, 303);
+    assert_eq!(h.item("greet").await.unwrap().2, HOSTILE);
+    let (_, _, page) = h
+        .fetch("GET", "/catalog/greet", Some(&root.cookie), None)
+        .await;
+    assert!(!page.contains("<script>alert"));
+    assert!(page.contains("&lt;script&gt;"));
+    h.finish().await;
+}
+
+#[sqlx::test]
+async fn a_hostile_edit_content_and_item_path_are_refused(pool: PgPool) {
+    let h = Harness::start(pool).await;
+    let root = h.session("root", 'b', true).await;
+    h.add(&root, "greet", "skill", "say hello").await;
+    let before = h.snapshot().await;
+    let (status, _) = h.post(&root, "/catalog/greet", &[("content", "")]).await;
+    assert_eq!(status, 400);
+    let (status, _) = h.post(&root, "/catalog/nope", &[("content", "x")]).await;
+    assert_eq!(status, 404);
+    for path in ["/catalog/%3Cscript%3E", "/catalog/UPPER", "/catalog/a%0Ab"] {
+        let (status, _, _) = h.fetch("GET", path, Some(&root.cookie), None).await;
+        assert_eq!(status, 404, "{path}");
+        let (status, _) = h.post(&root, &format!("{path}/enable"), &[]).await;
+        assert_eq!(status, 404, "{path}");
+    }
+    assert_eq!(h.snapshot().await, before);
+    h.finish().await;
+}
+
+#[sqlx::test]
+async fn adding_an_existing_id_is_refused_and_keeps_the_content(pool: PgPool) {
+    let h = Harness::start(pool).await;
+    let root = h.session("root", 'b', true).await;
+    h.add(&root, "greet", "skill", "say hello").await;
+    let before = h.snapshot().await;
+    let (status, _) = h.add(&root, "greet", "skill", "replaced").await;
+    assert_eq!(status, 400);
+    assert_eq!(h.snapshot().await, before);
+    h.finish().await;
+}
+
+#[sqlx::test]
+async fn a_demoted_admin_cannot_write_on_the_same_session(pool: PgPool) {
+    let h = Harness::start(pool).await;
+    let root = h.session("root", 'b', true).await;
+    h.add(&root, "greet", "skill", "say hello").await;
+    h.users.set_admin(root.user_id, false).await.unwrap();
+    let before = h.snapshot().await;
+    let (status, _) = h.add(&root, "other", "skill", "x").await;
+    assert_eq!(status, 403);
+    let (status, _) = h.post(&root, "/catalog/greet", &[("content", "y")]).await;
+    assert_eq!(status, 403);
+    let (status, _) = h.post(&root, "/catalog/greet/enable", &[]).await;
+    assert_eq!(status, 403);
+    assert_eq!(h.snapshot().await, before);
+    h.finish().await;
+}
+
+#[sqlx::test]
+async fn a_non_admin_with_a_valid_csrf_writes_nothing(pool: PgPool) {
+    let h = Harness::start(pool).await;
+    let root = h.session("root", 'b', true).await;
+    h.add(&root, "greet", "skill", "say hello").await;
+    let alice = h.session("alice", 'a', false).await;
+    let before = h.snapshot().await;
+    let (status, _) = h.add(&alice, "other", "skill", "x").await;
+    assert_eq!(status, 403);
+    let (status, _) = h.post(&alice, "/catalog/greet/enable", &[]).await;
+    assert_eq!(status, 403);
+    assert_eq!(h.snapshot().await, before);
+    h.finish().await;
+}
+
+#[sqlx::test]
+async fn every_kind_is_stored_as_chosen(pool: PgPool) {
+    let h = Harness::start(pool).await;
+    let root = h.session("root", 'b', true).await;
+    for (id, kind, content) in [
+        ("s1", "skill", "body"),
+        ("a1", "subagent", "body"),
+        ("c1", "context", "body"),
+    ] {
+        let (status, _) = h.add(&root, id, kind, content).await;
+        assert_eq!(status, 303, "{kind}");
+        assert_eq!(h.item(id).await.unwrap().0, kind);
+    }
+    h.finish().await;
+}
+
+const SEED_ITEMS: &str = "INSERT INTO catalog_items (id, kind, name, content, digest) \
+     SELECT 'i' || lpad(n::text, 3, '0'), 'skill', 'i' || lpad(n::text, 3, '0'), 'x', sha256('x'::bytea) \
+     FROM generate_series(0, $1) n";
+
+#[sqlx::test]
+async fn the_list_pages_past_the_limit_and_the_rest_is_reachable(pool: PgPool) {
+    let h = Harness::start(pool).await;
+    let root = h.session("root", 'b', true).await;
+    sqlx::query(SEED_ITEMS)
+        .bind(500_i32)
+        .execute(&h.pool)
+        .await
+        .unwrap();
+    let (status, _, first) = h.fetch("GET", "/catalog", Some(&root.cookie), None).await;
+    assert_eq!(status, 200);
+    assert!(first.contains("/catalog/i499\"") && !first.contains("/catalog/i500\""));
+    assert!(first.contains("href=\"/catalog?after=i499\""));
+    let (status, _, second) = h
+        .fetch("GET", "/catalog?after=i499", Some(&root.cookie), None)
+        .await;
+    assert_eq!(status, 200);
+    assert!(second.contains("/catalog/i500\"") && !second.contains("/catalog/i499\""));
+    assert!(!second.contains("after="));
+    let (status, location) = h.post(&root, "/catalog/i500/enable", &[]).await;
+    assert_eq!((status, location.as_str()), (303, "/catalog"));
+    assert!(h.item("i500").await.unwrap().3);
+    h.finish().await;
+}
+
+#[sqlx::test]
+async fn a_list_of_exactly_the_limit_has_no_next_link(pool: PgPool) {
+    let h = Harness::start(pool).await;
+    let root = h.session("root", 'b', true).await;
+    sqlx::query(SEED_ITEMS)
+        .bind(499_i32)
+        .execute(&h.pool)
+        .await
+        .unwrap();
+    let (status, _, page) = h.fetch("GET", "/catalog", Some(&root.cookie), None).await;
+    assert_eq!(status, 200);
+    assert!(page.contains("/catalog/i499\"") && !page.contains("after="));
+    h.finish().await;
+}
+
+#[sqlx::test]
+async fn an_illegal_list_cursor_is_refused(pool: PgPool) {
+    let h = Harness::start(pool).await;
+    let root = h.session("root", 'b', true).await;
+    for cursor in ["BAD", "-x", "a%00b", "a.b"] {
+        let path = format!("/catalog?after={cursor}");
+        let (status, _, _) = h.fetch("GET", &path, Some(&root.cookie), None).await;
+        assert_eq!(status, 400, "{cursor}");
+    }
+    h.finish().await;
+}
+
+#[sqlx::test]
+async fn adding_the_same_kind_and_name_under_a_new_id_is_refused(pool: PgPool) {
+    let h = Harness::start(pool).await;
+    let root = h.session("root", 'b', true).await;
+    h.add(&root, "greet", "skill", "say hello").await;
+    let before = h.snapshot().await;
+    let (status, _) = h
+        .post(
+            &root,
+            "/catalog",
+            &[
+                ("id", "other"),
+                ("kind", "skill"),
+                ("name", "greet"),
+                ("content", "x"),
+            ],
+        )
+        .await;
+    assert_eq!(status, 400);
+    assert!(h.item("other").await.is_none());
+    assert_eq!(h.snapshot().await, before);
     h.finish().await;
 }
