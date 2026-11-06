@@ -29,6 +29,7 @@ tonic.workspace = true
 
 [dev-dependencies]
 fleet-server = { path = "../fleet-server" }
+openssl = { version = "0.10", features = ["vendored"] }
 rcgen = { version = "0.14.10", default-features = false, features = ["pem", "ring"] }
 sqlx = { workspace = true, features = ["postgres", "migrate", "macros"] }
 tempfile.workspace = true

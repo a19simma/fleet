@@ -62,7 +62,7 @@ fn store_status(err: &StoreError) -> Status {
 
 fn github_status(err: GithubError) -> Status {
     match err {
-        GithubError::Rejected => Status::invalid_argument("github rejected the token"),
+        GithubError::Rejected => Status::invalid_argument(fleet_proto::ERR_GITHUB_REJECTED),
         GithubError::Unavailable => Status::unavailable("github is unavailable"),
     }
 }

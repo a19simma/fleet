@@ -15,8 +15,7 @@ use crate::auth::ADMIN_REQUIRED;
 /// The capability that lets a user attach tools to a profile. Store and handlers share this name.
 pub const PROFILE_TOOLS: &str = "profile:tools";
 
-/// Refusal text for a credential kind whose capability the user lacks.
-pub const ERR_CAPABILITY_NOT_GRANTED: &str = "credential kind needs a capability the user lacks";
+pub use fleet_proto::ERR_CAPABILITY_NOT_GRANTED;
 /// The capability that gates the `github_app` credential kind (ADR-0058).
 pub const FORGE_GITHUB_APP: &str = "forge:github_app";
 /// Refusal text for a capability name outside the closed set.

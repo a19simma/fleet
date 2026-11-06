@@ -49,7 +49,7 @@ pub enum GithubError {
 impl std::fmt::Display for GithubError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str(match self {
-            Self::Rejected => "github rejected the token",
+            Self::Rejected => fleet_proto::ERR_GITHUB_REJECTED,
             Self::Unavailable => "github is unavailable",
         })
     }

@@ -264,7 +264,7 @@ A shell command with no completion event. fleetd measures it as a `BgShell` **Sp
 _Avoid_: detached command, async shell
 
 **GitHub App credential**:
-The `github_app` **Credential kind**: a **User**'s installation id for the operator's GitHub App. The App id and private key are server config, never stored. Built: the kind, the installation id parser, the mint client with response validation, the App id and key file config, the mint audit schema, the tombstone and the `forge:github_app` capability gate. `PutCredential` and the web form save the kind for a **User** with the capability, and `VerifyCredential` mints once and drops the token (ADR-0058). The release path mints the token after the capability check and the transaction commit (ADR-0058, SEC-011). Not built: the allowlists, the mint audit rows, the post-mint recheck beyond the lease and the capability and fleetd (ADR-0058).
+The `github_app` **Credential kind**: a **User**'s installation id for the operator's GitHub App. The App id and private key are server config, never stored. Built: the kind, the installation id parser, the mint client with response validation, the App id and key file config, the mint audit schema, the tombstone and the `forge:github_app` capability gate. `PutCredential`, the web form and `fleet credential put` save the kind for a **User** with the capability, and `VerifyCredential` mints once and drops the token (ADR-0058). The release path mints the token after the capability check and the transaction commit (ADR-0058, SEC-011). Not built: the allowlists, the mint audit rows, the post-mint recheck beyond the lease and the capability and fleetd (ADR-0058).
 _Avoid_: app token, app key
 
 **Installation token**:

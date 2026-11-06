@@ -8,10 +8,11 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use fleet_core::credential::{CredentialError, CredentialKind};
+use fleet_core::credential::CredentialKind;
+use fleet_proto::CredentialNotice;
 use fleet_proto::v1::{DeleteCredentialRequest, PutCredentialRequest, VerifyCredentialRequest};
 use sqlx::PgPool;
-use tonic::{Code, Status};
+use tonic::Status;
 use topcoat::{
     Result,
     context::{Cx, app_context},
@@ -29,7 +30,6 @@ use super::layout::{Nav, shell};
 use super::pages::{auth, csrf_matches, current, fail, signed_in};
 use super::passkeys::AuthError;
 use crate::cred::CredentialService;
-use crate::cred::capability::ERR_CAPABILITY_NOT_GRANTED;
 
 const STATIC_SECRET: &str = "static_secret";
 
@@ -55,28 +55,7 @@ fn credentials(cx: &Cx) -> Result<&Backend> {
 }
 
 fn notice_text(code: &str) -> Option<&'static str> {
-    Some(match code {
-        "saved" => "Saved.",
-        "deleted" => "Deleted.",
-        "verified" => "GitHub accepted the stored credential.",
-        "invalid_token" => "GitHub refused the stored credential.",
-        "github_classic" => {
-            "A GitHub credential must be a fine-grained token starting with github_pat_."
-        }
-        "github_refused" => "GitHub refused the token.",
-        "invalid" => "The credential was refused. Check the kind and the value.",
-        "unavailable" => "A backing service is unavailable. Try again later.",
-        "not_found" => "No such credential.",
-        "no_verifier" => "This kind cannot be verified.",
-        "no_job" => {
-            "Submit a Job first. A GitHub App check mints a token for the repository of your latest Job."
-        }
-        "capability_required" => {
-            "This credential kind needs the forge:github_app capability. Ask an admin to grant it."
-        }
-        "failed" => "The request failed.",
-        _ => return None,
-    })
+    CredentialNotice::from_code(code).map(CredentialNotice::text)
 }
 
 fn notice_code(cx: &Cx) -> Option<&str> {
@@ -87,29 +66,7 @@ fn notice_code(cx: &Cx) -> Option<&str> {
 }
 
 fn notice_for(status: &Status) -> &'static str {
-    match status.code() {
-        Code::InvalidArgument
-            if status.message() == CredentialError::GithubNotFineGrained.to_string() =>
-        {
-            "github_classic"
-        }
-        Code::InvalidArgument if status.message() == "github rejected the token" => {
-            "github_refused"
-        }
-        Code::InvalidArgument => "invalid",
-        Code::PermissionDenied if status.message() == ERR_CAPABILITY_NOT_GRANTED => {
-            "capability_required"
-        }
-        Code::Unavailable => "unavailable",
-        Code::NotFound => "not_found",
-        Code::FailedPrecondition
-            if status.message() == fleet_proto::PRECONDITION_NO_VERIFY_REPO =>
-        {
-            "no_job"
-        }
-        Code::FailedPrecondition => "no_verifier",
-        _ => "failed",
-    }
+    CredentialNotice::for_status(status).code()
 }
 
 fn back(code: &str) -> SeeOther {

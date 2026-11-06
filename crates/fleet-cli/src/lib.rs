@@ -3,6 +3,7 @@
 pub mod batch;
 pub mod catalog;
 pub mod config;
+pub mod credential;
 pub mod list;
 pub mod logs;
 pub mod profile;
@@ -16,14 +17,15 @@ use std::io::{Read, Write};
 use std::time::Duration;
 
 use clap::{Parser, Subcommand};
-use fleet_proto::MAX_PROFILE_MESSAGE_BYTES;
 use fleet_proto::v1::fleet_batches_client::FleetBatchesClient;
+use fleet_proto::v1::fleet_credentials_client::FleetCredentialsClient;
 use fleet_proto::v1::fleet_jobs_client::FleetJobsClient;
 use fleet_proto::v1::fleet_profiles_client::FleetProfilesClient;
 use fleet_proto::v1::fleet_query_client::FleetQueryClient;
 use fleet_proto::v1::{
     CancelJobRequest, GetJobRequest, Job, JobState, ListJobsRequest, SubmitJobRequest,
 };
+use fleet_proto::{CredentialNotice, MAX_PROFILE_MESSAGE_BYTES};
 use tonic::metadata::MetadataValue;
 use tonic::service::interceptor::InterceptedService;
 use tonic::transport::{Certificate, Channel, ClientTlsConfig, Endpoint};
@@ -186,6 +188,12 @@ pub enum Command {
         #[command(subcommand)]
         action: ProfileAction,
     },
+    /// Store, list, delete and verify credentials. Secrets are read from stdin.
+    Credential {
+        /// The credential action.
+        #[command(subcommand)]
+        action: credential::CredentialAction,
+    },
 }
 
 /// A `fleet batch` action.
@@ -317,6 +325,8 @@ pub enum CliError {
     JobEnded(&'static str),
     /// The job exists but no timing report was stored for it.
     NoTimingReport,
+    /// A credential command ended in a fixed notice. It holds no server text or input.
+    Credential(CredentialNotice),
 }
 
 impl CliError {
@@ -337,7 +347,11 @@ impl CliError {
         match self {
             Self::Config(_) | Self::Usage(_) => 2,
             Self::NoTimingReport => 3,
-            Self::Connect(_) | Self::Rpc(_) | Self::Io(_) | Self::JobEnded(_) => 1,
+            Self::Connect(_)
+            | Self::Rpc(_)
+            | Self::Io(_)
+            | Self::JobEnded(_)
+            | Self::Credential(_) => 1,
         }
     }
 }
@@ -552,6 +566,7 @@ impl fmt::Display for CliError {
             Self::Io(e) => write!(f, "{e}"),
             Self::JobEnded(state) => write!(f, "job ended {state}"),
             Self::NoTimingReport => write!(f, "no timing report for this job"),
+            Self::Credential(notice) => f.write_str(notice.text()),
         }
     }
 }
@@ -584,6 +599,7 @@ struct Session {
     query: QueryClient,
     profiles: profile::ProfilesClient,
     batches: batch::BatchesClient,
+    credentials: credential::CredentialsClient,
     scrub: Scrub,
 }
 
@@ -738,7 +754,9 @@ async fn session(env: &Resolution, timeouts: bool) -> Result<Session, CliError> 
             .max_decoding_message_size(MAX_DECODE_BYTES),
         profiles: FleetProfilesClient::with_interceptor(channel.clone(), token.clone())
             .max_decoding_message_size(MAX_PROFILE_MESSAGE_BYTES),
-        batches: FleetBatchesClient::with_interceptor(channel, token)
+        batches: FleetBatchesClient::with_interceptor(channel.clone(), token.clone())
+            .max_decoding_message_size(MAX_DECODE_BYTES),
+        credentials: FleetCredentialsClient::with_interceptor(channel, token)
             .max_decoding_message_size(MAX_DECODE_BYTES),
     })
 }
@@ -830,6 +848,38 @@ async fn run_batch(
                 out,
             )
             .await
+        }
+    }
+}
+
+async fn run_credential(
+    action: credential::CredentialAction,
+    env: &Resolution,
+    timeouts: bool,
+    stdin: &mut impl Read,
+    out: &mut impl Write,
+) -> Result<(), CliError> {
+    credential::no_stray(action.rest())?;
+    match action {
+        credential::CredentialAction::List { .. } => {
+            let mut session = session(env, timeouts).await?;
+            credential::list(&mut session.credentials, &session.scrub, out).await
+        }
+        credential::CredentialAction::Put { kind, .. } => {
+            let kind = credential::parse_kind(&kind)?;
+            let value = credential::read_secret(stdin)?;
+            let mut session = session(env, timeouts).await?;
+            credential::put(&mut session.credentials, &session.scrub, kind, value, out).await
+        }
+        credential::CredentialAction::Delete { id, .. } => {
+            let id = credential::parse_id(&id)?;
+            let mut session = session(env, timeouts).await?;
+            credential::delete(&mut session.credentials, id, out).await
+        }
+        credential::CredentialAction::Verify { id, .. } => {
+            let id = credential::parse_id(&id)?;
+            let mut session = session(env, timeouts).await?;
+            credential::verify(&mut session.credentials, &session.scrub, id, out).await
         }
     }
 }
@@ -964,7 +1014,7 @@ pub async fn run_with(
         command,
     } = cli;
     let env = resolve(server, insecure, lookup);
-    dispatch(command, &env, timeouts, stdin, out)
+    Box::pin(dispatch(command, &env, timeouts, stdin, out))
         .await
         .map_err(|e| e.scrubbed(env.as_ref().ok().map(|resolved| &resolved.scrub)))
 }
@@ -1066,6 +1116,7 @@ async fn dispatch(
         Command::Profile { action } => {
             run_profile(action, env, timeouts, stdin, out).await?;
         }
+        Command::Credential { action } => run_credential(action, env, timeouts, stdin, out).await?,
         Command::Cancel { id } => {
             let session = session(env, timeouts).await?;
             cancel(session.jobs, &session.scrub, id, out).await?;

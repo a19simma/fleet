@@ -243,7 +243,7 @@ impl FleetService {
         request: &Request<T>,
     ) -> Result<(&CredentialService, i64), Status> {
         let user_id = caller_of(request)
-            .ok_or_else(|| Status::permission_denied("credentials need a user token"))?;
+            .ok_or_else(|| Status::permission_denied(fleet_proto::ERR_NEEDS_USER_TOKEN))?;
         let service = self
             .credentials
             .as_ref()

@@ -5,6 +5,7 @@
 
 mod convert;
 
+mod notice;
 pub use convert::{
     ConvertError, ProfileConvertError, ShellCommandRecord, TimingConvertError, TimingSpanRecord,
     capability_from_text, capability_to_text, catalog_entry_from_wire, catalog_entry_to_wire,
@@ -13,6 +14,7 @@ pub use convert::{
     shell_commands_from_wire, spans_from_wire, validate_box, visibility_from_wire,
     visibility_to_wire,
 };
+pub use notice::CredentialNotice;
 
 /// Wire protocol version fleetd reports in `HeartbeatRequest.protocol_version`. Changes are
 /// additive only, so a new server serves an old fleetd. An old fleetd sends 0.
@@ -211,6 +213,15 @@ pub const PRECONDITION_NO_VERIFY_REPO: &str = "no job to verify the github app a
 
 /// `FAILED_PRECONDITION` message: the server runs without a credential store.
 pub const PRECONDITION_NOT_CONFIGURED: &str = "credentials are not configured";
+
+/// `PERMISSION_DENIED` message: the credential kind needs a capability the user lacks.
+pub const ERR_CAPABILITY_NOT_GRANTED: &str = "credential kind needs a capability the user lacks";
+
+/// `PERMISSION_DENIED` message: credentials need a per-user token.
+pub const ERR_NEEDS_USER_TOKEN: &str = "credentials need a user token";
+
+/// `INVALID_ARGUMENT` message: GitHub refused the token on save.
+pub const ERR_GITHUB_REJECTED: &str = "github rejected the token";
 
 /// Most transcript chunks one report may carry. The server rejects more.
 pub const MAX_CHUNKS_PER_REPORT: usize = 256;

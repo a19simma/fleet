@@ -895,6 +895,7 @@ dependencies = [
  "fleet-core",
  "fleet-proto",
  "fleet-server",
+ "openssl",
  "rcgen",
  "sqlx",
  "tempfile",
