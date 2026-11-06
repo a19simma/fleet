@@ -1,4 +1,4 @@
-//! `fleet profile`: create, list and show named agent profiles.
+//! `fleet profile`: create, list, show, share and unshare named agent profiles.
 
 use std::io::{Read, Write};
 
@@ -6,6 +6,7 @@ use fleet_proto::MAX_PROFILE_JSON_BYTES;
 use fleet_proto::v1::fleet_profiles_client::FleetProfilesClient;
 use fleet_proto::v1::{
     CreateProfileRequest, GetProfileRequest, ListProfilesRequest, ProfileSummary, ProfileVersion,
+    ProfileVisibility, ShareProfileRequest, UnshareProfileRequest,
 };
 use tonic::service::interceptor::InterceptedService;
 use tonic::transport::Channel;
@@ -160,10 +161,12 @@ where
         for profile in &page {
             writeln!(
                 out,
-                "{}\t{}\t{}",
+                "{}\t{}\t{}\t{}\t{}",
                 scrub.ident(&profile.name),
                 profile.latest_version,
-                scrub.ident(&profile.hash)
+                scrub.ident(&profile.hash),
+                scrub.ident(&profile.owner),
+                visibility_label(profile.visibility)
             )?;
         }
         after_name = Some(last.name.clone());
@@ -187,8 +190,66 @@ pub(crate) async fn show(
         .into_inner();
     write_version(out, scrub, &reply)?;
     writeln!(out, "used-by: -")?;
+    write_detail(out, scrub, &reply)?;
     write_content(out, scrub, &reply)?;
     Ok(())
+}
+
+/// `fleet profile share` and `unshare`: sets the visibility and prints the result.
+pub(crate) async fn set_shared(
+    client: &mut ProfilesClient,
+    scrub: &Scrub,
+    name: String,
+    shared: bool,
+    out: &mut impl Write,
+) -> Result<(), CliError> {
+    let reply = if shared {
+        client.share_profile(ShareProfileRequest { name }).await
+    } else {
+        client.unshare_profile(UnshareProfileRequest { name }).await
+    }?
+    .into_inner();
+    writeln!(out, "name: {}", scrub.ident(&reply.name))?;
+    writeln!(out, "visibility: {}", visibility_label(reply.visibility))?;
+    Ok(())
+}
+
+/// The lowercase word for a wire visibility, or `unknown` for any other value.
+fn visibility_label(value: i32) -> &'static str {
+    match ProfileVisibility::try_from(value) {
+        Ok(ProfileVisibility::Private) => "private",
+        Ok(ProfileVisibility::Shared) => "shared",
+        _ => "unknown",
+    }
+}
+
+fn write_detail(
+    out: &mut impl Write,
+    scrub: &Scrub,
+    reply: &ProfileVersion,
+) -> std::io::Result<()> {
+    writeln!(out, "owner: {}", scrub.ident(&reply.owner))?;
+    writeln!(out, "visibility: {}", visibility_label(reply.visibility))?;
+    let items: Vec<String> = reply
+        .selection
+        .iter()
+        .map(|entry| scrub.ident(&entry.item_id))
+        .collect();
+    writeln!(
+        out,
+        "selection: {}",
+        if items.is_empty() {
+            "-".to_owned()
+        } else {
+            items.join(",")
+        }
+    )?;
+    let prompt = scrub.ident(&reply.authored_prompt);
+    writeln!(
+        out,
+        "prompt: {}",
+        if prompt.is_empty() { "-" } else { &prompt }
+    )
 }
 
 fn write_content(
@@ -202,6 +263,7 @@ fn write_content(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use fleet_proto::v1::SelectionEntry;
 
     #[test]
     fn a_bare_name_has_no_version() {
@@ -288,6 +350,71 @@ mod tests {
 
     const TOKEN: &str = "client-token-0123456789";
 
+    fn detail_text(set: impl FnOnce(&mut ProfileVersion)) -> String {
+        let mut reply = ProfileVersion::default();
+        set(&mut reply);
+        let mut out = Vec::new();
+        write_detail(&mut out, &Scrub::new(Some(TOKEN)), &reply).expect("write to a Vec");
+        String::from_utf8(out).expect("utf8")
+    }
+
+    #[test]
+    fn detail_prints_owner_visibility_selection_and_prompt() {
+        let text = detail_text(|r| {
+            r.owner = "alice".into();
+            r.visibility = ProfileVisibility::Shared as i32;
+            r.selection = vec![
+                SelectionEntry {
+                    item_id: "skill:a".into(),
+                    enabled: false,
+                },
+                SelectionEntry {
+                    item_id: "tool:b".into(),
+                    enabled: false,
+                },
+            ];
+            r.authored_prompt = "do it".into();
+        });
+        assert_eq!(
+            text,
+            "owner: alice\nvisibility: shared\nselection: skill:a,tool:b\nprompt: do it\n"
+        );
+    }
+
+    #[test]
+    fn detail_marks_empty_selection_and_prompt_with_a_dash() {
+        let text = detail_text(|r| r.visibility = ProfileVisibility::Private as i32);
+        assert_eq!(
+            text,
+            "owner: \nvisibility: private\nselection: -\nprompt: -\n"
+        );
+    }
+
+    #[test]
+    fn detail_fields_are_scrubbed_of_the_token() {
+        let text = detail_text(|r| {
+            r.owner = laden();
+            r.selection = vec![SelectionEntry {
+                item_id: laden(),
+                enabled: false,
+            }];
+            r.authored_prompt = laden();
+        });
+        assert!(!text.contains(TOKEN), "{text}");
+        assert_eq!(text.matches("v-[REDACTED]").count(), 3, "{text}");
+    }
+
+    #[test]
+    fn visibility_labels() {
+        assert_eq!(
+            visibility_label(ProfileVisibility::Private as i32),
+            "private"
+        );
+        assert_eq!(visibility_label(ProfileVisibility::Shared as i32), "shared");
+        assert_eq!(visibility_label(0), "unknown");
+        assert_eq!(visibility_label(99), "unknown");
+    }
+
     fn laden() -> String {
         format!("v-{TOKEN}")
     }
@@ -317,7 +444,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn profile_list_name_and_hash_are_scrubbed_of_the_token() {
+    async fn profile_list_name_hash_and_owner_are_scrubbed_of_the_token() {
         let mut done = false;
         let mut out = Vec::new();
         list_pages(
@@ -329,6 +456,7 @@ mod tests {
                         name: laden(),
                         latest_version: 1,
                         hash: laden(),
+                        owner: laden(),
                         ..ProfileSummary::default()
                     }]
                 };
@@ -341,7 +469,10 @@ mod tests {
         .await
         .expect("list");
         let text = String::from_utf8(out).expect("utf8");
-        assert_eq!(text, "v-[REDACTED]\t1\tv-[REDACTED]\n");
+        assert_eq!(
+            text,
+            "v-[REDACTED]\t1\tv-[REDACTED]\tv-[REDACTED]\tunknown\n"
+        );
     }
 
     #[test]

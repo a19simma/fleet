@@ -255,3 +255,60 @@ async fn a_bad_version_suffix_is_a_usage_error(pool: PgPool) {
         assert_eq!(result.unwrap_err().exit_code(), 2, "{target}");
     }
 }
+
+#[sqlx::test]
+async fn list_shows_owner_and_visibility_and_share_flips_it(pool: PgPool) {
+    let addr = serve(pool).await;
+    create(addr, "alpha", ONE).await;
+    let (result, out) = cli(addr, &["profile", "list"]).await;
+    result.unwrap();
+    let row: Vec<&str> = out.trim_end().split('\t').collect();
+    assert_eq!(row.len(), 5, "{out}");
+    assert!(!row[3].is_empty() && row[3] != "-", "{out}");
+    assert_eq!(row[4], "private");
+    let owner = row[3].to_owned();
+
+    let (result, shared) = cli(addr, &["profile", "share", "alpha"]).await;
+    result.unwrap();
+    assert_eq!(field(&shared, "name"), "alpha");
+    assert_eq!(field(&shared, "visibility"), "shared");
+    let (result, out) = cli(addr, &["profile", "list"]).await;
+    result.unwrap();
+    let row: Vec<&str> = out.trim_end().split('\t').collect();
+    assert_eq!((row[3], row[4]), (owner.as_str(), "shared"));
+
+    let (result, unshared) = cli(addr, &["profile", "unshare", "alpha"]).await;
+    result.unwrap();
+    assert_eq!(field(&unshared, "name"), "alpha");
+    assert_eq!(field(&unshared, "visibility"), "private");
+    let (result, out) = cli(addr, &["profile", "list"]).await;
+    result.unwrap();
+    assert_eq!(out.trim_end().split('\t').nth(4), Some("private"));
+}
+
+#[sqlx::test]
+async fn show_prints_owner_visibility_selection_and_prompt(pool: PgPool) {
+    let addr = serve(pool).await;
+    create(addr, "alpha", ONE).await;
+    let (result, out) = cli(addr, &["profile", "show", "alpha"]).await;
+    result.unwrap();
+    assert_eq!(field(&out, "visibility"), "private");
+    assert_ne!(field(&out, "owner"), "");
+    assert_eq!(field(&out, "selection"), "-");
+    assert_eq!(field(&out, "prompt"), "-");
+    cli(addr, &["profile", "share", "alpha"]).await.0.unwrap();
+    let (result, out) = cli(addr, &["profile", "show", "alpha@1"]).await;
+    result.unwrap();
+    assert_eq!(field(&out, "visibility"), "shared");
+}
+
+#[sqlx::test]
+async fn share_of_an_unknown_name_fails_and_prints_nothing(pool: PgPool) {
+    let addr = serve(pool).await;
+    for verb in ["share", "unshare"] {
+        let (result, out) = cli(addr, &["profile", verb, "missing"]).await;
+        let text = result.unwrap_err().to_string();
+        assert!(text.contains("NotFound"), "{text}");
+        assert_eq!(out, "");
+    }
+}

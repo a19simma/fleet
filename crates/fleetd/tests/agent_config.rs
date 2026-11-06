@@ -4,10 +4,14 @@
 use std::os::unix::fs::symlink;
 use std::path::Path;
 
+use fleet_core::Profile;
+use fleet_core::catalog::{CatalogItem, CatalogKind};
 use fleetd::agent_config::{
     AGENT_PROTOCOL, Bundle, BundleError, JobDir, MAX_BYTES, MAX_ENTRIES, protocol_for,
 };
+use fleetd::floor::BoxCeilings;
 use fleetd::jobsock::ServiceName;
+use fleetd::profile_apply::{ApplyError, apply_effective};
 use tempfile::TempDir;
 
 type TestResult = Result<(), Box<dyn std::error::Error>>;
@@ -491,4 +495,311 @@ fn from_files_rejects_unusable_paths() {
 fn from_files_rejects_a_file_that_is_also_a_directory() {
     let files = vec![("a", b"x".to_vec()), ("a/b", b"y".to_vec())];
     assert_eq!(Bundle::from_files(files), Err(BundleError::Entry));
+}
+
+fn frozen_set() -> Result<Vec<CatalogItem>, Box<dyn std::error::Error>> {
+    Ok(vec![
+        CatalogItem::new(
+            CatalogKind::Skill,
+            "s1",
+            "lint",
+            "---\nname: lint\ndescription: lint the tree\n---\nRun the linter.\n",
+        )?,
+        CatalogItem::new(
+            CatalogKind::Subagent,
+            "a1",
+            "review",
+            "---\nname: review\ndescription: review a diff\n---\nRead the diff.\n",
+        )?,
+        CatalogItem::new(CatalogKind::Context, "c1", "rules", "House rules.\n")?,
+        CatalogItem::new(CatalogKind::Tool, "t1", "jq", "1.7.1")?,
+    ])
+}
+
+fn ceilings() -> BoxCeilings {
+    BoxCeilings {
+        default_max_turns: 30,
+        max_turns: 50,
+        default_max_budget_cents: 500,
+        max_budget_cents: 1000,
+    }
+}
+
+fn walk(dir: &Path, out: &mut Vec<std::path::PathBuf>) -> TestResult {
+    for entry in std::fs::read_dir(dir)? {
+        let path = entry?.path();
+        if std::fs::symlink_metadata(&path)?.is_dir() {
+            walk(&path, out)?;
+        }
+        out.push(path);
+    }
+    Ok(())
+}
+
+#[test]
+fn the_effective_set_round_trips_through_the_bundle_parser_and_the_job_dir() -> TestResult {
+    let applied = apply_effective(
+        &Profile::default(),
+        &frozen_set()?,
+        &Bundle::default(),
+        &ceilings(),
+        "go",
+    )?;
+    let jobs = TempDir::new()?;
+    let real = jobs.path().join("real");
+    std::fs::create_dir(&real)?;
+    let link = jobs.path().join("link");
+    symlink(&real, &link)?;
+    let job = JobDir::create(&link, "j1", &applied.bundle)?;
+    let claude = job.home().join(".claude");
+    let reread = Bundle::from_dir(&claude)?;
+    assert_eq!(reread, applied.bundle);
+    assert_eq!(reread.sha256(), applied.bundle.sha256());
+    let settings: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(claude.join("settings.json"))?)?;
+    assert!(
+        settings
+            .pointer("/permissions/allow")
+            .is_some_and(serde_json::Value::is_array)
+    );
+    assert!(
+        std::fs::read_to_string(claude.join("skills/lint/SKILL.md"))?.contains("Run the linter.")
+    );
+    assert!(std::fs::read_to_string(claude.join("agents/review.md"))?.contains("Read the diff."));
+    let md = std::fs::read_to_string(claude.join("CLAUDE.md"))?;
+    let imports: Vec<&str> = md.lines().filter_map(|l| l.strip_prefix('@')).collect();
+    assert_eq!(imports, [".claude/ctx/rules.md"]);
+    for import in imports {
+        assert_eq!(
+            std::fs::read_to_string(claude.join(import))?,
+            "House rules.\n"
+        );
+    }
+    let inside = std::fs::canonicalize(job.path())?;
+    let mut all = Vec::new();
+    walk(&real, &mut all)?;
+    assert!(all.iter().any(|p| p.ends_with("agents/review.md")));
+    for path in all {
+        assert!(
+            std::fs::canonicalize(&path)?.starts_with(real.canonicalize()?),
+            "{path:?}"
+        );
+    }
+    assert!(inside.starts_with(real.canonicalize()?));
+    Ok(())
+}
+
+#[test]
+fn a_relative_root_and_a_planted_staging_link_never_escape() -> TestResult {
+    let jobs = TempDir::new()?;
+    let outside = TempDir::new()?;
+    std::fs::write(outside.path().join("keep"), "x")?;
+    let agent = jobs.path().join(".agent");
+    std::fs::create_dir(&agent)?;
+    symlink(outside.path(), agent.join("j2.tmp"))?;
+    let cwd = std::env::current_dir()?;
+    let mut relative = std::path::PathBuf::new();
+    for _ in cwd.components().skip(1) {
+        relative.push("..");
+    }
+    relative.push(jobs.path().strip_prefix("/")?);
+    assert!(relative.is_relative());
+    let applied = apply_effective(
+        &Profile::default(),
+        &frozen_set()?,
+        &Bundle::default(),
+        &ceilings(),
+        "go",
+    )?;
+    let job = JobDir::create(&relative, "j2", &applied.bundle)?;
+    assert!(job.home().join(".claude/skills/lint/SKILL.md").is_file());
+    let mut left = Vec::new();
+    walk(outside.path(), &mut left)?;
+    assert_eq!(left, [outside.path().join("keep")]);
+    assert_eq!(std::fs::read_to_string(outside.path().join("keep"))?, "x");
+    Ok(())
+}
+
+fn subagent_outcome(body: &str) -> Result<(), ApplyError> {
+    let items = [CatalogItem::new(CatalogKind::Subagent, "a1", "probe", body)
+        .map_err(|_| ApplyError::Collision)?];
+    apply_effective(
+        &Profile::default(),
+        &items,
+        &Bundle::default(),
+        &ceilings(),
+        "go",
+    )
+    .map(|_| ())
+}
+
+const ALLOWED_KEYS: [&str; 4] = ["name", "description", "color", "tools"];
+const DENIED_TOOLS: [&str; 5] = ["WebFetch", "Edit", "Write", "NotebookEdit", "MultiEdit"];
+
+fn assert_parser_sees_nothing_banned(body: &str) -> TestResult {
+    let Some(rest) = body.strip_prefix("---\n") else {
+        return Ok(());
+    };
+    let end = rest.find("\n---\n").map_or(rest.len(), |i| i + 1);
+    let value: serde_norway::Value = serde_norway::from_str(&rest[..end])?;
+    let Some(map) = value.as_mapping() else {
+        return Err(format!("not a mapping: {body:?}").into());
+    };
+    for (key, val) in map {
+        let key = key
+            .as_str()
+            .ok_or_else(|| format!("non-string key: {body:?}"))?;
+        assert!(ALLOWED_KEYS.contains(&key), "{key:?} in {body:?}");
+        if key == "tools" {
+            let text = val
+                .as_str()
+                .ok_or_else(|| format!("tools not a string: {body:?}"))?;
+            for tool in text.split(',').map(str::trim) {
+                assert!(
+                    !DENIED_TOOLS.iter().any(|d| d.eq_ignore_ascii_case(tool)),
+                    "{tool:?} in {body:?}"
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn the_subagent_allowlist_refuses_every_hostile_frontmatter() {
+    let hostile = [
+        "---  \nname: a\npermissionMode: x\n---\nb",
+        "--- \nname: a\npermissionMode: x\n---\nb",
+        "\n---\nname: a\npermissionMode: x\n---\nb",
+        " ---\nname: a\npermissionMode: x\n---\nb",
+        "\u{feff}---\nname: a\npermissionMode: x\n---\nb",
+        "\u{feff}name: a\nb",
+        "----\nname: a\npermissionMode: x\n----\nb",
+        "---\nname: x\rpermissionMode: bypassPermissions\n---\nb",
+        "---\nname: x\u{85}permissionMode: bypassPermissions\n---\nb",
+        "---\nname: x\u{2028}permissionMode: bypassPermissions\n---\nb",
+        "---\nname: x\u{2029}permissionMode: bypassPermissions\n---\nb",
+        "---\nname: a\n\"permissionMode\": x\n---\nb",
+        "---\nname: a\n'permissionMode': x\n---\nb",
+        "---\n{name: x, permissionMode: y}\n---\nb",
+        "---\n{\n  name: x,\n  permissionMode: y\n}\n---\nb",
+        "---\nname: a\n? permissionMode\n: x\n---\nb",
+        "---\nname: a\n\"tools\": Edit\n---\nb",
+        "---\n{tools: [Edit]}\n---\nb",
+        "---\n  name: a\n  permissionMode: x\n---\nb",
+        "---\n\tname: a\n\tpermissionMode: x\n---\nb",
+        "---\nname: a\n  permissionMode: x\n---\nb",
+        "---\nname: |\n  x\npermissionMode: y\n---\nb",
+        "---\nname: >\n  x\npermissionMode: y\n---\nb",
+        "---\nname: &anchor x\npermissionMode: *anchor\n---\nb",
+        "---\nname: *anchor\n---\nb",
+        "---\nname: a\nname: b\n---\nb",
+        "---\nname: a\ntools: Read\ntools: Edit\n---\nb",
+        "---\nname: a\nPermissionMode: x\n---\nb",
+        "---\nname: a\nPERMISSIONMODE: x\n---\nb",
+        "---\nname: a\nTools: Edit\n---\nb",
+        "---\nname: a\nhooks: x\n---\nb",
+        "---\nname: a\nmodel: opus\n---\nb",
+        "---\nname: a\nmcpServers: x\n---\nb",
+        "---\nname: a\n...\npermissionMode: x\n---\nb",
+        "---\nname: a\n--- \npermissionMode: x\n---\nb",
+        "---\nname: a\n---\n---\npermissionMode: x\n---\n",
+        "---\nname: a\ntools: Read, Edit\n---\nb",
+        "---\nname: a\ntools: write\n---\nb",
+        "---\nname: a\ntools: MultiEdit\n---\nb",
+        "---\nname: a\ntools: Read,\n  Edit\n---\nb",
+        "---\nname: a\ntools:\n  - Edit\n---\nb",
+        "---\nname: a\ntools:\n- Edit\n---\nb",
+        "---\nname: a\ntools: [Read,\n  Edit]\n---\nb",
+        "---\nname: a\ntools: [Edit]\n---\nb",
+        "---\nname: a\ntools: Read,,Grep\n---\nb",
+        "---\r\nname: a\r\ntools: Edit\r\n---\r\nb",
+        "---\r\nname: a\r\n---\r\nb",
+        "---\nname: a\r\n---\nb",
+        "---\nname: a\0\n---\nb",
+        "---\nname:\ta\n---\nb",
+        "---\nname: a\n---",
+        "---\nname: a\n",
+        "---\n---\nb",
+        "---\nname: a # permissionMode\n---\nb",
+        "---\nname: a\n\n---\nb",
+        "---\nname: a \n---\nb",
+        "---\nname: a\u{7f}b\n---\nb",
+        "---\nname:  a\n---\nb",
+        "---\nname: a:\n---\nb",
+        "---\nname: -a\n---\nb",
+        "---\nname: ?a\n---\nb",
+        "---\nname: :a\n---\nb",
+        "---\nname: ,a\n---\nb",
+        "---\nname: %a\n---\nb",
+        "---\nname: @a\n---\nb",
+        "---\nname: it's\n---\nb",
+        "---\nname: \n---\nb",
+        "---\nname: a\u{a0}b\n---\nb",
+        "---\nname: caf\u{e9}\n---\nb",
+        "---\nname: a\u{200b}b\n---\nb",
+    ];
+    for body in hostile {
+        assert_eq!(
+            subagent_outcome(body),
+            Err(ApplyError::Subagent),
+            "{body:?}"
+        );
+    }
+}
+
+#[test]
+fn the_subagent_allowlist_accepts_plain_frontmatter_and_the_parser_agrees() -> TestResult {
+    let accepted = [
+        "---\nname: a\ndescription: review a diff, quickly\ncolor: blue\ntools: Read, Grep, Bash\n---\nb",
+        "---\nname: a\n---\npermissionMode: x\ntools: Edit\n",
+        "no frontmatter permissionMode: x\n",
+        "# Title\n---\nb",
+        "---\nname: a\ntools: mcp__srv-1__t, Read\n---\nb",
+    ];
+    for body in accepted {
+        assert_eq!(subagent_outcome(body), Ok(()), "{body:?}");
+        assert_parser_sees_nothing_banned(body)?;
+    }
+    Ok(())
+}
+
+#[test]
+fn every_accepted_line_combination_is_clean_under_the_real_parser() -> TestResult {
+    let lines = [
+        "name: a",
+        "name: b",
+        "description: x y",
+        "model: sonnet",
+        "color: red",
+        "tools: Read, Grep",
+        "tools: Edit",
+        "tools: Bash",
+        "permissionMode: x",
+        "hooks: x",
+        "mcpServers: x",
+        "PermissionMode: x",
+        "name: a: b",
+        "name: a #c",
+        "name: &x y",
+        "name: |",
+        "name: [Edit]",
+        "  name: a",
+        "---",
+        "",
+    ];
+    let mut accepted = 0;
+    for a in lines {
+        for b in lines {
+            for c in lines {
+                let body = format!("---\n{a}\n{b}\n{c}\n---\nx");
+                if subagent_outcome(&body).is_ok() {
+                    accepted += 1;
+                    assert_parser_sees_nothing_banned(&body)?;
+                }
+            }
+        }
+    }
+    assert!(accepted > 20, "{accepted}");
+    Ok(())
 }

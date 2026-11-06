@@ -49,6 +49,7 @@ unicode-general-category = "1.1.0"
 tokio = { workspace = true, features = ["test-util"] }
 tokio-stream = "0.1.19"
 tower.workspace = true
+serde_norway = "0.9.42"
 
 [lints]
 workspace = true
