@@ -9,11 +9,12 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::path::PathBuf;
 
+use fleet_core::catalog::{CatalogItem, CatalogKind};
 use fleet_core::model_allowlist::ModelAllowlist;
 use fleet_core::tools::ToolSpec;
 use fleet_core::{Profile, ProfileHash, ProfileInvalid};
-use fleet_proto::MAX_PROFILE_JSON_BYTES;
 use fleet_proto::v1::{GetProfileBlobReply, ProfileRef};
+use fleet_proto::{MAX_PROFILE_JSON_BYTES, catalog_entry_from_wire};
 use serde_json::{Map, Value, json};
 
 use crate::agent_config::{Bundle, BundleError};
@@ -23,6 +24,8 @@ const CLAUDE_MD: &str = "CLAUDE.md";
 const SETTINGS: &str = "settings.json";
 const CTX_DIR: &str = ".claude/ctx";
 const SKILLS_DIR: &str = "skills";
+const AGENTS_DIR: &str = "agents";
+const SKILL_FILE: &str = "SKILL.md";
 const PLACEHOLDER: &str = "{prompt}";
 
 /// Why a Profile could not be laid over the bundle.
@@ -33,6 +36,13 @@ pub enum ApplyError {
     Collision,
     /// A context file path holds whitespace, which an `@` import line cannot carry.
     ImportPath,
+    /// A catalog item would overwrite a file of the default bundle.
+    DefaultPath,
+    /// A subagent file has frontmatter outside the strict allowlist, or lists a tool the Floor
+    /// denies.
+    Subagent,
+    /// A catalog tool is not a registry pin, or a tool is pinned twice.
+    Tool,
     /// The assembled files were rejected by [`Bundle::from_files`].
     Bundle(BundleError),
 }
@@ -42,6 +52,9 @@ impl fmt::Display for ApplyError {
         match self {
             Self::Collision => f.write_str("profile paths collide when compared without case"),
             Self::ImportPath => f.write_str("profile context file path holds whitespace"),
+            Self::DefaultPath => f.write_str("catalog item path collides with the default bundle"),
+            Self::Subagent => f.write_str("catalog subagent loosens the floor"),
+            Self::Tool => f.write_str("catalog tool is not a valid or unique pin"),
             Self::Bundle(err) => err.fmt(f),
         }
     }
@@ -125,7 +138,106 @@ fn settings_json(
     out
 }
 
-fn claude_md(default: &Bundle, profile: &Profile) -> Vec<u8> {
+fn item_path(item: &CatalogItem) -> Option<PathBuf> {
+    match item.kind() {
+        CatalogKind::Skill => Some(PathBuf::from(format!(
+            "{SKILLS_DIR}/{}/{SKILL_FILE}",
+            item.name()
+        ))),
+        CatalogKind::Subagent => Some(PathBuf::from(format!("{AGENTS_DIR}/{}.md", item.name()))),
+        CatalogKind::Context => Some(PathBuf::from(format!("{CTX_DIR}/{}.md", item.name()))),
+        CatalogKind::Tool => None,
+    }
+}
+
+const SUBAGENT_KEYS: [&str; 4] = ["name", "description", "color", "tools"];
+const SCALAR_FORBIDDEN: &str = "#&*!|>{}[]\"'`";
+const SCALAR_FIRST_FORBIDDEN: &str = "-?:,%@";
+
+/// A YAML plain scalar on one line, narrowed to printable ASCII. `ns-plain-first` excludes the
+/// indicators `- ? : , [ ] { } # & * ! | > ' " % @` and the backtick; `ns-plain-char` excludes
+/// `: ` and ` #`. This also refuses every flow, quote, anchor, alias, tag and block-scalar
+/// indicator anywhere in the value, a leading or trailing space, and a trailing colon.
+fn plain_scalar(value: &str) -> bool {
+    let Some(first) = value.chars().next() else {
+        return false;
+    };
+    value.chars().all(|c| matches!(c, ' '..='~'))
+        && !value.starts_with(' ')
+        && !value.ends_with([' ', ':'])
+        && !value.contains(": ")
+        && !SCALAR_FIRST_FORBIDDEN.contains(first)
+        && !value.chars().any(|c| SCALAR_FORBIDDEN.contains(c))
+}
+
+fn tool_name(entry: &str) -> bool {
+    !entry.is_empty()
+        && entry
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-'))
+}
+
+fn tool_denied(entry: &str) -> bool {
+    floor::FLOOR_DENY
+        .iter()
+        .any(|deny| deny.eq_ignore_ascii_case(entry))
+}
+
+fn fence_candidate(body: &str) -> bool {
+    body.trim_start().starts_with("---")
+}
+
+/// Whether a subagent body stays inside the Floor. The claude runner parses the frontmatter as
+/// YAML, so only a strict subset is accepted and everything else is refused. The body must start
+/// with `---\n`, then hold one line per key, each `key: value` with the key one of
+/// [`SUBAGENT_KEYS`] at most once and the value a [`plain_scalar`], then a `---\n` line that no further `---` line follows. No CR,
+/// tab, NUL, indentation, blank line or second document start can occur in that region, so no
+/// line break YAML knows (CR, NEL, U+2028, U+2029) hides a key. `tools` is a comma-separated
+/// list of tool names, none in the Floor deny set. A body with no frontmatter is accepted only
+/// when it has no BOM and its first non-whitespace line does not start with `---`.
+fn subagent_within_floor(body: &str) -> bool {
+    let Some(rest) = body.strip_prefix("---\n") else {
+        return !body.starts_with('\u{feff}') && !fence_candidate(body);
+    };
+    let mut seen: Vec<&str> = Vec::new();
+    let mut consumed = 0;
+    for raw in rest.split_inclusive('\n') {
+        let Some(line) = raw.strip_suffix('\n') else {
+            return false;
+        };
+        if line == "---" {
+            let after = &rest[consumed + raw.len()..];
+            return !seen.is_empty() && !after.starts_with("---");
+        }
+        consumed += raw.len();
+        let Some((key, value)) = line.split_once(": ") else {
+            return false;
+        };
+        if !SUBAGENT_KEYS.contains(&key) || seen.contains(&key) || !plain_scalar(value) {
+            return false;
+        }
+        if key == "tools"
+            && value
+                .split(',')
+                .map(str::trim)
+                .any(|entry| !tool_name(entry) || tool_denied(entry))
+        {
+            return false;
+        }
+        seen.push(key);
+    }
+    false
+}
+
+fn catalog_tools(items: &[CatalogItem]) -> Result<Vec<ToolSpec>, ApplyError> {
+    items
+        .iter()
+        .filter(|item| item.kind() == CatalogKind::Tool)
+        .map(|item| ToolSpec::new(item.name(), item.body()).map_err(|_| ApplyError::Tool))
+        .collect()
+}
+
+fn claude_md(default: &Bundle, profile: &Profile, items: &[CatalogItem]) -> Vec<u8> {
     let mut text = profile.claude_md.clone().unwrap_or_else(|| {
         default
             .files()
@@ -133,7 +245,9 @@ fn claude_md(default: &Bundle, profile: &Profile) -> Vec<u8> {
             .map(|raw| String::from_utf8_lossy(raw).into_owned())
             .unwrap_or_default()
     });
-    if !profile.context_files.is_empty() && !text.is_empty() && !text.ends_with('\n') {
+    let has_imports =
+        !profile.context_files.is_empty() || items.iter().any(|i| i.kind() == CatalogKind::Context);
+    if has_imports && !text.is_empty() && !text.ends_with('\n') {
         text.push('\n');
     }
     for file in &profile.context_files {
@@ -143,12 +257,20 @@ fn claude_md(default: &Bundle, profile: &Profile) -> Vec<u8> {
         text.push_str(&file.path);
         text.push('\n');
     }
+    for item in items.iter().filter(|i| i.kind() == CatalogKind::Context) {
+        text.push('@');
+        text.push_str(CTX_DIR);
+        text.push('/');
+        text.push_str(item.name());
+        text.push_str(".md\n");
+    }
     text.into_bytes()
 }
 
 fn overlay(
     default: &Bundle,
     profile: &Profile,
+    items: &[CatalogItem],
     settings: Vec<u8>,
 ) -> Result<BTreeMap<PathBuf, Vec<u8>>, ApplyError> {
     if profile
@@ -173,6 +295,22 @@ fn overlay(
             ));
         }
     }
+    let taken: BTreeSet<String> = default
+        .files()
+        .keys()
+        .map(|path| path.to_string_lossy().to_lowercase())
+        .collect();
+    for item in items {
+        if item.kind() == CatalogKind::Subagent && !subagent_within_floor(item.body()) {
+            return Err(ApplyError::Subagent);
+        }
+        if let Some(path) = item_path(item) {
+            if taken.contains(&path.to_string_lossy().to_lowercase()) {
+                return Err(ApplyError::DefaultPath);
+            }
+            added.push((path, item.body().as_bytes().to_vec()));
+        }
+    }
     let mut seen = BTreeSet::new();
     for (path, _) in &added {
         if !seen.insert(path.to_string_lossy().to_lowercase()) {
@@ -184,7 +322,7 @@ fn overlay(
         .iter()
         .map(|(path, data)| (path.clone(), data.clone()))
         .collect();
-    files.insert(PathBuf::from(CLAUDE_MD), claude_md(default, profile));
+    files.insert(PathBuf::from(CLAUDE_MD), claude_md(default, profile, items));
     files.insert(PathBuf::from(SETTINGS), settings);
     files.extend(added);
     Ok(files)
@@ -217,6 +355,38 @@ pub fn apply_profile(
     ceilings: &BoxCeilings,
     job_prompt: &str,
 ) -> Result<Applied, ApplyError> {
+    apply_effective(profile, &[], default, ceilings, job_prompt)
+}
+
+/// Lays `profile` and the frozen effective set `items` over `default`.
+///
+/// `items` is the set the server froze at submit; it is applied as given and never resolved
+/// again. A skill lands at `skills/<name>/SKILL.md`, a subagent at `agents/<name>.md` and a
+/// context item at `.claude/ctx/<name>.md` with an `@` import line in `CLAUDE.md`, each with the
+/// item body as the file text. A tool item joins [`Applied::tools`] as a pin. Item names have
+/// the [`CatalogItem`] id shape, so no name holds a separator, dot, space or non-ASCII byte.
+///
+/// # Errors
+///
+/// Returns [`ApplyError`] as [`apply_profile`] does, [`ApplyError::DefaultPath`] when an item
+/// would overwrite a default bundle file, [`ApplyError::Subagent`] for a subagent whose
+/// frontmatter is not the strict allowlist of `name`, `description`, `color` and `tools`
+/// plain-scalar lines, sets `model` (only the Profile model is checked against the box
+/// allowlist), or lists a tool in [`floor::FLOOR_DENY`], and [`ApplyError::Tool`] for a
+/// catalog tool that is not a valid registry pin or a tool pinned twice.
+pub fn apply_effective(
+    profile: &Profile,
+    items: &[CatalogItem],
+    default: &Bundle,
+    ceilings: &BoxCeilings,
+    job_prompt: &str,
+) -> Result<Applied, ApplyError> {
+    let mut tools = profile.tools.clone();
+    tools.extend(catalog_tools(items)?);
+    let mut names = BTreeSet::new();
+    if !tools.iter().all(|tool| names.insert(tool.name())) {
+        return Err(ApplyError::Tool);
+    }
     let mut merged = profile.clone();
     if let Some(perms) = profile
         .settings
@@ -232,7 +402,7 @@ pub fn apply_profile(
     }
     let settings_allow = floor::with_floor_allow(&effective.allow);
     let settings = settings_json(default, profile, &settings_allow, &effective.deny);
-    let bundle = Bundle::from_files(overlay(default, profile, settings)?)?;
+    let bundle = Bundle::from_files(overlay(default, profile, items, settings)?)?;
     let mut argv = Vec::new();
     if let Some(model) = &effective.model {
         argv.extend(["--model".to_owned(), model.clone()]);
@@ -261,7 +431,7 @@ pub fn apply_profile(
         prompt,
         dropped_allows: effective.dropped_allows,
         permission_mode: effective.permission_mode,
-        tools: sorted_tools(&profile.tools),
+        tools: sorted_tools(&tools),
     })
 }
 
@@ -276,6 +446,8 @@ pub enum LoadError {
     Mismatch,
     /// The hash in the Job's `ProfileRef` is not 64 lowercase hex characters.
     RefHash,
+    /// The catalog snapshot holds an item the core rules refuse, or one id twice.
+    Catalog,
     /// The blob is longer than [`MAX_PROFILE_JSON_BYTES`].
     TooLarge,
     /// A `tools` entry names a tool outside the registry, has a version that is not an exact
@@ -350,6 +522,7 @@ impl LoadError {
             Self::Fetch => "profile invalid: profile could not be fetched",
             Self::Mismatch => "profile invalid: server sent another profile than the job names",
             Self::RefHash => "profile invalid: job profile hash is malformed",
+            Self::Catalog => "profile invalid: the catalog snapshot is not valid",
             Self::TooLarge => "profile invalid: profile blob is too large",
             Self::ToolEntry => TOOL_ENTRY_REASON,
             Self::Malformed => "profile invalid: profile blob is not profile JSON",
@@ -377,6 +550,27 @@ impl fmt::Display for LoadError {
 
 impl std::error::Error for LoadError {}
 
+fn effective_items(
+    profile: &Profile,
+    wire: &[fleet_proto::v1::CatalogItem],
+) -> Result<Vec<CatalogItem>, LoadError> {
+    let mut seen = BTreeSet::new();
+    let mut kept = Vec::new();
+    for raw in wire {
+        let entry = catalog_entry_from_wire(raw).map_err(|_| LoadError::Catalog)?;
+        let item = entry.item();
+        if !seen.insert(item.id().clone()) {
+            return Err(LoadError::Catalog);
+        }
+        let off = profile.selection.ids().any(|id| id == item.id());
+        if entry.enabled() && !off {
+            kept.push(item.clone());
+        }
+    }
+    kept.sort_by(|a, b| (a.kind(), a.name(), a.id()).cmp(&(b.kind(), b.name(), b.id())));
+    Ok(kept)
+}
+
 /// Checks the blob `reply` against the Job's `expected` reference, then lays the Profile over
 /// `default` with [`apply_profile`].
 ///
@@ -385,6 +579,12 @@ impl std::error::Error for LoadError {}
 /// shared validator runs next, so fleetd does not trust the server's check. Then `allowlist`
 /// re-checks the Profile model with [`floor::check_model`], before the overlay is built, so a
 /// refused model leaves no bundle, argv or prompt behind (ADR-0054).
+///
+/// The catalog snapshot in `reply` is the effective set frozen at submit and is applied as
+/// sent, with [`apply_effective`]. An item that is not admin-enabled or that the Profile
+/// selection switched off is left out again here, so a snapshot cannot carry one in. An item
+/// the core rules refuse, or a repeated id, is [`LoadError::Catalog`]. A tool item needs the
+/// tools stamp like a Profile tool.
 ///
 /// `tools_granted` is the Job's `profile_tools_granted`. A Profile with tools and `false` is
 /// refused with [`LoadError::ToolsNotGranted`] after the validator and before the model check,
@@ -424,7 +624,10 @@ pub fn load_stamped(
         return Err(LoadError::HashMismatch);
     }
     profile.validate().map_err(LoadError::Invalid)?;
-    floor::check_tools_stamp(!profile.tools.is_empty(), tools_granted).map_err(|_| {
+    let items = effective_items(&profile, &reply.catalog)?;
+    let has_tools =
+        !profile.tools.is_empty() || items.iter().any(|item| item.kind() == CatalogKind::Tool);
+    floor::check_tools_stamp(has_tools, tools_granted).map_err(|_| {
         tracing::warn!("profile tools carry no server stamp");
         LoadError::ToolsNotGranted
     })?;
@@ -435,14 +638,15 @@ pub fn load_stamped(
         );
         LoadError::ModelDenied
     })?;
-    apply_profile(&profile, default, ceilings, job_prompt).map_err(LoadError::Apply)
+    apply_effective(&profile, &items, default, ceilings, job_prompt).map_err(LoadError::Apply)
 }
 
 #[cfg(test)]
 mod tests {
     use std::path::Path;
 
-    use fleet_core::{ContextFile, Skill};
+    use fleet_core::{ContextFile, Selection, Skill};
+    use fleet_proto::v1;
 
     use super::*;
 
@@ -1223,5 +1427,360 @@ mod tests {
             assert!(err.reason().starts_with("profile invalid: "));
             assert_eq!(err.to_string(), err.reason());
         }
+    }
+
+    fn wire(kind: i32, id: &str, name: &str, content: &str, enabled: bool) -> v1::CatalogItem {
+        v1::CatalogItem {
+            id: id.to_owned(),
+            kind,
+            name: name.to_owned(),
+            content: content.to_owned(),
+            digest: Vec::new(),
+            admin_enabled: enabled,
+        }
+    }
+
+    const SKILL: i32 = v1::CatalogKind::Skill as i32;
+    const SUBAGENT: i32 = v1::CatalogKind::Subagent as i32;
+    const TOOL: i32 = v1::CatalogKind::Tool as i32;
+    const CONTEXT: i32 = v1::CatalogKind::Context as i32;
+
+    fn with_catalog(
+        profile: &Profile,
+        catalog: Vec<v1::CatalogItem>,
+        granted: bool,
+    ) -> Result<Applied, LoadError> {
+        let (reference, mut reply) = blob(profile);
+        reply.catalog = catalog;
+        stamped(&reference, &reply, granted)
+    }
+
+    fn four() -> Vec<v1::CatalogItem> {
+        vec![
+            wire(SKILL, "s1", "lint", "---\nname: lint\n---\nbody", true),
+            wire(
+                SUBAGENT,
+                "a1",
+                "review",
+                "---\nname: review\n---\nrev",
+                true,
+            ),
+            wire(CONTEXT, "c1", "rules", "CTX", true),
+            wire(TOOL, "t1", "jq", "1.7.1", true),
+        ]
+    }
+
+    #[test]
+    fn the_frozen_set_lands_in_the_agent_config() -> Result<(), LoadError> {
+        let applied = with_catalog(&Profile::default(), four(), true)?;
+        assert_eq!(
+            body(&applied, "skills/lint/SKILL.md").as_deref(),
+            Some("---\nname: lint\n---\nbody")
+        );
+        assert_eq!(
+            body(&applied, "agents/review.md").as_deref(),
+            Some("---\nname: review\n---\nrev")
+        );
+        assert_eq!(
+            body(&applied, ".claude/ctx/rules.md").as_deref(),
+            Some("CTX")
+        );
+        let md = body(&applied, "CLAUDE.md").unwrap_or_default();
+        assert!(md.ends_with("@.claude/ctx/rules.md\n"), "{md:?}");
+        assert_eq!(
+            applied.tools,
+            vec![ToolSpec::new("jq", "1.7.1").unwrap_or_else(|e| panic!("{e}"))]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn admin_disabled_and_switched_off_items_are_absent() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let mut catalog = four();
+        catalog.push(wire(SKILL, "s2", "gone", "G", false));
+        catalog.push(wire(SKILL, "s3", "off", "O", true));
+        catalog.push(wire(SUBAGENT, "a2", "offagent", "O", true));
+        catalog.push(wire(CONTEXT, "c2", "offctx", "O", true));
+        catalog.push(wire(TOOL, "t2", "node", "20.11.1", true));
+        let profile = Profile {
+            selection: Selection::from_json(
+                br#"[{"item_id":"s3"},{"item_id":"a2"},{"item_id":"c2"},{"item_id":"t2"}]"#,
+            )?,
+            ..Profile::default()
+        };
+        let applied = with_catalog(&profile, catalog, true)?;
+        for path in [
+            "skills/gone/SKILL.md",
+            "skills/off/SKILL.md",
+            "agents/offagent.md",
+            ".claude/ctx/offctx.md",
+        ] {
+            assert_eq!(body(&applied, path), None, "{path}");
+        }
+        let md = body(&applied, "CLAUDE.md").unwrap_or_default();
+        assert!(!md.contains("offctx"), "{md:?}");
+        assert_eq!(applied.tools.len(), 1);
+        assert!(body(&applied, "skills/lint/SKILL.md").is_some());
+        Ok(())
+    }
+
+    #[test]
+    fn a_context_item_after_profile_context_files_keeps_import_order() -> Result<(), LoadError> {
+        let profile = Profile {
+            claude_md: Some("base".to_owned()),
+            context_files: vec![file("y.md", "Y")],
+            ..Profile::default()
+        };
+        let applied = with_catalog(
+            &profile,
+            vec![wire(CONTEXT, "c1", "rules", "C", true)],
+            true,
+        )?;
+        assert_eq!(
+            body(&applied, "CLAUDE.md").as_deref(),
+            Some("base\n@.claude/ctx/y.md\n@.claude/ctx/rules.md\n")
+        );
+        let only = with_catalog(
+            &Profile {
+                claude_md: Some("base".to_owned()),
+                ..Profile::default()
+            },
+            vec![wire(CONTEXT, "c1", "rules", "C", true)],
+            true,
+        )?;
+        assert_eq!(
+            body(&only, "CLAUDE.md").as_deref(),
+            Some("base\n@.claude/ctx/rules.md\n")
+        );
+        Ok(())
+    }
+
+    fn hostile_names() -> Vec<String> {
+        [
+            "",
+            "a\r",
+            "a\r\nb",
+            "a\nb",
+            "a\u{85}b",
+            "a\u{2028}b",
+            "a\\b",
+            "a/b",
+            "../x",
+            "..",
+            ".",
+            "a\0b",
+            " a",
+            "a b",
+            "a\tb",
+            "caf\u{e9}",
+            "\u{ff41}",
+            "Abc",
+            "ABC",
+            "a.b",
+        ]
+        .into_iter()
+        .map(str::to_owned)
+        .chain([String::from_utf8(vec![b'a'; 65]).unwrap_or_default()])
+        .collect()
+    }
+
+    #[test]
+    fn hostile_item_names_and_ids_fail_closed() {
+        for kind in [SKILL, SUBAGENT, CONTEXT, TOOL] {
+            for raw in hostile_names() {
+                let by_name = vec![wire(kind, "ok", &raw, "1.0.0", true)];
+                assert_eq!(
+                    with_catalog(&Profile::default(), by_name, true).err(),
+                    Some(LoadError::Catalog),
+                    "name {raw:?} kind {kind}"
+                );
+                let by_id = vec![wire(kind, &raw, "jq", "1.0.0", true)];
+                assert_eq!(
+                    with_catalog(&Profile::default(), by_id, true).err(),
+                    Some(LoadError::Catalog),
+                    "id {raw:?} kind {kind}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_bad_kind_body_tool_or_repeated_id_fails_closed() {
+        let cases = [
+            vec![wire(0, "a", "a", "x", true)],
+            vec![wire(9, "a", "a", "x", true)],
+            vec![wire(SKILL, "a", "a", "", true)],
+            vec![wire(TOOL, "a", "jq", "latest", true)],
+            vec![wire(TOOL, "a", "not-a-tool", "1.0.0", true)],
+            vec![
+                wire(SKILL, "a", "one", "x", true),
+                wire(SKILL, "a", "two", "x", true),
+            ],
+            vec![
+                wire(SKILL, "a", "one", "x", false),
+                wire(SKILL, "a", "two", "x", true),
+            ],
+        ];
+        for catalog in cases {
+            assert_eq!(
+                with_catalog(&Profile::default(), catalog, true).err(),
+                Some(LoadError::Catalog)
+            );
+        }
+        assert_eq!(
+            LoadError::Catalog.reason(),
+            "profile invalid: the catalog snapshot is not valid"
+        );
+    }
+
+    #[test]
+    fn a_subagent_cannot_loosen_the_floor() {
+        let bad = [
+            "---\nname: a\npermissionMode: bypassPermissions\n---\nx",
+            "---\nname: a\nPERMISSIONMODE: acceptEdits\n---\nx",
+            "---\nname: a\nhooks:\n  Stop: x\n---\nx",
+            "---\nname: a\nmcpServers: [x]\n---\nx",
+            "---\nname: a\ntools: Read, Edit\n---\nx",
+            "---\nname: a\ntools: [Read, \"Write\"]\n---\nx",
+            "---\nname: a\ntools: write\n---\nx",
+            "---\r\nname: a\r\ntools: MultiEdit\r\n---\r\nx",
+            "\u{feff}---\nname: a\ntools: Edit\n---\nx",
+            "---\nname: a\ntools:\n  - Read\n  - NotebookEdit\n---\nx",
+            "---\nname: a\ntools: Bash(gh pr *)\n---\nx",
+            "---\nname: a\ntools: WebFetch\n---\nx",
+            "---\nname: a\ntools:\n- Edit\n---\nx",
+            "---\nTools: Write\n---\nx",
+            "---\nname: a\nmodel: opus\n---\nx",
+            "---\nname: a\nmodel: haiku\n---\nx",
+            "---  \nname: a\npermissionMode: x\n---\nb",
+            "---\nname: a\u{85}permissionMode: x\n---\nb",
+            "---\nname: a\u{2028}permissionMode: x\n---\nb",
+            "---\nname: a\u{2029}permissionMode: x\n---\nb",
+            "\u{85}---\nname: a\npermissionMode: x\n---\nb",
+            "\u{2028}---\nname: a\npermissionMode: x\n---\nb",
+            "\u{2029}---\nname: a\npermissionMode: x\n---\nb",
+        ];
+        for text in bad {
+            assert_eq!(
+                with_catalog(
+                    &Profile::default(),
+                    vec![wire(SUBAGENT, "a", "a", text, true)],
+                    true
+                )
+                .err(),
+                Some(LoadError::Apply(ApplyError::Subagent)),
+                "{text:?}"
+            );
+        }
+        let good = [
+            "---\nname: a\ntools: Read, Grep, Bash\n---\nx",
+            "---\nname: a\ndescription: Edit, Write\n---\nWrite hooks: and permissionMode: later",
+            "no frontmatter permissionMode: x",
+            "---\nname: a\n---\ntools: Edit\npermissionMode: x\nx",
+        ];
+        for text in good {
+            assert!(
+                with_catalog(
+                    &Profile::default(),
+                    vec![wire(SUBAGENT, "a", "a", text, true)],
+                    true
+                )
+                .is_ok(),
+                "{text:?}"
+            );
+        }
+        let skill = "---\nname: a\npermissionMode: x\ntools: Edit\n---\nx";
+        assert!(
+            with_catalog(
+                &Profile::default(),
+                vec![wire(SKILL, "a", "a", skill, true)],
+                true
+            )
+            .is_ok()
+        );
+    }
+
+    #[test]
+    fn an_item_cannot_overwrite_a_default_bundle_file() {
+        let skill = vec![wire(SKILL, "a", "fetch", "x", true)];
+        assert_eq!(
+            with_catalog(&Profile::default(), skill, true).err(),
+            Some(LoadError::Apply(ApplyError::DefaultPath))
+        );
+        let broker = vec![wire(SKILL, "a", "broker", "x", true)];
+        assert_eq!(
+            with_catalog(&Profile::default(), broker, true).err(),
+            Some(LoadError::Apply(ApplyError::DefaultPath))
+        );
+    }
+
+    #[test]
+    fn item_paths_collide_with_profile_paths_without_case() {
+        let profile = Profile {
+            context_files: vec![file("rules.md", "Y")],
+            ..Profile::default()
+        };
+        assert_eq!(
+            with_catalog(&profile, vec![wire(CONTEXT, "c", "rules", "C", true)], true).err(),
+            Some(LoadError::Apply(ApplyError::Collision))
+        );
+        let skills = Profile {
+            skills: vec![Skill {
+                name: "lint".to_owned(),
+                files: vec![file("SKILL.md", "S")],
+            }],
+            ..Profile::default()
+        };
+        assert_eq!(
+            with_catalog(&skills, vec![wire(SKILL, "s", "lint", "C", true)], true).err(),
+            Some(LoadError::Apply(ApplyError::Collision))
+        );
+    }
+
+    #[test]
+    fn catalog_tools_need_the_stamp_and_never_repeat_a_pin() {
+        let tool = vec![wire(TOOL, "t", "jq", "1.7.1", true)];
+        assert_eq!(
+            with_catalog(&Profile::default(), tool.clone(), false).err(),
+            Some(LoadError::ToolsNotGranted)
+        );
+        let off = vec![wire(TOOL, "t", "jq", "1.7.1", false)];
+        assert!(with_catalog(&Profile::default(), off, false).is_ok());
+        let pinned = Profile {
+            tools: vec![ToolSpec::new("jq", "1.7.1").unwrap_or_else(|e| panic!("{e}"))],
+            ..Profile::default()
+        };
+        assert_eq!(
+            with_catalog(&pinned, tool, true).err(),
+            Some(LoadError::Apply(ApplyError::Tool))
+        );
+        let forward = vec![
+            wire(TOOL, "t2", "node", "20.11.1", true),
+            wire(TOOL, "t1", "jq", "1.7.1", true),
+        ];
+        let mut backward = forward.clone();
+        backward.reverse();
+        let a = with_catalog(&Profile::default(), forward, true).map(|a| a.tools);
+        let b = with_catalog(&Profile::default(), backward, true).map(|a| a.tools);
+        assert_eq!(a.as_ref().map(Vec::len), Ok(2));
+        assert_eq!(a, b);
+    }
+
+    #[test]
+    fn an_empty_catalog_changes_nothing() -> Result<(), LoadError> {
+        let plain = with_catalog(&full(), Vec::new(), false)?;
+        let (reference, reply) = blob(&full());
+        assert_eq!(plain, loaded(&reference, &reply)?);
+        assert_eq!(
+            plain
+                .bundle
+                .files()
+                .keys()
+                .filter(|p| p.starts_with("agents"))
+                .count(),
+            0
+        );
+        Ok(())
     }
 }
