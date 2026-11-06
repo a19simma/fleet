@@ -193,8 +193,8 @@ impl GithubAppConfig {
     ///
     /// # Errors
     ///
-    /// Returns [`AppKeyError`] when the file is unreadable, loosely permissioned, not a regular
-    /// file or not a usable RSA key.
+    /// Returns [`AppKeyError`] when the file is unreadable, owned by another uid than the server's,
+    /// loosely permissioned, not a regular file or not a usable RSA key.
     pub fn load_key(&self) -> Result<AppKey, AppKeyError> {
         AppKey::load(&self.key_file)
     }
@@ -359,10 +359,27 @@ fn model_allowlist(
         })
 }
 
+const MASTER_KEY_FILE_VAR: &str = "FLEET_MASTER_KEY_FILE";
 const GITHUB_APP_ID_VAR: &str = "FLEET_GITHUB_APP_ID";
 const GITHUB_APP_KEY_FILE_VAR: &str = "FLEET_GITHUB_APP_KEY_FILE";
 const GITHUB_APP_BOT_NAME_VAR: &str = "FLEET_GITHUB_APP_BOT_NAME";
 const GITHUB_APP_BOT_EMAIL_VAR: &str = "FLEET_GITHUB_APP_BOT_EMAIL";
+
+fn absolute(path: PathBuf, var: &'static str) -> Result<PathBuf, ConfigError> {
+    std::path::absolute(path).map_err(|_| ConfigError::Invalid {
+        var,
+        reason: "cannot be made an absolute path".to_owned(),
+    })
+}
+
+fn master_key_file(
+    lookup: &impl Fn(&str) -> Option<String>,
+) -> Result<Option<PathBuf>, ConfigError> {
+    lookup(MASTER_KEY_FILE_VAR)
+        .filter(|v| !v.is_empty())
+        .map(|v| absolute(PathBuf::from(v), MASTER_KEY_FILE_VAR))
+        .transpose()
+}
 
 fn github_app(
     lookup: &impl Fn(&str) -> Option<String>,
@@ -406,7 +423,7 @@ fn github_app(
     })?;
     Ok(Some(GithubAppConfig {
         app_id,
-        key_file: PathBuf::from(key_file),
+        key_file: absolute(PathBuf::from(key_file), GITHUB_APP_KEY_FILE_VAR)?,
         bot,
     }))
 }
@@ -459,7 +476,8 @@ impl Config {
     /// `FLEET_GITHUB_APP_KEY_FILE`, or the reverse, is an error, and so is an App id that is
     /// not 1 to 20 ASCII digits without a leading zero that fits a `u64`. With the App set,
     /// `FLEET_GITHUB_APP_BOT_NAME` and `FLEET_GITHUB_APP_BOT_EMAIL` are required and must pass
-    /// [`BotIdentity::new`].
+    /// [`BotIdentity::new`]. The App also requires `FLEET_MASTER_KEY_FILE`. The App key file
+    /// and the master key file are made absolute against the working directory here.
     pub fn from_env() -> Result<Self, ConfigError> {
         Self::from_lookup(|var| std::env::var(var).ok())
     }
@@ -471,7 +489,9 @@ impl Config {
     /// Same as [`Config::from_env`]: the GitHub App variables are both set or both unset, and
     /// the App id is 1 to 20 ASCII digits without a leading zero that fit a `u64`. With the App
     /// set, a bot name or email that is unset, or that fails [`BotIdentity::new`], returns
-    /// [`ConfigError::Missing`] or [`ConfigError::Invalid`].
+    /// [`ConfigError::Missing`] or [`ConfigError::Invalid`]. An App without a master key file
+    /// is [`ConfigError::Invalid`] for `FLEET_MASTER_KEY_FILE`, and so is a key path that cannot
+    /// be made absolute.
     pub fn from_lookup(lookup: impl Fn(&str) -> Option<String>) -> Result<Self, ConfigError> {
         refuse_removed_profile_tools(&lookup)?;
         let database_url = lookup("FLEET_DATABASE_URL")
@@ -488,6 +508,14 @@ impl Config {
                 reason: "must differ from FLEET_TOKEN".to_owned(),
             });
         }
+        let master_key_file = master_key_file(&lookup)?;
+        let github_app = github_app(&lookup)?;
+        if github_app.is_some() && master_key_file.is_none() {
+            return Err(ConfigError::Invalid {
+                var: MASTER_KEY_FILE_VAR,
+                reason: format!("required when {GITHUB_APP_ID_VAR} is set"),
+            });
+        }
         Ok(Self {
             listen: address(&lookup, "FLEET_LISTEN", DEFAULT_LISTEN)?,
             health_listen: address(&lookup, "FLEET_HEALTH_LISTEN", DEFAULT_HEALTH_LISTEN)?,
@@ -497,10 +525,8 @@ impl Config {
             retention: retention(&lookup)?,
             max_ci_retries: ci_retries(&lookup)?,
             model_allowlist: model_allowlist(&lookup)?,
-            github_app: github_app(&lookup)?,
-            master_key_file: lookup("FLEET_MASTER_KEY_FILE")
-                .filter(|v| !v.is_empty())
-                .map(PathBuf::from),
+            github_app,
+            master_key_file,
             update_manifest: lookup("FLEET_UPDATE_MANIFEST")
                 .filter(|v| !v.is_empty())
                 .map(PathBuf::from),
@@ -975,6 +1001,7 @@ mod tests {
         let app = with(&[
             ("FLEET_GITHUB_APP_ID", "123456"),
             ("FLEET_GITHUB_APP_KEY_FILE", "keys/app.pem"),
+            ("FLEET_MASTER_KEY_FILE", "/run/keys"),
             ("FLEET_GITHUB_APP_BOT_NAME", BOT_NAME),
             ("FLEET_GITHUB_APP_BOT_EMAIL", BOT_EMAIL),
         ])
@@ -985,7 +1012,34 @@ mod tests {
         assert_eq!(app.bot.email(), BOT_EMAIL);
         assert_eq!(app.app_id, 123_456);
         assert_eq!(app.app_id_text(), "123456");
-        assert_eq!(app.key_file, PathBuf::from("keys/app.pem"));
+        assert_eq!(app.key_file, std::path::absolute("keys/app.pem").unwrap());
+        assert!(app.key_file.is_absolute());
+    }
+
+    #[test]
+    fn master_key_file_is_made_absolute() {
+        let config = with(&[("FLEET_MASTER_KEY_FILE", "keys/master")]).unwrap();
+        assert_eq!(
+            config.master_key_file,
+            Some(std::path::absolute("keys/master").unwrap())
+        );
+    }
+
+    #[test]
+    fn github_app_without_a_master_key_refuses_start() {
+        for master in [None, Some("")] {
+            let mut extra = vec![
+                ("FLEET_GITHUB_APP_ID", "1"),
+                ("FLEET_GITHUB_APP_KEY_FILE", "/k.pem"),
+                ("FLEET_GITHUB_APP_BOT_NAME", BOT_NAME),
+                ("FLEET_GITHUB_APP_BOT_EMAIL", BOT_EMAIL),
+            ];
+            extra.extend(master.map(|m| ("FLEET_MASTER_KEY_FILE", m)));
+            match with(&extra).unwrap_err() {
+                ConfigError::Invalid { var, .. } => assert_eq!(var, "FLEET_MASTER_KEY_FILE"),
+                other @ ConfigError::Missing(_) => panic!("{other}"),
+            }
+        }
     }
 
     #[test]
@@ -1049,6 +1103,7 @@ mod tests {
         let max = with(&[
             ("FLEET_GITHUB_APP_ID", "18446744073709551615"),
             ("FLEET_GITHUB_APP_KEY_FILE", "/k.pem"),
+            ("FLEET_MASTER_KEY_FILE", "/run/keys"),
             ("FLEET_GITHUB_APP_BOT_NAME", BOT_NAME),
             ("FLEET_GITHUB_APP_BOT_EMAIL", BOT_EMAIL),
         ]);

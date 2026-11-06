@@ -78,6 +78,7 @@ struct Fake {
     seen: Arc<Mutex<Vec<String>>>,
     hook_ok: Arc<Mutex<Vec<bool>>>,
     held: Arc<Mutex<Vec<sqlx::pool::PoolConnection<sqlx::Postgres>>>>,
+    app: Arc<Mutex<(&'static str, String)>>,
 }
 
 impl Fake {
@@ -142,13 +143,17 @@ async fn fake_with(
     let seen = Arc::new(Mutex::new(Vec::new()));
     let hook_ok = Arc::new(Mutex::new(Vec::new()));
     let held = Arc::new(Mutex::new(Vec::new()));
+    let app = Arc::new(Mutex::new(("200 OK", r#"{"id":12345}"#.to_owned())));
+    let revokes = Arc::new(AtomicUsize::new(0));
     let (seen_task, hook_task, held_task) =
         (Arc::clone(&seen), Arc::clone(&hook_ok), Arc::clone(&held));
+    let (app_task, revokes_task) = (Arc::clone(&app), Arc::clone(&revokes));
     tokio::spawn(async move {
         loop {
             let Ok((mut stream, _)) = listener.accept().await else {
                 return;
             };
+            let (app, revokes) = (Arc::clone(&app_task), Arc::clone(&revokes_task));
             let (seen, ok_log, hook, parked, gate) = (
                 Arc::clone(&seen_task),
                 Arc::clone(&hook_task),
@@ -159,8 +164,12 @@ async fn fake_with(
             tokio::spawn(async move {
                 let request = read_request(&mut stream).await;
                 let is_mint = request.starts_with("POST ");
+                let is_app = request.starts_with("GET /app ");
                 seen.lock().unwrap().push(request);
-                let reply = if is_mint {
+                let reply = if is_app {
+                    let (status, body) = app.lock().unwrap().clone();
+                    http(status, &body)
+                } else if is_mint {
                     if let Some((pool, sql)) = hook {
                         let mut conn = pool.acquire().await.unwrap();
                         sqlx::query("SET lock_timeout = '500ms'")
@@ -184,6 +193,11 @@ async fn fake_with(
                     } else {
                         http(mint_status, "")
                     }
+                } else if revoke_status == "HANG_FIRST" {
+                    if revokes.fetch_add(1, Ordering::SeqCst) == 0 {
+                        tokio::time::sleep(Duration::from_secs(3600)).await;
+                    }
+                    http("500 Internal Server Error", "")
                 } else {
                     http(revoke_status, "")
                 };
@@ -197,6 +211,7 @@ async fn fake_with(
         seen,
         hook_ok,
         held,
+        app,
     }
 }
 
@@ -1439,4 +1454,401 @@ async fn a_denied_row_of_another_reason_does_not_hide_the_denial(pool: PgPool) {
     w.release_outcome().await.unwrap_err();
     let reasons: Vec<_> = w.rows().await.into_iter().filter_map(|(_, r)| r).collect();
     assert_eq!(reasons, ["job mint cap", "user mint rate"]);
+}
+
+async fn verify_reply(w: &World) -> Result<fleet_proto::v1::VerifyCredentialReply, tonic::Status> {
+    let service = super::CredentialService::new(w.creds.clone(), Arc::new(NoGithub));
+    let request = fleet_proto::v1::VerifyCredentialRequest {
+        id: app_id(w).await,
+    };
+    service.verify(w.alice, &request).await
+}
+
+#[sqlx::test]
+async fn verify_audits_an_attempt_a_minted_row_and_a_revoked_row_under_the_latest_job(
+    pool: PgPool,
+) {
+    let fake = fake("201 Created", None).await;
+    let w = world(pool, Some(client(&fake))).await;
+    w.seed(true).await;
+    assert!(verify_reply(&w).await.unwrap().valid);
+    assert_eq!(w.outcomes().await, ["attempt", "minted", "revoked"]);
+    let jobs: Vec<String> = sqlx::query_scalar("SELECT DISTINCT job_id FROM github_app_mint")
+        .fetch_all(&w.pool)
+        .await
+        .unwrap();
+    assert_eq!(jobs, [JOB]);
+    let expiring: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM github_app_mint WHERE outcome = 'minted' AND expires_at IS NOT NULL",
+    )
+    .fetch_one(&w.pool)
+    .await
+    .unwrap();
+    assert_eq!(expiring, 1);
+    assert_eq!(w.uses().await, 0);
+}
+
+#[sqlx::test]
+async fn a_failed_verify_mint_audits_an_attempt_then_failed(pool: PgPool) {
+    let fake = fake("500 Internal Server Error", None).await;
+    let w = world(pool, Some(client(&fake))).await;
+    w.seed(true).await;
+    assert!(!verify_reply(&w).await.unwrap().valid);
+    assert_eq!(
+        w.rows().await,
+        [
+            ("attempt".to_owned(), None),
+            ("failed".to_owned(), Some("mint failed".to_owned())),
+        ]
+    );
+}
+
+#[sqlx::test]
+async fn verify_mints_spend_the_job_cap_and_the_next_one_is_refused(pool: PgPool) {
+    let fake = fake("201 Created", None).await;
+    let w = world(pool, Some(client(&fake))).await.capped(1);
+    w.seed(true).await;
+    assert!(verify_reply(&w).await.unwrap().valid);
+    let status = verify_reply(&w).await.unwrap_err();
+    assert_eq!(status.code(), tonic::Code::FailedPrecondition);
+    assert_eq!(status.message(), fleet_proto::PRECONDITION_APP_MINT_CAP);
+    assert_eq!(fake.mints(), 1);
+    assert_eq!(
+        w.rows().await.last().cloned(),
+        Some(("denied".to_owned(), Some("job mint cap".to_owned())))
+    );
+    let err = w.release_outcome().await.unwrap_err();
+    assert!(matches!(err, StoreError::MintCapReached), "{err:?}");
+    assert_eq!(fake.mints(), 1);
+}
+
+#[sqlx::test]
+async fn failed_verify_mints_spend_the_job_cap(pool: PgPool) {
+    let fake = fake("500 Internal Server Error", None).await;
+    let w = world(pool, Some(client(&fake))).await.capped(1);
+    w.seed(true).await;
+    assert!(!verify_reply(&w).await.unwrap().valid);
+    let status = verify_reply(&w).await.unwrap_err();
+    assert_eq!(status.message(), fleet_proto::PRECONDITION_APP_MINT_CAP);
+    assert_eq!(fake.mints(), 1);
+}
+
+#[sqlx::test]
+async fn verify_obeys_the_user_rate_limit_with_a_denied_row_and_no_mint(pool: PgPool) {
+    let fake = fake("201 Created", None).await;
+    let w = world(pool, Some(client(&fake))).await.rate_limited(2);
+    w.seed(true).await;
+    w.plant_attempts(w.alice, 2, 0).await;
+    let status = verify_reply(&w).await.unwrap_err();
+    assert_eq!(status.code(), tonic::Code::FailedPrecondition);
+    assert_eq!(status.message(), fleet_proto::PRECONDITION_APP_MINT_CAP);
+    assert_eq!(fake.mints(), 0);
+    assert_eq!(
+        w.rows().await.last().cloned(),
+        Some(("denied".to_owned(), Some("user mint rate".to_owned())))
+    );
+}
+
+#[sqlx::test]
+async fn a_verify_whose_revoke_is_refused_is_invalid_and_audited(pool: PgPool) {
+    let fake = fake_with("201 Created", "500 Internal Server Error", None, None).await;
+    let w = world(pool, Some(client(&fake))).await;
+    w.seed(true).await;
+    assert!(!verify_reply(&w).await.unwrap().valid);
+    assert_eq!(w.outcomes().await, ["attempt", "minted", "revoke_failed"]);
+}
+
+async fn tombstoned_world(pool: PgPool) -> (World, Fake, i64) {
+    let fake = fake("201 Created", None).await;
+    let w = world(pool, Some(client(&fake))).await;
+    w.seed(true).await;
+    w.release_outcome().await.unwrap();
+    let id = i64::try_from(app_id(&w).await).unwrap();
+    (w, fake, id)
+}
+
+#[sqlx::test]
+async fn deleting_a_minted_app_credential_tombstones_it_and_keeps_the_history(pool: PgPool) {
+    let (w, _fake, id) = tombstoned_world(pool).await;
+    let deleted = w.creds.delete(w.alice, id).await;
+    assert!(deleted.is_ok(), "{deleted:?}");
+    let tombstoned: bool =
+        sqlx::query_scalar("SELECT tombstoned_at IS NOT NULL FROM credentials WHERE id = $1")
+            .bind(id)
+            .fetch_one(&w.pool)
+            .await
+            .unwrap();
+    assert!(tombstoned);
+    let listed = w.creds.list(w.alice).await.unwrap();
+    assert!(listed.iter().all(|c| c.kind != CredentialKind::GithubApp));
+    assert_eq!(w.outcomes().await, ["attempt", "minted"]);
+    let again = w.creds.delete(w.alice, id).await;
+    assert!(matches!(again, Err(StoreError::NotFound)), "{again:?}");
+}
+
+#[sqlx::test]
+async fn deleting_a_minted_app_credential_through_the_service_succeeds(pool: PgPool) {
+    let (w, _fake, id) = tombstoned_world(pool).await;
+    let service = super::CredentialService::new(w.creds.clone(), Arc::new(NoGithub));
+    let request = fleet_proto::v1::DeleteCredentialRequest {
+        id: u64::try_from(id).unwrap(),
+    };
+    let reply = service.delete(w.alice, &request).await;
+    assert!(reply.is_ok(), "{reply:?}");
+}
+
+#[sqlx::test]
+async fn deleting_an_app_credential_without_history_removes_the_row(pool: PgPool) {
+    let fake = fake("201 Created", None).await;
+    let w = world(pool, Some(client(&fake))).await;
+    w.seed(true).await;
+    let id = i64::try_from(app_id(&w).await).unwrap();
+    w.creds.delete(w.alice, id).await.unwrap();
+    let rows: i64 = sqlx::query_scalar("SELECT count(*) FROM credentials WHERE id = $1")
+        .bind(id)
+        .fetch_one(&w.pool)
+        .await
+        .unwrap();
+    assert_eq!(rows, 0);
+}
+
+#[sqlx::test]
+async fn deleting_a_pat_still_removes_the_row(pool: PgPool) {
+    let fake = fake("201 Created", None).await;
+    let w = world(pool, Some(client(&fake))).await;
+    w.seed(true).await;
+    let id: i64 = sqlx::query_scalar("SELECT id FROM credentials WHERE kind = 'github_pat'")
+        .fetch_one(&w.pool)
+        .await
+        .unwrap();
+    w.creds.delete(w.alice, id).await.unwrap();
+    let rows: i64 = sqlx::query_scalar("SELECT count(*) FROM credentials WHERE id = $1")
+        .bind(id)
+        .fetch_one(&w.pool)
+        .await
+        .unwrap();
+    assert_eq!(rows, 0);
+}
+
+#[sqlx::test]
+async fn a_put_onto_a_tombstoned_row_is_refused_and_leaves_the_row_untouched(pool: PgPool) {
+    let (w, _fake, id) = tombstoned_world(pool).await;
+    w.creds.delete(w.alice, id).await.unwrap();
+    let before: (String, Vec<u8>) =
+        sqlx::query_as("SELECT fingerprint, ciphertext FROM credentials WHERE id = $1")
+            .bind(id)
+            .fetch_one(&w.pool)
+            .await
+            .unwrap();
+    let err = w
+        .creds
+        .put(
+            w.alice,
+            CredentialKind::GithubApp,
+            STATIC,
+            Secret::new("777".to_owned()),
+            None,
+            None,
+        )
+        .await
+        .unwrap_err();
+    assert!(matches!(err, StoreError::Tombstoned), "{err:?}");
+    let after: (String, Vec<u8>, bool) = sqlx::query_as(
+        "SELECT fingerprint, ciphertext, tombstoned_at IS NOT NULL FROM credentials WHERE id = $1",
+    )
+    .bind(id)
+    .fetch_one(&w.pool)
+    .await
+    .unwrap();
+    assert_eq!((after.0, after.1), before);
+    assert!(after.2);
+}
+
+#[sqlx::test]
+async fn a_put_onto_any_tombstoned_kind_is_refused(pool: PgPool) {
+    let fake = fake("201 Created", None).await;
+    let w = world(pool, Some(client(&fake))).await;
+    w.seed(true).await;
+    sqlx::query("UPDATE credentials SET tombstoned_at = now() WHERE kind = 'github_pat'")
+        .execute(&w.pool)
+        .await
+        .unwrap();
+    let err = w
+        .creds
+        .put(
+            w.alice,
+            CredentialKind::GithubPat,
+            STATIC,
+            Secret::new(PAT.to_owned()),
+            None,
+            None,
+        )
+        .await
+        .unwrap_err();
+    assert!(matches!(err, StoreError::Tombstoned), "{err:?}");
+}
+
+#[sqlx::test]
+async fn the_service_maps_a_tombstoned_put_to_its_fixed_precondition(pool: PgPool) {
+    let (w, _fake, id) = tombstoned_world(pool).await;
+    w.creds.delete(w.alice, id).await.unwrap();
+    let service = super::CredentialService::new(w.creds.clone(), Arc::new(NoGithub));
+    let request = fleet_proto::v1::PutCredentialRequest {
+        kind: "github_app".to_owned(),
+        shape: "static_secret".to_owned(),
+        value: "777".to_owned(),
+        expires_at_ms: None,
+    };
+    let status = service.put(w.alice, request).await.unwrap_err();
+    assert_eq!(status.code(), tonic::Code::FailedPrecondition);
+    assert_eq!(
+        status.message(),
+        fleet_proto::PRECONDITION_CREDENTIAL_TOMBSTONED
+    );
+}
+
+#[sqlx::test]
+async fn a_release_cancelled_during_the_revoke_still_audits_revoke_failed(pool: PgPool) {
+    let fake = fake_with(
+        "201 Created",
+        "HANG_FIRST",
+        Some((
+            pool.clone(),
+            "UPDATE jobs SET lease_expires_at = now() - interval '1 minute'",
+        )),
+        None,
+    )
+    .await;
+    let w = world(pool, Some(client(&fake))).await;
+    w.seed(true).await;
+    let cancelled = tokio::time::timeout(
+        Duration::from_millis(1500),
+        w.creds.release_for_job(JOB, 1, "alpha"),
+    )
+    .await;
+    assert!(
+        cancelled.is_err(),
+        "the release finished instead of hanging"
+    );
+    eventually("the revoke_failed row after the cancel", || async {
+        w.outcomes().await.contains(&"revoke_failed".to_owned())
+    })
+    .await;
+    assert_eq!(fake.revokes(), 2);
+}
+
+#[sqlx::test]
+async fn the_rate_window_is_measured_from_the_count_not_from_the_transaction_start(pool: PgPool) {
+    let fake = fake("201 Created", None).await;
+    let w = world(pool, Some(client(&fake))).await.rate_limited(1);
+    w.seed(true).await;
+    w.plant_attempts(w.alice, 1, 58).await;
+    let mut holder = w.pool.begin().await.unwrap();
+    sqlx::query("SELECT 1 FROM credentials WHERE kind = 'github_app' FOR UPDATE")
+        .execute(&mut *holder)
+        .await
+        .unwrap();
+    let creds = w.creds.clone();
+    let release = tokio::spawn(async move { creds.release_for_job(JOB, 1, "alpha").await });
+    tokio::time::sleep(Duration::from_secs(3)).await;
+    holder.rollback().await.unwrap();
+    let outcome = release.await.unwrap();
+    assert!(outcome.is_ok(), "{:?}", outcome.err());
+    assert_eq!(fake.mints(), 1);
+}
+
+#[sqlx::test]
+async fn a_credential_tombstoned_during_the_mint_revokes_the_token_and_writes_no_use_row(
+    pool: PgPool,
+) {
+    let probe = fake(
+        "201 Created",
+        Some((
+            pool.clone(),
+            "UPDATE credentials SET tombstoned_at = now() WHERE kind = 'github_app'",
+        )),
+    )
+    .await;
+    let w = world(pool, Some(client(&probe))).await;
+    w.seed(true).await;
+    let err = w.release_outcome().await.unwrap_err();
+    assert!(matches!(err, StoreError::NotFound), "{err:?}");
+    assert_eq!(
+        w.rows().await,
+        [
+            ("attempt".to_owned(), None),
+            (
+                "denied".to_owned(),
+                Some("credential gone after mint".to_owned())
+            ),
+            ("revoked".to_owned(), None),
+        ]
+    );
+    assert_eq!(w.uses().await, 0);
+}
+
+struct LogBuffer(Arc<Mutex<Vec<u8>>>);
+
+impl Write for LogBuffer {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .extend_from_slice(buf);
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+#[test]
+fn a_guard_dropped_without_a_runtime_logs_the_unrevoked_token() {
+    let runtime = tokio::runtime::Runtime::new().unwrap();
+    let guard = runtime.block_on(async {
+        let pool = PgPool::connect_lazy("postgres://u:p@127.0.0.1:1/none").unwrap();
+        let bot = BotIdentity::new(BOT_NAME, BOT_EMAIL).unwrap();
+        let lane = AppLane::new(
+            app_key(),
+            "12345".to_owned(),
+            AppClient::plain("127.0.0.1:1".parse().unwrap(), Limits::default()),
+            bot,
+        );
+        super::store::armed_guard_for_test(
+            lane,
+            pool,
+            super::app_mint::InstallationToken::for_test(TOKEN, 1),
+        )
+    });
+    let logged = Arc::new(Mutex::new(Vec::new()));
+    let sink = Arc::clone(&logged);
+    let subscriber = tracing_subscriber::fmt()
+        .with_writer(move || LogBuffer(Arc::clone(&sink)))
+        .with_ansi(false)
+        .finish();
+    tracing::subscriber::with_default(subscriber, || drop(guard));
+    let text = String::from_utf8(logged.lock().unwrap().clone()).unwrap();
+    assert!(text.contains("ERROR"), "{text}");
+    assert!(text.contains("attempt-under-test"), "{text}");
+    assert!(!text.contains(TOKEN), "{text}");
+}
+
+fn bare_lane(fake: &Fake) -> AppLane {
+    let bot = BotIdentity::new(BOT_NAME, BOT_EMAIL).unwrap();
+    AppLane::new(app_key(), "12345".to_owned(), client(fake), bot)
+}
+
+#[tokio::test]
+async fn the_app_id_check_matches_mismatches_and_degrades_to_unchecked() {
+    use super::store::AppIdCheck;
+    let fake = fake("201 Created", None).await;
+    let lane = bare_lane(&fake);
+    assert_eq!(lane.check_app_id().await, AppIdCheck::Match);
+    *fake.app.lock().unwrap() = ("200 OK", r#"{"id":999}"#.to_owned());
+    assert_eq!(lane.check_app_id().await, AppIdCheck::Mismatch);
+    *fake.app.lock().unwrap() = ("500 Internal Server Error", String::new());
+    assert_eq!(lane.check_app_id().await, AppIdCheck::Unchecked);
+    *fake.app.lock().unwrap() = ("200 OK", "not json".to_owned());
+    assert_eq!(lane.check_app_id().await, AppIdCheck::Unchecked);
 }

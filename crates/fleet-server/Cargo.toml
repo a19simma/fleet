@@ -37,6 +37,7 @@ webpki-roots = "1.0.9"
 hyper-util = { version = "=0.1.21", features = ["tokio", "server-auto", "server-graceful", "service", "http1", "http2"] }
 zeroize.workspace = true
 ring = "0.17.14"
+rustix.workspace = true
 pem = "4.0.0"
 sqlx = { version = "0.9.0", default-features = false, features = ["runtime-tokio", "tls-rustls-ring-webpki", "postgres", "migrate", "macros"] }
 argon2 = "0.5.3"

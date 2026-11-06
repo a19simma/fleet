@@ -65,7 +65,7 @@ To continue without the old key, users re-enter their credentials. Storing a cre
 DELETE FROM credentials;
 ```
 
-`credential_use` keeps its rows after a credential delete (migration 0019), so the audit history survives.
+`credential_use` keeps its rows after a credential delete (migration 0019), so the audit history survives. A `github_app` credential with mint history is tombstoned on delete, not removed, and the user cannot store a replacement. A save then answers `FAILED_PRECONDITION` with `credential was deleted and cannot be replaced`.
 
 ## What happens to credentials
 

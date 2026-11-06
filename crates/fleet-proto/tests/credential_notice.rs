@@ -4,8 +4,9 @@ use std::collections::BTreeSet;
 
 use fleet_proto::{
     CredentialNotice, ERR_CAPABILITY_NOT_GRANTED, ERR_GITHUB_REJECTED, ERR_NEEDS_USER_TOKEN,
-    PRECONDITION_APP_MINT, PRECONDITION_EXPIRED, PRECONDITION_NO_AGENT, PRECONDITION_NO_GITHUB,
-    PRECONDITION_NO_VERIFY_REPO, PRECONDITION_NOT_CONFIGURED,
+    PRECONDITION_APP_MINT, PRECONDITION_CREDENTIAL_TOMBSTONED, PRECONDITION_EXPIRED,
+    PRECONDITION_NO_AGENT, PRECONDITION_NO_GITHUB, PRECONDITION_NO_VERIFY_REPO,
+    PRECONDITION_NOT_CONFIGURED,
 };
 use tonic::{Code, Status};
 
@@ -32,6 +33,11 @@ fn pinned_texts() {
         "This credential kind needs the forge:github_app capability. Ask an admin to grant it."
     );
     assert_eq!(CredentialNotice::NoJob.code(), "no_job");
+    assert_eq!(CredentialNotice::Tombstoned.code(), "tombstoned");
+    assert_eq!(
+        CredentialNotice::Tombstoned.text(),
+        "This credential was deleted and cannot be replaced. Ask an admin for help."
+    );
 }
 
 #[test]
@@ -78,6 +84,11 @@ fn status_mapping() {
             Code::FailedPrecondition,
             PRECONDITION_APP_MINT,
             CredentialNotice::NoVerifier,
+        ),
+        (
+            Code::FailedPrecondition,
+            PRECONDITION_CREDENTIAL_TOMBSTONED,
+            CredentialNotice::Tombstoned,
         ),
         (Code::Unavailable, "x", CredentialNotice::Unavailable),
         (Code::Internal, "x", CredentialNotice::Failed),

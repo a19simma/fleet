@@ -9,14 +9,13 @@ use std::time::Duration;
 use axum::Router;
 use axum::routing::get;
 use fleet_server::auth::BearerAuth;
-use fleet_server::config::{Config, CredentialsState, GithubAppConfig, exposed_binds, is_loopback};
+use fleet_server::config::{Config, CredentialsState, exposed_binds, is_loopback};
 use fleet_server::cred::admin::{AdminError, SETUP_CODE_TTL_HOURS, parse_args, run as run_admin};
-use fleet_server::cred::app_jwt::AppKey;
 use fleet_server::cred::app_mint::AppClient;
 use fleet_server::cred::github::HttpsGithub;
 use fleet_server::cred::limiter::Limiter;
 use fleet_server::cred::password::BootstrapPassword;
-use fleet_server::cred::store::{AppLane, CredentialStore};
+use fleet_server::cred::store::{AppIdCheck, AppLane, CredentialStore};
 use fleet_server::cred::{CredentialService, Users};
 use fleet_server::reaper::{DEFAULT_REAP_PERIOD, run_reaper};
 use fleet_server::retention::run_retention;
@@ -104,7 +103,7 @@ async fn bootstrap_password(config: &Config, users: &Users) -> Result<BootstrapP
 async fn credential_service(
     config: &Config,
     pool: &sqlx::PgPool,
-    github_app: Option<AppKey>,
+    github_app: Option<AppLane>,
 ) -> Result<Option<CredentialService>, BoxError> {
     let rows_exist: bool = sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM credentials)")
         .fetch_one(pool)
@@ -117,13 +116,8 @@ async fn credential_service(
     tracing::info!("credential master key loaded");
     let github = HttpsGithub::new()?;
     let mut store = CredentialStore::new(pool.clone(), sealer);
-    if let (Some(key), Some(app)) = (github_app, config.github_app.as_ref()) {
-        store = store.with_github_app(AppLane::new(
-            key,
-            app.app_id_text(),
-            AppClient::new()?,
-            app.bot.clone(),
-        ));
+    if let Some(lane) = github_app {
+        store = store.with_github_app(lane);
     }
     Ok(Some(CredentialService::new(store, Arc::new(github))))
 }
@@ -144,22 +138,30 @@ async fn log_setup_path(users: &Users) -> Result<(), BoxError> {
     Ok(())
 }
 
-fn load_github_app(config: &Config) -> Result<Option<AppKey>, BoxError> {
-    let key = config
-        .github_app
-        .as_ref()
-        .map(GithubAppConfig::load_key)
-        .transpose()
+async fn load_github_app(config: &Config) -> Result<Option<AppLane>, BoxError> {
+    let Some(app) = config.github_app.as_ref() else {
+        return Ok(None);
+    };
+    let key = app
+        .load_key()
         .map_err(|err| format!("FLEET_GITHUB_APP_KEY_FILE: {err}"))?;
-    if key.is_some() {
-        tracing::info!("github app key loaded");
+    tracing::info!("github app key loaded");
+    let lane = AppLane::new(key, app.app_id_text(), AppClient::new()?, app.bot.clone());
+    match lane.check_app_id().await {
+        AppIdCheck::Mismatch => {
+            Err("FLEET_GITHUB_APP_KEY_FILE: the key does not belong to FLEET_GITHUB_APP_ID".into())
+        }
+        AppIdCheck::Match => Ok(Some(lane)),
+        AppIdCheck::Unchecked => {
+            tracing::warn!("github app id check skipped: GitHub could not be reached");
+            Ok(Some(lane))
+        }
     }
-    Ok(key)
 }
 
 async fn run() -> Result<(), BoxError> {
     let config = Config::from_env()?;
-    let github_app = load_github_app(&config)?;
+    let github_app = load_github_app(&config).await?;
     let options = PgConnectOptions::from_str(config.database_url.expose())?
         .options([("statement_timeout", STATEMENT_TIMEOUT_MS)]);
     let pool = PgPoolOptions::new()

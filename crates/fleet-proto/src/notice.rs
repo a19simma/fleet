@@ -8,7 +8,7 @@ use tonic::{Code, Status};
 
 use crate::{
     ERR_CAPABILITY_NOT_GRANTED, ERR_GITHUB_REJECTED, ERR_NEEDS_USER_TOKEN,
-    PRECONDITION_NO_VERIFY_REPO, PRECONDITION_NOT_CONFIGURED,
+    PRECONDITION_CREDENTIAL_TOMBSTONED, PRECONDITION_NO_VERIFY_REPO, PRECONDITION_NOT_CONFIGURED,
 };
 
 /// One outcome of a credential operation, as shown to a person.
@@ -42,6 +42,8 @@ pub enum CredentialNotice {
     NotConfigured,
     /// The caller authenticated with the shared token, which has no user.
     UserTokenRequired,
+    /// The credential was deleted and kept as a tombstone, so it cannot be replaced.
+    Tombstoned,
     /// Any other failure.
     Failed,
 }
@@ -63,6 +65,7 @@ impl CredentialNotice {
         Self::CapabilityRequired,
         Self::NotConfigured,
         Self::UserTokenRequired,
+        Self::Tombstoned,
         Self::Failed,
     ];
 
@@ -84,6 +87,7 @@ impl CredentialNotice {
             Self::CapabilityRequired => "capability_required",
             Self::NotConfigured => "not_configured",
             Self::UserTokenRequired => "user_token_required",
+            Self::Tombstoned => "tombstoned",
             Self::Failed => "failed",
         }
     }
@@ -120,6 +124,9 @@ impl CredentialNotice {
             Self::UserTokenRequired => {
                 "Credentials need a per-user API token, not the shared client token."
             }
+            Self::Tombstoned => {
+                "This credential was deleted and cannot be replaced. Ask an admin for help."
+            }
             Self::Failed => "The request failed.",
         }
     }
@@ -146,6 +153,9 @@ impl CredentialNotice {
             Code::FailedPrecondition if message == PRECONDITION_NO_VERIFY_REPO => Self::NoJob,
             Code::FailedPrecondition if message == PRECONDITION_NOT_CONFIGURED => {
                 Self::NotConfigured
+            }
+            Code::FailedPrecondition if message == PRECONDITION_CREDENTIAL_TOMBSTONED => {
+                Self::Tombstoned
             }
             Code::FailedPrecondition => Self::NoVerifier,
             _ => Self::Failed,

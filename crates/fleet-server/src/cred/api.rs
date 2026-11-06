@@ -52,6 +52,9 @@ fn store_status(err: &StoreError) -> Status {
         StoreError::NoJobRepo => {
             Status::failed_precondition(fleet_proto::PRECONDITION_NO_VERIFY_REPO)
         }
+        StoreError::Tombstoned => {
+            Status::failed_precondition(fleet_proto::PRECONDITION_CREDENTIAL_TOMBSTONED)
+        }
         StoreError::Seal(_) => {
             tracing::error!(%err, "credential sealing failed");
             Status::internal("credential store error")
@@ -108,8 +111,10 @@ impl CredentialService {
     /// leading zero) or an expiry outside the allowed range, `PERMISSION_DENIED` with
     /// `ERR_CAPABILITY_NOT_GRANTED` when the kind needs a capability the user lacks (the check
     /// runs at save, under `FOR SHARE`),
-    /// `RESOURCE_EXHAUSTED` past the per-user cap, `INTERNAL` when the value cannot be sealed
-    /// or a stored kind is unknown,
+    /// `RESOURCE_EXHAUSTED` past the per-user cap, `FAILED_PRECONDITION` with
+    /// `PRECONDITION_CREDENTIAL_TOMBSTONED` when the user's credential of this kind was deleted
+    /// and kept as a tombstone, `INTERNAL` when the value cannot be sealed or a stored kind is
+    /// unknown,
     /// `UNAVAILABLE` when GitHub or storage cannot answer. Nothing is stored on any error.
     pub async fn put(
         &self,
@@ -189,12 +194,13 @@ impl CredentialService {
         Ok(ListCredentialsReply { credentials })
     }
 
-    /// Deletes a credential of `user_id`.
+    /// Deletes a credential of `user_id`. A credential with mint history is tombstoned, not
+    /// removed, and cannot be replaced.
     ///
     /// # Errors
     ///
-    /// `NOT_FOUND` when the id is unknown or belongs to another user, `UNAVAILABLE` when
-    /// storage fails.
+    /// `NOT_FOUND` when the id is unknown, belongs to another user or is already tombstoned,
+    /// `UNAVAILABLE` when storage fails.
     pub async fn delete(
         &self,
         user_id: i64,
@@ -264,17 +270,17 @@ impl CredentialService {
     ///
     /// A `github_pat` is checked with a user lookup. A `github_app` mints one installation
     /// token, revokes it and drops it, so the reply holds no token text: `valid` is true when
-    /// the mint succeeded and false on any mint failure (lane absent, malformed id, GitHub
-    /// refusal).
+    /// the mint succeeded and the revoke was accepted, and false on any mint failure (lane
+    /// absent, malformed id, GitHub refusal) and when GitHub refuses the revoke.
     ///
     /// # Errors
     ///
-    /// `NOT_FOUND` for an unknown or foreign id, `FAILED_PRECONDITION` for a kind without a
-    /// verifier and, for `github_app`, when the user has no Job to scope the mint to,
-    /// `PERMISSION_DENIED` with `ERR_CAPABILITY_NOT_GRANTED` when a `github_app` owner lacks
-    /// the capability, `INTERNAL` when a sealed value cannot be opened or a stored kind is
-    /// unknown, `UNAVAILABLE`
-    /// when GitHub or storage cannot answer.
+    /// `NOT_FOUND` for an unknown, foreign or tombstoned id, `FAILED_PRECONDITION` for a kind
+    /// without a verifier and, for `github_app`, when the user has no Job to scope the mint to
+    /// and with `PRECONDITION_APP_MINT_CAP` when the per-Job mint cap or the per-User mint rate
+    /// limit is reached, `PERMISSION_DENIED` with `ERR_CAPABILITY_NOT_GRANTED` when a
+    /// `github_app` owner lacks the capability, `INTERNAL` when a sealed value cannot be opened
+    /// or a stored kind is unknown, `UNAVAILABLE` when GitHub or storage cannot answer.
     pub async fn verify(
         &self,
         user_id: i64,
@@ -286,7 +292,11 @@ impl CredentialService {
             .await
             .map_err(|e| store_status(&e))?;
         if kind == CredentialKind::GithubApp {
-            return match self.store.probe_app(user_id, &value).await {
+            return match self
+                .store
+                .probe_app(user_id, row_id(request.id)?, &value)
+                .await
+            {
                 Ok(()) => Ok(VerifyCredentialReply {
                     valid: true,
                     login: None,

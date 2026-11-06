@@ -12,7 +12,7 @@
 
 use std::fmt;
 use std::io::Read;
-use std::os::unix::fs::PermissionsExt;
+use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::Path;
 
 use ring::rand::SystemRandom;
@@ -34,6 +34,8 @@ pub enum AppKeyError {
     Mode,
     /// The key path is not a regular file.
     NotFile,
+    /// The key file is owned by another user than the server.
+    Owner,
     /// The file is over 16 KiB, or is not a PEM RSA private key `ring` accepts.
     Key,
 }
@@ -44,6 +46,7 @@ impl fmt::Display for AppKeyError {
             Self::Read => "github app key file unreadable",
             Self::Mode => "github app key file must not be group or other accessible",
             Self::NotFile => "github app key path is not a regular file",
+            Self::Owner => "github app key file must be owned by the server user",
             Self::Key => "github app key is not a PEM RSA private key of at least 2048 bits",
         })
     }
@@ -108,10 +111,10 @@ impl fmt::Debug for AppKey {
 impl AppKey {
     /// Loads a PKCS#1 or PKCS#8 RSA PEM key from `path`.
     ///
-    /// Refuses a path that is not a regular file, a file that group or other can access
-    /// (`mode & 0o077`), anything that is not RSA, and RSA under 2048 bits. Symlinks are
-    /// followed because Kubernetes Secret mounts are symlinks. The file should be owned by the
-    /// server's uid and writable by no one else. The file bytes live in a preallocated
+    /// Refuses a path that is not a regular file, a file owned by another uid than the server's
+    /// effective uid (SEC-007), a file that group or other can access (`mode & 0o077`),
+    /// anything that is not RSA, and RSA under 2048 bits. Symlinks are followed because
+    /// Kubernetes Secret mounts are symlinks. The file bytes live in a preallocated
     /// `Zeroizing` buffer while parsing.
     ///
     /// # Errors
@@ -119,13 +122,27 @@ impl AppKey {
     /// Returns [`AppKeyError`]:
     /// - `Read` when the file cannot be opened or read.
     /// - `NotFile` when the path is not a regular file.
+    /// - `Owner` when the file belongs to another uid than the server's effective uid.
     /// - `Mode` when group or other can access the file.
-    /// - `Key` when the file is over 16 KiB or holds no usable RSA key (`ring` accepts RSA 2048 to 8192 bits).
+    /// - `Key` when the file is over 16 KiB or holds no usable RSA key (`ring` accepts RSA
+    ///   2048 to 8192 bits).
     pub fn load(path: &Path) -> Result<Self, AppKeyError> {
+        Self::load_as(path, rustix::process::geteuid().as_raw())
+    }
+
+    /// Same as [`AppKey::load`], with the uid the file must belong to given by the caller.
+    ///
+    /// # Errors
+    ///
+    /// Same as [`AppKey::load`].
+    pub fn load_as(path: &Path, owner: u32) -> Result<Self, AppKeyError> {
         let mut file = std::fs::File::open(path).map_err(|_| AppKeyError::Read)?;
         let meta = file.metadata().map_err(|_| AppKeyError::Read)?;
         if !meta.is_file() {
             return Err(AppKeyError::NotFile);
+        }
+        if meta.uid() != owner {
+            return Err(AppKeyError::Owner);
         }
         if meta.permissions().mode() & 0o077 != 0 {
             return Err(AppKeyError::Mode);
@@ -203,7 +220,7 @@ mod tests {
     use openssl::nid::Nid;
     use openssl::pkey::PKey;
     use openssl::rsa::Rsa;
-    use std::os::unix::fs::PermissionsExt;
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
     use std::sync::atomic::{AtomicU64, Ordering};
 
     static COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -310,6 +327,27 @@ mod tests {
         let k = r.unwrap();
         assert_eq!(k.sign("1", 59).unwrap_err(), SignError::Clock);
         assert!(k.sign("1", 60).is_ok());
+    }
+
+    #[test]
+    fn a_key_file_owned_by_another_user_is_refused() {
+        let fx = Fixture::new("owner");
+        let p = fx.file(&rsa(2048).private_key_to_pem().unwrap(), 0o400);
+        let me = std::fs::metadata(&p).unwrap().uid();
+        assert_eq!(
+            AppKey::load_as(&p, me.wrapping_add(1)).unwrap_err(),
+            AppKeyError::Owner
+        );
+        assert!(AppKey::load_as(&p, me).is_ok());
+    }
+
+    #[test]
+    fn load_accepts_a_file_owned_by_the_server_user() {
+        let fx = Fixture::new("own");
+        let p = fx.file(&rsa(2048).private_key_to_pem().unwrap(), 0o400);
+        let me = std::fs::metadata(&p).unwrap().uid();
+        assert_eq!(me, rustix::process::geteuid().as_raw());
+        assert!(AppKey::load(&p).is_ok());
     }
 
     #[test]

@@ -21,20 +21,21 @@ The end-to-end check is in `crates/fleetd/tests/daemon_jobs.rs`: `an_app_job_com
 5. Generate a private key in the App settings. GitHub lets an App hold several keys at once, which the rotation below uses.
 6. Look up the bot id: `gh api '/users/<slug>[bot]' --jq .id`. The bot email is `<bot-id>+<slug>[bot]@users.noreply.github.com`.
 
-Not yet built, so do not rely on them: the installation allowlist, the repository allowlist, refresh of the mirror fetch and the broker token, a revoke that survives a daemon exit and the delete path that sets the credential tombstone (ADR-0058, Status; see Refresh, limits and audit). Until the repository allowlist exists, any holder of `forge:github_app` can mint a write token for any repository in the installation. Grant the capability with that in mind.
+Not yet built, so do not rely on them: the installation allowlist, the repository allowlist, refresh of the mirror fetch and the broker token, a revoke that survives a daemon exit (ADR-0058, Status; see Refresh, limits and audit). Until the repository allowlist exists, any holder of `forge:github_app` can mint a write token for any repository in the installation. Grant the capability with that in mind.
 
 ## Server variables
 
-Set all four together on the fleet-server Deployment. Unset, the lane is off and startup is unchanged.
+Set the id, the key file, the name and the email on the fleet-server Deployment, together with `FLEET_MASTER_KEY_FILE`. Unset, the lane is off and startup is unchanged.
 
 | Variable | Rule | Startup failure |
 | --- | --- | --- |
 | `FLEET_GITHUB_APP_ID` | 1 to 20 ASCII digits, no leading zero, within `u64`. | An invalid value, or `FLEET_GITHUB_APP_KEY_FILE` set without it, stops startup naming `FLEET_GITHUB_APP_ID`. |
 | `FLEET_GITHUB_APP_KEY_FILE` | Path to the PEM key. | `FLEET_GITHUB_APP_ID` set without it stops startup naming `FLEET_GITHUB_APP_KEY_FILE`. A bad file stops startup with `FLEET_GITHUB_APP_KEY_FILE:` and a fixed message, see below. |
+| `FLEET_MASTER_KEY_FILE` | Path to the credential master key file, see the credential key runbook. | Required when `FLEET_GITHUB_APP_ID` is set: without it startup stops naming `FLEET_MASTER_KEY_FILE` with `required when FLEET_GITHUB_APP_ID is set`. |
 | `FLEET_GITHUB_APP_BOT_NAME` | 1 to 64 characters from letters, digits, space, `.`, `_`, `-`, `[` and `]`. Starts alphanumeric, ends alphanumeric or `]`. | Missing or outside the grammar stops startup naming this variable. |
 | `FLEET_GITHUB_APP_BOT_EMAIL` | `<bot-id>+<slug>[bot]@users.noreply.github.com`: digits, `+`, lowercase letters, digits and `-`, `[bot]`, that domain. At most 128 bytes. | Missing or outside the grammar stops startup naming this variable. |
 
-The id and the key file go together: one without the other stops startup, and an empty value counts as unset. The name and the email are required once the id and key file are set. They are read only then, so a name or email set alone is ignored, not rejected. The server checks both against the identity grammar (SEC-006). fleetd checks them again before the clone and fails the Job on a bad identity, so a server bug cannot inject a hostile name.
+The id and the key file go together: one without the other stops startup, and an empty value counts as unset. The server makes both key paths absolute against its working directory at startup. After it loads the key it asks GitHub which App the key belongs to. A key for another App stops startup with `FLEET_GITHUB_APP_KEY_FILE: the key does not belong to FLEET_GITHUB_APP_ID`. When GitHub cannot be reached, the server logs a warning that the id check was skipped and starts. The name and the email are required once the id and key file are set. They are read only then, so a name or email set alone is ignored, not rejected. The server checks both against the identity grammar (SEC-006). fleetd checks them again before the clone and fails the Job on a bad identity, so a server bug cannot inject a hostile name.
 
 ## Mount the private key
 
@@ -46,14 +47,15 @@ The server loads the file once at startup and refuses it when:
 | --- | --- |
 | The file cannot be opened or read. | `github app key file unreadable` |
 | The path is not a regular file. | `github app key path is not a regular file` |
+| The file is owned by another uid than the server's effective uid. | `github app key file must be owned by the server user` |
 | `mode & 0o077` is not zero. | `github app key file must not be group or other accessible` |
 | The file is over 16 KiB, or is not a PEM RSA private key of 2048 to 8192 bits. | `github app key is not a PEM RSA private key of at least 2048 bits` |
 
-Why the mode check exists: the key mints tokens that write to every installed repository. A group or other readable file lets any other uid in the pod or on the node read it. Mode `0400` or `0600` passes. `0440` fails, because the group bit is inside `0o077`. The file should be owned by the server's uid and writable by no one else. The server does not check the owner, so that part is on the operator.
+Why the mode check exists: the key mints tokens that write to every installed repository. A group or other readable file lets any other uid in the pod or on the node read it. Mode `0400` or `0600` passes. `0440` fails, because the group bit is inside `0o077`. The server also refuses a file owned by another uid than its own effective uid, so a stolen copy placed by another user does not load. The file should be writable by no one else.
 
 Symlinks are followed, because Kubernetes Secret mounts are symlinks. The server checks the file the link points at. It accepts PKCS#1 (`RSA PRIVATE KEY`) and PKCS#8 (`PRIVATE KEY`) PEM.
 
-Unverified: whether a Secret volume can satisfy both rules in `infra/deployment.yaml`. That pod runs as uid 65532 with `fsGroup: 65532`, and the master key volume uses `defaultMode: 0440` for that reason. A Secret file is owned by root, so `0400` leaves a non-root server unable to read it, and Kubernetes can add group read for `fsGroup`, which the mode check refuses. Test this on the cluster before you rely on it. The two startup messages above tell the cases apart: `unreadable` means the uid cannot read it, `must not be group or other accessible` means the mode is too wide. If the mount cannot pass, a copy step into an `emptyDir` that sets the file to `0400` for uid 65532 is a candidate. It is not part of this repo and no image shell is available in the distroless server image, so that step would need its own container.
+The mode check and the owner check must both pass. A Secret file is owned by root, so a server running as uid 65532 (see `infra/deployment.yaml`, which also sets `fsGroup: 65532`) fails the owner check on a root-owned mount, whatever the mode. With mode `0400` and root as owner it also cannot read the file. Kubernetes can add group read for `fsGroup`, which the mode check refuses. The operator must make the file's owner the server uid, through the pod security context or the mount, and keep the mode at `0400` or `0600`. Unverified: no setting in this repo does this, and whether a Secret volume can satisfy both rules is untested. Test it on a live cluster before you rely on it. The startup messages above tell the cases apart: `unreadable` means the uid cannot read it, `must be owned by the server user` means the owner is wrong, `must not be group or other accessible` means the mode is too wide. If the mount cannot pass, a copy step into an `emptyDir` that sets the file to `0400` for uid 65532 is a candidate. It is not part of this repo and no image shell is available in the distroless server image, so that step would need its own container.
 
 ## Rotate the key
 
@@ -80,9 +82,9 @@ Running Jobs are not lost. The server never stores the token, so a restart does 
 
 ## Verify
 
-1. Submit one Job as that User against a repository the installation covers. `fleet credential verify` mints against the repository of the User's latest Job, so a User with no Job gets `FAILED_PRECONDITION` and the CLI notice for no job.
+1. Submit one Job as that User against a repository the installation covers. `fleet credential verify` mints against the repository of the User's latest Job and counts toward the per-Job cap and the per-User rate limit, so a User with no Job gets `FAILED_PRECONDITION` and the CLI notice for no job.
 2. Run `fleet credential list` to read the credential id, then `fleet credential verify <id>`.
-3. The server mints once, revokes the token best effort and returns no token text. Success prints `GitHub accepted the stored credential.`, and a refused token prints `GitHub refused the stored credential.`. Any mint failure prints the invalid token notice, with no detail. For the cause, read the server log and check, in order: the App id, the key, the installation id, the granted permissions and the repository.
+3. The server mints once and revokes the token, and returns no token text. A revoke GitHub refuses answers `valid: false`, so the CLI prints the refused notice. The call writes `attempt`, `minted` and `revoked` rows to `github_app_mint`. Success prints `GitHub accepted the stored credential.`, and a refused token prints `GitHub refused the stored credential.`. Any mint failure prints the invalid token notice, with no detail. For the cause, read the server log and check, in order: the App id, the key, the installation id, the granted permissions and the repository.
 4. Run an App Job to the end. The pull request shows the bot as author (see Unverified claims). `git log` on the pushed branch shows `<name>` and `<email>` from the server variables for author and committer.
 
 ## Refresh, limits and audit
@@ -94,7 +96,7 @@ Built (ADR-0058):
 - fleetd revokes the token a refresh replaced, and the held token when the Job ends, with `DELETE /installation/token`. The revoke is best effort with a 10 second bound. A failed revoke logs a fixed string and never fails the Job, so that token lives until its expiry.
 - Every mint writes rows to `github_app_mint`: `attempt`, then `minted`, `failed` or `denied`, and `revoked` or `revoke_failed` when the server revokes after a failed recheck.
 
-Not built: the installation and repository allowlists, refresh of the mirror fetch and the broker token, a revoke that survives a daemon exit, and the delete path that sets the credential tombstone.
+Not built: the installation and repository allowlists, refresh of the mirror fetch and the broker token, and a revoke that survives a daemon exit.
 
 When the cap is hit, the step fails with the Job reason `github app token limit reached`. A plain mint failure reports `credentials could not be fetched` instead. A refresh whose mint fails keeps the last good token until it expires. To see the cause, list the denied rows. The table has no user column, so join through the credential:
 

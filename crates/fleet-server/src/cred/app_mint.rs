@@ -213,6 +213,16 @@ impl fmt::Debug for AppClient {
     }
 }
 
+#[cfg(test)]
+impl InstallationToken {
+    pub(crate) fn for_test(value: &str, expires_at: u64) -> Self {
+        Self {
+            value: Zeroizing::new(value.to_owned()),
+            expires_at,
+        }
+    }
+}
+
 impl AppClient {
     /// Builds the client for `https://api.github.com` with the bundled web roots.
     ///
@@ -298,6 +308,21 @@ impl AppClient {
                 Err(MintError::Invalid { reason, revoke })
             }
         }
+    }
+
+    /// Reads the App id GitHub reports for the key behind `jwt`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`MintError`]: `Setup` when the request cannot be built, `Status`, `Timeout`,
+    /// `Transport` or `TooLarge` for a failed call, and `Malformed` when the reply holds no
+    /// numeric `id`.
+    pub async fn app_id(&self, jwt: &AppJwt) -> Result<u64, MintError> {
+        let request = self.request(Method::GET, "/app", jwt.expose(), Vec::new())?;
+        let bytes = self.send(request, StatusCode::OK).await?;
+        serde_json::from_slice::<AppIdOnly>(&bytes)
+            .map(|reply| reply.id)
+            .map_err(|_| MintError::Malformed)
     }
 
     /// Revokes `token` with `DELETE /installation/token`.
@@ -473,6 +498,11 @@ impl<'de> Deserialize<'de> for Permissions {
 #[derive(Deserialize)]
 struct RawRepository {
     name: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct AppIdOnly {
+    id: u64,
 }
 
 #[derive(Deserialize)]
@@ -1241,5 +1271,47 @@ mod tests {
         let token = mint(&fake).await.unwrap();
         assert_eq!(format!("{token:?}"), "InstallationToken(..)");
         assert!(!format!("{:?}", client(&fake)).contains("127.0.0.1"));
+    }
+
+    #[tokio::test]
+    async fn app_id_reads_the_id_from_get_app() {
+        let fake = fake(vec![Script::Reply(http(
+            "200 OK",
+            "",
+            r#"{"id":12345,"slug":"fleet"}"#,
+        ))])
+        .await;
+        let id = client(&fake).app_id(&AppJwt::from_text(JWT)).await.unwrap();
+        assert_eq!(id, 12345);
+        let request = &fake.requests()[0];
+        assert!(request.starts_with("GET /app "), "{request}");
+        assert!(request.contains("Bearer jwt.header.sig"), "{request}");
+    }
+
+    #[tokio::test]
+    async fn app_id_refuses_a_status_other_than_200() {
+        let fake = fake(vec![Script::Reply(http("401 Unauthorized", "", ""))]).await;
+        let err = client(&fake)
+            .app_id(&AppJwt::from_text(JWT))
+            .await
+            .unwrap_err();
+        assert_eq!(err, MintError::Status(401));
+    }
+
+    #[tokio::test]
+    async fn app_id_refuses_a_body_without_a_numeric_id() {
+        for body in [
+            r#"{"slug":"fleet"}"#,
+            r#"{"id":"12345"}"#,
+            r#"{"id":-1}"#,
+            "not json",
+        ] {
+            let fake = fake(vec![Script::Reply(http("200 OK", "", body))]).await;
+            let err = client(&fake)
+                .app_id(&AppJwt::from_text(JWT))
+                .await
+                .unwrap_err();
+            assert_eq!(err, MintError::Malformed, "{body}");
+        }
     }
 }

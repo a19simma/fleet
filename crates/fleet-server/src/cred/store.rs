@@ -24,7 +24,7 @@ INSERT INTO credentials (user_id, kind, shape, ciphertext, key_id, fingerprint, 
 VALUES ($1, $2, $3, '\\x'::bytea, 'pending', $4, $5, to_timestamp($6::bigint / 1000.0)) \
 ON CONFLICT (user_id, kind) DO UPDATE SET shape = EXCLUDED.shape, \
 fingerprint = EXCLUDED.fingerprint, login = EXCLUDED.login, expires_at = EXCLUDED.expires_at \
-RETURNING id";
+WHERE credentials.tombstoned_at IS NULL RETURNING id";
 
 const LOCK_USER: &str = "SELECT pg_advisory_xact_lock($1)";
 
@@ -39,6 +39,18 @@ FROM credentials WHERE user_id = $1 AND tombstoned_at IS NULL ORDER BY id";
 
 const DELETE: &str = "DELETE FROM credentials WHERE id = $1 AND user_id = $2";
 
+const LOCK_FOR_DELETE: &str = "\
+SELECT id FROM credentials WHERE id = $1 AND user_id = $2 AND tombstoned_at IS NULL FOR UPDATE";
+
+const HAS_MINT_HISTORY: &str =
+    "SELECT EXISTS (SELECT 1 FROM github_app_mint WHERE credential_id = $1)";
+
+const TOMBSTONE: &str =
+    "UPDATE credentials SET tombstoned_at = now() WHERE id = $1 AND user_id = $2";
+
+const LIVE_CREDENTIAL: &str =
+    "SELECT id FROM credentials WHERE id = $1 AND tombstoned_at IS NULL FOR SHARE";
+
 const SELECT_FOR_USE: &str = "\
 SELECT kind, ciphertext, key_id FROM credentials WHERE id = $1 AND user_id = $2 AND tombstoned_at IS NULL FOR SHARE";
 
@@ -51,8 +63,8 @@ const SELECT_RELEASABLE: &str = "\
 SELECT id, kind, (expires_at IS NOT NULL AND expires_at <= now()) AS expired \
 FROM credentials WHERE user_id = $1 AND kind = ANY($2) AND tombstoned_at IS NULL ORDER BY id";
 
-const LATEST_JOB_REPO: &str =
-    "SELECT repo FROM jobs WHERE user_id = $1 ORDER BY created_at DESC, job_id DESC LIMIT 1";
+const LATEST_JOB: &str = "\
+SELECT job_id, repo FROM jobs WHERE user_id = $1 ORDER BY created_at DESC, job_id DESC LIMIT 1";
 
 const READ_CAPABILITY: &str =
     "SELECT user_id FROM user_capabilities WHERE user_id = $1 AND capability = $2 FOR SHARE";
@@ -67,7 +79,7 @@ const COUNT_ATTEMPTS: &str =
 
 const COUNT_USER_ATTEMPTS: &str = "\
 SELECT count(*) FROM github_app_mint m JOIN credentials c ON c.id = m.credential_id \
-WHERE c.user_id = $1 AND m.outcome = 'attempt' AND m.at > now() - $2::bigint * interval '1 second'";
+WHERE c.user_id = $1 AND m.outcome = 'attempt' AND m.at > clock_timestamp() - $2::bigint * interval '1 second'";
 
 const DENIED_RECENTLY: &str = "\
 SELECT EXISTS (SELECT 1 FROM github_app_mint WHERE job_id = $1 AND outcome = 'denied' \
@@ -123,6 +135,7 @@ const REASON_LEASE: &str = "lease lost after mint";
 const REASON_CAPABILITY: &str = "capability gone after mint";
 const REASON_OUTCOME: &str = "outcome write failed";
 const REASON_REVOKE: &str = "revoke refused";
+const REASON_CREDENTIAL: &str = "credential gone after mint";
 
 #[derive(Clone)]
 struct MintRecord {
@@ -210,7 +223,7 @@ struct Armed {
 }
 
 impl Armed {
-    async fn revoke(self) {
+    async fn revoke(&self) -> bool {
         let revoked = self.lane.revoke(&self.token).await;
         let (outcome, reason) = if revoked {
             ("revoked", None)
@@ -220,6 +233,7 @@ impl Armed {
         self.record
             .outcome_pooled(&self.pool, &self.attempt_id, outcome, reason)
             .await;
+        revoked
     }
 }
 
@@ -228,10 +242,13 @@ struct RevokeGuard {
 }
 
 impl RevokeGuard {
-    async fn revoke(&mut self) {
-        if let Some(armed) = self.armed.take() {
-            armed.revoke().await;
-        }
+    async fn revoke(&mut self) -> bool {
+        let Some(armed) = &self.armed else {
+            return true;
+        };
+        let revoked = armed.revoke().await;
+        self.armed = None;
+        revoked
     }
 
     fn disarm(&mut self) -> Option<InstallationToken> {
@@ -245,8 +262,38 @@ impl Drop for RevokeGuard {
             return;
         };
         if let Ok(runtime) = tokio::runtime::Handle::try_current() {
-            runtime.spawn(armed.revoke());
+            runtime.spawn(async move {
+                armed.revoke().await;
+            });
+        } else {
+            tracing::error!(
+                attempt_id = %armed.attempt_id,
+                credential_id = armed.record.credential_id,
+                "github app token not revoked: guard dropped outside a runtime"
+            );
         }
+    }
+}
+
+#[cfg(test)]
+pub(super) fn armed_guard_for_test(
+    lane: AppLane,
+    pool: PgPool,
+    token: InstallationToken,
+) -> impl Drop {
+    RevokeGuard {
+        armed: Some(Armed {
+            lane: Arc::new(lane),
+            pool,
+            record: MintRecord {
+                credential_id: 1,
+                job_id: "job".to_owned(),
+                repo: "o/widget".to_owned(),
+                installation: "1".to_owned(),
+            },
+            attempt_id: "attempt-under-test".to_owned(),
+            token,
+        }),
     }
 }
 
@@ -281,6 +328,17 @@ struct Release<'a> {
     box_name: &'a str,
     user_id: i64,
     repo: &'a str,
+}
+
+/// The result of comparing the configured App id with the one GitHub reports for the key.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AppIdCheck {
+    /// GitHub reports the configured App id.
+    Match,
+    /// GitHub reports a different App id: the key belongs to another App.
+    Mismatch,
+    /// GitHub could not answer, so the key was not compared.
+    Unchecked,
 }
 
 /// The GitHub App mint lane: the parsed key, the App id, the token client and the bot identity
@@ -329,6 +387,24 @@ impl AppLane {
             Err(err) => {
                 tracing::warn!(error = %err, "github app token mint failed");
                 Err(StoreError::MintFailed)
+            }
+        }
+    }
+
+    /// Compares the configured App id with the one GitHub reports for the key.
+    pub async fn check_app_id(&self) -> AppIdCheck {
+        let Ok(now) = SystemTime::now().duration_since(UNIX_EPOCH) else {
+            return AppIdCheck::Unchecked;
+        };
+        let Ok(jwt) = self.key.sign(&self.app_id, now.as_secs()) else {
+            return AppIdCheck::Unchecked;
+        };
+        match self.client.app_id(&jwt).await {
+            Ok(id) if id.to_string() == self.app_id => AppIdCheck::Match,
+            Ok(_) => AppIdCheck::Mismatch,
+            Err(err) => {
+                tracing::warn!(error = %err, "github app id check failed");
+                AppIdCheck::Unchecked
             }
         }
     }
@@ -488,6 +564,9 @@ pub enum StoreError {
     MintCapReached,
     /// The owner has no Job whose repository a verify mint can be scoped to.
     NoJobRepo,
+    /// The credential was deleted and kept as a tombstone because it has mint history. A
+    /// `put` cannot replace it (ADR-0058, SEC-022).
+    Tombstoned,
     /// The database failed.
     Db(sqlx::Error),
 }
@@ -507,6 +586,7 @@ impl fmt::Display for StoreError {
             Self::MintFailed => f.write_str(fleet_proto::PRECONDITION_APP_MINT),
             Self::MintCapReached => f.write_str(fleet_proto::PRECONDITION_APP_MINT_CAP),
             Self::NoJobRepo => f.write_str(fleet_proto::PRECONDITION_NO_VERIFY_REPO),
+            Self::Tombstoned => f.write_str(fleet_proto::PRECONDITION_CREDENTIAL_TOMBSTONED),
             Self::Seal(e) => e.fmt(f),
             Self::Db(_) => f.write_str("credential store database error"),
         }
@@ -655,7 +735,8 @@ impl CredentialStore {
     /// expiry outside `0..=MAX_EXPIRY_MS`, [`StoreError::TooMany`] when a new kind would pass
     /// the per-user cap, [`StoreError::CapabilityDenied`] when the kind needs a capability the
     /// user lacks (checked before any write), [`StoreError::Seal`] when sealing fails and
-    /// [`StoreError::Db`] for a database failure.
+    /// [`StoreError::Tombstoned`] when the user's credential of this kind was deleted and kept
+    /// as a tombstone, and [`StoreError::Db`] for a database failure.
     pub async fn put(
         &self,
         user_id: i64,
@@ -692,8 +773,9 @@ impl CredentialStore {
             .bind(&print)
             .bind(&login)
             .bind(expires_at_ms)
-            .fetch_one(&mut *tx)
-            .await?;
+            .fetch_optional(&mut *tx)
+            .await?
+            .ok_or(StoreError::Tombstoned)?;
         let aad = Aad::new(&user_id.to_string(), &id.to_string(), kind);
         let sealed = self.sealer.seal(&aad, value.expose())?;
         sqlx::query(STORE_SEALED)
@@ -739,20 +821,36 @@ impl CredentialStore {
         Ok(out)
     }
 
-    /// Deletes the user's credential. The delete is final: use rows stay.
+    /// Deletes the user's credential. Use rows stay.
+    ///
+    /// A credential with mint history in `github_app_mint` is tombstoned instead of removed:
+    /// the row stays, no read returns it and a `put` of the same kind is refused (ADR-0058,
+    /// SEC-022). The history check runs under `FOR UPDATE` on the row, the lock every mint
+    /// takes before it writes its first audit row. Any other credential is removed.
     ///
     /// # Errors
     ///
-    /// Returns [`StoreError::NotFound`] when the id is unknown or owned by another user.
+    /// Returns [`StoreError::NotFound`] when the id is unknown, owned by another user or
+    /// already tombstoned, and [`StoreError::Db`] for a database failure.
     pub async fn delete(&self, user_id: i64, credential_id: i64) -> Result<(), StoreError> {
-        let done = sqlx::query(DELETE)
+        let mut tx = self.pool.begin().await?;
+        sqlx::query(LOCK_FOR_DELETE)
             .bind(credential_id)
             .bind(user_id)
-            .execute(&self.pool)
+            .fetch_optional(&mut *tx)
+            .await?
+            .ok_or(StoreError::NotFound)?;
+        let history: bool = sqlx::query_scalar(HAS_MINT_HISTORY)
+            .bind(credential_id)
+            .fetch_one(&mut *tx)
             .await?;
-        if done.rows_affected() == 0 {
-            return Err(StoreError::NotFound);
-        }
+        let statement = if history { TOMBSTONE } else { DELETE };
+        sqlx::query(statement)
+            .bind(credential_id)
+            .bind(user_id)
+            .execute(&mut *tx)
+            .await?;
+        tx.commit().await?;
         Ok(())
     }
 
@@ -760,8 +858,8 @@ impl CredentialStore {
     ///
     /// # Errors
     ///
-    /// Returns [`StoreError::NotFound`] when the id is unknown or owned by another user and
-    /// [`StoreError::Seal`] when the value cannot be opened.
+    /// Returns [`StoreError::NotFound`] when the id is unknown, owned by another user or tombstoned
+    /// and [`StoreError::Seal`] when the value cannot be opened.
     pub async fn open_for_verify(
         &self,
         user_id: i64,
@@ -851,7 +949,8 @@ impl CredentialStore {
     /// past its expiry. Returns [`StoreError::CapabilityDenied`] when the owner lacks the
     /// capability a stored kind needs, which also happens after the mint when the recheck
     /// fails. Returns [`StoreError::NoAgentCredential`] when the owner has none the agent
-    /// accepts. Returns [`StoreError::MintFailed`] when the App token cannot be minted.
+    /// accepts. Returns [`StoreError::NotFound`] when the credential row is gone or tombstoned
+    /// after the mint. Returns [`StoreError::MintFailed`] when the App token cannot be minted.
     /// Returns [`StoreError::MintCapReached`] when the Job already holds the cap of mint
     /// attempts or the User started the per-minute limit of them. Returns
     /// [`StoreError::Seal`] when a value cannot be opened and [`StoreError::Db`] for a
@@ -961,7 +1060,7 @@ impl CredentialStore {
 
     async fn mint_released(
         &self,
-        mut tx: sqlx::Transaction<'_, sqlx::Postgres>,
+        tx: sqlx::Transaction<'_, sqlx::Postgres>,
         release: &Release<'_>,
         app: AppCredential,
         mut released: Vec<ReleasedCredential>,
@@ -987,27 +1086,7 @@ impl CredentialStore {
             repo: repo.to_owned(),
             installation: installation.to_string(),
         };
-        let attempts: i64 = sqlx::query_scalar(COUNT_ATTEMPTS)
-            .bind(job_id)
-            .fetch_one(&mut *tx)
-            .await?;
-        if attempts >= i64::from(self.mint_cap) {
-            self.deny(&mut tx, &record, REASON_CAP).await?;
-            tx.commit().await?;
-            return Err(StoreError::MintCapReached);
-        }
-        let recent: i64 = sqlx::query_scalar(COUNT_USER_ATTEMPTS)
-            .bind(user_id)
-            .bind(MINT_RATE_WINDOW_SECS)
-            .fetch_one(&mut *tx)
-            .await?;
-        if recent >= i64::from(self.user_rate) {
-            self.deny(&mut tx, &record, REASON_USER_RATE).await?;
-            tx.commit().await?;
-            return Err(StoreError::MintCapReached);
-        }
-        let attempt_id = record.root(&mut tx, "attempt", None).await?;
-        tx.commit().await?;
+        let attempt_id = self.admit(tx, &record, user_id).await?;
         let token = match lane.mint(&released, repo).await {
             Ok(token) => token,
             Err(err) => {
@@ -1045,6 +1124,7 @@ impl CredentialStore {
             let (outcome, reason) = match err {
                 StoreError::LeaseDenied => ("denied", REASON_LEASE),
                 StoreError::CapabilityDenied => ("denied", REASON_CAPABILITY),
+                StoreError::NotFound => ("denied", REASON_CREDENTIAL),
                 _ => ("failed", REASON_OUTCOME),
             };
             record
@@ -1062,6 +1142,36 @@ impl CredentialStore {
             }
         }
         Ok(released)
+    }
+
+    async fn admit(
+        &self,
+        mut tx: sqlx::Transaction<'_, sqlx::Postgres>,
+        record: &MintRecord,
+        user_id: i64,
+    ) -> Result<String, StoreError> {
+        let attempts: i64 = sqlx::query_scalar(COUNT_ATTEMPTS)
+            .bind(&record.job_id)
+            .fetch_one(&mut *tx)
+            .await?;
+        if attempts >= i64::from(self.mint_cap) {
+            self.deny(&mut tx, record, REASON_CAP).await?;
+            tx.commit().await?;
+            return Err(StoreError::MintCapReached);
+        }
+        let recent: i64 = sqlx::query_scalar(COUNT_USER_ATTEMPTS)
+            .bind(user_id)
+            .bind(MINT_RATE_WINDOW_SECS)
+            .fetch_one(&mut *tx)
+            .await?;
+        if recent >= i64::from(self.user_rate) {
+            self.deny(&mut tx, record, REASON_USER_RATE).await?;
+            tx.commit().await?;
+            return Err(StoreError::MintCapReached);
+        }
+        let attempt_id = record.root(&mut tx, "attempt", None).await?;
+        tx.commit().await?;
+        Ok(attempt_id)
     }
 
     async fn deny(
@@ -1106,6 +1216,11 @@ impl CredentialStore {
             .ok_or(StoreError::LeaseDenied)?;
         self.require_capability(&mut tx, user_id, CredentialKind::GithubApp)
             .await?;
+        sqlx::query(LIVE_CREDENTIAL)
+            .bind(record.credential_id)
+            .fetch_optional(&mut *tx)
+            .await?
+            .ok_or(StoreError::NotFound)?;
         record_uses(&mut tx, ids, job_id).await?;
         record
             .outcome(&mut tx, attempt_id, "minted", None, Some(expires_at))
@@ -1117,17 +1232,30 @@ impl CredentialStore {
     /// Mints one installation token for a stored `github_app` credential and drops it.
     ///
     /// The token is scoped to the repository of the user's most recent Job (ADR-0058, SEC-009).
-    /// The capability is checked in a short transaction under `FOR SHARE`, the transaction
-    /// commits, and then the mint runs: no row lock is held across the network call. The token
-    /// is revoked best effort and never leaves this function. No use row is written.
+    /// A probe is a mint like any other and takes the same gate as a release. A short
+    /// transaction checks the capability under `FOR SHARE`, takes `FOR UPDATE` on the credential
+    /// row and counts attempts against the cap of that Job and against the per-User rate limit.
+    /// Under both limits it writes an `attempt` row and commits, and then the mint runs: no row
+    /// lock is held across the network call. A mint failure writes `failed`. A mint writes
+    /// `minted`, and the revoke then writes `revoked` or `revoke_failed`. A guard revokes the
+    /// token when this future is dropped between the mint and the revoke. The token never
+    /// leaves this function. No use row is written.
     ///
     /// # Errors
     ///
     /// Returns [`StoreError::CapabilityDenied`] when the user lacks the capability,
-    /// [`StoreError::NoJobRepo`] when the user has no Job, [`StoreError::MintFailed`] when the
-    /// lane is absent, the installation id is malformed or the mint fails, and
-    /// [`StoreError::Db`] for a database failure.
-    pub async fn probe_app(&self, user_id: i64, installation: &Secret) -> Result<(), StoreError> {
+    /// [`StoreError::NotFound`] when the credential is gone or tombstoned,
+    /// [`StoreError::NoJobRepo`] when the user has no Job, [`StoreError::MintCapReached`] when
+    /// that Job holds the cap of attempts or the User started the per-minute limit of them,
+    /// [`StoreError::MintFailed`] when the lane is absent, the installation id is malformed,
+    /// the mint fails or GitHub refuses the revoke, and [`StoreError::Db`] for a database
+    /// failure.
+    pub async fn probe_app(
+        &self,
+        user_id: i64,
+        credential_id: i64,
+        installation: &Secret,
+    ) -> Result<(), StoreError> {
         let installation = std::str::from_utf8(installation.expose())
             .ok()
             .and_then(|text| text.parse::<u64>().ok())
@@ -1136,15 +1264,56 @@ impl CredentialStore {
         let mut tx = self.pool.begin().await?;
         self.require_capability(&mut tx, user_id, CredentialKind::GithubApp)
             .await?;
-        let repo: String = sqlx::query_scalar(LATEST_JOB_REPO)
+        sqlx::query(LOCK_CREDENTIAL)
+            .bind(credential_id)
+            .fetch_optional(&mut *tx)
+            .await?
+            .ok_or(StoreError::NotFound)?;
+        let (job_id, repo): (String, String) = sqlx::query_as(LATEST_JOB)
             .bind(user_id)
             .fetch_optional(&mut *tx)
             .await?
             .ok_or(StoreError::NoJobRepo)?;
-        tx.commit().await?;
-        let token = lane.mint_installation(installation, &repo).await?;
-        lane.revoke(&token).await;
-        Ok(())
+        let record = MintRecord {
+            credential_id,
+            job_id,
+            repo,
+            installation: installation.to_string(),
+        };
+        let attempt_id = self.admit(tx, &record, user_id).await?;
+        let token = match lane.mint_installation(installation, &record.repo).await {
+            Ok(token) => token,
+            Err(err) => {
+                record
+                    .outcome_pooled(&self.pool, &attempt_id, "failed", Some(REASON_MINT_FAILED))
+                    .await;
+                return Err(err);
+            }
+        };
+        let expires_at = token.expires_at();
+        let mut guard = RevokeGuard {
+            armed: Some(Armed {
+                lane,
+                pool: self.pool.clone(),
+                record: record.clone(),
+                attempt_id: attempt_id.clone(),
+                token,
+            }),
+        };
+        let minted = async {
+            let mut conn = self.pool.acquire().await?;
+            record
+                .outcome(&mut conn, &attempt_id, "minted", None, Some(expires_at))
+                .await
+        }
+        .await;
+        let revoked = guard.revoke().await;
+        minted?;
+        if revoked {
+            Ok(())
+        } else {
+            Err(StoreError::MintFailed)
+        }
     }
 
     /// Unseals the user's credential for `job_id` and records the use in the same transaction.

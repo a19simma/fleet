@@ -943,6 +943,7 @@ dependencies = [
  "openssl",
  "pem",
  "ring",
+ "rustix",
  "rustls",
  "serde",
  "serde_json",

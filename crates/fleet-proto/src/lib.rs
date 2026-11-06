@@ -216,6 +216,11 @@ pub const PRECONDITION_APP_MINT_CAP: &str = "github app token limit reached";
 /// `FAILED_PRECONDITION` message: a `github_app` verify has no Job repository to scope its mint to.
 pub const PRECONDITION_NO_VERIFY_REPO: &str = "no job to verify the github app against";
 
+/// `FAILED_PRECONDITION` message: a `PutCredential` hit a credential that was deleted and kept as
+/// a tombstone because it has mint history (ADR-0058, SEC-022).
+pub const PRECONDITION_CREDENTIAL_TOMBSTONED: &str =
+    "credential was deleted and cannot be replaced";
+
 /// `FAILED_PRECONDITION` message: the server runs without a credential store.
 pub const PRECONDITION_NOT_CONFIGURED: &str = "credentials are not configured";
 
