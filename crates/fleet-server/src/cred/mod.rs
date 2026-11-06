@@ -2,6 +2,7 @@
 
 pub mod admin;
 pub mod api;
+pub mod app_jwt;
 pub mod capability;
 pub mod github;
 pub mod limiter;
