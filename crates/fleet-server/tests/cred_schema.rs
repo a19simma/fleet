@@ -372,6 +372,32 @@ async fn credential_without_mint_history_can_be_deleted(pool: PgPool) {
 }
 
 #[sqlx::test]
+async fn the_capability_check_accepts_forge_github_app_and_rejects_unknown_names(pool: PgPool) {
+    let admin = user(&pool, "admin").await.unwrap();
+    let alice = user(&pool, "alice").await.unwrap();
+    let grant = |cap: &'static str| {
+        sqlx::query(
+            "INSERT INTO user_capabilities (user_id, capability, granted_by) VALUES ($1, $2, $3)",
+        )
+        .bind(alice)
+        .bind(cap)
+        .bind(admin)
+        .execute(&pool)
+    };
+    grant("forge:github_app").await.unwrap();
+    grant("profile:tools").await.unwrap();
+    for bad in [
+        "forge:github_apps",
+        "FORGE:GITHUB_APP",
+        "forge:github_app ",
+        "",
+    ] {
+        let err = grant(bad).await.unwrap_err();
+        assert_eq!(code(&err), "23514", "{bad:?}");
+    }
+}
+
+#[sqlx::test]
 async fn unknown_kind_is_rejected(pool: PgPool) {
     let id = user(&pool, "alice").await.unwrap();
     let err = credential(&pool, id, "mystery_key", "static_secret")

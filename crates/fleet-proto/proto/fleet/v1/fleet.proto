@@ -641,8 +641,8 @@ message StreamShellLogChunk {
   ShellStatus status = 4;
 }
 
-// One capability a user holds. capability is the canonical text of fleet_core::capability,
-// today only "profile:tools". granted_by is the admin user id.
+// One capability a user holds. capability is the canonical text of fleet_core::capability
+// (profile:tools or forge:github_app). granted_by is the admin user id.
 message UserCapability {
   uint64 user_id = 1;
   string capability = 2;

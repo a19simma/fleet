@@ -148,8 +148,7 @@ const D_UNKNOWN_ITEM: &str = "the CLI can name any item id and the server refuse
 const D_DISABLED_ITEM: &str = "the CLI can name an admin-disabled item; the web form renders it without a toggle so it cannot be switched";
 const D_HOSTILE_PROMPT: &str =
     "both refuse a control character in the prompt, with different message text";
-const D_UNKNOWN_CAP: &str =
-    "the CLI names the capability; the web capability form only grants or revokes profile:tools";
+const D_UNKNOWN_CAP: &str = "both refuse the unknown capability as invalid, with different text";
 
 const ROWS: &[Row] = &[
     Row {
@@ -329,7 +328,7 @@ const ROWS: &[Row] = &[
         class: Class::Differs(
             D_UNKNOWN_CAP,
             Shape::Refused(Refusal::Invalid),
-            Shape::Absent,
+            Shape::Refused(Refusal::Invalid),
         ),
     },
     Row {
@@ -353,7 +352,7 @@ const ROWS: &[Row] = &[
         class: Class::Differs(
             D_UNKNOWN_CAP,
             Shape::Refused(Refusal::Invalid),
-            Shape::Absent,
+            Shape::Refused(Refusal::Invalid),
         ),
     },
 ];
@@ -1116,14 +1115,16 @@ async fn capability_row(
                 .await;
             cli_outcome(&result, Vec::new())
         }
-        Surface::Web if matches!(subject, Subject::NoCapability) => Outcome::Absent,
         Surface::Web => {
             let verb = if grant { "grant" } else { "revoke" };
             let reply = rig
                 .post(
                     who,
                     &format!("/users/{user}/capabilities"),
-                    &format!("action={verb}"),
+                    &format!(
+                        "action={verb}&capability={}",
+                        capability.replace(':', "%3A")
+                    ),
                 )
                 .await;
             web_outcome(&reply, Vec::new())

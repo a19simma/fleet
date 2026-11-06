@@ -10,6 +10,8 @@ use fleet_proto::{CAPABILITY_ADMIN_PATH, capability_from_wire, user_id_from_wire
 use prost::Message;
 
 const MIGRATION: &str = include_str!("../../fleet-server/migrations/0026_user_capabilities.sql");
+const LATEST_CHECK: &str =
+    include_str!("../../fleet-server/migrations/0034_capability_forge_github_app.sql");
 const PROTO: &str = include_str!("../proto/fleet/v1/fleet.proto");
 
 fn block<'a>(open: &str) -> &'a str {
@@ -188,8 +190,8 @@ fn user_id_range() {
 }
 
 #[test]
-fn the_migration_check_lists_exactly_the_core_capabilities() {
-    let list = MIGRATION
+fn the_latest_check_lists_every_capability() {
+    let list = LATEST_CHECK
         .split("capability IN (")
         .nth(1)
         .and_then(|rest| rest.split(')').next())

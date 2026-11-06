@@ -15,6 +15,10 @@ use crate::auth::ADMIN_REQUIRED;
 /// The capability that lets a user attach tools to a profile. Store and handlers share this name.
 pub const PROFILE_TOOLS: &str = "profile:tools";
 
+/// Refusal text for a credential kind whose capability the user lacks.
+pub const ERR_CAPABILITY_NOT_GRANTED: &str = "credential kind needs a capability the user lacks";
+/// The capability that gates the `github_app` credential kind (ADR-0058).
+pub const FORGE_GITHUB_APP: &str = "forge:github_app";
 /// Refusal text for a capability name outside the closed set.
 pub const REASON_UNKNOWN_CAPABILITY: &str = "unknown capability";
 /// Refusal text for a grant whose target user does not exist.
@@ -25,7 +29,7 @@ pub const REASON_NO_SUCH_ACTOR: &str = "no such acting user";
 pub const REASON_ADMIN_REQUIRED: &str = ADMIN_REQUIRED;
 const REASON_DB: &str = "capability store database error";
 
-const KNOWN: [&str; 1] = [PROFILE_TOOLS];
+const KNOWN: [&str; 2] = [PROFILE_TOOLS, FORGE_GITHUB_APP];
 
 const LOCK_USER: &str = "SELECT id FROM users WHERE id = $1 FOR SHARE";
 const LOCK_ACTOR: &str = "SELECT is_admin FROM users WHERE id = $1 FOR SHARE";

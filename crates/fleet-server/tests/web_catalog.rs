@@ -10,6 +10,7 @@ use std::fmt::Write as _;
 use std::net::SocketAddr;
 use std::time::Duration;
 
+use fleet_core::capability::Capability;
 use fleet_server::auth::BearerAuth;
 use fleet_server::config::Token;
 use fleet_server::cred::Users;
@@ -284,7 +285,16 @@ fn caps_path(user_id: i64) -> String {
 }
 
 fn toggle_body(session: &Session, action: &str) -> String {
-    format!("csrf={}&action={}", session.csrf, encode(action))
+    toggle_body_for(session, action, "profile:tools")
+}
+
+fn toggle_body_for(session: &Session, action: &str, capability: &str) -> String {
+    format!(
+        "csrf={}&action={}&capability={}",
+        session.csrf,
+        encode(action),
+        encode(capability)
+    )
 }
 
 fn csrf_body(session: &Session) -> String {
@@ -884,24 +894,110 @@ async fn revoke_removes_the_row(pool: PgPool) {
 }
 
 #[sqlx::test]
-async fn a_capability_field_cannot_pick_another_capability(pool: PgPool) {
+async fn an_unknown_or_missing_capability_is_refused_and_writes_nothing(pool: PgPool) {
     let h = Harness::start(pool).await;
     let root = h.session("root", 'b', true).await;
     let bob = h.session("bob", 'c', false).await;
-    let body = format!(
-        "{}&capability=admin%3Aeverything",
-        toggle_body(&root, "grant")
-    );
-    let (status, _) = h
-        .send(
+    let path = caps_path(bob.user_id);
+    let bodies = [
+        toggle_body_for(&root, "grant", "admin:everything"),
+        toggle_body_for(&root, "grant", "profile:tools "),
+        toggle_body_for(&root, "grant", "PROFILE:TOOLS"),
+        toggle_body_for(&root, "grant", ""),
+        toggle_body_for(&root, "revoke", "admin:everything"),
+        format!("csrf={}&action=grant", root.csrf),
+    ];
+    for body in &bodies {
+        let (status, _) = h.send("POST", &path, Some(&root.cookie), Some(body)).await;
+        assert_eq!(status, 400, "{body}");
+    }
+    assert_eq!(h.grants().await.len(), 0);
+    h.finish().await;
+}
+
+#[sqlx::test]
+async fn every_capability_can_be_granted_and_revoked_from_the_page(pool: PgPool) {
+    let h = Harness::start(pool).await;
+    let root = h.session("root", 'b', true).await;
+    let bob = h.session("bob", 'c', false).await;
+    let path = caps_path(bob.user_id);
+    let (_, _, page) = h.fetch("GET", &path, Some(&root.cookie), None).await;
+    for cap in Capability::ALL {
+        assert!(
+            page.contains(&format!("name=\"capability\" value=\"{}\"", cap.as_str())),
+            "{cap:?} {page}"
+        );
+    }
+    for only in Capability::ALL {
+        let (status, _) = h
+            .send(
+                "POST",
+                &path,
+                Some(&root.cookie),
+                Some(&toggle_body_for(&root, "grant", only.as_str())),
+            )
+            .await;
+        assert_eq!(status, 303);
+        let (_, _, page) = h.fetch("GET", &path, Some(&root.cookie), None).await;
+        for cap in Capability::ALL {
+            let (shown, hidden) = if cap == only {
+                ("Revoke", "Grant")
+            } else {
+                ("Grant", "Revoke")
+            };
+            assert!(
+                page.contains(&format!("{shown} {}", cap.as_str())),
+                "{only:?} {cap:?}"
+            );
+            assert!(
+                !page.contains(&format!("{hidden} {}", cap.as_str())),
+                "{only:?} {cap:?}"
+            );
+        }
+        h.send(
             "POST",
-            &caps_path(bob.user_id),
+            &path,
             Some(&root.cookie),
-            Some(&body),
+            Some(&toggle_body_for(&root, "revoke", only.as_str())),
         )
         .await;
-    assert_eq!(status, 303);
-    assert_eq!(h.grants().await[0].1, "profile:tools");
+    }
+    assert_eq!(h.grants().await.len(), 0);
+    for cap in Capability::ALL {
+        let name = cap.as_str();
+        let (status, location) = h
+            .send(
+                "POST",
+                &path,
+                Some(&root.cookie),
+                Some(&toggle_body_for(&root, "grant", name)),
+            )
+            .await;
+        assert_eq!((status, location.as_str()), (303, path.as_str()), "{name}");
+        let held: Vec<String> = h.grants().await.into_iter().map(|g| g.1).collect();
+        assert!(held.iter().any(|g| g == name), "{name} {held:?}");
+        let (_, _, page) = h.fetch("GET", &path, Some(&root.cookie), None).await;
+        assert!(page.contains(&format!("Revoke {name}")), "{name} {page}");
+        assert!(!page.contains(&format!("Grant {name}")), "{name} {page}");
+    }
+    assert_eq!(h.grants().await.len(), Capability::ALL.len());
+    for cap in Capability::ALL {
+        let name = cap.as_str();
+        let (status, _) = h
+            .send(
+                "POST",
+                &path,
+                Some(&root.cookie),
+                Some(&toggle_body_for(&root, "revoke", name)),
+            )
+            .await;
+        assert_eq!(status, 303, "{name}");
+        let held: Vec<String> = h.grants().await.into_iter().map(|g| g.1).collect();
+        assert!(!held.iter().any(|g| g == name), "{name} {held:?}");
+        let (_, _, page) = h.fetch("GET", &path, Some(&root.cookie), None).await;
+        assert!(page.contains(&format!("Grant {name}")), "{name} {page}");
+    }
+    assert_eq!(h.grants().await.len(), 0);
     h.finish().await;
 }
 

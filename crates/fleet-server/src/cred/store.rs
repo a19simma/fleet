@@ -5,12 +5,14 @@
 use std::fmt;
 use std::sync::Arc;
 
+use fleet_core::capability::Capability;
 use fleet_core::credential::{
     CredentialError, CredentialKind, CredentialShape, Secret, fingerprint, validate,
 };
 use fleet_proto::MAX_CREDENTIALS_PER_USER;
 use sqlx::{PgPool, Row};
 
+use super::capability::ERR_CAPABILITY_NOT_GRANTED;
 use super::github::MAX_EXPIRY_MS;
 use super::seal::{Aad, SealError, Sealer};
 
@@ -46,6 +48,9 @@ const SELECT_RELEASABLE: &str = "\
 SELECT id, kind, (expires_at IS NOT NULL AND expires_at <= now()) AS expired \
 FROM credentials WHERE user_id = $1 AND kind = ANY($2) AND tombstoned_at IS NULL ORDER BY id";
 
+const READ_CAPABILITY: &str =
+    "SELECT user_id FROM user_capabilities WHERE user_id = $1 AND capability = $2 FOR SHARE";
+
 const INSERT_USE: &str = "INSERT INTO credential_use (credential_id, job_id) VALUES ($1, $2)";
 
 /// One credential released to a Box for a leased Job.
@@ -64,6 +69,22 @@ impl fmt::Debug for ReleasedCredential {
             .field("kind", &self.kind)
             .field("shape", &self.shape)
             .finish_non_exhaustive()
+    }
+}
+
+/// The capability a User must hold to store or have released a credential of `kind`.
+///
+/// Only the `github_app` kind needs one: [`Capability::ForgeGithubApp`] (ADR-0058). The API
+/// refuses that kind at put before this check runs, until the save path lands.
+pub const fn required_capability(kind: CredentialKind) -> Option<Capability> {
+    match kind {
+        CredentialKind::GithubApp => Some(Capability::ForgeGithubApp),
+        CredentialKind::AnthropicApiKey
+        | CredentialKind::ClaudeSubscriptionToken
+        | CredentialKind::GithubPat
+        | CredentialKind::KimiMembershipKey
+        | CredentialKind::KimiPlatformKey
+        | CredentialKind::CodexApiKey => None,
     }
 }
 
@@ -121,6 +142,8 @@ pub enum StoreError {
     NoAgentCredential,
     /// A credential the job needs is past its expiry.
     Expired,
+    /// The owner lacks the capability the credential kind needs.
+    CapabilityDenied,
     /// The database failed.
     Db(sqlx::Error),
 }
@@ -136,6 +159,7 @@ impl fmt::Display for StoreError {
             Self::NoGithub => f.write_str("no github credential"),
             Self::NoAgentCredential => f.write_str("no agent credential"),
             Self::Expired => f.write_str("credential expired"),
+            Self::CapabilityDenied => f.write_str(ERR_CAPABILITY_NOT_GRANTED),
             Self::Seal(e) => e.fmt(f),
             Self::Db(_) => f.write_str("credential store database error"),
         }
@@ -168,6 +192,7 @@ pub struct CredentialStore {
     pool: PgPool,
     sealer: Arc<dyn Sealer>,
     limit: usize,
+    gate: fn(CredentialKind) -> Option<Capability>,
 }
 
 impl fmt::Debug for CredentialStore {
@@ -200,7 +225,34 @@ impl CredentialStore {
             pool,
             sealer,
             limit,
+            gate: required_capability,
         }
+    }
+
+    /// Replaces the map from credential kind to the capability it needs.
+    ///
+    /// A seam for tests: production uses [`required_capability`].
+    #[must_use]
+    pub fn with_capability_gate(mut self, gate: fn(CredentialKind) -> Option<Capability>) -> Self {
+        self.gate = gate;
+        self
+    }
+
+    async fn require_capability(
+        &self,
+        tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+        user_id: i64,
+        kind: CredentialKind,
+    ) -> Result<(), StoreError> {
+        let Some(capability) = (self.gate)(kind) else {
+            return Ok(());
+        };
+        let held = sqlx::query(READ_CAPABILITY)
+            .bind(user_id)
+            .bind(capability.as_str())
+            .fetch_optional(&mut **tx)
+            .await?;
+        held.map(|_| ()).ok_or(StoreError::CapabilityDenied)
     }
 
     /// Validates, seals and stores `value`, replacing the user's credential of the same kind.
@@ -208,9 +260,10 @@ impl CredentialStore {
     /// # Errors
     ///
     /// Returns [`StoreError::Invalid`] for a rejected value, [`StoreError::InvalidExpiry`] for an
-    /// expiry outside `0..=MAX_EXPIRY_MS`, [`StoreError::TooMany`] when a new kind would pass the
-    /// per-user cap, [`StoreError::Seal`] when sealing fails and [`StoreError::Db`] for a
-    /// database failure.
+    /// expiry outside `0..=MAX_EXPIRY_MS`, [`StoreError::TooMany`] when a new kind would pass
+    /// the per-user cap, [`StoreError::CapabilityDenied`] when the kind needs a capability the
+    /// user lacks (checked before any write), [`StoreError::Seal`] when sealing fails and
+    /// [`StoreError::Db`] for a database failure.
     pub async fn put(
         &self,
         user_id: i64,
@@ -227,6 +280,7 @@ impl CredentialStore {
         }
         let print = fingerprint(&value);
         let mut tx = self.pool.begin().await?;
+        self.require_capability(&mut tx, user_id, kind).await?;
         sqlx::query(LOCK_USER)
             .bind(user_id)
             .execute(&mut *tx)
@@ -376,6 +430,7 @@ impl CredentialStore {
     /// Returns [`StoreError::LeaseDenied`] when no job matches the lease,
     /// [`StoreError::NoGithub`] when the owner has no GitHub credential,
     /// [`StoreError::Expired`] when a needed credential is past its expiry,
+    /// [`StoreError::CapabilityDenied`] when the owner lacks the capability a stored kind needs,
     /// [`StoreError::NoAgentCredential`] when the owner has none the agent accepts,
     /// [`StoreError::Seal`] when a value cannot be opened and [`StoreError::Db`] for a
     /// database failure. No use row is written on any error.
@@ -411,6 +466,9 @@ impl CredentialStore {
             let name: String = row.try_get("kind")?;
             let expired: bool = row.try_get("expired")?;
             found.push((row.try_get::<i64, _>("id")?, kind_of(&name)?, expired));
+        }
+        for (_, kind, _) in &found {
+            self.require_capability(&mut tx, user_id, *kind).await?;
         }
         if !found
             .iter()

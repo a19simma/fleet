@@ -236,7 +236,7 @@ The `private` or `shared` setting of a **Profile**. A new Profile is `private`, 
 _Avoid_: access level, sharing mode
 
 **Capability**:
-A grant an **Admin** gives a **User**. The only one is `profile:tools`, needed to save or submit a **Profile** that lists `tools` or selects a `tool` **Catalog item**. A request under the **Client token** acts as the **Bootstrap user**, which holds the Capability only if an Admin grants it (ADR-0054).
+A grant an **Admin** gives a **User**. `profile:tools` is needed to save or submit a **Profile** that lists `tools` or selects a `tool` **Catalog item**. `forge:github_app` gates the `github_app` credential kind (ADR-0058). A request under the **Client token** acts as the **Bootstrap user**, which holds the Capability only if an Admin grants it (ADR-0054).
 _Avoid_: role, permission
 
 **Model allowlist**:
@@ -264,7 +264,7 @@ A shell command with no completion event. fleetd measures it as a `BgShell` **Sp
 _Avoid_: detached command, async shell
 
 **GitHub App credential**:
-The `github_app` **Credential kind**: a **User**'s installation id for the operator's GitHub App. The App id and private key are server config, never stored. Built: the kind, the installation id parser, the mint audit schema and the tombstone. Saving is refused until the capability check and the save path land (ADR-0058). Not built: minting, the capability, the config and fleetd (ADR-0058).
+The `github_app` **Credential kind**: a **User**'s installation id for the operator's GitHub App. The App id and private key are server config, never stored. Built: the kind, the installation id parser, the mint audit schema, the tombstone and the `forge:github_app` capability gate. `PutCredential` and the web form still refuse the kind until the save path lands (ADR-0058). Not built: minting, the config and fleetd (ADR-0058).
 _Avoid_: app token, app key
 
 **Installation token**:

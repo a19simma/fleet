@@ -51,4 +51,4 @@ ADR-0048 gates Profile `tools` with one server switch, `FLEET_ALLOW_PROFILE_TOOL
 
 ## Amendment (ADR-0058)
 
-ADR-0058 (proposed, not built) adds the capability `forge:github_app`. The server checks it at `PutCredential` for the `github_app` kind and live at release. Holders can mint write tokens for any repository in the installation, clamped to the Job repository.
+ADR-0058 (proposed, partly built) adds the capability `forge:github_app`. Built: the name, the migration 0034 CHECK that allows it, the admin page that grants and revokes it, and the credential store gate at put and live at release. `PutCredential` refuses the `github_app` kind before that gate runs until the save path lands. Holders can mint write tokens for any repository in the installation, clamped to the Job repository.

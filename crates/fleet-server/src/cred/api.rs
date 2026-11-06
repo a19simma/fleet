@@ -17,7 +17,7 @@ use tonic::Status;
 use super::github::{GithubApi, GithubError, GithubUser, MAX_EXPIRY_MS};
 use super::store::{CredentialStore, CredentialSummary, StoreError};
 
-/// The fixed refusal for a `github_app` save. Refused until the capability check and the save path land (ADR-0058).
+/// The fixed refusal for a `github_app` save. Refused until the save path lands (ADR-0058).
 pub const GITHUB_APP_REFUSED: &str = "github_app credentials cannot be stored yet";
 
 /// The credential RPC logic over a sealed store and a GitHub seam.
@@ -45,6 +45,9 @@ fn store_status(err: &StoreError) -> Status {
             Status::failed_precondition(fleet_proto::PRECONDITION_NO_AGENT)
         }
         StoreError::Expired => Status::failed_precondition(fleet_proto::PRECONDITION_EXPIRED),
+        StoreError::CapabilityDenied => {
+            Status::permission_denied(super::capability::ERR_CAPABILITY_NOT_GRANTED)
+        }
         StoreError::Seal(_) => {
             tracing::error!(%err, "credential sealing failed");
             Status::internal("credential store error")
@@ -90,9 +93,10 @@ impl CredentialService {
     ///
     /// `INVALID_ARGUMENT` for an unknown kind, an unsupported shape, an invalid value or a
     /// token GitHub refuses, `PERMISSION_DENIED` with [`GITHUB_APP_REFUSED`] for kind
-    /// `github_app` whatever the value (until the save path lands), `RESOURCE_EXHAUSTED` past the
-    /// per-user cap, `UNAVAILABLE` when GitHub or storage cannot answer. Nothing is stored on
-    /// any error.
+    /// `github_app` whatever the value (until the save path lands), `PERMISSION_DENIED` with
+    /// `ERR_CAPABILITY_NOT_GRANTED` when the kind needs a capability the user lacks,
+    /// `RESOURCE_EXHAUSTED` past the per-user cap, `UNAVAILABLE` when GitHub or storage cannot
+    /// answer. Nothing is stored on any error.
     pub async fn put(
         &self,
         user_id: i64,
@@ -193,7 +197,9 @@ impl CredentialService {
     ///
     /// # Errors
     ///
-    /// `PERMISSION_DENIED` with one fixed message for any lease mismatch, `FAILED_PRECONDITION`
+    /// `PERMISSION_DENIED` with `lease does not match` for any lease mismatch, and with
+    /// `ERR_CAPABILITY_NOT_GRANTED` when the owner lost the capability a stored kind needs,
+    /// `FAILED_PRECONDITION`
     /// when the owner has no GitHub credential, no credential the agent accepts, or a needed
     /// credential is expired, `UNAVAILABLE` when storage fails. Nothing is recorded on error.
     pub async fn job_credentials(

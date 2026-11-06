@@ -1,14 +1,17 @@
-//! Admin capability page: show whether one user holds `profile:tools` and toggle it.
+//! Admin capability page: show whether one user holds each capability and toggle each one.
 //!
-//! Both routes start with [`admin_gate`] or [`admin_post_gate`], which read `users.is_admin` on
-//! that request, and the POST checks the session's CSRF token. The user id in the path must be
-//! plain ASCII digits that parse as an `i64` before any SQL runs; anything else is the same 404 as a
-//! missing user. The capability name is fixed to [`PROFILE_TOOLS`]: the form selects only the
-//! action. A write goes through [`Capabilities`], which re-reads the acting admin under a row
-//! lock. Every stored string is passed to the view as text, which escapes it.
+//! Both routes start with [`admin_gate`] or [`admin_post_gate`], which read `users.is_admin`
+//! on that request, and the POST checks the session's CSRF token. The user id in the path must
+//! be plain ASCII digits that parse as an `i64` before any SQL runs; anything else is the same
+//! 404 as a missing user. The form names one capability and an action. The name must parse as
+//! a [`Capability`] exactly, else the POST is a 400 and nothing is written. A write goes
+//! through [`Capabilities`], which re-reads the acting admin under a row lock. Every stored
+//! string is passed to the view as text, which escapes it.
 
 use std::collections::HashMap;
 
+use fleet_core::capability::Capability;
+use fleet_proto::capability_from_wire;
 use sqlx::{PgPool, Row as _};
 use topcoat::{
     Result,
@@ -23,7 +26,7 @@ use topcoat::{
 
 use super::catalog::{admin_gate, admin_post_gate, internal, pool, refusal};
 use super::layout::{Nav, shell};
-use crate::cred::capability::{Capabilities, PROFILE_TOOLS};
+use crate::cred::capability::Capabilities;
 
 const USERNAME: &str = "SELECT username FROM users WHERE id = $1";
 const GRANT: &str = "SELECT u.username, \
@@ -32,6 +35,11 @@ const GRANT: &str = "SELECT u.username, \
      WHERE c.user_id = $1 AND c.capability = $2";
 
 path_param!(user_id);
+
+struct Row {
+    name: &'static str,
+    held: Option<Held>,
+}
 
 struct Held {
     by: String,
@@ -55,10 +63,10 @@ async fn username(pool: &PgPool, id: i64) -> Result<String> {
         .ok_or_else(|| not_found().into())
 }
 
-async fn held(pool: &PgPool, id: i64) -> Result<Option<Held>> {
+async fn held(pool: &PgPool, id: i64, capability: Capability) -> Result<Option<Held>> {
     let row = sqlx::query(GRANT)
         .bind(id)
-        .bind(PROFILE_TOOLS)
+        .bind(capability.as_str())
         .fetch_optional(pool)
         .await
         .map_err(|err| internal(&err))?;
@@ -77,13 +85,14 @@ async fn capabilities_page(cx: &Cx) -> Result<impl View> {
     let pool = pool(cx)?;
     let id = user_path(cx)?;
     let name = username(pool, id).await?;
-    let grant = held(pool, id).await?;
+    let mut rows = Vec::new();
+    for capability in Capability::ALL {
+        rows.push(Row {
+            name: capability.as_str(),
+            held: held(pool, id, *capability).await?,
+        });
+    }
     let csrf = String::from_utf8_lossy(session.csrf.expose()).into_owned();
-    let granted = grant.is_some();
-    let (by, at) = grant.map_or_else(
-        || (String::new(), String::new()),
-        |grant| (grant.by, grant.at),
-    );
     let action = format!("/users/{id}/capabilities");
     Ok(view! {
         shell(title: "fleet capabilities", active: Nav::Catalog, user: session.username.as_str(), csrf: csrf.as_str(), mode: "",
@@ -91,33 +100,38 @@ async fn capabilities_page(cx: &Cx) -> Result<impl View> {
                     <span class="text-primary">"$"</span>
                     <h1 class="text-sm font-bold">(name.as_str())</h1>
                 </header>
-                <dl class="mb-3 grid max-w-xl grid-cols-[8rem_1fr] gap-y-1 border border-base-300 p-2 text-xs">
-                    <dt class="text-base-content/60">"User id"</dt><dd>(id.to_string())</dd>
-                    <dt class="text-base-content/60">"profile:tools"</dt>
-                    <dd>
-                        if granted {
-                            <span class="badge badge-sm badge-success">"granted"</span>
-                        }
-                        if !granted {
-                            <span class="badge badge-sm badge-ghost">"not granted"</span>
-                        }
-                    </dd>
-                    if granted {
-                        <dt class="text-base-content/60">"Granted by"</dt><dd>(by.as_str())</dd>
-                        <dt class="text-base-content/60">"Granted at"</dt><dd>(at.as_str())" UTC"</dd>
-                    }
-                </dl>
-                <form id="toggle" method="post" action=(action.as_str()) class="text-xs">
-                    <input type="hidden" name="csrf" value=(csrf.as_str())>
-                    if granted {
-                        <input type="hidden" name="action" value="revoke">
-                        <button class="btn btn-outline btn-xs" type="submit">"Revoke profile:tools"</button>
-                    }
-                    if !granted {
-                        <input type="hidden" name="action" value="grant">
-                        <button class="btn btn-primary btn-xs" type="submit">"Grant profile:tools"</button>
-                    }
-                </form>
+                <p class="mb-3 text-xs"><span class="text-base-content/60">"User id "</span>(id.to_string())</p>
+                for row in rows {
+                    <section class="mb-3 max-w-xl border border-base-300 p-2 text-xs">
+                        <dl class="mb-2 grid grid-cols-[8rem_1fr] gap-y-1">
+                            <dt class="text-base-content/60">(row.name)</dt>
+                            <dd>
+                                if row.held.is_some() {
+                                    <span class="badge badge-sm badge-success">"granted"</span>
+                                }
+                                if row.held.is_none() {
+                                    <span class="badge badge-sm badge-ghost">"not granted"</span>
+                                }
+                            </dd>
+                            if let Some(grant) = row.held.as_ref() {
+                                <dt class="text-base-content/60">"Granted by"</dt><dd>(grant.by.as_str())</dd>
+                                <dt class="text-base-content/60">"Granted at"</dt><dd>(grant.at.as_str())" UTC"</dd>
+                            }
+                        </dl>
+                        <form method="post" action=(action.as_str())>
+                            <input type="hidden" name="csrf" value=(csrf.as_str())>
+                            <input type="hidden" name="capability" value=(row.name)>
+                            if row.held.is_some() {
+                                <input type="hidden" name="action" value="revoke">
+                                <button class="btn btn-outline btn-xs" type="submit">"Revoke "(row.name)</button>
+                            }
+                            if row.held.is_none() {
+                                <input type="hidden" name="action" value="grant">
+                                <button class="btn btn-primary btn-xs" type="submit">"Grant "(row.name)</button>
+                            }
+                        </form>
+                    </section>
+                }
             )
     })
 }
@@ -128,14 +142,18 @@ async fn capabilities_post(cx: &Cx, Form(form): Form<HashMap<String, String>>) -
     let pool = pool(cx)?;
     let id = user_path(cx)?;
     username(pool, id).await?;
+    let capability = form
+        .get("capability")
+        .and_then(|raw| capability_from_wire(raw))
+        .ok_or_else(|| bad_request("the capability is unknown"))?;
     let caps = Capabilities::new(pool.clone());
     match form.get("action").map(String::as_str) {
         Some("grant") => caps
-            .grant(session.user_id, id, PROFILE_TOOLS)
+            .grant(session.user_id, id, capability.as_str())
             .await
             .map(drop),
         Some("revoke") => caps
-            .revoke(session.user_id, id, PROFILE_TOOLS)
+            .revoke(session.user_id, id, capability.as_str())
             .await
             .map(drop),
         _ => return Err(bad_request("the capability action is unknown").into()),

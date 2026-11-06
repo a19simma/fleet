@@ -117,6 +117,14 @@ async fn put_rejects_an_invalid_value(pool: PgPool) {
 async fn put_validates_a_github_app_installation_id(pool: PgPool) {
     let store = store(&pool, "app-id").unwrap();
     let alice = user(&pool, "alice").await.unwrap();
+    sqlx::query(
+        "INSERT INTO user_capabilities (user_id, capability, granted_by) \
+         VALUES ($1, 'forge:github_app', $1)",
+    )
+    .bind(alice)
+    .execute(&pool)
+    .await
+    .unwrap();
     for bad in ["0", "12a", "99999999999999999999", "1/.."] {
         let err = store
             .put(

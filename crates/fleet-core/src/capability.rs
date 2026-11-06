@@ -11,6 +11,8 @@ use std::str::FromStr;
 pub enum Capability {
     /// Save a Profile that lists `tools` or selects a `tool` Catalog item, submit a Profile that lists `tools`, or have its blob served to a leased Box.
     ProfileTools,
+    /// Store a `github_app` Credential and have its installation token minted for a Job (ADR-0058). Holders can mint write tokens for every repository the installation covers.
+    ForgeGithubApp,
 }
 
 /// A string is not the canonical text of any capability.
@@ -29,12 +31,13 @@ impl std::error::Error for CapabilityError {}
 
 impl Capability {
     /// Every capability. Adding a variant means adding it here and in [`Capability::as_str`].
-    pub const ALL: &'static [Self] = &[Self::ProfileTools];
+    pub const ALL: &'static [Self] = &[Self::ProfileTools, Self::ForgeGithubApp];
 
     /// The canonical text.
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::ProfileTools => "profile:tools",
+            Self::ForgeGithubApp => "forge:github_app",
         }
     }
 
@@ -91,6 +94,25 @@ mod tests {
     fn canonical_text_is_profile_tools() {
         assert_eq!(Capability::ProfileTools.as_str(), "profile:tools");
         assert_eq!(Capability::ProfileTools.to_string(), "profile:tools");
+    }
+
+    #[test]
+    fn canonical_text_is_forge_github_app() {
+        assert_eq!(Capability::ForgeGithubApp.as_str(), "forge:github_app");
+        assert_eq!(
+            Capability::parse("forge:github_app"),
+            Ok(Capability::ForgeGithubApp)
+        );
+        for raw in [
+            "forge:github_app ",
+            "Forge:github_app",
+            "forge:github_app\n",
+            "forge:github-app",
+            "forge:github_pat",
+            "forge:",
+        ] {
+            assert_eq!(Capability::parse(raw), Err(CapabilityError), "{raw:?}");
+        }
     }
 
     #[test]
@@ -152,7 +174,7 @@ mod tests {
             .max()
             .unwrap_or(0);
         assert_eq!(Capability::MAX_LEN, longest);
-        assert_eq!(Capability::MAX_LEN, "profile:tools".len());
+        assert_eq!(Capability::MAX_LEN, "forge:github_app".len());
     }
 
     #[test]

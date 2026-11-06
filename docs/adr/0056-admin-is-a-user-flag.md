@@ -65,5 +65,5 @@ ADR-0042 and ADR-0054 are Proposed, so their lines are edited in place in this c
 
 - **A static `FLEET_ADMIN_TOKEN`.** It has no identity for `granted_by` and the audit, adds a second shared secret, needs a redeploy after a leak and has no web use.
 - **Making `bootstrap` admin.** The shared client token would become admin.
-- **An admin capability in `user_capabilities`.** The grant RPC could mint admins, it depends on the unbuilt CAP-S1, and the table CHECK allows only `profile:tools`.
+- **An admin capability in `user_capabilities`.** The grant RPC could mint admins, it depends on the unbuilt CAP-S1, and the table CHECK lists a closed set of resource capabilities.
 - **Promotion by RPC or web route.** It is escalation over the network.

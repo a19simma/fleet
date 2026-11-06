@@ -13,7 +13,7 @@ A user stores the credentials their agent and their forge need. This ADR lists t
 | `anthropic_api_key` | Anthropic Console | Static key, sealed by ADR-0040. No prefix check. |
 | `claude_subscription_token` | `claude setup-token` | Valid one year. Passed to the agent as `CLAUDE_CODE_OAUTH_TOKEN`. |
 | `github_pat` | GitHub | Fine-grained `github_pat_` tokens only. |
-| `github_app` | GitHub App installation | The sealed value is the installation id, `static_secret` shape (ADR-0058). Saving is refused until the capability check and the save path land (ADR-0058). |
+| `github_app` | GitHub App installation | The sealed value is the installation id, `static_secret` shape (ADR-0058). Saving is refused until the save path lands (ADR-0058). |
 | `kimi_membership_key` | Kimi Code Console | `sk-kimi-` prefix, checked on save. Prefix unverified. |
 | `kimi_platform_key` | Kimi platform | Static key, sealed by ADR-0040. No prefix check. |
 | `codex_api_key` | OpenAI | Static key, sealed by ADR-0040. No prefix check. |

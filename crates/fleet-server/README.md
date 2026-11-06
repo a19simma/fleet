@@ -21,7 +21,7 @@ The hosted Fleet service. It stores box state, jobs, transcripts, job timing and
 ## Modules
 
 - `catalog`: the global Catalog of skill, subagent, tool and context items (ADR-0053). An admin creates and enables items through `FleetCatalogAdmin` or the `/catalog` pages. A Profile switches items off and the effective set is resolved at submit.
-- `cred::capability`: per-user capability grants. `profile:tools` is the only one (ADR-0054). A user needs it to save a Profile with tools.
+- `cred::capability`: per-user capability grants. `profile:tools` (ADR-0054) lets a user save a Profile with tools. `forge:github_app` (ADR-0058) gates the `github_app` credential kind at put and release through `cred::store::required_capability`, which maps the `github_app` kind. Migration 0034 widens the table CHECK to both names, and the admin capability page lists, grants and revokes each one.
 - `timing`: stores the `ReportTiming` breakdown and the shell command logs a box reports, and serves `GetJobTiming` and `StreamShellLog` (ADR-0055). The pages are `/jobs/{job_id}/timing` and `/jobs/{job_id}/shell/{command_id}/log`.
 - `profiles`: owner-scoped Profiles with `private` and `shared` visibility (ADR-0052).
 - `retention`: the telemetry retention sweep. See the root `README.md` for the variables.

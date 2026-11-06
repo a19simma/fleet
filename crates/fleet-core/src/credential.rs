@@ -66,7 +66,8 @@ impl CredentialKind {
 
     /// True for kinds a user may store through `PutCredential` and the web form.
     ///
-    /// `github_app` is refused until the capability check and the save path land (ADR-0058).
+    /// `github_app` is refused until the save path lands (ADR-0058). The capability gate in
+    /// `cred::store` is built.
     /// The save path lifts the refusal by removing this exception.
     pub const fn is_storable(self) -> bool {
         !matches!(self, Self::GithubApp)
