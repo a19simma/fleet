@@ -15,6 +15,7 @@ use fleet_proto::{
 };
 use sqlx::{PgConnection, PgPool, Row};
 
+use crate::cred::capability::PROFILE_TOOLS;
 use crate::jobs::{JobInvalid, Snapshot, kind_of};
 use crate::store::{DEFAULT_LIST_LIMIT, MAX_LIST_LIMIT, StoreError};
 
@@ -55,6 +56,9 @@ impl From<Option<i64>> for Viewer {
 /// The refusal text for a profile submit without a stored user, shared by the handler and
 /// [`ProfileFault::Unowned`].
 pub const ERR_PROFILE_SUBMIT_UNOWNED: &str = "profile submit needs a user token";
+
+/// The refusal text for a submit of a profile with `tools` by a user without `profile:tools`.
+pub const ERR_PROFILE_TOOLS_NOT_GRANTED: &str = "profile tools need the profile:tools capability";
 
 const LOCK_OWN_PROFILE_FOR_UPDATE: &str =
     "SELECT id, visibility FROM profile WHERE owner_user_id = $1 AND name = $2 FOR UPDATE";
@@ -178,6 +182,8 @@ const SELECT_PINNED_FOR_SUBMIT: &str = "SELECT p.id, v.version, v.hash, b.conten
      JOIN profile_version v ON v.profile_id = p.id \
      JOIN profile_blob b ON b.hash = v.hash \
      ORDER BY v.version DESC LIMIT 1";
+const READ_TOOLS_GRANT: &str =
+    "SELECT user_id FROM user_capabilities WHERE user_id = $1 AND capability = $2 FOR SHARE";
 const LOCK_CATALOG: &str = "SELECT id, kind, name, content, admin_enabled FROM catalog_items \
      ORDER BY id LIMIT $1 FOR SHARE";
 const SELECT_LEASED_BLOB: &str = "SELECT j.profile_name, j.profile_version, j.profile_hash, \
@@ -684,6 +690,20 @@ pub(crate) struct Pinned {
     pub(crate) version: i32,
     pub(crate) hash: Vec<u8>,
     pub(crate) snapshot: Snapshot,
+    pub(crate) tools_granted: bool,
+}
+
+async fn read_tools_grant(conn: &mut PgConnection, owner: i64) -> Result<bool, StoreError> {
+    sqlx::query(LOCK_OWNER)
+        .bind(owner)
+        .fetch_optional(&mut *conn)
+        .await?;
+    let held = sqlx::query(READ_TOOLS_GRANT)
+        .bind(owner)
+        .bind(PROFILE_TOOLS)
+        .fetch_optional(&mut *conn)
+        .await?;
+    Ok(held.is_some())
 }
 
 async fn lock_catalog(conn: &mut PgConnection) -> Result<Vec<CatalogEntry>, StoreError> {
@@ -742,6 +762,10 @@ pub(crate) async fn pin_for_submit(
     if profile.hash().as_bytes().as_slice() != hash.as_slice() {
         return Err(corrupt());
     }
+    let tools_granted = read_tools_grant(conn, caller).await?;
+    if !profile.tools.is_empty() && !tools_granted {
+        return Err(StoreError::ToolsNotGranted);
+    }
     let entries = lock_catalog(conn).await?;
     let set = resolve(runner, &profile.selection, &entries).map_err(|_| JobInvalid::Snapshot)?;
     Ok(Pinned {
@@ -749,6 +773,7 @@ pub(crate) async fn pin_for_submit(
         version: row.try_get("version")?,
         hash,
         snapshot: Snapshot::freeze(&set)?,
+        tools_granted,
     })
 }
 

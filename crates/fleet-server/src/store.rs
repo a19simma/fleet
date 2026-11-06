@@ -40,7 +40,7 @@ macro_rules! job_columns {
     () => {
         "job_id, idempotency_key, prompt, repo, base_ref, open_pr, state, box, attempt, \
 progress, phase, branch, pr_url, error, exit_code, cancel_requested, batch_id, \
-kind, user_id, agent, target_job_id, parent_job_id, ci_retry_attempt, ci_retry, ci_state, ci_url, profile_name, profile_version, encode(profile_hash, 'hex') AS profile_hash, \
+kind, user_id, agent, profile_tools_granted, target_job_id, parent_job_id, ci_retry_attempt, ci_retry, ci_state, ci_url, profile_name, profile_version, encode(profile_hash, 'hex') AS profile_hash, \
 (EXTRACT(EPOCH FROM lease_expires_at) * 1000)::bigint AS lease_ms, \
 (EXTRACT(EPOCH FROM created_at) * 1000)::bigint AS created_ms, \
 (EXTRACT(EPOCH FROM claimed_at) * 1000)::bigint AS claimed_ms, \
@@ -157,8 +157,9 @@ const KEY_EXISTS: &str = "SELECT EXISTS (SELECT 1 FROM jobs WHERE idempotency_ke
 
 const INSERT_JOB_WITH_PROFILE: &str = "\
 INSERT INTO jobs (job_id, idempotency_key, prompt, repo, base_ref, branch, open_pr, user_id, agent, \
-profile_name, profile_id, profile_version, profile_hash, snapshot_catalog, snapshot_notes, snapshot_hash) \
-VALUES ($1, $2, $3, $4, $5, 'swarm/' || $1, $6, $7, $8, $9, $10, $11, $12, $13::text::jsonb, $14::text::jsonb, $15) \
+profile_name, profile_id, profile_version, profile_hash, snapshot_catalog, snapshot_notes, snapshot_hash, \
+profile_tools_granted) \
+VALUES ($1, $2, $3, $4, $5, 'swarm/' || $1, $6, $7, $8, $9, $10, $11, $12, $13::text::jsonb, $14::text::jsonb, $15, $16) \
 ON CONFLICT (idempotency_key) DO NOTHING \
 RETURNING job_id";
 
@@ -392,6 +393,9 @@ pub enum StoreError {
     /// A batch named a profile that has no version. The handler maps this to gRPC
     /// `NOT_FOUND`. The error carries no data.
     UnknownProfile,
+    /// A submit pinned a profile with `tools` for an owner who does not hold `profile:tools`.
+    /// The handler maps this to gRPC `PERMISSION_DENIED`. The error carries no data.
+    ToolsNotGranted,
     /// A profile blob read did not match a live lease, or no such job exists. The handler
     /// maps this to gRPC `PERMISSION_DENIED`. The error carries no data.
     LeaseDenied,
@@ -413,6 +417,7 @@ impl fmt::Display for StoreError {
             Self::InvalidProfile(reason) => reason.fmt(f),
             Self::InvalidBatch(reason) => reason.fmt(f),
             Self::UnknownProfile => f.write_str("profile not found"),
+            Self::ToolsNotGranted => f.write_str(profiles::ERR_PROFILE_TOOLS_NOT_GRANTED),
             Self::LeaseDenied => f.write_str("lease does not match"),
         }
     }
@@ -434,6 +439,7 @@ impl std::error::Error for StoreError {
             | Self::TelemetryTooLarge
             | Self::NotFound
             | Self::UnknownProfile
+            | Self::ToolsNotGranted
             | Self::LeaseDenied => None,
         }
     }
@@ -609,7 +615,7 @@ fn job_from_row(row: &PgRow) -> Result<Job, StoreError> {
         user_id: u64::try_from(row.try_get::<i64, _>("user_id")?)
             .map_err(|_| StoreError::OutOfRange("user id"))?,
         agent: row.try_get("agent")?,
-        profile_tools_granted: false,
+        profile_tools_granted: row.try_get("profile_tools_granted")?,
         ci_retry_attempt: u32::try_from(row.try_get::<i32, _>("ci_retry_attempt")?)
             .map_err(|_| StoreError::OutOfRange("ci retry attempt"))?,
         ci_retry: row
@@ -946,7 +952,8 @@ impl Store {
     /// A request that names a profile needs a user: the profile is read as that user, its
     /// effective catalog set is resolved for the job's runner, and the set, its notes and
     /// its hash are stored on the job in the insert transaction under `FOR SHARE` locks on the
-    /// profile and catalog rows. Later catalog edits never change a stored job. A repeat under
+    /// profile and catalog rows. The same transaction re-reads the owner's `profile:tools`
+    /// grant under `FOR SHARE` on the owner and grant rows and stamps the result on the job. Later catalog edits never change a stored job. A repeat under
     /// the same key skips the resolution and returns the stored job.
     ///
     /// The request is validated once, by [`validate_submit`]. The job id is a fresh
@@ -960,6 +967,8 @@ impl Store {
     /// Returns [`StoreError::InvalidJob`] when the request fails validation or its profile
     /// set cannot be frozen, [`ProfileFault::Unowned`] for a profile with no user,
     /// [`StoreError::UnknownProfile`] when the user cannot read the profile,
+    /// [`StoreError::ToolsNotGranted`] when the profile has `tools` and the owner no longer
+    /// holds `profile:tools`,
     /// [`StoreError::KeyConflict`] when the key exists with different parameters, and
     /// [`StoreError::Database`] when a query fails.
     pub async fn submit_job(&self, request: &SubmitJobRequest) -> Result<Job, StoreError> {
@@ -1081,6 +1090,7 @@ impl Store {
                     .bind(pinned.snapshot.catalog_json())
                     .bind(pinned.snapshot.notes_json())
                     .bind(pinned.snapshot.hash().as_slice())
+                    .bind(pinned.tools_granted)
                     .fetch_optional(&mut *tx)
                     .await?;
             }

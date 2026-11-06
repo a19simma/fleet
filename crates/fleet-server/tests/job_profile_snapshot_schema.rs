@@ -14,12 +14,16 @@ use sqlx::migrate::Migrator;
 
 const SNAPSHOT_VERSION: i64 = 29;
 
+/// Migration 0031 adds `jobs.profile_tools_granted`, a plain column the store reads on every job
+/// select, so the pre-snapshot schema keeps it.
+const TOOLS_GRANTED_VERSION: i64 = 31;
+
 async fn migrate_before(pool: &PgPool) {
     let all = sqlx::migrate!("./migrations");
     let older: Vec<_> = all
         .migrations
         .iter()
-        .filter(|m| m.version < SNAPSHOT_VERSION)
+        .filter(|m| m.version < SNAPSHOT_VERSION || m.version == TOOLS_GRANTED_VERSION)
         .cloned()
         .collect();
     let partial = Migrator {

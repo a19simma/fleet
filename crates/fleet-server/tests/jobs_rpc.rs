@@ -17,6 +17,7 @@ use fleet_proto::v1::{
 use fleet_server::auth::BearerAuth;
 use fleet_server::config::Token;
 use fleet_server::cred::Users;
+use fleet_server::cred::capability::{Capabilities, PROFILE_TOOLS};
 use fleet_server::profiles::{self, ProfileContent};
 use fleet_server::service::router;
 use fleet_server::store::Store;
@@ -1461,4 +1462,161 @@ async fn the_callers_own_profile_beats_a_shared_one_of_the_same_name(pool: PgPoo
     .await
     .unwrap();
     assert_eq!(pinned, bob);
+}
+
+const TOOLS_TOML: &str = "[[tools]]\nname = \"node\"\nversion = \"20.11.1\"\n";
+const PLAIN_TOML: &str = "claude_md = \"x\"\n";
+
+async fn saved(pool: &PgPool, owner: i64, name: &str, toml: &str) {
+    profiles::create_owned(pool, Some(owner), name, ProfileContent::Toml(toml), true)
+        .await
+        .unwrap();
+}
+
+async fn admin(pool: &PgPool) -> i64 {
+    sqlx::query_scalar("INSERT INTO users (username, is_admin) VALUES ('root', true) RETURNING id")
+        .fetch_one(pool)
+        .await
+        .unwrap()
+}
+
+async fn stamp_of(pool: &PgPool, job_id: &str) -> bool {
+    sqlx::query_scalar("SELECT profile_tools_granted FROM jobs WHERE job_id = $1")
+        .bind(job_id)
+        .fetch_one(pool)
+        .await
+        .unwrap()
+}
+
+#[sqlx::test]
+async fn a_holder_submitting_a_tools_profile_is_stamped_granted(pool: PgPool) {
+    let store = store(pool.clone()).await;
+    let (user, token) = user_with_token(&pool, "ann").await;
+    let root = admin(&pool).await;
+    Capabilities::new(pool.clone())
+        .grant(root, user, PROFILE_TOOLS)
+        .await
+        .unwrap();
+    saved(&pool, user, "alpha", TOOLS_TOML).await;
+    let mut jobs = client(serve_users(&pool, &store), &token);
+    let job = jobs
+        .submit_job(with_profile("k1", "alpha", ""))
+        .await
+        .unwrap()
+        .into_inner();
+    assert!(job.profile_tools_granted);
+    assert!(stamp_of(&pool, &job.job_id).await);
+    let fetched = jobs
+        .get_job(GetJobRequest {
+            job_id: job.job_id.clone(),
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    assert!(fetched.profile_tools_granted);
+}
+
+#[sqlx::test]
+async fn a_revoke_between_save_and_submit_refuses_the_queued_submit(pool: PgPool) {
+    let store = store(pool.clone()).await;
+    let (user, token) = user_with_token(&pool, "ann").await;
+    let root = admin(&pool).await;
+    let caps = Capabilities::new(pool.clone());
+    caps.grant(root, user, PROFILE_TOOLS).await.unwrap();
+    saved(&pool, user, "alpha", TOOLS_TOML).await;
+    assert!(caps.revoke(root, user, PROFILE_TOOLS).await.unwrap());
+    let mut jobs = client(serve_users(&pool, &store), &token);
+    let err = jobs
+        .submit_job(with_profile("k1", "alpha", ""))
+        .await
+        .unwrap_err();
+    assert_eq!(err.code(), Code::PermissionDenied);
+    assert!(err.message().contains("profile:tools"));
+    assert_eq!(job_count(&pool).await, 0);
+}
+
+#[sqlx::test]
+async fn a_user_who_never_held_the_capability_is_refused_a_tools_profile(pool: PgPool) {
+    let store = store(pool.clone()).await;
+    let (user, token) = user_with_token(&pool, "ann").await;
+    saved(&pool, user, "alpha", TOOLS_TOML).await;
+    let mut jobs = client(serve_users(&pool, &store), &token);
+    let err = jobs
+        .submit_job(with_profile("k1", "alpha", ""))
+        .await
+        .unwrap_err();
+    assert_eq!(err.code(), Code::PermissionDenied);
+    assert_eq!(job_count(&pool).await, 0);
+}
+
+#[sqlx::test]
+async fn a_profile_without_tools_needs_no_capability_and_is_not_stamped(pool: PgPool) {
+    let store = store(pool.clone()).await;
+    let (user, token) = user_with_token(&pool, "ann").await;
+    saved(&pool, user, "alpha", PLAIN_TOML).await;
+    let mut jobs = client(serve_users(&pool, &store), &token);
+    let job = jobs
+        .submit_job(with_profile("k1", "alpha", ""))
+        .await
+        .unwrap()
+        .into_inner();
+    assert!(!job.profile_tools_granted);
+    assert!(!stamp_of(&pool, &job.job_id).await);
+}
+
+#[sqlx::test]
+async fn a_repeat_submit_after_a_revoke_returns_the_stored_stamped_job(pool: PgPool) {
+    let store = store(pool.clone()).await;
+    let (user, token) = user_with_token(&pool, "ann").await;
+    let root = admin(&pool).await;
+    let caps = Capabilities::new(pool.clone());
+    caps.grant(root, user, PROFILE_TOOLS).await.unwrap();
+    saved(&pool, user, "alpha", TOOLS_TOML).await;
+    let mut jobs = client(serve_users(&pool, &store), &token);
+    let first = jobs
+        .submit_job(with_profile("k1", "alpha", ""))
+        .await
+        .unwrap()
+        .into_inner();
+    caps.revoke(root, user, PROFILE_TOOLS).await.unwrap();
+    let again = jobs
+        .submit_job(with_profile("k1", "alpha", ""))
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(again.job_id, first.job_id);
+    assert!(again.profile_tools_granted);
+    let err = jobs
+        .submit_job(with_profile("k2", "alpha", ""))
+        .await
+        .unwrap_err();
+    assert_eq!(err.code(), Code::PermissionDenied);
+    assert_eq!(job_count(&pool).await, 1);
+}
+
+#[sqlx::test]
+async fn a_submit_waits_for_a_revoke_in_flight_and_is_then_refused(pool: PgPool) {
+    let store = store(pool.clone()).await;
+    let (user, token) = user_with_token(&pool, "ann").await;
+    let root = admin(&pool).await;
+    Capabilities::new(pool.clone())
+        .grant(root, user, PROFILE_TOOLS)
+        .await
+        .unwrap();
+    saved(&pool, user, "alpha", TOOLS_TOML).await;
+    let mut revoke = pool.begin().await.unwrap();
+    sqlx::query("DELETE FROM user_capabilities WHERE user_id = $1")
+        .bind(user)
+        .execute(&mut *revoke)
+        .await
+        .unwrap();
+    let mut jobs = client(serve_users(&pool, &store), &token);
+    let submit =
+        tokio::spawn(async move { jobs.submit_job(with_profile("k1", "alpha", "")).await });
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert!(!submit.is_finished());
+    revoke.commit().await.unwrap();
+    let err = timeout(WAIT, submit).await.unwrap().unwrap().unwrap_err();
+    assert_eq!(err.code(), Code::PermissionDenied);
+    assert_eq!(job_count(&pool).await, 0);
 }

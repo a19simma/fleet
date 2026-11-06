@@ -568,6 +568,9 @@ fn jobs_error(err: &StoreError) -> Status {
         }
         StoreError::NotFound => Status::not_found("job not found"),
         StoreError::UnknownProfile => Status::not_found("profile not found"),
+        StoreError::ToolsNotGranted => {
+            Status::permission_denied(profiles::ERR_PROFILE_TOOLS_NOT_GRANTED)
+        }
         StoreError::InvalidProfile(ProfileFault::Unowned) => {
             Status::permission_denied(profiles::ERR_PROFILE_SUBMIT_UNOWNED)
         }
