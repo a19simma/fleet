@@ -1,4 +1,4 @@
-//! The `/catalog` pages and the `/users/{id}/capabilities` stub behind `admin_gate`: GET and
+//! The `/catalog` pages and the `/users/{id}/capabilities` page behind `admin_gate`: GET and
 //! POST against no session, a non-admin, an admin, an admin demoted after login, and a
 //! missing or wrong CSRF token on every route; then add, edit, enable and disable as an admin
 //! with one hostile value per field. The tests need a Postgres superuser URL in `DATABASE_URL` for
@@ -33,7 +33,6 @@ const POST_ROUTES: [&str; 5] = [
     "/catalog/greet/disable",
     "/users/1/capabilities",
 ];
-const STUB: [&str; 1] = ["/users/1/capabilities"];
 const HOSTILE: &str = "<script>alert('x')</script>\"'&\r\n\u{2028}";
 
 struct Session {
@@ -55,6 +54,7 @@ type Snapshot = (
     i64,
     i64,
     Vec<(String, String, String, String, bool)>,
+    Vec<(i64, String, i64)>,
 );
 
 impl Harness {
@@ -134,7 +134,13 @@ impl Harness {
         .fetch_all(&self.pool)
         .await
         .unwrap();
-        (flags, audit, sessions, items)
+        let grants = sqlx::query_as(
+            "SELECT user_id, capability, granted_by FROM user_capabilities ORDER BY user_id",
+        )
+        .fetch_all(&self.pool)
+        .await
+        .unwrap();
+        (flags, audit, sessions, items, grants)
     }
 
     async fn send(
@@ -273,6 +279,14 @@ fn encode(value: &str) -> String {
     })
 }
 
+fn caps_path(user_id: i64) -> String {
+    format!("/users/{user_id}/capabilities")
+}
+
+fn toggle_body(session: &Session, action: &str) -> String {
+    format!("csrf={}&action={}", session.csrf, encode(action))
+}
+
 fn csrf_body(session: &Session) -> String {
     format!("csrf={}", session.csrf)
 }
@@ -293,10 +307,11 @@ async fn get_as_a_non_admin_is_forbidden(pool: PgPool) {
 }
 
 #[sqlx::test]
-async fn get_as_an_admin_reaches_the_capability_stub(pool: PgPool) {
+async fn get_as_an_admin_reaches_the_capability_page(pool: PgPool) {
     let h = Harness::start(pool).await;
     let root = h.session("root", 'b', true).await;
-    h.expect_on(&STUB, "GET", Some(&root), None, (501, ""))
+    let path = caps_path(root.user_id);
+    h.expect_on(&[path.as_str()], "GET", Some(&root), None, (200, ""))
         .await;
     let (status, _) = h
         .send("GET", "/users/1/nope", Some(&root.cookie), None)
@@ -309,7 +324,8 @@ async fn get_as_an_admin_reaches_the_capability_stub(pool: PgPool) {
 async fn get_after_demotion_is_forbidden_on_the_same_session(pool: PgPool) {
     let h = Harness::start(pool).await;
     let root = h.session("root", 'b', true).await;
-    h.expect_on(&STUB, "GET", Some(&root), None, (501, ""))
+    let path = caps_path(root.user_id);
+    h.expect_on(&[path.as_str()], "GET", Some(&root), None, (200, ""))
         .await;
     h.users.set_admin(root.user_id, false).await.unwrap();
     h.expect("GET", Some(&root), None, (403, "")).await;
@@ -334,12 +350,19 @@ async fn post_as_a_non_admin_with_a_valid_csrf_is_forbidden(pool: PgPool) {
 }
 
 #[sqlx::test]
-async fn post_as_an_admin_with_a_valid_csrf_reaches_the_stub(pool: PgPool) {
+async fn post_as_an_admin_with_a_valid_csrf_and_no_action_is_a_bad_request(pool: PgPool) {
     let h = Harness::start(pool).await;
     let root = h.session("root", 'b', true).await;
     let body = csrf_body(&root);
-    h.expect_on(&STUB, "POST", Some(&root), Some(&body), (501, ""))
-        .await;
+    let path = caps_path(root.user_id);
+    h.expect_on(
+        &[path.as_str()],
+        "POST",
+        Some(&root),
+        Some(&body),
+        (400, ""),
+    )
+    .await;
     h.finish().await;
 }
 
@@ -348,8 +371,15 @@ async fn post_after_demotion_with_a_valid_csrf_is_forbidden(pool: PgPool) {
     let h = Harness::start(pool).await;
     let root = h.session("root", 'b', true).await;
     let body = csrf_body(&root);
-    h.expect_on(&STUB, "POST", Some(&root), Some(&body), (501, ""))
-        .await;
+    let path = caps_path(root.user_id);
+    h.expect_on(
+        &[path.as_str()],
+        "POST",
+        Some(&root),
+        Some(&body),
+        (400, ""),
+    )
+    .await;
     h.users.set_admin(root.user_id, false).await.unwrap();
     h.expect("POST", Some(&root), Some(&body), (403, "")).await;
     h.finish().await;
@@ -723,5 +753,350 @@ async fn the_catalog_pages_mark_the_link_current(pool: PgPool) {
         assert!(!page.contains(LINK_PLAIN), "{path}");
         assert_eq!(page.matches("aria-current=\"page\"").count(), 1, "{path}");
     }
+    h.finish().await;
+}
+
+impl Harness {
+    async fn grants(&self) -> Vec<(i64, String, i64)> {
+        sqlx::query_as(
+            "SELECT user_id, capability, granted_by FROM user_capabilities ORDER BY user_id",
+        )
+        .fetch_all(&self.pool)
+        .await
+        .unwrap()
+    }
+}
+
+#[sqlx::test]
+async fn the_page_shows_the_user_and_a_csrf_protected_grant_form(pool: PgPool) {
+    let h = Harness::start(pool).await;
+    let root = h.session("root", 'b', true).await;
+    let bob = h.session("bob", 'c', false).await;
+    let path = caps_path(bob.user_id);
+    let (status, _, page) = h.fetch("GET", &path, Some(&root.cookie), None).await;
+    assert_eq!(status, 200);
+    assert!(
+        page.contains("bob") && page.contains("not granted"),
+        "{page}"
+    );
+    assert!(page.contains("value=\"grant\""), "{page}");
+    assert!(page.contains(&format!("action=\"{path}\"")), "{page}");
+    assert!(page.contains(&format!("name=\"csrf\" value=\"{}\"", root.csrf)));
+    assert!(!page.contains("Granted by"));
+    h.finish().await;
+}
+
+#[sqlx::test]
+async fn grant_stores_the_row_and_the_page_shows_who_and_when(pool: PgPool) {
+    let h = Harness::start(pool).await;
+    let root = h.session("gina", 'b', true).await;
+    let bob = h.session("bob", 'c', false).await;
+    let path = caps_path(bob.user_id);
+    let (status, location) = h
+        .send(
+            "POST",
+            &path,
+            Some(&root.cookie),
+            Some(&toggle_body(&root, "grant")),
+        )
+        .await;
+    assert_eq!((status, location.as_str()), (303, path.as_str()));
+    assert_eq!(
+        h.grants().await,
+        [(bob.user_id, "profile:tools".to_owned(), root.user_id)]
+    );
+    let stamp: String = sqlx::query_scalar(
+        "SELECT to_char(granted_at AT TIME ZONE 'UTC', 'YYYY-MM-DD HH24:MI:SS') \
+         FROM user_capabilities",
+    )
+    .fetch_one(&h.pool)
+    .await
+    .unwrap();
+    let (_, _, page) = h.fetch("GET", &path, Some(&root.cookie), None).await;
+    assert!(page.contains(">granted<"), "{page}");
+    assert!(page.contains("<dd>gina</dd>"), "{page}");
+    assert!(page.contains(&stamp), "{page}");
+    assert!(page.contains("value=\"revoke\""), "{page}");
+    h.finish().await;
+}
+
+#[sqlx::test]
+async fn a_second_grant_keeps_the_first_audit_columns(pool: PgPool) {
+    let h = Harness::start(pool).await;
+    let root = h.session("root", 'b', true).await;
+    let other = h.session("other", 'd', true).await;
+    let bob = h.session("bob", 'c', false).await;
+    let path = caps_path(bob.user_id);
+    h.send(
+        "POST",
+        &path,
+        Some(&root.cookie),
+        Some(&toggle_body(&root, "grant")),
+    )
+    .await;
+    let (status, _) = h
+        .send(
+            "POST",
+            &path,
+            Some(&other.cookie),
+            Some(&toggle_body(&other, "grant")),
+        )
+        .await;
+    assert_eq!(status, 303);
+    assert_eq!(h.grants().await.len(), 1);
+    assert_eq!(h.grants().await[0].2, root.user_id);
+    h.finish().await;
+}
+
+#[sqlx::test]
+async fn revoke_removes_the_row(pool: PgPool) {
+    let h = Harness::start(pool).await;
+    let root = h.session("root", 'b', true).await;
+    let bob = h.session("bob", 'c', false).await;
+    let path = caps_path(bob.user_id);
+    h.send(
+        "POST",
+        &path,
+        Some(&root.cookie),
+        Some(&toggle_body(&root, "grant")),
+    )
+    .await;
+    let (status, location) = h
+        .send(
+            "POST",
+            &path,
+            Some(&root.cookie),
+            Some(&toggle_body(&root, "revoke")),
+        )
+        .await;
+    assert_eq!((status, location.as_str()), (303, path.as_str()));
+    assert_eq!(h.grants().await.len(), 0);
+    let (status, _) = h
+        .send(
+            "POST",
+            &path,
+            Some(&root.cookie),
+            Some(&toggle_body(&root, "revoke")),
+        )
+        .await;
+    assert_eq!(status, 303);
+    h.finish().await;
+}
+
+#[sqlx::test]
+async fn a_capability_field_cannot_pick_another_capability(pool: PgPool) {
+    let h = Harness::start(pool).await;
+    let root = h.session("root", 'b', true).await;
+    let bob = h.session("bob", 'c', false).await;
+    let body = format!(
+        "{}&capability=admin%3Aeverything",
+        toggle_body(&root, "grant")
+    );
+    let (status, _) = h
+        .send(
+            "POST",
+            &caps_path(bob.user_id),
+            Some(&root.cookie),
+            Some(&body),
+        )
+        .await;
+    assert_eq!(status, 303);
+    assert_eq!(h.grants().await[0].1, "profile:tools");
+    h.finish().await;
+}
+
+#[sqlx::test]
+async fn a_grant_post_is_refused_for_a_non_admin_and_a_demoted_admin(pool: PgPool) {
+    let h = Harness::start(pool).await;
+    let root = h.session("root", 'b', true).await;
+    let alice = h.session("alice", 'a', false).await;
+    let bob = h.session("bob", 'c', false).await;
+    let path = caps_path(bob.user_id);
+    let before = h.snapshot().await;
+    let (status, _) = h
+        .send(
+            "POST",
+            &path,
+            Some(&alice.cookie),
+            Some(&toggle_body(&alice, "grant")),
+        )
+        .await;
+    assert_eq!(status, 403);
+    h.users.set_admin(root.user_id, false).await.unwrap();
+    let before_demoted = h.snapshot().await;
+    assert_eq!(before.4, before_demoted.4);
+    let (status, _) = h
+        .send(
+            "POST",
+            &path,
+            Some(&root.cookie),
+            Some(&toggle_body(&root, "grant")),
+        )
+        .await;
+    assert_eq!(status, 403);
+    assert_eq!(h.snapshot().await, before_demoted);
+    let (status, _) = h.send("GET", &path, Some(&alice.cookie), None).await;
+    assert_eq!(status, 403);
+    assert_eq!(h.grants().await.len(), 0);
+    h.finish().await;
+}
+
+#[sqlx::test]
+async fn a_grant_post_without_or_with_a_wrong_csrf_changes_nothing(pool: PgPool) {
+    let h = Harness::start(pool).await;
+    let root = h.session("root", 'b', true).await;
+    let bob = h.session("bob", 'c', false).await;
+    let path = caps_path(bob.user_id);
+    for body in [
+        "action=grant",
+        "csrf=wrong&action=grant",
+        "csrf=&action=grant",
+    ] {
+        let (status, _) = h.send("POST", &path, Some(&root.cookie), Some(body)).await;
+        assert_eq!(status, 403, "{body}");
+    }
+    assert_eq!(h.grants().await.len(), 0);
+    h.send(
+        "POST",
+        &path,
+        Some(&root.cookie),
+        Some(&toggle_body(&root, "grant")),
+    )
+    .await;
+    for body in ["action=revoke", "csrf=wrong&action=revoke"] {
+        let (status, _) = h.send("POST", &path, Some(&root.cookie), Some(body)).await;
+        assert_eq!(status, 403, "{body}");
+    }
+    assert_eq!(h.grants().await.len(), 1);
+    h.finish().await;
+}
+
+#[sqlx::test]
+async fn a_hostile_action_is_a_bad_request_and_changes_nothing(pool: PgPool) {
+    let h = Harness::start(pool).await;
+    let root = h.session("root", 'b', true).await;
+    let bob = h.session("bob", 'c', false).await;
+    let path = caps_path(bob.user_id);
+    let long = "grant".repeat(5000);
+    let hostile = [
+        "",
+        "GRANT",
+        " grant",
+        "grant ",
+        "grant\r",
+        "grant\r\n",
+        "grant\u{85}",
+        "grant\u{2028}",
+        "grant\\",
+        "\\grant",
+        "gr\u{430}nt",
+        "\u{ff47}rant",
+        "grant%00",
+        "%67rant",
+        "grant,revoke",
+        "<script>",
+        long.as_str(),
+    ];
+    for action in hostile {
+        let before = h.snapshot().await;
+        let (status, _) = h
+            .send(
+                "POST",
+                &path,
+                Some(&root.cookie),
+                Some(&toggle_body(&root, action)),
+            )
+            .await;
+        assert_eq!(status, 400, "{action:?}");
+        assert_eq!(h.snapshot().await, before, "{action:?}");
+    }
+    let (status, _) = h
+        .send("POST", &path, Some(&root.cookie), Some(&csrf_body(&root)))
+        .await;
+    assert_eq!(status, 400);
+    assert_eq!(h.grants().await.len(), 0);
+    h.finish().await;
+}
+
+#[sqlx::test]
+async fn a_hostile_path_id_is_not_found_and_changes_nothing(pool: PgPool) {
+    let h = Harness::start(pool).await;
+    let root = h.session("root", 'b', true).await;
+    let bob = h.session("bob", 'c', false).await;
+    let ids = [
+        "abc".to_owned(),
+        "0".to_owned(),
+        "-1".to_owned(),
+        "+1".to_owned(),
+        "1.0".to_owned(),
+        "1e1".to_owned(),
+        "%20".to_owned(),
+        format!("{}%20", bob.user_id),
+        format!("{}%0D", bob.user_id),
+        format!("{}%0D%0A", bob.user_id),
+        format!("{}%C2%85", bob.user_id),
+        format!("{}%E2%80%A8", bob.user_id),
+        format!("{}%5C", bob.user_id),
+        format!("{}%00", bob.user_id),
+        "%D9%A1".to_owned(),
+        "%EF%BC%91".to_owned(),
+        "99999999999999999999".to_owned(),
+        "9223372036854775808".to_owned(),
+        "9".repeat(5000),
+        "1;2".to_owned(),
+        "%2F".to_owned(),
+        "..".to_owned(),
+    ];
+    let (_, _, reference) = h
+        .fetch(
+            "GET",
+            "/users/999999/capabilities",
+            Some(&root.cookie),
+            None,
+        )
+        .await;
+    let before = h.snapshot().await;
+    for id in &ids {
+        let path = format!("/users/{id}/capabilities");
+        let (status, _, page) = h.fetch("GET", &path, Some(&root.cookie), None).await;
+        assert_eq!(status, 404, "GET {id}");
+        assert_eq!(page, reference, "GET {id}");
+        let (status, _, page) = h
+            .fetch(
+                "POST",
+                &path,
+                Some(&root.cookie),
+                Some(&toggle_body(&root, "grant")),
+            )
+            .await;
+        assert_eq!(status, 404, "POST {id}");
+        assert_eq!(page, reference, "POST {id}");
+    }
+    assert_eq!(h.snapshot().await, before);
+    h.finish().await;
+}
+
+#[sqlx::test]
+async fn an_absent_user_is_not_found_with_the_shared_text(pool: PgPool) {
+    let h = Harness::start(pool).await;
+    let root = h.session("root", 'b', true).await;
+    let (status, _, missing_route) = h
+        .fetch("GET", "/users/1/nope", Some(&root.cookie), None)
+        .await;
+    assert_eq!(status, 404);
+    for (method, action) in [("GET", "grant"), ("POST", "grant"), ("POST", "revoke")] {
+        let body = toggle_body(&root, action);
+        let (status, _, page) = h
+            .fetch(
+                method,
+                "/users/987654/capabilities",
+                Some(&root.cookie),
+                (method == "POST").then_some(body.as_str()),
+            )
+            .await;
+        assert_eq!(status, 404, "{method}");
+        assert_eq!(page, missing_route, "{method}");
+    }
+    assert_eq!(h.grants().await.len(), 0);
     h.finish().await;
 }

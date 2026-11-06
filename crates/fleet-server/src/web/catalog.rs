@@ -83,7 +83,7 @@ struct Entry {
     enabled: bool,
 }
 
-fn pool(cx: &Cx) -> Result<&PgPool> {
+pub(super) fn pool(cx: &Cx) -> Result<&PgPool> {
     app_context::<ConsoleSlot>(cx)
         .0
         .as_deref()
@@ -91,12 +91,12 @@ fn pool(cx: &Cx) -> Result<&PgPool> {
         .ok_or_else(|| not_found().into())
 }
 
-fn internal(err: &dyn std::fmt::Display) -> topcoat::Error {
+pub(super) fn internal(err: &dyn std::fmt::Display) -> topcoat::Error {
     tracing::error!(error = %err, "catalog page store call failed");
     fail(AuthError::Internal)
 }
 
-fn refusal(status: &Status) -> topcoat::Error {
+pub(super) fn refusal(status: &Status) -> topcoat::Error {
     match status.code() {
         Code::PermissionDenied => forbidden().into(),
         Code::NotFound => not_found().into(),
