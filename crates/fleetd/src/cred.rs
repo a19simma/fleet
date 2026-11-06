@@ -127,7 +127,8 @@ pub const ERR_MALFORMED: &str = "credentials reply was invalid";
 /// Why a job could not get its credentials. Each variant has one fixed reason.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CredentialFailure {
-    /// `PERMISSION_DENIED`: wrong box, wrong attempt, lost lease or unknown job.
+    /// Any `PERMISSION_DENIED`: wrong box, wrong attempt, lost lease, unknown job, or a User
+    /// who lacks the capability a stored kind needs. fleetd does not tell them apart.
     LeaseMismatch,
     /// `FAILED_PRECONDITION` `no github credential`.
     NoGithub,
@@ -148,11 +149,12 @@ pub enum CredentialFailure {
     /// The git identity that came with an installation token is outside the grammar of
     /// ADR-0058 (SEC-006, SEC-012).
     AppIdentityInvalid,
-    /// The reply held an unknown kind or shape, a bad value, a duplicate kind, or lacked the
-    /// GitHub or agent credential. It is also this variant when an installation token does not
-    /// start with `ghs_` followed by alphanumerics or underscores, when the reply holds two
-    /// forge credentials, when a credential has the wire kind `github_app`, or when a git
-    /// identity rides on a credential that is not an installation token.
+    /// The reply held an unknown kind or shape, a value outside the length bounds, a duplicate
+    /// kind, or an installation token with no expiry. A refresh reply with no installation
+    /// token or no expiry is this variant too. It is also this variant when an installation
+    /// token does not start with `ghs_` followed by alphanumerics or underscores, when the
+    /// reply holds two forge credentials, when a credential has the wire kind `github_app`, or
+    /// when a git identity rides on a credential that is not an installation token.
     Malformed,
 }
 
@@ -647,7 +649,14 @@ impl CredentialBook {
     /// # Errors
     ///
     /// Returns the failure whose [`CredentialFailure::reason`] the job reports. Nothing is
-    /// held for `job_id` after an error.
+    /// held for `job_id` after an error. The server's answer maps to
+    /// [`CredentialFailure::LeaseMismatch`] (any `PERMISSION_DENIED`),
+    /// [`CredentialFailure::NoGithub`], [`CredentialFailure::NoAgent`],
+    /// [`CredentialFailure::Expired`], [`CredentialFailure::NotConfigured`] and
+    /// [`CredentialFailure::MintCap`]. Any other status, a timeout or a transport error is
+    /// [`CredentialFailure::Unavailable`]. A reply that breaks a rule is
+    /// [`CredentialFailure::Malformed`], [`CredentialFailure::AppIdentityMissing`] or
+    /// [`CredentialFailure::AppIdentityInvalid`].
     pub async fn fetch(
         &self,
         job_id: &str,
@@ -707,7 +716,7 @@ impl CredentialBook {
     /// than [`REFRESH_SKEW_MS`] ahead of the clock (the stale-wait guard, `wait_is_stale`) is
     /// ignored and the refresh goes ahead, so a clock that moved back cannot hold it off for
     /// longer than that. [`CredentialFailure::Malformed`] is returned when the reply holds no
-    /// installation token or no expiry.
+    /// installation token or no expiry, or breaks any other reply rule.
     pub async fn refresh_if_due(
         &self,
         job_id: &str,

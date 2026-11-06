@@ -479,7 +479,8 @@ impl Users {
     ///
     /// # Errors
     ///
-    /// Returns [`UserError::BadSetupCode`] for an unknown, used or expired code.
+    /// Returns [`UserError::BadSetupCode`] for an unknown, used or expired code and
+    /// [`UserError::Db`] for a database failure.
     pub async fn redeem_user_setup(&self, code: &[u8]) -> Result<i64, UserError> {
         let mut tx = self.pool.begin().await?;
         let user_id = Self::redeem_user_setup_in(&mut tx, code).await?;
@@ -491,7 +492,8 @@ impl Users {
     ///
     /// # Errors
     ///
-    /// Returns [`UserError::BadSetupCode`] for an unknown, used or expired code.
+    /// Returns [`UserError::BadSetupCode`] for an unknown, used or expired code and
+    /// [`UserError::Db`] for a database failure.
     pub async fn check_user_setup(&self, code: &[u8]) -> Result<i64, UserError> {
         sqlx::query_scalar(FIND_USER_CODE)
             .bind(code)
@@ -508,7 +510,8 @@ impl Users {
     ///
     /// # Errors
     ///
-    /// Returns [`UserError::BadSetupCode`] for an unknown, used or expired code.
+    /// Returns [`UserError::BadSetupCode`] for an unknown, used or expired code and
+    /// [`UserError::Db`] for a database failure.
     pub async fn redeem_user_setup_in(
         conn: &mut sqlx::PgConnection,
         code: &[u8],
@@ -554,7 +557,8 @@ impl Users {
     ///
     /// # Errors
     ///
-    /// Returns [`UserError::NotFound`] when the id is unknown, revoked or owned by another user.
+    /// Returns [`UserError::NotFound`] when the id is unknown, revoked or owned by another user
+    /// and [`UserError::Db`] for a database failure.
     pub async fn revoke_api_token(&self, user_id: i64, token_id: i64) -> Result<(), UserError> {
         let done = sqlx::query(REVOKE_TOKEN)
             .bind(token_id)

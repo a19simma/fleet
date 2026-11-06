@@ -47,7 +47,7 @@ const API_HOST: &str = "api.github.com";
 const API_VERSION: &str = "2022-11-28";
 
 /// Longest accepted distance from now to the token `expires_at`: 65 minutes. GitHub issues
-/// one-hour tokens, so the margin covers clock skew.
+/// one-hour tokens (official docs, see ADR-0058), so the margin covers clock skew.
 pub const MAX_TOKEN_TTL_SECS: u64 = 65 * 60;
 
 /// Time allowed to open the TCP connection and finish the TLS handshake.
@@ -386,7 +386,10 @@ impl AppClient {
     ///
     /// # Errors
     ///
-    /// Returns [`MintError`] when the call fails or GitHub does not answer 204.
+    /// Returns [`MintError::Setup`] when the request cannot be built or the host name is
+    /// refused, [`MintError::Transport`] or [`MintError::Timeout`] when the call fails,
+    /// [`MintError::Status`] when GitHub does not answer 204, and [`MintError::TooLarge`] when
+    /// the body is over [`MAX_RESPONSE_BYTES`].
     pub async fn revoke(&self, token: &InstallationToken) -> Result<(), MintError> {
         let request = self.request(
             Method::DELETE,

@@ -24,8 +24,8 @@ pub const PLACEHOLDER: &str = "[REDACTED]";
 /// Redaction is exact-match and best effort, plus an opt-in shape mode,
 /// [`Redactor::with_installation_tokens`], for GitHub App installation tokens. It does not
 /// catch base64, URL-encoded or split forms of a secret. It covers the payload and the
-/// free-form `session_id` and `prompt_id` of an envelope. It leaves `kind`, `box`, `hostname`, `machine_id` and
-/// `boot_id` alone.
+/// free-form `session_id` and `prompt_id` of an envelope. It leaves `kind`, `box`, `hostname`,
+/// `machine_id` and `boot_id` alone.
 ///
 /// Replacement runs in one pass over the original text: the match ranges of all secrets
 /// are merged where they overlap and each merged range becomes one [`PLACEHOLDER`], so

@@ -25,7 +25,7 @@ Verified on one Box on 2026-10-24 with a throwaway python grpcio 1.84.1 server o
 Notes that refine it:
 
 - One tower layer wraps the whole router, so it covers every service and every path. It also blocks gRPC reflection, so `grpcurl` without a proto needs the token. Behind the layer, reflection leaks nothing.
-- Redaction matches exact values. It misses base64, URL-encoded and split forms, so "the token cannot leak through an event" holds for literal occurrences only.
+- Redaction matches exact values. It misses base64, URL-encoded and split forms, so "the token cannot leak through an event" holds for literal occurrences only. The job redactor of a GitHub App Job also masks `ghs_` installation tokens by shape (ADR-0058).
 - Not run: a tonic client, TLS, and a real VPN path. A Phase 1 pre-check confirms the tonic `MetadataValue` for `Bearer <token>` parses as ASCII with no newline.
 - The `FLEET_TOKEN` entry does not exist in `/etc/swarm/secrets.env` yet. T7 used a throwaway file with the same mode and ownership.
 

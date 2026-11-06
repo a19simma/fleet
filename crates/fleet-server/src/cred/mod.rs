@@ -1,4 +1,8 @@
-//! Credential storage support: sealing of secrets at rest (ADR-0040).
+//! Credentials, users and capabilities.
+//!
+//! Sealing of secrets at rest (ADR-0040), the credential store and its release path
+//! (ADR-0043), the GitHub App lane with its mint client, policy and audit (ADR-0058), and the
+//! user, token and capability stores.
 
 pub mod admin;
 pub mod api;

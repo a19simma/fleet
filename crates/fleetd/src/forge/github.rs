@@ -35,13 +35,14 @@ struct Bucketed {
 
 /// Folds the `gh pr checks` buckets of the broker output into one [`CiResult`].
 ///
-/// `fail` and `cancel` give `Failure`, then `pending` gives `InProgress`, an unknown bucket
-/// gives `Queued`, `pass` gives `Success` and only `skipping` gives `Neutral`. An empty list
-/// gives `NoChecks`.
+/// `fail` and `cancel` give `Failure`, then `pending` gives `InProgress`, any other bucket
+/// besides `pass` and `skipping` gives `Queued`, `pass` gives `Success` and only `skipping`
+/// gives `Neutral`. An empty list gives `NoChecks`.
 ///
 /// A list the broker truncated hides checks, so without a visible `fail` or `cancel` it is
-/// `Err(ForgeError::Failed)` and never a passing or pending result. A truncated list and an
-/// executor error both return `ForgeError::Failed`, so a caller cannot tell them apart.
+/// `Err(ForgeError::Failed)` and never a passing or pending result. Output that is not the
+/// expected JSON also gives `ForgeError::Failed`. A truncated list, unparseable output and an
+/// executor error all return `ForgeError::Failed`, so a caller cannot tell them apart.
 fn from_buckets(output: &str) -> Result<CiResult, ForgeError> {
     let listed: Listed = serde_json::from_str(output).map_err(|_| ForgeError::Failed)?;
     let has = |wanted: &[&str]| {

@@ -474,7 +474,16 @@ impl<R: Resolver, D: Dialer> Fetcher<R, D> {
     /// Fetch `url` and return its text body.
     ///
     /// # Errors
-    /// Returns the [`FetchError`] for the first rule the fetch breaks.
+    /// Returns the [`FetchError`] for the first rule the fetch breaks: [`FetchError::Refused`]
+    /// or [`FetchError::RedirectRefused`] for a URL that fails the pre-check,
+    /// [`FetchError::HostNotPermitted`], [`FetchError::Resolve`],
+    /// [`FetchError::NonPublicAddress`], [`FetchError::Connect`], [`FetchError::Tls`] or
+    /// [`FetchError::ConnectTimeout`] while it reaches the host,
+    /// [`FetchError::BadRedirect`] or [`FetchError::TooManyRedirects`] on a redirect,
+    /// [`FetchError::Protocol`] when the server breaks HTTP/1.1, [`FetchError::Status`] for a
+    /// non-success status, [`FetchError::Encoded`], [`FetchError::NotText`],
+    /// [`FetchError::BodyTooLarge`] or [`FetchError::DecodedTooLarge`] for the body, and
+    /// [`FetchError::Timeout`] past the total deadline.
     pub async fn fetch(&self, url: &str) -> Result<Fetched, FetchError> {
         let landed = timeout(self.caps.total_timeout, self.follow(url, Mode::Text))
             .await

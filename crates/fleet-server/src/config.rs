@@ -132,8 +132,9 @@ pub struct Config {
     pub database_url: Secret,
     /// Box bearer token: `FleetIngest` and `FleetWorker`.
     pub token: Token,
-    /// Client bearer token: `FleetQuery` and `FleetJobs`. `None` when
-    /// `FLEET_CLIENT_TOKEN` is unset or empty; that closes `FleetQuery` and `FleetJobs`.
+    /// Client bearer token for the client-scope services, among them `FleetQuery` and
+    /// `FleetJobs`. `None` when `FLEET_CLIENT_TOKEN` is unset or empty; the static client token
+    /// then authenticates nobody and only per-user API tokens reach those services.
     pub client_token: Option<Token>,
     /// How long telemetry rows are kept, from `FLEET_EVENTS_RETENTION_DAYS` and
     /// `FLEET_SUMMARIES_RETENTION_DAYS`.

@@ -229,8 +229,11 @@ pub(crate) async fn delete(
 ///
 /// # Errors
 ///
-/// Returns [`CliError::Credential`] for any server refusal and for a credential GitHub
-/// refused, and [`CliError::Io`] when writing fails.
+/// Returns [`CliError::Credential`] for any server refusal and for a reply with `valid: false`,
+/// and [`CliError::Io`] when writing fails. The server answers `valid: false` for a PAT GitHub
+/// refused and, for a `github_app` credential, for any mint failure: an absent lane, a
+/// malformed installation id, a failed installation lookup, a signing failure, a refused mint
+/// and a revoke GitHub refused.
 pub(crate) async fn verify(
     client: &mut CredentialsClient,
     scrub: &Scrub,

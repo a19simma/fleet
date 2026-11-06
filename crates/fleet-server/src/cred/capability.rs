@@ -20,7 +20,7 @@ pub use fleet_proto::ERR_CAPABILITY_NOT_GRANTED;
 pub const FORGE_GITHUB_APP: &str = "forge:github_app";
 /// Refusal text for a capability name outside the closed set.
 pub const REASON_UNKNOWN_CAPABILITY: &str = "unknown capability";
-/// Refusal text for a grant whose target user does not exist.
+/// Refusal text for a call whose target user does not exist.
 pub const REASON_NO_SUCH_USER: &str = "no such user";
 /// Refusal text for a call whose acting admin does not exist.
 pub const REASON_NO_SUCH_ACTOR: &str = "no such acting user";

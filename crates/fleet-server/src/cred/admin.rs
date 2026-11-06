@@ -159,16 +159,18 @@ pub fn parse_args(args: &[String]) -> Result<AdminCommand, AdminError> {
 
 /// Runs `cmd` in one transaction and records `operator` in the audit row.
 ///
-/// # Errors
-///
-/// Returns [`AdminError::NoSuchUser`] when a reset, grant or revoke names no user or names
-/// `bootstrap`, [`AdminError::LastAdmin`] when a revoke would leave no admin, a username
-/// error for a create, or a database error. A failed command leaves no row behind.
-///
 /// A revoke locks every admin row in id order, then the target row, then counts admins, all
 /// in the transaction that clears the flag. Two concurrent revokes therefore serialise and
 /// the second sees the first's result. Granting an admin or revoking a non-admin succeeds
 /// and writes an audit row.
+///
+/// # Errors
+///
+/// Returns [`AdminError::NoSuchUser`] when a reset, grant or revoke names no user or names
+/// `bootstrap`, [`AdminError::LastAdmin`] when a revoke would leave no admin, and
+/// [`AdminError::User`] wrapping [`UserError::InvalidUsername`], [`UserError::ReservedUsername`]
+/// or [`UserError::Taken`] for a create and [`UserError::Db`] for a database failure. A failed
+/// command leaves no row behind.
 pub async fn run(
     pool: &PgPool,
     cmd: &AdminCommand,

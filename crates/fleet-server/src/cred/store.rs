@@ -952,7 +952,8 @@ impl CredentialStore {
     ///
     /// # Errors
     ///
-    /// Returns [`StoreError::Db`] for a database failure.
+    /// Returns [`StoreError::Seal`] when a stored row names a kind this build does not know and
+    /// [`StoreError::Db`] for a database failure.
     pub async fn list(&self, user_id: i64) -> Result<Vec<CredentialSummary>, StoreError> {
         let rows = sqlx::query(LIST)
             .bind(user_id)
@@ -1011,8 +1012,9 @@ impl CredentialStore {
     ///
     /// # Errors
     ///
-    /// Returns [`StoreError::NotFound`] when the id is unknown, owned by another user or tombstoned
-    /// and [`StoreError::Seal`] when the value cannot be opened.
+    /// Returns [`StoreError::NotFound`] when the id is unknown, owned by another user or tombstoned,
+    /// [`StoreError::Seal`] when the value cannot be opened or the stored kind is unknown, and
+    /// [`StoreError::Db`] for a database failure.
     pub async fn open_for_verify(
         &self,
         user_id: i64,
@@ -1513,8 +1515,9 @@ impl CredentialStore {
     ///
     /// # Errors
     ///
-    /// Returns [`StoreError::NotFound`] when the id is unknown or owned by another user and
-    /// [`StoreError::Seal`] when the value cannot be opened. No use row is written then.
+    /// Returns [`StoreError::NotFound`] when the id is unknown, owned by another user or
+    /// tombstoned, [`StoreError::Seal`] when the value cannot be opened or the stored kind is
+    /// unknown, and [`StoreError::Db`] for a database failure. No use row is written then.
     pub async fn open_for_use(
         &self,
         user_id: i64,

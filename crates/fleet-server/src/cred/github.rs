@@ -150,6 +150,12 @@ impl GithubApi for HttpsGithub {
     }
 }
 
+/// Builds the TLS client config: ring, the bundled webpki roots and HTTP/1.1 only.
+///
+/// # Errors
+///
+/// Returns [`GithubError::Unavailable`] when ring does not support the default protocol
+/// versions.
 pub(super) fn tls_config() -> Result<Arc<ClientConfig>, GithubError> {
     let roots = RootCertStore {
         roots: webpki_roots::TLS_SERVER_ROOTS.to_vec(),
