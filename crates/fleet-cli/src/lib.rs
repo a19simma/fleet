@@ -180,7 +180,7 @@ pub enum Command {
         #[command(subcommand)]
         area: catalog::UserArea,
     },
-    /// Create, list and show named agent profiles.
+    /// Create, list, show, share and unshare named agent profiles.
     Profile {
         /// The profile action.
         #[command(subcommand)]
@@ -237,12 +237,22 @@ pub enum ProfileAction {
         #[arg(long)]
         file: String,
     },
-    /// List every profile with its latest version and hash.
+    /// List every profile with its latest version, hash, owner and visibility.
     List,
-    /// Show a profile: canonical content, version and hash.
+    /// Show a profile: owner, visibility, selection, authored prompt, content, version and hash.
     Show {
         /// Profile name, or `name@version` for a pinned version.
         target: String,
+    },
+    /// Share one of your profiles so every user can read it.
+    Share {
+        /// Profile name.
+        name: String,
+    },
+    /// Make one of your shared profiles private again.
+    Unshare {
+        /// Profile name.
+        name: String,
     },
 }
 
@@ -823,6 +833,16 @@ async fn run_profile(
             let session = session(env, timeouts).await?;
             let mut client = session.profiles;
             profile::show(&mut client, &session.scrub, name.to_owned(), version, out).await
+        }
+        ProfileAction::Share { name } => {
+            let session = session(env, timeouts).await?;
+            let mut client = session.profiles;
+            profile::set_shared(&mut client, &session.scrub, name, true, out).await
+        }
+        ProfileAction::Unshare { name } => {
+            let session = session(env, timeouts).await?;
+            let mut client = session.profiles;
+            profile::set_shared(&mut client, &session.scrub, name, false, out).await
         }
     }
 }
