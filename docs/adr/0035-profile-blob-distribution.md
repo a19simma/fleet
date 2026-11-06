@@ -33,7 +33,7 @@ Per Job, fleetd:
 4. Overlays a `Bundle` with `Bundle::from_files`.
 5. Applies the fixed Floor and the Box ceilings last.
 
-fleetd fails closed with `profile invalid: <reason>`. The Job fails before the clone and fleetd never falls back to the default Bundle. The reply must name the Job's `ProfileRef` exactly, the blob must fit `MAX_PROFILE_JSON_BYTES`, equal the canonical JSON of its Profile and hash to the `ProfileRef` hash. A failed fetch fails the Job the same way. fleetd derives the ceilings from its `max_turns` and `max_budget_usd` settings, and keeps `dontAsk` from the Effective settings, so a Profile Job never skips permissions, even on a disposable box. Each reason is a fixed message and never echoes the blob. A **Bundle** is the on-disk file set fleetd installs for the agent; the Profile overlays it for one Job.
+fleetd fails closed with `profile invalid: <reason>`. The Job fails before the clone and fleetd never falls back to the default Bundle. The reply must name the Job's `ProfileRef` exactly, the blob must fit `MAX_PROFILE_JSON_BYTES`, equal the canonical JSON of its Profile and hash to the `ProfileRef` hash. A failed fetch fails the Job the same way. The catalog snapshot in the reply is checked too: the item and byte caps, duplicate ids, each item's digest against its fields, and the core rules for names and bodies. fleetd derives the ceilings from its `max_turns` and `max_budget_usd` settings, and keeps `dontAsk` from the Effective settings, so a Profile Job never skips permissions, even on a disposable box. Each reason is a fixed message and never echoes the blob. A **Bundle** is the on-disk file set fleetd installs for the agent; the Profile overlays it for one Job.
 
 ## Consequences
 

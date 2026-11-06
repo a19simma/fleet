@@ -9,12 +9,14 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::path::PathBuf;
 
-use fleet_core::catalog::{CatalogItem, CatalogKind};
+use fleet_core::catalog::{CatalogEntry, CatalogError, CatalogItem, CatalogKind};
 use fleet_core::model_allowlist::ModelAllowlist;
 use fleet_core::tools::ToolSpec;
 use fleet_core::{Profile, ProfileHash, ProfileInvalid};
 use fleet_proto::v1::{GetProfileBlobReply, ProfileRef};
-use fleet_proto::{MAX_PROFILE_JSON_BYTES, catalog_entry_from_wire};
+use fleet_proto::{
+    MAX_PROFILE_JSON_BYTES, ProfileConvertError, catalog_entry_from_wire, validate_blob_catalog,
+};
 use serde_json::{Map, Value, json};
 
 use crate::agent_config::{Bundle, BundleError};
@@ -446,8 +448,19 @@ pub enum LoadError {
     Mismatch,
     /// The hash in the Job's `ProfileRef` is not 64 lowercase hex characters.
     RefHash,
-    /// The catalog snapshot holds an item the core rules refuse, or one id twice.
+    /// The catalog snapshot holds an item the core rules refuse, other than a name or body.
     Catalog,
+    /// The catalog snapshot holds more than `MAX_BLOB_CATALOG_ITEMS` items or more than
+    /// `MAX_BLOB_CATALOG_BYTES` content bytes.
+    CatalogTooLarge,
+    /// The catalog snapshot names one item id twice.
+    CatalogDuplicate,
+    /// An item digest differs from the digest of its fields.
+    CatalogDigest,
+    /// An item name is empty, over-long or outside the name shape.
+    CatalogName,
+    /// An item body is empty or over-long.
+    CatalogBody,
     /// The blob is longer than [`MAX_PROFILE_JSON_BYTES`].
     TooLarge,
     /// A `tools` entry names a tool outside the registry, has a version that is not an exact
@@ -523,6 +536,11 @@ impl LoadError {
             Self::Mismatch => "profile invalid: server sent another profile than the job names",
             Self::RefHash => "profile invalid: job profile hash is malformed",
             Self::Catalog => "profile invalid: the catalog snapshot is not valid",
+            Self::CatalogTooLarge => "profile invalid: the catalog snapshot is too large",
+            Self::CatalogDuplicate => "profile invalid: the catalog snapshot repeats an item id",
+            Self::CatalogDigest => "profile invalid: a catalog item digest does not match",
+            Self::CatalogName => "profile invalid: a catalog item name is not allowed",
+            Self::CatalogBody => "profile invalid: a catalog item body is not allowed",
             Self::TooLarge => "profile invalid: profile blob is too large",
             Self::ToolEntry => TOOL_ENTRY_REASON,
             Self::Malformed => "profile invalid: profile blob is not profile JSON",
@@ -550,18 +568,50 @@ impl fmt::Display for LoadError {
 
 impl std::error::Error for LoadError {}
 
+/// Checks the catalog snapshot of a blob reply and returns its entries in wire order.
+///
+/// The snapshot must fit `MAX_BLOB_CATALOG_ITEMS` items and `MAX_BLOB_CATALOG_BYTES` content
+/// bytes, checked before any item is read. Every item goes through the core rules, its digest
+/// must equal the digest of its fields, and no id may repeat.
+///
+/// # Errors
+///
+/// Returns [`LoadError::CatalogTooLarge`] over either cap, [`LoadError::CatalogName`] and
+/// [`LoadError::CatalogBody`] for a refused name or body, [`LoadError::CatalogDigest`] for a
+/// digest that does not match, [`LoadError::CatalogDuplicate`] for a repeated id and
+/// [`LoadError::Catalog`] for any other refused item.
+pub fn validated_catalog(
+    wire: &[fleet_proto::v1::CatalogItem],
+) -> Result<Vec<CatalogEntry>, LoadError> {
+    if !validate_blob_catalog(wire) {
+        return Err(LoadError::CatalogTooLarge);
+    }
+    let mut seen = BTreeSet::new();
+    let mut entries = Vec::with_capacity(wire.len());
+    for raw in wire {
+        let entry = catalog_entry_from_wire(raw).map_err(|err| match err {
+            ProfileConvertError::Catalog(CatalogError::InvalidName) => LoadError::CatalogName,
+            ProfileConvertError::Catalog(CatalogError::InvalidBody) => LoadError::CatalogBody,
+            _ => LoadError::Catalog,
+        })?;
+        if raw.digest.as_slice() != entry.item().digest().as_slice() {
+            return Err(LoadError::CatalogDigest);
+        }
+        if !seen.insert(entry.item().id().clone()) {
+            return Err(LoadError::CatalogDuplicate);
+        }
+        entries.push(entry);
+    }
+    Ok(entries)
+}
+
 fn effective_items(
     profile: &Profile,
     wire: &[fleet_proto::v1::CatalogItem],
 ) -> Result<Vec<CatalogItem>, LoadError> {
-    let mut seen = BTreeSet::new();
     let mut kept = Vec::new();
-    for raw in wire {
-        let entry = catalog_entry_from_wire(raw).map_err(|_| LoadError::Catalog)?;
+    for entry in validated_catalog(wire)? {
         let item = entry.item();
-        if !seen.insert(item.id().clone()) {
-            return Err(LoadError::Catalog);
-        }
         let off = profile.selection.ids().any(|id| id == item.id());
         if entry.enabled() && !off {
             kept.push(item.clone());
@@ -583,8 +633,9 @@ fn effective_items(
 /// The catalog snapshot in `reply` is the effective set frozen at submit and is applied as
 /// sent, with [`apply_effective`]. An item that is not admin-enabled or that the Profile
 /// selection switched off is left out again here, so a snapshot cannot carry one in. An item
-/// the core rules refuse, or a repeated id, is [`LoadError::Catalog`]. A tool item needs the
-/// tools stamp like a Profile tool.
+/// the core rules refuse, a digest that does not match, a repeated id or a snapshot over the
+/// caps is refused by [`validated_catalog`]. A tool item needs the tools stamp like a Profile
+/// tool.
 ///
 /// `tools_granted` is the Job's `profile_tools_granted`. A Profile with tools and `false` is
 /// refused with [`LoadError::ToolsNotGranted`] after the validator and before the model check,
@@ -646,7 +697,7 @@ mod tests {
     use std::path::Path;
 
     use fleet_core::{ContextFile, Selection, Skill};
-    use fleet_proto::v1;
+    use fleet_proto::{MAX_BLOB_CATALOG_BYTES, MAX_BLOB_CATALOG_ITEMS, catalog_kind_from_wire, v1};
 
     use super::*;
 
@@ -1417,6 +1468,12 @@ mod tests {
             LoadError::Mismatch,
             LoadError::RefHash,
             LoadError::TooLarge,
+            LoadError::Catalog,
+            LoadError::CatalogTooLarge,
+            LoadError::CatalogDuplicate,
+            LoadError::CatalogDigest,
+            LoadError::CatalogName,
+            LoadError::CatalogBody,
             LoadError::Malformed,
             LoadError::NotCanonical,
             LoadError::HashMismatch,
@@ -1435,9 +1492,17 @@ mod tests {
             kind,
             name: name.to_owned(),
             content: content.to_owned(),
-            digest: Vec::new(),
+            digest: digest_of(kind, id, name, content),
             admin_enabled: enabled,
         }
+    }
+
+    fn digest_of(kind: i32, id: &str, name: &str, content: &str) -> Vec<u8> {
+        catalog_kind_from_wire(kind)
+            .ok()
+            .and_then(|k| CatalogItem::new(k, id, name, content).ok())
+            .map(|item| item.digest().to_vec())
+            .unwrap_or_default()
     }
 
     const SKILL: i32 = v1::CatalogKind::Skill as i32;
@@ -1592,7 +1657,7 @@ mod tests {
                 let by_name = vec![wire(kind, "ok", &raw, "1.0.0", true)];
                 assert_eq!(
                     with_catalog(&Profile::default(), by_name, true).err(),
-                    Some(LoadError::Catalog),
+                    Some(LoadError::CatalogName),
                     "name {raw:?} kind {kind}"
                 );
                 let by_id = vec![wire(kind, &raw, "jq", "1.0.0", true)];
@@ -1610,17 +1675,8 @@ mod tests {
         let cases = [
             vec![wire(0, "a", "a", "x", true)],
             vec![wire(9, "a", "a", "x", true)],
-            vec![wire(SKILL, "a", "a", "", true)],
             vec![wire(TOOL, "a", "jq", "latest", true)],
             vec![wire(TOOL, "a", "not-a-tool", "1.0.0", true)],
-            vec![
-                wire(SKILL, "a", "one", "x", true),
-                wire(SKILL, "a", "two", "x", true),
-            ],
-            vec![
-                wire(SKILL, "a", "one", "x", false),
-                wire(SKILL, "a", "two", "x", true),
-            ],
         ];
         for catalog in cases {
             assert_eq!(
@@ -1629,9 +1685,179 @@ mod tests {
             );
         }
         assert_eq!(
+            with_catalog(
+                &Profile::default(),
+                vec![wire(SKILL, "a", "a", "", true)],
+                true
+            )
+            .err(),
+            Some(LoadError::CatalogBody)
+        );
+        assert_eq!(
             LoadError::Catalog.reason(),
             "profile invalid: the catalog snapshot is not valid"
         );
+    }
+
+    fn skills(count: usize) -> Vec<v1::CatalogItem> {
+        (0..count)
+            .map(|n| wire(SKILL, &format!("s{n}"), &format!("n{n}"), "x", true))
+            .collect()
+    }
+
+    #[test]
+    fn a_catalog_at_the_item_cap_loads() -> Result<(), LoadError> {
+        let entries = validated_catalog(&skills(MAX_BLOB_CATALOG_ITEMS))?;
+        assert_eq!(entries.len(), MAX_BLOB_CATALOG_ITEMS);
+        assert_eq!(entries[0].item().id().as_str(), "s0");
+        Ok(())
+    }
+
+    #[test]
+    fn a_catalog_one_item_over_the_cap_is_refused() {
+        assert_eq!(
+            validated_catalog(&skills(MAX_BLOB_CATALOG_ITEMS + 1)).err(),
+            Some(LoadError::CatalogTooLarge)
+        );
+        assert_eq!(
+            with_catalog(
+                &Profile::default(),
+                skills(MAX_BLOB_CATALOG_ITEMS + 1),
+                true
+            )
+            .err(),
+            Some(LoadError::CatalogTooLarge)
+        );
+    }
+
+    #[test]
+    fn a_catalog_at_the_byte_cap_loads_and_one_byte_over_is_refused() -> Result<(), LoadError> {
+        let per = MAX_BLOB_CATALOG_BYTES / 16;
+        let at: Vec<_> = (0..16)
+            .map(|n| {
+                wire(
+                    SKILL,
+                    &format!("s{n}"),
+                    &format!("n{n}"),
+                    &"x".repeat(per),
+                    true,
+                )
+            })
+            .collect();
+        validated_catalog(&at)?;
+        let mut over = at;
+        over[0] = wire(SKILL, "s0", "n0", &"x".repeat(per + 1), true);
+        assert_eq!(
+            validated_catalog(&over).err(),
+            Some(LoadError::CatalogTooLarge)
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn a_repeated_id_is_refused_with_its_own_reason() {
+        let twice = vec![
+            wire(SKILL, "a", "one", "x", true),
+            wire(SKILL, "a", "two", "x", true),
+        ];
+        let mixed = vec![
+            wire(SKILL, "a", "one", "x", false),
+            wire(SKILL, "a", "two", "x", true),
+        ];
+        assert_eq!(
+            with_catalog(&Profile::default(), mixed, true).err(),
+            Some(LoadError::CatalogDuplicate)
+        );
+        assert_eq!(
+            validated_catalog(&twice).err(),
+            Some(LoadError::CatalogDuplicate)
+        );
+        assert_eq!(
+            LoadError::CatalogDuplicate.reason(),
+            "profile invalid: the catalog snapshot repeats an item id"
+        );
+    }
+
+    #[test]
+    fn a_tampered_digest_is_refused_and_fails_the_load() {
+        let mut flips = Vec::new();
+        for field in 0..4 {
+            let mut items = four();
+            match field {
+                0 => items[0].content.push('x'),
+                1 => items[0].name = "other".to_owned(),
+                2 => items[0].digest[0] ^= 1,
+                _ => items[0].digest.clear(),
+            }
+            flips.push(items);
+        }
+        for items in flips {
+            assert_eq!(
+                validated_catalog(&items).err(),
+                Some(LoadError::CatalogDigest)
+            );
+            assert_eq!(
+                with_catalog(&Profile::default(), items, true).err(),
+                Some(LoadError::CatalogDigest)
+            );
+        }
+        let mut short = four();
+        short[0].digest.pop();
+        assert_eq!(
+            validated_catalog(&short).err(),
+            Some(LoadError::CatalogDigest)
+        );
+        assert_eq!(
+            LoadError::CatalogDigest.reason(),
+            "profile invalid: a catalog item digest does not match"
+        );
+    }
+
+    #[test]
+    fn a_name_at_the_limit_loads_and_one_byte_over_is_refused() -> Result<(), LoadError> {
+        let at = "a".repeat(fleet_core::catalog::MAX_NAME_BYTES);
+        validated_catalog(&[wire(SKILL, "a", &at, "x", true)])?;
+        let over = "a".repeat(fleet_core::catalog::MAX_NAME_BYTES + 1);
+        assert_eq!(
+            validated_catalog(&[wire(SKILL, "a", &over, "x", true)]).err(),
+            Some(LoadError::CatalogName)
+        );
+        assert_eq!(
+            LoadError::CatalogName.reason(),
+            "profile invalid: a catalog item name is not allowed"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn hostile_names_get_the_name_reason() {
+        for raw in hostile_names() {
+            assert_eq!(
+                validated_catalog(&[wire(SKILL, "a", &raw, "x", true)]).err(),
+                Some(LoadError::CatalogName),
+                "name {raw:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_body_at_the_limit_loads_and_one_byte_over_is_refused() -> Result<(), LoadError> {
+        let at = "x".repeat(fleet_core::catalog::MAX_BODY_BYTES);
+        validated_catalog(&[wire(SKILL, "a", "one", &at, true)])?;
+        let over = "x".repeat(fleet_core::catalog::MAX_BODY_BYTES + 1);
+        assert_eq!(
+            validated_catalog(&[wire(SKILL, "a", "one", &over, true)]).err(),
+            Some(LoadError::CatalogBody)
+        );
+        assert_eq!(
+            validated_catalog(&[wire(SKILL, "a", "one", "", true)]).err(),
+            Some(LoadError::CatalogBody)
+        );
+        assert_eq!(
+            LoadError::CatalogBody.reason(),
+            "profile invalid: a catalog item body is not allowed"
+        );
+        Ok(())
     }
 
     #[test]
