@@ -180,7 +180,7 @@ pub enum Command {
         #[command(subcommand)]
         area: catalog::UserArea,
     },
-    /// Create, list, show, share and unshare named agent profiles.
+    /// Create, list, show, share, unshare and edit named agent profiles.
     Profile {
         /// The profile action.
         #[command(subcommand)]
@@ -253,6 +253,31 @@ pub enum ProfileAction {
     Unshare {
         /// Profile name.
         name: String,
+    },
+    /// Switch one catalog item on or off in a profile. Saves a new version, or keeps the
+    /// current one when nothing changes. The server refuses an id it does not know.
+    Item {
+        /// Profile name.
+        profile: String,
+        /// Item kind: skill, subagent, tool or context. Checked for spelling only; the server
+        /// matches the id alone, so the same id under another kind is also switched off.
+        #[arg(value_parser = ["skill", "subagent", "tool", "context"])]
+        kind: String,
+        /// Catalog item id: 1 to 64 characters of lowercase letters, digits, `_` and `-`.
+        id: String,
+        /// `off` stores the item as switched off; `on` removes it from the stored selection.
+        #[arg(value_parser = ["on", "off"])]
+        state: String,
+    },
+    /// Set the authored prompt of a profile from a file or stdin. Saves a new version, or
+    /// keeps the current one when nothing changes. Empty input clears the prompt.
+    Prompt {
+        /// Profile name.
+        profile: String,
+        /// File holding the prompt text, or `-` to read it from stdin: at most
+        /// `MAX_PROMPT_TEXT_BYTES` bytes, no control characters but newline and tab.
+        #[arg(long)]
+        file: String,
     },
 }
 
@@ -843,6 +868,40 @@ async fn run_profile(
             let session = session(env, timeouts).await?;
             let mut client = session.profiles;
             profile::set_shared(&mut client, &session.scrub, name, false, out).await
+        }
+        ProfileAction::Item {
+            profile: name,
+            kind: _,
+            id,
+            state,
+        } => {
+            let id = profile::item_id(&id)?;
+            let session = session(env, timeouts).await?;
+            let mut client = session.profiles;
+            profile::edit(
+                &mut client,
+                &session.scrub,
+                name,
+                |content| profile::set_item(content, &id, state == "on"),
+                out,
+            )
+            .await
+        }
+        ProfileAction::Prompt {
+            profile: name,
+            file,
+        } => {
+            let text = profile::read_prompt(&file, stdin)?;
+            let session = session(env, timeouts).await?;
+            let mut client = session.profiles;
+            profile::edit(
+                &mut client,
+                &session.scrub,
+                name,
+                |content| profile::set_prompt(content, text.clone()),
+                out,
+            )
+            .await
         }
     }
 }

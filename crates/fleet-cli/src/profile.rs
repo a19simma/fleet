@@ -1,13 +1,15 @@
-//! `fleet profile`: create, list, show, share and unshare named agent profiles.
+//! `fleet profile`: create, list, show, share, unshare and edit named agent profiles.
 
 use std::io::{Read, Write};
 
+use fleet_core::{ItemId, Profile, PromptText, Selection};
 use fleet_proto::MAX_PROFILE_JSON_BYTES;
 use fleet_proto::v1::fleet_profiles_client::FleetProfilesClient;
 use fleet_proto::v1::{
     CreateProfileRequest, GetProfileRequest, ListProfilesRequest, ProfileSummary, ProfileVersion,
     ProfileVisibility, ShareProfileRequest, UnshareProfileRequest,
 };
+use tonic::Status;
 use tonic::service::interceptor::InterceptedService;
 use tonic::transport::Channel;
 
@@ -24,6 +26,12 @@ const LIST_PAGE: u32 = 200;
 const MAX_LIST_PAGES: usize = 5_000;
 const TOO_LARGE: &str = "profile JSON is larger than the allowed maximum";
 const TOO_MANY_PAGES: &str = "server returned too many profile list pages";
+const BAD_ITEM: &str =
+    "invalid item id: use 1 to 64 characters of a-z, 0-9, _ and -, starting with a letter or digit";
+const BAD_PROMPT: &str = "invalid prompt: at most 65536 bytes, no control characters but newline and tab, no CR, U+2028, U+2029 or bidirectional control";
+const BAD_STORED: &str = "server returned a profile this client cannot edit";
+const NOT_LATEST: &str = "the edited profile equals an older version, so it cannot become the latest; change something else or recreate it";
+const BAD_RESULT: &str = "the edited profile is not valid";
 const BAD_TARGET: &str =
     "invalid profile: use <name> or <name>@<version> with a version of 1 or more";
 
@@ -73,6 +81,135 @@ pub(crate) fn read_source(path: &str, stdin: &mut impl Read) -> Result<String, C
     } else {
         read_bounded(&mut std::fs::File::open(path)?)
     }
+}
+
+/// Checks a catalog item id before any connection is opened. The message never repeats it.
+///
+/// # Errors
+/// Returns [`CliError::Usage`] for an id outside `[a-z0-9][a-z0-9_-]{0,63}`.
+pub(crate) fn item_id(raw: &str) -> Result<ItemId, CliError> {
+    ItemId::new(raw).map_err(|_| CliError::Usage(BAD_ITEM.into()))
+}
+
+/// Reads an authored prompt from `path`, or from `stdin` when `path` is `-`, and checks it.
+///
+/// The read stops one byte past `PromptText::MAX_BYTES`. Empty input gives `None`, which
+/// clears the prompt. A file that is not UTF-8 is an I/O error.
+///
+/// # Errors
+/// Returns [`CliError::Usage`] with a fixed message for a refused character. An over-long
+/// text is [`CliError::Usage`] too, except when the cap falls inside a multibyte character,
+/// which is [`CliError::Io`] like any non-UTF-8 input. [`CliError::Io`] also covers a source
+/// that cannot be read.
+pub(crate) fn read_prompt(
+    path: &str,
+    stdin: &mut impl Read,
+) -> Result<Option<PromptText>, CliError> {
+    let limit = PromptText::MAX_BYTES as u64 + 1;
+    let mut text = String::new();
+    if path == "-" {
+        stdin.take(limit).read_to_string(&mut text)?;
+    } else {
+        std::fs::File::open(path)?
+            .take(limit)
+            .read_to_string(&mut text)?;
+    }
+    PromptText::new(&text).map_err(|_| CliError::Usage(BAD_PROMPT.into()))
+}
+
+fn parse_stored(content_json: &str) -> Result<Profile, CliError> {
+    Profile::from_stored_json(content_json.as_bytes())
+        .map_err(|_| CliError::Usage(BAD_STORED.into()))
+}
+
+fn selection_with(profile: &Profile, id: &ItemId, off: bool) -> Result<Selection, CliError> {
+    let mut ids: Vec<&str> = profile
+        .selection
+        .ids()
+        .map(ItemId::as_str)
+        .filter(|kept| *kept != id.as_str())
+        .collect();
+    if off {
+        ids.push(id.as_str());
+    }
+    let entries: Vec<String> = ids
+        .iter()
+        .map(|id| format!("{{\"item_id\":\"{id}\",\"enabled\":false}}"))
+        .collect();
+    Selection::from_json(format!("[{}]", entries.join(",")).as_bytes())
+        .map_err(|_| CliError::Usage(BAD_RESULT.into()))
+}
+
+/// Returns `content_json` with `id` switched on (`on`) or off in its selection.
+///
+/// Switching off an id that is already off, or on an id that is not off, changes nothing.
+///
+/// # Errors
+/// Returns [`CliError::Usage`] when the stored content cannot be parsed or the result
+/// breaks a selection rule such as the entry cap.
+pub(crate) fn set_item(content_json: &str, id: &ItemId, on: bool) -> Result<String, CliError> {
+    let mut profile = parse_stored(content_json)?;
+    profile.selection = selection_with(&profile, id, !on)?;
+    canonical(&profile)
+}
+
+/// Returns `content_json` with its authored prompt replaced by `text`, or cleared for `None`.
+///
+/// # Errors
+/// Returns [`CliError::Usage`] when the stored content cannot be parsed.
+pub(crate) fn set_prompt(content_json: &str, text: Option<PromptText>) -> Result<String, CliError> {
+    let mut profile = parse_stored(content_json)?;
+    profile.authored_prompt = text;
+    canonical(&profile)
+}
+
+fn canonical(profile: &Profile) -> Result<String, CliError> {
+    String::from_utf8(profile.canonical_json()).map_err(|_| CliError::Usage(BAD_RESULT.into()))
+}
+
+/// `fleet profile item` and `prompt`: reads the latest version, applies `change` to its
+/// content and saves the result through `CreateProfile`, so the server checks the
+/// selection and keeps the version when the content hash is unchanged. Prints the version.
+///
+/// Selection is keyed by item id only: the kind is not part of the stored entry.
+///
+/// The server keeps one version per distinct content. When the edit equals an older
+/// version than the one read, `CreateProfile` returns that older version and leaves the
+/// latest unchanged, so the command fails with `FailedPrecondition` and prints nothing.
+/// Known gap: switching an item back on after it was switched off can hit this, until the
+/// server moves "latest". Another save between the read and the write is overwritten: the
+/// last writer wins.
+///
+/// A profile that sets `tools` cannot be saved as JSON, so the server refuses it.
+pub(crate) async fn edit(
+    client: &mut ProfilesClient,
+    scrub: &Scrub,
+    name: String,
+    change: impl FnOnce(&str) -> Result<String, CliError>,
+    out: &mut impl Write,
+) -> Result<(), CliError> {
+    let current = client
+        .get_profile(GetProfileRequest {
+            name: name.clone(),
+            version: None,
+        })
+        .await?
+        .into_inner();
+    let content_json = change(&current.content_json)?;
+    let reply = client
+        .create_profile(CreateProfileRequest {
+            name,
+            content_json,
+            content_toml: String::new(),
+        })
+        .await?
+        .into_inner();
+    if !reply.created && reply.version != current.version {
+        return Err(CliError::Rpc(Status::failed_precondition(NOT_LATEST)));
+    }
+    write_version(out, scrub, &reply)?;
+    writeln!(out, "created: {}", if reply.created { "yes" } else { "no" })?;
+    Ok(())
 }
 
 fn write_version(

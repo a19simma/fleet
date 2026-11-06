@@ -1,6 +1,6 @@
 # Profiles and batches
 
-Status: Accepted 2026-10-27. Profile storage, the `FleetProfiles` client RPCs, `fleet profile create`, `list` and `show`, migration 0012, the `FleetBatches.SubmitBatch` and `GetBatch` client RPCs, `fleet batch show`, `fleet batch submit`, the clone by commit id and `Job.profile` and `Job.batch_id` are built; the rest is not built. Amends ADR-0021, ADR-0023, ADR-0029 and ADR-0030. ADR-0035 covers storage and distribution.
+Status: Accepted 2026-10-27. Profile storage, the `FleetProfiles` client RPCs, `fleet profile create`, `list`, `show`, `share`, `unshare`, `item` and `prompt`, migration 0012, the `FleetBatches.SubmitBatch` and `GetBatch` client RPCs, `fleet batch show`, `fleet batch submit`, the clone by commit id and `Job.profile` and `Job.batch_id` are built; the rest is not built. Amends ADR-0021, ADR-0023, ADR-0029 and ADR-0030. ADR-0035 covers storage and distribution.
 
 A future UI will dispatch the same prompt with several named configurations and compare outcomes. No UI exists yet. This ADR records the structure that comparison needs: a Profile that fixes the agent config of one Job, a Batch that groups Jobs by Profile, and a per-profile view in the CLI.
 
@@ -95,7 +95,7 @@ This ADR covers structure only: Profile storage and application, a batch table a
 - A/A runs.
 - MCP in Profiles.
 - Assigning `claude_version` per Profile.
-- A UI and a Profile editor.
+- A UI and a full Profile editor (`fleet profile item` and `prompt` edit only the selection and the authored prompt).
 - Per-Profile secrets.
 
 ## Consequences

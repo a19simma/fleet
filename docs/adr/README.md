@@ -24,7 +24,7 @@ ADRs for fleetd, the Fleet server and the `fleet` CLI. The plan is in `../plan.m
 | [0030](0030-metrics-and-improvement-loop.md) | Metrics and the improvement loop | Accepted, `GetStats`, caps and shadow stuck detector built, enforcement not built, builds on 0029 |
 | [0031](0031-agent-isolation.md) | Agent isolation | Accepted 2026-10-26, P1 built behind `agent_launcher = "systemd"` and cut over on the first Box, P2 built, P3 clone and publish built, supersedes the Known limit paragraph of 0024 and amends its credential and mirror-hardening sections |
 | [0033](0033-credential-delivery.md) | Credential delivery | Proposed 2026-10-29, built, builds on 0035, 0040 and 0043, amends 0014, 0021, 0023, 0024, 0031 and 0037 |
-| [0034](0034-profiles-and-batches.md) | Profiles and batches | Accepted 2026-10-27, storage, profile and batch RPCs and `fleet batch show` and `fleet batch submit` built, fleetd profile apply and clone by commit id built, live probe not run, amends 0021, 0023, 0029 and 0030 |
+| [0034](0034-profiles-and-batches.md) | Profiles and batches | Accepted 2026-10-27, storage, profile and batch RPCs, `fleet profile item` and `prompt`, `fleet batch show` and `fleet batch submit` built, fleetd profile apply and clone by commit id built, live probe not run, amends 0021, 0023, 0029 and 0030 |
 | [0035](0035-profile-blob-distribution.md) | Profile blob distribution | Accepted 2026-10-27, server side and fleetd materialisation built, amends 0021 and 0023, implements 0034, amended by 0057 |
 | [0036](0036-per-job-unix-socket.md) | Per-job unix socket | Proposed 2026-10-28, socket, fetch, egress proxy and broker wired under the systemd launcher, mount isolation unverified, amends 0031 |
 | [0037](0037-credential-broker.md) | Credential broker | Proposed 2026-10-28, built and wired under the systemd launcher, push op built on 0031 P3, builds on 0028 and 0036, amends 0024 and 0031 |
@@ -43,7 +43,7 @@ ADRs for fleetd, the Fleet server and the `fleet` CLI. The plan is in `../plan.m
 | [0050](0050-baked-default-update-trust-root.md) | Baked default update trust root | Proposed 2026-11-01, built, no live run, amends 0047 |
 | [0051](0051-web-ui-styling-tailwind-daisyui.md) | Web UI styling: Tailwind and daisyUI, generated CSS committed | Accepted 2026-11-01, built, extends 0041 |
 | [0052](0052-profile-ownership-and-visibility.md) | Profile ownership and visibility | Proposed 2026-11-02, not built, amends 0034, 0035 and 0048, builds on 0042 |
-| [0053](0053-global-catalog-and-profile-selection.md) | Global catalog and profile selection | Proposed 2026-11-02, save-time selection validation built, rest not built, amends 0034 and 0035, builds on 0044, 0048 and 0054 |
+| [0053](0053-global-catalog-and-profile-selection.md) | Global catalog and profile selection | Proposed 2026-11-02, save-time selection validation and `fleet profile item` and `prompt` built, rest not built, amends 0034 and 0035, builds on 0044, 0048 and 0054 |
 | [0054](0054-user-capabilities-and-model-allowlist.md) | User capabilities and model allowlist | Proposed 2026-11-02, built, amends 0048, builds on 0035, 0042 and 0044, amended by 0056 |
 | [0055](0055-job-timing-breakdown.md) | Job timing breakdown and loopback OTLP receiver | Proposed 2026-11-02, not built, loopback probe not run on a live host, supersedes in part and amends 0029, amends 0031 |
 | [0056](0056-admin-is-a-user-flag.md) | Admin is a user flag | Proposed 2026-11-04, not built, amends 0023, 0042 and 0054, builds on 0042 |

@@ -720,14 +720,14 @@ fn failures(seed: &Seeded, rendered: &Rendered) -> Vec<String> {
 
 #[sqlx::test]
 async fn every_field_is_present_on_every_surface(pool: PgPool) {
-    let seeded = seed(pool).await;
+    let seeded = Box::pin(seed(pool)).await;
     let red = failures(&seeded, &seeded.rendered);
     assert!(red.is_empty(), "{}", red.join("\n"));
 }
 
 #[sqlx::test]
 async fn the_table_covers_every_fields_entry_and_command_field(pool: PgPool) {
-    let seeded = seed(pool).await;
+    let seeded = Box::pin(seed(pool)).await;
     let table = rows(&seeded.view);
     let mut listed = String::new();
     for field in FIELDS {
@@ -777,7 +777,7 @@ async fn the_table_covers_every_fields_entry_and_command_field(pool: PgPool) {
 
 #[sqlx::test]
 async fn a_blank_surface_turns_every_present_row_red(pool: PgPool) {
-    let seeded = seed(pool).await;
+    let seeded = Box::pin(seed(pool)).await;
     let blank = Rendered::default();
     let green: Vec<String> = rows(&seeded.view)
         .iter()
@@ -793,7 +793,7 @@ async fn a_blank_surface_turns_every_present_row_red(pool: PgPool) {
 
 #[sqlx::test]
 async fn the_seed_carries_a_value_for_every_field(pool: PgPool) {
-    let seeded = seed(pool).await;
+    let seeded = Box::pin(seed(pool)).await;
     let s = seeded.sent_summary;
     let parts = [
         s.api_wait_ms,
