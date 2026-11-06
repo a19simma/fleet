@@ -1,6 +1,6 @@
 # User capabilities and model allowlist
 
-Status: Proposed 2026-11-02. Built: the `profile:tools` capability (save, Job submit, batch submit, blob serve), the startup refusal of `FLEET_ALLOW_PROFILE_TOOLS`, the server `FLEET_MODEL_ALLOWLIST` check at profile save, Job submit, batch submit and blob serve, and the fleetd `model_allowlist`. Amends ADR-0048 (the server gate for `tools`). Builds on ADR-0035, ADR-0042 and ADR-0044. Amended by ADR-0056.
+Status: Proposed 2026-11-02. Built: the `profile:tools` capability (save, Job submit, batch submit, blob serve), the startup refusal of `FLEET_ALLOW_PROFILE_TOOLS`, the server `FLEET_MODEL_ALLOWLIST` check at profile save, Job submit, batch submit and blob serve, and the fleetd `model_allowlist`. Amends ADR-0048 (the server gate for `tools`). Builds on ADR-0035, ADR-0042 and ADR-0044. Amended by ADR-0056 and ADR-0058.
 
 ADR-0048 gates Profile `tools` with one server switch, `FLEET_ALLOW_PROFILE_TOOLS`, because the server then had only box and client scopes. The server now has Users and an admin, a user with `users.is_admin` (ADR-0042, ADR-0056), so a grant can attach to a principal. A global switch lets every client install toolchains once an operator flips it. This ADR replaces it with a per-user capability and adds a model allowlist so a Job cannot select a model the operator never approved.
 
@@ -48,3 +48,7 @@ ADR-0048 gates Profile `tools` with one server switch, `FLEET_ALLOW_PROFILE_TOOL
 - **Deny by default when fleetd has no allowlist.** It breaks every existing Box on upgrade. The deploy note covers the gap instead.
 - **Deny by default when the server has no allowlist.** Same upgrade break, and existing Jobs set models freely today.
 - **Role instead of capability.** A role bundles rights, and `profile:tools` is a single narrow grant.
+
+## Amendment (ADR-0058)
+
+ADR-0058 (proposed, not built) adds the capability `forge:github_app`. The server checks it at `PutCredential` for the `github_app` kind and live at release. Holders can mint write tokens for any repository in the installation, clamped to the Job repository.

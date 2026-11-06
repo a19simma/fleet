@@ -1,6 +1,6 @@
 # Fleet
 
-Fleet runs coding-agent Jobs on Boxes and records what each Job did. This file defines the terms of the ADRs on telemetry and metrics (0029, 0030), profiles (0034, 0035, 0052, 0053, 0057), capabilities and the model allowlist (0054), job timing (0055), the job socket, broker and registration (0036, 0037, 0039), fetch policy (0038), credentials and users (0040, 0042, 0043), agent runners and forges (0044, 0045) the mirror key (0046) and the update trust root (0047, 0050).
+Fleet runs coding-agent Jobs on Boxes and records what each Job did. This file defines the terms of the ADRs on telemetry and metrics (0029, 0030), profiles (0034, 0035, 0052, 0053, 0057), capabilities and the model allowlist (0054), job timing (0055), the job socket, broker and registration (0036, 0037, 0039), fetch policy (0038), credentials and users (0040, 0042, 0043), the GitHub App lane (0058), agent runners and forges (0044, 0045) the mirror key (0046) and the update trust root (0047, 0050).
 
 ## Language
 
@@ -262,6 +262,21 @@ _Avoid_: setup time
 **Background command**:
 A shell command with no completion event. fleetd measures it as a `BgShell` **Span**. `BgWatcher` polls `pueue status --json` for tasks created after the Job started, and a pueue task still open at Job exit ends with `ended_by=job_exit` (ADR-0055).
 _Avoid_: detached command, async shell
+
+**GitHub App credential**:
+The `github_app` **Credential kind**: a **User**'s installation id for the operator's GitHub App. The App id and private key are server config, never stored. Proposed, not built (ADR-0058).
+_Avoid_: app token, app key
+
+**Installation token**:
+The one-hour GitHub token the server mints from a **GitHub App credential** for one Job, clamped to the Job repository and delivered as wire kind `github_installation_token`. It is never stored. Proposed, not built (ADR-0058).
+_Avoid_: app token
+
+**Bot identity**:
+The git name and email (`GitIdentity`) a Job commits under when it uses a **GitHub App credential**. The server sends it and fleetd re-validates it. Proposed, not built (ADR-0058).
+_Avoid_: bot user
+
+**Forge credential**:
+A **Credential** for a **Forge**: a `github_pat` today, or a **GitHub App credential** (ADR-0043, ADR-0058). Proposed, not built (ADR-0058).
 
 ## Relationships
 

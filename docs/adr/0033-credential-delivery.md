@@ -1,6 +1,6 @@
 # Credential delivery
 
-Status: Proposed 2026-10-29. Built: the server `GetJobCredentials`, the fleetd credential holder, and broker, askpass and `gh` use of the held token. Builds on ADR-0035 (lease-authorised worker calls), ADR-0040 (store) and ADR-0043 (kinds). Amends ADR-0014, ADR-0021, ADR-0023, ADR-0024, ADR-0031 and ADR-0037. ADR-0035 reserved this number for delivery.
+Status: Proposed 2026-10-29. Built: the server `GetJobCredentials`, the fleetd credential holder, and broker, askpass and `gh` use of the held token. Builds on ADR-0035 (lease-authorised worker calls), ADR-0040 (store) and ADR-0043 (kinds). Amends ADR-0014, ADR-0021, ADR-0023, ADR-0024, ADR-0031 and ADR-0037. ADR-0035 reserved this number for delivery. Amended by ADR-0058.
 
 The server stores user credentials (ADR-0040). A Box needs the credentials of one Job, and only for that Job. This ADR fixes the call, its authorisation, who sees the result and what happens when a credential is missing.
 
@@ -48,3 +48,7 @@ Accepted because there is one Box and one user. Per-Box tokens arrive with a lat
 - **Box fetches with the client token.** It would hand a Box the client scope (ADR-0023).
 - **Fallback to the Box PAT.** It would push as the Box identity for a user who stored nothing, and keep the PAT alive.
 - **Writing credentials to the agent's environment.** The agent could read and exfiltrate them.
+
+## Amendment (ADR-0058)
+
+ADR-0058 (proposed, not built) adds the `github_app` kind. When a User holds it, release prefers it over `github_pat`, mints an installation token outside the transaction after the capability check, and sends it as the wire kind `github_installation_token` with a `GitIdentity`. Release stays one RPC, called again to refresh when under 10 minutes remain, under a per-Job mint cap. Mint audit goes into the new insert-only table `github_app_mint` (migration 0032, ADR-0058 SEC-005). The one-row-per-credential-released rule above is unchanged: each refresh release writes one `credential_use` row per credential released, so a refresh adds a row (`crates/fleet-server/src/cred/store.rs` inserts one per released credential). The `github_app_mint` columns include `mint_id` and `attempt_id` (ADR-0058 SEC-015), and its outcomes are `attempt`, `minted`, `failed`, `denied`, `revoked` and `revoke_failed` (ADR-0058 SEC-005, ADR-0058 SEC-022). A mint failure fails the Job with one fixed error and never falls back to a PAT.

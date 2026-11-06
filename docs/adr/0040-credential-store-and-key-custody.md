@@ -1,6 +1,6 @@
 # Credential store and key custody
 
-Status: Proposed 2026-10-29. Built in fleet-server: the sealed store, `FileSealer`, the key ring loaded from the master key file at startup, and the insert-only `credential_use` audit (migrations 0017 and 0019). Not built: the re-seal pass (`Sealer::rewrap` exists and no code calls it) and a key ring reload without a restart. Amends ADR-0013 (storage). Refers to ADR-0043 for the credential kinds and shapes this store holds.
+Status: Proposed 2026-10-29. Built in fleet-server: the sealed store, `FileSealer`, the key ring loaded from the master key file at startup, and the insert-only `credential_use` audit (migrations 0017 and 0019). Not built: the re-seal pass (`Sealer::rewrap` exists and no code calls it) and a key ring reload without a restart. Amends ADR-0013 (storage). Refers to ADR-0043 for the credential kinds and shapes this store holds. Amended by ADR-0058.
 
 Fleet will run Jobs with the user's own agent and forge credentials. The server must keep them between Jobs and hand them to a Box only for the Job that needs them. This ADR fixes where they live, how they are sealed and who holds the key.
 
@@ -45,3 +45,7 @@ The key and the plaintext coexist in the server pod while a Job is claimed. Anyo
 ## Amendment to ADR-0013 (storage)
 
 Postgres also holds `credentials` and `credential_use`, defined above. The rule "prompts are sensitive data at rest" extends to credentials, with the sealing and key custody set here.
+
+## Amendment (ADR-0058)
+
+ADR-0058 (proposed, not built) stores only the installation id for the `github_app` kind. The App id and private key are server config (`FLEET_GITHUB_APP_ID`, `FLEET_GITHUB_APP_KEY_FILE`, a file mounted from a Kubernetes Secret) and never enter the sealed store. `credential_use` is unchanged: insert-only, one row per credential released (ADR-0033), including each refresh release. Mint audit goes into the new insert-only table `github_app_mint` (migration 0032, ADR-0058 SEC-005). The server inserts an `attempt` row before each mint (correlated by `mint_id` and `attempt_id`, ADR-0058 SEC-015) and a `minted`, `failed` or `denied` row after it, plus `revoked` or `revoke_failed` when it revokes a token (ADR-0058 SEC-022). The `expires_at` column is nullable and only `minted` rows record it (ADR-0058 SEC-023). Failed and denied mints leave a row with no secret. A credential with mint history cannot be deleted (trigger and `ON DELETE NO ACTION` foreign key), so a tombstone column on `credentials` takes the place of delete (ADR-0058 SEC-022). The installation id must parse as `u64` at `PutCredential` (ADR-0058 SEC-019).

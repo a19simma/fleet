@@ -1,6 +1,6 @@
 # Forge trait
 
-Status: Proposed 2026-10-29. Built in fleetd: the `Forge` trait, the GitHub implementation and the `Unsupported` Gitea slot, with CI read through `Forge::ci_result`. Builds on ADR-0043 and ADR-0033. Amends ADR-0037 and ADR-0024.
+Status: Proposed 2026-10-29. Built in fleetd: the `Forge` trait, the GitHub implementation and the `Unsupported` Gitea slot, with CI read through `Forge::ci_result`. Builds on ADR-0043 and ADR-0033. Amends ADR-0037 and ADR-0024. Amended by ADR-0058.
 
 Fleet pushes a branch, opens a pull request and reads CI state on GitHub through the broker (ADR-0037). This ADR puts those operations behind one interface so another forge can fit later.
 
@@ -35,3 +35,7 @@ Gitea and Forgejo have no GitHub App equivalent (https://forgejo.org/docs/latest
 
 - **Build Gitea now.** The user chose the shared interface only.
 - **No trait, GitHub calls inline.** A second forge would rewrite the broker.
+
+## Amendment (ADR-0058)
+
+ADR-0058 (proposed, not built) lets the GitHub implementation use a one-hour installation token and the bot identity instead of the owner's `github_pat`. The `Forge` operations do not change. The Gitea note above stands.

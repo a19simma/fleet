@@ -1,0 +1,98 @@
+# GitHub App lane
+
+Status: Proposed 2026-11-06, not built. The operator accepted everything except the permission set (open decision below). This flips to Accepted when the permission decision closes. Nothing here exists in code yet. Builds on ADR-0033, ADR-0040, ADR-0043, ADR-0045 and ADR-0054. Amends ADR-0024, ADR-0033, ADR-0040, ADR-0043, ADR-0045 and ADR-0054.
+
+Jobs push and open pull requests with the owner's `github_pat` (ADR-0043), so every change appears under the owner's name and the token lives for weeks. This ADR adds a second GitHub path: a GitHub App installation. The Job gets a one-hour installation token scoped to its repository and acts as the App's bot identity.
+
+## Decision
+
+### Credential kind `github_app`
+
+- `github_app` is a new Credential kind, stored per User. Its sealed value is the installation id and nothing else (ADR-0040 sealing, `static_secret` shape).
+- The App id and the App private key are operator config on the server: `FLEET_GITHUB_APP_ID` and `FLEET_GITHUB_APP_KEY_FILE`. The key file is mounted from a Kubernetes Secret, like the master key (ADR-0040). The key never enters the sealed store and is never an environment variable.
+- The bot name and the bot email id are server config as well: `FLEET_GITHUB_APP_BOT_NAME` sits beside the email id and the server validates it by the same identity grammar (SEC-006). They travel to the Box with the credential as `GitIdentity` (a name and an email).
+- The wire kind `github_installation_token` is what the Box receives. It is not storable: `PutCredential` refuses it.
+
+### Selection
+
+- When a User holds both `github_app` and `github_pat`, the App wins.
+- A User with neither still fails with the fixed missing-GitHub error of ADR-0033.
+
+### Capability
+
+- `forge:github_app` is a new capability under ADR-0054. The server checks it at `PutCredential` for the `github_app` kind and again live at release, in the same transaction as the other release checks. A revoke refuses a leased Job that has not yet fetched its credentials.
+- Escalation note: any holder of the capability can mint write tokens for any repository in the installation. The clamp below narrows each token to the Job repository, and the User chooses that repository at submit. The capability therefore grants write on every repository the installation covers. Admins grant it with that in mind.
+
+### Minting
+
+- The server signs a JWT with RS256 through `ring`, as a new direct `ring` dependency of the server crate (open item: dependencies need operator approval before APP-3 starts, see SEC-018): `iat` is now minus 60 seconds, `exp` is now plus 540 seconds, `iss` is the App id (JWT rules: https://docs.github.com/en/apps/creating-github-apps/authenticating-with-a-github-app/generating-a-json-web-token-jwt-for-a-github-app, official docs). It calls the installation token endpoint with that JWT (https://docs.github.com/en/rest/apps/apps#create-an-installation-access-token-for-an-app, official docs: the token lasts one hour and the response carries `token`, `expires_at`, `permissions` and `repositories`).
+- The request body comes from server constants only: `{"repositories":[<job repo name>],"permissions":{"contents":"write","pull_requests":"write"}}`. No client field reaches it.
+- The server fails closed on the response when any of these holds: the returned permissions differ from the accepted set (SEC-016), `repositories` is not exactly the one requested, or `expires_at` is more than `MAX_TOKEN_TTL` away. The server pins `MAX_TOKEN_TTL` at 65 minutes as a named constant.
+- The mint call runs outside the database transaction, after the capability check. The `attempt` row and the per-Job cap counter are written inside the transaction before it (SEC-005 and SEC-011). The token reaches fleetd and git as SEC-017 describes.
+- The repository at mint comes from the stored Job row, never from a request field (SEC-009).
+
+### Lifetime and refresh
+
+- A token lasts one hour. fleetd refreshes it through `GetJobCredentials` when under 10 minutes remain.
+- The server caps mints per Job with a named constant. A Job over the cap fails.
+- Agent-driven refresh is bounded by the cap and the per-User rate limit (SEC-011). Under the direct launcher the agent shares fleetd's uid (ADR-0024) and holds the token. Under the systemd launcher the broker (ADR-0037) holds the token and the agent holds none (ADR-0031), with no fleetd token and no network route to the server, so it cannot call `GetJobCredentials`.
+
+### Identity on the Box
+
+- fleetd re-validates the `GitIdentity` name and email grammar before use and fails the Job before clone on a bad identity. The server is not trusted alone, as in ADR-0054.
+- Today fleetd uses the fixed `JOB_NAME` and `JOB_EMAIL` in `crates/fleetd/src/agent_config.rs`. For App Jobs the identity comes from `GitIdentity` instead.
+- Bot id lookup, for the operator: `gh api /users/<slug>[bot] --jq .id`.
+
+### Failure
+
+- A mint failure fails the Job with one fixed error. There is no fallback to a PAT or any other identity (ADR-0033).
+
+### Security decisions
+
+- SEC-001, installation allowlist: the operator sets `FLEET_GITHUB_APP_INSTALLATIONS`, a list of allowed installation ids. At `PutCredential` and again at mint the server calls `GET /app/installations/{id}` with the App JWT. It refuses unless the id is on the allowlist, `account.login` matches the operator account, `suspended_at` is null and `app_id` equals the configured App id (SEC-013). The App must be private, installable only on the operator account.
+- SEC-002, repository allowlist: each `github_app` credential carries a repository allowlist. The server enforces it at submit and again at mint. Until the allowlist is set the server refuses the credential for submit. Multi-user rollout requires branch protection on every installed repository.
+- SEC-003, rate limit: the server applies a per-User mint rate limit (see SEC-004 and SEC-011). The limit is the named constant `MAX_APP_MINTS_PER_USER_PER_MINUTE`. The database enforces it by counting `github_app_mint` rows, so it holds across replicas. The count and the `attempt` insert run in one transaction that takes `FOR UPDATE` on the credentials row (SEC-021), so concurrent releases for one User serialize. A breach returns the fixed error and writes a `denied` row.
+- SEC-004, refresh: every refresh re-checks the capability, requires the Job to be running and leased to the calling Box, then mints (SEC-011). The mint cap is `max_job_duration / refresh_interval` plus a margin.
+- SEC-005, audit: `credential_use` stays insert-only (trigger in migration 0017) and keeps one row per credential released (ADR-0033), unchanged. Mint audit goes into a new insert-only table `github_app_mint` (migration 0032) with a trigger rejecting `UPDATE`, `DELETE` and `TRUNCATE`. Columns: `id`, `mint_id`, `attempt_id`, `credential_id`, `job_id`, `repo`, `installation_id`, `requested_permissions`, `outcome`, `reason`, `expires_at`, `at` (`mint_id` and `attempt_id` as SEC-015 defines them, `expires_at` nullable and recorded on `minted` rows only, as SEC-023 defines it). The outcome set is `attempt`, `minted`, `failed`, `denied`, `revoked` and `revoke_failed` (SEC-022). The table is append-only. Each refresh release writes one `credential_use` row per credential released, the ADR-0033 rule, as `crates/fleet-server/src/cred/store.rs` does today: the release transaction inserts one row for each released credential, so a refresh adds a row in addition to its `github_app_mint` rows. Inside the transaction and before any mint call the server inserts an `attempt` row. If that insert fails there is no mint call (fail closed). The result is a second row with outcome `minted`, `failed` or `denied`, with a reason code and no secret. A capability or allowlist denial writes a `denied` row. An `attempt` with no outcome row after `MAX_TOKEN_TTL` reads as unknown by query, never by update.
+- SEC-006, identity grammar: the name matches `\A[A-Za-z0-9](?:[A-Za-z0-9 ._\[\]-]{0,62}[A-Za-z0-9\]])?\z`, so it starts with an alphanumeric and cannot end in a space (SEC-012). The email matches `\A[0-9]+\+[a-z0-9-]+\[bot\]@users\.noreply\.github\.com\z`. The uppercase rejection applies to the email only. Hostile-input table, all rejected: CR, LF, NUL, angle brackets, U+2028, NEL, over-length, non-ASCII, plus the SEC-012 additions.
+- SEC-007, runbook: rotate the App key by adding a second key on GitHub (it supports several), switching `FLEET_GITHUB_APP_KEY_FILE`, then deleting the old key. The key file has mode 0400. The server reads it into a `Zeroizing` buffer, implements `Debug` with redaction, and logs only fixed error codes.
+- SEC-008: a User who holds a `github_app` credential but lacks `forge:github_app` fails the Job with the fixed error. The server never falls back to the PAT.
+- SEC-009, allowlist authority and grammar: only an admin or operator config sets the allowlist, never the credential owner. The effective list is the operator ceiling `FLEET_GITHUB_APP_REPOS` intersected with the per-credential list an admin sets. An entry is exact `owner/name` or `owner/*`, with no other glob. The server compares after ASCII lowercasing. Hostile-input table, all rejected: `..`, an extra slash, an empty label, a trailing slash, whitespace, non-ASCII, a backslash. The repository at mint comes from the stored Job row, never from a request field.
+- SEC-010, revocation: the server never stores the token, so it runs no sweep. The server sends `DELETE /installation/token` immediately on any failed response validation, before it discards the token. fleetd revokes the old token after a successful refresh, and makes a best-effort revoke at Job end, cancel, failure and lease loss. Residual: when fleetd cannot revoke (crash, lost network), the one-hour expiry is the only bound.
+- SEC-011, mint ordering: the `attempt` row and the per-Job cap counter increment happen inside the transaction with a row lock on the Job row and `FOR UPDATE` on the credentials row (SEC-021), then the mint runs. After the mint the server re-checks the Job state. If the Job ended or the capability is gone, it revokes the token and returns the fixed error. The recheck also re-reads the capability (SEC-017). Under the direct launcher the agent shares fleetd's uid (ADR-0024) and can drive refresh, bounded by the cap and the per-User rate limit. Under the systemd launcher the broker holds the token and the agent holds none (ADR-0031, ADR-0037).
+- SEC-012, identity injection: the identity name must start with an alphanumeric. Patterns are anchored with `\A` and `\z` in both the name and the email. fleetd passes the identity by environment or `git -c`, never as a bare argv token. The hostile table adds leading whitespace and trailing whitespace for the name, and uppercase for the email only.
+- SEC-013, key and installation checks: the server holds the parsed key in one process-lifetime object with a redacted `Debug`. Residual: the key stays in process memory for the life of the server. At `PutCredential` and at mint the `GET /app/installations/{id}` response must have `suspended_at` null and `app_id` equal to the configured id.
+- SEC-014, owner binding: the Job repo owner, ASCII-lowercased, must equal the installation `account.login` at submit and at mint. The operator account is config `FLEET_GITHUB_APP_ACCOUNT`. Allowlist and ceiling entries whose owner differs from it are rejected at config load. `FLEET_GITHUB_APP_REPOS` unset means deny-all.
+- SEC-015, correlation: every `github_app_mint` row carries `mint_id` (uuid). Outcome rows reference the attempt through `attempt_id`, with a unique `(attempt_id, outcome)`. The `credential_id` foreign key is `ON DELETE NO ACTION`. If the outcome insert fails after a successful mint, the server revokes the token and returns the fixed error.
+- SEC-016, response validation: the accepted response permissions set is exactly `{contents:write, pull_requests:write, metadata:read}`. Any other key or a higher level fails closed and triggers the SEC-010 revoke. Inferred, not part of the design: GitHub adds `metadata:read` to every installation token, so the set includes it. Confirm with a live token before APP-3.
+- SEC-017, recheck and token handling: the post-mint recheck (SEC-011) also re-reads the capability. In fleetd the token never reaches argv, `.git/config` or logs. SEC-023 states which processes hold it in their environment and which receive it through askpass.
+- SEC-018, dependencies: `ring` is a new direct dependency and `zeroize` may be new. Both need operator approval before APP-3. Inferred, not part of the design: `ring` may accept PKCS#1 DER. The implementer confirms against ring's docs which key encodings it accepts. Any PEM or DER conversion dependency is listed for approval only if needed.
+- SEC-019, installation id and URL construction: the installation id must parse as `u64` at `PutCredential`, and the server rejects anything else. The server builds every URL from the parsed integer, never from the stored text. The mint body is built with `serde_json` from the stored Job repo name, whose grammar is SEC-009. Hostile-input table, all rejected: `/`, `..`, `?`, `#`, `%2f`, leading zeros, over-long.
+- SEC-020, outbound client: the base URL is the fixed `https://api.github.com` with no production environment override. Redirects are disabled. The connect timeout and the total timeout are named constants. The server reads the response with `take(cap + 1)` and a named cap, and fails closed on truncation. The JWT type and the installation token type implement `Debug` with redaction and hold their value in `Zeroizing`, on the server and in fleetd.
+- SEC-021, credentials row lock: the per-User rate limit (SEC-003) and the per-Job cap (SEC-011) take `FOR UPDATE` on the credentials row in the same transaction as the count and the `attempt` insert. Without the lock two concurrent releases both read a count under the limit and both insert.
+- SEC-022, commit order and credential deletion: the `attempt` row commits first, then the mint runs, then the outcome transaction commits. The outcome set adds `revoked` and `revoke_failed`, which record the SEC-010 revoke and its failure. A credential with mint history cannot be deleted: a trigger and the `ON DELETE NO ACTION` foreign key (SEC-015) refuse it. Off-boarding therefore uses capability revocation and a tombstone column on `credentials`. The tombstone is decided. The delete path for a credential with mint history sets the tombstone and does not delete the row. A tombstoned credential is never released.
+- SEC-023, residual token lifetime and token handling: When fleetd's revoke at Job end fails (SEC-010), a refresh-minted token can outlive the Job by up to one hour, because the server never stores the token and cannot revoke it later. The server records `expires_at` on minted rows in `github_app_mint`, so the overlap is auditable by query. Token handling in fleetd, from ADR-0024, ADR-0037 and `crates/fleetd/src/runner/token.rs` and `crates/fleetd/src/broker.rs`: `GH_TOKEN` is in the environment of the `git push` child, the `gh` child (with `GH_ENTERPRISE_TOKEN` off `github.com`) and the mirror fetch child, and `fleetd askpass` prints it from its own `GH_TOKEN` for a password prompt. The `git` process in those children receives the token through askpass and never in argv. The agent child environment strips `GH_TOKEN`. Under the direct launcher the agent shares fleetd's uid and reads the token from `/proc` (ADR-0024 Known limit). Under the systemd launcher the broker (ADR-0037) performs push and `gh` calls and the agent holds no token.
+
+### Permission set
+
+The permission set is a server constant: `contents:write` and `pull_requests:write`. The operator fixed this scope.
+
+OPEN DECISION: reading CI results needs `checks:read` and `statuses:read` as well, per https://docs.github.com/en/rest/overview/permissions-required-for-github-apps (official docs). Without them `pr_checks` and `ci_result` fail for App Jobs. Fixing this means adding both read permissions to the App's granted permissions and to the server constant. Inferred, not part of the design: `gh pr checks` may use GraphQL, which has its own permission rules. Test with a live token before deciding.
+
+A push that touches `.github/workflows` needs the `workflows` permission, which this ADR does not request. Such pushes fail.
+
+## Consequences
+
+- Pull requests and commits show the bot as author. Operators must create the App, install it and record the installation id and bot email id before any User can store the credential.
+- The CLI has no credential commands today (`crates/fleet-cli/src`). A planned follow-up ticket adds them for all kinds. Until then a User stores `github_app` through the web credentials page or the API.
+- Under the direct launcher ADR-0024 still applies: the agent runs as fleetd's uid and can read the token from `/proc`. Under the systemd launcher ADR-0031 supersedes that limit and the broker (ADR-0037) holds the token, so the agent holds none. The one-hour life and the one-repository clamp bound the damage.
+- A Job needs one extra HTTPS call to GitHub at release and at each refresh. A GitHub outage fails new App Jobs.
+
+## Considered and rejected
+
+- **Store the App private key in the sealed store.** One store compromise would expose a key that mints tokens for every installation. Operator config keeps it out of the database and its backups.
+- **Key in an environment variable.** Environment values leak through process listings and crash dumps.
+- **PAT wins when both exist.** It would keep Jobs on the long-lived token the lane exists to replace.
+- **Fall back to a PAT on mint failure.** It hides an outage and changes the acting identity without the User asking.
+- **Client-chosen permissions or repositories.** The request would then be as wide as a client can ask.
+- **Mint inside the release transaction.** A slow GitHub call would hold row locks.

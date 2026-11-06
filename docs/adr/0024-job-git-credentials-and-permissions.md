@@ -1,6 +1,6 @@
 # Job git credentials and permission policy
 
-Status: Accepted. The runner, push and pull request step and reporter are built and run by the daemon, with a token host, a hardened mirror and a scoped fetch credential. Amends ADR-0011. The Known limit paragraph is superseded and the mirror-hardening window is retired by ADR-0031 (Accepted, P1 built).
+Status: Accepted. The runner, push and pull request step and reporter are built and run by the daemon, with a token host, a hardened mirror and a scoped fetch credential. Amends ADR-0011. The Known limit paragraph is superseded and the mirror-hardening window is retired by ADR-0031 (Accepted, P1 built). Amended by ADR-0058.
 
 Pushing a branch and opening a pull request need write access to the repo, and ADR-0011 says fleetd holds no git credential. A headless `claude -p` run stalls on any permission prompt, and the agent can run arbitrary shell.
 
@@ -48,3 +48,7 @@ ADR-0037 amends the push and `gh` sections: the agent will request `push`, `pr_c
 ## Amendment (ADR-0033, ADR-0045, ADR-0046)
 
 For user Jobs the `GH_TOKEN` comes from the owner's stored `github_pat`, delivered by `GetJobCredentials` (ADR-0033), and never from the Box PAT. A missing credential fails the Job with a fixed error. The daemon no longer reads `GH_TOKEN` from `secrets.env` on the Job path: the holder token is the only source for the push, the mirror fetch and `gh`, and the `gh` child env is the fixed set plus that token. The daemon refuses a plain `http` `FLEET_SERVER_URL` for the credential channel unless the host is loopback or `FLEETD_ALLOW_PLAINTEXT_CREDENTIALS=1`. The mirror directory is keyed by `(user, repo)` (ADR-0046). Push and pull request go through the `Forge` trait (ADR-0045).
+
+## Amendment (ADR-0058)
+
+For App Jobs (ADR-0058, proposed, not built) `GH_TOKEN` is a one-hour installation token released through `GetJobCredentials`, and commits use the `GitIdentity` the server sends in place of the fixed Job identity. Under the direct launcher the limit above holds: the agent shares the uid and can read the token from `/proc`. Under the systemd launcher ADR-0031 supersedes the limit and the broker (ADR-0037) holds the token, so the agent holds none; it also has no fleetd token and no network route to the server (ADR-0031), so it cannot call `GetJobCredentials`. The token is clamped to the Job repository. The token sits in the environment of the push, `gh` and mirror fetch children, and git receives it through `fleetd askpass` (ADR-0058 SEC-017, ADR-0058 SEC-023).
