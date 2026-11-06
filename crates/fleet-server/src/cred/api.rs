@@ -49,6 +49,10 @@ fn store_status(err: &StoreError) -> Status {
         StoreError::MintCapReached => {
             Status::failed_precondition(fleet_proto::PRECONDITION_APP_MINT_CAP)
         }
+        StoreError::InstallationDenied => {
+            Status::failed_precondition(fleet_proto::PRECONDITION_APP_INSTALLATION)
+        }
+        StoreError::RepoDenied => Status::failed_precondition(fleet_proto::PRECONDITION_APP_REPO),
         StoreError::NoJobRepo => {
             Status::failed_precondition(fleet_proto::PRECONDITION_NO_VERIFY_REPO)
         }
@@ -111,10 +115,16 @@ impl CredentialService {
     /// leading zero) or an expiry outside the allowed range, `PERMISSION_DENIED` with
     /// `ERR_CAPABILITY_NOT_GRANTED` when the kind needs a capability the user lacks (the check
     /// runs at save, under `FOR SHARE`),
-    /// `RESOURCE_EXHAUSTED` past the per-user cap, `FAILED_PRECONDITION` with
-    /// `PRECONDITION_CREDENTIAL_TOMBSTONED` when the user's credential of this kind was deleted
-    /// and kept as a tombstone, `INTERNAL` when the value cannot be sealed or a stored kind is
-    /// unknown,
+    /// `RESOURCE_EXHAUSTED` past the per-user cap.
+    ///
+    /// `FAILED_PRECONDITION` with `PRECONDITION_APP_INSTALLATION` when a `github_app`
+    /// installation id is off the operator allowlist or GitHub reports it suspended, owned by
+    /// another App or installed on another account (checked after the capability, before
+    /// anything is stored), and with `PRECONDITION_CREDENTIAL_TOMBSTONED` when the user's
+    /// credential of this kind was deleted and kept as a tombstone.
+    ///
+    /// `INTERNAL` when the value cannot be sealed or a stored kind is unknown.
+    ///
     /// `UNAVAILABLE` when GitHub or storage cannot answer. Nothing is stored on any error.
     pub async fn put(
         &self,
@@ -161,6 +171,13 @@ impl CredentialService {
             expires_at_ms = expiry;
         } else if kind == CredentialKind::GithubApp {
             expires_at_ms = None;
+            self.store
+                .vet_installation(user_id, &value)
+                .await
+                .map_err(|err| match err {
+                    StoreError::MintFailed => github_status(GithubError::Unavailable),
+                    other => store_status(&other),
+                })?;
         }
         let summary = self
             .store
@@ -224,9 +241,12 @@ impl CredentialService {
     /// `ERR_CAPABILITY_NOT_GRANTED` when the owner lost the capability a stored kind needs.
     ///
     /// `FAILED_PRECONDITION` with `PRECONDITION_APP_MINT` when the App token cannot be minted,
-    /// with `PRECONDITION_APP_MINT_CAP` when the per-Job mint cap or the per-User mint rate
-    /// limit is reached (no PAT fallback), and with another message when the owner has no
-    /// GitHub credential, no credential the agent accepts, or a needed credential is expired.
+    /// with `PRECONDITION_APP_INSTALLATION` when the installation is off the allowlist or fails
+    /// the owner binding, with `PRECONDITION_APP_REPO` when the Job repository is not allowed
+    /// (neither falls back to a PAT), with `PRECONDITION_APP_MINT_CAP` when the per-Job mint
+    /// cap or the per-User mint rate limit is reached (no PAT fallback), and with another
+    /// message when the owner has no GitHub credential, no credential the agent accepts, or a
+    /// needed credential is expired.
     ///
     /// `NOT_FOUND` when a credential row vanishes during release.
     ///
@@ -276,11 +296,16 @@ impl CredentialService {
     /// # Errors
     ///
     /// `NOT_FOUND` for an unknown, foreign or tombstoned id, `FAILED_PRECONDITION` for a kind
-    /// without a verifier and, for `github_app`, when the user has no Job to scope the mint to
-    /// and with `PRECONDITION_APP_MINT_CAP` when the per-Job mint cap or the per-User mint rate
+    /// without a verifier and, for `github_app`, when the user has no Job to scope the mint to,
+    /// with `PRECONDITION_APP_INSTALLATION` or `PRECONDITION_APP_REPO` when the installation or
+    /// the repository of the user's latest Job is refused, and with
+    /// `PRECONDITION_APP_MINT_CAP` when the per-Job mint cap or the per-User mint rate
     /// limit is reached, `PERMISSION_DENIED` with `ERR_CAPABILITY_NOT_GRANTED` when a
     /// `github_app` owner lacks the capability, `INTERNAL` when a sealed value cannot be opened
     /// or a stored kind is unknown, `UNAVAILABLE` when GitHub or storage cannot answer.
+    ///
+    /// A `github_app` mint failure, including a failed installation lookup and a signing
+    /// failure, is a reply with `valid: false`, not an error.
     pub async fn verify(
         &self,
         user_id: i64,

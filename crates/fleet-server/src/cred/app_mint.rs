@@ -11,6 +11,10 @@
 //! validation revokes the token before it is discarded (SEC-010), also when the 201 body does
 //! not parse but its `token` field reads. No error carries text from the network.
 //!
+//! [`AppClient::installation`] reads `GET /app/installations/{id}` for the owner binding
+//! (SEC-013, SEC-014). A reply with a missing or null `suspended_at`, `app_id`, `id` or
+//! `account.login` is malformed, so a missing field never reads as "not suspended".
+//!
 //! The release path in `cred::store` calls the client after the capability check and the
 //! transaction commit (SEC-011).
 //!
@@ -201,6 +205,32 @@ enum Endpoint {
     Plain(std::net::SocketAddr),
 }
 
+/// What `GET /app/installations/{id}` says about an installation (SEC-013, SEC-014). The reply
+/// shape is unverified against GitHub docs.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Installation {
+    /// The installation id GitHub reports.
+    pub id: u64,
+    /// The id of the App the installation belongs to.
+    pub app_id: u64,
+    /// The login of the account the App is installed on.
+    pub account_login: String,
+    /// Whether `suspended_at` is set.
+    pub suspended: bool,
+}
+
+/// Looks an installation up through `GET /app/installations/{id}` (unverified against GitHub
+/// docs). Tests replace it with a fake.
+#[tonic::async_trait]
+pub trait InstallationDirectory: Send + Sync {
+    /// Reads the installation `id` with the App `jwt`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`MintError`] when the call fails or the reply is not a complete installation.
+    async fn installation(&self, jwt: &AppJwt, id: u64) -> Result<Installation, MintError>;
+}
+
 /// The GitHub App installation token client.
 pub struct AppClient {
     endpoint: Endpoint,
@@ -323,6 +353,33 @@ impl AppClient {
         serde_json::from_slice::<AppIdOnly>(&bytes)
             .map(|reply| reply.id)
             .map_err(|_| MintError::Malformed)
+    }
+
+    /// Reads the installation `id` with `GET /app/installations/{id}`. The URL is built from
+    /// the integer.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`MintError`]: `Setup` when the request cannot be built, `Status`, `Timeout`,
+    /// `Transport` or `TooLarge` for a failed call, and `Malformed` when the reply lacks a
+    /// numeric `id` or `app_id`, an `account.login` text or a present `suspended_at` (null or
+    /// text), or repeats a key.
+    pub async fn installation(&self, jwt: &AppJwt, id: u64) -> Result<Installation, MintError> {
+        let request = self.request(
+            Method::GET,
+            &format!("/app/installations/{id}"),
+            jwt.expose(),
+            Vec::new(),
+        )?;
+        let bytes = self.send(request, StatusCode::OK).await?;
+        let raw =
+            serde_json::from_slice::<RawInstallation>(&bytes).map_err(|_| MintError::Malformed)?;
+        Ok(Installation {
+            id: raw.id,
+            app_id: raw.app_id,
+            account_login: raw.account.login,
+            suspended: raw.suspended_at.is_some(),
+        })
     }
 
     /// Revokes `token` with `DELETE /installation/token`.
@@ -503,6 +560,31 @@ struct RawRepository {
 #[derive(Deserialize)]
 struct AppIdOnly {
     id: u64,
+}
+
+#[derive(Deserialize)]
+struct RawAccount {
+    login: String,
+}
+
+fn present<'de, D: Deserializer<'de>>(deserializer: D) -> Result<Option<String>, D::Error> {
+    Option::<String>::deserialize(deserializer)
+}
+
+#[derive(Deserialize)]
+struct RawInstallation {
+    id: u64,
+    app_id: u64,
+    account: RawAccount,
+    #[serde(deserialize_with = "present")]
+    suspended_at: Option<String>,
+}
+
+#[tonic::async_trait]
+impl InstallationDirectory for AppClient {
+    async fn installation(&self, jwt: &AppJwt, id: u64) -> Result<Installation, MintError> {
+        Self::installation(self, jwt, id).await
+    }
 }
 
 #[derive(Deserialize)]
@@ -1296,6 +1378,93 @@ mod tests {
             .await
             .unwrap_err();
         assert_eq!(err, MintError::Status(401));
+    }
+
+    fn installation_body(suspended: &str) -> String {
+        format!(
+            r#"{{"id":4242,"app_id":12345,"account":{{"login":"Acme","id":9}},"suspended_at":{suspended},"extra":1}}"#
+        )
+    }
+
+    #[tokio::test]
+    async fn installation_reads_the_binding_fields_from_the_integer_url() {
+        let fake = fake(vec![Script::Reply(http(
+            "200 OK",
+            "",
+            &installation_body("null"),
+        ))])
+        .await;
+        let got = client(&fake)
+            .installation(&AppJwt::from_text(JWT), ID)
+            .await
+            .unwrap();
+        assert_eq!(
+            got,
+            Installation {
+                id: 4242,
+                app_id: 12345,
+                account_login: "Acme".to_owned(),
+                suspended: false,
+            }
+        );
+        let request = &fake.requests()[0];
+        assert!(
+            request.starts_with("GET /app/installations/4242 "),
+            "{request}"
+        );
+        assert!(request.contains("Bearer jwt.header.sig"), "{request}");
+    }
+
+    #[tokio::test]
+    async fn installation_reports_a_suspended_installation() {
+        let fake = fake(vec![Script::Reply(http(
+            "200 OK",
+            "",
+            &installation_body(r#""2024-01-01T00:00:00Z""#),
+        ))])
+        .await;
+        let got = client(&fake)
+            .installation(&AppJwt::from_text(JWT), ID)
+            .await
+            .unwrap();
+        assert!(got.suspended);
+    }
+
+    #[tokio::test]
+    async fn installation_refuses_an_incomplete_or_duplicated_reply() {
+        for body in [
+            r#"{"id":4242,"app_id":12345,"account":{"login":"a"}}"#,
+            r#"{"id":4242,"app_id":12345,"account":null,"suspended_at":null}"#,
+            r#"{"id":4242,"app_id":12345,"account":{},"suspended_at":null}"#,
+            r#"{"id":4242,"app_id":12345,"account":{"login":1},"suspended_at":null}"#,
+            r#"{"id":4242,"account":{"login":"a"},"suspended_at":null}"#,
+            r#"{"app_id":12345,"account":{"login":"a"},"suspended_at":null}"#,
+            r#"{"id":"4242","app_id":12345,"account":{"login":"a"},"suspended_at":null}"#,
+            r#"{"id":4242,"app_id":"12345","account":{"login":"a"},"suspended_at":null}"#,
+            r#"{"id":4242,"app_id":12345,"account":{"login":"a"},"suspended_at":1}"#,
+            r#"{"id":4242,"app_id":12345,"account":{"login":"a"},"suspended_at":null,"suspended_at":"x"}"#,
+            "[]",
+            "not json",
+        ] {
+            let fake = fake(vec![Script::Reply(http("200 OK", "", body))]).await;
+            let err = client(&fake)
+                .installation(&AppJwt::from_text(JWT), ID)
+                .await
+                .unwrap_err();
+            assert_eq!(err, MintError::Malformed, "{body}");
+        }
+    }
+
+    #[tokio::test]
+    async fn installation_refuses_a_status_other_than_200() {
+        for status in ["404 Not Found", "301 Moved Permanently", "403 Forbidden"] {
+            let fake = fake(vec![Script::Reply(http(status, "", ""))]).await;
+            let err = client(&fake)
+                .installation(&AppJwt::from_text(JWT), ID)
+                .await
+                .unwrap_err();
+            assert!(matches!(err, MintError::Status(_)), "{status}");
+        }
     }
 
     #[tokio::test]

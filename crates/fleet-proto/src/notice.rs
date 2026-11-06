@@ -8,7 +8,8 @@ use tonic::{Code, Status};
 
 use crate::{
     ERR_CAPABILITY_NOT_GRANTED, ERR_GITHUB_REJECTED, ERR_NEEDS_USER_TOKEN,
-    PRECONDITION_CREDENTIAL_TOMBSTONED, PRECONDITION_NO_VERIFY_REPO, PRECONDITION_NOT_CONFIGURED,
+    PRECONDITION_APP_INSTALLATION, PRECONDITION_APP_REPO, PRECONDITION_CREDENTIAL_TOMBSTONED,
+    PRECONDITION_NO_VERIFY_REPO, PRECONDITION_NOT_CONFIGURED,
 };
 
 /// One outcome of a credential operation, as shown to a person.
@@ -44,6 +45,10 @@ pub enum CredentialNotice {
     UserTokenRequired,
     /// The credential was deleted and kept as a tombstone, so it cannot be replaced.
     Tombstoned,
+    /// The GitHub App installation is not allowed by the operator.
+    InstallationRefused,
+    /// The repository of the Job is not allowed for the GitHub App.
+    RepoRefused,
     /// Any other failure.
     Failed,
 }
@@ -66,6 +71,8 @@ impl CredentialNotice {
         Self::NotConfigured,
         Self::UserTokenRequired,
         Self::Tombstoned,
+        Self::InstallationRefused,
+        Self::RepoRefused,
         Self::Failed,
     ];
 
@@ -88,6 +95,8 @@ impl CredentialNotice {
             Self::NotConfigured => "not_configured",
             Self::UserTokenRequired => "user_token_required",
             Self::Tombstoned => "tombstoned",
+            Self::InstallationRefused => "installation_refused",
+            Self::RepoRefused => "repo_refused",
             Self::Failed => "failed",
         }
     }
@@ -127,6 +136,12 @@ impl CredentialNotice {
             Self::Tombstoned => {
                 "This credential was deleted and cannot be replaced. Ask an admin for help."
             }
+            Self::InstallationRefused => {
+                "The GitHub App installation is not allowed on this server. Ask the operator."
+            }
+            Self::RepoRefused => {
+                "The repository is not allowed for the GitHub App. Ask the operator."
+            }
             Self::Failed => "The request failed.",
         }
     }
@@ -157,6 +172,10 @@ impl CredentialNotice {
             Code::FailedPrecondition if message == PRECONDITION_CREDENTIAL_TOMBSTONED => {
                 Self::Tombstoned
             }
+            Code::FailedPrecondition if message == PRECONDITION_APP_INSTALLATION => {
+                Self::InstallationRefused
+            }
+            Code::FailedPrecondition if message == PRECONDITION_APP_REPO => Self::RepoRefused,
             Code::FailedPrecondition => Self::NoVerifier,
             _ => Self::Failed,
         }

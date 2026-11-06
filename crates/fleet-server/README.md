@@ -37,6 +37,8 @@ The hosted Fleet service. It stores box state, jobs, transcripts, job timing and
 | `FLEET_MODEL_ALLOWLIST` | Comma-separated exact model ids a Profile may name. Unset allows every model. A bad list stops startup. Checked at Profile create, update, submit, batch pin and blob serve. |
 | `FLEET_GITHUB_APP_ID`, `FLEET_GITHUB_APP_KEY_FILE` | GitHub App id and private key path. Set both or neither (ADR-0058). |
 | `FLEET_GITHUB_APP_BOT_NAME`, `FLEET_GITHUB_APP_BOT_EMAIL` | Git author name and email for App Jobs. Required when the App is set, checked by the identity grammar (ADR-0058 SEC-006). |
+| `FLEET_GITHUB_APP_ACCOUNT` | Operator GitHub login that owns the installation. Required when the App is set (ADR-0058 SEC-014). |
+| `FLEET_GITHUB_APP_INSTALLATIONS`, `FLEET_GITHUB_APP_REPOS` | Comma separated installation ids and `owner/name` or `owner/*` repository entries. Unset allows nothing (ADR-0058 SEC-001, SEC-002). |
 | `FLEET_MAX_CI_RETRIES` | Automatic CI retry cap, 0 to 5. |
 | `FLEET_LISTEN`, `FLEET_HEALTH_LISTEN` | Listen addresses. |
 | `FLEET_EVENTS_RETENTION_DAYS`, `FLEET_SUMMARIES_RETENTION_DAYS`, `FLEET_RETENTION_INTERVAL_SECS` | Retention sweep. |

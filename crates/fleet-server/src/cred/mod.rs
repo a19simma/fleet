@@ -4,6 +4,7 @@ pub mod admin;
 pub mod api;
 pub mod app_jwt;
 pub mod app_mint;
+pub mod app_policy;
 pub mod capability;
 pub mod github;
 pub mod limiter;

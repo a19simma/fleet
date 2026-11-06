@@ -11,6 +11,7 @@ use fleet_core::model_allowlist::ModelAllowlist;
 use fleet_proto::{DEFAULT_CI_RETRIES, MAX_CI_RETRIES};
 
 use crate::cred::app_jwt::{AppKey, AppKeyError};
+use crate::cred::app_policy::{AppPolicy, PolicyError as AppPolicyError};
 use crate::cred::{FileSealer, KeyRingError};
 use crate::retention::{
     DEFAULT_EVENTS_DAYS, DEFAULT_INTERVAL, DEFAULT_SUMMARIES_DAYS, MIN_INTERVAL, Policy,
@@ -165,14 +166,17 @@ pub struct Config {
     /// included, refuses start.
     pub model_allowlist: Option<ModelAllowlist>,
     /// The GitHub App, from `FLEET_GITHUB_APP_ID` and `FLEET_GITHUB_APP_KEY_FILE`, with the bot
-    /// identity from `FLEET_GITHUB_APP_BOT_NAME` and `FLEET_GITHUB_APP_BOT_EMAIL`. The id and the
-    /// key file are both set or both unset: one without the other refuses start. The bot
-    /// variables are required once the App is set. `None` when the id and the key file are
-    /// unset or empty.
+    /// identity from `FLEET_GITHUB_APP_BOT_NAME` and `FLEET_GITHUB_APP_BOT_EMAIL`, and the
+    /// allowlists from `FLEET_GITHUB_APP_ACCOUNT`, `FLEET_GITHUB_APP_INSTALLATIONS` and
+    /// `FLEET_GITHUB_APP_REPOS`. The id and the key file are both set or both unset: one without
+    /// the other refuses start. The bot and account variables are required once the App is set;
+    /// the installation and repository lists are optional and an unset list allows nothing.
+    /// `None` when the id and the key file are unset or empty.
     pub github_app: Option<GithubAppConfig>,
 }
 
-/// The GitHub App id and the path of its private key (ADR-0058).
+/// The GitHub App id, the path of its private key, the bot identity and the allowlist policy
+/// (ADR-0058).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GithubAppConfig {
     /// The App id: 1 to 20 ASCII digits with no leading zero, in the range of `u64`.
@@ -181,6 +185,9 @@ pub struct GithubAppConfig {
     pub key_file: PathBuf,
     /// The git name and email an App Job commits under, validated by the ADR-0058 SEC-006 grammar.
     pub bot: BotIdentity,
+    /// The operator account, the installation allowlist and the repository allowlist
+    /// (ADR-0058, SEC-001, SEC-002, SEC-009, SEC-014).
+    pub policy: AppPolicy,
 }
 
 impl GithubAppConfig {
@@ -364,6 +371,9 @@ const GITHUB_APP_ID_VAR: &str = "FLEET_GITHUB_APP_ID";
 const GITHUB_APP_KEY_FILE_VAR: &str = "FLEET_GITHUB_APP_KEY_FILE";
 const GITHUB_APP_BOT_NAME_VAR: &str = "FLEET_GITHUB_APP_BOT_NAME";
 const GITHUB_APP_BOT_EMAIL_VAR: &str = "FLEET_GITHUB_APP_BOT_EMAIL";
+const GITHUB_APP_ACCOUNT_VAR: &str = "FLEET_GITHUB_APP_ACCOUNT";
+const GITHUB_APP_INSTALLATIONS_VAR: &str = "FLEET_GITHUB_APP_INSTALLATIONS";
+const GITHUB_APP_REPOS_VAR: &str = "FLEET_GITHUB_APP_REPOS";
 
 fn absolute(path: PathBuf, var: &'static str) -> Result<PathBuf, ConfigError> {
     std::path::absolute(path).map_err(|_| ConfigError::Invalid {
@@ -421,10 +431,26 @@ fn github_app(
         },
         reason: err.to_string(),
     })?;
+    let account =
+        lookup(GITHUB_APP_ACCOUNT_VAR).ok_or(ConfigError::Missing(GITHUB_APP_ACCOUNT_VAR))?;
+    let policy = AppPolicy::parse(
+        &account,
+        lookup(GITHUB_APP_INSTALLATIONS_VAR).as_deref(),
+        lookup(GITHUB_APP_REPOS_VAR).as_deref(),
+    )
+    .map_err(|err| ConfigError::Invalid {
+        var: match err {
+            AppPolicyError::Account => GITHUB_APP_ACCOUNT_VAR,
+            AppPolicyError::Installations => GITHUB_APP_INSTALLATIONS_VAR,
+            AppPolicyError::Repositories => GITHUB_APP_REPOS_VAR,
+        },
+        reason: err.to_string(),
+    })?;
     Ok(Some(GithubAppConfig {
         app_id,
         key_file: absolute(PathBuf::from(key_file), GITHUB_APP_KEY_FILE_VAR)?,
         bot,
+        policy,
     }))
 }
 
@@ -476,8 +502,11 @@ impl Config {
     /// `FLEET_GITHUB_APP_KEY_FILE`, or the reverse, is an error, and so is an App id that is
     /// not 1 to 20 ASCII digits without a leading zero that fits a `u64`. With the App set,
     /// `FLEET_GITHUB_APP_BOT_NAME` and `FLEET_GITHUB_APP_BOT_EMAIL` are required and must pass
-    /// [`BotIdentity::new`]. The App also requires `FLEET_MASTER_KEY_FILE`. The App key file
-    /// and the master key file are made absolute against the working directory here.
+    /// [`BotIdentity::new`], and so is `FLEET_GITHUB_APP_ACCOUNT`, a GitHub login. The
+    /// optional `FLEET_GITHUB_APP_INSTALLATIONS` and `FLEET_GITHUB_APP_REPOS` are checked
+    /// against the allowlist grammar and an unset one allows nothing. The App also requires
+    /// `FLEET_MASTER_KEY_FILE`. The App key file and the master key file are made absolute against
+    /// the working directory here.
     pub fn from_env() -> Result<Self, ConfigError> {
         Self::from_lookup(|var| std::env::var(var).ok())
     }
@@ -488,8 +517,10 @@ impl Config {
     ///
     /// Same as [`Config::from_env`]: the GitHub App variables are both set or both unset, and
     /// the App id is 1 to 20 ASCII digits without a leading zero that fit a `u64`. With the App
-    /// set, a bot name or email that is unset, or that fails [`BotIdentity::new`], returns
-    /// [`ConfigError::Missing`] or [`ConfigError::Invalid`]. An App without a master key file
+    /// set, a bot name, email or account that is unset, or that fails [`BotIdentity::new`] or
+    /// the login grammar, returns [`ConfigError::Missing`] or [`ConfigError::Invalid`], and so
+    /// does an installation or repository list outside its grammar (a repository entry whose
+    /// owner is not the account included). An App without a master key file
     /// is [`ConfigError::Invalid`] for `FLEET_MASTER_KEY_FILE`, and so is a key path that cannot
     /// be made absolute.
     pub fn from_lookup(lookup: impl Fn(&str) -> Option<String>) -> Result<Self, ConfigError> {
@@ -940,6 +971,7 @@ mod tests {
             ("FLEET_GITHUB_APP_ID", "1"),
             ("FLEET_GITHUB_APP_KEY_FILE", "/k.pem"),
         ];
+        extra.push(("FLEET_GITHUB_APP_ACCOUNT", "acme"));
         extra.extend(name.map(|n| ("FLEET_GITHUB_APP_BOT_NAME", n)));
         extra.extend(email.map(|e| ("FLEET_GITHUB_APP_BOT_EMAIL", e)));
         with(&extra)
@@ -957,6 +989,64 @@ mod tests {
                 ConfigError::Missing(var) | ConfigError::Invalid { var, .. } => {
                     assert_eq!(var, want, "{name:?} {email:?}");
                 }
+            }
+        }
+    }
+
+    #[test]
+    fn github_app_requires_the_account_and_checks_the_allowlists() {
+        let app = |extra: &[(&'static str, &'static str)]| {
+            let mut vars = vec![
+                ("FLEET_GITHUB_APP_ID", "1"),
+                ("FLEET_GITHUB_APP_KEY_FILE", "/k.pem"),
+                ("FLEET_MASTER_KEY_FILE", "/run/keys"),
+                ("FLEET_GITHUB_APP_BOT_NAME", BOT_NAME),
+                ("FLEET_GITHUB_APP_BOT_EMAIL", BOT_EMAIL),
+            ];
+            vars.extend_from_slice(extra);
+            with(&vars)
+        };
+        for account in [None, Some("")] {
+            let extra: Vec<_> = account
+                .map(|a| ("FLEET_GITHUB_APP_ACCOUNT", a))
+                .into_iter()
+                .collect();
+            let err = app(&extra).unwrap_err();
+            match (account, err) {
+                (None, ConfigError::Missing(var)) | (Some(_), ConfigError::Invalid { var, .. }) => {
+                    assert_eq!(var, "FLEET_GITHUB_APP_ACCOUNT");
+                }
+                (_, other) => panic!("{other}"),
+            }
+        }
+        let denies_all = app(&[("FLEET_GITHUB_APP_ACCOUNT", "acme")])
+            .unwrap()
+            .github_app
+            .unwrap()
+            .policy;
+        assert!(!denies_all.installation_allowed(1));
+        assert!(!denies_all.repo_allowed("acme/widget"));
+        for (var, value) in [
+            ("FLEET_GITHUB_APP_ACCOUNT", "ac me"),
+            ("FLEET_GITHUB_APP_INSTALLATIONS", "01"),
+            ("FLEET_GITHUB_APP_INSTALLATIONS", "1,"),
+            ("FLEET_GITHUB_APP_REPOS", "acme/wid*"),
+            ("FLEET_GITHUB_APP_REPOS", "other/widget"),
+            ("FLEET_GITHUB_APP_REPOS", "acme/widget\n"),
+        ] {
+            let mut extra = vec![("FLEET_GITHUB_APP_ACCOUNT", "acme"), (var, value)];
+            extra.dedup_by_key(|(name, _)| *name);
+            let extra: Vec<_> = if var == "FLEET_GITHUB_APP_ACCOUNT" {
+                vec![(var, value)]
+            } else {
+                extra
+            };
+            match app(&extra).unwrap_err() {
+                ConfigError::Invalid { var: got, reason } => {
+                    assert_eq!(got, var, "{value:?}");
+                    assert!(!reason.contains(value), "{reason}");
+                }
+                other @ ConfigError::Missing(_) => panic!("{other}"),
             }
         }
     }
@@ -1004,10 +1094,21 @@ mod tests {
             ("FLEET_MASTER_KEY_FILE", "/run/keys"),
             ("FLEET_GITHUB_APP_BOT_NAME", BOT_NAME),
             ("FLEET_GITHUB_APP_BOT_EMAIL", BOT_EMAIL),
+            ("FLEET_GITHUB_APP_ACCOUNT", "Acme"),
+            ("FLEET_GITHUB_APP_INSTALLATIONS", "4242,7"),
+            ("FLEET_GITHUB_APP_REPOS", "acme/widget,ACME/*"),
         ])
         .unwrap()
         .github_app
         .unwrap();
+        assert!(app.policy.installation_allowed(4242));
+        assert!(app.policy.installation_allowed(7));
+        assert!(!app.policy.installation_allowed(8));
+        assert!(
+            app.policy
+                .repo_allowed("https://github.com/acme/anything.git")
+        );
+        assert!(!app.policy.repo_allowed("other/anything"));
         assert_eq!(app.bot.name(), BOT_NAME);
         assert_eq!(app.bot.email(), BOT_EMAIL);
         assert_eq!(app.app_id, 123_456);
@@ -1033,6 +1134,7 @@ mod tests {
                 ("FLEET_GITHUB_APP_KEY_FILE", "/k.pem"),
                 ("FLEET_GITHUB_APP_BOT_NAME", BOT_NAME),
                 ("FLEET_GITHUB_APP_BOT_EMAIL", BOT_EMAIL),
+                ("FLEET_GITHUB_APP_ACCOUNT", "acme"),
             ];
             extra.extend(master.map(|m| ("FLEET_MASTER_KEY_FILE", m)));
             match with(&extra).unwrap_err() {
@@ -1106,6 +1208,7 @@ mod tests {
             ("FLEET_MASTER_KEY_FILE", "/run/keys"),
             ("FLEET_GITHUB_APP_BOT_NAME", BOT_NAME),
             ("FLEET_GITHUB_APP_BOT_EMAIL", BOT_EMAIL),
+            ("FLEET_GITHUB_APP_ACCOUNT", "acme"),
         ]);
         assert_eq!(max.unwrap().github_app.unwrap().app_id, u64::MAX);
     }
@@ -1116,6 +1219,7 @@ mod tests {
             app_id: 1,
             key_file: PathBuf::from("/nonexistent/fleet-app-key.pem"),
             bot: BotIdentity::new(BOT_NAME, BOT_EMAIL).unwrap(),
+            policy: AppPolicy::parse("acme", None, None).unwrap(),
         };
         assert_eq!(app.load_key().unwrap_err(), AppKeyError::Read);
     }

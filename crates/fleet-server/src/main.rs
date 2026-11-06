@@ -146,7 +146,13 @@ async fn load_github_app(config: &Config) -> Result<Option<AppLane>, BoxError> {
         .load_key()
         .map_err(|err| format!("FLEET_GITHUB_APP_KEY_FILE: {err}"))?;
     tracing::info!("github app key loaded");
-    let lane = AppLane::new(key, app.app_id_text(), AppClient::new()?, app.bot.clone());
+    let lane = AppLane::new(
+        key,
+        app.app_id_text(),
+        AppClient::new()?,
+        app.bot.clone(),
+        app.policy.clone(),
+    );
     match lane.check_app_id().await {
         AppIdCheck::Mismatch => {
             Err("FLEET_GITHUB_APP_KEY_FILE: the key does not belong to FLEET_GITHUB_APP_ID".into())

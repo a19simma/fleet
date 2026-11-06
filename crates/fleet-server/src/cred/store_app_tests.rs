@@ -15,6 +15,7 @@ use tokio::net::{TcpListener, TcpStream};
 
 use super::app_jwt::AppKey;
 use super::app_mint::{AppClient, Limits};
+use super::app_policy::AppPolicy;
 use super::capability::Capabilities;
 use super::seal::FileSealer;
 use super::store::{AppLane, CredentialStore, DENIED_DEDUPE_SECS, StoreError};
@@ -79,9 +80,38 @@ struct Fake {
     hook_ok: Arc<Mutex<Vec<bool>>>,
     held: Arc<Mutex<Vec<sqlx::pool::PoolConnection<sqlx::Postgres>>>>,
     app: Arc<Mutex<(&'static str, String)>>,
+    inst: Arc<Mutex<(&'static str, String)>>,
+}
+
+fn installation_json(id: u64, app_id: u64, login: &str, suspended: &str) -> String {
+    format!(
+        r#"{{"id":{id},"app_id":{app_id},"account":{{"login":"{login}"}},"suspended_at":{suspended}}}"#
+    )
+}
+
+fn policy(installations: &str, repos: &str) -> AppPolicy {
+    AppPolicy::parse("o", Some(installations), Some(repos)).unwrap()
+}
+
+fn open_policy() -> AppPolicy {
+    policy("4242", "o/*")
 }
 
 impl Fake {
+    fn first_mint(&self) -> String {
+        self.requests()
+            .into_iter()
+            .find(|r| r.starts_with("POST "))
+            .unwrap()
+    }
+
+    fn lookups(&self) -> usize {
+        self.requests()
+            .iter()
+            .filter(|r| r.starts_with("GET /app/installations/"))
+            .count()
+    }
+
     fn requests(&self) -> Vec<String> {
         self.seen.lock().unwrap().clone()
     }
@@ -144,16 +174,22 @@ async fn fake_with(
     let hook_ok = Arc::new(Mutex::new(Vec::new()));
     let held = Arc::new(Mutex::new(Vec::new()));
     let app = Arc::new(Mutex::new(("200 OK", r#"{"id":12345}"#.to_owned())));
+    let inst = Arc::new(Mutex::new((
+        "200 OK",
+        installation_json(INSTALLATION, 12345, "o", "null"),
+    )));
     let revokes = Arc::new(AtomicUsize::new(0));
     let (seen_task, hook_task, held_task) =
         (Arc::clone(&seen), Arc::clone(&hook_ok), Arc::clone(&held));
     let (app_task, revokes_task) = (Arc::clone(&app), Arc::clone(&revokes));
+    let inst_task = Arc::clone(&inst);
     tokio::spawn(async move {
         loop {
             let Ok((mut stream, _)) = listener.accept().await else {
                 return;
             };
             let (app, revokes) = (Arc::clone(&app_task), Arc::clone(&revokes_task));
+            let inst = Arc::clone(&inst_task);
             let (seen, ok_log, hook, parked, gate) = (
                 Arc::clone(&seen_task),
                 Arc::clone(&hook_task),
@@ -165,8 +201,12 @@ async fn fake_with(
                 let request = read_request(&mut stream).await;
                 let is_mint = request.starts_with("POST ");
                 let is_app = request.starts_with("GET /app ");
+                let is_inst = request.starts_with("GET /app/installations/");
                 seen.lock().unwrap().push(request);
-                let reply = if is_app {
+                let reply = if is_inst {
+                    let (status, body) = inst.lock().unwrap().clone();
+                    http(status, &body)
+                } else if is_app {
                     let (status, body) = app.lock().unwrap().clone();
                     http(status, &body)
                 } else if is_mint {
@@ -212,6 +252,7 @@ async fn fake_with(
         hook_ok,
         held,
         app,
+        inst,
     }
 }
 
@@ -251,6 +292,10 @@ async fn user(pool: &PgPool, name: &str, admin: bool) -> i64 {
 }
 
 async fn world(pool: PgPool, lane: Option<AppClient>) -> World {
+    world_with(pool, lane, open_policy()).await
+}
+
+async fn world_with(pool: PgPool, lane: Option<AppClient>, policy: AppPolicy) -> World {
     Store::new(pool.clone()).migrate().await.unwrap();
     let path = std::env::temp_dir().join(format!(
         "fleet-app-lane-{}-{}.keys",
@@ -263,7 +308,13 @@ async fn world(pool: PgPool, lane: Option<AppClient>) -> World {
     let mut creds = CredentialStore::new(pool.clone(), Arc::new(sealer.unwrap()));
     if let Some(client) = lane {
         let bot = BotIdentity::new(BOT_NAME, BOT_EMAIL).unwrap();
-        creds = creds.with_github_app(AppLane::new(app_key(), "12345".to_owned(), client, bot));
+        creds = creds.with_github_app(AppLane::new(
+            app_key(),
+            "12345".to_owned(),
+            client,
+            bot,
+            policy.clone(),
+        ));
     }
     World {
         caps: Capabilities::new(pool.clone()),
@@ -337,7 +388,7 @@ async fn the_app_wins_over_the_pat_and_the_reply_carries_the_token(pool: PgPool)
         .unwrap();
     assert_eq!(app.value.expose(), TOKEN.as_bytes());
     assert_eq!(fake.mints(), 1);
-    let request = &fake.requests()[0];
+    let request = &fake.first_mint();
     assert!(
         request.starts_with("POST /app/installations/4242/access_tokens "),
         "{request}"
@@ -649,7 +700,7 @@ async fn verify_mints_once_revokes_and_the_reply_holds_no_token(pool: PgPool) {
     assert_eq!(reply.expires_at_ms, None);
     assert!(!format!("{reply:?}").contains(TOKEN));
     assert_eq!(fake.mints(), 1);
-    let request = &fake.requests()[0];
+    let request = &fake.first_mint();
     assert!(
         request.contains(r#""repositories":["widget"]"#),
         "{request}"
@@ -746,7 +797,7 @@ async fn verify_scopes_the_mint_to_the_most_recent_job_repository(pool: PgPool) 
         id: app_id(&w).await,
     };
     service.verify(w.alice, &request).await.unwrap();
-    let mint = &fake.requests()[0];
+    let mint = &fake.first_mint();
     assert!(mint.contains(r#""repositories":["gadget"]"#), "{mint}");
 }
 
@@ -1696,7 +1747,7 @@ async fn the_service_maps_a_tombstoned_put_to_its_fixed_precondition(pool: PgPoo
     let request = fleet_proto::v1::PutCredentialRequest {
         kind: "github_app".to_owned(),
         shape: "static_secret".to_owned(),
-        value: "777".to_owned(),
+        value: INSTALLATION.to_string(),
         expires_at_ms: None,
     };
     let status = service.put(w.alice, request).await.unwrap_err();
@@ -1814,6 +1865,7 @@ fn a_guard_dropped_without_a_runtime_logs_the_unrevoked_token() {
             "12345".to_owned(),
             AppClient::plain("127.0.0.1:1".parse().unwrap(), Limits::default()),
             bot,
+            open_policy(),
         );
         super::store::armed_guard_for_test(
             lane,
@@ -1836,7 +1888,13 @@ fn a_guard_dropped_without_a_runtime_logs_the_unrevoked_token() {
 
 fn bare_lane(fake: &Fake) -> AppLane {
     let bot = BotIdentity::new(BOT_NAME, BOT_EMAIL).unwrap();
-    AppLane::new(app_key(), "12345".to_owned(), client(fake), bot)
+    AppLane::new(
+        app_key(),
+        "12345".to_owned(),
+        client(fake),
+        bot,
+        open_policy(),
+    )
 }
 
 #[tokio::test]
@@ -1851,4 +1909,240 @@ async fn the_app_id_check_matches_mismatches_and_degrades_to_unchecked() {
     assert_eq!(lane.check_app_id().await, AppIdCheck::Unchecked);
     *fake.app.lock().unwrap() = ("200 OK", "not json".to_owned());
     assert_eq!(lane.check_app_id().await, AppIdCheck::Unchecked);
+}
+
+const INSTALLATION_REASON: &str = "installation not on allowlist";
+const BINDING_REASON: &str = "installation binding refused";
+const REPO_REASON: &str = "repository not allowed";
+
+async fn refused_release(w: &World, fake: &Fake, want: &str, rows: Vec<Row>) {
+    let err = w.creds.release_for_job(JOB, 1, "alpha").await.unwrap_err();
+    assert_eq!(err.to_string(), want, "{err:?}");
+    assert_eq!(fake.mints(), 0);
+    assert_eq!(w.uses().await, 0);
+    assert_eq!(w.rows().await, rows);
+}
+
+#[sqlx::test]
+async fn an_installation_off_the_allowlist_is_refused_before_any_call(pool: PgPool) {
+    let fake = fake("201 Created", None).await;
+    let w = world_with(pool, Some(client(&fake)), policy("9999", "o/*")).await;
+    w.seed(true).await;
+    refused_release(
+        &w,
+        &fake,
+        fleet_proto::PRECONDITION_APP_INSTALLATION,
+        vec![("denied".to_owned(), Some(INSTALLATION_REASON.to_owned()))],
+    )
+    .await;
+    assert_eq!(fake.lookups(), 0);
+}
+
+#[sqlx::test]
+async fn the_default_policy_allows_no_installation_and_no_repository(pool: PgPool) {
+    let fake = fake("201 Created", None).await;
+    let w = world_with(
+        pool,
+        Some(client(&fake)),
+        AppPolicy::parse("o", None, None).unwrap(),
+    )
+    .await;
+    w.seed(true).await;
+    refused_release(
+        &w,
+        &fake,
+        fleet_proto::PRECONDITION_APP_INSTALLATION,
+        vec![("denied".to_owned(), Some(INSTALLATION_REASON.to_owned()))],
+    )
+    .await;
+}
+
+#[sqlx::test]
+async fn a_repository_off_the_allowlist_is_refused_before_any_call(pool: PgPool) {
+    let fake = fake("201 Created", None).await;
+    let w = world_with(pool, Some(client(&fake)), policy("4242", "o/other")).await;
+    w.seed(true).await;
+    refused_release(
+        &w,
+        &fake,
+        fleet_proto::PRECONDITION_APP_REPO,
+        vec![("denied".to_owned(), Some(REPO_REASON.to_owned()))],
+    )
+    .await;
+    assert_eq!(fake.lookups(), 0);
+}
+
+#[sqlx::test]
+async fn a_job_repository_with_another_owner_is_refused(pool: PgPool) {
+    let fake = fake("201 Created", None).await;
+    let w = world(pool, Some(client(&fake))).await;
+    w.seed(true).await;
+    sqlx::query("UPDATE jobs SET repo = 'evil/widget'")
+        .execute(&w.pool)
+        .await
+        .unwrap();
+    refused_release(
+        &w,
+        &fake,
+        fleet_proto::PRECONDITION_APP_REPO,
+        vec![("denied".to_owned(), Some(REPO_REASON.to_owned()))],
+    )
+    .await;
+}
+
+#[sqlx::test]
+async fn a_hostile_job_repository_is_refused_and_audited_within_the_column_cap(pool: PgPool) {
+    let fake = fake("201 Created", None).await;
+    let w = world(pool, Some(client(&fake))).await;
+    w.seed(true).await;
+    let long = format!("o/{}", "a".repeat(400));
+    for hostile in [
+        "o/widget\r",
+        "o/widget\n",
+        "o\\widget",
+        "u:p@o/widget",
+        "o//widget",
+        "o/",
+        "o/wïdget",
+        long.as_str(),
+    ] {
+        sqlx::query("UPDATE jobs SET repo = $1")
+            .bind(hostile)
+            .execute(&w.pool)
+            .await
+            .unwrap();
+        let err = w.creds.release_for_job(JOB, 1, "alpha").await.unwrap_err();
+        assert!(matches!(err, StoreError::RepoDenied), "{hostile:?} {err:?}");
+    }
+    assert_eq!(fake.mints(), 0);
+}
+
+async fn binding_refused(pool: PgPool, body: String) {
+    let fake = fake("201 Created", None).await;
+    *fake.inst.lock().unwrap() = ("200 OK", body);
+    let w = world(pool, Some(client(&fake))).await;
+    w.seed(true).await;
+    let err = w.creds.release_for_job(JOB, 1, "alpha").await.unwrap_err();
+    assert!(matches!(err, StoreError::InstallationDenied), "{err:?}");
+    assert_eq!(fake.mints(), 0);
+    assert_eq!(fake.lookups(), 1);
+    assert_eq!(w.uses().await, 0);
+    assert_eq!(
+        w.rows().await,
+        [
+            ("attempt".to_owned(), None),
+            ("denied".to_owned(), Some(BINDING_REASON.to_owned())),
+        ]
+    );
+}
+
+#[sqlx::test]
+async fn a_suspended_installation_mints_nothing(pool: PgPool) {
+    binding_refused(
+        pool,
+        installation_json(INSTALLATION, 12345, "o", "\"2026-01-01T00:00:00Z\""),
+    )
+    .await;
+}
+
+#[sqlx::test]
+async fn an_installation_of_another_app_mints_nothing(pool: PgPool) {
+    binding_refused(pool, installation_json(INSTALLATION, 99, "o", "null")).await;
+}
+
+#[sqlx::test]
+async fn an_installation_of_another_account_mints_nothing(pool: PgPool) {
+    binding_refused(pool, installation_json(INSTALLATION, 12345, "evil", "null")).await;
+}
+
+#[sqlx::test]
+async fn an_installation_reply_with_another_id_mints_nothing(pool: PgPool) {
+    binding_refused(pool, installation_json(1, 12345, "o", "null")).await;
+}
+
+#[sqlx::test]
+async fn a_failed_installation_lookup_is_a_failed_mint_and_mints_nothing(pool: PgPool) {
+    let fake = fake("201 Created", None).await;
+    *fake.inst.lock().unwrap() = ("404 Not Found", String::new());
+    let w = world(pool, Some(client(&fake))).await;
+    w.seed(true).await;
+    let err = w.creds.release_for_job(JOB, 1, "alpha").await.unwrap_err();
+    assert!(matches!(err, StoreError::MintFailed), "{err:?}");
+    assert_eq!(fake.mints(), 0);
+    assert_eq!(
+        w.rows().await,
+        [
+            ("attempt".to_owned(), None),
+            ("failed".to_owned(), Some("mint failed".to_owned())),
+        ]
+    );
+}
+
+#[sqlx::test]
+async fn verify_refuses_an_off_list_installation_and_a_bad_binding_without_a_mint(pool: PgPool) {
+    let fake = fake("201 Created", None).await;
+    let w = world_with(pool, Some(client(&fake)), policy("9999", "o/*")).await;
+    w.seed(true).await;
+    let status = verify_reply(&w).await.unwrap_err();
+    assert_eq!(status.code(), tonic::Code::FailedPrecondition);
+    assert_eq!(status.message(), fleet_proto::PRECONDITION_APP_INSTALLATION);
+    assert_eq!(fake.mints(), 0);
+}
+
+#[sqlx::test]
+async fn verify_refuses_an_off_list_repository_without_a_mint(pool: PgPool) {
+    let fake = fake("201 Created", None).await;
+    let w = world_with(pool, Some(client(&fake)), policy("4242", "o/other")).await;
+    w.seed(true).await;
+    let status = verify_reply(&w).await.unwrap_err();
+    assert_eq!(status.message(), fleet_proto::PRECONDITION_APP_REPO);
+    assert_eq!(fake.mints(), 0);
+}
+
+#[sqlx::test]
+async fn put_vets_the_installation_against_the_allowlist_and_the_binding(pool: PgPool) {
+    let fake = fake("201 Created", None).await;
+    let w = world_with(pool, Some(client(&fake)), policy("4242", "o/*")).await;
+    w.caps.grant(w.admin, w.alice, CAP).await.unwrap();
+    let id = |n: u64| Secret::new(n.to_string());
+    w.creds
+        .vet_installation(w.alice, &id(INSTALLATION))
+        .await
+        .unwrap();
+    let err = w.creds.vet_installation(w.alice, &id(7)).await.unwrap_err();
+    assert!(matches!(err, StoreError::InstallationDenied), "{err:?}");
+    assert_eq!(fake.lookups(), 1);
+    *fake.inst.lock().unwrap() = (
+        "200 OK",
+        installation_json(INSTALLATION, 12345, "evil", "null"),
+    );
+    let err = w
+        .creds
+        .vet_installation(w.alice, &id(INSTALLATION))
+        .await
+        .unwrap_err();
+    assert!(matches!(err, StoreError::InstallationDenied), "{err:?}");
+}
+
+#[sqlx::test]
+async fn the_service_put_refuses_an_off_list_installation_with_the_fixed_message(pool: PgPool) {
+    let fake = fake("201 Created", None).await;
+    let w = world_with(pool, Some(client(&fake)), policy("9999", "o/*")).await;
+    w.caps.grant(w.admin, w.alice, CAP).await.unwrap();
+    let service = super::CredentialService::new(w.creds.clone(), Arc::new(NoGithub));
+    let request = fleet_proto::v1::PutCredentialRequest {
+        kind: "github_app".to_owned(),
+        shape: "static_secret".to_owned(),
+        value: INSTALLATION.to_string(),
+        expires_at_ms: None,
+    };
+    let status = service.put(w.alice, request).await.unwrap_err();
+    assert_eq!(status.code(), tonic::Code::FailedPrecondition);
+    assert_eq!(status.message(), fleet_proto::PRECONDITION_APP_INSTALLATION);
+    assert_eq!(fake.lookups(), 0);
+    let stored: i64 = sqlx::query_scalar("SELECT count(*) FROM credentials")
+        .fetch_one(&w.pool)
+        .await
+        .unwrap();
+    assert_eq!(stored, 0);
 }

@@ -36,8 +36,10 @@ use fleet_proto::v1::{
 };
 use fleet_server::auth::BearerAuth;
 use fleet_server::config::Token;
+use fleet_server::cred::app_jwt::AppJwt;
 use fleet_server::cred::app_jwt::AppKey;
-use fleet_server::cred::app_mint::AppClient;
+use fleet_server::cred::app_mint::{AppClient, Installation, InstallationDirectory, MintError};
+use fleet_server::cred::app_policy::AppPolicy;
 use fleet_server::cred::capability::Capabilities;
 use fleet_server::cred::github::{GithubApi, GithubError, GithubUser};
 use fleet_server::cred::store::{AppLane, CredentialStore};
@@ -386,6 +388,20 @@ fn enc(text: &[u8]) -> String {
     out
 }
 
+struct BoundDirectory;
+
+#[tonic::async_trait]
+impl InstallationDirectory for BoundDirectory {
+    async fn installation(&self, _jwt: &AppJwt, id: u64) -> Result<Installation, MintError> {
+        Ok(Installation {
+            id,
+            app_id: 12345,
+            account_login: "acme".to_owned(),
+            suspended: false,
+        })
+    }
+}
+
 struct Rig {
     addr: SocketAddr,
     pool: PgPool,
@@ -404,12 +420,17 @@ impl Rig {
         let mut creds = CredentialStore::new(pool.clone(), Arc::new(sealer()));
         if mode.lane {
             let bot = BotIdentity::new(BOT_NAME, BOT_EMAIL).unwrap();
-            creds = creds.with_github_app(AppLane::new(
-                app_key(),
-                "12345".to_owned(),
-                AppClient::new().unwrap(),
-                bot,
-            ));
+            let policy = AppPolicy::parse("acme", Some(APP), Some("acme/*")).unwrap();
+            creds = creds.with_github_app(
+                AppLane::new(
+                    app_key(),
+                    "12345".to_owned(),
+                    AppClient::new().unwrap(),
+                    bot,
+                    policy,
+                )
+                .with_directory(Arc::new(BoundDirectory)),
+            );
         }
         let service = CredentialService::new(creds, Arc::new(github.clone()));
         let auth = WebAuth::new(pool.clone(), users.clone(), ORIGIN, Some("example.com")).unwrap();

@@ -4,7 +4,7 @@ Operations runbook for the GitHub App lane. Design: [ADR-0058](adr/0058-github-a
 
 Every id, key, host and email below is a placeholder. Replace `<app-id>`, `<slug>`, `<bot-id>`, `<installation-id>` and `<fleet-host>` with your own values.
 
-Unverified claims: this runbook states four things about GitHub that nobody checked against GitHub docs. An installation token lives one hour. GitHub adds `metadata: read` to every installation token. A push that changes `.github/workflows` needs the `workflows` permission. The pull request shows the bot as author.
+Unverified claims: this runbook states four things about GitHub that nobody checked against GitHub docs. An installation token lives one hour. GitHub adds `metadata: read` to every installation token. A push that changes `.github/workflows` needs the `workflows` permission. The pull request shows the bot as author. Two more are flagged where they appear: the shape of the `GET /app/installations/{id}` reply, and how an older fleetd answers the `github_installation_token` wire kind.
 
 ## What the lane does
 
@@ -21,7 +21,7 @@ The end-to-end check is in `crates/fleetd/tests/daemon_jobs.rs`: `an_app_job_com
 5. Generate a private key in the App settings. GitHub lets an App hold several keys at once, which the rotation below uses.
 6. Look up the bot id: `gh api '/users/<slug>[bot]' --jq .id`. The bot email is `<bot-id>+<slug>[bot]@users.noreply.github.com`.
 
-Not yet built, so do not rely on them: the installation allowlist, the repository allowlist, refresh of the mirror fetch and the broker token, a revoke that survives a daemon exit (ADR-0058, Status; see Refresh, limits and audit). Until the repository allowlist exists, any holder of `forge:github_app` can mint a write token for any repository in the installation. Grant the capability with that in mind.
+Not yet built, so do not rely on them: the per-credential repository list, refresh of the mirror fetch and the broker token, a revoke that survives a daemon exit (ADR-0058, Status; see Refresh, limits and audit). Until the per-credential repository list exists, the operator list is the only repository ceiling, so any holder of `forge:github_app` can mint a write token for any repository the operator list allows. Grant the capability with that in mind.
 
 ## Server variables
 
@@ -34,12 +34,15 @@ Set the id, the key file, the name and the email on the fleet-server Deployment,
 | `FLEET_MASTER_KEY_FILE` | Path to the credential master key file, see the credential key runbook. | Required when `FLEET_GITHUB_APP_ID` is set: without it startup stops naming `FLEET_MASTER_KEY_FILE` with `required when FLEET_GITHUB_APP_ID is set`. |
 | `FLEET_GITHUB_APP_BOT_NAME` | 1 to 64 characters from letters, digits, space, `.`, `_`, `-`, `[` and `]`. Starts alphanumeric, ends alphanumeric or `]`. | Missing or outside the grammar stops startup naming this variable. |
 | `FLEET_GITHUB_APP_BOT_EMAIL` | `<bot-id>+<slug>[bot]@users.noreply.github.com`: digits, `+`, lowercase letters, digits and `-`, `[bot]`, that domain. At most 128 bytes. | Missing or outside the grammar stops startup naming this variable. |
+| `FLEET_GITHUB_APP_ACCOUNT` | The GitHub login of the operator account that owns the installation: 1 to 39 ASCII letters, digits and hyphens, not starting or ending with a hyphen. Compared after ASCII lowercasing. | Required once the App is set. Missing or outside the grammar stops startup naming this variable. |
+| `FLEET_GITHUB_APP_INSTALLATIONS` | Comma separated installation ids, each a `u64` with no leading zero, at most 64 entries. | Unset or empty allows no installation, so every put, verify and release is refused. An empty entry or a bad id stops startup naming this variable. |
+| `FLEET_GITHUB_APP_REPOS` | Comma separated `owner/name` or `owner/*` entries, at most 1024. Each owner must be `FLEET_GITHUB_APP_ACCOUNT`. | Unset or empty allows no repository, so every verify and release is refused. A bad entry, another owner or any other glob stops startup naming this variable. |
 
-The id and the key file go together: one without the other stops startup, and an empty value counts as unset. The server makes both key paths absolute against its working directory at startup. After it loads the key it asks GitHub which App the key belongs to. A key for another App stops startup with `FLEET_GITHUB_APP_KEY_FILE: the key does not belong to FLEET_GITHUB_APP_ID`. When GitHub cannot be reached, the server logs a warning that the id check was skipped and starts. The name and the email are required once the id and key file are set. They are read only then, so a name or email set alone is ignored, not rejected. The server checks both against the identity grammar (SEC-006). fleetd checks them again before the clone and fails the Job on a bad identity, so a server bug cannot inject a hostile name.
+The id and the key file go together: one without the other stops startup, and an empty value counts as unset. The server makes both key paths absolute against its working directory at startup. After it loads the key it asks GitHub which App the key belongs to. A key for another App stops startup with `FLEET_GITHUB_APP_KEY_FILE: the key does not belong to FLEET_GITHUB_APP_ID`. When GitHub cannot be reached, the server logs a warning that the id check was skipped and starts. The name, the email and the account are required once the id and key file are set. The name and the email are read only then, so a name or email set alone is ignored, not rejected. The server checks both against the identity grammar (SEC-006). fleetd checks them again before the clone and fails the Job on a bad identity, so a server bug cannot inject a hostile name.
 
 ## Mount the private key
 
-The key is a file, never an environment variable and never in the sealed store (ADR-0058). Keep it in a Kubernetes Secret apart from `fleet-master-key`, and mount it read-only at a path of its own, for example `/etc/fleet/github-app/private-key.pem`, with `FLEET_GITHUB_APP_KEY_FILE` set to that path. The Deployment in this repo mounts only the master key, so the operator adds the volume, the mount and the four variables in its own patch.
+The key is a file, never an environment variable and never in the sealed store (ADR-0058). Keep it in a Kubernetes Secret apart from `fleet-master-key`, and mount it read-only at a path of its own, for example `/etc/fleet/github-app/private-key.pem`, with `FLEET_GITHUB_APP_KEY_FILE` set to that path. The Deployment in this repo mounts only the master key, so the operator adds the volume, the mount and the variables in its own patch, including the three allowlist variables.
 
 The server loads the file once at startup and refuses it when:
 
@@ -80,6 +83,14 @@ Running Jobs are not lost. The server never stores the token, so a restart does 
 
    The secret is read from stdin and never from an argument. The command prints the stored row with its id.
 
+The server refuses the installation before any GitHub call when the id is not in `FLEET_GITHUB_APP_INSTALLATIONS`. It then calls `GET /app/installations/{id}` with the App JWT, at put and at every mint, and refuses an installation that is suspended, that belongs to another App id, whose `account.login` is not `FLEET_GITHUB_APP_ACCOUNT` or whose reply carries another id. The shape of that reply is unverified against a live GitHub response: check it with `fleet credential verify` before you rely on it. The Job repository is compared in full as lowercase `owner/name` against `FLEET_GITHUB_APP_REPOS`; a repository with a CR, LF, backslash, `@`, an empty segment, a non-ASCII character or an over-long name never matches. The per-credential repository list an admin sets is not built, so the operator list is the only repository check.
+
+| Refusal | Cause | Server status and message | CLI and web notice | Audit row |
+| --- | --- | --- | --- | --- |
+| Installation not allowed | Id off the list, empty list, suspended, other App id, other account or id mismatch. | `FAILED_PRECONDITION`, `github app installation is not allowed` | `installation_refused` | `denied`: `installation not on allowlist` or `installation binding refused` |
+| Repository not allowed | Job repository off the list, owned by another account or malformed. | `FAILED_PRECONDITION`, `repository is not allowed for the github app` | `repo_refused` | `denied`: `repository not allowed` |
+| Installation lookup failed | GitHub unreachable, non-200 or an incomplete reply. | `FAILED_PRECONDITION`, `github app token unavailable` at release, `UNAVAILABLE` at put | invalid token notice | `failed`: `mint failed` |
+
 ## Verify
 
 1. Submit one Job as that User against a repository the installation covers. `fleet credential verify` mints against the repository of the User's latest Job and counts toward the per-Job cap and the per-User rate limit, so a User with no Job gets `FAILED_PRECONDITION` and the CLI notice for no job.
@@ -96,7 +107,7 @@ Built (ADR-0058):
 - fleetd revokes the token a refresh replaced, and the held token when the Job ends, with `DELETE /installation/token`. A replaced token is revoked after the push or `gh` children that started with it have exited, at most 15 minutes later. The revoke is best effort with a 10 second bound. A failed revoke logs a fixed string and never fails the Job, so that token lives until its expiry.
 - Every mint writes rows to `github_app_mint`: `attempt`, then `minted`, `failed` or `denied`, and `revoked` or `revoke_failed` when the server revokes after a failed recheck.
 
-Not built: the installation and repository allowlists, refresh of the mirror fetch and the broker token, and a revoke that survives a daemon exit.
+Not built: the per-credential repository list, refresh of the mirror fetch and the broker token, and a revoke that survives a daemon exit.
 
 When the cap is hit, the step fails with the Job reason `github app token limit reached`. A plain mint failure reports `credentials could not be fetched` instead. A refresh whose mint fails keeps the last good token until it expires. A box whose clock runs ahead of the server's refreshes every 45 minutes and never fails a step on the expiry. A box clock that runs behind cannot be detected: its steps fail at GitHub once the token has expired. To see the cause, list the denied rows. The table has no user column, so join through the credential:
 
@@ -114,7 +125,7 @@ Reason `job mint cap` means the Job used its 34 attempts. Reason `user mint rate
 
 Applies when you move to a server and fleetd that carry the GitHub App lane (ADR-0058).
 
-- Server variables: none are required to upgrade. To turn the lane on, set `FLEET_GITHUB_APP_ID`, `FLEET_GITHUB_APP_KEY_FILE`, `FLEET_GITHUB_APP_BOT_NAME` and `FLEET_GITHUB_APP_BOT_EMAIL` together. The first two go as a pair, and the last two are required once they are set. A partial or invalid set stops startup with the variable named.
+- Server variables: none are required to upgrade. To turn the lane on, set `FLEET_GITHUB_APP_ID`, `FLEET_GITHUB_APP_KEY_FILE`, `FLEET_GITHUB_APP_BOT_NAME`, `FLEET_GITHUB_APP_BOT_EMAIL` and `FLEET_GITHUB_APP_ACCOUNT` together, with `FLEET_GITHUB_APP_INSTALLATIONS` and `FLEET_GITHUB_APP_REPOS` to allow anything. The first two go as a pair, and the rest are required once they are set, except the two lists, which default to deny-all. A partial or invalid set stops startup with the variable named.
 - Mount the key file first. A key file that is group or other accessible, not a regular file, over 16 KiB or not RSA stops startup.
 - Database: the server migrations add the `github_app_mint` audit table and the `credentials.tombstoned_at` column (0033) and the `forge:github_app` capability CHECK (0034). They run with the server.
 - fleetd: upgrade every Box before you grant `forge:github_app`. The Box needs the code that accepts the `github_installation_token` wire kind and the `GitIdentity`. How an older fleetd answers that kind is unverified.

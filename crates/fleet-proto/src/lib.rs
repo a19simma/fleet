@@ -213,6 +213,19 @@ pub const PRECONDITION_APP_MINT: &str = "github app token unavailable";
 /// falls back to a PAT.
 pub const PRECONDITION_APP_MINT_CAP: &str = "github app token limit reached";
 
+/// `FAILED_PRECONDITION` message: the installation is refused.
+///
+/// It is off the operator allowlist, or GitHub reports it suspended, owned by another App or
+/// installed on another account (ADR-0058, SEC-001, SEC-013). It applies at `PutCredential`,
+/// at verify and at release.
+pub const PRECONDITION_APP_INSTALLATION: &str = "github app installation is not allowed";
+
+/// `FAILED_PRECONDITION` message: the Job repository is refused.
+///
+/// It is outside the operator repository allowlist or its owner is not the configured account
+/// (ADR-0058, SEC-002, SEC-009, SEC-014). The Job or step fails and never falls back to a PAT.
+pub const PRECONDITION_APP_REPO: &str = "repository is not allowed for the github app";
+
 /// `FAILED_PRECONDITION` message: a `github_app` verify has no Job repository to scope its mint to.
 pub const PRECONDITION_NO_VERIFY_REPO: &str = "no job to verify the github app against";
 

@@ -13,8 +13,12 @@ use fleet_core::credential::{
 use fleet_proto::MAX_CREDENTIALS_PER_USER;
 use sqlx::{PgPool, Row};
 
-use super::app_jwt::AppKey;
-use super::app_mint::{AppClient, InstallationToken, REQUESTED_PERMISSIONS};
+use super::app_jwt::{AppJwt, AppKey};
+use super::app_mint::{
+    AppClient, Installation, InstallationDirectory, InstallationToken, MintError,
+    REQUESTED_PERMISSIONS,
+};
+use super::app_policy::AppPolicy;
 use super::capability::ERR_CAPABILITY_NOT_GRANTED;
 use super::github::MAX_EXPIRY_MS;
 use super::seal::{Aad, SealError, Sealer};
@@ -136,6 +140,35 @@ const REASON_CAPABILITY: &str = "capability gone after mint";
 const REASON_OUTCOME: &str = "outcome write failed";
 const REASON_REVOKE: &str = "revoke refused";
 const REASON_CREDENTIAL: &str = "credential gone after mint";
+const REASON_INSTALLATION_ALLOWLIST: &str = "installation not on allowlist";
+const REASON_REPO_ALLOWLIST: &str = "repository not allowed";
+const REASON_INSTALLATION_BINDING: &str = "installation binding refused";
+
+const MAX_AUDIT_REPO_CHARS: usize = 140;
+
+fn audit_repo(repo: &str) -> String {
+    let bounded: String = repo.chars().take(MAX_AUDIT_REPO_CHARS).collect();
+    if bounded.is_empty() {
+        "-".to_owned()
+    } else {
+        bounded
+    }
+}
+
+fn refusal_reason(err: &StoreError) -> &'static str {
+    match err {
+        StoreError::InstallationDenied => REASON_INSTALLATION_ALLOWLIST,
+        StoreError::RepoDenied => REASON_REPO_ALLOWLIST,
+        _ => REASON_MINT_FAILED,
+    }
+}
+
+fn mint_failure_outcome(err: &StoreError) -> (&'static str, &'static str) {
+    match err {
+        StoreError::InstallationDenied => ("denied", REASON_INSTALLATION_BINDING),
+        _ => ("failed", REASON_MINT_FAILED),
+    }
+}
 
 #[derive(Clone)]
 struct MintRecord {
@@ -341,13 +374,15 @@ pub enum AppIdCheck {
     Unchecked,
 }
 
-/// The GitHub App mint lane: the parsed key, the App id, the token client and the bot identity
-/// a Job commits under (ADR-0058).
+/// The GitHub App mint lane: the parsed key, the App id, the token client, the operator
+/// allowlists and the bot identity a Job commits under (ADR-0058).
 pub struct AppLane {
     key: AppKey,
     app_id: String,
     client: AppClient,
     identity: BotIdentity,
+    policy: AppPolicy,
+    directory: Option<Arc<dyn InstallationDirectory>>,
 }
 
 impl AppLane {
@@ -365,11 +400,7 @@ impl AppLane {
         self.mint_installation(installation, repo).await
     }
 
-    async fn mint_installation(
-        &self,
-        installation: u64,
-        repo: &str,
-    ) -> Result<InstallationToken, StoreError> {
+    fn sign(&self) -> Result<(AppJwt, u64), StoreError> {
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map_err(|_| StoreError::MintFailed)?
@@ -378,6 +409,70 @@ impl AppLane {
             .key
             .sign(&self.app_id, now)
             .map_err(|_| StoreError::MintFailed)?;
+        Ok((jwt, now))
+    }
+
+    fn allow_installation(&self, installation: u64) -> Result<(), StoreError> {
+        if self.policy.installation_allowed(installation) {
+            Ok(())
+        } else {
+            tracing::warn!("github app installation is not on the allowlist");
+            Err(StoreError::InstallationDenied)
+        }
+    }
+
+    fn allow_repo(&self, repo: &str) -> Result<(), StoreError> {
+        if self.policy.repo_allowed(repo) {
+            Ok(())
+        } else {
+            tracing::warn!("github app repository is not allowed");
+            Err(StoreError::RepoDenied)
+        }
+    }
+
+    fn binding_fault(&self, installation: u64, found: &Installation) -> Option<&'static str> {
+        if found.id != installation {
+            Some("installation id differs")
+        } else if found.app_id.to_string() != self.app_id {
+            Some("installation belongs to another app")
+        } else if found.suspended {
+            Some("installation is suspended")
+        } else if !self.policy.account_matches(&found.account_login) {
+            Some("installation account differs")
+        } else {
+            None
+        }
+    }
+
+    async fn bind_installation(&self, jwt: &AppJwt, installation: u64) -> Result<(), StoreError> {
+        let found = match &self.directory {
+            Some(directory) => directory.installation(jwt, installation).await,
+            None => self.client.installation(jwt, installation).await,
+        }
+        .map_err(|err: MintError| {
+            tracing::warn!(error = %err, "github app installation lookup failed");
+            StoreError::MintFailed
+        })?;
+        self.binding_fault(installation, &found)
+            .map_or(Ok(()), |fault| {
+                tracing::warn!(fault, "github app installation refused");
+                Err(StoreError::InstallationDenied)
+            })
+    }
+
+    async fn vet_installation(&self, installation: u64) -> Result<(), StoreError> {
+        self.allow_installation(installation)?;
+        let (jwt, _) = self.sign()?;
+        self.bind_installation(&jwt, installation).await
+    }
+
+    async fn mint_installation(
+        &self,
+        installation: u64,
+        repo: &str,
+    ) -> Result<InstallationToken, StoreError> {
+        let (jwt, now) = self.sign()?;
+        self.bind_installation(&jwt, installation).await?;
         match self
             .client
             .mint(&jwt, installation, repo_name(repo), now)
@@ -419,15 +514,31 @@ impl AppLane {
         }
     }
 
-    /// Builds the lane. `app_id` is the JWT `iss` text and `identity` is what the Box commits
-    /// under.
-    pub fn new(key: AppKey, app_id: String, client: AppClient, identity: BotIdentity) -> Self {
+    /// Builds the lane. `app_id` is the JWT `iss` text, `identity` is what the Box commits under
+    /// and `policy` holds the operator allowlists.
+    pub fn new(
+        key: AppKey,
+        app_id: String,
+        client: AppClient,
+        identity: BotIdentity,
+        policy: AppPolicy,
+    ) -> Self {
         Self {
             key,
             app_id,
             client,
             identity,
+            policy,
+            directory: None,
         }
+    }
+
+    /// Reads installations through `directory` instead of the client, for tests that cannot
+    /// reach GitHub.
+    #[must_use]
+    pub fn with_directory(mut self, directory: Arc<dyn InstallationDirectory>) -> Self {
+        self.directory = Some(directory);
+        self
     }
 }
 
@@ -567,6 +678,12 @@ pub enum StoreError {
     /// The credential was deleted and kept as a tombstone because it has mint history. A
     /// `put` cannot replace it (ADR-0058, SEC-022).
     Tombstoned,
+    /// The installation is not on the operator allowlist, or GitHub reports it suspended, owned
+    /// by another App or installed on another account (ADR-0058, SEC-001, SEC-013).
+    InstallationDenied,
+    /// The Job repository is outside the operator allowlist or its owner is not the configured
+    /// account (ADR-0058, SEC-002, SEC-009, SEC-014).
+    RepoDenied,
     /// The database failed.
     Db(sqlx::Error),
 }
@@ -587,6 +704,8 @@ impl fmt::Display for StoreError {
             Self::MintCapReached => f.write_str(fleet_proto::PRECONDITION_APP_MINT_CAP),
             Self::NoJobRepo => f.write_str(fleet_proto::PRECONDITION_NO_VERIFY_REPO),
             Self::Tombstoned => f.write_str(fleet_proto::PRECONDITION_CREDENTIAL_TOMBSTONED),
+            Self::InstallationDenied => f.write_str(fleet_proto::PRECONDITION_APP_INSTALLATION),
+            Self::RepoDenied => f.write_str(fleet_proto::PRECONDITION_APP_REPO),
             Self::Seal(e) => e.fmt(f),
             Self::Db(_) => f.write_str("credential store database error"),
         }
@@ -795,6 +914,40 @@ impl CredentialStore {
         })
     }
 
+    /// Vets a `github_app` installation id before [`CredentialStore::put`] saves it (ADR-0058,
+    /// SEC-001, SEC-013, SEC-014).
+    ///
+    /// The capability check comes first, so a user without the capability sees that refusal and
+    /// learns nothing about the allowlist. The id must be on the operator allowlist, and
+    /// `GET /app/installations/{id}` must report that id, the configured App id, no suspension
+    /// and the configured account. A store without the App lane has no allowlist and no mint, so
+    /// it accepts the id and no token can ever be minted for it.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StoreError::CapabilityDenied`] when the user lacks the capability,
+    /// [`StoreError::InstallationDenied`] when the id is not a `u64`, is not allowed or fails the
+    /// binding, [`StoreError::MintFailed`] when the installation lookup cannot answer or the
+    /// App JWT cannot be signed, and [`StoreError::Db`] for a database failure.
+    pub async fn vet_installation(
+        &self,
+        user_id: i64,
+        installation: &Secret,
+    ) -> Result<(), StoreError> {
+        let mut tx = self.pool.begin().await?;
+        self.require_capability(&mut tx, user_id, CredentialKind::GithubApp)
+            .await?;
+        tx.rollback().await?;
+        let Some(lane) = self.app.clone() else {
+            return Ok(());
+        };
+        let id = std::str::from_utf8(installation.expose())
+            .ok()
+            .and_then(|text| text.parse::<u64>().ok())
+            .ok_or(StoreError::InstallationDenied)?;
+        lane.vet_installation(id).await
+    }
+
     /// Lists the user's credentials without secret material.
     ///
     /// # Errors
@@ -944,16 +1097,23 @@ impl CredentialStore {
     /// # Errors
     ///
     /// Returns [`StoreError::LeaseDenied`] when no job matches the lease, which also happens
-    /// after the mint when the recheck fails. Returns [`StoreError::NoGithub`] when the owner
-    /// has no GitHub credential. Returns [`StoreError::Expired`] when a needed credential is
-    /// past its expiry. Returns [`StoreError::CapabilityDenied`] when the owner lacks the
-    /// capability a stored kind needs, which also happens after the mint when the recheck
-    /// fails. Returns [`StoreError::NoAgentCredential`] when the owner has none the agent
-    /// accepts. Returns [`StoreError::NotFound`] when the credential row is gone or tombstoned
-    /// after the mint. Returns [`StoreError::MintFailed`] when the App token cannot be minted.
+    /// after the mint when the recheck fails.
+    /// Returns [`StoreError::NoGithub`] when the owner has no GitHub credential.
+    /// Returns [`StoreError::Expired`] when a needed credential is past its expiry.
+    /// Returns [`StoreError::CapabilityDenied`] when the owner lacks the capability a stored
+    /// kind needs, which also happens after the mint when the recheck fails.
+    /// Returns [`StoreError::NoAgentCredential`] when the owner has none the agent accepts.
+    /// Returns [`StoreError::NotFound`] when the credential row is gone or tombstoned after
+    /// the mint.
+    /// Returns [`StoreError::MintFailed`] when the App token cannot be minted, which covers a
+    /// failed installation lookup and a signing failure.
     /// Returns [`StoreError::MintCapReached`] when the Job already holds the cap of mint
-    /// attempts or the User started the per-minute limit of them. Returns
-    /// [`StoreError::Seal`] when a value cannot be opened and [`StoreError::Db`] for a
+    /// attempts or the User started the per-minute limit of them.
+    /// Returns [`StoreError::InstallationDenied`] when the installation is not on the
+    /// allowlist or its `GET /app/installations/{id}` binding fails, and
+    /// [`StoreError::RepoDenied`] when the Job repository is outside the allowlist or its
+    /// owner is not the configured account; both write a `denied` row and mint nothing.
+    /// Returns [`StoreError::Seal`] when a value cannot be opened and [`StoreError::Db`] for a
     /// database failure, which includes an audit row that cannot be written before the mint.
     /// No use row is written on any error.
     pub async fn release_for_job(
@@ -1083,15 +1243,22 @@ impl CredentialStore {
         let record = MintRecord {
             credential_id: app_id,
             job_id: job_id.to_owned(),
-            repo: repo.to_owned(),
+            repo: audit_repo(repo),
             installation: installation.to_string(),
         };
+        if let Err(err) = lane
+            .allow_installation(installation)
+            .and_then(|()| lane.allow_repo(repo))
+        {
+            return Err(self.refuse(tx, &record, err).await);
+        }
         let attempt_id = self.admit(tx, &record, user_id).await?;
         let token = match lane.mint(&released, repo).await {
             Ok(token) => token,
             Err(err) => {
+                let (outcome, reason) = mint_failure_outcome(&err);
                 record
-                    .outcome_pooled(&self.pool, &attempt_id, "failed", Some(REASON_MINT_FAILED))
+                    .outcome_pooled(&self.pool, &attempt_id, outcome, Some(reason))
                     .await;
                 return Err(err);
             }
@@ -1142,6 +1309,23 @@ impl CredentialStore {
             }
         }
         Ok(released)
+    }
+
+    async fn refuse(
+        &self,
+        mut tx: sqlx::Transaction<'_, sqlx::Postgres>,
+        record: &MintRecord,
+        err: StoreError,
+    ) -> StoreError {
+        let written = async {
+            self.deny(&mut tx, record, refusal_reason(&err)).await?;
+            tx.commit().await
+        }
+        .await;
+        match written {
+            Ok(()) => err,
+            Err(db) => StoreError::Db(db),
+        }
     }
 
     async fn admit(
@@ -1247,9 +1431,11 @@ impl CredentialStore {
     /// [`StoreError::NotFound`] when the credential is gone or tombstoned,
     /// [`StoreError::NoJobRepo`] when the user has no Job, [`StoreError::MintCapReached`] when
     /// that Job holds the cap of attempts or the User started the per-minute limit of them,
+    /// [`StoreError::InstallationDenied`] when the installation is not allowed or fails the
+    /// binding, [`StoreError::RepoDenied`] when the Job repository is not allowed,
     /// [`StoreError::MintFailed`] when the lane is absent, the installation id is malformed,
-    /// the mint fails or GitHub refuses the revoke, and [`StoreError::Db`] for a database
-    /// failure.
+    /// the installation lookup or the mint fails or GitHub refuses the revoke, and
+    /// [`StoreError::Db`] for a database failure.
     pub async fn probe_app(
         &self,
         user_id: i64,
@@ -1277,15 +1463,22 @@ impl CredentialStore {
         let record = MintRecord {
             credential_id,
             job_id,
-            repo,
+            repo: audit_repo(&repo),
             installation: installation.to_string(),
         };
+        if let Err(err) = lane
+            .allow_installation(installation)
+            .and_then(|()| lane.allow_repo(&repo))
+        {
+            return Err(self.refuse(tx, &record, err).await);
+        }
         let attempt_id = self.admit(tx, &record, user_id).await?;
-        let token = match lane.mint_installation(installation, &record.repo).await {
+        let token = match lane.mint_installation(installation, &repo).await {
             Ok(token) => token,
             Err(err) => {
+                let (outcome, reason) = mint_failure_outcome(&err);
                 record
-                    .outcome_pooled(&self.pool, &attempt_id, "failed", Some(REASON_MINT_FAILED))
+                    .outcome_pooled(&self.pool, &attempt_id, outcome, Some(reason))
                     .await;
                 return Err(err);
             }
