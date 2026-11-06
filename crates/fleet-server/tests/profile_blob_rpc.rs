@@ -89,7 +89,7 @@ async fn shared_with(
         .fetch_one(pool)
         .await
         .unwrap();
-    let made = fleet_server::profiles::create_owned(pool, Some(system), name, content)
+    let made = fleet_server::profiles::create_owned(pool, Some(system), None, name, content)
         .await
         .unwrap();
     sqlx::query("UPDATE profile SET visibility = 'shared' WHERE owner_user_id = $1 AND name = $2")
@@ -383,6 +383,7 @@ async fn the_blob_follows_the_pin_of_either_owner(pool: PgPool) {
         fleet_server::profiles::create_owned(
             &pool,
             Some(owner),
+            None,
             "alpha",
             ProfileContent::Json(json),
         )
@@ -429,6 +430,7 @@ async fn submitted_job(pool: &PgPool, store: &Store) -> (String, fleet_proto::v1
     fleet_server::profiles::create_owned(
         pool,
         Some(user),
+        None,
         "alpha",
         ProfileContent::Json(r#"{"claude_md":"one","selection":[{"item_id":"s2"}]}"#),
     )

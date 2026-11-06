@@ -948,7 +948,7 @@ async fn item(pool: &PgPool, id: &str, kind: &str, content: &str, enabled: bool)
 }
 
 async fn profile(pool: &PgPool, owner: i64, name: &str, json: &str) {
-    profiles::create_owned(pool, Some(owner), name, ProfileContent::Json(json))
+    profiles::create_owned(pool, Some(owner), None, name, ProfileContent::Json(json))
         .await
         .unwrap();
 }
@@ -1468,7 +1468,7 @@ const TOOLS_TOML: &str = "[[tools]]\nname = \"node\"\nversion = \"20.11.1\"\n";
 const PLAIN_TOML: &str = "claude_md = \"x\"\n";
 
 async fn saved(pool: &PgPool, owner: i64, name: &str, toml: &str) {
-    profiles::create_owned(pool, Some(owner), name, ProfileContent::Toml(toml))
+    profiles::create_owned(pool, Some(owner), None, name, ProfileContent::Toml(toml))
         .await
         .unwrap();
 }

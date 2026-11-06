@@ -3,12 +3,13 @@
 use std::collections::HashSet;
 use std::fmt;
 
-use fleet_core::EventId;
+use fleet_core::model_allowlist::ModelAllowlist;
+use fleet_core::{EventId, Profile};
 use fleet_proto::v1::{GetBatchReply, SubmitBatchReply, SubmitBatchRequest, SubmitJobRequest};
 use sqlx::{PgPool, Row};
 
 use crate::jobs::{validate_job_id, validate_submit};
-use crate::profiles::{Viewer, validate_name};
+use crate::profiles::{Viewer, require_model, validate_name};
 use crate::store::StoreError;
 
 /// Most profiles one batch may name.
@@ -28,8 +29,9 @@ const LOCK_VISIBLE_PROFILE: &str = "SELECT id FROM profile \
      WHERE name = $1 AND (owner_user_id = $2 OR visibility = 'shared') \
      ORDER BY (owner_user_id = $2) DESC, id LIMIT 1 FOR SHARE";
 const LOCK_PROFILE_ID: &str = "SELECT pg_advisory_xact_lock($1)";
-const SELECT_LATEST: &str = "SELECT version, hash FROM profile_version WHERE profile_id = $1 \
-     ORDER BY version DESC LIMIT 1";
+const SELECT_LATEST: &str = "SELECT v.version, v.hash, b.content FROM profile_version v \
+     JOIN profile_blob b ON b.hash = v.hash WHERE v.profile_id = $1 \
+     ORDER BY v.version DESC LIMIT 1";
 const INSERT_BATCH_JOB: &str = "INSERT INTO jobs (job_id, prompt, repo, base_ref, branch, open_pr, \
      batch_id, repeat_idx, batch_pos, profile_name, profile_id, profile_version, profile_hash, \
      user_id, agent) \
@@ -187,6 +189,7 @@ struct Pin {
 async fn pin_profiles(
     tx: &mut sqlx::PgConnection,
     viewer: Viewer,
+    allowlist: Option<&ModelAllowlist>,
     names: &[String],
 ) -> Result<Vec<Pin>, StoreError> {
     if let Viewer::User(user) = viewer {
@@ -221,6 +224,10 @@ async fn pin_profiles(
             .fetch_optional(&mut *tx)
             .await?
             .ok_or(StoreError::UnknownProfile)?;
+        let content: Vec<u8> = row.try_get("content")?;
+        let profile = Profile::from_stored_json(&content)
+            .map_err(|_| StoreError::OutOfRange("profile blob"))?;
+        require_model(allowlist, profile.model.as_deref())?;
         pins.push(Pin {
             profile_id,
             version: row.try_get("version")?,
@@ -233,6 +240,7 @@ async fn pin_profiles(
 pub(crate) async fn submit(
     pool: &PgPool,
     owner: Option<i64>,
+    allowlist: Option<&ModelAllowlist>,
     request: &SubmitBatchRequest,
 ) -> Result<SubmitBatchReply, StoreError> {
     let batch = validate_batch(request)?;
@@ -287,7 +295,7 @@ pub(crate) async fn submit(
             created: false,
         });
     }
-    let pins = pin_profiles(&mut tx, viewer, &batch.profiles).await?;
+    let pins = pin_profiles(&mut tx, viewer, allowlist, &batch.profiles).await?;
     let mut job_ids = Vec::with_capacity(pins.len());
     for (pos, (name, pin)) in batch.profiles.iter().zip(pins).enumerate() {
         let job_id = EventId::generate().to_string();

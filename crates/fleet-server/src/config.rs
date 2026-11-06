@@ -6,6 +6,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
+use fleet_core::model_allowlist::ModelAllowlist;
 use fleet_proto::{DEFAULT_CI_RETRIES, MAX_CI_RETRIES};
 
 use crate::cred::{FileSealer, KeyRingError};
@@ -156,6 +157,11 @@ pub struct Config {
     /// Trusted proxies in front of the server, from `FLEET_TRUSTED_PROXY_HOPS`: 0 to
     /// [`MAX_TRUSTED_HOPS`], default 0, which ignores `X-Forwarded-For`.
     pub trusted_proxy_hops: usize,
+    /// Model ids a profile may name, from `FLEET_MODEL_ALLOWLIST`: a comma-separated list with
+    /// exact, case-sensitive entries and no trimming. `None` when the variable is unset, which
+    /// applies no model restriction. A set value that does not parse, the empty string
+    /// included, refuses start.
+    pub model_allowlist: Option<ModelAllowlist>,
 }
 
 /// Why the credential store cannot start. Messages carry no key bytes.
@@ -284,6 +290,9 @@ fn number(
     }
 }
 
+/// The variable that holds the model allowlist.
+const MODEL_ALLOWLIST_VAR: &str = "FLEET_MODEL_ALLOWLIST";
+
 const REMOVED_PROFILE_TOOLS_VAR: &str = "FLEET_ALLOW_PROFILE_TOOLS";
 
 /// Refuses the removed `FLEET_ALLOW_PROFILE_TOOLS` switch when it is set to any value, the
@@ -300,6 +309,18 @@ fn refuse_removed_profile_tools(
                 .to_owned(),
         }),
     }
+}
+
+fn model_allowlist(
+    lookup: &impl Fn(&str) -> Option<String>,
+) -> Result<Option<ModelAllowlist>, ConfigError> {
+    lookup(MODEL_ALLOWLIST_VAR)
+        .map(|raw| ModelAllowlist::parse(&raw))
+        .transpose()
+        .map_err(|err| ConfigError::Invalid {
+            var: MODEL_ALLOWLIST_VAR,
+            reason: err.to_string(),
+        })
 }
 
 fn ci_retries(lookup: &impl Fn(&str) -> Option<String>) -> Result<u32, ConfigError> {
@@ -380,6 +401,7 @@ impl Config {
             client_token,
             retention: retention(&lookup)?,
             max_ci_retries: ci_retries(&lookup)?,
+            model_allowlist: model_allowlist(&lookup)?,
             master_key_file: lookup("FLEET_MASTER_KEY_FILE")
                 .filter(|v| !v.is_empty())
                 .map(PathBuf::from),
@@ -434,6 +456,71 @@ mod tests {
         assert_eq!(config.listen.to_string(), "127.0.0.1:7070");
         assert_eq!(config.health_listen.to_string(), "0.0.0.0:7072");
         assert_eq!(config.token.expose(), TOKEN);
+        assert_eq!(config.model_allowlist, None);
+    }
+
+    fn with_allowlist(raw: &str) -> Result<Config, ConfigError> {
+        let mut vars: Vec<(&str, &str)> = base();
+        vars.push(("FLEET_MODEL_ALLOWLIST", raw));
+        Config::from_lookup(lookup(&vars))
+    }
+
+    #[test]
+    fn model_allowlist_is_read_from_the_environment() {
+        let config = with_allowlist("claude-opus-4-1,claude-sonnet-4-5").unwrap();
+        let list = config.model_allowlist.unwrap();
+        assert_eq!(list.entries(), ["claude-opus-4-1", "claude-sonnet-4-5"]);
+        assert!(list.allows("claude-opus-4-1"));
+        assert!(!list.allows("Claude-Opus-4-1"));
+    }
+
+    #[test]
+    fn a_bad_model_allowlist_refuses_start_without_echoing_it() {
+        let over_long = "x".repeat(fleet_core::MAX_MODEL_BYTES + 1);
+        let many = (0..=fleet_core::model_allowlist::MAX_ENTRIES)
+            .map(|n| format!("m{n}"))
+            .collect::<Vec<_>>()
+            .join(",");
+        let cases: Vec<(&str, String)> = vec![
+            ("empty", String::new()),
+            ("empty entry", "a,,b".into()),
+            ("trailing comma", "a,".into()),
+            ("cr", "a\rb".into()),
+            ("crlf", "a\r\nb".into()),
+            ("nel", "a\u{85}b".into()),
+            ("line separator", "a\u{2028}b".into()),
+            ("backslash", "a\\b".into()),
+            ("space", "a b".into()),
+            ("padded", " a".into()),
+            ("non-ascii", "mod\u{e8}le".into()),
+            ("duplicate", "a,a".into()),
+            ("over-long entry", over_long),
+            ("too many entries", many),
+        ];
+        for (label, raw) in cases {
+            let err = with_allowlist(&raw).unwrap_err();
+            match &err {
+                ConfigError::Invalid { var, reason } => {
+                    assert_eq!(*var, "FLEET_MODEL_ALLOWLIST", "{label}");
+                    assert!(raw.len() < 8 || !reason.contains(&raw), "{label}");
+                }
+                other => panic!("{label}: {other}"),
+            }
+            assert!(!err.to_string().contains('\r'), "{label}");
+        }
+    }
+
+    #[test]
+    fn model_allowlist_accepts_the_entry_limit() {
+        let max = (0..fleet_core::model_allowlist::MAX_ENTRIES)
+            .map(|n| format!("m{n}"))
+            .collect::<Vec<_>>()
+            .join(",");
+        let config = with_allowlist(&max).unwrap();
+        assert_eq!(
+            config.model_allowlist.unwrap().entries().len(),
+            fleet_core::model_allowlist::MAX_ENTRIES
+        );
     }
 
     fn key_file(tag: &str, body: &str) -> PathBuf {

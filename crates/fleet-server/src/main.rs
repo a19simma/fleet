@@ -120,7 +120,9 @@ async fn credential_service(
 }
 
 fn configured_store(pool: sqlx::PgPool, config: &Config) -> Store {
-    Store::new(pool).with_max_ci_retries(config.max_ci_retries)
+    Store::new(pool)
+        .with_max_ci_retries(config.max_ci_retries)
+        .with_model_allowlist(config.model_allowlist.clone())
 }
 
 async fn log_setup_path(users: &Users) -> Result<(), BoxError> {
@@ -294,5 +296,35 @@ async fn main() -> ExitCode {
             tracing::error!(%err, "fleet-server failed");
             ExitCode::FAILURE
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const TOKEN: &str = "0123456789abcdef0123456789abcdef";
+
+    fn config(allowlist: Option<&'static str>) -> Config {
+        Config::from_lookup(|var| match var {
+            "FLEET_DATABASE_URL" => Some("postgres://h/db".to_owned()),
+            "FLEET_TOKEN" => Some(TOKEN.to_owned()),
+            "FLEET_MODEL_ALLOWLIST" => allowlist.map(str::to_owned),
+            _ => None,
+        })
+        .unwrap()
+    }
+
+    #[sqlx::test]
+    async fn the_configured_store_carries_the_model_allowlist(pool: sqlx::PgPool) {
+        let set = configured_store(pool.clone(), &config(Some("claude-opus-4-1")));
+        assert_eq!(
+            set.model_allowlist().map(|l| l.entries().to_vec()),
+            Some(vec!["claude-opus-4-1".to_owned()])
+        );
+        assert_eq!(
+            configured_store(pool, &config(None)).model_allowlist(),
+            None
+        );
     }
 }

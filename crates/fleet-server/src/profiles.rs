@@ -4,6 +4,7 @@ use std::fmt::{self, Write};
 use std::str::FromStr;
 
 use fleet_core::catalog::{CatalogEntry, CatalogItem, MAX_CATALOG, RunnerKind, resolve};
+use fleet_core::model_allowlist::ModelAllowlist;
 use fleet_core::{Profile, ProfileError, ProfileHash, ProfileInvalid, Visibility};
 use fleet_proto::v1::{
     GetProfileBlobReply, ListProfilesReply, Profile as WireProfile, ProfileRef, ProfileSummary,
@@ -278,6 +279,7 @@ pub struct NewProfile {
     canonical: Vec<u8>,
     hash: ProfileHash,
     has_tools: bool,
+    model: Option<String>,
 }
 
 /// A validated Profile body without a name: the canonical JSON and its hash.
@@ -285,6 +287,7 @@ struct Body {
     canonical: Vec<u8>,
     hash: ProfileHash,
     has_tools: bool,
+    model: Option<String>,
 }
 
 /// Validates a profile name.
@@ -321,12 +324,14 @@ pub fn validate_create(
         canonical,
         hash,
         has_tools,
+        model,
     } = validate_body(content)?;
     Ok(NewProfile {
         name: name.to_owned(),
         canonical,
         hash,
         has_tools,
+        model,
     })
 }
 
@@ -344,7 +349,25 @@ fn validate_body(content: ProfileContent<'_>) -> Result<Body, ProfileFault> {
         canonical: profile.canonical_json(),
         hash: profile.hash(),
         has_tools: !profile.tools.is_empty(),
+        model: profile.model,
     })
+}
+
+/// Refuses a model outside `allowlist` with [`StoreError::ModelDenied`].
+///
+/// With no allowlist every model passes, and a profile with no model passes too: it names no
+/// model for a Box to run. The allowlist is process configuration, fixed for the life of the
+/// process, so a read inside or outside a transaction sees the same list. The save paths check
+/// before opening a transaction. The submit paths and [`blob_for_lease`] check after reading
+/// the pinned blob, so a job queued before the list changed is refused at lease time.
+pub(crate) fn require_model(
+    allowlist: Option<&ModelAllowlist>,
+    model: Option<&str>,
+) -> Result<(), StoreError> {
+    match (allowlist, model) {
+        (Some(list), Some(model)) => list.check(model).map_err(StoreError::ModelDenied),
+        _ => Ok(()),
+    }
 }
 
 fn hex(bytes: &[u8]) -> String {
@@ -377,15 +400,19 @@ fn text_of(bytes: Vec<u8>) -> Result<String, StoreError> {
 ///
 /// Returns [`ProfileFault::Unowned`] with nothing written when `caller` is `None` or not a
 /// stored user, any validation fault of [`validate_create`], [`StoreError::ToolsNotGranted`]
-/// when the profile has tools and the owner lacks `profile:tools`, and a database error.
+/// when the profile has tools and the owner lacks `profile:tools`,
+/// [`StoreError::ModelDenied`] when `allowlist` is set and the profile model is outside it, and
+/// a database error.
 pub async fn create_owned(
     pool: &PgPool,
     caller: Option<i64>,
+    allowlist: Option<&ModelAllowlist>,
     name: &str,
     content: ProfileContent<'_>,
 ) -> Result<ProfileVersion, StoreError> {
     let owner = caller.ok_or(ProfileFault::Unowned)?;
     let new = validate_create(name, content)?;
+    require_model(allowlist, new.model.as_deref())?;
     store_version(pool, owner, new).await
 }
 
@@ -427,6 +454,7 @@ async fn store_version(
         canonical,
         hash,
         has_tools,
+        model,
     } = new;
     let stored = push_version(
         &mut tx,
@@ -435,6 +463,7 @@ async fn store_version(
             canonical,
             hash,
             has_tools,
+            model,
         },
     )
     .await?;
@@ -528,15 +557,18 @@ async fn lock_for_owner(
 /// content, [`StoreError::NotFound`] for an absent profile or a private one owned by someone
 /// else, [`ProfileFault::NotOwner`] for a shared one owned by someone else,
 /// [`StoreError::ToolsNotGranted`] when the content has tools and `caller` lacks
-/// `profile:tools`, and a database error. Every refusal writes nothing.
+/// `profile:tools`, [`StoreError::ModelDenied`] when `allowlist` is set and the model is outside
+/// it, and a database error. Every refusal writes nothing.
 pub async fn update_owned(
     pool: &PgPool,
     caller: Option<i64>,
+    allowlist: Option<&ModelAllowlist>,
     profile_id: i64,
     content: ProfileContent<'_>,
 ) -> Result<ProfileVersion, StoreError> {
     let caller = caller.ok_or(ProfileFault::Unowned)?;
     let body = validate_body(content)?;
+    require_model(allowlist, body.model.as_deref())?;
     let size = i32::try_from(body.canonical.len())
         .map_err(|_| StoreError::OutOfRange("profile content"))?;
     let mut tx = pool.begin().await?;
@@ -645,11 +677,14 @@ fn wire_visibility(text: &str) -> Result<i32, StoreError> {
 /// A blob with `tools` is served only while the job owner (`jobs.user_id`, the user who
 /// submitted and was checked at submit) holds `profile:tools`. The grant is read live in the
 /// same transaction as the blob, under `FOR SHARE`. The profile owner's grant does not count.
+/// The pinned model is checked against `allowlist` too, so a job queued before the list was set
+/// or narrowed is refused here. The list is process configuration and takes no lock.
 pub(crate) async fn blob_for_lease(
     pool: &PgPool,
     job_id: &str,
     attempt: u32,
     box_name: &str,
+    allowlist: Option<&ModelAllowlist>,
 ) -> Result<GetProfileBlobReply, StoreError> {
     let attempt = i32::try_from(attempt).map_err(|_| StoreError::LeaseDenied)?;
     let mut tx = pool.begin().await?;
@@ -688,6 +723,7 @@ pub(crate) async fn blob_for_lease(
     if !profile.tools.is_empty() {
         require_tools_grant(&mut tx, row.try_get("user_id")?).await?;
     }
+    require_model(allowlist, profile.model.as_deref())?;
     let catalog = match (
         row.try_get::<Option<String>, _>("snapshot_catalog")?,
         row.try_get::<Option<String>, _>("snapshot_notes")?,
@@ -779,11 +815,13 @@ async fn lock_catalog(conn: &mut PgConnection) -> Result<Vec<CatalogEntry>, Stor
 /// [`StoreError::UnknownProfile`] when the caller cannot read a profile of that name, whether
 /// it is absent or someone else's private one. [`JobInvalid::Snapshot`] when the selection
 /// names an item the catalog lacks or the set passes the blob catalog caps. A stored profile
-/// or catalog row that fails its own validation is [`StoreError::OutOfRange`]. A database
-/// error.
+/// or catalog row that fails its own validation is [`StoreError::OutOfRange`].
+/// [`StoreError::ModelDenied`] when `allowlist` is set and the pinned model is outside it. A
+/// database error.
 pub(crate) async fn pin_for_submit(
     conn: &mut PgConnection,
     caller: i64,
+    allowlist: Option<&ModelAllowlist>,
     name: &str,
     runner: RunnerKind,
 ) -> Result<Pinned, StoreError> {
@@ -805,6 +843,7 @@ pub(crate) async fn pin_for_submit(
     if !profile.tools.is_empty() && !tools_granted {
         return Err(StoreError::ToolsNotGranted);
     }
+    require_model(allowlist, profile.model.as_deref())?;
     let entries = lock_catalog(conn).await?;
     let set = resolve(runner, &profile.selection, &entries).map_err(|_| JobInvalid::Snapshot)?;
     Ok(Pinned {

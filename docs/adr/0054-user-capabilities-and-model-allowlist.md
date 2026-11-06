@@ -1,6 +1,6 @@
 # User capabilities and model allowlist
 
-Status: Proposed 2026-11-02. Built: the `profile:tools` capability (save, submit, blob serve) and the startup refusal of `FLEET_ALLOW_PROFILE_TOOLS`. Not built: `FLEET_MODEL_ALLOWLIST` and the fleetd `model_allowlist`. Amends ADR-0048 (the server gate for `tools`). Builds on ADR-0035, ADR-0042 and ADR-0044. Amended by ADR-0056.
+Status: Proposed 2026-11-02. Built: the `profile:tools` capability (save, submit, blob serve), the startup refusal of `FLEET_ALLOW_PROFILE_TOOLS`, the server `FLEET_MODEL_ALLOWLIST` check at profile save, Job submit, batch submit and blob serve, and the fleetd `model_allowlist`. Amends ADR-0048 (the server gate for `tools`). Builds on ADR-0035, ADR-0042 and ADR-0044. Amended by ADR-0056.
 
 ADR-0048 gates Profile `tools` with one server switch, `FLEET_ALLOW_PROFILE_TOOLS`, because the server then had only box and client scopes. The server now has Users and an admin, a user with `users.is_admin` (ADR-0042, ADR-0056), so a grant can attach to a principal. A global switch lets every client install toolchains once an operator flips it. This ADR replaces it with a per-user capability and adds a model allowlist so a Job cannot select a model the operator never approved.
 
@@ -33,6 +33,7 @@ ADR-0048 gates Profile `tools` with one server switch, `FLEET_ALLOW_PROFILE_TOOL
 
 - An operator upgrading must remove `FLEET_ALLOW_PROFILE_TOOLS` and grant `profile:tools` to each user that needs it, or the server does not start.
 - Existing Profiles with `tools` stay stored and keep their hash. Submitting a Job that uses one needs a User with the capability, and a revoke refuses a leased Job of that owner before it fetches its blob.
+- Blob serve also checks the model allowlist against the pinned blob, so a Job queued before the list was set or narrowed is refused at lease time.
 - The admin RPC and the admin UI gain grant and revoke for the capability. `fleet-server admin` gains `grant-admin` and `revoke-admin` instead (ADR-0056).
 - A fleetd with an allowlist and a server without one still enforces on the Box. A server with one and a fleetd without one enforces at submit only.
 - Model ids that vendors rename need an allowlist edit in both configs.

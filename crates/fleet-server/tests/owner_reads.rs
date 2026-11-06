@@ -62,6 +62,7 @@ async fn shared(pool: &PgPool, name: &str, json: &str) {
     fleet_server::profiles::create_owned(
         pool,
         Some(system),
+        None,
         name,
         fleet_server::profiles::ProfileContent::Json(json),
     )

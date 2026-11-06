@@ -125,6 +125,7 @@ impl Harness {
         profiles::create_owned(
             &self.pool,
             Some(owner.user_id),
+            None,
             name,
             ProfileContent::Json(json),
         )

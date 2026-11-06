@@ -476,7 +476,7 @@ async fn owners(pool: &PgPool) -> Vec<(i64, String)> {
 }
 
 async fn owned(pool: &PgPool, caller: Option<i64>, name: &str, json: &str) -> Result<(), String> {
-    profiles::create_owned(pool, caller, name, ProfileContent::Json(json))
+    profiles::create_owned(pool, caller, None, name, ProfileContent::Json(json))
         .await
         .map(|_| ())
         .map_err(|err| err.to_string())
@@ -530,9 +530,15 @@ async fn forged_owner_in_the_content_does_not_stick(pool: PgPool) {
 }
 
 async fn put(pool: &PgPool, caller: i64, json: &str) -> fleet_proto::v1::ProfileVersion {
-    profiles::create_owned(pool, Some(caller), "alpha", ProfileContent::Json(json))
-        .await
-        .unwrap()
+    profiles::create_owned(
+        pool,
+        Some(caller),
+        None,
+        "alpha",
+        ProfileContent::Json(json),
+    )
+    .await
+    .unwrap()
 }
 
 const SHARED_CONTENT: &str = r#"{"claude_md":"same"}"#;
@@ -624,7 +630,7 @@ async fn update(
     id: i64,
     json: &str,
 ) -> Result<fleet_proto::v1::ProfileVersion, StoreError> {
-    profiles::update_owned(pool, caller, id, ProfileContent::Json(json)).await
+    profiles::update_owned(pool, caller, None, id, ProfileContent::Json(json)).await
 }
 
 const NEXT: &str = r#"{"claude_md":"next"}"#;
@@ -970,7 +976,8 @@ async fn create_waits_for_a_concurrent_user_delete_and_is_then_refused(pool: PgP
     let task = tokio::spawn({
         let pool = pool.clone();
         async move {
-            profiles::create_owned(&pool, Some(alice), "alpha", ProfileContent::Json(ONE)).await
+            profiles::create_owned(&pool, Some(alice), None, "alpha", ProfileContent::Json(ONE))
+                .await
         }
     });
     tokio::time::sleep(Duration::from_millis(400)).await;
@@ -1844,13 +1851,25 @@ async fn updating_with_tools_needs_the_capability(pool: PgPool) {
     owned(&pool, Some(alice), "alpha", ONE).await.unwrap();
     let id = profile_id(&pool, alice, "alpha").await;
     let before = counts(&pool).await;
-    let err = profiles::update_owned(&pool, Some(alice), id, ProfileContent::Toml(TOOLS_TOML))
-        .await
-        .unwrap_err();
+    let err = profiles::update_owned(
+        &pool,
+        Some(alice),
+        None,
+        id,
+        ProfileContent::Toml(TOOLS_TOML),
+    )
+    .await
+    .unwrap_err();
     assert!(matches!(err, StoreError::ToolsNotGranted), "{err}");
     assert_eq!(counts(&pool).await, before);
     grant_tools(&pool, alice).await;
-    profiles::update_owned(&pool, Some(alice), id, ProfileContent::Toml(TOOLS_TOML))
-        .await
-        .unwrap();
+    profiles::update_owned(
+        &pool,
+        Some(alice),
+        None,
+        id,
+        ProfileContent::Toml(TOOLS_TOML),
+    )
+    .await
+    .unwrap();
 }

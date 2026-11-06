@@ -397,6 +397,7 @@ fn worker_error(err: &StoreError) -> Status {
         StoreError::ToolsNotGranted => {
             Status::permission_denied(profiles::ERR_PROFILE_TOOLS_NOT_GRANTED)
         }
+        StoreError::ModelDenied(denied) => Status::permission_denied(denied.to_string()),
         other => storage_unavailable(other),
     }
 }
@@ -574,6 +575,7 @@ fn jobs_error(err: &StoreError) -> Status {
         StoreError::ToolsNotGranted => {
             Status::permission_denied(profiles::ERR_PROFILE_TOOLS_NOT_GRANTED)
         }
+        StoreError::ModelDenied(denied) => Status::permission_denied(denied.to_string()),
         StoreError::InvalidProfile(ProfileFault::Unowned) => {
             Status::permission_denied(profiles::ERR_PROFILE_SUBMIT_UNOWNED)
         }
@@ -597,6 +599,7 @@ fn profiles_error(err: &StoreError) -> Status {
         StoreError::ToolsNotGranted => {
             Status::permission_denied(profiles::ERR_PROFILE_TOOLS_NOT_GRANTED)
         }
+        StoreError::ModelDenied(denied) => Status::permission_denied(denied.to_string()),
         other => storage_unavailable(other),
     }
 }
@@ -611,6 +614,7 @@ fn batches_error(err: &StoreError) -> Status {
         StoreError::InvalidBatch(reason) => Status::invalid_argument(reason.to_string()),
         StoreError::InvalidProfile(_) => Status::invalid_argument("invalid profile name"),
         StoreError::InvalidJob(_) => Status::invalid_argument("invalid job request"),
+        StoreError::ModelDenied(denied) => Status::permission_denied(denied.to_string()),
         other => storage_unavailable(other),
     }
 }
@@ -1249,6 +1253,22 @@ mod tests {
             let status = jobs_error(&err);
             assert_eq!(status.code(), code, "{err}");
             assert!(!status.message().contains("pool"), "{err}");
+        }
+    }
+
+    #[test]
+    fn a_denied_model_maps_to_permission_denied_naming_it_on_every_path() {
+        let denied = || {
+            let list = fleet_core::model_allowlist::ModelAllowlist::parse("a").unwrap();
+            StoreError::ModelDenied(list.check("gpt-5").unwrap_err())
+        };
+        for status in [
+            jobs_error(&denied()),
+            profiles_error(&denied()),
+            batches_error(&denied()),
+        ] {
+            assert_eq!(status.code(), Code::PermissionDenied);
+            assert_eq!(status.message(), "model gpt-5 is not in the allowlist");
         }
     }
 

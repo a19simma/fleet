@@ -4,6 +4,8 @@ use std::collections::{BTreeMap, HashSet};
 use std::fmt;
 use std::time::Duration;
 
+use fleet_core::catalog::RunnerKind;
+use fleet_core::model_allowlist::{ModelAllowlist, ModelDenied};
 use fleet_core::{BoxName, Envelope, EventId, SCHEMA_VERSION};
 use fleet_proto::v1::{
     BoxStatus, BoxView, CiRetry, CiState, GetJobTranscriptReply, GetProfileBlobReply,
@@ -396,6 +398,11 @@ pub enum StoreError {
     /// A save, a submit or a blob serve involved a profile with `tools` and the responsible user
     /// does not hold `profile:tools`. The handler maps this to gRPC `PERMISSION_DENIED`. The error carries no data.
     ToolsNotGranted,
+    /// A profile save, a submit, a batch submit or a profile blob read named a model outside
+    /// the allowlist. The blob read refuses a job queued before the list was set or narrowed. The
+    /// handler maps this to gRPC `PERMISSION_DENIED`. The name is escaped and capped by
+    /// [`ModelDenied`].
+    ModelDenied(ModelDenied),
     /// A profile blob read did not match a live lease, or no such job exists. The handler
     /// maps this to gRPC `PERMISSION_DENIED`. The error carries no data.
     LeaseDenied,
@@ -418,6 +425,7 @@ impl fmt::Display for StoreError {
             Self::InvalidBatch(reason) => reason.fmt(f),
             Self::UnknownProfile => f.write_str("profile not found"),
             Self::ToolsNotGranted => f.write_str(profiles::ERR_PROFILE_TOOLS_NOT_GRANTED),
+            Self::ModelDenied(denied) => denied.fmt(f),
             Self::LeaseDenied => f.write_str("lease does not match"),
         }
     }
@@ -431,6 +439,7 @@ impl std::error::Error for StoreError {
             Self::InvalidJob(err) => Some(err),
             Self::InvalidProfile(err) => Some(err),
             Self::InvalidBatch(err) => Some(err),
+            Self::ModelDenied(err) => Some(err),
             Self::OutOfRange(_)
             | Self::KeyConflict
             | Self::StaleReport
@@ -779,6 +788,7 @@ pub struct Store {
     pool: PgPool,
     lease: Duration,
     max_ci_retries: u32,
+    model_allowlist: Option<ModelAllowlist>,
     #[cfg(test)]
     snapshot_gate: Option<std::sync::Arc<SnapshotGate>>,
 }
@@ -797,6 +807,7 @@ impl Store {
             pool,
             lease: DEFAULT_LEASE,
             max_ci_retries: DEFAULT_CI_RETRIES,
+            model_allowlist: None,
             #[cfg(test)]
             snapshot_gate: None,
         }
@@ -826,6 +837,22 @@ impl Store {
     pub fn with_max_ci_retries(mut self, max: u32) -> Self {
         self.max_ci_retries = max.min(MAX_CI_RETRIES);
         self
+    }
+
+    /// Sets the model allowlist, none otherwise.
+    ///
+    /// With a list, a profile save, a job or batch submit and a profile blob read refuse a profile
+    /// model outside it with [`StoreError::ModelDenied`]. With `None` the store applies no model restriction. The
+    /// list is process configuration and never changes after this call.
+    #[must_use]
+    pub fn with_model_allowlist(mut self, allowlist: Option<ModelAllowlist>) -> Self {
+        self.model_allowlist = allowlist;
+        self
+    }
+
+    /// The model allowlist the store enforces, `None` when it applies no model restriction.
+    pub fn model_allowlist(&self) -> Option<&ModelAllowlist> {
+        self.model_allowlist.as_ref()
     }
 
     /// Applies the embedded migrations.
@@ -959,6 +986,7 @@ impl Store {
     /// [`StoreError::UnknownProfile`] when the user cannot read the profile,
     /// [`StoreError::ToolsNotGranted`] when the profile has `tools` and the submitting user no longer
     /// holds `profile:tools`,
+    /// [`StoreError::ModelDenied`] when the pinned model is outside the allowlist,
     /// [`StoreError::KeyConflict`] when the key exists with different parameters, and
     /// [`StoreError::Database`] when a query fails.
     pub async fn submit_job(&self, request: &SubmitJobRequest) -> Result<Job, StoreError> {
@@ -1017,6 +1045,16 @@ impl Store {
         self.insert_job(owner, job).await
     }
 
+    async fn pin_profile(
+        &self,
+        tx: &mut sqlx::PgConnection,
+        caller: i64,
+        name: &str,
+        runner: RunnerKind,
+    ) -> Result<profiles::Pinned, StoreError> {
+        profiles::pin_for_submit(tx, caller, self.model_allowlist.as_ref(), name, runner).await
+    }
+
     async fn insert_job(&self, owner: Option<i64>, job: NewJob) -> Result<Job, StoreError> {
         let scoped = owner;
         if job.profile.is_some() && scoped.is_none() {
@@ -1063,7 +1101,7 @@ impl Store {
                 .fetch_one(&mut *tx)
                 .await?;
             if !stored {
-                let pinned = profiles::pin_for_submit(&mut tx, caller, name, runner).await?;
+                let pinned = self.pin_profile(&mut tx, caller, name, runner).await?;
                 sqlx::query(INSERT_JOB_WITH_PROFILE)
                     .bind(id)
                     .bind(&job.key)
@@ -1389,15 +1427,18 @@ impl Store {
     /// # Errors
     ///
     /// Returns [`StoreError::InvalidProfile`] when the name or content fails validation or
-    /// `caller` is `None` or not a stored user ([`ProfileFault::Unowned`]), and
-    /// [`StoreError::Database`] when a query fails.
+    /// `caller` is `None` or not a stored user ([`ProfileFault::Unowned`]),
+    /// [`StoreError::ToolsNotGranted`] when the content has tools and `caller` does not hold
+    /// `profile:tools`, [`StoreError::ModelDenied`] when the store has an allowlist and the
+    /// profile model is outside it, and [`StoreError::Database`] when a query fails.
     pub async fn create_profile(
         &self,
         caller: Option<i64>,
         name: &str,
         content_json: &str,
     ) -> Result<fleet_proto::v1::ProfileVersion, StoreError> {
-        profiles::create_owned(&self.pool, caller, name, ProfileContent::Json(content_json)).await
+        let content = ProfileContent::Json(content_json);
+        self.create_profile_content(caller, name, content).await
     }
 
     /// Stores a profile from either input form, checked like [`Store::create_profile`].
@@ -1406,15 +1447,23 @@ impl Store {
     ///
     /// # Errors
     ///
-    /// Same as [`Store::create_profile`], and [`StoreError::ToolsNotGranted`] when tools are
-    /// present and `caller` does not hold the capability.
+    /// Same as [`Store::create_profile`], [`StoreError::ToolsNotGranted`] when tools are
+    /// present and `caller` does not hold the capability, and [`StoreError::ModelDenied`] when
+    /// the store has an allowlist and the profile model is outside it.
     pub async fn create_profile_content(
         &self,
         caller: Option<i64>,
         name: &str,
         content: ProfileContent<'_>,
     ) -> Result<fleet_proto::v1::ProfileVersion, StoreError> {
-        profiles::create_owned(&self.pool, caller, name, content).await
+        profiles::create_owned(
+            &self.pool,
+            caller,
+            self.model_allowlist.as_ref(),
+            name,
+            content,
+        )
+        .await
     }
 
     /// Reads a profile version as `viewer`, or the latest one when `version` is `None`.
@@ -1462,13 +1511,15 @@ impl Store {
     /// Returns [`StoreError::InvalidBatch`], [`StoreError::InvalidProfile`] or
     /// [`StoreError::InvalidJob`] when the request fails validation,
     /// [`StoreError::UnknownProfile`] when a profile has no version,
+    /// [`StoreError::OutOfRange`] when a stored profile blob fails its own validation,
+    /// [`StoreError::ModelDenied`] when a pinned model is outside the allowlist,
     /// [`StoreError::KeyConflict`] when the key exists with other parameters and
     /// [`StoreError::Database`] when a query fails.
     pub async fn submit_batch(
         &self,
         request: &SubmitBatchRequest,
     ) -> Result<SubmitBatchReply, StoreError> {
-        batches::submit(&self.pool, None, request).await
+        batches::submit(&self.pool, None, self.model_allowlist.as_ref(), request).await
     }
 
     /// Submits a batch owned by `owner`, like [`Store::submit_batch`].
@@ -1485,7 +1536,7 @@ impl Store {
         owner: Option<i64>,
         request: &SubmitBatchRequest,
     ) -> Result<SubmitBatchReply, StoreError> {
-        batches::submit(&self.pool, owner, request).await
+        batches::submit(&self.pool, owner, self.model_allowlist.as_ref(), request).await
     }
 
     /// Returns a batch with its jobs in profile order, each with its profile and telemetry
@@ -1532,7 +1583,8 @@ impl Store {
     /// Reads the profile blob a running job pins, authorised against its lease.
     ///
     /// The job must be `RUNNING` at `attempt` on `box_name` with an unexpired lease. A job
-    /// that does not exist gives the same error as a lease mismatch.
+    /// that does not exist gives the same error as a lease mismatch. The model allowlist is
+    /// checked against the pinned blob, so a job queued before the list changed is refused.
     ///
     /// # Errors
     ///
@@ -1540,7 +1592,8 @@ impl Store {
     /// [`StoreError::LeaseDenied`] when no job matches the lease,
     /// [`StoreError::UnknownProfile`] when the leased job pins no profile,
     /// [`StoreError::ToolsNotGranted`] when the blob has tools and the job owner no longer
-    /// holds `profile:tools`, [`StoreError::OutOfRange`] when the stored blob fails the hash
+    /// holds `profile:tools`, [`StoreError::ModelDenied`] when the pinned model is outside the
+    /// configured allowlist, [`StoreError::OutOfRange`] when the stored blob fails the hash
     /// check and [`StoreError::Database`] when the query fails.
     pub async fn get_profile_blob(
         &self,
@@ -1549,7 +1602,14 @@ impl Store {
         box_name: &BoxName,
     ) -> Result<GetProfileBlobReply, StoreError> {
         validate_job_id(job_id)?;
-        profiles::blob_for_lease(&self.pool, job_id, attempt, box_name.as_str()).await
+        profiles::blob_for_lease(
+            &self.pool,
+            job_id,
+            attempt,
+            box_name.as_str(),
+            self.model_allowlist.as_ref(),
+        )
+        .await
     }
 
     /// Reads the whole transcript of the job a running judge job targets, authorised against
