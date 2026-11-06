@@ -264,11 +264,11 @@ A shell command with no completion event. fleetd measures it as a `BgShell` **Sp
 _Avoid_: detached command, async shell
 
 **GitHub App credential**:
-The `github_app` **Credential kind**: a **User**'s installation id for the operator's GitHub App. The App id and private key are server config, never stored. Built: the kind, the installation id parser, the mint audit schema, the tombstone and the `forge:github_app` capability gate. `PutCredential` and the web form still refuse the kind until the save path lands (ADR-0058). Not built: minting, the config and fleetd (ADR-0058).
+The `github_app` **Credential kind**: a **User**'s installation id for the operator's GitHub App. The App id and private key are server config, never stored. Built: the kind, the installation id parser, the mint client with response validation, the App id and key file config, the mint audit schema, the tombstone and the `forge:github_app` capability gate. `PutCredential` and the web form still refuse the kind until the save path lands (ADR-0058). Not wired or not built: calling the mint and fleetd (ADR-0058).
 _Avoid_: app token, app key
 
 **Installation token**:
-The one-hour GitHub token the server mints from a **GitHub App credential** for one Job, clamped to the Job repository and delivered as wire kind `github_installation_token`. It is never stored. Not built: no minting yet (ADR-0058).
+The one-hour GitHub token the server mints from a **GitHub App credential** for one Job, clamped to the Job repository and delivered as wire kind `github_installation_token`. It is never stored. Built, not wired: the mint client exists but no release path calls it (ADR-0058).
 _Avoid_: app token
 
 **Bot identity**:

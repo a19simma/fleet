@@ -87,19 +87,7 @@ impl HttpsGithub {
     ///
     /// Returns [`GithubError::Unavailable`] when the TLS stack cannot be set up.
     pub fn new() -> Result<Self, GithubError> {
-        let roots = RootCertStore {
-            roots: webpki_roots::TLS_SERVER_ROOTS.to_vec(),
-        };
-        let provider = Arc::new(rustls::crypto::ring::default_provider());
-        let mut config = ClientConfig::builder_with_provider(provider)
-            .with_safe_default_protocol_versions()
-            .map_err(|_| GithubError::Unavailable)?
-            .with_root_certificates(roots)
-            .with_no_client_auth();
-        config.alpn_protocols = vec![b"http/1.1".to_vec()];
-        Ok(Self {
-            tls: Arc::new(config),
-        })
+        Ok(Self { tls: tls_config()? })
     }
 
     async fn request(&self, token: &Secret) -> Result<GithubUser, GithubError> {
@@ -162,7 +150,21 @@ impl GithubApi for HttpsGithub {
     }
 }
 
-struct AbortOnDrop(JoinHandle<Result<(), hyper::Error>>);
+pub(super) fn tls_config() -> Result<Arc<ClientConfig>, GithubError> {
+    let roots = RootCertStore {
+        roots: webpki_roots::TLS_SERVER_ROOTS.to_vec(),
+    };
+    let provider = Arc::new(rustls::crypto::ring::default_provider());
+    let mut config = ClientConfig::builder_with_provider(provider)
+        .with_safe_default_protocol_versions()
+        .map_err(|_| GithubError::Unavailable)?
+        .with_root_certificates(roots)
+        .with_no_client_auth();
+    config.alpn_protocols = vec![b"http/1.1".to_vec()];
+    Ok(Arc::new(config))
+}
+
+pub(super) struct AbortOnDrop(pub(super) JoinHandle<Result<(), hyper::Error>>);
 
 impl Drop for AbortOnDrop {
     fn drop(&mut self) {

@@ -38,4 +38,4 @@ Gitea and Forgejo have no GitHub App equivalent (https://forgejo.org/docs/latest
 
 ## Amendment (ADR-0058)
 
-ADR-0058 (proposed, not built) lets the GitHub implementation use a one-hour installation token and the bot identity instead of the owner's `github_pat`. The `Forge` operations do not change. The Gitea note above stands.
+ADR-0058 (proposed; server side partly built, the fleetd Forge side not built) lets the GitHub implementation use a one-hour installation token and the bot identity instead of the owner's `github_pat`. The `Forge` operations do not change. The Gitea note above stands.

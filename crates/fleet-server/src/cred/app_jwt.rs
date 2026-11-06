@@ -1,8 +1,9 @@
 //! GitHub App key loading and RS256 JWT signing (ADR-0058, SEC-007, SEC-013, SEC-020).
 //!
-//! JWT `Debug` redaction (SEC-020) is deferred until the JWT is wired.
+//! The signed JWT is an [`AppJwt`]: `Debug` is redacted and the text is wiped on drop.
 //!
-//! Built, not wired: no runtime path calls this module yet.
+//! Built, not wired: startup loads the key through [`AppKey::load`]; no runtime path calls
+//! [`AppKey::sign`] yet.
 //!
 //! Key bytes are read into a preallocated `Zeroizing` buffer so growth never leaves unwiped
 //! copies, and the DER moves out of the parsed PEM into a `Zeroizing` buffer. Not zeroized: the
@@ -70,6 +71,29 @@ impl fmt::Display for SignError {
 
 impl std::error::Error for SignError {}
 
+/// A signed App JWT. `Debug` is redacted and the text is wiped on drop.
+pub struct AppJwt(Zeroizing<String>);
+
+impl AppJwt {
+    /// The JWT text. Pass it only to GitHub.
+    pub fn expose(&self) -> &str {
+        &self.0
+    }
+}
+
+#[cfg(test)]
+impl AppJwt {
+    pub(super) fn from_text(text: &str) -> Self {
+        Self(Zeroizing::new(text.to_owned()))
+    }
+}
+
+impl fmt::Debug for AppJwt {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("AppJwt(..)")
+    }
+}
+
 /// The parsed GitHub App private key, held for the life of the process.
 pub struct AppKey {
     pair: RsaKeyPair,
@@ -135,7 +159,7 @@ impl AppKey {
     /// Returns [`SignError`]:
     /// - `Clock` when `now` is under 60 or `now + 540` overflows `u64`.
     /// - `Sign` when the signature or the claim serialisation fails.
-    pub fn sign(&self, app_id: &str, now: u64) -> Result<Zeroizing<String>, SignError> {
+    pub fn sign(&self, app_id: &str, now: u64) -> Result<AppJwt, SignError> {
         let iat = now.checked_sub(IAT_BACKDATE_SECS).ok_or(SignError::Clock)?;
         let exp = now.checked_add(EXP_AHEAD_SECS).ok_or(SignError::Clock)?;
         let iss = serde_json::to_string(app_id).map_err(|_| SignError::Sign)?;
@@ -155,7 +179,7 @@ impl AppKey {
             .map_err(|_| SignError::Sign)?;
         jwt.push('.');
         b64url(&sig, &mut jwt);
-        Ok(jwt)
+        Ok(AppJwt(jwt))
     }
 }
 
@@ -237,6 +261,7 @@ mod tests {
         let key = rsa(2048);
         let (_fx, r) = loaded(&key.private_key_to_pem().unwrap());
         let jwt = r.unwrap().sign("12345", NOW).unwrap();
+        let jwt = jwt.expose();
         let parts: Vec<&str> = jwt.split('.').collect();
         assert_eq!(parts.len(), 3);
         assert_eq!(b64url_decode(parts[0]), br#"{"alg":"RS256","typ":"JWT"}"#);
@@ -263,7 +288,7 @@ mod tests {
     fn exp_is_at_most_540_seconds_after_now_and_span_is_600() {
         let (_fx, r) = loaded(&rsa(2048).private_key_to_pem().unwrap());
         let jwt = r.unwrap().sign("1", NOW).unwrap();
-        let claims = b64url_decode(jwt.split('.').nth(1).unwrap());
+        let claims = b64url_decode(jwt.expose().split('.').nth(1).unwrap());
         let v: serde_json::Value = serde_json::from_slice(&claims).unwrap();
         let (iat, exp) = (v["iat"].as_u64().unwrap(), v["exp"].as_u64().unwrap());
         assert_eq!(exp - iat, 600);
@@ -274,7 +299,8 @@ mod tests {
     fn iss_is_json_escaped() {
         let (_fx, r) = loaded(&rsa(2048).private_key_to_pem().unwrap());
         let jwt = r.unwrap().sign("a\"b", NOW).unwrap();
-        let claims = String::from_utf8(b64url_decode(jwt.split('.').nth(1).unwrap())).unwrap();
+        let claims =
+            String::from_utf8(b64url_decode(jwt.expose().split('.').nth(1).unwrap())).unwrap();
         assert!(claims.ends_with(r#""iss":"a\"b"}"#));
     }
 
@@ -401,13 +427,22 @@ mod tests {
     }
 
     #[test]
+    fn jwt_debug_is_redacted() {
+        let (_fx, r) = loaded(&rsa(2048).private_key_to_pem().unwrap());
+        let jwt = r.unwrap().sign("1", NOW).unwrap();
+        let shown = format!("{jwt:?}");
+        assert_eq!(shown, "AppJwt(..)");
+        assert!(!shown.contains(jwt.expose()));
+    }
+
+    #[test]
     fn jwt_never_appears_in_errors() {
         let (_fx, r) = loaded(&rsa(2048).private_key_to_pem().unwrap());
         let k = r.unwrap();
         let jwt = k.sign("1", NOW).unwrap();
         let e = k.sign("1", 1).unwrap_err();
         let shown = format!("{e} {e:?}");
-        assert!(!shown.contains(jwt.as_str()));
+        assert!(!shown.contains(jwt.expose()));
         assert!(!format!("{:?}", SignError::Sign).contains('.'));
     }
 }

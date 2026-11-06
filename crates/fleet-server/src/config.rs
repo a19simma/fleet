@@ -9,6 +9,7 @@ use std::time::Duration;
 use fleet_core::model_allowlist::ModelAllowlist;
 use fleet_proto::{DEFAULT_CI_RETRIES, MAX_CI_RETRIES};
 
+use crate::cred::app_jwt::{AppKey, AppKeyError};
 use crate::cred::{FileSealer, KeyRingError};
 use crate::retention::{
     DEFAULT_EVENTS_DAYS, DEFAULT_INTERVAL, DEFAULT_SUMMARIES_DAYS, MIN_INTERVAL, Policy,
@@ -162,6 +163,36 @@ pub struct Config {
     /// applies no model restriction. A set value that does not parse, the empty string
     /// included, refuses start.
     pub model_allowlist: Option<ModelAllowlist>,
+    /// The GitHub App, from `FLEET_GITHUB_APP_ID` and `FLEET_GITHUB_APP_KEY_FILE`. Both are set
+    /// or both are unset: one without the other refuses start. `None` when both are unset or
+    /// empty.
+    pub github_app: Option<GithubAppConfig>,
+}
+
+/// The GitHub App id and the path of its private key (ADR-0058).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GithubAppConfig {
+    /// The App id: 1 to 20 ASCII digits with no leading zero, in the range of `u64`.
+    pub app_id: u64,
+    /// Path of the PEM private key. [`AppKey::load`] checks the file at startup.
+    pub key_file: PathBuf,
+}
+
+impl GithubAppConfig {
+    /// The App id as the JWT `iss` text.
+    pub fn app_id_text(&self) -> String {
+        self.app_id.to_string()
+    }
+
+    /// Loads the private key.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AppKeyError`] when the file is unreadable, loosely permissioned, not a regular
+    /// file or not a usable RSA key.
+    pub fn load_key(&self) -> Result<AppKey, AppKeyError> {
+        AppKey::load(&self.key_file)
+    }
 }
 
 /// Why the credential store cannot start. Messages carry no key bytes.
@@ -323,6 +354,44 @@ fn model_allowlist(
         })
 }
 
+const GITHUB_APP_ID_VAR: &str = "FLEET_GITHUB_APP_ID";
+const GITHUB_APP_KEY_FILE_VAR: &str = "FLEET_GITHUB_APP_KEY_FILE";
+
+fn github_app(
+    lookup: &impl Fn(&str) -> Option<String>,
+) -> Result<Option<GithubAppConfig>, ConfigError> {
+    let id = lookup(GITHUB_APP_ID_VAR).filter(|v| !v.is_empty());
+    let key_file = lookup(GITHUB_APP_KEY_FILE_VAR).filter(|v| !v.is_empty());
+    let (id, key_file) = match (id, key_file) {
+        (None, None) => return Ok(None),
+        (Some(id), Some(key_file)) => (id, key_file),
+        (Some(_), None) => {
+            return Err(ConfigError::Invalid {
+                var: GITHUB_APP_KEY_FILE_VAR,
+                reason: format!("required when {GITHUB_APP_ID_VAR} is set"),
+            });
+        }
+        (None, Some(_)) => {
+            return Err(ConfigError::Invalid {
+                var: GITHUB_APP_ID_VAR,
+                reason: format!("required when {GITHUB_APP_KEY_FILE_VAR} is set"),
+            });
+        }
+    };
+    let valid = id.len() <= 20 && !id.starts_with('0') && id.bytes().all(|b| b.is_ascii_digit());
+    let app_id = valid
+        .then(|| id.parse::<u64>().ok())
+        .flatten()
+        .ok_or_else(|| ConfigError::Invalid {
+            var: GITHUB_APP_ID_VAR,
+            reason: "must be 1 to 20 ASCII digits without a leading zero, within u64".to_owned(),
+        })?;
+    Ok(Some(GithubAppConfig {
+        app_id,
+        key_file: PathBuf::from(key_file),
+    }))
+}
+
 fn ci_retries(lookup: &impl Fn(&str) -> Option<String>) -> Result<u32, ConfigError> {
     let value = number(
         lookup,
@@ -367,7 +436,9 @@ impl Config {
     /// address does not parse, or a retention setting is out of range. Retention days run
     /// from 1 to 3650, `FLEET_SUMMARIES_RETENTION_DAYS` must not be below
     /// `FLEET_EVENTS_RETENTION_DAYS`, and `FLEET_RETENTION_INTERVAL_SECS` is at least 60.
-    /// `FLEET_MAX_CI_RETRIES` runs from 0 to 5 and defaults to 0.
+    /// `FLEET_MAX_CI_RETRIES` runs from 0 to 5 and defaults to 0. `FLEET_GITHUB_APP_ID` without
+    /// `FLEET_GITHUB_APP_KEY_FILE`, or the reverse, is an error, and so is an App id that is
+    /// not 1 to 20 ASCII digits without a leading zero that fits a `u64`.
     pub fn from_env() -> Result<Self, ConfigError> {
         Self::from_lookup(|var| std::env::var(var).ok())
     }
@@ -376,7 +447,8 @@ impl Config {
     ///
     /// # Errors
     ///
-    /// Same as [`Config::from_env`].
+    /// Same as [`Config::from_env`]: the GitHub App variables are both set or both unset, and
+    /// the App id is 1 to 20 ASCII digits without a leading zero that fit a `u64`.
     pub fn from_lookup(lookup: impl Fn(&str) -> Option<String>) -> Result<Self, ConfigError> {
         refuse_removed_profile_tools(&lookup)?;
         let database_url = lookup("FLEET_DATABASE_URL")
@@ -402,6 +474,7 @@ impl Config {
             retention: retention(&lookup)?,
             max_ci_retries: ci_retries(&lookup)?,
             model_allowlist: model_allowlist(&lookup)?,
+            github_app: github_app(&lookup)?,
             master_key_file: lookup("FLEET_MASTER_KEY_FILE")
                 .filter(|v| !v.is_empty())
                 .map(PathBuf::from),
@@ -805,6 +878,102 @@ mod tests {
         let mut vars = base();
         vars.extend_from_slice(extra);
         Config::from_lookup(lookup(&vars))
+    }
+
+    #[test]
+    fn github_app_is_none_when_both_are_unset_or_empty() {
+        assert_eq!(with(&[]).unwrap().github_app, None);
+        let empty = with(&[
+            ("FLEET_GITHUB_APP_ID", ""),
+            ("FLEET_GITHUB_APP_KEY_FILE", ""),
+        ]);
+        assert_eq!(empty.unwrap().github_app, None);
+    }
+
+    #[test]
+    fn github_app_is_read_when_both_are_set() {
+        let app = with(&[
+            ("FLEET_GITHUB_APP_ID", "123456"),
+            ("FLEET_GITHUB_APP_KEY_FILE", "keys/app.pem"),
+        ])
+        .unwrap()
+        .github_app
+        .unwrap();
+        assert_eq!(app.app_id, 123_456);
+        assert_eq!(app.app_id_text(), "123456");
+        assert_eq!(app.key_file, PathBuf::from("keys/app.pem"));
+    }
+
+    #[test]
+    fn github_app_id_without_key_file_refuses_start() {
+        for key in [None, Some("")] {
+            let mut extra = vec![("FLEET_GITHUB_APP_ID", "1")];
+            extra.extend(key.map(|k| ("FLEET_GITHUB_APP_KEY_FILE", k)));
+            match with(&extra).unwrap_err() {
+                ConfigError::Invalid { var, .. } => assert_eq!(var, "FLEET_GITHUB_APP_KEY_FILE"),
+                other @ ConfigError::Missing(_) => panic!("{other}"),
+            }
+        }
+    }
+
+    #[test]
+    fn github_app_key_file_without_id_refuses_start() {
+        for id in [None, Some("")] {
+            let mut extra = vec![("FLEET_GITHUB_APP_KEY_FILE", "/k.pem")];
+            extra.extend(id.map(|i| ("FLEET_GITHUB_APP_ID", i)));
+            match with(&extra).unwrap_err() {
+                ConfigError::Invalid { var, .. } => assert_eq!(var, "FLEET_GITHUB_APP_ID"),
+                other @ ConfigError::Missing(_) => panic!("{other}"),
+            }
+        }
+    }
+
+    #[test]
+    fn github_app_id_must_be_a_u64_without_leading_zero() {
+        for bad in [
+            "0",
+            "007",
+            "12a",
+            "-1",
+            "+1",
+            "1 ",
+            " 1",
+            "1\n",
+            "1.5",
+            "18446744073709551616",
+            "123456789012345678901",
+            "\u{661}",
+        ] {
+            let err = with(&[
+                ("FLEET_GITHUB_APP_ID", bad),
+                ("FLEET_GITHUB_APP_KEY_FILE", "/k.pem"),
+            ])
+            .unwrap_err();
+            match err {
+                ConfigError::Invalid { var, reason } => {
+                    assert_eq!(var, "FLEET_GITHUB_APP_ID", "{bad:?}");
+                    assert!(
+                        !reason.contains("12a") && !reason.contains("0.5"),
+                        "{reason}"
+                    );
+                }
+                other @ ConfigError::Missing(_) => panic!("{other}"),
+            }
+        }
+        let max = with(&[
+            ("FLEET_GITHUB_APP_ID", "18446744073709551615"),
+            ("FLEET_GITHUB_APP_KEY_FILE", "/k.pem"),
+        ]);
+        assert_eq!(max.unwrap().github_app.unwrap().app_id, u64::MAX);
+    }
+
+    #[test]
+    fn github_app_key_load_refuses_a_missing_file() {
+        let app = GithubAppConfig {
+            app_id: 1,
+            key_file: PathBuf::from("/nonexistent/fleet-app-key.pem"),
+        };
+        assert_eq!(app.load_key().unwrap_err(), AppKeyError::Read);
     }
 
     #[test]

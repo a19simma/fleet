@@ -9,8 +9,9 @@ use std::time::Duration;
 use axum::Router;
 use axum::routing::get;
 use fleet_server::auth::BearerAuth;
-use fleet_server::config::{Config, CredentialsState, exposed_binds, is_loopback};
+use fleet_server::config::{Config, CredentialsState, GithubAppConfig, exposed_binds, is_loopback};
 use fleet_server::cred::admin::{AdminError, SETUP_CODE_TTL_HOURS, parse_args, run as run_admin};
+use fleet_server::cred::app_jwt::AppKey;
 use fleet_server::cred::github::HttpsGithub;
 use fleet_server::cred::limiter::Limiter;
 use fleet_server::cred::password::BootstrapPassword;
@@ -135,8 +136,22 @@ async fn log_setup_path(users: &Users) -> Result<(), BoxError> {
     Ok(())
 }
 
+fn load_github_app(config: &Config) -> Result<Option<AppKey>, BoxError> {
+    let key = config
+        .github_app
+        .as_ref()
+        .map(GithubAppConfig::load_key)
+        .transpose()
+        .map_err(|err| format!("FLEET_GITHUB_APP_KEY_FILE: {err}"))?;
+    if key.is_some() {
+        tracing::info!("github app key loaded");
+    }
+    Ok(key)
+}
+
 async fn run() -> Result<(), BoxError> {
     let config = Config::from_env()?;
+    let _github_app = load_github_app(&config)?;
     let options = PgConnectOptions::from_str(config.database_url.expose())?
         .options([("statement_timeout", STATEMENT_TIMEOUT_MS)]);
     let pool = PgPoolOptions::new()
