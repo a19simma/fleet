@@ -28,10 +28,12 @@ const WAIT: Duration = Duration::from_secs(60);
 struct Rig {
     addr: SocketAddr,
     admin: String,
+    admin_id: u64,
     plain: String,
+    plain_id: u64,
 }
 
-async fn token_for(pool: &PgPool, users: &Users, name: &str, admin: bool) -> String {
+async fn token_for(pool: &PgPool, users: &Users, name: &str, admin: bool) -> (u64, String) {
     let id = admin_run(pool, &AdminCommand::CreateUser(name.into()), "op")
         .await
         .unwrap()
@@ -40,7 +42,10 @@ async fn token_for(pool: &PgPool, users: &Users, name: &str, admin: bool) -> Str
         users.set_admin(id, true).await.unwrap();
     }
     let token = users.create_api_token(id, "t").await.unwrap();
-    String::from_utf8(token.token.expose().to_vec()).unwrap()
+    (
+        u64::try_from(id).unwrap(),
+        String::from_utf8(token.token.expose().to_vec()).unwrap(),
+    )
 }
 
 async fn serve(pool: PgPool) -> Rig {
@@ -55,9 +60,15 @@ async fn serve(pool: PgPool) -> Rig {
     let incoming = TcpIncoming::bind("127.0.0.1:0".parse().unwrap()).unwrap();
     let addr = incoming.local_addr().unwrap();
     tokio::spawn(router(&store, &auth).serve_with_incoming(incoming));
-    let admin = token_for(&pool, &users, "root", true).await;
-    let plain = token_for(&pool, &users, "pat", false).await;
-    Rig { addr, admin, plain }
+    let (admin_id, admin) = token_for(&pool, &users, "root", true).await;
+    let (plain_id, plain) = token_for(&pool, &users, "pat", false).await;
+    Rig {
+        addr,
+        admin,
+        admin_id,
+        plain,
+        plain_id,
+    }
 }
 
 async fn cli_as(
@@ -314,21 +325,115 @@ fn every_capability_form_parses_and_bad_ones_are_refused() {
     }
 }
 
-#[tokio::test]
-async fn user_cap_exits_nonzero_with_the_not_implemented_message() {
-    let cli = Cli::try_parse_from(["fleet", "user", "cap", "list", "7"]).unwrap();
-    let mut stdin = std::io::empty();
-    let mut out = Vec::new();
-    let err = run(cli, |_| None, &mut stdin, &mut out).await.unwrap_err();
-    assert_eq!(err.exit_code(), 1);
-    assert_eq!(out, Vec::<u8>::new());
-    assert!(
-        matches!(&err, CliError::Rpc(status) if status.code() == Code::Unimplemented),
-        "{err}"
-    );
-    assert!(
-        err.to_string()
-            .contains("fleet user cap is not implemented"),
-        "{err}"
-    );
+async fn caps(rig: &Rig, user: u64) -> String {
+    let id = user.to_string();
+    let (r, out) = cli_as(rig.addr, &rig.admin, &["user", "cap", "list", &id], b"").await;
+    r.unwrap();
+    out
+}
+
+#[sqlx::test]
+async fn an_admin_grants_lists_and_revokes_a_capability(pool: PgPool) {
+    let rig = serve(pool).await;
+    let id = rig.plain_id.to_string();
+    let a = &rig.admin;
+    assert_eq!(caps(&rig, rig.plain_id).await, "");
+    for _ in 0..2 {
+        let (r, out) = cli_as(
+            rig.addr,
+            a,
+            &["user", "cap", "grant", &id, "profile:tools"],
+            b"",
+        )
+        .await;
+        r.unwrap();
+        let rows = rows(&out);
+        assert_eq!(rows.len(), 1, "{out}");
+        assert_eq!(
+            rows[0][..3],
+            [
+                id.as_str(),
+                "profile:tools",
+                rig.admin_id.to_string().as_str()
+            ]
+        );
+        assert!(rows[0][3].parse::<u64>().unwrap() > 0);
+    }
+    assert_eq!(rows(&caps(&rig, rig.plain_id).await).len(), 1);
+    let revoke = ["user", "cap", "revoke", &id, "profile:tools"];
+    let (r, out) = cli_as(rig.addr, a, &revoke, b"").await;
+    r.unwrap();
+    assert_eq!(out, format!("revoked\t{id}\tprofile:tools\n"));
+    let (r, out) = cli_as(rig.addr, a, &revoke, b"").await;
+    r.unwrap();
+    assert_eq!(out, format!("not held\t{id}\tprofile:tools\n"));
+    assert_eq!(caps(&rig, rig.plain_id).await, "");
+}
+
+#[sqlx::test]
+async fn a_non_admin_token_cannot_change_capabilities_and_grants_stay(pool: PgPool) {
+    let rig = serve(pool).await;
+    let id = rig.plain_id.to_string();
+    let grant = ["user", "cap", "grant", &id, "profile:tools"];
+    cli_as(rig.addr, &rig.admin, &grant, b"").await.0.unwrap();
+    let before = caps(&rig, rig.plain_id).await;
+    assert_eq!(rows(&before).len(), 1);
+    let other = rig.admin_id.to_string();
+    let attempts = [
+        vec!["user", "cap", "grant", &other, "profile:tools"],
+        vec!["user", "cap", "revoke", &id, "profile:tools"],
+        vec!["user", "cap", "list", &id],
+    ];
+    for token in [rig.plain.as_str(), CLIENT] {
+        for args in &attempts {
+            let (r, out) = cli_as(rig.addr, token, args, b"").await;
+            assert_denied(r);
+            assert_eq!(out, "", "{args:?}");
+        }
+    }
+    assert_eq!(caps(&rig, rig.plain_id).await, before);
+    assert_eq!(caps(&rig, rig.admin_id).await, "");
+}
+
+#[sqlx::test]
+async fn unknown_targets_and_capabilities_are_server_refusals(pool: PgPool) {
+    let rig = serve(pool).await;
+    let id = rig.plain_id.to_string();
+    let missing = (rig.plain_id + 1000).to_string();
+    let too_big = u64::MAX.to_string();
+    let a = &rig.admin;
+    for (args, code) in [
+        (
+            vec!["user", "cap", "grant", &missing, "profile:tools"],
+            Code::NotFound,
+        ),
+        (vec!["user", "cap", "list", &missing], Code::NotFound),
+        (
+            vec!["user", "cap", "grant", &id, "profile:nothing"],
+            Code::InvalidArgument,
+        ),
+        (
+            vec!["user", "cap", "grant", &too_big, "profile:tools"],
+            Code::InvalidArgument,
+        ),
+    ] {
+        let (r, out) = cli_as(rig.addr, a, &args, b"").await;
+        let err = r.unwrap_err();
+        assert!(
+            matches!(&err, CliError::Rpc(s) if s.code() == code),
+            "{args:?} {err}"
+        );
+        assert_eq!(err.exit_code(), 1);
+        assert_eq!(out, "");
+    }
+    let (r, out) = cli_as(
+        rig.addr,
+        a,
+        &["user", "cap", "revoke", &missing, "profile:tools"],
+        b"",
+    )
+    .await;
+    r.unwrap();
+    assert_eq!(out, format!("not held\t{missing}\tprofile:tools\n"));
+    assert_eq!(caps(&rig, rig.plain_id).await, "");
 }
