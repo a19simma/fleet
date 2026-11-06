@@ -8,7 +8,7 @@ use fleet_proto::v1::{GetBatchReply, SubmitBatchReply, SubmitBatchRequest, Submi
 use sqlx::{PgPool, Row};
 
 use crate::jobs::{validate_job_id, validate_submit};
-use crate::profiles::validate_name;
+use crate::profiles::{Viewer, validate_name};
 use crate::store::StoreError;
 
 /// Most profiles one batch may name.
@@ -177,21 +177,30 @@ struct Pin {
     hash: Vec<u8>,
 }
 
+/// Locks and pins the latest version of each named profile as `viewer`, in the caller's
+/// transaction.
+///
+/// A name resolves like single submit: the viewer's own profile first, then a shared one. A
+/// [`Viewer::Shared`] sees shared profiles only. Each chosen profile row is locked `FOR SHARE`.
+/// A profile that is absent and one that is someone else's private one both give
+/// [`StoreError::UnknownProfile`].
 async fn pin_profiles(
     tx: &mut sqlx::PgConnection,
-    owner: i64,
+    viewer: Viewer,
     names: &[String],
 ) -> Result<Vec<Pin>, StoreError> {
-    sqlx::query(LOCK_OWNER)
-        .bind(owner)
-        .fetch_optional(&mut *tx)
-        .await?
-        .ok_or(StoreError::UnknownProfile)?;
+    if let Viewer::User(user) = viewer {
+        sqlx::query(LOCK_OWNER)
+            .bind(user)
+            .fetch_optional(&mut *tx)
+            .await?
+            .ok_or(StoreError::UnknownProfile)?;
+    }
     let mut ids = Vec::with_capacity(names.len());
     for name in names {
         let id: i64 = sqlx::query_scalar(LOCK_VISIBLE_PROFILE)
             .bind(name)
-            .bind(owner)
+            .bind(viewer.id())
             .fetch_optional(&mut *tx)
             .await?
             .ok_or(StoreError::UnknownProfile)?;
@@ -227,6 +236,7 @@ pub(crate) async fn submit(
     request: &SubmitBatchRequest,
 ) -> Result<SubmitBatchReply, StoreError> {
     let batch = validate_batch(request)?;
+    let viewer = Viewer::from(owner);
     let owner = match owner {
         Some(owner) => owner,
         None => {
@@ -277,7 +287,7 @@ pub(crate) async fn submit(
             created: false,
         });
     }
-    let pins = pin_profiles(&mut tx, owner, &batch.profiles).await?;
+    let pins = pin_profiles(&mut tx, viewer, &batch.profiles).await?;
     let mut job_ids = Vec::with_capacity(pins.len());
     for (pos, (name, pin)) in batch.profiles.iter().zip(pins).enumerate() {
         let job_id = EventId::generate().to_string();

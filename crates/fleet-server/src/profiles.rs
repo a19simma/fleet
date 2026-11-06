@@ -38,7 +38,7 @@ pub enum Viewer {
 }
 
 impl Viewer {
-    fn id(self) -> Option<i64> {
+    pub(crate) fn id(self) -> Option<i64> {
         match self {
             Self::Shared => None,
             Self::User(id) => Some(id),

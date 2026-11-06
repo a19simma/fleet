@@ -906,3 +906,164 @@ async fn a_private_profile_wins_over_a_shared_one_of_the_same_name(pool: PgPool)
     assert_eq!(read.content_json, own.content_json);
     assert_eq!(read.hash, own.hash);
 }
+
+const MINE: &str = r#"{"claude_md":"mine"}"#;
+
+async fn private_of(pool: &PgPool, owner: i64, name: &str, json: &str) {
+    profiles::create_owned(pool, Some(owner), name, ProfileContent::Json(json))
+        .await
+        .unwrap();
+    let visibility: String =
+        sqlx::query_scalar("SELECT visibility FROM profile WHERE owner_user_id = $1 AND name = $2")
+            .bind(owner)
+            .bind(name)
+            .fetch_one(pool)
+            .await
+            .unwrap();
+    assert_eq!(visibility, "private");
+}
+
+#[sqlx::test]
+async fn another_users_private_profile_is_not_found_and_matches_an_absent_one(pool: PgPool) {
+    let store = store(pool.clone()).await;
+    let alice = user(&pool, "alice").await;
+    let bob = user(&pool, "bob").await;
+    private_of(&pool, bob, "secret", MINE).await;
+    let hidden = store
+        .submit_batch_for(Some(alice), &request("k1", &["secret"]))
+        .await
+        .unwrap_err();
+    let absent = store
+        .submit_batch_for(Some(alice), &request("k2", &["nothing-here"]))
+        .await
+        .unwrap_err();
+    assert!(matches!(
+        hidden,
+        fleet_server::store::StoreError::UnknownProfile
+    ));
+    assert_eq!(format!("{hidden:?}"), format!("{absent:?}"));
+    assert_eq!(hidden.to_string(), absent.to_string());
+    assert_eq!(hidden.to_string(), "profile not found");
+    assert_eq!(count(&pool, "batch").await, 0);
+    assert_eq!(count(&pool, "jobs").await, 0);
+}
+
+#[sqlx::test]
+async fn a_hidden_second_profile_refuses_the_whole_batch(pool: PgPool) {
+    let store = store(pool.clone()).await;
+    shared(&pool, "alpha", ONE).await;
+    let alice = user(&pool, "alice").await;
+    let bob = user(&pool, "bob").await;
+    private_of(&pool, bob, "secret", MINE).await;
+    let err = store
+        .submit_batch_for(Some(alice), &request("k1", &["alpha", "secret"]))
+        .await
+        .unwrap_err();
+    assert!(matches!(
+        err,
+        fleet_server::store::StoreError::UnknownProfile
+    ));
+    assert_eq!(count(&pool, "batch").await, 0);
+    assert_eq!(count(&pool, "jobs").await, 0);
+}
+
+#[sqlx::test]
+async fn a_shared_and_an_own_private_profile_are_accepted(pool: PgPool) {
+    let store = store(pool.clone()).await;
+    shared(&pool, "alpha", ONE).await;
+    let alice = user(&pool, "alice").await;
+    private_of(&pool, alice, "mine", MINE).await;
+    let reply = store
+        .submit_batch_for(Some(alice), &request("k1", &["alpha", "mine"]))
+        .await
+        .unwrap();
+    assert_eq!(reply.job_ids.len(), 2);
+}
+
+#[sqlx::test]
+async fn an_own_profile_wins_a_name_clash_with_a_shared_one(pool: PgPool) {
+    let store = store(pool.clone()).await;
+    shared(&pool, "alpha", ONE).await;
+    let alice = user(&pool, "alice").await;
+    private_of(&pool, alice, "alpha", MINE).await;
+    let reply = store
+        .submit_batch_for(Some(alice), &request("k1", &["alpha"]))
+        .await
+        .unwrap();
+    let owner: i64 = sqlx::query_scalar(
+        "SELECT p.owner_user_id FROM jobs j JOIN profile p ON p.id = j.profile_id WHERE j.job_id = $1",
+    )
+    .bind(&reply.job_ids[0])
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(owner, alice);
+}
+
+#[sqlx::test]
+async fn the_legacy_path_sees_shared_profiles_only(pool: PgPool) {
+    let store = store(pool.clone()).await;
+    shared(&pool, "alpha", ONE).await;
+    let boot: i64 = sqlx::query_scalar("SELECT bootstrap_user_id()")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    private_of(&pool, boot, "secret", MINE).await;
+    assert!(store.submit_batch(&request("k1", &["alpha"])).await.is_ok());
+    let err = store
+        .submit_batch(&request("k2", &["secret"]))
+        .await
+        .unwrap_err();
+    assert!(matches!(
+        err,
+        fleet_server::store::StoreError::UnknownProfile
+    ));
+    assert_eq!(count(&pool, "batch").await, 1);
+}
+
+#[sqlx::test]
+async fn a_caller_without_a_user_row_is_refused_as_not_found(pool: PgPool) {
+    let store = store(pool.clone()).await;
+    shared(&pool, "alpha", ONE).await;
+    let err = store
+        .submit_batch_for(Some(i64::MAX), &request("k1", &["alpha"]))
+        .await
+        .unwrap_err();
+    assert!(matches!(
+        err,
+        fleet_server::store::StoreError::UnknownProfile
+    ));
+    assert_eq!(count(&pool, "batch").await, 0);
+}
+
+#[sqlx::test]
+async fn an_unshare_waits_for_a_batch_that_pinned_the_profile(pool: PgPool) {
+    let store = store(pool.clone()).await;
+    shared(&pool, "alpha", ONE).await;
+    let alice = user(&pool, "alice").await;
+    let mut lock = pool.begin().await.unwrap();
+    sqlx::query("UPDATE profile SET visibility = 'private' WHERE name = 'alpha'")
+        .execute(&mut *lock)
+        .await
+        .unwrap();
+    let pending = tokio::spawn({
+        let store = store.clone();
+        async move {
+            store
+                .submit_batch_for(Some(alice), &request("k1", &["alpha"]))
+                .await
+        }
+    });
+    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    assert!(!pending.is_finished());
+    lock.commit().await.unwrap();
+    let err = tokio::time::timeout(std::time::Duration::from_secs(30), pending)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap_err();
+    assert!(matches!(
+        err,
+        fleet_server::store::StoreError::UnknownProfile
+    ));
+}
