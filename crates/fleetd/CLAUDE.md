@@ -16,6 +16,7 @@
 ## Profile jobs
 
 - **`Reporter::profile_blob` defaults to `UNIMPLEMENTED`.** A test reporter that omits it makes any Job with a `profile` fail closed with `profile invalid: profile could not be fetched`. A test that needs a blob implements it, as `Served` in `runner.rs` and `Blob` in `jobs.rs` do.
+- **`GetProfileBlobReply.catalog` is applied as sent, never re-resolved.** `load_stamped` drops items that are not `admin_enabled` or that the Profile selection names, refuses any item the core rules refuse with `LoadError::Catalog`, and writes skills to `skills/<name>/SKILL.md`, subagents to `agents/<name>.md` and context items to `.claude/ctx/<name>.md`. A catalog tool needs the tools stamp. Only the claude runner reads the bundle; codex and kimi take the tool pins and the prompt only. The subagent frontmatter check is a strict allowlist, not a scan: `---\n`, then only `name|description|color|tools: <one-line printable-ASCII plain scalar>` lines (no repeat, no indent, no CR or tab), then `---\n`, with `tools` names checked against the Floor deny set and `model` refused, since only the Profile model is checked against the box allowlist; anything else is refused, as is a BOM or a leading `---` that is not that fence.
 - **A new `FleetWorker` stub needs `get_profile_blob`.** `daemon_jobs` serves a real blob through `Worker::blob`; the other stubs return `unimplemented`.
 
 ## Askpass test
