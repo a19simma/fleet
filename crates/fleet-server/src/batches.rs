@@ -9,7 +9,9 @@ use fleet_proto::v1::{GetBatchReply, SubmitBatchReply, SubmitBatchRequest, Submi
 use sqlx::{PgPool, Row};
 
 use crate::jobs::{validate_job_id, validate_submit};
-use crate::profiles::{Viewer, require_model, validate_name};
+use crate::profiles::{
+    Viewer, check_profile_tools, read_tools_grant, require_model, validate_name,
+};
 use crate::store::StoreError;
 
 /// Most profiles one batch may name.
@@ -34,8 +36,8 @@ const SELECT_LATEST: &str = "SELECT v.version, v.hash, b.content FROM profile_ve
      ORDER BY v.version DESC LIMIT 1";
 const INSERT_BATCH_JOB: &str = "INSERT INTO jobs (job_id, prompt, repo, base_ref, branch, open_pr, \
      batch_id, repeat_idx, batch_pos, profile_name, profile_id, profile_version, profile_hash, \
-     user_id, agent) \
-     VALUES ($1, $2, $3, $4, 'swarm/' || $1, false, $5, 0, $6, $7, $8, $9, $10, $11, $12)";
+     user_id, agent, profile_tools_granted) \
+     VALUES ($1, $2, $3, $4, 'swarm/' || $1, false, $5, 0, $6, $7, $8, $9, $10, $11, $12, $13)";
 const SELECT_BOOTSTRAP_USER: &str = "SELECT bootstrap_user_id()";
 
 /// Why a batch request was refused. The variants carry no client input.
@@ -177,6 +179,7 @@ struct Pin {
     profile_id: i64,
     version: i32,
     hash: Vec<u8>,
+    tools_granted: bool,
 }
 
 /// Locks and pins the latest version of each named profile as `viewer`, in the caller's
@@ -186,6 +189,17 @@ struct Pin {
 /// [`Viewer::Shared`] sees shared profiles only. Each chosen profile row is locked `FOR SHARE`.
 /// A profile that is absent and one that is someone else's private one both give
 /// [`StoreError::UnknownProfile`].
+///
+/// A [`Viewer::User`] holds `profile:tools` when the grant row exists, read `FOR SHARE` with the
+/// owner row like single submit, and a [`Viewer::Shared`] caller has no grant. Every pin records
+/// that grant, and one profile with tools and no grant refuses the whole batch.
+///
+/// # Errors
+///
+/// [`StoreError::UnknownProfile`] for an absent or hidden profile or a missing user,
+/// [`StoreError::ToolsNotGranted`] when a profile has tools and the viewer lacks the grant,
+/// [`StoreError::OutOfRange`] when a stored profile blob fails its own validation,
+/// [`StoreError::ModelDenied`] when a pinned model is outside `allowlist`, and a database error.
 async fn pin_profiles(
     tx: &mut sqlx::PgConnection,
     viewer: Viewer,
@@ -199,6 +213,10 @@ async fn pin_profiles(
             .await?
             .ok_or(StoreError::UnknownProfile)?;
     }
+    let tools_granted = match viewer {
+        Viewer::User(user) => read_tools_grant(&mut *tx, user).await?,
+        Viewer::Shared => false,
+    };
     let mut ids = Vec::with_capacity(names.len());
     for name in names {
         let id: i64 = sqlx::query_scalar(LOCK_VISIBLE_PROFILE)
@@ -227,16 +245,30 @@ async fn pin_profiles(
         let content: Vec<u8> = row.try_get("content")?;
         let profile = Profile::from_stored_json(&content)
             .map_err(|_| StoreError::OutOfRange("profile blob"))?;
+        check_profile_tools(&profile, tools_granted)?;
         require_model(allowlist, profile.model.as_deref())?;
         pins.push(Pin {
             profile_id,
             version: row.try_get("version")?,
             hash: row.try_get("hash")?,
+            tools_granted,
         });
     }
     Ok(pins)
 }
 
+/// Creates a batch and one job per profile for `owner`, or returns the stored batch of the key.
+///
+/// The `profile:tools` rule of single submit applies: a profile with tools needs the grant of
+/// `owner`, a legacy `None` owner has none, and every job stamps `profile_tools_granted` with
+/// the grant read in the batch transaction.
+///
+/// # Errors
+///
+/// [`StoreError::InvalidBatch`], [`StoreError::InvalidProfile`] or [`StoreError::InvalidJob`] for
+/// a bad request, [`StoreError::KeyConflict`] when the key exists with other parameters, owner, agent
+/// or profile list, every error of `pin_profiles` including [`StoreError::ToolsNotGranted`], and a
+/// database error.
 pub(crate) async fn submit(
     pool: &PgPool,
     owner: Option<i64>,
@@ -312,6 +344,7 @@ pub(crate) async fn submit(
             .bind(pin.hash)
             .bind(owner)
             .bind(batch.agent)
+            .bind(pin.tools_granted)
             .execute(&mut *tx)
             .await?;
         job_ids.push(job_id);

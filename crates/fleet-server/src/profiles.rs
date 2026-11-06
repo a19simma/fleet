@@ -756,7 +756,16 @@ pub(crate) struct Pinned {
     pub(crate) tools_granted: bool,
 }
 
-async fn read_tools_grant(conn: &mut PgConnection, owner: i64) -> Result<bool, StoreError> {
+/// Reports whether `owner` holds `profile:tools`, reading the `users` row and the grant row
+/// `FOR SHARE` on `conn`. A missing user row reads as no grant.
+///
+/// # Errors
+///
+/// [`StoreError::Database`] when a query fails.
+pub(crate) async fn read_tools_grant(
+    conn: &mut PgConnection,
+    owner: i64,
+) -> Result<bool, StoreError> {
     sqlx::query(LOCK_OWNER)
         .bind(owner)
         .fetch_optional(&mut *conn)
@@ -775,6 +784,17 @@ async fn read_tools_grant(conn: &mut PgConnection, owner: i64) -> Result<bool, S
 /// in flight finishes first and a later one waits for the caller's transaction.
 async fn require_tools_grant(conn: &mut PgConnection, user: i64) -> Result<(), StoreError> {
     if read_tools_grant(conn, user).await? {
+        Ok(())
+    } else {
+        Err(StoreError::ToolsNotGranted)
+    }
+}
+
+/// Refuses with [`StoreError::ToolsNotGranted`] when `profile` has tools and `granted` is false.
+///
+/// Single and batch submit share this rule, so the two paths cannot drift.
+pub(crate) fn check_profile_tools(profile: &Profile, granted: bool) -> Result<(), StoreError> {
+    if profile.tools.is_empty() || granted {
         Ok(())
     } else {
         Err(StoreError::ToolsNotGranted)
@@ -840,9 +860,7 @@ pub(crate) async fn pin_for_submit(
         return Err(corrupt());
     }
     let tools_granted = read_tools_grant(conn, caller).await?;
-    if !profile.tools.is_empty() && !tools_granted {
-        return Err(StoreError::ToolsNotGranted);
-    }
+    check_profile_tools(&profile, tools_granted)?;
     require_model(allowlist, profile.model.as_deref())?;
     let entries = lock_catalog(conn).await?;
     let set = resolve(runner, &profile.selection, &entries).map_err(|_| JobInvalid::Snapshot)?;

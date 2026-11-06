@@ -614,6 +614,9 @@ fn batches_error(err: &StoreError) -> Status {
         StoreError::InvalidBatch(reason) => Status::invalid_argument(reason.to_string()),
         StoreError::InvalidProfile(_) => Status::invalid_argument("invalid profile name"),
         StoreError::InvalidJob(_) => Status::invalid_argument("invalid job request"),
+        StoreError::ToolsNotGranted => {
+            Status::permission_denied(profiles::ERR_PROFILE_TOOLS_NOT_GRANTED)
+        }
         StoreError::ModelDenied(denied) => Status::permission_denied(denied.to_string()),
         other => storage_unavailable(other),
     }

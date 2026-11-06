@@ -11,9 +11,10 @@ use fleet_proto::v1::fleet_jobs_client::FleetJobsClient;
 use fleet_proto::v1::{GetBatchRequest, ListJobsRequest, SubmitBatchRequest};
 use fleet_server::auth::BearerAuth;
 use fleet_server::config::Token;
+use fleet_server::cred::capability::{Capabilities, PROFILE_TOOLS};
 use fleet_server::profiles::{self, ProfileContent};
 use fleet_server::service::router;
-use fleet_server::store::Store;
+use fleet_server::store::{Store, StoreError};
 use sqlx::PgPool;
 use tonic::metadata::MetadataValue;
 use tonic::service::interceptor::InterceptedService;
@@ -735,10 +736,7 @@ async fn a_batch_key_stored_for_another_owner_conflicts(pool: PgPool) {
     let other = store
         .submit_batch_for(Some(bob), &request("k1", &["alpha", "beta"]))
         .await;
-    assert!(matches!(
-        other,
-        Err(fleet_server::store::StoreError::KeyConflict)
-    ));
+    assert!(matches!(other, Err(StoreError::KeyConflict)));
     assert_eq!(count(&pool, "jobs").await, 2);
 }
 
@@ -756,10 +754,7 @@ async fn a_batch_agent_other_than_the_default_conflicts_on_resubmit(pool: PgPool
         .await
         .unwrap();
     let again = store.submit_batch(&request("k1", &["alpha", "beta"])).await;
-    assert!(matches!(
-        again,
-        Err(fleet_server::store::StoreError::KeyConflict)
-    ));
+    assert!(matches!(again, Err(StoreError::KeyConflict)));
 }
 
 #[sqlx::test]
@@ -816,10 +811,7 @@ async fn a_batch_resubmitted_with_another_agent_conflicts(pool: PgPool) {
     let same = store.submit_batch(&codex).await.unwrap();
     assert!(!same.created);
     let other = store.submit_batch(&request("k1", &["alpha", "beta"])).await;
-    assert!(matches!(
-        other,
-        Err(fleet_server::store::StoreError::KeyConflict)
-    ));
+    assert!(matches!(other, Err(StoreError::KeyConflict)));
 }
 
 #[sqlx::test]
@@ -877,10 +869,7 @@ async fn a_batch_pins_the_submitters_own_profile_and_never_a_foreign_private_one
         .await
         .unwrap_err();
     assert_eq!(foreign.to_string(), absent.to_string());
-    assert!(matches!(
-        foreign,
-        fleet_server::store::StoreError::UnknownProfile
-    ));
+    assert!(matches!(foreign, StoreError::UnknownProfile));
     assert_eq!(count(&pool, "batch").await, 2);
 }
 
@@ -943,10 +932,7 @@ async fn another_users_private_profile_is_not_found_and_matches_an_absent_one(po
         .submit_batch_for(Some(alice), &request("k2", &["nothing-here"]))
         .await
         .unwrap_err();
-    assert!(matches!(
-        hidden,
-        fleet_server::store::StoreError::UnknownProfile
-    ));
+    assert!(matches!(hidden, StoreError::UnknownProfile));
     assert_eq!(format!("{hidden:?}"), format!("{absent:?}"));
     assert_eq!(hidden.to_string(), absent.to_string());
     assert_eq!(hidden.to_string(), "profile not found");
@@ -965,10 +951,7 @@ async fn a_hidden_second_profile_refuses_the_whole_batch(pool: PgPool) {
         .submit_batch_for(Some(alice), &request("k1", &["alpha", "secret"]))
         .await
         .unwrap_err();
-    assert!(matches!(
-        err,
-        fleet_server::store::StoreError::UnknownProfile
-    ));
+    assert!(matches!(err, StoreError::UnknownProfile));
     assert_eq!(count(&pool, "batch").await, 0);
     assert_eq!(count(&pool, "jobs").await, 0);
 }
@@ -1020,10 +1003,7 @@ async fn the_legacy_path_sees_shared_profiles_only(pool: PgPool) {
         .submit_batch(&request("k2", &["secret"]))
         .await
         .unwrap_err();
-    assert!(matches!(
-        err,
-        fleet_server::store::StoreError::UnknownProfile
-    ));
+    assert!(matches!(err, StoreError::UnknownProfile));
     assert_eq!(count(&pool, "batch").await, 1);
 }
 
@@ -1035,10 +1015,7 @@ async fn a_caller_without_a_user_row_is_refused_as_not_found(pool: PgPool) {
         .submit_batch_for(Some(i64::MAX), &request("k1", &["alpha"]))
         .await
         .unwrap_err();
-    assert!(matches!(
-        err,
-        fleet_server::store::StoreError::UnknownProfile
-    ));
+    assert!(matches!(err, StoreError::UnknownProfile));
     assert_eq!(count(&pool, "batch").await, 0);
 }
 
@@ -1068,8 +1045,246 @@ async fn an_unshare_waits_for_a_batch_that_pinned_the_profile(pool: PgPool) {
         .unwrap()
         .unwrap()
         .unwrap_err();
-    assert!(matches!(
-        err,
-        fleet_server::store::StoreError::UnknownProfile
-    ));
+    assert!(matches!(err, StoreError::UnknownProfile));
+}
+
+const TOOLS_TOML: &str = "[[tools]]\nname = \"node\"\nversion = \"20.11.1\"\n";
+const PLAIN_TOML: &str = "claude_md = \"x\"\n";
+
+async fn admin(pool: &PgPool) -> i64 {
+    sqlx::query_scalar("INSERT INTO users (username, is_admin) VALUES ('root', true) RETURNING id")
+        .fetch_one(pool)
+        .await
+        .unwrap()
+}
+
+async fn shared_tools(pool: &PgPool, name: &str, toml: &str) {
+    let author = user(pool, &format!("author-{name}")).await;
+    let root: i64 = match sqlx::query_scalar("SELECT id FROM users WHERE username = 'root'")
+        .fetch_optional(pool)
+        .await
+        .unwrap()
+    {
+        Some(id) => id,
+        None => admin(pool).await,
+    };
+    Capabilities::new(pool.clone())
+        .grant(root, author, PROFILE_TOOLS)
+        .await
+        .unwrap();
+    profiles::create_owned(pool, Some(author), None, name, ProfileContent::Toml(toml))
+        .await
+        .unwrap();
+    sqlx::query("UPDATE profile SET visibility = 'shared' WHERE owner_user_id = $1 AND name = $2")
+        .bind(author)
+        .bind(name)
+        .execute(pool)
+        .await
+        .unwrap();
+}
+
+async fn grant(pool: &PgPool, user: i64) {
+    let root: i64 = match sqlx::query_scalar("SELECT id FROM users WHERE username = 'root'")
+        .fetch_optional(pool)
+        .await
+        .unwrap()
+    {
+        Some(id) => id,
+        None => admin(pool).await,
+    };
+    Capabilities::new(pool.clone())
+        .grant(root, user, PROFILE_TOOLS)
+        .await
+        .unwrap();
+}
+
+async fn stamps(pool: &PgPool, batch_id: &str) -> Vec<bool> {
+    sqlx::query_scalar(
+        "SELECT profile_tools_granted FROM jobs WHERE batch_id = $1 ORDER BY batch_pos",
+    )
+    .bind(batch_id)
+    .fetch_all(pool)
+    .await
+    .unwrap()
+}
+
+#[sqlx::test]
+async fn a_batch_with_a_tools_profile_is_refused_without_the_grant(pool: PgPool) {
+    let store = store(pool.clone()).await;
+    shared_tools(&pool, "tooled", TOOLS_TOML).await;
+    let alice = user(&pool, "alice").await;
+    let err = store
+        .submit_batch_for(Some(alice), &request("k1", &["tooled"]))
+        .await
+        .unwrap_err();
+    assert!(matches!(err, StoreError::ToolsNotGranted), "{err}");
+    assert_eq!(err.to_string(), profiles::ERR_PROFILE_TOOLS_NOT_GRANTED);
+    assert_eq!(count(&pool, "jobs").await, 0);
+    assert_eq!(count(&pool, "batch").await, 0);
+}
+
+#[sqlx::test]
+async fn a_granted_batch_stamps_every_job_true(pool: PgPool) {
+    let store = store(pool.clone()).await;
+    shared_tools(&pool, "tooled", TOOLS_TOML).await;
+    shared_tools(&pool, "tooled2", TOOLS_TOML).await;
+    let alice = user(&pool, "alice").await;
+    grant(&pool, alice).await;
+    let reply = store
+        .submit_batch_for(Some(alice), &request("k1", &["tooled", "tooled2"]))
+        .await
+        .unwrap();
+    assert_eq!(stamps(&pool, &reply.batch_id).await, vec![true, true]);
+}
+
+#[sqlx::test]
+async fn a_revoke_between_two_batches_refuses_the_second(pool: PgPool) {
+    let store = store(pool.clone()).await;
+    shared_tools(&pool, "tooled", TOOLS_TOML).await;
+    let alice = user(&pool, "alice").await;
+    grant(&pool, alice).await;
+    let first = store
+        .submit_batch_for(Some(alice), &request("k1", &["tooled"]))
+        .await
+        .unwrap();
+    assert_eq!(stamps(&pool, &first.batch_id).await, vec![true]);
+    let root: i64 = sqlx::query_scalar("SELECT id FROM users WHERE username = 'root'")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert!(
+        Capabilities::new(pool.clone())
+            .revoke(root, alice, PROFILE_TOOLS)
+            .await
+            .unwrap()
+    );
+    let err = store
+        .submit_batch_for(Some(alice), &request("k2", &["tooled"]))
+        .await
+        .unwrap_err();
+    assert!(matches!(err, StoreError::ToolsNotGranted), "{err}");
+    assert_eq!(count(&pool, "jobs").await, 1);
+    assert_eq!(count(&pool, "batch").await, 1);
+}
+
+#[sqlx::test]
+async fn a_mixed_batch_is_refused_whole_without_the_grant(pool: PgPool) {
+    let store = store(pool.clone()).await;
+    shared(&pool, "alpha", ONE).await;
+    shared_tools(&pool, "tooled", TOOLS_TOML).await;
+    let alice = user(&pool, "alice").await;
+    for (key, names) in [("k1", ["alpha", "tooled"]), ("k2", ["tooled", "alpha"])] {
+        let err = store
+            .submit_batch_for(Some(alice), &request(key, &names))
+            .await
+            .unwrap_err();
+        assert!(matches!(err, StoreError::ToolsNotGranted), "{err}");
+    }
+    assert_eq!(count(&pool, "jobs").await, 0);
+    assert_eq!(count(&pool, "batch").await, 0);
+}
+
+#[sqlx::test]
+async fn a_granted_mixed_batch_stamps_every_job_with_the_grant(pool: PgPool) {
+    let store = store(pool.clone()).await;
+    shared(&pool, "alpha", ONE).await;
+    shared_tools(&pool, "tooled", TOOLS_TOML).await;
+    let alice = user(&pool, "alice").await;
+    grant(&pool, alice).await;
+    let reply = store
+        .submit_batch_for(Some(alice), &request("k1", &["alpha", "tooled"]))
+        .await
+        .unwrap();
+    assert_eq!(stamps(&pool, &reply.batch_id).await, vec![true, true]);
+}
+
+#[sqlx::test]
+async fn a_batch_without_tools_needs_no_grant_and_stamps_false(pool: PgPool) {
+    let store = store(pool.clone()).await;
+    shared_tools(&pool, "plain", PLAIN_TOML).await;
+    shared(&pool, "alpha", ONE).await;
+    let alice = user(&pool, "alice").await;
+    let reply = store
+        .submit_batch_for(Some(alice), &request("k1", &["plain", "alpha"]))
+        .await
+        .unwrap();
+    assert_eq!(stamps(&pool, &reply.batch_id).await, vec![false, false]);
+}
+
+#[sqlx::test]
+async fn the_legacy_batch_has_no_grant_and_is_refused_a_tools_profile(pool: PgPool) {
+    let store = store(pool.clone()).await;
+    shared_tools(&pool, "tooled", TOOLS_TOML).await;
+    shared(&pool, "alpha", ONE).await;
+    let err = store
+        .submit_batch(&request("k1", &["tooled"]))
+        .await
+        .unwrap_err();
+    assert!(matches!(err, StoreError::ToolsNotGranted), "{err}");
+    assert_eq!(count(&pool, "jobs").await, 0);
+    let ok = store
+        .submit_batch(&request("k2", &["alpha"]))
+        .await
+        .unwrap();
+    assert_eq!(stamps(&pool, &ok.batch_id).await, vec![false]);
+}
+
+#[sqlx::test]
+async fn the_legacy_bootstrap_grant_does_not_lift_the_legacy_refusal(pool: PgPool) {
+    let store = store(pool.clone()).await;
+    shared_tools(&pool, "tooled", TOOLS_TOML).await;
+    let boot: i64 = sqlx::query_scalar("SELECT bootstrap_user_id()")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    grant(&pool, boot).await;
+    let err = store
+        .submit_batch(&request("k1", &["tooled"]))
+        .await
+        .unwrap_err();
+    assert!(matches!(err, StoreError::ToolsNotGranted), "{err}");
+    assert_eq!(count(&pool, "jobs").await, 0);
+}
+
+#[sqlx::test]
+async fn the_refusal_is_permission_denied_with_the_single_submit_text_over_rpc(pool: PgPool) {
+    let store = store(pool.clone()).await;
+    shared_tools(&pool, "tooled", TOOLS_TOML).await;
+    let addr = serve(&store);
+    let err = batches(addr, as_client)
+        .submit_batch(request("k1", &["tooled"]))
+        .await
+        .unwrap_err();
+    assert_eq!(err.code(), Code::PermissionDenied);
+    assert_eq!(err.message(), profiles::ERR_PROFILE_TOOLS_NOT_GRANTED);
+    assert_eq!(count(&pool, "jobs").await, 0);
+}
+
+#[sqlx::test]
+async fn a_batch_waits_for_a_revoke_in_flight_and_is_then_refused(pool: PgPool) {
+    let store = store(pool.clone()).await;
+    shared_tools(&pool, "tooled", TOOLS_TOML).await;
+    let alice = user(&pool, "alice").await;
+    grant(&pool, alice).await;
+    let mut revoke = pool.begin().await.unwrap();
+    sqlx::query("DELETE FROM user_capabilities WHERE user_id = $1")
+        .bind(alice)
+        .execute(&mut *revoke)
+        .await
+        .unwrap();
+    let held = store.clone();
+    let submit = tokio::spawn(async move {
+        held.submit_batch_for(Some(alice), &request("k1", &["tooled"]))
+            .await
+    });
+    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    assert!(!submit.is_finished());
+    revoke.commit().await.unwrap();
+    let err = tokio::time::timeout(std::time::Duration::from_secs(30), submit)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap_err();
+    assert!(matches!(err, StoreError::ToolsNotGranted), "{err}");
+    assert_eq!(count(&pool, "jobs").await, 0);
 }

@@ -1510,8 +1510,11 @@ impl Store {
     ///
     /// Returns [`StoreError::InvalidBatch`], [`StoreError::InvalidProfile`] or
     /// [`StoreError::InvalidJob`] when the request fails validation,
-    /// [`StoreError::UnknownProfile`] when a profile has no version,
+    /// [`StoreError::UnknownProfile`] when a profile is absent or hidden from the submitter, has
+    /// no version, or the owner row is missing,
     /// [`StoreError::OutOfRange`] when a stored profile blob fails its own validation,
+    /// [`StoreError::ToolsNotGranted`] when a profile has tools and the submitter lacks
+    /// `profile:tools`, which is always so on this legacy path,
     /// [`StoreError::ModelDenied`] when a pinned model is outside the allowlist,
     /// [`StoreError::KeyConflict`] when the key exists with other parameters and
     /// [`StoreError::Database`] when a query fails.
@@ -1527,10 +1530,12 @@ impl Store {
     /// Every job of the batch binds `owner` as `jobs.user_id` and the agent of the request;
     /// an empty agent means claude. `None` is the legacy path and stamps the `bootstrap` user.
     /// A key already stored for another owner or another agent is a [`StoreError::KeyConflict`].
+    /// A profile with tools needs `profile:tools` of `owner`, read `FOR SHARE` in the batch
+    /// transaction, and every job stamps `profile_tools_granted` with that grant.
     ///
     /// # Errors
     ///
-    /// The errors of [`Store::submit_batch`].
+    /// The errors of [`Store::submit_batch`], [`StoreError::ToolsNotGranted`] among them.
     pub async fn submit_batch_for(
         &self,
         owner: Option<i64>,

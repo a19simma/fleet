@@ -1,6 +1,6 @@
 # User capabilities and model allowlist
 
-Status: Proposed 2026-11-02. Built: the `profile:tools` capability (save, submit, blob serve), the startup refusal of `FLEET_ALLOW_PROFILE_TOOLS`, the server `FLEET_MODEL_ALLOWLIST` check at profile save, Job submit, batch submit and blob serve, and the fleetd `model_allowlist`. Amends ADR-0048 (the server gate for `tools`). Builds on ADR-0035, ADR-0042 and ADR-0044. Amended by ADR-0056.
+Status: Proposed 2026-11-02. Built: the `profile:tools` capability (save, Job submit, batch submit, blob serve), the startup refusal of `FLEET_ALLOW_PROFILE_TOOLS`, the server `FLEET_MODEL_ALLOWLIST` check at profile save, Job submit, batch submit and blob serve, and the fleetd `model_allowlist`. Amends ADR-0048 (the server gate for `tools`). Builds on ADR-0035, ADR-0042 and ADR-0044. Amended by ADR-0056.
 
 ADR-0048 gates Profile `tools` with one server switch, `FLEET_ALLOW_PROFILE_TOOLS`, because the server then had only box and client scopes. The server now has Users and an admin, a user with `users.is_admin` (ADR-0042, ADR-0056), so a grant can attach to a principal. A global switch lets every client install toolchains once an operator flips it. This ADR replaces it with a per-user capability and adds a model allowlist so a Job cannot select a model the operator never approved.
 
@@ -9,7 +9,7 @@ ADR-0048 gates Profile `tools` with one server switch, `FLEET_ALLOW_PROFILE_TOOL
 ### Capability `profile:tools`
 
 - `profile:tools` is a capability on a User. An admin grants and revokes it.
-- The server checks it at profile save (`CreateProfile` with a `tools` list), at Job submit when the Job pins a Profile that has `tools`, and when it serves the pinned blob to a leased Box. The blob check uses the job owner's (`jobs.user_id`) grant, read live in the same transaction.
+- The server checks it at profile save (`CreateProfile` with a `tools` list), at Job submit and batch submit when a pinned Profile has `tools`, and when it serves the pinned blob to a leased Box. The blob check uses the job owner's (`jobs.user_id`) grant, read live in the same transaction.
 - A User without the capability gets a fixed refusal that names `profile:tools`. The store is not written.
 - A revoke refuses a leased Job that has not yet fetched its blob. A Job whose Box already holds the blob keeps running.
 - The client token (`FLEET_CLIENT_TOKEN`) carries no User. A request under it never holds the capability, so it cannot save or submit a Profile with `tools`.
