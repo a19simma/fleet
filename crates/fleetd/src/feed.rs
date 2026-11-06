@@ -1378,4 +1378,27 @@ mod tests {
             Err(FetchRecordError::OverBudget)
         );
     }
+
+    #[test]
+    fn an_installation_token_is_redacted_in_every_event_text_field() {
+        const APP: &str = "ghs_AbCdEfGhIjKlMnOpQrStUvWxYz0123456789";
+        let redactor = Redactor::new([APP]);
+        let text = |field: &str| format!("{field} GH_TOKEN={APP} end");
+        let event = JobEvent {
+            tool_use_id: Some(text("id")),
+            tool: Some(text("tool")),
+            cmd: Some(text("cmd")),
+            detail: Some(text("detail")),
+            ..JobEvent::default()
+        };
+        let sent = convert(&redactor, event);
+        for field in [&sent.tool_use_id, &sent.tool, &sent.cmd, &sent.detail] {
+            let field = field.as_deref().unwrap_or_default();
+            assert!(!field.contains("ghs_"), "{field}");
+            assert!(field.contains("GH_TOKEN=[REDACTED] end"), "{field}");
+        }
+        let mut feed = Feed::new(Instant::now());
+        feed.queue_notes(&redactor, vec![note(&text("note"))]);
+        assert!(details(&feed).iter().all(|d| !d.contains("ghs_")));
+    }
 }

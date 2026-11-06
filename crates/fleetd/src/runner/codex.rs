@@ -55,8 +55,9 @@ impl<R: Reporter> AgentRunner<R> {
     /// The command line and environment of a Codex job.
     ///
     /// The environment is [`codex::env`] over the base environment: no box secret passes, and
-    /// `CODEX_API_KEY` is set from the held `codex_api_key` only. A job with none held, or a
-    /// runner with no credential book, gets no key.
+    /// `CODEX_API_KEY` is set from the held `codex_api_key` only, and the four git identity
+    /// variables from `git_env` follow. A job with none held, or a runner with no credential
+    /// book, gets no key.
     pub(crate) fn codex_spec(&self, job: &Job, cwd: &Path, home: &Path) -> AgentSpec {
         let applied = self.profile_for(job);
         let prompt = applied
@@ -84,6 +85,7 @@ impl<R: Reporter> AgentRunner<R> {
         if key.is_none() {
             env.remove(&OsString::from(codex::API_KEY_ENV));
         }
+        env.extend(self.git_env(&job.job_id));
         let bundle = applied
             .as_deref()
             .map_or(&self.config.bundle, |applied| &applied.bundle);

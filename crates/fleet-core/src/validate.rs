@@ -233,11 +233,14 @@ fn has_jwt(text: &str) -> bool {
 }
 
 /// True when `text` looks like a secret. `github_pat_` and `-----BEGIN` match on the prefix
-/// alone, which is stricter than the length-checked `ghp_`, `sk-` and `AKIA` forms.
+/// alone, which is stricter than the length-checked `ghp_`, `ghs_`, `ghu_`, `sk-` and `AKIA`
+/// forms.
 fn secret_like(text: &str) -> bool {
     text.contains("github_pat_")
         || text.contains("-----BEGIN")
         || has_prefixed(text, "ghp_", 20, |b| b.is_ascii_alphanumeric())
+        || has_prefixed(text, "ghs_", 20, |b| b.is_ascii_alphanumeric())
+        || has_prefixed(text, "ghu_", 20, |b| b.is_ascii_alphanumeric())
         || has_prefixed(text, "sk-", 20, is_b64url)
         || has_prefixed(text, "AKIA", 16, |b| {
             b.is_ascii_uppercase() || b.is_ascii_digit()
@@ -448,10 +451,10 @@ impl Profile {
     /// - Env: every `env_flags` name is in [`ENV_FLAG_ALLOWLIST`]. Values are `"0"` or `"1"` by
     ///   type.
     /// - Template: `prompt_template` holds `{prompt}` once and no other `{` or `}`.
-    /// - Text: no NUL byte, and no text that looks like a secret: `ghp_` plus 20 alphanumerics,
-    ///   `github_pat_`, `sk-` plus 20 of `[A-Za-z0-9_-]`, `-----BEGIN`, `AKIA` plus 16 uppercase
-    ///   alphanumerics, or a JWT shape. This is a best-effort lint, not a guarantee. It covers
-    ///   the text fields and the attribution text.
+    /// - Text: no NUL byte, and no text that looks like a secret: `ghp_`, `ghs_` or `ghu_` plus
+    ///   20 alphanumerics, `github_pat_`, `sk-` plus 20 of `[A-Za-z0-9_-]`, `-----BEGIN`, `AKIA`
+    ///   plus 16 uppercase alphanumerics, or a JWT shape. This is a best-effort lint, not a
+    ///   guarantee. It covers the text fields and the attribution text.
     ///
     /// Neither the hash nor the canonical form changes.
     ///
@@ -913,6 +916,11 @@ mod tests {
         let samples = [
             format!("{MARK} ghp_{a20}"),
             format!("{MARK} ghp_{}", text(40)),
+            format!("{MARK} ghs_{a20}"),
+            format!("{MARK} ghs_{}", text(40)),
+            format!("{MARK} ghu_{a20}"),
+            format!("{MARK} ghu_{}", text(40)),
+            format!("{MARK} ghs_short ghu_{a20}"),
             format!("{MARK} github_pat_x"),
             format!("{MARK} sk-{}", "a_-".repeat(7)),
             format!("{MARK}\n-----BEGIN PRIVATE KEY-----"),
@@ -946,6 +954,11 @@ mod tests {
         for sample in [
             format!("ghp_{a19}"),
             format!("ghp_{a19}-"),
+            format!("ghs_{a19}"),
+            format!("ghs_{a19}-"),
+            format!("ghu_{a19}"),
+            format!("ghu_{a19}-"),
+            format!("ghs{a19}"),
             "github_pat".to_owned(),
             format!("sk-{a19}"),
             format!("sk-{a19}!"),

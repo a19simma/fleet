@@ -814,7 +814,7 @@ const REQUIRED_MIRROR_PATHS: [(&str, bool); 6] = [
 /// Whether `mirror` is a repo fleetd made and nobody else changed.
 ///
 /// A mirror made before the job group lost write access could hold anything an agent wrote,
-/// and fleetd fetches into it with the PAT in the environment. So the whole tree is walked
+/// and fleetd fetches into it with the GitHub token. So the whole tree is walked
 /// without following symlinks, and every entry must be a regular file or directory owned by
 /// fleetd's effective uid with no group or other write bit. Every entry of
 /// [`REQUIRED_MIRROR_PATHS`] must exist with the right kind. No path in

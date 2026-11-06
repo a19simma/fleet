@@ -69,7 +69,7 @@ use tokio::process::{Child, Command};
 use tokio::time::{Instant, MissedTickBehavior, Sleep};
 use tonic::{Code, Status};
 
-use crate::agent_config::{Bundle, JOB_EMAIL, JOB_NAME, JUDGE_PROTOCOL, JobDir, protocol_for};
+use crate::agent_config::{Bundle, JUDGE_PROTOCOL, JobDir, protocol_for};
 use crate::askpass;
 use crate::cred::CredentialBook;
 use crate::feed::Feed;
@@ -1789,7 +1789,7 @@ impl<R: Reporter> AgentRunner<R> {
             .env("GIT_TERMINAL_PROMPT", "0")
             .env("GH_PROMPT_DISABLED", "1");
         let allowed: &[&str] = match scope {
-            Scope::Clean | Scope::Tree(_) => &CLEAN_ENV,
+            Scope::Clean | Scope::Tree(..) => &CLEAN_ENV,
             Scope::Push(_) => &PUSH_ENV,
             Scope::Gh(_) => &GH_ENV,
         };
@@ -1814,7 +1814,7 @@ impl<R: Reporter> AgentRunner<R> {
                 .map(|(name, value)| (name, value)),
         );
         match scope {
-            Scope::Clean | Scope::Tree(_) => command.env("GIT_ALLOW_PROTOCOL", "file"),
+            Scope::Clean | Scope::Tree(..) => command.env("GIT_ALLOW_PROTOCOL", "file"),
             Scope::Push(_) => command
                 .env("GIT_ALLOW_PROTOCOL", self.config.repo_policy.protocols())
                 .envs(askpass::env(&self.config.askpass_bin))
@@ -1834,14 +1834,11 @@ impl<R: Reporter> AgentRunner<R> {
         if let Scope::Push(id) | Scope::Gh(id) = scope {
             self.apply_github_token(&mut command, id, matches!(scope, Scope::Gh(_)));
         }
-        if let Scope::Tree(work) = scope {
+        if let Scope::Tree(id, work) = scope {
             command
                 .current_dir(work)
                 .env_remove("GIT_DIR")
-                .env("GIT_AUTHOR_NAME", JOB_NAME)
-                .env("GIT_AUTHOR_EMAIL", JOB_EMAIL)
-                .env("GIT_COMMITTER_NAME", JOB_NAME)
-                .env("GIT_COMMITTER_EMAIL", JOB_EMAIL);
+                .envs(self.git_env(id));
         }
         let keep = if tail { Keep::Tail } else { Keep::Head };
         capture_keeping(command, self.config.finish_timeout, limit, keep).await
@@ -2058,7 +2055,7 @@ impl<R: Reporter> AgentRunner<R> {
             .filter(|(name, _)| self.agent_env_kept(name))
             .cloned()
             .collect();
-        let fixed: [(&str, OsString); 15] = [
+        let fixed: [(&str, OsString); 11] = [
             ("FLEET_JOB_ID", job.job_id.clone().into()),
             ("SWARM_BOX", "1".into()),
             ("HOME", home.into()),
@@ -2070,12 +2067,9 @@ impl<R: Reporter> AgentRunner<R> {
             ("DISABLE_AUTOUPDATER", "1".into()),
             ("GIT_CONFIG_GLOBAL", home.join(".gitconfig").into()),
             ("GIT_TERMINAL_PROMPT", "0".into()),
-            ("GIT_AUTHOR_NAME", JOB_NAME.into()),
-            ("GIT_AUTHOR_EMAIL", JOB_EMAIL.into()),
-            ("GIT_COMMITTER_NAME", JOB_NAME.into()),
-            ("GIT_COMMITTER_EMAIL", JOB_EMAIL.into()),
         ];
         env.extend(fixed.map(|(name, value)| (OsString::from(name), value)));
+        env.extend(self.git_env(&job.job_id));
         self.apply_model_env(&mut env, job);
         AgentSpec {
             argv,
@@ -2708,7 +2702,7 @@ pub(crate) enum Scope<'a> {
     Clean,
     Push(&'a str),
     Gh(&'a str),
-    Tree(&'a Path),
+    Tree(&'a str, &'a Path),
 }
 
 pub(crate) trait IntoFailure {

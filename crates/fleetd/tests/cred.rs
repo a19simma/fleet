@@ -23,8 +23,9 @@ use fleet_proto::{
 };
 use fleetd::DaemonRunner;
 use fleetd::cred::{
-    CredentialBook, CredentialClient, CredentialFailure, ERR_EXPIRED, ERR_LEASE, ERR_MALFORMED,
-    ERR_NO_AGENT, ERR_NO_GITHUB, ERR_NOT_CONFIGURED, ERR_UNAVAILABLE,
+    CredentialBook, CredentialClient, CredentialFailure, ERR_APP_IDENTITY_INVALID,
+    ERR_APP_IDENTITY_MISSING, ERR_EXPIRED, ERR_LEASE, ERR_MALFORMED, ERR_NO_AGENT, ERR_NO_GITHUB,
+    ERR_NOT_CONFIGURED, ERR_UNAVAILABLE,
 };
 use fleetd::poller::{JobRunner, Shutdown, channel};
 use fleetd::runner::{AgentRunner, JobEnd, Reporter, RunConfig};
@@ -305,29 +306,239 @@ async fn a_reply_that_breaks_a_server_rule_is_malformed() -> TestResult {
     Ok(())
 }
 
-#[tokio::test]
-async fn an_installation_token_reply_fails_with_its_own_reason_and_holds_nothing() -> TestResult {
-    let mut app = wire("github_installation_token", "static_secret", GITHUB);
-    app.expires_at_ms = Some(1);
-    app.git_identity = Some(fleet_proto::v1::GitIdentity {
-        name: "bot".into(),
-        email: "1+bot[bot]@users.noreply.github.com".into(),
-    });
-    let (book, _fake) = serve(Ok(GetJobCredentialsReply {
-        credentials: vec![app, wire("anthropic_api_key", "static_secret", AGENT)],
-    }))
-    .await?;
+const APP_TOKEN: &str = "ghs_AbCdEfGhIjKlMnOpQrStUvWxYz0123456789";
+const BOT_NAME: &str = "fleet-bot[bot]";
+const BOT_EMAIL: &str = "123456+fleet-bot[bot]@users.noreply.github.com";
+const INSTALLATION_KIND: &str = "github_installation_token";
+
+fn app_wire(value: &str, name: &str, email: &str) -> JobCredential {
+    JobCredential {
+        expires_at_ms: Some(1_700_000_000_000),
+        git_identity: Some(fleet_proto::v1::GitIdentity {
+            name: name.into(),
+            email: email.into(),
+        }),
+        ..wire(INSTALLATION_KIND, "static_secret", value)
+    }
+}
+
+fn agent_wire() -> JobCredential {
+    wire("anthropic_api_key", "static_secret", AGENT)
+}
+
+async fn app_fetch(
+    credentials: Vec<JobCredential>,
+) -> Result<
+    (
+        Result<Arc<fleetd::cred::JobCredentials>, CredentialFailure>,
+        Arc<CredentialBook>,
+    ),
+    Box<dyn std::error::Error>,
+> {
+    let (book, _fake) = serve(Ok(GetJobCredentialsReply { credentials })).await?;
     let got = book.fetch("job1", 1, &box_name()).await;
-    assert_eq!(got.err(), Some(CredentialFailure::AppTokenUnsupported));
+    Ok((got, book))
+}
+
+#[tokio::test]
+async fn an_installation_token_reply_is_held_as_the_github_token_with_its_identity() -> TestResult {
+    let (got, book) =
+        app_fetch(vec![app_wire(APP_TOKEN, BOT_NAME, BOT_EMAIL), agent_wire()]).await?;
+    let held = got?;
+    assert_eq!(
+        held.github().map(Secret::expose),
+        Some(APP_TOKEN.as_bytes())
+    );
+    assert_eq!(
+        held.get(CredentialKind::GithubApp).map(Secret::expose),
+        Some(APP_TOKEN.as_bytes())
+    );
+    assert!(held.get(CredentialKind::GithubPat).is_none());
+    let identity = held.git_identity().ok_or("no identity")?;
+    assert_eq!(identity.name(), BOT_NAME);
+    assert_eq!(identity.email(), BOT_EMAIL);
+    let app = held
+        .iter()
+        .find(|c| c.kind() == CredentialKind::GithubApp)
+        .ok_or("no app credential")?;
+    assert_eq!(app.expires_at_ms(), Some(1_700_000_000_000));
+    assert!(book.get("job1").is_some());
+    let text = format!("{held:?}");
+    assert!(!text.contains(APP_TOKEN), "{text}");
+    let clean = held
+        .redactor()
+        .redact_str(&format!("echo GH_TOKEN={APP_TOKEN} end"))
+        .into_owned();
+    assert_eq!(clean, "echo GH_TOKEN=[REDACTED] end");
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_pat_reply_holds_no_identity_and_no_expiry() -> TestResult {
+    let (got, _book) = app_fetch(good().credentials).await?;
+    let held = got?;
+    assert!(held.git_identity().is_none());
+    assert!(held.iter().all(|c| c.expires_at_ms().is_none()));
+    Ok(())
+}
+
+fn hostile_names() -> Vec<String> {
+    let long = format!("a{}", "b".repeat(64));
+    let mut names = vec![
+        String::new(),
+        " bot".into(),
+        "bot ".into(),
+        "bot\r".into(),
+        "bot\n".into(),
+        "bot\r\nx".into(),
+        "bo\0t".into(),
+        "bot\u{85}".into(),
+        "bot\u{2028}".into(),
+        "bot<x>".into(),
+        "<bot>".into(),
+        "bot@host".into(),
+        "bot\\".into(),
+        "bot:x".into(),
+        "bot,x".into(),
+        "-bot".into(),
+        "[bot".into(),
+        "b\u{f6}t".into(),
+        long,
+    ];
+    names.push(format!("{BOT_NAME}\n{BOT_NAME}"));
+    names
+}
+
+fn hostile_emails() -> Vec<String> {
+    let long = format!("1+{}[bot]@users.noreply.github.com", "a".repeat(110));
+    vec![
+        String::new(),
+        BOT_EMAIL.to_uppercase(),
+        format!("{BOT_EMAIL}\r"),
+        format!("{BOT_EMAIL}\n"),
+        format!("{BOT_EMAIL}\r\n"),
+        format!(" {BOT_EMAIL}"),
+        format!("{BOT_EMAIL} "),
+        format!("{BOT_EMAIL}\u{85}"),
+        format!("{BOT_EMAIL}\u{2028}"),
+        format!("<{BOT_EMAIL}>"),
+        format!("x@{BOT_EMAIL}"),
+        format!("a:b@{BOT_EMAIL}"),
+        BOT_EMAIL.replace('+', "\\"),
+        "123456+fleet-bot[bot]@users.noreply.github.com.evil.test".into(),
+        "123456+fleet-bot[bot]@users.noreply.github.co".into(),
+        "+fleet-bot[bot]@users.noreply.github.com".into(),
+        "12a+fleet-bot[bot]@users.noreply.github.com".into(),
+        "123456+[bot]@users.noreply.github.com".into(),
+        "123456+Fleet-Bot[bot]@users.noreply.github.com".into(),
+        "123456+fleet\u{f6}[bot]@users.noreply.github.com".into(),
+        "123456+fleet-bot@users.noreply.github.com".into(),
+        long,
+    ]
+}
+
+#[tokio::test]
+async fn a_hostile_identity_fails_closed_with_the_fixed_reason_and_holds_nothing() -> TestResult {
+    let mut cases: Vec<(String, String, &str)> = Vec::new();
+    for name in hostile_names() {
+        cases.push((name, BOT_EMAIL.to_owned(), "name"));
+    }
+    for email in hostile_emails() {
+        cases.push((BOT_NAME.to_owned(), email, "email"));
+    }
+    assert!(cases.len() >= 40);
+    for (name, email, field) in cases {
+        let (got, book) = app_fetch(vec![app_wire(APP_TOKEN, &name, &email), agent_wire()]).await?;
+        assert_eq!(
+            got.err(),
+            Some(CredentialFailure::AppIdentityInvalid),
+            "{field}: {name:?} {email:?}"
+        );
+        assert!(book.get("job1").is_none());
+    }
+    assert_eq!(
+        CredentialFailure::AppIdentityInvalid.reason(),
+        ERR_APP_IDENTITY_INVALID
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn the_longest_legal_identity_passes() -> TestResult {
+    let name = format!("a{}]", "b".repeat(62));
+    let slug = "a".repeat(128 - "1+[bot]@users.noreply.github.com".len());
+    let email = format!("1+{slug}[bot]@users.noreply.github.com");
+    assert_eq!(name.len(), 64);
+    assert_eq!(email.len(), 128);
+    let (got, _book) = app_fetch(vec![app_wire(APP_TOKEN, &name, &email), agent_wire()]).await?;
+    assert!(got.is_ok());
+    Ok(())
+}
+
+#[tokio::test]
+async fn an_installation_token_without_an_identity_fails_closed() -> TestResult {
+    let mut app = app_wire(APP_TOKEN, BOT_NAME, BOT_EMAIL);
+    app.git_identity = None;
+    let (got, book) = app_fetch(vec![app, agent_wire()]).await?;
+    assert_eq!(got.err(), Some(CredentialFailure::AppIdentityMissing));
     assert!(book.get("job1").is_none());
     assert_eq!(
-        CredentialFailure::AppTokenUnsupported.reason(),
-        fleetd::cred::ERR_APP_TOKEN_UNSUPPORTED
+        CredentialFailure::AppIdentityMissing.reason(),
+        ERR_APP_IDENTITY_MISSING
     );
-    assert_ne!(
-        CredentialFailure::AppTokenUnsupported.reason(),
-        ERR_MALFORMED
+    assert_ne!(ERR_APP_IDENTITY_MISSING, ERR_APP_IDENTITY_INVALID);
+    assert_ne!(ERR_APP_IDENTITY_MISSING, ERR_MALFORMED);
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_broken_installation_token_reply_is_malformed() -> TestResult {
+    let long = format!(
+        "ghs_{}",
+        "a".repeat(fleet_proto::MAX_CREDENTIAL_VALUE_BYTES)
     );
+    let mut refreshing = app_wire(APP_TOKEN, BOT_NAME, BOT_EMAIL);
+    refreshing.shape = "refreshing_file".into();
+    let mut pat_identity = wire("github_pat", "static_secret", GITHUB);
+    pat_identity.git_identity = app_wire(APP_TOKEN, BOT_NAME, BOT_EMAIL).git_identity;
+    let replies = [
+        vec![wire("github_app", "static_secret", APP_TOKEN), agent_wire()],
+        vec![app_wire("ghs_short", BOT_NAME, BOT_EMAIL), agent_wire()],
+        vec![app_wire(&long, BOT_NAME, BOT_EMAIL), agent_wire()],
+        vec![app_wire(GITHUB, BOT_NAME, BOT_EMAIL), agent_wire()],
+        vec![
+            app_wire("ghs_AbCdEfGhIjKlMnOpQrSt UvWxYz0123", BOT_NAME, BOT_EMAIL),
+            agent_wire(),
+        ],
+        vec![
+            app_wire("ghs_AbCdEfGhIjKlMnOpQrStUvWx\nYz0123", BOT_NAME, BOT_EMAIL),
+            agent_wire(),
+        ],
+        vec![refreshing, agent_wire()],
+        vec![
+            app_wire(APP_TOKEN, BOT_NAME, BOT_EMAIL),
+            app_wire(APP_TOKEN, BOT_NAME, BOT_EMAIL),
+            agent_wire(),
+        ],
+        vec![
+            app_wire(APP_TOKEN, BOT_NAME, BOT_EMAIL),
+            wire("github_pat", "static_secret", GITHUB),
+            agent_wire(),
+        ],
+        vec![pat_identity, agent_wire()],
+    ];
+    for credentials in replies {
+        let (got, book) = app_fetch(credentials).await?;
+        assert_eq!(got.err(), Some(CredentialFailure::Malformed));
+        assert!(book.get("job1").is_none());
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn an_installation_token_alone_still_needs_an_agent_credential() -> TestResult {
+    let (got, _book) = app_fetch(vec![app_wire(APP_TOKEN, BOT_NAME, BOT_EMAIL)]).await?;
+    assert_eq!(got.err(), Some(CredentialFailure::NoAgent));
     Ok(())
 }
 
@@ -401,7 +612,8 @@ async fn no_debug_or_error_text_carries_a_value() -> TestResult {
         CredentialFailure::Expired,
         CredentialFailure::NotConfigured,
         CredentialFailure::Unavailable,
-        CredentialFailure::AppTokenUnsupported,
+        CredentialFailure::AppIdentityMissing,
+        CredentialFailure::AppIdentityInvalid,
         CredentialFailure::Malformed,
     ] {
         let text = format!("{failure:?} {failure}");
@@ -855,5 +1067,45 @@ async fn a_refused_fetch_fails_the_job_with_the_fixed_reason_before_any_clone() 
     assert_eq!(seen.len(), 1);
     assert_eq!(seen[0].1.r#box, box_name());
     assert_eq!(seen[0].1.attempt, 4);
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_bad_identity_fails_the_job_with_the_fixed_reason_before_any_clone() -> TestResult {
+    for (identity, reason) in [
+        (Some(("bot\nname", BOT_EMAIL)), ERR_APP_IDENTITY_INVALID),
+        (
+            Some((BOT_NAME, "evil@example.com")),
+            ERR_APP_IDENTITY_INVALID,
+        ),
+        (None, ERR_APP_IDENTITY_MISSING),
+    ] {
+        let mut app = app_wire(APP_TOKEN, BOT_NAME, BOT_EMAIL);
+        app.git_identity = identity.map(|(name, email)| fleet_proto::v1::GitIdentity {
+            name: name.into(),
+            email: email.into(),
+        });
+        let mut lane = lane(
+            Ok(GetJobCredentialsReply {
+                credentials: vec![app, agent_wire()],
+            }),
+            Renew::Quiet,
+            None,
+        )
+        .await?;
+        let (_trigger, shutdown) = Shutdown::channel();
+        let result = bounded(Box::pin(lane.runner.run(repo_job(), shutdown))).await?;
+        assert!(result.is_err());
+        let all = drain(&mut lane.reports);
+        let last = terminal(&all).ok_or("no terminal report")?;
+        assert_eq!(last.terminal_state, Some(JobState::Failed as i32));
+        assert_eq!(last.error.as_deref(), Some(reason));
+        assert!(!lane.jobs.exists() || std::fs::read_dir(&lane.jobs)?.next().is_none());
+        assert!(lane.book.get("job1").is_none());
+        for report in &all {
+            let text = format!("{report:?}");
+            assert!(!text.contains(APP_TOKEN), "{text}");
+        }
+    }
     Ok(())
 }

@@ -59,10 +59,10 @@ pub fn protocol_for(services: &[ServiceName]) -> Cow<'static, str> {
     Cow::Owned(text)
 }
 
-/// Git author and committer name of a job.
+/// Git author and committer name of a PAT job, and the fallback when no bot identity is held.
 pub const JOB_NAME: &str = "Fleet Job";
 
-/// Git author and committer email of a job.
+/// Git author and committer email of a PAT job, and the fallback when no bot identity is held.
 pub const JOB_EMAIL: &str = "fleet-job@fleet.invalid";
 
 /// Most entries, files and directories, in an operator bundle directory.

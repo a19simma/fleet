@@ -6,11 +6,13 @@
 //! default for callers that have no credential channel. The agent shares fleetd's uid under the
 //! direct launcher, so the token is hidden from other uids only (ADR-0024 Known limit).
 
+use std::ffi::OsString;
 use std::sync::{Arc, PoisonError};
 
 use fleet_core::Redactor;
 use tokio::process::Command;
 
+use crate::agent_config::{JOB_EMAIL, JOB_NAME};
 use crate::cred::JobCredentials;
 use crate::runner::{AgentRunner, Reporter};
 
@@ -41,6 +43,27 @@ impl<R: Reporter> AgentRunner<R> {
         }
     }
 
+    /// The git author and committer environment for `job_id`: the bot identity of a held
+    /// GitHub App credential, else the fixed job identity of a PAT job or a runner with no
+    /// book.
+    pub(crate) fn git_env(&self, job_id: &str) -> [(OsString, OsString); 4] {
+        let (name, email) = self
+            .credentials
+            .as_ref()
+            .and_then(|book| book.get(job_id))
+            .and_then(|held| {
+                held.git_identity()
+                    .map(|bot| (bot.name().to_owned(), bot.email().to_owned()))
+            })
+            .unwrap_or_else(|| (JOB_NAME.to_owned(), JOB_EMAIL.to_owned()));
+        [
+            ("GIT_AUTHOR_NAME".into(), name.clone().into()),
+            ("GIT_AUTHOR_EMAIL".into(), email.clone().into()),
+            ("GIT_COMMITTER_NAME".into(), name.into()),
+            ("GIT_COMMITTER_EMAIL".into(), email.into()),
+        ]
+    }
+
     pub(crate) fn apply_github_token(&self, command: &mut Command, job_id: &str, gh: bool) {
         if self.credentials.is_none() {
             return;
@@ -66,7 +89,7 @@ impl<R: Reporter> AgentRunner<R> {
     /// `env` is left as it is.
     pub(crate) fn apply_model_env(
         &self,
-        env: &mut std::collections::BTreeMap<std::ffi::OsString, std::ffi::OsString>,
+        env: &mut std::collections::BTreeMap<OsString, OsString>,
         job: &fleet_proto::v1::Job,
     ) {
         let Some(book) = &self.credentials else {
@@ -133,6 +156,7 @@ mod tests {
     use tokio_stream::wrappers::TcpListenerStream;
     use tonic::{Request, Response, Status};
 
+    use crate::agent_config::{JOB_EMAIL, JOB_NAME};
     use crate::cred::{CredentialBook, CredentialClient};
     use crate::poller::channel;
     use crate::runner::{AgentRunner, Reporter, RunConfig, Scope};
@@ -155,7 +179,11 @@ mod tests {
         }
     }
 
-    struct Stub(&'static str);
+    const APP_TOKEN: &str = "ghs_AbCdEfGhIjKlMnOpQrStUvWxYz0123456789";
+    const BOT_NAME: &str = "fleet-bot[bot]";
+    const BOT_EMAIL: &str = "123456+fleet-bot[bot]@users.noreply.github.com";
+
+    struct Stub(&'static str, bool);
 
     #[tonic::async_trait]
     impl FleetWorker for Stub {
@@ -191,8 +219,20 @@ mod tests {
                 expires_at_ms: None,
                 git_identity: None,
             };
+            let github = if self.1 {
+                JobCredential {
+                    expires_at_ms: Some(1),
+                    git_identity: Some(fleet_proto::v1::GitIdentity {
+                        name: BOT_NAME.into(),
+                        email: BOT_EMAIL.into(),
+                    }),
+                    ..wire("github_installation_token", APP_TOKEN)
+                }
+            } else {
+                wire("github_pat", HOLDER)
+            };
             Ok(Response::new(GetJobCredentialsReply {
-                credentials: vec![wire("github_pat", HOLDER), wire(self.0, AGENT)],
+                credentials: vec![github, wire(self.0, AGENT)],
             }))
         }
 
@@ -228,11 +268,23 @@ mod tests {
         attach: bool,
         kind: &'static str,
     ) -> Result<Fixture, Box<dyn std::error::Error>> {
+        fixture_with(attach, kind, false).await
+    }
+
+    async fn fixture_app() -> Result<Fixture, Box<dyn std::error::Error>> {
+        fixture_with(true, "anthropic_api_key", true).await
+    }
+
+    async fn fixture_with(
+        attach: bool,
+        kind: &'static str,
+        app: bool,
+    ) -> Result<Fixture, Box<dyn std::error::Error>> {
         let listener = TcpListener::bind(("127.0.0.1", 0)).await?;
         let url = format!("http://{}", listener.local_addr()?);
         tokio::spawn(
             tonic::transport::Server::builder()
-                .add_service(FleetWorkerServer::new(Stub(kind)))
+                .add_service(FleetWorkerServer::new(Stub(kind, app)))
                 .serve_with_incoming(TcpListenerStream::new(listener)),
         );
         let book = Arc::new(CredentialBook::new(CredentialClient::new(
@@ -477,6 +529,10 @@ mod tests {
             "XDG_CONFIG_HOME",
             "XDG_CACHE_HOME",
             "GIT_TERMINAL_PROMPT",
+            "GIT_AUTHOR_NAME",
+            "GIT_AUTHOR_EMAIL",
+            "GIT_COMMITTER_NAME",
+            "GIT_COMMITTER_EMAIL",
             "CODEX_API_KEY",
         ]
         .into_iter()
@@ -622,6 +678,10 @@ mod tests {
                 "XDG_CONFIG_HOME",
                 "XDG_CACHE_HOME",
                 "GIT_TERMINAL_PROMPT",
+                "GIT_AUTHOR_NAME",
+                "GIT_AUTHOR_EMAIL",
+                "GIT_COMMITTER_NAME",
+                "GIT_COMMITTER_EMAIL",
                 "KIMI_MODEL_API_KEY",
                 "KIMI_MODEL_NAME",
                 "KIMI_MODEL_PROVIDER_TYPE",
@@ -766,6 +826,193 @@ mod tests {
                 .redact_str(&text)
                 .contains(HOLDER)
         );
+        Ok(())
+    }
+
+    fn identity_of(env: &[(String, String)]) -> [Option<&str>; 4] {
+        [
+            "GIT_AUTHOR_NAME",
+            "GIT_AUTHOR_EMAIL",
+            "GIT_COMMITTER_NAME",
+            "GIT_COMMITTER_EMAIL",
+        ]
+        .map(|key| value(env, key))
+    }
+
+    const BOT: [Option<&str>; 4] = [
+        Some(BOT_NAME),
+        Some(BOT_EMAIL),
+        Some(BOT_NAME),
+        Some(BOT_EMAIL),
+    ];
+    const FIXED: [Option<&str>; 4] = [
+        Some(JOB_NAME),
+        Some(JOB_EMAIL),
+        Some(JOB_NAME),
+        Some(JOB_EMAIL),
+    ];
+
+    #[tokio::test]
+    async fn an_app_job_pushes_and_runs_gh_with_the_installation_token()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (runner, _book, dir) = fixture_app().await?;
+        assert_eq!(runner.github_token("job1").as_deref(), Some(APP_TOKEN));
+        for scope in [Scope::Push("job1"), Scope::Gh("job1")] {
+            let env = env_of(&runner, dir.path(), scope).await?;
+            assert_eq!(value(&env, "GH_TOKEN"), Some(APP_TOKEN));
+            assert!(env.iter().all(|(_, v)| v != BOX_PAT && v != BOX_ENT));
+        }
+        let env = env_of(&runner, dir.path(), Scope::Gh("job1")).await?;
+        assert_eq!(value(&env, "GH_ENTERPRISE_TOKEN"), None);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn an_app_job_agent_env_carries_the_bot_and_never_the_token()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (runner, _book, _dir) = fixture_app().await?;
+        let env = spec_env(&runner, "job1", JobKind::Agent);
+        assert_eq!(identity_of(&env), BOT);
+        assert!(value(&env, "GH_TOKEN").is_none());
+        assert!(env.iter().all(|(_, v)| v != APP_TOKEN));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_pat_job_and_a_runner_with_no_book_keep_the_fixed_identity()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (runner, _book, _dir) = fixture(true).await?;
+        assert_eq!(
+            identity_of(&spec_env(&runner, "job1", JobKind::Agent)),
+            FIXED
+        );
+        assert_eq!(
+            identity_of(&spec_env(&runner, "job2", JobKind::Agent)),
+            FIXED
+        );
+        let (bare, _book, _dir) = fixture(false).await?;
+        assert_eq!(identity_of(&spec_env(&bare, "job1", JobKind::Agent)), FIXED);
+        let (app, _book, _dir) = fixture_app().await?;
+        assert_eq!(identity_of(&spec_env(&app, "job2", JobKind::Agent)), FIXED);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn the_fallback_commit_env_carries_the_bot_for_an_app_job_only()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (app, _book, dir) = fixture_app().await?;
+        let env = env_of(&app, dir.path(), Scope::Tree("job1", dir.path())).await?;
+        assert_eq!(identity_of(&env), BOT);
+        assert!(env.iter().all(|(_, v)| v != APP_TOKEN));
+        let env = env_of(&app, dir.path(), Scope::Tree("job2", dir.path())).await?;
+        assert_eq!(identity_of(&env), FIXED);
+        let (pat, _book, dir) = fixture(true).await?;
+        let env = env_of(&pat, dir.path(), Scope::Tree("job1", dir.path())).await?;
+        assert_eq!(identity_of(&env), FIXED);
+        let (bare, _book, dir) = fixture(false).await?;
+        let env = env_of(&bare, dir.path(), Scope::Tree("job1", dir.path())).await?;
+        assert_eq!(identity_of(&env), FIXED);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_codex_or_kimi_app_job_carries_the_bot_and_a_pat_job_the_fixed_identity()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (mut app, _book, dir) = fixture_with(true, "codex_api_key", true).await?;
+        app.config.codex_bin = "codex-fake".into();
+        assert_eq!(
+            identity_of(&spec_pairs(&codex_spec(&app, dir.path(), "job1"))),
+            BOT
+        );
+        let (mut pat, _book, dir) = fixture_kind(true, "codex_api_key").await?;
+        pat.config.codex_bin = "codex-fake".into();
+        assert_eq!(
+            identity_of(&spec_pairs(&codex_spec(&pat, dir.path(), "job1"))),
+            FIXED
+        );
+        let (app, _book, dir) = fixture_with(true, "kimi_membership_key", true).await?;
+        assert_eq!(
+            identity_of(&spec_pairs(&kimi_spec(&app, dir.path(), "job1"))),
+            BOT
+        );
+        let (pat, _book, dir) = fixture_kind(true, "kimi_membership_key").await?;
+        assert_eq!(
+            identity_of(&spec_pairs(&kimi_spec(&pat, dir.path(), "job1"))),
+            FIXED
+        );
+        Ok(())
+    }
+
+    fn hostile_forms() -> Vec<(&'static str, String)> {
+        vec![
+            ("plain", format!("x {APP_TOKEN} y")),
+            ("env echo", format!("GH_TOKEN={APP_TOKEN}")),
+            ("export echo", format!("export GH_TOKEN='{APP_TOKEN}'")),
+            (
+                "url userinfo",
+                format!("https://x-access-token:{APP_TOKEN}@github.com/o/r"),
+            ),
+            ("auth header", format!("Authorization: token {APP_TOKEN}")),
+            ("twice", format!("{APP_TOKEN}{APP_TOKEN}")),
+            ("crlf", format!("a\r\n{APP_TOKEN}\r\nb")),
+            ("json quoted", format!("{{\"t\":\"{APP_TOKEN}\"}}")),
+        ]
+    }
+
+    #[tokio::test]
+    async fn the_installation_token_is_redacted_in_every_text_path()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (runner, book, _dir) = fixture_app().await?;
+        let held = book.get("job1").ok_or("held")?;
+        runner.adopt_credentials("job1", &held);
+        let redactor = runner.job_redactor("job1");
+        for (name, text) in hostile_forms() {
+            let clean = redactor.redact_str(&text);
+            assert!(!clean.contains(APP_TOKEN), "{name}: {clean}");
+            assert!(!clean.contains("ghs_"), "{name}: {clean}");
+            assert!(clean.contains("[REDACTED]"), "{name}");
+            let mut value = serde_json::json!({ text.clone(): [text.clone()] });
+            redactor.redact_value(&mut value);
+            assert!(!value.to_string().contains("ghs_"), "{name}: {value}");
+            let hidden = crate::shell_timing::strip_redact(&redactor, &text, true);
+            assert!(!hidden.contains("ghs_"), "{name}: {hidden}");
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn an_installation_token_straddling_a_shell_cap_is_redacted_before_the_cut()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use crate::shell_timing::{ShellInput, ShellRecorder};
+        use fleet_proto::{MAX_COMMAND_BYTES, MAX_SHELL_LOG_BYTES};
+        let (runner, book, _dir) = fixture_app().await?;
+        let held = book.get("job1").ok_or("held")?;
+        runner.adopt_credentials("job1", &held);
+        for back in [1, 4, 5, 9] {
+            let command = format!("{}{APP_TOKEN} tail", "a".repeat(MAX_COMMAND_BYTES - back));
+            let output = format!("{}{APP_TOKEN} tail", "b".repeat(MAX_SHELL_LOG_BYTES - back));
+            let mut recorder = ShellRecorder::new(runner.job_redactor("job1").as_ref().clone());
+            recorder
+                .record(&ShellInput {
+                    command,
+                    output,
+                    started: 1,
+                    ended: Some(2),
+                    exit_code: Some(0),
+                    background: false,
+                })
+                .map_err(|_| "refused")?;
+            let record = recorder.records().first().ok_or("no record")?;
+            for text in [&record.command, &record.output] {
+                for end in 4..=APP_TOKEN.len() {
+                    assert!(
+                        !text.contains(&APP_TOKEN[..end]),
+                        "back {back}: {end} bytes leaked"
+                    );
+                }
+            }
+            assert!(record.truncated);
+        }
         Ok(())
     }
 }

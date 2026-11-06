@@ -9,6 +9,12 @@
 //! claim is held and before the agent starts. The server's fixed refusals map to one
 //! [`CredentialFailure`] each, and each failure has a fixed reason the job report carries.
 //! There is no fallback to a box credential on any failure.
+//!
+//! A GitHub App job holds an installation token under wire kind `github_installation_token`
+//! and the bot [`BotIdentity`] the server sent with it (ADR-0058). The token takes the place of
+//! the PAT as the git and `gh` token. fleetd validates the identity again with
+//! [`BotIdentity::new`] and fails the job before any clone when the identity is missing or
+//! outside the grammar. `expires_at_ms` is held for a later refresh and nothing reads it yet.
 
 use std::collections::{HashMap, HashSet};
 use std::fmt;
@@ -17,7 +23,7 @@ use std::time::Duration;
 
 use fleet_core::Redactor;
 use fleet_core::credential::{
-    CredentialKind, CredentialShape, MAX_CREDENTIAL_LEN, MIN_CREDENTIAL_LEN, Secret,
+    BotIdentity, CredentialKind, CredentialShape, MAX_CREDENTIAL_LEN, MIN_CREDENTIAL_LEN, Secret,
 };
 use fleet_proto::v1::fleet_worker_client::FleetWorkerClient;
 use fleet_proto::v1::{GetJobCredentialsReply, GetJobCredentialsRequest};
@@ -61,10 +67,14 @@ pub const ERR_NOT_CONFIGURED: &str = "credentials are not configured";
 /// Job failure reason: the call failed or timed out.
 pub const ERR_UNAVAILABLE: &str = "credentials could not be fetched";
 
-/// Job failure reason: the reply carries a GitHub App installation token, which this fleetd
-/// does not consume yet (ADR-0058).
-pub const ERR_APP_TOKEN_UNSUPPORTED: &str =
-    "github app credentials are not supported by this fleetd";
+/// Job failure reason: the reply carries a GitHub App installation token and no git identity.
+pub const ERR_APP_IDENTITY_MISSING: &str = "github app credential has no git identity";
+
+/// Job failure reason: the git identity of a GitHub App credential is outside the grammar.
+pub const ERR_APP_IDENTITY_INVALID: &str = "github app git identity is invalid";
+
+/// Prefix of every GitHub App installation token.
+const APP_TOKEN_PREFIX: &str = "ghs_";
 
 /// Job failure reason: the reply broke a rule the server keeps.
 pub const ERR_MALFORMED: &str = "credentials reply was invalid";
@@ -84,11 +94,16 @@ pub enum CredentialFailure {
     NotConfigured,
     /// Any other status, a timeout or a transport error.
     Unavailable,
-    /// The reply carries wire kind `github_installation_token`. fleetd parses it and fails the
-    /// job with a fixed reason until it consumes the token (ADR-0058).
-    AppTokenUnsupported,
+    /// The reply carries wire kind `github_installation_token` and no git identity.
+    AppIdentityMissing,
+    /// The git identity that came with an installation token is outside the grammar of
+    /// ADR-0058 (SEC-006, SEC-012).
+    AppIdentityInvalid,
     /// The reply held an unknown kind or shape, a bad value, a duplicate kind, or lacked the
-    /// GitHub or agent credential.
+    /// GitHub or agent credential. It is also this variant when an installation token does not
+    /// start with `ghs_` followed by alphanumerics or underscores, when the reply holds two
+    /// forge credentials, when a credential has the wire kind `github_app`, or when a git
+    /// identity rides on a credential that is not an installation token.
     Malformed,
 }
 
@@ -103,7 +118,8 @@ impl CredentialFailure {
             Self::Expired => ERR_EXPIRED,
             Self::NotConfigured => ERR_NOT_CONFIGURED,
             Self::Unavailable => ERR_UNAVAILABLE,
-            Self::AppTokenUnsupported => ERR_APP_TOKEN_UNSUPPORTED,
+            Self::AppIdentityMissing => ERR_APP_IDENTITY_MISSING,
+            Self::AppIdentityInvalid => ERR_APP_IDENTITY_INVALID,
             Self::Malformed => ERR_MALFORMED,
         }
     }
@@ -128,11 +144,12 @@ impl fmt::Display for CredentialFailure {
 
 impl std::error::Error for CredentialFailure {}
 
-/// One credential of a job: its kind and its secret value.
+/// One credential of a job: its kind, its secret value and the expiry the server sent.
 #[derive(Debug)]
 pub struct Credential {
     kind: CredentialKind,
     value: Secret,
+    expires_at_ms: Option<u64>,
 }
 
 impl Credential {
@@ -147,46 +164,72 @@ impl Credential {
     pub const fn value(&self) -> &Secret {
         &self.value
     }
+
+    /// The expiry the server sent, in milliseconds since the Unix epoch. Only an installation
+    /// token carries one. Nothing refreshes it yet.
+    #[must_use]
+    pub const fn expires_at_ms(&self) -> Option<u64> {
+        self.expires_at_ms
+    }
 }
 
 /// The credentials of one job, one per kind.
 #[derive(Debug)]
 pub struct JobCredentials {
     items: Vec<Credential>,
+    identity: Option<BotIdentity>,
 }
 
 impl JobCredentials {
     fn from_reply(reply: GetJobCredentialsReply) -> Result<Self, CredentialFailure> {
-        let mut wires: Vec<(String, String, Zeroizing<String>)> = reply
-            .credentials
-            .into_iter()
-            .map(|wire| (wire.kind, wire.shape, Zeroizing::new(wire.value)))
-            .collect();
         let mut seen = HashSet::new();
-        let mut items = Vec::with_capacity(wires.len());
-        for (kind, shape, value) in &mut wires {
-            if kind == GITHUB_INSTALLATION_TOKEN_KIND {
-                return Err(CredentialFailure::AppTokenUnsupported);
-            }
-            let kind = CredentialKind::from_wire_name(kind).ok_or(CredentialFailure::Malformed)?;
-            if shape != CredentialShape::StaticSecret.wire_name()
+        let mut items = Vec::with_capacity(reply.credentials.len());
+        let mut identity = None;
+        for wire in reply.credentials {
+            let mut value = Zeroizing::new(wire.value);
+            let is_app = wire.kind == GITHUB_INSTALLATION_TOKEN_KIND;
+            let kind = if is_app {
+                CredentialKind::GithubApp
+            } else {
+                CredentialKind::from_wire_name(&wire.kind).ok_or(CredentialFailure::Malformed)?
+            };
+            if wire.shape != CredentialShape::StaticSecret.wire_name()
                 || !(MIN_CREDENTIAL_LEN..=MAX_CREDENTIAL_LEN).contains(&value.len())
-                || !seen.insert(kind.wire_name())
+                || !seen.insert(wire.kind)
+                || (is_app && !is_app_token(&value))
+                || (!is_app && wire.git_identity.is_some())
+                || (kind == CredentialKind::GithubApp && !is_app)
             {
                 return Err(CredentialFailure::Malformed);
             }
+            if is_app {
+                identity = Some(
+                    wire.git_identity
+                        .ok_or(CredentialFailure::AppIdentityMissing)?,
+                );
+            }
             items.push(Credential {
                 kind,
-                value: Secret::new(std::mem::take(&mut **value)),
+                value: Secret::new(std::mem::take(&mut *value)),
+                expires_at_ms: wire.expires_at_ms,
             });
         }
-        if !items.iter().any(|c| c.kind == CredentialKind::GithubPat) {
+        if items.iter().filter(|c| c.kind.is_forge()).count() > 1 {
+            return Err(CredentialFailure::Malformed);
+        }
+        let identity = identity
+            .map(|wire| {
+                BotIdentity::new(&wire.name, &wire.email)
+                    .map_err(|_| CredentialFailure::AppIdentityInvalid)
+            })
+            .transpose()?;
+        if !items.iter().any(|c| c.kind.is_forge()) {
             return Err(CredentialFailure::NoGithub);
         }
-        if items.iter().all(|c| c.kind == CredentialKind::GithubPat) {
+        if items.iter().all(|c| c.kind.is_forge()) {
             return Err(CredentialFailure::NoAgent);
         }
-        Ok(Self { items })
+        Ok(Self { items, identity })
     }
 
     /// The credential of `kind`, if the job has one.
@@ -198,10 +241,21 @@ impl JobCredentials {
             .map(Credential::value)
     }
 
-    /// The GitHub token. Every successful fetch holds one.
+    /// The GitHub token: the PAT, or the installation token of a GitHub App job. Every
+    /// successful fetch holds exactly one.
     #[must_use]
     pub fn github(&self) -> Option<&Secret> {
-        self.get(CredentialKind::GithubPat)
+        self.items
+            .iter()
+            .find(|c| c.kind.is_forge())
+            .map(Credential::value)
+    }
+
+    /// The bot identity a GitHub App job commits under. `None` for a PAT job, which keeps the
+    /// fixed job identity.
+    #[must_use]
+    pub const fn git_identity(&self) -> Option<&BotIdentity> {
+        self.identity.as_ref()
     }
 
     /// The credentials, in reply order.
@@ -233,6 +287,12 @@ impl<'a> IntoIterator for &'a JobCredentials {
     fn into_iter(self) -> Self::IntoIter {
         self.iter()
     }
+}
+
+fn is_app_token(value: &str) -> bool {
+    value
+        .strip_prefix(APP_TOKEN_PREFIX)
+        .is_some_and(|rest| rest.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_'))
 }
 
 fn bearer_header(token: &str) -> Result<MetadataValue<tonic::metadata::Ascii>, Error> {

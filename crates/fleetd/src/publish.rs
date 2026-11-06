@@ -305,7 +305,7 @@ impl<R: Reporter> AgentRunner<R> {
     }
 
     async fn commit_leftovers(&self, job: &Job, cwd: &Path, dir: &Path) -> Result<(), Failure> {
-        let tree = Scope::Tree(cwd);
+        let tree = Scope::Tree(&job.job_id, cwd);
         let listed = self
             .helper(
                 &self.config.git_bin,

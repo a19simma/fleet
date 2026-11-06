@@ -72,4 +72,4 @@ The Anthropic legal page says developers "may not collect, store, or intermediat
 
 ## Amendment (ADR-0058)
 
-ADR-0058 (proposed, partly built) adds the kind `github_app`, shape `static_secret`, holding the installation id. The wire kind `github_installation_token` is delivered to a Box only and `PutCredential` refuses it. When a User holds both GitHub kinds, the App wins.
+ADR-0058 (proposed, partly built) adds the kind `github_app`, shape `static_secret`, holding the installation id. The wire kind `github_installation_token` is delivered to a Box only and `PutCredential` refuses it. When a User holds both GitHub kinds, the App wins. The fleetd holder accepts the wire kind only with shape `static_secret`, a value of `ghs_` plus letters, digits and `_`, and a valid `GitIdentity`, and refuses a reply that holds it together with a `github_pat`.
