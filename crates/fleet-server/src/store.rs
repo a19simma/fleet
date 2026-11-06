@@ -395,8 +395,8 @@ pub enum StoreError {
     /// A batch named a profile that has no version. The handler maps this to gRPC
     /// `NOT_FOUND`. The error carries no data.
     UnknownProfile,
-    /// A save, a submit or a blob serve involved a profile with `tools` and the responsible user
-    /// does not hold `profile:tools`. The handler maps this to gRPC `PERMISSION_DENIED`. The error carries no data.
+    /// A save, a submit or a blob serve involved a profile with `tools`, or a save named a `tool`
+    /// catalog item, and the responsible user does not hold `profile:tools`. The handler maps this to gRPC `PERMISSION_DENIED`. The error carries no data.
     ToolsNotGranted,
     /// A profile save, a submit, a batch submit or a profile blob read named a model outside
     /// the allowlist. The blob read refuses a job queued before the list was set or narrowed. The
@@ -1432,10 +1432,13 @@ impl Store {
     /// # Errors
     ///
     /// Returns [`StoreError::InvalidProfile`] when the name or content fails validation or
-    /// `caller` is `None` or not a stored user ([`ProfileFault::Unowned`]),
+    /// `caller` is `None` or not a stored user ([`ProfileFault::Unowned`]), or when a selection
+    /// id is absent from the catalog or admin-disabled,
     /// [`StoreError::ToolsNotGranted`] when the content has tools and `caller` does not hold
-    /// `profile:tools`, [`StoreError::ModelDenied`] when the store has an allowlist and the
-    /// profile model is outside it, and [`StoreError::Database`] when a query fails.
+    /// `profile:tools` (checked first, by `require_tools_grant`) or when the selection names a
+    /// `tool` item and `caller` lacks it (the selection faults come in the order `UnknownItem`,
+    /// `ItemDisabled`, `ToolsNotGranted`), [`StoreError::ModelDenied`] when the store has an
+    /// allowlist and the profile model is outside it, and [`StoreError::Database`] when a query fails.
     pub async fn create_profile(
         &self,
         caller: Option<i64>,
@@ -1452,8 +1455,9 @@ impl Store {
     ///
     /// # Errors
     ///
-    /// Same as [`Store::create_profile`], [`StoreError::ToolsNotGranted`] when tools are
-    /// present and `caller` does not hold the capability, and [`StoreError::ModelDenied`] when
+    /// Same as [`Store::create_profile`], including an invalid selection id,
+    /// [`StoreError::ToolsNotGranted`] when tools are present or the selection names a `tool`
+    /// item and `caller` does not hold the capability, and [`StoreError::ModelDenied`] when
     /// the store has an allowlist and the profile model is outside it.
     pub async fn create_profile_content(
         &self,

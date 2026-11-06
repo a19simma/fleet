@@ -1305,6 +1305,7 @@ async fn a_set_past_the_byte_cap_is_refused_and_the_cap_itself_passes(pool: PgPo
 async fn a_selection_naming_a_missing_item_is_refused(pool: PgPool) {
     let store = store(pool.clone()).await;
     seed(&pool).await;
+    item(&pool, "gone", "skill", "soon removed", true).await;
     let (user, token) = user_with_token(&pool, "ann").await;
     profile(
         &pool,
@@ -1313,6 +1314,10 @@ async fn a_selection_naming_a_missing_item_is_refused(pool: PgPool) {
         r#"{"claude_md":"x","selection":[{"item_id":"gone","enabled":false}]}"#,
     )
     .await;
+    sqlx::query("DELETE FROM catalog_items WHERE id = 'gone'")
+        .execute(&pool)
+        .await
+        .unwrap();
     let mut jobs = client(serve_users(&pool, &store), &token);
     let err = jobs
         .submit_job(with_profile("k1", "alpha", ""))
@@ -1389,6 +1394,7 @@ async fn submit_waits_on_the_catalog_and_profile_rows(pool: PgPool) {
 #[sqlx::test]
 async fn the_pin_and_snapshot_columns_keep_their_all_or_none_rules(pool: PgPool) {
     store(pool.clone()).await;
+    seed(&pool).await;
     let (user, _) = user_with_token(&pool, "ann").await;
     profile(&pool, user, "alpha", SELECT_S2_OFF).await;
     let pid: i64 = sqlx::query_scalar("SELECT id FROM profile")

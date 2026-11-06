@@ -1,6 +1,6 @@
 # Global catalog and profile selection
 
-Status: Proposed 2026-11-02. Nothing is built. Amends ADR-0034 (what a Profile holds) and ADR-0035 (what the hash covers). Builds on ADR-0044 and ADR-0048. Tool items need the owner capability `profile:tools` of ADR-0054.
+Status: Proposed 2026-11-02. Save-time selection validation is built, the rest is not. Amends ADR-0034 (what a Profile holds) and ADR-0035 (what the hash covers). Builds on ADR-0044 and ADR-0048. Tool items need the owner capability `profile:tools` of ADR-0054.
 
 ADR-0034 defines a Profile as a bundle of content: `claude_md`, inline skills, context files and rules. Every Profile repeats the content it needs, and nothing says which skills, subagents or tools exist on the server. This ADR adds a server-managed catalog and turns a Profile into a selection over it.
 
@@ -38,7 +38,17 @@ The owner said: "there's a global list of available ones but the user can turn t
 4. When the job agent is `kimi` (ADR-0044), drop every `subagent` item and add a visible job note that names each dropped item. The Kimi runner has no subagent mechanism.
 5. Return the kept items in id order, plus the notes.
 
-The function reads no clock, database or environment. A `disabled` id that no longer exists in the Catalog is ignored.
+The function reads no clock, database or environment. A `disabled` id that is not in the Catalog makes `resolve` return `ResolveError::UnknownItem`. A `disabled` id for a Catalog item that is not `enabled` is dropped with the rest of that item.
+
+### Save validates the selection
+
+A Profile save (create or new version) checks `disabled` against the Catalog in the save transaction. One keyed read takes the named Catalog rows `FOR SHARE`, bounded by the selection cap `MAX_SELECTION` (256), so an admin edit in flight finishes first and a later one waits for the save. The save first refuses a `tools` content list from a user without `profile:tools` (`ToolsNotGranted`), then refuses on the selection faults below, checked in this order:
+
+- an id has no Catalog row (`InvalidProfile(UnknownItem)`),
+- an id names an item an admin disabled (`InvalidProfile(ItemDisabled)`), or
+- an id names a `tool` item and the owner lacks `profile:tools`, read `FOR SHARE` in the same transaction (`ToolsNotGranted`, ADR-0054).
+
+The faults come in that order and none echoes the id. Save diverges from submit here: submit drops a disabled id, because an admin can disable an item after the save, but a save that names one is a mistake worth failing early. Resolve drops the item when an admin later disables it. An id that later leaves the Catalog makes `resolve` fail with `ResolveError::UnknownItem`, and submit refuses the job with the snapshot error (`JobInvalid::Snapshot`).
 
 ### Submit and snapshot
 

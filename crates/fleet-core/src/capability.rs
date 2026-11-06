@@ -9,7 +9,7 @@ use std::str::FromStr;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 #[non_exhaustive]
 pub enum Capability {
-    /// Save or submit a Profile that lists `tools`.
+    /// Save a Profile that lists `tools` or selects a `tool` Catalog item, submit a Profile that lists `tools`, or have its blob served to a leased Box.
     ProfileTools,
 }
 

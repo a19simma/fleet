@@ -427,15 +427,6 @@ async fn submitted_job(pool: &PgPool, store: &Store) -> (String, fleet_proto::v1
         .fetch_one(pool)
         .await
         .unwrap();
-    fleet_server::profiles::create_owned(
-        pool,
-        Some(user),
-        None,
-        "alpha",
-        ProfileContent::Json(r#"{"claude_md":"one","selection":[{"item_id":"s2"}]}"#),
-    )
-    .await
-    .unwrap();
     for (id, body) in [("s1", "skill one"), ("s2", "skill two")] {
         sqlx::query(
             "INSERT INTO catalog_items (id, kind, name, content, digest, admin_enabled) \
@@ -447,6 +438,15 @@ async fn submitted_job(pool: &PgPool, store: &Store) -> (String, fleet_proto::v1
         .await
         .unwrap();
     }
+    fleet_server::profiles::create_owned(
+        pool,
+        Some(user),
+        None,
+        "alpha",
+        ProfileContent::Json(r#"{"claude_md":"one","selection":[{"item_id":"s2"}]}"#),
+    )
+    .await
+    .unwrap();
     let job = store
         .submit_job_for(
             Some(user),

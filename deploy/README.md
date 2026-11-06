@@ -498,4 +498,4 @@ These are fleet-server settings. `infra/README.md` carries the same rows.
 | --- | --- |
 | `FLEET_UPDATE_MANIFEST` | path of the signed update manifest. The signature is the file of the same name with `.minisig` appended. Unset or empty means no manifest. |
 
-`FLEET_ALLOW_PROFILE_TOOLS` is removed and stops startup if set, to any value. Profile `tools` need the `profile:tools` capability on the saving user, on the submitting user, and on the job owner when the server serves the blob to a leased Box. Tools are accepted only in TOML Profile content (`content_toml`). A Box still needs `[mise]`, see [Bundled mise](#bundled-mise-and-the-mise-section).
+`FLEET_ALLOW_PROFILE_TOOLS` is removed and stops startup if set, to any value. Profile `tools` need the `profile:tools` capability on the saving user (for `tools`, and for a selection that names a `tool` Catalog item), on the submitting user, and on the job owner when the server serves the blob to a leased Box. Tools are accepted only in TOML Profile content (`content_toml`). A Box still needs `[mise]`, see [Bundled mise](#bundled-mise-and-the-mise-section).

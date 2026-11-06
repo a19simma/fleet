@@ -1522,6 +1522,11 @@ async fn share_rpc_maps_owner_not_owner_and_missing(pool: PgPool) {
 
 const RICH: &str = r#"{"authored_prompt":"be brief","selection":[{"enabled":false,"item_id":"skill-b"},{"enabled":false,"item_id":"skill-a"}]}"#;
 
+async fn seed_rich(pool: &PgPool) {
+    catalog_item(pool, "skill-a", "skill", true).await;
+    catalog_item(pool, "skill-b", "skill", true).await;
+}
+
 fn off(id: &str) -> fleet_proto::v1::SelectionEntry {
     fleet_proto::v1::SelectionEntry {
         item_id: id.to_owned(),
@@ -1544,6 +1549,7 @@ async fn get_returns_owner_visibility_selection_and_prompt(pool: PgPool) {
     store(pool.clone()).await;
     let alice = user(&pool, "alice").await;
     let bob = user(&pool, "bob").await;
+    seed_rich(&pool).await;
     put(&pool, alice, RICH).await;
     let own = read(&pool, Viewer::User(alice), "alpha", None)
         .await
@@ -1575,6 +1581,7 @@ async fn get_returns_owner_visibility_selection_and_prompt(pool: PgPool) {
 #[sqlx::test]
 async fn get_fields_follow_the_requested_version(pool: PgPool) {
     store(pool.clone()).await;
+    seed_rich(&pool).await;
     let alice = user(&pool, "alice").await;
     put(&pool, alice, RICH).await;
     put(&pool, alice, OWNED).await;
@@ -1603,6 +1610,7 @@ async fn list_returns_owner_and_visibility_per_row(pool: PgPool) {
     store(pool.clone()).await;
     let alice = user(&pool, "alice").await;
     let bob = user(&pool, "bob").await;
+    seed_rich(&pool).await;
     owned(&pool, Some(alice), "alpha", OWNED).await.unwrap();
     owned(&pool, Some(bob), "beta", OWNED).await.unwrap();
     owned(&pool, Some(bob), "gamma", OWNED).await.unwrap();
@@ -1666,6 +1674,7 @@ async fn a_hostile_owner_name_is_returned_verbatim(pool: PgPool) {
 async fn not_visible_and_absent_profiles_give_one_status_over_rpc(pool: PgPool) {
     let store = store(pool.clone()).await;
     let alice = user(&pool, "alice").await;
+    seed_rich(&pool).await;
     put(&pool, alice, RICH).await;
     let mut client = spawn(&pool, &store);
     let hidden = timeout(
@@ -1872,4 +1881,397 @@ async fn updating_with_tools_needs_the_capability(pool: PgPool) {
     )
     .await
     .unwrap();
+}
+
+const UNKNOWN_ITEM: &str = "profile selection names an item that is not in the catalog";
+const DISABLED_ITEM: &str = "profile selection names an item an admin disabled";
+
+async fn catalog_item(pool: &PgPool, id: &str, kind: &str, enabled: bool) {
+    let body = if kind == "tool" { "1.2.3" } else { "body" };
+    let name = if kind == "tool" { "node" } else { id };
+    sqlx::query(
+        "INSERT INTO catalog_items (id, kind, name, content, digest, admin_enabled) \
+         VALUES ($1, $2, $3, $4, decode(repeat('00', 32), 'hex'), $5)",
+    )
+    .bind(id)
+    .bind(kind)
+    .bind(name)
+    .bind(body)
+    .bind(enabled)
+    .execute(pool)
+    .await
+    .unwrap();
+}
+
+fn off_json(ids: &[&str]) -> String {
+    let entries: Vec<serde_json::Value> = ids
+        .iter()
+        .map(|id| serde_json::json!({ "item_id": id, "enabled": false }))
+        .collect();
+    serde_json::json!({ "claude_md": "x", "selection": entries }).to_string()
+}
+
+fn off_toml(ids: &[&str]) -> String {
+    let mut out = String::from("claude_md = \"x\"\n");
+    for id in ids {
+        out.push_str("[[selection]]\nitem_id = \"");
+        out.push_str(id);
+        out.push_str("\"\nenabled = false\n");
+    }
+    out
+}
+
+async fn save(pool: &PgPool, caller: i64, name: &str, content: ProfileContent<'_>) -> StoreError {
+    profiles::create_owned(pool, Some(caller), None, name, content)
+        .await
+        .unwrap_err()
+}
+
+#[sqlx::test]
+async fn an_unknown_selection_id_is_refused_and_writes_nothing(pool: PgPool) {
+    store(pool.clone()).await;
+    let alice = user(&pool, "alice").await;
+    catalog_item(&pool, "known", "skill", true).await;
+    for content in [off_json(&["known", "ghost"]), off_json(&["ghost"])] {
+        let err = save(&pool, alice, "alpha", ProfileContent::Json(&content)).await;
+        assert!(matches!(err, StoreError::InvalidProfile(_)), "{err}");
+        assert_eq!(err.to_string(), UNKNOWN_ITEM);
+        assert!(!err.to_string().contains("ghost"));
+    }
+    let toml = off_toml(&["ghost"]);
+    let err = save(&pool, alice, "alpha", ProfileContent::Toml(&toml)).await;
+    assert_eq!(err.to_string(), UNKNOWN_ITEM);
+    nothing_written(&pool).await;
+}
+
+#[sqlx::test]
+async fn an_admin_disabled_selection_id_is_refused_and_writes_nothing(pool: PgPool) {
+    store(pool.clone()).await;
+    let alice = user(&pool, "alice").await;
+    catalog_item(&pool, "known", "skill", true).await;
+    catalog_item(&pool, "dis", "skill", false).await;
+    let json = off_json(&["known", "dis"]);
+    let err = save(&pool, alice, "alpha", ProfileContent::Json(&json)).await;
+    assert!(matches!(err, StoreError::InvalidProfile(_)), "{err}");
+    assert_eq!(err.to_string(), DISABLED_ITEM);
+    assert!(!err.to_string().contains("dis\u{0}"));
+    let toml = off_toml(&["dis"]);
+    let err = save(&pool, alice, "alpha", ProfileContent::Toml(&toml)).await;
+    assert_eq!(err.to_string(), DISABLED_ITEM);
+    nothing_written(&pool).await;
+}
+
+#[sqlx::test]
+async fn an_unknown_id_is_reported_before_a_disabled_one(pool: PgPool) {
+    store(pool.clone()).await;
+    let alice = user(&pool, "alice").await;
+    catalog_item(&pool, "dis", "skill", false).await;
+    let json = off_json(&["dis", "ghost"]);
+    let err = save(&pool, alice, "alpha", ProfileContent::Json(&json)).await;
+    assert_eq!(err.to_string(), UNKNOWN_ITEM);
+}
+
+#[sqlx::test]
+async fn known_enabled_and_empty_selections_are_accepted(pool: PgPool) {
+    store(pool.clone()).await;
+    let alice = user(&pool, "alice").await;
+    catalog_item(&pool, "a", "skill", true).await;
+    catalog_item(&pool, "b", "context", true).await;
+    catalog_item(&pool, "c", "subagent", true).await;
+    for (name, content) in [("one", off_json(&["a", "b", "c"])), ("two", off_json(&[]))] {
+        profiles::create_owned(
+            &pool,
+            Some(alice),
+            None,
+            name,
+            ProfileContent::Json(&content),
+        )
+        .await
+        .unwrap();
+    }
+    let toml = off_toml(&["a"]);
+    profiles::create_owned(
+        &pool,
+        Some(alice),
+        None,
+        "three",
+        ProfileContent::Toml(&toml),
+    )
+    .await
+    .unwrap();
+    assert_eq!(counts(&pool).await, (3, 3));
+}
+
+#[sqlx::test]
+async fn a_tool_item_needs_the_owner_grant_to_save(pool: PgPool) {
+    store(pool.clone()).await;
+    let alice = user(&pool, "alice").await;
+    catalog_item(&pool, "tool1", "tool", true).await;
+    let json = off_json(&["tool1"]);
+    let toml = off_toml(&["tool1"]);
+    for content in [ProfileContent::Json(&json), ProfileContent::Toml(&toml)] {
+        let err = save(&pool, alice, "alpha", content).await;
+        assert!(matches!(err, StoreError::ToolsNotGranted), "{err}");
+        assert_eq!(err.to_string(), profiles::ERR_PROFILE_TOOLS_NOT_GRANTED);
+    }
+    nothing_written(&pool).await;
+    grant_tools(&pool, alice).await;
+    profiles::create_owned(
+        &pool,
+        Some(alice),
+        None,
+        "alpha",
+        ProfileContent::Json(&json),
+    )
+    .await
+    .unwrap();
+    profiles::create_owned(
+        &pool,
+        Some(alice),
+        None,
+        "beta",
+        ProfileContent::Toml(&toml),
+    )
+    .await
+    .unwrap();
+    revoke_tools(&pool, alice).await;
+    let err = save(&pool, alice, "gamma", ProfileContent::Json(&json)).await;
+    assert!(matches!(err, StoreError::ToolsNotGranted), "{err}");
+    assert_eq!(counts(&pool).await, (1, 2));
+}
+
+#[sqlx::test]
+async fn non_tool_kinds_need_no_grant(pool: PgPool) {
+    store(pool.clone()).await;
+    let alice = user(&pool, "alice").await;
+    for (id, kind) in [("a", "skill"), ("b", "subagent"), ("c", "context")] {
+        catalog_item(&pool, id, kind, true).await;
+    }
+    let json = off_json(&["a", "b", "c"]);
+    profiles::create_owned(
+        &pool,
+        Some(alice),
+        None,
+        "alpha",
+        ProfileContent::Json(&json),
+    )
+    .await
+    .unwrap();
+}
+
+#[sqlx::test]
+async fn a_disabled_tool_item_reports_disabled_before_the_grant(pool: PgPool) {
+    store(pool.clone()).await;
+    let alice = user(&pool, "alice").await;
+    catalog_item(&pool, "tool1", "tool", false).await;
+    let json = off_json(&["tool1"]);
+    let err = save(&pool, alice, "alpha", ProfileContent::Json(&json)).await;
+    assert_eq!(err.to_string(), DISABLED_ITEM);
+}
+
+#[sqlx::test]
+async fn update_applies_the_same_selection_rules(pool: PgPool) {
+    store(pool.clone()).await;
+    let alice = user(&pool, "alice").await;
+    catalog_item(&pool, "ok", "skill", true).await;
+    catalog_item(&pool, "dis", "skill", false).await;
+    catalog_item(&pool, "tool1", "tool", true).await;
+    owned(&pool, Some(alice), "alpha", ONE).await.unwrap();
+    let id = profile_id(&pool, alice, "alpha").await;
+    let before = counts(&pool).await;
+    for (ids, want) in [
+        (vec!["ghost"], UNKNOWN_ITEM),
+        (vec!["dis"], DISABLED_ITEM),
+        (vec!["tool1"], profiles::ERR_PROFILE_TOOLS_NOT_GRANTED),
+    ] {
+        let json = off_json(&ids);
+        let err = profiles::update_owned(&pool, Some(alice), None, id, ProfileContent::Json(&json))
+            .await
+            .unwrap_err();
+        assert_eq!(err.to_string(), want);
+        let toml = off_toml(&ids);
+        let err = profiles::update_owned(&pool, Some(alice), None, id, ProfileContent::Toml(&toml))
+            .await
+            .unwrap_err();
+        assert_eq!(err.to_string(), want);
+    }
+    assert_eq!(counts(&pool).await, before);
+    let json = off_json(&["ok"]);
+    profiles::update_owned(&pool, Some(alice), None, id, ProfileContent::Json(&json))
+        .await
+        .unwrap();
+    grant_tools(&pool, alice).await;
+    let json = off_json(&["tool1"]);
+    profiles::update_owned(&pool, Some(alice), None, id, ProfileContent::Json(&json))
+        .await
+        .unwrap();
+}
+
+#[sqlx::test]
+async fn hostile_selection_ids_are_refused_by_the_validator_without_an_echo(pool: PgPool) {
+    store(pool.clone()).await;
+    let alice = user(&pool, "alice").await;
+    catalog_item(&pool, "known", "skill", true).await;
+    let long = "a".repeat(65);
+    let hostile = [
+        "",
+        long.as_str(),
+        "a\rb",
+        "a\nb",
+        "a\r\nb",
+        "a\u{0}b",
+        "a b",
+        " known",
+        "known ",
+        "\u{e9}clair",
+        "a%41",
+        "a\\b",
+        "a'; DROP TABLE catalog_items; --",
+        "a\" OR \"1\"=\"1",
+        "A",
+        "-a",
+        "a\u{85}b",
+        "a\u{2028}b",
+    ];
+    for id in hostile {
+        let json = off_json(&[id]);
+        let err = save(&pool, alice, "alpha", ProfileContent::Json(&json)).await;
+        assert!(
+            matches!(err, StoreError::InvalidProfile(_)),
+            "{id:?}: {err}"
+        );
+        let text = err.to_string();
+        let sample = id.trim();
+        assert!(
+            sample.is_empty() || !text.contains(sample),
+            "{id:?}: {text}"
+        );
+        assert_ne!(text, UNKNOWN_ITEM, "{id:?}");
+        assert_ne!(text, DISABLED_ITEM, "{id:?}");
+    }
+    nothing_written(&pool).await;
+    let items: i64 = sqlx::query_scalar("SELECT count(*) FROM catalog_items")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(items, 1);
+}
+
+#[sqlx::test]
+async fn the_model_allowlist_still_runs_first(pool: PgPool) {
+    let allow = fleet_core::model_allowlist::ModelAllowlist::parse("claude-opus-4-1").unwrap();
+    let store = Store::new(pool.clone()).with_model_allowlist(Some(allow));
+    store.migrate().await.unwrap();
+    let alice = user(&pool, "alice").await;
+    let json = serde_json::json!({
+        "model": "gpt-5",
+        "selection": [{ "item_id": "ghost", "enabled": false }],
+    })
+    .to_string();
+    let err = store
+        .create_profile(Some(alice), "alpha", &json)
+        .await
+        .unwrap_err();
+    assert!(matches!(err, StoreError::ModelDenied(_)), "{err}");
+    let ok = serde_json::json!({
+        "model": "claude-opus-4-1",
+        "selection": [{ "item_id": "ghost", "enabled": false }],
+    })
+    .to_string();
+    let err = store
+        .create_profile(Some(alice), "alpha", &ok)
+        .await
+        .unwrap_err();
+    assert_eq!(err.to_string(), UNKNOWN_ITEM);
+}
+
+#[sqlx::test]
+async fn a_save_over_rpc_maps_the_refusals_to_fixed_statuses(pool: PgPool) {
+    let store = store(pool.clone()).await;
+    let alice = user(&pool, "alice").await;
+    catalog_item(&pool, "dis", "skill", false).await;
+    catalog_item(&pool, "tool1", "tool", true).await;
+    let addr = serve(&pool, &store);
+    let mut as_alice = bearer_client(addr, api_token(&pool, alice).await);
+    let err = as_alice
+        .create_profile(create("alpha", &off_json(&["ghost"])))
+        .await
+        .unwrap_err();
+    assert_eq!(err.code(), Code::InvalidArgument);
+    assert_eq!(err.message(), UNKNOWN_ITEM);
+    let err = as_alice
+        .create_profile(create("alpha", &off_json(&["dis"])))
+        .await
+        .unwrap_err();
+    assert_eq!(err.code(), Code::InvalidArgument);
+    assert_eq!(err.message(), DISABLED_ITEM);
+    let err = as_alice
+        .create_profile(create("alpha", &off_json(&["tool1"])))
+        .await
+        .unwrap_err();
+    assert_eq!(err.code(), Code::PermissionDenied);
+    assert_eq!(err.message(), profiles::ERR_PROFILE_TOOLS_NOT_GRANTED);
+    nothing_written(&pool).await;
+}
+
+#[sqlx::test]
+async fn a_save_waits_for_a_tools_revoke_in_flight_and_is_then_refused(pool: PgPool) {
+    store(pool.clone()).await;
+    let alice = user(&pool, "alice").await;
+    catalog_item(&pool, "tool1", "tool", true).await;
+    grant_tools(&pool, alice).await;
+    let mut revoke = pool.begin().await.unwrap();
+    sqlx::query("DELETE FROM user_capabilities WHERE user_id = $1")
+        .bind(alice)
+        .execute(&mut *revoke)
+        .await
+        .unwrap();
+    let held = pool.clone();
+    let json = off_json(&["tool1"]);
+    let save = tokio::spawn(async move {
+        profiles::create_owned(
+            &held,
+            Some(alice),
+            None,
+            "alpha",
+            ProfileContent::Json(&json),
+        )
+        .await
+    });
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert!(!save.is_finished());
+    revoke.commit().await.unwrap();
+    let err = timeout(WAIT, save).await.unwrap().unwrap().unwrap_err();
+    assert!(matches!(err, StoreError::ToolsNotGranted), "{err}");
+    nothing_written(&pool).await;
+}
+
+#[sqlx::test]
+async fn a_save_waits_for_an_admin_disable_in_flight_and_is_then_refused(pool: PgPool) {
+    store(pool.clone()).await;
+    let alice = user(&pool, "alice").await;
+    catalog_item(&pool, "a", "skill", true).await;
+    let mut edit = pool.begin().await.unwrap();
+    sqlx::query("UPDATE catalog_items SET admin_enabled = false WHERE id = 'a'")
+        .execute(&mut *edit)
+        .await
+        .unwrap();
+    let held = pool.clone();
+    let json = off_json(&["a"]);
+    let save = tokio::spawn(async move {
+        profiles::create_owned(
+            &held,
+            Some(alice),
+            None,
+            "alpha",
+            ProfileContent::Json(&json),
+        )
+        .await
+    });
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert!(!save.is_finished());
+    edit.commit().await.unwrap();
+    let err = timeout(WAIT, save).await.unwrap().unwrap().unwrap_err();
+    assert_eq!(err.to_string(), DISABLED_ITEM);
+    nothing_written(&pool).await;
 }

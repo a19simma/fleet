@@ -59,8 +59,14 @@ impl From<Option<i64>> for Viewer {
 /// [`ProfileFault::Unowned`].
 pub const ERR_PROFILE_SUBMIT_UNOWNED: &str = "profile submit needs a user token";
 
-/// The refusal text for a save, submit or blob serve of a profile with `tools` by a user without
-/// `profile:tools`.
+/// The refusal for a selection id that is not in the catalog.
+pub const ERR_PROFILE_UNKNOWN_ITEM: &str =
+    "profile selection names an item that is not in the catalog";
+/// The refusal for a selection id an admin disabled.
+pub const ERR_PROFILE_ITEM_DISABLED: &str = "profile selection names an item an admin disabled";
+
+/// The refusal text for a save, submit or blob serve of a profile with `tools`, or a save that
+/// names a `tool` catalog item, by a user without `profile:tools`.
 pub const ERR_PROFILE_TOOLS_NOT_GRANTED: &str = "profile tools need the profile:tools capability";
 
 /// The `UNAVAILABLE` message for a blob read whose stored catalog snapshot passes the item or
@@ -191,6 +197,8 @@ const SELECT_PINNED_FOR_SUBMIT: &str = "SELECT p.id, v.version, v.hash, b.conten
      ORDER BY v.version DESC LIMIT 1";
 const READ_TOOLS_GRANT: &str =
     "SELECT user_id FROM user_capabilities WHERE user_id = $1 AND capability = $2 FOR SHARE";
+const LOCK_SELECTED: &str =
+    "SELECT kind, admin_enabled FROM catalog_items WHERE id = ANY($1) FOR SHARE";
 const LOCK_CATALOG: &str = "SELECT id, kind, name, content, admin_enabled FROM catalog_items \
      ORDER BY id LIMIT $1 FOR SHARE";
 const SELECT_LEASED_BLOB: &str = "SELECT j.profile_name, j.profile_version, j.profile_hash, \
@@ -229,6 +237,10 @@ pub enum ProfileFault {
     NotOwner,
     /// The profile has versions, which are insert-only, so the row cannot be removed.
     HasVersions,
+    /// The selection names an id that is not in the catalog.
+    UnknownItem,
+    /// The selection names an item an admin disabled. Submit drops an admin-disabled item; save refuses it.
+    ItemDisabled,
 }
 
 impl fmt::Display for ProfileFault {
@@ -242,6 +254,8 @@ impl fmt::Display for ProfileFault {
             Self::Unowned => f.write_str(ERR_PROFILE_UNOWNED),
             Self::NotOwner => f.write_str("only the owner can change this profile"),
             Self::HasVersions => f.write_str("profile has versions and cannot be deleted"),
+            Self::UnknownItem => f.write_str(ERR_PROFILE_UNKNOWN_ITEM),
+            Self::ItemDisabled => f.write_str(ERR_PROFILE_ITEM_DISABLED),
         }
     }
 }
@@ -286,6 +300,7 @@ pub struct NewProfile {
     hash: ProfileHash,
     has_tools: bool,
     model: Option<String>,
+    selection: Vec<String>,
 }
 
 /// A validated Profile body without a name: the canonical JSON and its hash.
@@ -294,6 +309,7 @@ struct Body {
     hash: ProfileHash,
     has_tools: bool,
     model: Option<String>,
+    selection: Vec<String>,
 }
 
 /// Validates a profile name.
@@ -331,6 +347,7 @@ pub fn validate_create(
         hash,
         has_tools,
         model,
+        selection,
     } = validate_body(content)?;
     Ok(NewProfile {
         name: name.to_owned(),
@@ -338,6 +355,7 @@ pub fn validate_create(
         hash,
         has_tools,
         model,
+        selection,
     })
 }
 
@@ -355,6 +373,7 @@ fn validate_body(content: ProfileContent<'_>) -> Result<Body, ProfileFault> {
         canonical: profile.canonical_json(),
         hash: profile.hash(),
         has_tools: !profile.tools.is_empty(),
+        selection: profile.selection.ids().map(ToString::to_string).collect(),
         model: profile.model,
     })
 }
@@ -406,7 +425,11 @@ fn text_of(bytes: Vec<u8>) -> Result<String, StoreError> {
 ///
 /// Returns [`ProfileFault::Unowned`] with nothing written when `caller` is `None` or not a
 /// stored user, any validation fault of [`validate_create`], [`StoreError::ToolsNotGranted`]
-/// when the profile has tools and the owner lacks `profile:tools`,
+/// when the profile has `tools` and the owner lacks `profile:tools` (checked first, by
+/// `require_tools_grant`), then the selection faults in order: [`ProfileFault::UnknownItem`]
+/// when a selected id has no catalog row, [`ProfileFault::ItemDisabled`] when a selected item
+/// is admin-disabled, and [`StoreError::ToolsNotGranted`] when the selection names a `tool`
+/// catalog item and the owner lacks `profile:tools`,
 /// [`StoreError::ModelDenied`] when `allowlist` is set and the profile model is outside it, and
 /// a database error.
 pub async fn create_owned(
@@ -438,6 +461,7 @@ async fn store_version(
     if new.has_tools {
         require_tools_grant(&mut tx, owner).await?;
     }
+    check_selection(&mut tx, owner, &new.selection).await?;
     sqlx::query(INSERT_BLOB)
         .bind(new.hash.as_bytes().as_slice())
         .bind(new.canonical.as_slice())
@@ -461,6 +485,7 @@ async fn store_version(
         hash,
         has_tools,
         model,
+        selection,
     } = new;
     let stored = push_version(
         &mut tx,
@@ -470,6 +495,7 @@ async fn store_version(
             hash,
             has_tools,
             model,
+            selection,
         },
     )
     .await?;
@@ -562,8 +588,14 @@ async fn lock_for_owner(
 /// Returns [`ProfileFault::Unowned`] for a `None` caller, any validation fault of the
 /// content, [`StoreError::NotFound`] for an absent profile or a private one owned by someone
 /// else, [`ProfileFault::NotOwner`] for a shared one owned by someone else,
-/// [`StoreError::ToolsNotGranted`] when the content has tools and `caller` lacks
-/// `profile:tools`, [`StoreError::ModelDenied`] when `allowlist` is set and the model is outside
+/// [`StoreError::ToolsNotGranted`] when the content has `tools` and `caller` lacks
+/// `profile:tools` (checked first, by `require_tools_grant`), then the selection faults in
+/// order: [`ProfileFault::UnknownItem`] when a selected id has no catalog row,
+/// [`ProfileFault::ItemDisabled`] when a selected item is admin-disabled, and
+/// [`StoreError::ToolsNotGranted`] when the selection names a `tool` catalog item and
+/// `caller` lacks `profile:tools` (all inside the transaction after the `FOR UPDATE` lock on
+/// the profile row),
+/// [`StoreError::ModelDenied`] when `allowlist` is set and the model is outside
 /// it, and a database error. Every refusal writes nothing.
 pub async fn update_owned(
     pool: &PgPool,
@@ -582,6 +614,7 @@ pub async fn update_owned(
     if body.has_tools {
         require_tools_grant(&mut tx, caller).await?;
     }
+    check_selection(&mut tx, caller, &body.selection).await?;
     sqlx::query(INSERT_BLOB)
         .bind(body.hash.as_bytes().as_slice())
         .bind(body.canonical.as_slice())
@@ -826,6 +859,45 @@ async fn require_tools_grant(conn: &mut PgConnection, user: i64) -> Result<(), S
     } else {
         Err(StoreError::ToolsNotGranted)
     }
+}
+
+/// Checks a saved selection against the catalog on `conn`, in the save transaction.
+///
+/// One keyed read takes the named catalog rows `FOR SHARE`, so an admin edit in flight
+/// finishes first and a later one waits for the save. `ids` holds at most
+/// [`fleet_core::MAX_SELECTION`] distinct ids, so the read is bounded.
+///
+/// # Errors
+///
+/// [`ProfileFault::UnknownItem`] when an id has no catalog row, [`ProfileFault::ItemDisabled`]
+/// when a row is admin-disabled, [`StoreError::ToolsNotGranted`] when a `tool` row is named and
+/// `owner` lacks `profile:tools`, and a database error. The faults are reported in that order.
+async fn check_selection(
+    conn: &mut PgConnection,
+    owner: i64,
+    ids: &[String],
+) -> Result<(), StoreError> {
+    if ids.is_empty() {
+        return Ok(());
+    }
+    let rows = sqlx::query(LOCK_SELECTED)
+        .bind(ids)
+        .fetch_all(&mut *conn)
+        .await?;
+    if rows.len() != ids.len() {
+        return Err(ProfileFault::UnknownItem.into());
+    }
+    let mut has_tool = false;
+    for row in &rows {
+        if !row.try_get::<bool, _>("admin_enabled")? {
+            return Err(ProfileFault::ItemDisabled.into());
+        }
+        has_tool |= row.try_get::<String, _>("kind")? == "tool";
+    }
+    if has_tool && !read_tools_grant(conn, owner).await? {
+        return Err(StoreError::ToolsNotGranted);
+    }
+    Ok(())
 }
 
 /// Refuses with [`StoreError::ToolsNotGranted`] when `profile` has tools and `granted` is false.
