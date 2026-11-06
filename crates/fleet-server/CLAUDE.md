@@ -12,3 +12,24 @@
 - **Job owner default.** `jobs.user_id` is NOT NULL with `DEFAULT bootstrap_user_id()` (migration 0018). Every production insert (`store.rs`, `batches.rs`, `store/ci_retry.rs`) binds `user_id` and `agent`; only a raw `INSERT INTO jobs` in a test falls back to the default and lands on the `bootstrap` user, which the function creates on first use.
 - **Migration backfill tests.** Use `#[sqlx::test(migrations = false)]`, run a `Migrator` filtered to versions below the new one, insert old-shape rows, then run the full `sqlx::migrate!`.
 - **Recovery and reset tasks.** Enumerate every credential class of the user (passkeys, sessions, api tokens, setup codes) and test that each is revoked.
+
+## Catalog, capabilities and admin
+
+- **Admin RPCs sit outside both static token scopes.** `auth.rs` lets `FleetCatalogAdmin` (`UpsertCatalogItem`, `SetCatalogItemEnabled`) and `FleetCapabilityAdmin` (`GrantCapability`, `RevokeCapability`, `ListCapabilities`) through only for a per-user API token whose user has `users.is_admin`. The box token, `FLEET_CLIENT_TOKEN` and a non-admin token get `PERMISSION_DENIED`. `FleetCatalog.ListCatalog` is a client-scope read.
+- **Admin writes lock the actor row.** `catalog::upsert_item`, `catalog::set_enabled` and the `Capabilities` store read `is_admin` with `FOR SHARE` on the acting user in the write transaction, so a demotion in flight blocks or refuses the write. A new admin write path takes the same lock and does not trust the `Caller` flag read at authentication.
+- **A catalog item keeps its kind and name.** `upsert_item` validates through `fleet_core::catalog::CatalogItem::new`, stores the digest of the validated content and never touches `admin_enabled`. A changed kind or name for an existing id is `FAILED_PRECONDITION` and a second id with the same kind and name is `ALREADY_EXISTS`.
+- **The only capability is `profile:tools`.** `cred::capability::PROFILE_TOOLS` is the one name, and the table CHECK in migration 0026 allows only `profile:tools`. A new capability needs a migration and a constant.
+- **Admin pages repeat the gate.** `web/catalog.rs` and `web/capabilities.rs` start every route, GET and POST, with an admin gate that reads `users.is_admin` per request, and every POST checks the session CSRF token.
+- **`fleet-server admin` is the recovery path.** `cred/admin.rs` runs user create, passkey reset, admin grant and admin revoke by direct database access, each in one transaction with an `admin_audit` row.
+
+## Model allowlist
+
+- **`FLEET_MODEL_ALLOWLIST` is a comma-separated list of exact model ids.** `config.rs` parses it with `ModelAllowlist::parse`; nothing is trimmed and a bad list stops startup without echoing the value. Unset means every model passes.
+- **It is checked at profile create, update, submit, batch pin and blob serve.** `profiles::create_owned`, `profiles::update_owned`, `profiles::pin_for_submit` (reached from `store.rs`), `profiles::blob_for_lease` and `batches::pin_profiles` (through `profiles::require_model`) return `StoreError::ModelDenied`, which `service.rs` maps to `PERMISSION_DENIED`. A profile with no model passes. fleetd checks again with its own `model_allowlist`.
+
+## Timing
+
+- **`ReportTiming` is checked before any row is written.** `timing::store_timing` refuses with fixed reasons (`REASON_PARTS_SUM`, `REASON_SPAN_OUTSIDE`, `REASON_WINDOW_AHEAD`, `REASON_AGENT_WINDOW`, `REASON_SUMMARY_MISMATCH`), allows `WINDOW_TOLERANCE_MS` (30 s) of clock skew and needs a running lease that matches box, job and attempt. Spans are capped at `fleet_proto::MAX_SPANS` and shell commands at `MAX_SHELL_COMMANDS`.
+- **Shell logs are capped per job.** `report_shell_log` stores at most `MAX_LOG_COMMANDS_PER_JOB` commands and `MAX_LOG_BYTES_PER_JOB` (4 MiB) of chunks. `StreamShellLog` polls every `STREAM_POLL` and ends after `STREAM_MAX_WAIT` (600 s); the client reconnects with `from_seq`.
+- **`GetJobTiming` refuses an oversize reply.** `MAX_JOB_TIMING_REPLY_BYTES` derives from the stored caps, and `with_timing_reply_cap` shrinks it so a test can cross it.
+- **Timing pages scope by owner.** `web/timing.rs` serves `/jobs/{job_id}/timing` and `/jobs/{job_id}/shell/{command_id}/log`, and answers 404 for a job that is unknown or not the session user's.

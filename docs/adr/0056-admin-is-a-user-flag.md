@@ -1,6 +1,6 @@
 # Admin is a user flag
 
-Status: Proposed 2026-11-04. Not built. Amends ADR-0023, ADR-0042 and ADR-0054. Builds on ADR-0042.
+Status: Proposed 2026-11-04. Built: migration 0028 adds `users.is_admin`, `auth.rs` gates the two admin services on it, and the catalog, capability and `fleet-server admin` paths read it. Amends ADR-0023, ADR-0042 and ADR-0054. Builds on ADR-0042.
 
 ADR-0042 creates "the admin" at setup but stores no admin concept: the first user is a user like any other, and recovery runs as a database operator. ADR-0054 needs admin grants and the catalog and capability RPC services need a caller they can trust. The static client token carries no identity, and the capability table cannot hold an admin role. This ADR stores admin as one flag on the user and fixes who can set it.
 

@@ -1,6 +1,6 @@
 # Profile ownership and visibility
 
-Status: Proposed 2026-11-02. Not built. Amends ADR-0034 (Profiles have no owner), ADR-0035 (profile RPCs and storage are unscoped) and ADR-0048 (the `tools` gate meets owner scoping). Builds on ADR-0042 (users and Job ownership).
+Status: Proposed 2026-11-02. Built: migration 0023 gives each Profile an `owner_user_id` and a `visibility`, and `profiles::create_owned`, `ShareProfile` and `UnshareProfile` scope by them. Amends ADR-0034 (Profiles have no owner), ADR-0035 (profile RPCs and storage are unscoped) and ADR-0048 (the `tools` gate meets owner scoping). Builds on ADR-0042 (users and Job ownership).
 
 ADR-0034 and ADR-0035 store Profiles by name with no owner. Any client caller lists, reads and creates any Profile. ADR-0042 made Jobs and credentials owner-scoped but left Profiles out. With several users, one user can read another user's prompt text and context files, and nothing says who may change a name. This ADR gives each Profile an owner and a visibility.
 
