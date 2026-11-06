@@ -2,6 +2,7 @@
 //! served over `file://`, and reports `SUCCEEDED` with a pull request url. Own test binary
 //! because it spawns children and binds sockets.
 
+use std::fmt::Write as _;
 use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 use std::process::Command;
@@ -70,6 +71,7 @@ struct Worker {
     reports: mpsc::UnboundedSender<(String, ReportJobRequest)>,
     blob: Option<GetProfileBlobReply>,
     blob_requests: Mutex<Vec<(String, GetProfileBlobRequest)>>,
+    credentials: Vec<fleet_proto::v1::JobCredential>,
 }
 
 struct Served {
@@ -155,19 +157,7 @@ impl FleetWorker for Stub {
         _request: Request<fleet_proto::v1::GetJobCredentialsRequest>,
     ) -> Result<Response<fleet_proto::v1::GetJobCredentialsReply>, Status> {
         Ok(Response::new(fleet_proto::v1::GetJobCredentialsReply {
-            credentials: [
-                ("github_pat", "holder-pat-0123456789abcdef"),
-                ("anthropic_api_key", "agent-key-0123456789abcdef"),
-            ]
-            .into_iter()
-            .map(|(kind, value)| fleet_proto::v1::JobCredential {
-                kind: kind.into(),
-                shape: "static_secret".into(),
-                value: value.into(),
-                expires_at_ms: None,
-                git_identity: None,
-            })
-            .collect(),
+            credentials: self.0.credentials.clone(),
         }))
     }
 
@@ -193,6 +183,23 @@ impl FleetWorker for Stub {
     ) -> Result<Response<fleet_proto::v1::ReportTimingReply>, Status> {
         Err(Status::unimplemented("not used"))
     }
+}
+
+fn credential(kind: &str, value: &str) -> fleet_proto::v1::JobCredential {
+    fleet_proto::v1::JobCredential {
+        kind: kind.into(),
+        shape: "static_secret".into(),
+        value: value.into(),
+        expires_at_ms: None,
+        git_identity: None,
+    }
+}
+
+fn pat_credentials() -> Vec<fleet_proto::v1::JobCredential> {
+    vec![
+        credential("github_pat", "holder-pat-0123456789abcdef"),
+        credential("anthropic_api_key", "agent-key-0123456789abcdef"),
+    ]
 }
 
 fn script(dir: &Path, name: &str, body: &str) -> Result<std::path::PathBuf, std::io::Error> {
@@ -254,6 +261,33 @@ async fn launch_full(
     extra: &str,
     profile: Option<Served>,
 ) -> Result<Launched, Box<dyn std::error::Error>> {
+    let forge = Forge {
+        gh: GH,
+        credentials: pat_credentials(),
+        token_host: false,
+    };
+    launch_all(dir, agent, forge, repo, extra, profile).await
+}
+
+struct Forge<'a> {
+    gh: &'a str,
+    credentials: Vec<fleet_proto::v1::JobCredential>,
+    token_host: bool,
+}
+
+async fn launch_all(
+    dir: &TempDir,
+    agent: &str,
+    forge: Forge<'_>,
+    repo: Option<String>,
+    extra: &str,
+    profile: Option<Served>,
+) -> Result<Launched, Box<dyn std::error::Error>> {
+    let Forge {
+        gh: gh_script,
+        credentials,
+        token_host,
+    } = forge;
     let origin = dir.path().join("origin.git");
     let seed = dir.path().join("seed");
     std::fs::create_dir(&origin)?;
@@ -270,7 +304,7 @@ async fn launch_full(
     let bin = dir.path().join("bin");
     std::fs::create_dir(&bin)?;
     let claude = script(&bin, "claude", agent)?;
-    let gh = script(&bin, "gh", GH)?;
+    let gh = script(&bin, "gh", gh_script)?;
 
     let (reports, inbox) = mpsc::unbounded_channel();
     let worker = Arc::new(Worker {
@@ -296,6 +330,7 @@ async fn launch_full(
             catalog: Vec::new(),
         }),
         blob_requests: Mutex::new(Vec::new()),
+        credentials,
     });
     let listener = TcpListener::bind(("127.0.0.1", 0)).await?;
     let url = format!("http://{}", listener.local_addr()?);
@@ -319,6 +354,9 @@ async fn launch_full(
     let mut config = Config::resolve(Some(&file), &|_| None)?;
     config.allow_file_repos = true;
     config.repo_hosts.clear();
+    if token_host {
+        config.repo_hosts.push("github.com".into());
+    }
     let env = move |name: &str| match name {
         "FLEET_SERVER_URL" => Some(url.clone()),
         "FLEET_TOKEN" => Some(TOKEN.to_owned()),
@@ -792,6 +830,249 @@ async fn a_tool_hook_posted_to_the_daemon_socket_reaches_the_running_jobs_teleme
         let _ = stop.send(());
         tokio::time::timeout(Duration::from_secs(30), daemon).await???;
         server.abort();
+        Ok(())
+    }))
+    .await
+}
+
+const APP_TOKEN: &str = "ghs_AbCdEfGhIjKlMnOpQrStUvWxYz0123456789";
+const PAT_TOKEN: &str = "holder-pat-0123456789abcdef";
+const BOT_NAME: &str = "fleet-bot[bot]";
+const BOT_EMAIL: &str = "123456+fleet-bot[bot]@users.noreply.github.com";
+
+const FORGE_AGENT: &str = r#"#!/bin/sh
+[ "$1" = --version ] && { echo '2.0.0 (Claude Code)'; exit 0; }
+env > @ENV@
+printf '%s\n' "$@" > @ARGV@
+echo fake-agent-output > hello.txt
+git add hello.txt
+git commit -q -m "add hello.txt"
+"#;
+
+const FORGE_GH: &str = r#"#!/bin/sh
+if [ "$1" = pr ] && [ "$2" = checks ]; then
+  echo '[{"bucket":"pass","link":"https://example.invalid/actions/runs/9/job/41","name":"build"}]'
+  exit 0
+fi
+if [ "$1" = pr ] && [ "$2" = create ]; then
+  curl -s -X POST -H "Authorization: Bearer $GH_TOKEN" -d '{"title":"t"}' "http://127.0.0.1:@PORT@/repos/e2e/repo/pulls" | sed -n 's/.*"html_url":"\([^"]*\)".*/\1/p'
+  exit 0
+fi
+echo created
+echo https://example.invalid/pr/9
+"#;
+
+type Seen = Arc<Mutex<Vec<(String, String)>>>;
+
+fn fake_rest() -> Result<(u16, Seen), Box<dyn std::error::Error>> {
+    use std::io::{Read, Write};
+    let listener = std::net::TcpListener::bind(("127.0.0.1", 0))?;
+    let port = listener.local_addr()?.port();
+    let seen: Seen = Arc::default();
+    let sink = Arc::clone(&seen);
+    std::thread::spawn(move || {
+        for stream in listener.incoming() {
+            let Ok(mut stream) = stream else { continue };
+            let _ = stream.set_read_timeout(Some(Duration::from_secs(10)));
+            let mut raw = Vec::new();
+            let mut buf = [0_u8; 1024];
+            while let Ok(n) = stream.read(&mut buf) {
+                if n == 0 {
+                    break;
+                }
+                raw.extend_from_slice(buf.get(..n).unwrap_or_default());
+                let text = String::from_utf8_lossy(&raw).into_owned();
+                if let Some((head, body)) = text.split_once("\r\n\r\n") {
+                    let want = head
+                        .lines()
+                        .find_map(|l| {
+                            l.to_ascii_lowercase()
+                                .strip_prefix("content-length:")
+                                .map(|v| v.trim().parse::<usize>().unwrap_or(0))
+                        })
+                        .unwrap_or(0);
+                    if body.len() >= want {
+                        break;
+                    }
+                }
+            }
+            let text = String::from_utf8_lossy(&raw).into_owned();
+            let auth = text
+                .lines()
+                .find_map(|l| l.strip_prefix("Authorization: ").map(str::to_owned))
+                .unwrap_or_default();
+            let body = text
+                .split_once("\r\n\r\n")
+                .map(|(_, b)| b.to_owned())
+                .unwrap_or_default();
+            sink.lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .push((auth, body));
+            let reply = format!("{{\"html_url\":\"{PR_URL}\"}}");
+            let _ = write!(
+                stream,
+                "HTTP/1.1 201 Created\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{reply}",
+                reply.len()
+            );
+        }
+    });
+    Ok((port, seen))
+}
+
+struct ForgeRun {
+    authors: String,
+    committers: String,
+    history: String,
+    agent_env: String,
+    agent_argv: String,
+    reports: String,
+    pr_url: Option<String>,
+    rest: Vec<(String, String)>,
+}
+
+async fn forge_run(
+    credentials: Vec<fleet_proto::v1::JobCredential>,
+) -> Result<ForgeRun, Box<dyn std::error::Error>> {
+    let dir = TempDir::new()?;
+    let (port, seen) = fake_rest()?;
+    let env_file = dir.path().join("agent.env");
+    let argv_file = dir.path().join("agent.argv");
+    let agent = FORGE_AGENT
+        .replace("@ENV@", &env_file.to_string_lossy())
+        .replace("@ARGV@", &argv_file.to_string_lossy());
+    let gh = FORGE_GH.replace("@PORT@", &port.to_string());
+    let Launched {
+        mut inbox,
+        stop,
+        daemon,
+        server,
+        origin,
+        ..
+    } = launch_all(
+        &dir,
+        &agent,
+        Forge {
+            gh: &gh,
+            credentials,
+            token_host: true,
+        },
+        None,
+        "",
+        None,
+    )
+    .await?;
+    let mut reports = String::new();
+    let terminal = tokio::time::timeout(Duration::from_secs(60), async {
+        while let Some((_, report)) = inbox.recv().await {
+            let _ = write!(reports, "{report:?}");
+            if report.terminal_state.is_some() {
+                return Some(report);
+            }
+        }
+        None
+    })
+    .await?
+    .ok_or("no terminal report")?;
+    assert_eq!(
+        terminal.terminal_state,
+        Some(JobState::Succeeded.into()),
+        "{terminal:?}"
+    );
+    let _ = stop.send(());
+    tokio::time::timeout(Duration::from_secs(30), daemon).await???;
+    server.abort();
+    let log = |format: &str| {
+        git(
+            &origin,
+            &["log", "-1", &format!("--format={format}"), "swarm/job1"],
+        )
+    };
+    let history = format!(
+        "{}{}{}",
+        git(&origin, &["log", "--all", "-p", "--format=fuller"])?,
+        git(&origin, &["config", "--list"])?,
+        git(&origin, &["for-each-ref"])?,
+    );
+    let rest = seen.lock().unwrap_or_else(PoisonError::into_inner).clone();
+    Ok(ForgeRun {
+        authors: log("%an|%ae")?.trim().to_owned(),
+        committers: log("%cn|%ce")?.trim().to_owned(),
+        history,
+        agent_env: std::fs::read_to_string(&env_file)?,
+        agent_argv: std::fs::read_to_string(&argv_file)?,
+        reports,
+        pr_url: terminal.pr_url,
+        rest,
+    })
+}
+
+#[tokio::test]
+async fn an_app_job_commits_as_the_bot_and_the_token_reaches_only_the_forge_call() -> TestResult {
+    common::bounded(Box::pin(async {
+        let mut app = credential("github_installation_token", APP_TOKEN);
+        app.expires_at_ms = Some(4_000_000_000_000);
+        app.git_identity = Some(fleet_proto::v1::GitIdentity {
+            name: BOT_NAME.into(),
+            email: BOT_EMAIL.into(),
+        });
+        let run = forge_run(vec![
+            app,
+            credential("anthropic_api_key", "agent-key-0123456789abcdef"),
+        ])
+        .await?;
+        let bot = format!("{BOT_NAME}|{BOT_EMAIL}");
+        assert_eq!(run.authors, bot);
+        assert_eq!(run.committers, bot);
+        assert!(
+            run.agent_env
+                .contains(&format!("GIT_AUTHOR_NAME={BOT_NAME}\n")),
+            "{}",
+            run.agent_env
+        );
+        assert!(
+            run.agent_env
+                .contains(&format!("GIT_COMMITTER_EMAIL={BOT_EMAIL}\n"))
+        );
+        assert_eq!(run.pr_url.as_deref(), Some(PR_URL));
+        assert_eq!(run.rest.len(), 1, "{:?}", run.rest);
+        assert_eq!(run.rest[0].0, format!("Bearer {APP_TOKEN}"));
+        for (place, text) in [
+            ("repo", &run.history),
+            ("agent env", &run.agent_env),
+            ("agent argv", &run.agent_argv),
+            ("reports", &run.reports),
+        ] {
+            assert!(!text.contains(APP_TOKEN), "{place}");
+            assert!(!text.contains("ghs_"), "{place}");
+        }
+        Ok(())
+    }))
+    .await
+}
+
+#[tokio::test]
+async fn a_pat_job_in_the_same_harness_keeps_the_fixed_identity() -> TestResult {
+    common::bounded(Box::pin(async {
+        let run = forge_run(pat_credentials()).await?;
+        let fixed = format!(
+            "{}|{}",
+            fleetd::agent_config::JOB_NAME,
+            fleetd::agent_config::JOB_EMAIL
+        );
+        assert_eq!(run.authors, fixed);
+        assert_eq!(run.committers, fixed);
+        assert!(!run.agent_env.contains(BOT_NAME));
+        assert_eq!(run.pr_url.as_deref(), Some(PR_URL));
+        assert_eq!(run.rest.len(), 1, "{:?}", run.rest);
+        assert_eq!(run.rest[0].0, format!("Bearer {PAT_TOKEN}"));
+        for (place, text) in [
+            ("repo", &run.history),
+            ("agent env", &run.agent_env),
+            ("agent argv", &run.agent_argv),
+            ("reports", &run.reports),
+        ] {
+            assert!(!text.contains(PAT_TOKEN), "{place}");
+        }
         Ok(())
     }))
     .await

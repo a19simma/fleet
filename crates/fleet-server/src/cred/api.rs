@@ -102,10 +102,12 @@ impl CredentialService {
     ///
     /// `INVALID_ARGUMENT` for an unknown kind, an unsupported shape, an invalid value or a
     /// token GitHub refuses (a `github_app` value must be a `u64` installation id with no
-    /// leading zero), `PERMISSION_DENIED` with `ERR_CAPABILITY_NOT_GRANTED` when the kind
-    /// needs a capability the user lacks (the check runs at save, under `FOR SHARE`),
-    /// `RESOURCE_EXHAUSTED` past the per-user cap, `UNAVAILABLE` when GitHub or storage cannot
-    /// answer. Nothing is stored on any error.
+    /// leading zero) or an expiry outside the allowed range, `PERMISSION_DENIED` with
+    /// `ERR_CAPABILITY_NOT_GRANTED` when the kind needs a capability the user lacks (the check
+    /// runs at save, under `FOR SHARE`),
+    /// `RESOURCE_EXHAUSTED` past the per-user cap, `INTERNAL` when the value cannot be sealed
+    /// or a stored kind is unknown,
+    /// `UNAVAILABLE` when GitHub or storage cannot answer. Nothing is stored on any error.
     pub async fn put(
         &self,
         user_id: i64,
@@ -171,7 +173,7 @@ impl CredentialService {
     ///
     /// # Errors
     ///
-    /// `UNAVAILABLE` when storage fails.
+    /// `INTERNAL` when a stored kind is unknown, `UNAVAILABLE` when storage fails.
     pub async fn list(&self, user_id: i64) -> Result<ListCredentialsReply, Status> {
         let credentials = self
             .store
@@ -188,7 +190,8 @@ impl CredentialService {
     ///
     /// # Errors
     ///
-    /// `NOT_FOUND` when the id is unknown or belongs to another user.
+    /// `NOT_FOUND` when the id is unknown or belongs to another user, `UNAVAILABLE` when
+    /// storage fails.
     pub async fn delete(
         &self,
         user_id: i64,
@@ -209,10 +212,18 @@ impl CredentialService {
     /// # Errors
     ///
     /// `PERMISSION_DENIED` with `lease does not match` for any lease mismatch, and with
-    /// `ERR_CAPABILITY_NOT_GRANTED` when the owner lost the capability a stored kind needs,
+    /// `ERR_CAPABILITY_NOT_GRANTED` when the owner lost the capability a stored kind needs.
+    ///
     /// `FAILED_PRECONDITION` with `PRECONDITION_APP_MINT` when the App token cannot be minted,
     /// and with another message when the owner has no GitHub credential, no credential the
-    /// agent accepts, or a needed credential is expired, `UNAVAILABLE` when storage fails. Nothing is recorded on error.
+    /// agent accepts, or a needed credential is expired.
+    ///
+    /// `NOT_FOUND` when a credential row vanishes during release.
+    ///
+    /// `INTERNAL` when a sealed value cannot be opened, a stored kind is unknown or a value is
+    /// not text.
+    ///
+    /// `UNAVAILABLE` when storage fails. Nothing is recorded on error.
     pub async fn job_credentials(
         &self,
         job_id: &str,
@@ -256,7 +267,9 @@ impl CredentialService {
     /// `NOT_FOUND` for an unknown or foreign id, `FAILED_PRECONDITION` for a kind without a
     /// verifier and, for `github_app`, when the user has no Job to scope the mint to,
     /// `PERMISSION_DENIED` with `ERR_CAPABILITY_NOT_GRANTED` when a `github_app` owner lacks
-    /// the capability, `UNAVAILABLE` when GitHub or storage cannot answer.
+    /// the capability, `INTERNAL` when a sealed value cannot be opened or a stored kind is
+    /// unknown, `UNAVAILABLE`
+    /// when GitHub or storage cannot answer.
     pub async fn verify(
         &self,
         user_id: i64,
