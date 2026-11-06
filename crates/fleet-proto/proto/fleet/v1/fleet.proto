@@ -786,12 +786,20 @@ message GetProfileRequest {
   optional uint32 version = 2;
 }
 
+// A profile version. GetProfile fills owner, visibility, selection and authored_prompt for
+// the returned version: owner is the owner's display name, never the user id, selection holds
+// at most MAX_SELECTION switched-off entries and authored_prompt is empty when the version sets
+// none. CreateProfile leaves the four fields unset.
 message ProfileVersion {
   string name = 1;
   uint32 version = 2;
   string hash = 3;
   string content_json = 4;
   bool created = 5;
+  string owner = 6;
+  ProfileVisibility visibility = 7;
+  repeated SelectionEntry selection = 8;
+  string authored_prompt = 9;
 }
 
 message ListProfilesRequest {
@@ -799,10 +807,14 @@ message ListProfilesRequest {
   optional string after_name = 2;
 }
 
+// owner is the owner's display name, never the user id. The reader sees a profile only when
+// it is the reader's own or shared.
 message ProfileSummary {
   string name = 1;
   uint32 latest_version = 2;
   string hash = 3;
+  string owner = 4;
+  ProfileVisibility visibility = 5;
 }
 
 message ListProfilesReply {

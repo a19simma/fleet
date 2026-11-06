@@ -1559,3 +1559,208 @@ async fn share_rpc_maps_owner_not_owner_and_missing(pool: PgPool) {
     let id = profile_id(&pool, alice, "alpha").await;
     assert_eq!(visibility_of(&pool, id).await, "private");
 }
+
+const RICH: &str = r#"{"authored_prompt":"be brief","selection":[{"enabled":false,"item_id":"skill-b"},{"enabled":false,"item_id":"skill-a"}]}"#;
+
+fn off(id: &str) -> fleet_proto::v1::SelectionEntry {
+    fleet_proto::v1::SelectionEntry {
+        item_id: id.to_owned(),
+        enabled: false,
+    }
+}
+
+async fn read(
+    pool: &PgPool,
+    viewer: Viewer,
+    name: &str,
+    version: Option<u32>,
+) -> Result<fleet_proto::v1::ProfileVersion, StoreError> {
+    profiles::get_for(pool, viewer, name, version).await
+}
+
+#[sqlx::test]
+async fn get_returns_owner_visibility_selection_and_prompt(pool: PgPool) {
+    use fleet_proto::v1::ProfileVisibility;
+    store(pool.clone()).await;
+    let alice = user(&pool, "alice").await;
+    let bob = user(&pool, "bob").await;
+    put(&pool, alice, RICH).await;
+    let own = read(&pool, Viewer::User(alice), "alpha", None)
+        .await
+        .unwrap();
+    assert_eq!(own.owner, "alice");
+    assert_eq!(own.visibility, ProfileVisibility::Private as i32);
+    assert_eq!(own.selection, vec![off("skill-a"), off("skill-b")]);
+    assert_eq!(own.authored_prompt, "be brief");
+    assert!(!own.created);
+    assert!(read(&pool, Viewer::User(bob), "alpha", None).await.is_err());
+    profiles::share_owned(&pool, Some(alice), "alpha")
+        .await
+        .unwrap();
+    for viewer in [Viewer::User(bob), Viewer::Shared, Viewer::User(alice)] {
+        let seen = read(&pool, viewer, "alpha", Some(1)).await.unwrap();
+        assert_eq!(seen.owner, "alice");
+        assert_eq!(seen.visibility, ProfileVisibility::Shared as i32);
+        assert_eq!(seen.selection, own.selection);
+        assert_eq!(seen.authored_prompt, "be brief");
+    }
+    assert_eq!(
+        read(&pool, Viewer::User(bob), "alpha", None).await.unwrap(),
+        read(&pool, Viewer::User(alice), "alpha", None)
+            .await
+            .unwrap()
+    );
+}
+
+#[sqlx::test]
+async fn get_fields_follow_the_requested_version(pool: PgPool) {
+    store(pool.clone()).await;
+    let alice = user(&pool, "alice").await;
+    put(&pool, alice, RICH).await;
+    put(&pool, alice, OWNED).await;
+    let first = read(&pool, Viewer::User(alice), "alpha", Some(1))
+        .await
+        .unwrap();
+    let latest = read(&pool, Viewer::User(alice), "alpha", None)
+        .await
+        .unwrap();
+    assert_eq!(
+        (first.version, first.authored_prompt.as_str()),
+        (1, "be brief")
+    );
+    assert_eq!(first.selection.len(), 2);
+    assert_eq!(latest.version, 2);
+    assert_eq!(latest.authored_prompt, "");
+    assert_eq!(
+        latest.selection,
+        Vec::<fleet_proto::v1::SelectionEntry>::new()
+    );
+}
+
+#[sqlx::test]
+async fn list_returns_owner_and_visibility_per_row(pool: PgPool) {
+    use fleet_proto::v1::ProfileVisibility::{Private, Shared};
+    store(pool.clone()).await;
+    let alice = user(&pool, "alice").await;
+    let bob = user(&pool, "bob").await;
+    owned(&pool, Some(alice), "alpha", OWNED).await.unwrap();
+    owned(&pool, Some(bob), "beta", OWNED).await.unwrap();
+    owned(&pool, Some(bob), "gamma", OWNED).await.unwrap();
+    owned(&pool, Some(alice), "gamma", RICH).await.unwrap();
+    for (owner, name) in [(bob, "beta"), (bob, "gamma")] {
+        profiles::share_owned(&pool, Some(owner), name)
+            .await
+            .unwrap();
+    }
+    let rows = |viewer| {
+        let pool = pool.clone();
+        async move {
+            profiles::list_for(&pool, viewer, 0, None)
+                .await
+                .unwrap()
+                .profiles
+                .into_iter()
+                .map(|p| (p.name, p.owner, p.visibility))
+                .collect::<Vec<_>>()
+        }
+    };
+    let row = |name: &str, owner: &str, vis: fleet_proto::v1::ProfileVisibility| {
+        (name.to_owned(), owner.to_owned(), vis as i32)
+    };
+    assert_eq!(
+        rows(Viewer::User(alice)).await,
+        vec![
+            row("alpha", "alice", Private),
+            row("beta", "bob", Shared),
+            row("gamma", "alice", Private),
+        ]
+    );
+    assert_eq!(
+        rows(Viewer::User(bob)).await,
+        vec![row("beta", "bob", Shared), row("gamma", "bob", Shared)]
+    );
+    assert_eq!(
+        rows(Viewer::Shared).await,
+        vec![row("beta", "bob", Shared), row("gamma", "bob", Shared)]
+    );
+}
+
+#[sqlx::test]
+async fn a_hostile_owner_name_is_returned_verbatim(pool: PgPool) {
+    store(pool.clone()).await;
+    let hostile = "al\"\r\n\u{85}\u{2028}\u{202e}<b>\\\u{1f600}";
+    let owner = user(&pool, hostile).await;
+    put(&pool, owner, OWNED).await;
+    profiles::share_owned(&pool, Some(owner), "alpha")
+        .await
+        .unwrap();
+    let got = read(&pool, Viewer::Shared, "alpha", None).await.unwrap();
+    assert_eq!(got.owner, hostile);
+    let listed = profiles::list_for(&pool, Viewer::Shared, 0, None)
+        .await
+        .unwrap();
+    assert_eq!(listed.profiles[0].owner, hostile);
+}
+
+#[sqlx::test]
+async fn not_visible_and_absent_profiles_give_one_status_over_rpc(pool: PgPool) {
+    let store = store(pool.clone()).await;
+    let alice = user(&pool, "alice").await;
+    put(&pool, alice, RICH).await;
+    let mut client = spawn(&pool, &store);
+    let hidden = timeout(
+        WAIT,
+        client.get_profile(GetProfileRequest {
+            name: "alpha".to_owned(),
+            version: None,
+        }),
+    )
+    .await
+    .unwrap()
+    .unwrap_err();
+    let absent = timeout(
+        WAIT,
+        client.get_profile(GetProfileRequest {
+            name: "ghost".to_owned(),
+            version: None,
+        }),
+    )
+    .await
+    .unwrap()
+    .unwrap_err();
+    assert_eq!(hidden.code(), Code::NotFound);
+    assert_eq!(hidden.code(), absent.code());
+    assert_eq!(hidden.message(), absent.message());
+    profiles::share_owned(&pool, Some(alice), "alpha")
+        .await
+        .unwrap();
+    let seen = timeout(
+        WAIT,
+        client.get_profile(GetProfileRequest {
+            name: "alpha".to_owned(),
+            version: None,
+        }),
+    )
+    .await
+    .unwrap()
+    .unwrap()
+    .into_inner();
+    assert_eq!(seen.owner, "alice");
+    assert_eq!(seen.authored_prompt, "be brief");
+    let listed = timeout(
+        WAIT,
+        client.list_profiles(ListProfilesRequest {
+            limit: 0,
+            after_name: None,
+        }),
+    )
+    .await
+    .unwrap()
+    .unwrap()
+    .into_inner();
+    assert_eq!(listed.profiles[0].owner, "alice");
+    assert_eq!(
+        listed.profiles[0].visibility,
+        fleet_proto::v1::ProfileVisibility::Shared as i32
+    );
+}

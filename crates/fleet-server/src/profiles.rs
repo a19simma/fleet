@@ -1,14 +1,18 @@
 //! Profile storage: insert-only blobs and named versions behind `FleetProfiles`.
 
 use std::fmt::{self, Write};
+use std::str::FromStr;
 
 use fleet_core::catalog::{CatalogEntry, CatalogItem, MAX_CATALOG, RunnerKind, resolve};
-use fleet_core::{Profile, ProfileError, ProfileHash, ProfileInvalid};
+use fleet_core::{Profile, ProfileError, ProfileHash, ProfileInvalid, Visibility};
 use fleet_proto::v1::{
     GetProfileBlobReply, ListProfilesReply, Profile as WireProfile, ProfileRef, ProfileSummary,
     ProfileVersion, ProfileVisibility,
 };
-use fleet_proto::{ERR_PROFILE_CONTENT_CHOICE, ERR_PROFILE_TOOLS_DISABLED, MAX_PROFILE_JSON_BYTES};
+use fleet_proto::{
+    ERR_PROFILE_CONTENT_CHOICE, ERR_PROFILE_TOOLS_DISABLED, MAX_PROFILE_JSON_BYTES,
+    selection_to_wire, visibility_to_wire,
+};
 use sqlx::{PgConnection, PgPool, Row};
 
 use crate::jobs::{JobInvalid, Snapshot, kind_of};
@@ -159,9 +163,12 @@ const SELECT_VERSION_BY_HASH: &str =
 const INSERT_VERSION: &str = "INSERT INTO profile_version (profile_id, version, hash) \
      SELECT $1, COALESCE(MAX(version), 0) + 1, $2 FROM profile_version WHERE profile_id = $1 \
      RETURNING version";
-const SELECT_VISIBLE: &str = "SELECT v.version, v.hash, b.content FROM \
-     (SELECT id FROM profile WHERE name = $1 AND (owner_user_id = $2 OR visibility = 'shared') \
+const SELECT_VISIBLE: &str = "SELECT v.version, v.hash, b.content, p.visibility, \
+     u.username AS owner FROM \
+     (SELECT id, owner_user_id, visibility FROM profile \
+      WHERE name = $1 AND (owner_user_id = $2 OR visibility = 'shared') \
       ORDER BY (owner_user_id = $2) DESC NULLS LAST, id LIMIT 1) p \
+     JOIN users u ON u.id = p.owner_user_id \
      JOIN profile_version v ON v.profile_id = p.id \
      JOIN profile_blob b ON b.hash = v.hash \
      WHERE $3::int IS NULL OR v.version = $3 ORDER BY v.version DESC LIMIT 1";
@@ -180,7 +187,9 @@ const SELECT_LEASED_BLOB: &str = "SELECT j.profile_name, j.profile_version, j.pr
      LEFT JOIN profile_blob b ON b.hash = j.profile_hash \
      WHERE j.job_id = $1 AND j.attempt = $2 AND j.box = $3 AND j.state = 'RUNNING' \
      AND j.lease_expires_at > now()";
-const LIST: &str = "SELECT DISTINCT ON (p.name) p.name, v.version, v.hash FROM profile p \
+const LIST: &str = "SELECT DISTINCT ON (p.name) p.name, v.version, v.hash, p.visibility, \
+     u.username AS owner FROM profile p \
+     JOIN users u ON u.id = p.owner_user_id \
      JOIN profile_version v ON v.profile_id = p.id \
      WHERE ($1::text IS NULL OR p.name > $1) \
      AND (p.owner_user_id = $3 OR p.visibility = 'shared') \
@@ -424,6 +433,7 @@ fn version_reply(name: String, stored: Stored) -> Result<ProfileVersion, StoreEr
         hash: stored.body.hash.to_string(),
         content_json: text_of(stored.body.canonical)?,
         created: stored.created,
+        ..ProfileVersion::default()
     })
 }
 
@@ -580,13 +590,29 @@ pub async fn get_for(
         .fetch_optional(pool)
         .await?
         .ok_or(StoreError::NotFound)?;
+    let content = row.try_get::<Vec<u8>, _>("content")?;
+    let stored = Profile::from_stored_json(&content)
+        .map_err(|_| StoreError::OutOfRange("profile content"))?;
     Ok(ProfileVersion {
         name: name.to_owned(),
         version: version_of(row.try_get("version")?)?,
         hash: hex(&row.try_get::<Vec<u8>, _>("hash")?),
-        content_json: text_of(row.try_get("content")?)?,
+        content_json: text_of(content)?,
         created: false,
+        owner: row.try_get("owner")?,
+        visibility: wire_visibility(&row.try_get::<String, _>("visibility")?)?,
+        selection: selection_to_wire(&stored.selection),
+        authored_prompt: stored
+            .authored_prompt
+            .map(|text| text.as_str().to_owned())
+            .unwrap_or_default(),
     })
+}
+
+fn wire_visibility(text: &str) -> Result<i32, StoreError> {
+    Visibility::from_str(text)
+        .map(|visibility| visibility_to_wire(visibility) as i32)
+        .map_err(|_| StoreError::OutOfRange("profile visibility"))
 }
 
 pub(crate) async fn blob_for_lease(
@@ -758,6 +784,8 @@ pub async fn list_for(
                 name: row.try_get("name")?,
                 latest_version: version_of(row.try_get("version")?)?,
                 hash: hex(&row.try_get::<Vec<u8>, _>("hash")?),
+                owner: row.try_get("owner")?,
+                visibility: wire_visibility(&row.try_get::<String, _>("visibility")?)?,
             })
         })
         .collect::<Result<Vec<_>, StoreError>>()?;

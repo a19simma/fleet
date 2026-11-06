@@ -273,6 +273,7 @@ mod tests {
                     name: format!("{next:08}"),
                     latest_version: 1,
                     hash: String::new(),
+                    ..ProfileSummary::default()
                 }]))
             },
             &Scrub::default(),
@@ -328,6 +329,7 @@ mod tests {
                         name: laden(),
                         latest_version: 1,
                         hash: laden(),
+                        ..ProfileSummary::default()
                     }]
                 };
                 done = true;
