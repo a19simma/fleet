@@ -118,7 +118,12 @@ async fn credential_service(
     let github = HttpsGithub::new()?;
     let mut store = CredentialStore::new(pool.clone(), sealer);
     if let (Some(key), Some(app)) = (github_app, config.github_app.as_ref()) {
-        store = store.with_github_app(AppLane::new(key, app.app_id_text(), AppClient::new()?));
+        store = store.with_github_app(AppLane::new(
+            key,
+            app.app_id_text(),
+            AppClient::new()?,
+            app.bot.clone(),
+        ));
     }
     Ok(Some(CredentialService::new(store, Arc::new(github))))
 }

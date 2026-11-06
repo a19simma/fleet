@@ -206,6 +206,9 @@ pub const GITHUB_INSTALLATION_TOKEN_KIND: &str = "github_installation_token";
 /// every cause.
 pub const PRECONDITION_APP_MINT: &str = "github app token unavailable";
 
+/// `FAILED_PRECONDITION` message: a `github_app` verify has no Job repository to scope its mint to.
+pub const PRECONDITION_NO_VERIFY_REPO: &str = "no job to verify the github app against";
+
 /// `FAILED_PRECONDITION` message: the server runs without a credential store.
 pub const PRECONDITION_NOT_CONFIGURED: &str = "credentials are not configured";
 
@@ -406,6 +409,8 @@ impl std::fmt::Debug for v1::JobCredential {
             .field("kind", &self.kind)
             .field("shape", &self.shape)
             .field("value", &"<redacted>")
+            .field("expires_at_ms", &self.expires_at_ms)
+            .field("git_identity", &self.git_identity)
             .finish()
     }
 }

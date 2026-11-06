@@ -22,8 +22,9 @@ use fleet_core::credential::{
 use fleet_proto::v1::fleet_worker_client::FleetWorkerClient;
 use fleet_proto::v1::{GetJobCredentialsReply, GetJobCredentialsRequest};
 use fleet_proto::{
-    MAX_CREDENTIAL_VALUE_BYTES, MAX_CREDENTIALS_PER_USER, PRECONDITION_EXPIRED,
-    PRECONDITION_NO_AGENT, PRECONDITION_NO_GITHUB, PRECONDITION_NOT_CONFIGURED,
+    GITHUB_INSTALLATION_TOKEN_KIND, MAX_CREDENTIAL_VALUE_BYTES, MAX_CREDENTIALS_PER_USER,
+    PRECONDITION_EXPIRED, PRECONDITION_NO_AGENT, PRECONDITION_NO_GITHUB,
+    PRECONDITION_NOT_CONFIGURED,
 };
 use tonic::metadata::MetadataValue;
 use tonic::service::Interceptor;
@@ -60,6 +61,11 @@ pub const ERR_NOT_CONFIGURED: &str = "credentials are not configured";
 /// Job failure reason: the call failed or timed out.
 pub const ERR_UNAVAILABLE: &str = "credentials could not be fetched";
 
+/// Job failure reason: the reply carries a GitHub App installation token, which this fleetd
+/// does not consume yet (ADR-0058).
+pub const ERR_APP_TOKEN_UNSUPPORTED: &str =
+    "github app credentials are not supported by this fleetd";
+
 /// Job failure reason: the reply broke a rule the server keeps.
 pub const ERR_MALFORMED: &str = "credentials reply was invalid";
 
@@ -78,6 +84,9 @@ pub enum CredentialFailure {
     NotConfigured,
     /// Any other status, a timeout or a transport error.
     Unavailable,
+    /// The reply carries wire kind `github_installation_token`. fleetd parses it and fails the
+    /// job with a fixed reason until it consumes the token (ADR-0058).
+    AppTokenUnsupported,
     /// The reply held an unknown kind or shape, a bad value, a duplicate kind, or lacked the
     /// GitHub or agent credential.
     Malformed,
@@ -94,6 +103,7 @@ impl CredentialFailure {
             Self::Expired => ERR_EXPIRED,
             Self::NotConfigured => ERR_NOT_CONFIGURED,
             Self::Unavailable => ERR_UNAVAILABLE,
+            Self::AppTokenUnsupported => ERR_APP_TOKEN_UNSUPPORTED,
             Self::Malformed => ERR_MALFORMED,
         }
     }
@@ -155,6 +165,9 @@ impl JobCredentials {
         let mut seen = HashSet::new();
         let mut items = Vec::with_capacity(wires.len());
         for (kind, shape, value) in &mut wires {
+            if kind == GITHUB_INSTALLATION_TOKEN_KIND {
+                return Err(CredentialFailure::AppTokenUnsupported);
+            }
             let kind = CredentialKind::from_wire_name(kind).ok_or(CredentialFailure::Malformed)?;
             if shape != CredentialShape::StaticSecret.wire_name()
                 || !(MIN_CREDENTIAL_LEN..=MAX_CREDENTIAL_LEN).contains(&value.len())

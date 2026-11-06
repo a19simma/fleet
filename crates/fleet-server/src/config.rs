@@ -6,6 +6,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
+use fleet_core::credential::{BotIdentity, BotIdentityError};
 use fleet_core::model_allowlist::ModelAllowlist;
 use fleet_proto::{DEFAULT_CI_RETRIES, MAX_CI_RETRIES};
 
@@ -163,9 +164,11 @@ pub struct Config {
     /// applies no model restriction. A set value that does not parse, the empty string
     /// included, refuses start.
     pub model_allowlist: Option<ModelAllowlist>,
-    /// The GitHub App, from `FLEET_GITHUB_APP_ID` and `FLEET_GITHUB_APP_KEY_FILE`. Both are set
-    /// or both are unset: one without the other refuses start. `None` when both are unset or
-    /// empty.
+    /// The GitHub App, from `FLEET_GITHUB_APP_ID` and `FLEET_GITHUB_APP_KEY_FILE`, with the bot
+    /// identity from `FLEET_GITHUB_APP_BOT_NAME` and `FLEET_GITHUB_APP_BOT_EMAIL`. The id and the
+    /// key file are both set or both unset: one without the other refuses start. The bot
+    /// variables are required once the App is set. `None` when the id and the key file are
+    /// unset or empty.
     pub github_app: Option<GithubAppConfig>,
 }
 
@@ -176,6 +179,8 @@ pub struct GithubAppConfig {
     pub app_id: u64,
     /// Path of the PEM private key. [`AppKey::load`] checks the file at startup.
     pub key_file: PathBuf,
+    /// The git name and email an App Job commits under, validated by the ADR-0058 SEC-006 grammar.
+    pub bot: BotIdentity,
 }
 
 impl GithubAppConfig {
@@ -356,6 +361,8 @@ fn model_allowlist(
 
 const GITHUB_APP_ID_VAR: &str = "FLEET_GITHUB_APP_ID";
 const GITHUB_APP_KEY_FILE_VAR: &str = "FLEET_GITHUB_APP_KEY_FILE";
+const GITHUB_APP_BOT_NAME_VAR: &str = "FLEET_GITHUB_APP_BOT_NAME";
+const GITHUB_APP_BOT_EMAIL_VAR: &str = "FLEET_GITHUB_APP_BOT_EMAIL";
 
 fn github_app(
     lookup: &impl Fn(&str) -> Option<String>,
@@ -386,9 +393,21 @@ fn github_app(
             var: GITHUB_APP_ID_VAR,
             reason: "must be 1 to 20 ASCII digits without a leading zero, within u64".to_owned(),
         })?;
+    let name =
+        lookup(GITHUB_APP_BOT_NAME_VAR).ok_or(ConfigError::Missing(GITHUB_APP_BOT_NAME_VAR))?;
+    let email =
+        lookup(GITHUB_APP_BOT_EMAIL_VAR).ok_or(ConfigError::Missing(GITHUB_APP_BOT_EMAIL_VAR))?;
+    let bot = BotIdentity::new(&name, &email).map_err(|err| ConfigError::Invalid {
+        var: match err {
+            BotIdentityError::Name => GITHUB_APP_BOT_NAME_VAR,
+            BotIdentityError::Email => GITHUB_APP_BOT_EMAIL_VAR,
+        },
+        reason: err.to_string(),
+    })?;
     Ok(Some(GithubAppConfig {
         app_id,
         key_file: PathBuf::from(key_file),
+        bot,
     }))
 }
 
@@ -438,7 +457,9 @@ impl Config {
     /// `FLEET_EVENTS_RETENTION_DAYS`, and `FLEET_RETENTION_INTERVAL_SECS` is at least 60.
     /// `FLEET_MAX_CI_RETRIES` runs from 0 to 5 and defaults to 0. `FLEET_GITHUB_APP_ID` without
     /// `FLEET_GITHUB_APP_KEY_FILE`, or the reverse, is an error, and so is an App id that is
-    /// not 1 to 20 ASCII digits without a leading zero that fits a `u64`.
+    /// not 1 to 20 ASCII digits without a leading zero that fits a `u64`. With the App set,
+    /// `FLEET_GITHUB_APP_BOT_NAME` and `FLEET_GITHUB_APP_BOT_EMAIL` are required and must pass
+    /// [`BotIdentity::new`].
     pub fn from_env() -> Result<Self, ConfigError> {
         Self::from_lookup(|var| std::env::var(var).ok())
     }
@@ -448,7 +469,9 @@ impl Config {
     /// # Errors
     ///
     /// Same as [`Config::from_env`]: the GitHub App variables are both set or both unset, and
-    /// the App id is 1 to 20 ASCII digits without a leading zero that fit a `u64`.
+    /// the App id is 1 to 20 ASCII digits without a leading zero that fit a `u64`. With the App
+    /// set, a bot name or email that is unset, or that fails [`BotIdentity::new`], returns
+    /// [`ConfigError::Missing`] or [`ConfigError::Invalid`].
     pub fn from_lookup(lookup: impl Fn(&str) -> Option<String>) -> Result<Self, ConfigError> {
         refuse_removed_profile_tools(&lookup)?;
         let database_url = lookup("FLEET_DATABASE_URL")
@@ -880,6 +903,63 @@ mod tests {
         Config::from_lookup(lookup(&vars))
     }
 
+    const BOT_NAME: &str = "fleet-bot[bot]";
+    const BOT_EMAIL: &str = "12345+fleet-bot[bot]@users.noreply.github.com";
+
+    fn with_app(
+        name: Option<&'static str>,
+        email: Option<&'static str>,
+    ) -> Result<Config, ConfigError> {
+        let mut extra = vec![
+            ("FLEET_GITHUB_APP_ID", "1"),
+            ("FLEET_GITHUB_APP_KEY_FILE", "/k.pem"),
+        ];
+        extra.extend(name.map(|n| ("FLEET_GITHUB_APP_BOT_NAME", n)));
+        extra.extend(email.map(|e| ("FLEET_GITHUB_APP_BOT_EMAIL", e)));
+        with(&extra)
+    }
+
+    #[test]
+    fn github_app_requires_the_bot_identity() {
+        for (name, email, want) in [
+            (None, Some(BOT_EMAIL), "FLEET_GITHUB_APP_BOT_NAME"),
+            (Some(BOT_NAME), None, "FLEET_GITHUB_APP_BOT_EMAIL"),
+            (Some(""), Some(BOT_EMAIL), "FLEET_GITHUB_APP_BOT_NAME"),
+            (Some(BOT_NAME), Some(""), "FLEET_GITHUB_APP_BOT_EMAIL"),
+        ] {
+            match with_app(name, email).unwrap_err() {
+                ConfigError::Missing(var) | ConfigError::Invalid { var, .. } => {
+                    assert_eq!(var, want, "{name:?} {email:?}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn github_app_refuses_a_hostile_bot_identity() {
+        for bad in [" bot", "bot\n", "bot\u{2028}", "b<ot>", "bot\u{85}"] {
+            match with_app(Some(bad), Some(BOT_EMAIL)).unwrap_err() {
+                ConfigError::Invalid { var, reason } => {
+                    assert_eq!(var, "FLEET_GITHUB_APP_BOT_NAME", "{bad:?}");
+                    assert_eq!(reason, BotIdentityError::Name.to_string(), "{bad:?}");
+                }
+                other @ ConfigError::Missing(_) => panic!("{other}"),
+            }
+        }
+        for bad in [
+            "1+A[bot]@users.noreply.github.com",
+            "1+a[bot]@users.noreply.github.com\n",
+            "x@evil.example",
+        ] {
+            match with_app(Some(BOT_NAME), Some(bad)).unwrap_err() {
+                ConfigError::Invalid { var, .. } => {
+                    assert_eq!(var, "FLEET_GITHUB_APP_BOT_EMAIL", "{bad:?}");
+                }
+                other @ ConfigError::Missing(_) => panic!("{other}"),
+            }
+        }
+    }
+
     #[test]
     fn github_app_is_none_when_both_are_unset_or_empty() {
         assert_eq!(with(&[]).unwrap().github_app, None);
@@ -895,10 +975,14 @@ mod tests {
         let app = with(&[
             ("FLEET_GITHUB_APP_ID", "123456"),
             ("FLEET_GITHUB_APP_KEY_FILE", "keys/app.pem"),
+            ("FLEET_GITHUB_APP_BOT_NAME", BOT_NAME),
+            ("FLEET_GITHUB_APP_BOT_EMAIL", BOT_EMAIL),
         ])
         .unwrap()
         .github_app
         .unwrap();
+        assert_eq!(app.bot.name(), BOT_NAME);
+        assert_eq!(app.bot.email(), BOT_EMAIL);
         assert_eq!(app.app_id, 123_456);
         assert_eq!(app.app_id_text(), "123456");
         assert_eq!(app.key_file, PathBuf::from("keys/app.pem"));
@@ -947,6 +1031,8 @@ mod tests {
             let err = with(&[
                 ("FLEET_GITHUB_APP_ID", bad),
                 ("FLEET_GITHUB_APP_KEY_FILE", "/k.pem"),
+                ("FLEET_GITHUB_APP_BOT_NAME", BOT_NAME),
+                ("FLEET_GITHUB_APP_BOT_EMAIL", BOT_EMAIL),
             ])
             .unwrap_err();
             match err {
@@ -963,6 +1049,8 @@ mod tests {
         let max = with(&[
             ("FLEET_GITHUB_APP_ID", "18446744073709551615"),
             ("FLEET_GITHUB_APP_KEY_FILE", "/k.pem"),
+            ("FLEET_GITHUB_APP_BOT_NAME", BOT_NAME),
+            ("FLEET_GITHUB_APP_BOT_EMAIL", BOT_EMAIL),
         ]);
         assert_eq!(max.unwrap().github_app.unwrap().app_id, u64::MAX);
     }
@@ -972,6 +1060,7 @@ mod tests {
         let app = GithubAppConfig {
             app_id: 1,
             key_file: PathBuf::from("/nonexistent/fleet-app-key.pem"),
+            bot: BotIdentity::new(BOT_NAME, BOT_EMAIL).unwrap(),
         };
         assert_eq!(app.load_key().unwrap_err(), AppKeyError::Read);
     }

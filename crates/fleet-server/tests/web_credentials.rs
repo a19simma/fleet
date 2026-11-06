@@ -14,6 +14,7 @@ use std::time::Duration;
 use fleet_core::credential::Secret;
 use fleet_server::auth::BearerAuth;
 use fleet_server::config::Token;
+use fleet_server::cred::capability::Capabilities;
 use fleet_server::cred::github::{GithubApi, GithubError, GithubUser};
 use fleet_server::cred::store::CredentialStore;
 use fleet_server::cred::{CredentialService, FileSealer, Users};
@@ -314,8 +315,21 @@ async fn the_page_lists_every_kind_and_no_refreshing_file_option(pool: PgPool) {
     h.finish().await;
 }
 
+async fn grant_app(h: &Harness, who: &Session) {
+    let admin: i64 = sqlx::query_scalar(
+        "INSERT INTO users (username, is_admin) VALUES ('root', true) RETURNING id",
+    )
+    .fetch_one(&h.pool)
+    .await
+    .unwrap();
+    Capabilities::new(h.pool.clone())
+        .grant(admin, who.user_id, "forge:github_app")
+        .await
+        .unwrap();
+}
+
 #[sqlx::test]
-async fn the_kind_dropdown_omits_github_app(pool: PgPool) {
+async fn the_kind_dropdown_lists_github_app(pool: PgPool) {
     let h = Harness::start(pool).await;
     let alice = h.session("alice", 'a').await;
     let page = h.page(&alice, "").await;
@@ -323,21 +337,58 @@ async fn the_kind_dropdown_omits_github_app(pool: PgPool) {
     let select = &page.body[start..];
     let select = &select[..select.find("</select>").unwrap()];
     assert!(select.contains("github_pat"));
-    assert!(!select.contains("github_app"));
+    assert!(select.contains("value=\"github_app\""));
     h.finish().await;
 }
 
 #[sqlx::test]
-async fn saving_github_app_is_refused_and_stores_nothing(pool: PgPool) {
+async fn saving_github_app_without_the_capability_is_refused_and_stores_nothing(pool: PgPool) {
     let h = Harness::start(pool).await;
     let alice = h.session("alice", 'a').await;
-    for value in ["12345678", "not-an-id"] {
+    let put = h.put(&alice, "github_app", "12345678").await;
+    assert_eq!(put.location(), "/credentials?notice=capability_required");
+    assert_eq!(stored(&h.pool).await, 0);
+    let page = h.page(&alice, "?notice=capability_required").await;
+    assert!(page.body.contains("forge:github_app"));
+    h.finish().await;
+}
+
+#[sqlx::test]
+async fn saving_github_app_with_the_capability_stores_it_and_shows_a_verify_button(pool: PgPool) {
+    let h = Harness::start(pool).await;
+    let alice = h.session("alice", 'a').await;
+    grant_app(&h, &alice).await;
+    let put = h.put(&alice, "github_app", "12345678").await;
+    assert_eq!(put.location(), "/credentials?notice=saved");
+    assert_eq!(stored(&h.pool).await, 1);
+    assert_eq!(h.github.calls(), 0);
+    let page = h.page(&alice, "").await;
+    assert_eq!(page.body.matches("/credentials/verify").count(), 1);
+    assert!(!page.body.contains("12345678"));
+    let id = id_of(&h.pool, alice.user_id, "github_app").await;
+    let verify = h
+        .act(&alice, "verify", &format!("csrf={}&id={id}", alice.csrf))
+        .await;
+    assert_eq!(verify.location(), "/credentials?notice=invalid_token");
+    h.finish().await;
+}
+
+#[sqlx::test]
+async fn saving_a_hostile_github_app_id_is_invalid_and_stores_nothing(pool: PgPool) {
+    let h = Harness::start(pool).await;
+    let alice = h.session("alice", 'a').await;
+    grant_app(&h, &alice).await;
+    for value in [
+        "not-an-id",
+        "0123",
+        "-1",
+        "1%2F2",
+        "18446744073709551616",
+        "%0D1",
+        "1%E2%80%A8",
+    ] {
         let put = h.put(&alice, "github_app", value).await;
-        assert_eq!(
-            put.location(),
-            "/credentials?notice=github_app_unavailable",
-            "{value}"
-        );
+        assert_eq!(put.location(), "/credentials?notice=invalid", "{value}");
     }
     assert_eq!(stored(&h.pool).await, 0);
     h.finish().await;
@@ -593,6 +644,19 @@ async fn verify_reports_valid_and_invalid_and_refuses_kinds_without_a_verifier(p
         .await;
     assert_eq!(none.location(), "/credentials?notice=no_verifier");
     let page = h.page(&alice, "?notice=invalid_token").await;
-    assert!(page.body.contains("GitHub refused the stored token"));
+    assert!(page.body.contains("GitHub refused the stored credential."));
+    let page = h.page(&alice, "?notice=verified").await;
+    assert!(page.body.contains("GitHub accepted the stored credential."));
+    h.finish().await;
+}
+
+#[sqlx::test]
+async fn the_no_job_notice_tells_the_user_to_submit_a_job(pool: PgPool) {
+    let h = Harness::start(pool).await;
+    let alice = h.session("alice", 'a').await;
+    let page = h.page(&alice, "?notice=no_job").await;
+    assert!(page.body.contains(
+        "Submit a Job first. A GitHub App check mints a token for the repository of your latest Job."
+    ));
     h.finish().await;
 }

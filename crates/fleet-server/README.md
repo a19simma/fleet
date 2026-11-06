@@ -21,7 +21,7 @@ The hosted Fleet service. It stores box state, jobs, transcripts, job timing and
 ## Modules
 
 - `catalog`: the global Catalog of skill, subagent, tool and context items (ADR-0053). An admin creates and enables items through `FleetCatalogAdmin` or the `/catalog` pages. A Profile switches items off and the effective set is resolved at submit.
-- `cred::capability`: per-user capability grants. `profile:tools` (ADR-0054) lets a user save a Profile with tools. `forge:github_app` (ADR-0058) gates the `github_app` credential kind at put and release through `cred::store::required_capability`, which maps the `github_app` kind. Migration 0034 widens the table CHECK to both names, and the admin capability page lists, grants and revokes each one.
+- `cred::capability`: per-user capability grants. `profile:tools` (ADR-0054) lets a user save a Profile with tools. `forge:github_app` (ADR-0058) gates the `github_app` credential kind at put, release and verify through `cred::store::required_capability`, which maps the `github_app` kind. Migration 0034 widens the table CHECK to both names, and the admin capability page lists, grants and revokes each one.
 - `timing`: stores the `ReportTiming` breakdown and the shell command logs a box reports, and serves `GetJobTiming` and `StreamShellLog` (ADR-0055). The pages are `/jobs/{job_id}/timing` and `/jobs/{job_id}/shell/{command_id}/log`.
 - `profiles`: owner-scoped Profiles with `private` and `shared` visibility (ADR-0052).
 - `retention`: the telemetry retention sweep. See the root `README.md` for the variables.
@@ -35,6 +35,8 @@ The hosted Fleet service. It stores box state, jobs, transcripts, job timing and
 | `FLEET_TOKEN` | Box token. Required. |
 | `FLEET_CLIENT_TOKEN` | Client token. Optional. Acts as the `bootstrap` user: never admin, no capabilities. |
 | `FLEET_MODEL_ALLOWLIST` | Comma-separated exact model ids a Profile may name. Unset allows every model. A bad list stops startup. Checked at Profile create, update, submit, batch pin and blob serve. |
+| `FLEET_GITHUB_APP_ID`, `FLEET_GITHUB_APP_KEY_FILE` | GitHub App id and private key path. Set both or neither (ADR-0058). |
+| `FLEET_GITHUB_APP_BOT_NAME`, `FLEET_GITHUB_APP_BOT_EMAIL` | Git author name and email for App Jobs. Required when the App is set, checked by the identity grammar (ADR-0058 SEC-006). |
 | `FLEET_MAX_CI_RETRIES` | Automatic CI retry cap, 0 to 5. |
 | `FLEET_LISTEN`, `FLEET_HEALTH_LISTEN` | Listen addresses. |
 | `FLEET_EVENTS_RETENTION_DAYS`, `FLEET_SUMMARIES_RETENTION_DAYS`, `FLEET_RETENTION_INTERVAL_SECS` | Retention sweep. |

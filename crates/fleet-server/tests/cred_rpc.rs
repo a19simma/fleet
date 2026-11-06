@@ -15,6 +15,7 @@ use fleet_proto::v1::{
 };
 use fleet_server::auth::BearerAuth;
 use fleet_server::config::Token;
+use fleet_server::cred::capability::{Capabilities, ERR_CAPABILITY_NOT_GRANTED};
 use fleet_server::cred::github::{GithubApi, GithubError, GithubUser};
 use fleet_server::cred::store::CredentialStore;
 use fleet_server::cred::{CredentialService, FileSealer, Users};
@@ -257,21 +258,119 @@ async fn unreachable_github_is_unavailable_and_stores_nothing(pool: PgPool) {
     assert_eq!(stored(&h.pool).await, 0);
 }
 
+async fn grant_app(h: &Harness) {
+    let admin: i64 = sqlx::query_scalar(
+        "INSERT INTO users (username, is_admin) VALUES ('root', true) RETURNING id",
+    )
+    .fetch_one(&h.pool)
+    .await
+    .unwrap();
+    Capabilities::new(h.pool.clone())
+        .grant(admin, h.alice_id, "forge:github_app")
+        .await
+        .unwrap();
+}
+
 #[sqlx::test]
-async fn put_refuses_github_app_and_stores_nothing(pool: PgPool) {
+async fn put_github_app_without_the_capability_is_refused_and_stores_nothing(pool: PgPool) {
     let mut h = harness(pool, FakeGithub::ok()).await;
-    for value in ["12345678", "not-an-id", PAT] {
+    let err = h
+        .client
+        .put_credential(as_user(&h.alice, put("github_app", "12345678")))
+        .await
+        .unwrap_err();
+    assert_eq!(err.code(), Code::PermissionDenied);
+    assert_eq!(err.message(), ERR_CAPABILITY_NOT_GRANTED);
+    assert_eq!(h.github.calls(), 0);
+    assert_eq!(stored(&h.pool).await, 0);
+}
+
+#[sqlx::test]
+async fn put_github_app_with_the_capability_stores_the_installation_id(pool: PgPool) {
+    let mut h = harness(pool, FakeGithub::ok()).await;
+    grant_app(&h).await;
+    let mut request = put("github_app", "12345678");
+    request.expires_at_ms = Some(1);
+    let info = h
+        .client
+        .put_credential(as_user(&h.alice, request))
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(info.kind, "github_app");
+    assert_eq!(info.shape, STATIC);
+    assert_eq!(info.login, None);
+    assert_eq!(info.expires_at_ms, None);
+    assert_eq!(h.github.calls(), 0);
+    assert_eq!(stored(&h.pool).await, 1);
+    let sealed: Vec<u8> = sqlx::query_scalar("SELECT ciphertext FROM credentials")
+        .fetch_one(&h.pool)
+        .await
+        .unwrap();
+    assert!(!sealed.windows(8).any(|w| w == b"12345678"));
+}
+
+#[sqlx::test]
+async fn put_github_app_refuses_hostile_installation_ids_even_with_the_capability(pool: PgPool) {
+    let mut h = harness(pool, FakeGithub::ok()).await;
+    grant_app(&h).await;
+    let long = "9".repeat(21);
+    for value in [
+        "",
+        " ",
+        " 1",
+        "1 ",
+        "1 2",
+        "1\r",
+        "1\r\n",
+        "1\n",
+        "\u{85}1",
+        "1\u{2028}",
+        "1\u{2029}",
+        "0",
+        "0123",
+        "007",
+        "+1",
+        "-1",
+        "1.0",
+        "\u{661}",
+        "\u{ff11}\u{ff12}",
+        "12a",
+        "1/2",
+        "..",
+        "1%2f",
+        "1?x",
+        "1#x",
+        "1\\2",
+        "18446744073709551616",
+        long.as_str(),
+        PAT,
+    ] {
         let err = h
             .client
             .put_credential(as_user(&h.alice, put("github_app", value)))
             .await
             .unwrap_err();
-        assert_eq!(err.code(), Code::PermissionDenied, "{value}");
-        assert_eq!(err.message(), "github_app credentials cannot be stored yet");
-        assert!(!format!("{err:?}").contains(value), "{value}");
+        assert_eq!(err.code(), Code::InvalidArgument, "{value:?}");
+        if value.len() > 4 {
+            assert!(!err.message().contains(value), "{value:?}");
+        }
     }
     assert_eq!(h.github.calls(), 0);
     assert_eq!(stored(&h.pool).await, 0);
+}
+
+#[sqlx::test]
+async fn put_github_app_accepts_the_u64_edges(pool: PgPool) {
+    let mut h = harness(pool, FakeGithub::ok()).await;
+    grant_app(&h).await;
+    for value in ["1", "18446744073709551615"] {
+        h.client
+            .put_credential(as_user(&h.alice, put("github_app", value)))
+            .await
+            .unwrap();
+    }
+    assert_eq!(stored(&h.pool).await, 1);
 }
 
 #[sqlx::test]
@@ -421,11 +520,12 @@ async fn box_token_is_denied(pool: PgPool) {
 #[sqlx::test]
 async fn out_of_range_expiry_is_invalid_argument_for_every_kind(pool: PgPool) {
     let mut h = harness(pool, FakeGithub::ok()).await;
-    for kind in CredentialKind::ALL.into_iter().filter(|k| k.is_storable()) {
-        let value = if kind == CredentialKind::GithubPat {
-            PAT
-        } else {
-            ANT
+    grant_app(&h).await;
+    for kind in CredentialKind::ALL {
+        let value = match kind {
+            CredentialKind::GithubPat => PAT,
+            CredentialKind::GithubApp => "12345678",
+            _ => ANT,
         };
         for ms in [
             253_402_300_800_000,

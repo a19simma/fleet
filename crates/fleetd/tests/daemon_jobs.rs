@@ -164,6 +164,8 @@ impl FleetWorker for Stub {
                 kind: kind.into(),
                 shape: "static_secret".into(),
                 value: value.into(),
+                expires_at_ms: None,
+                git_identity: None,
             })
             .collect(),
         }))

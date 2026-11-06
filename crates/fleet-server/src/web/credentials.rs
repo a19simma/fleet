@@ -29,7 +29,7 @@ use super::layout::{Nav, shell};
 use super::pages::{auth, csrf_matches, current, fail, signed_in};
 use super::passkeys::AuthError;
 use crate::cred::CredentialService;
-use crate::cred::api::GITHUB_APP_REFUSED;
+use crate::cred::capability::ERR_CAPABILITY_NOT_GRANTED;
 
 const STATIC_SECRET: &str = "static_secret";
 
@@ -58,8 +58,8 @@ fn notice_text(code: &str) -> Option<&'static str> {
     Some(match code {
         "saved" => "Saved.",
         "deleted" => "Deleted.",
-        "verified" => "GitHub accepted the stored token.",
-        "invalid_token" => "GitHub refused the stored token.",
+        "verified" => "GitHub accepted the stored credential.",
+        "invalid_token" => "GitHub refused the stored credential.",
         "github_classic" => {
             "A GitHub credential must be a fine-grained token starting with github_pat_."
         }
@@ -68,7 +68,12 @@ fn notice_text(code: &str) -> Option<&'static str> {
         "unavailable" => "A backing service is unavailable. Try again later.",
         "not_found" => "No such credential.",
         "no_verifier" => "This kind cannot be verified.",
-        "github_app_unavailable" => "GitHub App credentials cannot be saved yet.",
+        "no_job" => {
+            "Submit a Job first. A GitHub App check mints a token for the repository of your latest Job."
+        }
+        "capability_required" => {
+            "This credential kind needs the forge:github_app capability. Ask an admin to grant it."
+        }
         "failed" => "The request failed.",
         _ => return None,
     })
@@ -92,11 +97,16 @@ fn notice_for(status: &Status) -> &'static str {
             "github_refused"
         }
         Code::InvalidArgument => "invalid",
-        Code::PermissionDenied if status.message() == GITHUB_APP_REFUSED => {
-            "github_app_unavailable"
+        Code::PermissionDenied if status.message() == ERR_CAPABILITY_NOT_GRANTED => {
+            "capability_required"
         }
         Code::Unavailable => "unavailable",
         Code::NotFound => "not_found",
+        Code::FailedPrecondition
+            if status.message() == fleet_proto::PRECONDITION_NO_VERIFY_REPO =>
+        {
+            "no_job"
+        }
         Code::FailedPrecondition => "no_verifier",
         _ => "failed",
     }
@@ -198,7 +208,7 @@ async fn credentials_page(cx: &Cx) -> Result<impl View> {
                                             <input type="hidden" name="id" value=(id.to_string())>
                                             <button class="btn btn-xs btn-outline btn-error" type="submit">"Delete"</button>
                                         </form>
-                                        if row.kind == CredentialKind::GithubPat.wire_name() {
+                                        if row.kind == CredentialKind::GithubPat.wire_name() || row.kind == CredentialKind::GithubApp.wire_name() {
                                             <form class="inline" method="post" action="/credentials/verify">
                                                 <input type="hidden" name="csrf" value=(csrf.as_str())>
                                                 <input type="hidden" name="id" value=(id.to_string())>
@@ -225,7 +235,7 @@ async fn credentials_page(cx: &Cx) -> Result<impl View> {
                     <fieldset class="fieldset">
                         <label class="label" for="credential-kind">"Kind"</label>
                         <select class="select select-sm" id="credential-kind" name="kind">
-                            for kind in CredentialKind::ALL.into_iter().filter(|k| k.is_storable()) {
+                            for kind in CredentialKind::ALL {
                                 <option value=(kind.wire_name())>(kind.wire_name())</option>
                             }
                         </select>
@@ -299,5 +309,18 @@ async fn verify(cx: &Cx, Form(form): Form<HashMap<String, String>>) -> Result<Se
         Ok(reply) if reply.valid => Ok(back("verified")),
         Ok(_) => Ok(back("invalid_token")),
         Err(status) => Ok(back(notice_for(&status))),
+    }
+}
+
+#[cfg(test)]
+mod notice_tests {
+    use super::*;
+
+    #[test]
+    fn a_missing_job_repo_maps_to_no_job_and_other_preconditions_to_no_verifier() {
+        let no_job = Status::failed_precondition(fleet_proto::PRECONDITION_NO_VERIFY_REPO);
+        assert_eq!(notice_for(&no_job), "no_job");
+        let other = Status::failed_precondition("this credential kind cannot be verified");
+        assert_eq!(notice_for(&other), "no_verifier");
     }
 }

@@ -64,15 +64,6 @@ impl CredentialKind {
         }
     }
 
-    /// True for kinds a user may store through `PutCredential` and the web form.
-    ///
-    /// `github_app` is refused until the save path lands (ADR-0058). The capability gate in
-    /// `cred::store` is built.
-    /// The save path lifts the refusal by removing this exception.
-    pub const fn is_storable(self) -> bool {
-        !matches!(self, Self::GithubApp)
-    }
-
     /// True for kinds that authenticate against the git forge.
     pub const fn is_forge(self) -> bool {
         matches!(self, Self::GithubPat | Self::GithubApp)
@@ -156,6 +147,113 @@ pub fn parse_installation_id(value: &str) -> Result<u64, InstallationIdError> {
         return Err(InstallationIdError::LeadingZero);
     }
     value.parse().map_err(|_| InstallationIdError::OutOfRange)
+}
+
+/// Longest accepted bot name, in bytes.
+pub const MAX_BOT_NAME_LEN: usize = 64;
+
+/// Longest accepted bot email, in bytes.
+pub const MAX_BOT_EMAIL_LEN: usize = 128;
+
+const BOT_EMAIL_SUFFIX: &str = "[bot]@users.noreply.github.com";
+
+/// Why a git identity was rejected. Messages are fixed and carry no input text. An email over
+/// [`MAX_BOT_EMAIL_LEN`] (128 bytes) is rejected as [`BotIdentityError::Email`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BotIdentityError {
+    /// The name is outside the grammar of ADR-0058 (SEC-006, SEC-012).
+    Name,
+    /// The email is outside the grammar of ADR-0058 (SEC-006, SEC-012).
+    Email,
+}
+
+impl fmt::Display for BotIdentityError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Self::Name => "bot name is outside the identity grammar",
+            Self::Email => "bot email is outside the identity grammar",
+        })
+    }
+}
+
+impl std::error::Error for BotIdentityError {}
+
+/// The git name and email a GitHub App Job commits under (ADR-0058).
+///
+/// The fields are private, so a value of this type always passed the grammar. `fleetd`
+/// re-validates with the same constructor before use.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BotIdentity {
+    name: String,
+    email: String,
+}
+
+impl BotIdentity {
+    /// Builds an identity from `name` and `email`.
+    ///
+    /// The name is 1 to [`MAX_BOT_NAME_LEN`] ASCII bytes, starts with a letter or digit, ends
+    /// with a letter, digit or `]`, and holds only letters, digits, space, `.`, `_`, `[`, `]`
+    /// and `-`. The email is at most [`MAX_BOT_EMAIL_LEN`] bytes shaped
+    /// `<digits>+<slug>[bot]@users.noreply.github.com` with a lowercase slug of letters, digits
+    /// and `-`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BotIdentityError::Name`] or [`BotIdentityError::Email`] for the first field
+    /// outside its grammar.
+    pub fn new(name: &str, email: &str) -> Result<Self, BotIdentityError> {
+        if !valid_bot_name(name) {
+            return Err(BotIdentityError::Name);
+        }
+        if !valid_bot_email(email) {
+            return Err(BotIdentityError::Email);
+        }
+        Ok(Self {
+            name: name.to_owned(),
+            email: email.to_owned(),
+        })
+    }
+
+    /// The git author and committer name.
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+
+    /// The git author and committer email.
+    pub fn email(&self) -> &str {
+        &self.email
+    }
+}
+
+fn valid_bot_name(name: &str) -> bool {
+    let bytes = name.as_bytes();
+    let (Some(first), Some(last)) = (bytes.first(), bytes.last()) else {
+        return false;
+    };
+    bytes.len() <= MAX_BOT_NAME_LEN
+        && first.is_ascii_alphanumeric()
+        && (last.is_ascii_alphanumeric() || *last == b']')
+        && bytes
+            .iter()
+            .all(|b| b.is_ascii_alphanumeric() || b" ._[]-".contains(b))
+}
+
+fn valid_bot_email(email: &str) -> bool {
+    if email.len() > MAX_BOT_EMAIL_LEN {
+        return false;
+    }
+    let Some(local) = email.strip_suffix(BOT_EMAIL_SUFFIX) else {
+        return false;
+    };
+    let Some((id, slug)) = local.split_once('+') else {
+        return false;
+    };
+    !id.is_empty()
+        && id.bytes().all(|b| b.is_ascii_digit())
+        && !slug.is_empty()
+        && slug
+            .bytes()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
 }
 
 /// A secret value. Zeroed on drop, never printed, never serialised.
@@ -255,8 +353,8 @@ pub struct Validated {
 /// unverified: a mismatch sets [`Validated::unknown_prefix`] and still succeeds.
 ///
 /// A `github_app` value must satisfy [`parse_installation_id`]. It skips the length bounds,
-/// which suit tokens and not ids. Whether a user may store the kind at all is
-/// [`CredentialKind::is_storable`], checked by the callers.
+/// which suit tokens and not ids. Whether a user may store the kind is a capability check
+/// the store makes at save.
 ///
 /// # Errors
 ///
@@ -353,15 +451,117 @@ mod tests {
         );
     }
 
+    const BOT_EMAIL: &str = "12345+fleet-bot[bot]@users.noreply.github.com";
+
     #[test]
-    fn only_github_app_is_not_storable() {
-        for kind in CredentialKind::ALL {
+    fn bot_identity_accepts_the_grammar() {
+        for name in [
+            "a",
+            "fleet-bot[bot]",
+            "Fleet Bot",
+            "x.y_z[1]",
+            &format!("a{}b", "c".repeat(62)),
+        ] {
+            let id = BotIdentity::new(name, BOT_EMAIL).unwrap();
+            assert_eq!(id.name(), name);
+            assert_eq!(id.email(), BOT_EMAIL);
+        }
+        for email in [
+            "1+a[bot]@users.noreply.github.com",
+            "007+a-b-1[bot]@users.noreply.github.com",
+        ] {
+            assert!(BotIdentity::new("bot", email).is_ok(), "{email}");
+        }
+    }
+
+    #[test]
+    fn bot_name_hostile_input_table() {
+        let long = "a".repeat(65);
+        let edge = format!("a{}b", "c".repeat(63));
+        for name in [
+            "",
+            " bot",
+            "bot ",
+            "-bot",
+            ".bot",
+            "bot-",
+            "bot.",
+            "bot_",
+            "bot\n",
+            "bot\r",
+            "bot\r\n",
+            "bot\0",
+            "bot\u{85}",
+            "bot\u{2028}",
+            "bot\u{2029}",
+            "bot<x>",
+            "b<ot",
+            "bot>",
+            "b\"ot",
+            "b'ot",
+            "b/ot",
+            "b\\ot",
+            "b:ot",
+            "b@ot",
+            "b,ot",
+            "b\tot",
+            "bot\u{e9}",
+            "b\u{ff41}",
+            "\u{200b}bot",
+            long.as_str(),
+            edge.as_str(),
+        ] {
             assert_eq!(
-                kind.is_storable(),
-                kind != CredentialKind::GithubApp,
-                "{}",
-                kind.wire_name()
+                BotIdentity::new(name, BOT_EMAIL),
+                Err(BotIdentityError::Name),
+                "{name:?}"
             );
+        }
+    }
+
+    #[test]
+    fn bot_email_hostile_input_table() {
+        let long = format!("1+{}[bot]@users.noreply.github.com", "a".repeat(120));
+        for email in [
+            "",
+            "bot@users.noreply.github.com",
+            "+a[bot]@users.noreply.github.com",
+            "a+b[bot]@users.noreply.github.com",
+            "1+[bot]@users.noreply.github.com",
+            "1+A[bot]@users.noreply.github.com",
+            "1+a_b[bot]@users.noreply.github.com",
+            "1+a[bot]@users.noreply.github.com\n",
+            "1+a[bot]@users.noreply.github.com\r\n",
+            "1+a[bot]@users.noreply.github.com ",
+            " 1+a[bot]@users.noreply.github.com",
+            "1+a[bot]@users.noreply.github.com\u{85}",
+            "1+a[bot]@users.noreply.github.com\u{2028}",
+            "1+a[bot]@Users.noreply.github.com",
+            "1+a[bot]@users.noreply.github.com.evil.example",
+            "x@evil.example,1+a[bot]@users.noreply.github.com",
+            "1+a<b>[bot]@users.noreply.github.com",
+            "1+a[bot]\0@users.noreply.github.com",
+            "1+\u{e9}[bot]@users.noreply.github.com",
+            "\u{0661}+a[bot]@users.noreply.github.com",
+            "1+2+a[bot]@users.noreply.github.com",
+            "-1+a[bot]@users.noreply.github.com",
+            "1+a[bot]@users.noreply.github.com@x",
+            "1+a[bot]@users\\.noreply.github.com",
+            "1+a[Bot]@users.noreply.github.com",
+            long.as_str(),
+        ] {
+            assert_eq!(
+                BotIdentity::new("bot", email),
+                Err(BotIdentityError::Email),
+                "{email:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn bot_identity_errors_carry_no_input() {
+        for err in [BotIdentityError::Name, BotIdentityError::Email] {
+            assert_ne!(err.to_string(), "");
         }
     }
 

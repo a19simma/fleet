@@ -8,7 +8,7 @@ use std::sync::Arc;
 use fleet_core::credential::{CredentialKind, CredentialShape, Secret, validate};
 use fleet_proto::v1::{
     CredentialInfo, DeleteCredentialReply, DeleteCredentialRequest, GetJobCredentialsReply,
-    JobCredential, ListCredentialsReply, PutCredentialRequest, VerifyCredentialReply,
+    GitIdentity, JobCredential, ListCredentialsReply, PutCredentialRequest, VerifyCredentialReply,
     VerifyCredentialRequest,
 };
 use fleet_proto::{MAX_CREDENTIAL_VALUE_BYTES, MAX_CREDENTIALS_PER_USER};
@@ -16,9 +16,6 @@ use tonic::Status;
 
 use super::github::{GithubApi, GithubError, GithubUser, MAX_EXPIRY_MS};
 use super::store::{CredentialStore, CredentialSummary, StoreError};
-
-/// The fixed refusal for a `github_app` save. Refused until the save path lands (ADR-0058).
-pub const GITHUB_APP_REFUSED: &str = "github_app credentials cannot be stored yet";
 
 /// The credential RPC logic over a sealed store and a GitHub seam.
 #[derive(Clone)]
@@ -49,6 +46,9 @@ fn store_status(err: &StoreError) -> Status {
             Status::permission_denied(super::capability::ERR_CAPABILITY_NOT_GRANTED)
         }
         StoreError::MintFailed => Status::failed_precondition(fleet_proto::PRECONDITION_APP_MINT),
+        StoreError::NoJobRepo => {
+            Status::failed_precondition(fleet_proto::PRECONDITION_NO_VERIFY_REPO)
+        }
         StoreError::Seal(_) => {
             tracing::error!(%err, "credential sealing failed");
             Status::internal("credential store error")
@@ -101,9 +101,9 @@ impl CredentialService {
     /// # Errors
     ///
     /// `INVALID_ARGUMENT` for an unknown kind, an unsupported shape, an invalid value or a
-    /// token GitHub refuses, `PERMISSION_DENIED` with [`GITHUB_APP_REFUSED`] for kind
-    /// `github_app` whatever the value (until the save path lands), `PERMISSION_DENIED` with
-    /// `ERR_CAPABILITY_NOT_GRANTED` when the kind needs a capability the user lacks,
+    /// token GitHub refuses (a `github_app` value must be a `u64` installation id with no
+    /// leading zero), `PERMISSION_DENIED` with `ERR_CAPABILITY_NOT_GRANTED` when the kind
+    /// needs a capability the user lacks (the check runs at save, under `FOR SHARE`),
     /// `RESOURCE_EXHAUSTED` past the per-user cap, `UNAVAILABLE` when GitHub or storage cannot
     /// answer. Nothing is stored on any error.
     pub async fn put(
@@ -113,9 +113,6 @@ impl CredentialService {
     ) -> Result<CredentialInfo, Status> {
         let kind = CredentialKind::from_wire_name(&request.kind)
             .ok_or_else(|| Status::invalid_argument("unknown credential kind"))?;
-        if !kind.is_storable() {
-            return Err(Status::permission_denied(GITHUB_APP_REFUSED));
-        }
         if request.shape != CredentialShape::StaticSecret.wire_name() {
             return Err(Status::invalid_argument(
                 "credential shape is not supported in v1",
@@ -152,6 +149,8 @@ impl CredentialService {
             } = self.github.user(&value).await.map_err(github_status)?;
             login = Some(name);
             expires_at_ms = expiry;
+        } else if kind == CredentialKind::GithubApp {
+            expires_at_ms = None;
         }
         let summary = self
             .store
@@ -204,6 +203,9 @@ impl CredentialService {
 
     /// Releases the credentials of the owner of the job a Box holds the lease for.
     ///
+    /// A released `github_app` credential carries `expires_at_ms` and the bot `GitIdentity`; a
+    /// PAT carries neither.
+    ///
     /// # Errors
     ///
     /// `PERMISSION_DENIED` with `lease does not match` for any lease mismatch, and with
@@ -232,17 +234,29 @@ impl CredentialService {
                 kind: wire_kind(item.kind).to_owned(),
                 shape: item.shape.wire_name().to_owned(),
                 value,
+                expires_at_ms: item.expires_at_ms,
+                git_identity: item.git_identity.map(|identity| GitIdentity {
+                    name: identity.name().to_owned(),
+                    email: identity.email().to_owned(),
+                }),
             });
         }
         Ok(GetJobCredentialsReply { credentials })
     }
 
-    /// Checks a stored GitHub token against GitHub. No use row is written.
+    /// Checks a stored GitHub credential against GitHub. No use row is written.
+    ///
+    /// A `github_pat` is checked with a user lookup. A `github_app` mints one installation
+    /// token, revokes it and drops it, so the reply holds no token text: `valid` is true when
+    /// the mint succeeded and false on any mint failure (lane absent, malformed id, GitHub
+    /// refusal).
     ///
     /// # Errors
     ///
     /// `NOT_FOUND` for an unknown or foreign id, `FAILED_PRECONDITION` for a kind without a
-    /// verifier, `UNAVAILABLE` when GitHub or storage cannot answer.
+    /// verifier and, for `github_app`, when the user has no Job to scope the mint to,
+    /// `PERMISSION_DENIED` with `ERR_CAPABILITY_NOT_GRANTED` when a `github_app` owner lacks
+    /// the capability, `UNAVAILABLE` when GitHub or storage cannot answer.
     pub async fn verify(
         &self,
         user_id: i64,
@@ -253,6 +267,21 @@ impl CredentialService {
             .open_for_verify(user_id, row_id(request.id)?)
             .await
             .map_err(|e| store_status(&e))?;
+        if kind == CredentialKind::GithubApp {
+            return match self.store.probe_app(user_id, &value).await {
+                Ok(()) => Ok(VerifyCredentialReply {
+                    valid: true,
+                    login: None,
+                    expires_at_ms: None,
+                }),
+                Err(StoreError::MintFailed) => Ok(VerifyCredentialReply {
+                    valid: false,
+                    login: None,
+                    expires_at_ms: None,
+                }),
+                Err(err) => Err(store_status(&err)),
+            };
+        }
         if kind != CredentialKind::GithubPat {
             return Err(Status::failed_precondition(
                 "this credential kind cannot be verified",

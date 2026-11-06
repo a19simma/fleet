@@ -121,10 +121,17 @@ message GetJobCredentialsRequest {
   string box = 3;
 }
 
+message GitIdentity {
+  string name = 1;
+  string email = 2;
+}
+
 message JobCredential {
   string kind = 1;
   string shape = 2;
   string value = 3;
+  optional uint64 expires_at_ms = 4;
+  optional GitIdentity git_identity = 5;
 }
 
 message GetJobCredentialsReply {

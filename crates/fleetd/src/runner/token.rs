@@ -188,6 +188,8 @@ mod tests {
                 kind: kind.into(),
                 shape: "static_secret".into(),
                 value: value.into(),
+                expires_at_ms: None,
+                git_identity: None,
             };
             Ok(Response::new(GetJobCredentialsReply {
                 credentials: vec![wire("github_pat", HOLDER), wire(self.0, AGENT)],

@@ -146,6 +146,8 @@ fn wire(kind: &str, shape: &str, value: &str) -> JobCredential {
         kind: kind.into(),
         shape: shape.into(),
         value: value.into(),
+        expires_at_ms: None,
+        git_identity: None,
     }
 }
 
@@ -304,6 +306,32 @@ async fn a_reply_that_breaks_a_server_rule_is_malformed() -> TestResult {
 }
 
 #[tokio::test]
+async fn an_installation_token_reply_fails_with_its_own_reason_and_holds_nothing() -> TestResult {
+    let mut app = wire("github_installation_token", "static_secret", GITHUB);
+    app.expires_at_ms = Some(1);
+    app.git_identity = Some(fleet_proto::v1::GitIdentity {
+        name: "bot".into(),
+        email: "1+bot[bot]@users.noreply.github.com".into(),
+    });
+    let (book, _fake) = serve(Ok(GetJobCredentialsReply {
+        credentials: vec![app, wire("anthropic_api_key", "static_secret", AGENT)],
+    }))
+    .await?;
+    let got = book.fetch("job1", 1, &box_name()).await;
+    assert_eq!(got.err(), Some(CredentialFailure::AppTokenUnsupported));
+    assert!(book.get("job1").is_none());
+    assert_eq!(
+        CredentialFailure::AppTokenUnsupported.reason(),
+        fleetd::cred::ERR_APP_TOKEN_UNSUPPORTED
+    );
+    assert_ne!(
+        CredentialFailure::AppTokenUnsupported.reason(),
+        ERR_MALFORMED
+    );
+    Ok(())
+}
+
+#[tokio::test]
 async fn a_reply_without_github_or_without_an_agent_credential_fails_closed() -> TestResult {
     let (book, _fake) = serve(Ok(GetJobCredentialsReply {
         credentials: vec![wire("anthropic_api_key", "static_secret", AGENT)],
@@ -373,6 +401,7 @@ async fn no_debug_or_error_text_carries_a_value() -> TestResult {
         CredentialFailure::Expired,
         CredentialFailure::NotConfigured,
         CredentialFailure::Unavailable,
+        CredentialFailure::AppTokenUnsupported,
         CredentialFailure::Malformed,
     ] {
         let text = format!("{failure:?} {failure}");

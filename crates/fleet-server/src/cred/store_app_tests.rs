@@ -8,7 +8,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use fleet_core::credential::{CredentialKind, CredentialShape, Secret};
+use fleet_core::credential::{BotIdentity, CredentialKind, CredentialShape, Secret};
 use sqlx::PgPool;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
@@ -25,6 +25,8 @@ const ANT: &str = "sk-ant-api03-abcdefghijklmnopqrstuv";
 const TOKEN: &str = "ghs_testtoken0123456789";
 const CAP: &str = "forge:github_app";
 const INSTALLATION: u64 = 4242;
+const BOT_NAME: &str = "fleet-bot[bot]";
+const BOT_EMAIL: &str = "12345+fleet-bot[bot]@users.noreply.github.com";
 const STATIC: CredentialShape = CredentialShape::StaticSecret;
 const JOB: &str = "01JJOBAPP00000000000000000";
 
@@ -211,7 +213,8 @@ async fn world(pool: PgPool, lane: Option<AppClient>) -> World {
     std::fs::remove_file(&path).unwrap();
     let mut creds = CredentialStore::new(pool.clone(), Arc::new(sealer.unwrap()));
     if let Some(client) = lane {
-        creds = creds.with_github_app(AppLane::new(app_key(), "12345".to_owned(), client));
+        let bot = BotIdentity::new(BOT_NAME, BOT_EMAIL).unwrap();
+        creds = creds.with_github_app(AppLane::new(app_key(), "12345".to_owned(), client, bot));
     }
     World {
         caps: Capabilities::new(pool.clone()),
@@ -517,6 +520,199 @@ async fn the_service_sends_the_token_under_the_installation_token_kind(pool: PgP
         .find(|c| c.kind == fleet_proto::GITHUB_INSTALLATION_TOKEN_KIND)
         .unwrap();
     assert_eq!(token.value, TOKEN);
+    let want_ms = (now() + 3600) * 1000;
+    let got_ms = token.expires_at_ms.unwrap();
+    assert!(got_ms.abs_diff(want_ms) < 60_000, "{got_ms} {want_ms}");
+    let identity = token.git_identity.as_ref().unwrap();
+    assert_eq!(identity.name, BOT_NAME);
+    assert_eq!(identity.email, BOT_EMAIL);
+    let agent = reply
+        .credentials
+        .iter()
+        .find(|c| c.kind == "anthropic_api_key")
+        .unwrap();
+    assert_eq!(agent.expires_at_ms, None);
+    assert_eq!(agent.git_identity, None);
+}
+
+#[sqlx::test]
+async fn a_pat_release_carries_no_expiry_and_no_identity(pool: PgPool) {
+    let fake = fake("201 Created", None).await;
+    let w = world(pool, Some(client(&fake))).await;
+    w.seed(true).await;
+    sqlx::query("DELETE FROM credentials WHERE kind = 'github_app'")
+        .execute(&w.pool)
+        .await
+        .unwrap();
+    let service = super::CredentialService::new(w.creds.clone(), Arc::new(NoGithub));
+    let reply = service.job_credentials(JOB, 1, "alpha").await.unwrap();
+    assert_eq!(reply.credentials.len(), 2);
+    for credential in &reply.credentials {
+        assert_eq!(credential.expires_at_ms, None, "{}", credential.kind);
+        assert_eq!(credential.git_identity, None, "{}", credential.kind);
+    }
+}
+
+#[sqlx::test]
+async fn a_user_holding_github_app_without_the_capability_fails_the_job_and_never_gets_the_pat(
+    pool: PgPool,
+) {
+    let fake = fake("201 Created", None).await;
+    let w = world(pool, Some(client(&fake))).await;
+    w.seed(false).await;
+    let service = super::CredentialService::new(w.creds.clone(), Arc::new(NoGithub));
+    let status = service.job_credentials(JOB, 1, "alpha").await.unwrap_err();
+    assert_eq!(status.code(), tonic::Code::PermissionDenied);
+    assert_eq!(
+        status.message(),
+        super::capability::ERR_CAPABILITY_NOT_GRANTED
+    );
+    assert_eq!(fake.mints(), 0);
+    assert_eq!(w.uses().await, 0);
+    let kinds: Vec<String> = sqlx::query_scalar("SELECT kind FROM credentials ORDER BY 1")
+        .fetch_all(&w.pool)
+        .await
+        .unwrap();
+    assert!(kinds.iter().any(|k| k == "github_pat"));
+    assert!(kinds.iter().any(|k| k == "github_app"));
+}
+
+async fn app_id(w: &World) -> u64 {
+    let id: i64 = sqlx::query_scalar("SELECT id FROM credentials WHERE kind = 'github_app'")
+        .fetch_one(&w.pool)
+        .await
+        .unwrap();
+    u64::try_from(id).unwrap()
+}
+
+#[sqlx::test]
+async fn verify_mints_once_revokes_and_the_reply_holds_no_token(pool: PgPool) {
+    let fake = fake("201 Created", None).await;
+    let w = world(pool, Some(client(&fake))).await;
+    w.seed(true).await;
+    let service = super::CredentialService::new(w.creds.clone(), Arc::new(NoGithub));
+    let request = fleet_proto::v1::VerifyCredentialRequest {
+        id: app_id(&w).await,
+    };
+    let reply = service.verify(w.alice, &request).await.unwrap();
+    assert!(reply.valid);
+    assert_eq!(reply.login, None);
+    assert_eq!(reply.expires_at_ms, None);
+    assert!(!format!("{reply:?}").contains(TOKEN));
+    assert_eq!(fake.mints(), 1);
+    let request = &fake.requests()[0];
+    assert!(
+        request.contains(r#""repositories":["widget"]"#),
+        "{request}"
+    );
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    while !fake
+        .requests()
+        .iter()
+        .any(|r| r.starts_with("DELETE /installation/token "))
+    {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "no revoke within 5 s"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert_eq!(w.uses().await, 0);
+}
+
+#[sqlx::test]
+async fn verify_reports_invalid_when_the_mint_fails_and_holds_no_token(pool: PgPool) {
+    let fake = fake("500 Internal Server Error", None).await;
+    let w = world(pool, Some(client(&fake))).await;
+    w.seed(true).await;
+    let service = super::CredentialService::new(w.creds.clone(), Arc::new(NoGithub));
+    let request = fleet_proto::v1::VerifyCredentialRequest {
+        id: app_id(&w).await,
+    };
+    let reply = service.verify(w.alice, &request).await.unwrap();
+    assert!(!reply.valid);
+    assert_eq!(fake.mints(), 1);
+}
+
+#[sqlx::test]
+async fn verify_without_the_capability_mints_nothing(pool: PgPool) {
+    let fake = fake("201 Created", None).await;
+    let w = world(pool, Some(client(&fake))).await;
+    w.seed(false).await;
+    let service = super::CredentialService::new(w.creds.clone(), Arc::new(NoGithub));
+    let request = fleet_proto::v1::VerifyCredentialRequest {
+        id: app_id(&w).await,
+    };
+    let status = service.verify(w.alice, &request).await.unwrap_err();
+    assert_eq!(status.code(), tonic::Code::PermissionDenied);
+    assert_eq!(
+        status.message(),
+        super::capability::ERR_CAPABILITY_NOT_GRANTED
+    );
+    assert_eq!(fake.mints(), 0);
+}
+
+#[sqlx::test]
+async fn verify_without_a_job_repository_fails_the_precondition_and_mints_nothing(pool: PgPool) {
+    let fake = fake("201 Created", None).await;
+    let w = world(pool, Some(client(&fake))).await;
+    w.seed(true).await;
+    sqlx::query("DELETE FROM jobs")
+        .execute(&w.pool)
+        .await
+        .unwrap();
+    let service = super::CredentialService::new(w.creds.clone(), Arc::new(NoGithub));
+    let request = fleet_proto::v1::VerifyCredentialRequest {
+        id: app_id(&w).await,
+    };
+    let status = service.verify(w.alice, &request).await.unwrap_err();
+    assert_eq!(status.code(), tonic::Code::FailedPrecondition);
+    assert_eq!(status.message(), fleet_proto::PRECONDITION_NO_VERIFY_REPO);
+    assert_eq!(fake.mints(), 0);
+}
+
+#[sqlx::test]
+async fn verify_scopes_the_mint_to_the_most_recent_job_repository(pool: PgPool) {
+    let fake = fake("201 Created", None).await;
+    let w = world(pool, Some(client(&fake))).await;
+    w.seed(true).await;
+    sqlx::query(
+        "INSERT INTO jobs (job_id, idempotency_key, prompt, repo, base_ref, branch, open_pr, state, user_id, agent, created_at) \
+         VALUES ('01JJOBAPP00000000000000001', 'k2', 'p', 'o/gadget', 'main', 'b', false, 'QUEUED', $1, 'claude', now() + interval '1 hour')",
+    )
+    .bind(w.alice)
+    .execute(&w.pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO jobs (job_id, idempotency_key, prompt, repo, base_ref, branch, open_pr, state, user_id, agent, created_at) \
+         VALUES ('01JJOBAPP00000000000000002', 'k3', 'p', 'o/foreign', 'main', 'b', false, 'QUEUED', $1, 'claude', now() + interval '2 hours')",
+    )
+    .bind(w.admin)
+    .execute(&w.pool)
+    .await
+    .unwrap();
+    let service = super::CredentialService::new(w.creds.clone(), Arc::new(NoGithub));
+    let request = fleet_proto::v1::VerifyCredentialRequest {
+        id: app_id(&w).await,
+    };
+    service.verify(w.alice, &request).await.unwrap();
+    let mint = &fake.requests()[0];
+    assert!(mint.contains(r#""repositories":["gadget"]"#), "{mint}");
+}
+
+#[sqlx::test]
+async fn verify_for_another_user_is_not_found_and_mints_nothing(pool: PgPool) {
+    let fake = fake("201 Created", None).await;
+    let w = world(pool, Some(client(&fake))).await;
+    w.seed(true).await;
+    let service = super::CredentialService::new(w.creds.clone(), Arc::new(NoGithub));
+    let request = fleet_proto::v1::VerifyCredentialRequest {
+        id: app_id(&w).await,
+    };
+    let status = service.verify(w.admin, &request).await.unwrap_err();
+    assert_eq!(status.code(), tonic::Code::NotFound);
+    assert_eq!(fake.mints(), 0);
 }
 
 struct NoGithub;

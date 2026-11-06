@@ -8,7 +8,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use fleet_core::capability::Capability;
 use fleet_core::credential::{
-    CredentialError, CredentialKind, CredentialShape, Secret, fingerprint, validate,
+    BotIdentity, CredentialError, CredentialKind, CredentialShape, Secret, fingerprint, validate,
 };
 use fleet_proto::MAX_CREDENTIALS_PER_USER;
 use sqlx::{PgPool, Row};
@@ -51,16 +51,21 @@ const SELECT_RELEASABLE: &str = "\
 SELECT id, kind, (expires_at IS NOT NULL AND expires_at <= now()) AS expired \
 FROM credentials WHERE user_id = $1 AND kind = ANY($2) AND tombstoned_at IS NULL ORDER BY id";
 
+const LATEST_JOB_REPO: &str =
+    "SELECT repo FROM jobs WHERE user_id = $1 ORDER BY created_at DESC, job_id DESC LIMIT 1";
+
 const READ_CAPABILITY: &str =
     "SELECT user_id FROM user_capabilities WHERE user_id = $1 AND capability = $2 FOR SHARE";
 
 const INSERT_USE: &str = "INSERT INTO credential_use (credential_id, job_id) VALUES ($1, $2)";
 
-/// The GitHub App mint lane: the parsed key, the App id and the token client (ADR-0058).
+/// The GitHub App mint lane: the parsed key, the App id, the token client and the bot identity
+/// a Job commits under (ADR-0058).
 pub struct AppLane {
     key: AppKey,
     app_id: String,
     client: AppClient,
+    identity: BotIdentity,
 }
 
 impl AppLane {
@@ -75,6 +80,14 @@ impl AppLane {
             .and_then(|c| std::str::from_utf8(c.value.expose()).ok())
             .and_then(|text| text.parse::<u64>().ok())
             .ok_or(StoreError::MintFailed)?;
+        self.mint_installation(installation, repo).await
+    }
+
+    async fn mint_installation(
+        &self,
+        installation: u64,
+        repo: &str,
+    ) -> Result<InstallationToken, StoreError> {
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map_err(|_| StoreError::MintFailed)?
@@ -102,12 +115,14 @@ impl AppLane {
         }
     }
 
-    /// Builds the lane. `app_id` is the JWT `iss` text.
-    pub fn new(key: AppKey, app_id: String, client: AppClient) -> Self {
+    /// Builds the lane. `app_id` is the JWT `iss` text and `identity` is what the Box commits
+    /// under.
+    pub fn new(key: AppKey, app_id: String, client: AppClient, identity: BotIdentity) -> Self {
         Self {
             key,
             app_id,
             client,
+            identity,
         }
     }
 }
@@ -150,6 +165,10 @@ pub struct ReleasedCredential {
     pub shape: CredentialShape,
     /// The secret value.
     pub value: Secret,
+    /// Expiry in milliseconds since the Unix epoch, set on a minted installation token.
+    pub expires_at_ms: Option<u64>,
+    /// The git identity to commit under, set on the `github_app` credential only.
+    pub git_identity: Option<BotIdentity>,
 }
 
 impl fmt::Debug for ReleasedCredential {
@@ -163,8 +182,8 @@ impl fmt::Debug for ReleasedCredential {
 
 /// The capability a User must hold to store or have released a credential of `kind`.
 ///
-/// Only the `github_app` kind needs one: [`Capability::ForgeGithubApp`] (ADR-0058). The API
-/// refuses that kind at put before this check runs, until the save path lands.
+/// Only the `github_app` kind needs one: [`Capability::ForgeGithubApp`] (ADR-0058). `put`
+/// checks it at save, and the release and verify paths check it again.
 pub const fn required_capability(kind: CredentialKind) -> Option<Capability> {
     match kind {
         CredentialKind::GithubApp => Some(Capability::ForgeGithubApp),
@@ -235,6 +254,8 @@ pub enum StoreError {
     CapabilityDenied,
     /// The GitHub App token could not be minted. One fixed error covers every cause.
     MintFailed,
+    /// The owner has no Job whose repository a verify mint can be scoped to.
+    NoJobRepo,
     /// The database failed.
     Db(sqlx::Error),
 }
@@ -252,6 +273,7 @@ impl fmt::Display for StoreError {
             Self::Expired => f.write_str("credential expired"),
             Self::CapabilityDenied => f.write_str(ERR_CAPABILITY_NOT_GRANTED),
             Self::MintFailed => f.write_str(fleet_proto::PRECONDITION_APP_MINT),
+            Self::NoJobRepo => f.write_str(fleet_proto::PRECONDITION_NO_VERIFY_REPO),
             Self::Seal(e) => e.fmt(f),
             Self::Db(_) => f.write_str("credential store database error"),
         }
@@ -324,7 +346,8 @@ impl CredentialStore {
     }
 
     /// Attaches the GitHub App mint lane. Without it a release for a User holding a
-    /// `github_app` credential fails with [`StoreError::MintFailed`].
+    /// `github_app` credential fails with [`StoreError::MintFailed`], and a verify without it yields the same error, shown as
+    /// `valid: false`.
     #[must_use]
     pub fn with_github_app(mut self, lane: AppLane) -> Self {
         self.app = Some(Arc::new(lane));
@@ -616,6 +639,8 @@ impl CredentialStore {
                 kind,
                 shape: CredentialShape::StaticSecret,
                 value,
+                expires_at_ms: None,
+                git_identity: None,
             });
         }
         if forge != CredentialKind::GithubApp {
@@ -636,6 +661,8 @@ impl CredentialStore {
         for credential in &mut released {
             if credential.kind == CredentialKind::GithubApp {
                 credential.value = Secret::new(token.expose().to_owned());
+                credential.expires_at_ms = token.expires_at().checked_mul(1000);
+                credential.git_identity = Some(lane.identity.clone());
             }
         }
         Ok(released)
@@ -661,6 +688,39 @@ impl CredentialStore {
             .await?;
         record_uses(&mut tx, ids, job_id).await?;
         tx.commit().await?;
+        Ok(())
+    }
+
+    /// Mints one installation token for a stored `github_app` credential and drops it.
+    ///
+    /// The token is scoped to the repository of the user's most recent Job (ADR-0058, SEC-009).
+    /// The capability is checked in a short transaction under `FOR SHARE`, the transaction
+    /// commits, and then the mint runs: no row lock is held across the network call. The token
+    /// is revoked best effort and never leaves this function. No use row is written.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StoreError::CapabilityDenied`] when the user lacks the capability,
+    /// [`StoreError::NoJobRepo`] when the user has no Job, [`StoreError::MintFailed`] when the
+    /// lane is absent, the installation id is malformed or the mint fails, and
+    /// [`StoreError::Db`] for a database failure.
+    pub async fn probe_app(&self, user_id: i64, installation: &Secret) -> Result<(), StoreError> {
+        let installation = std::str::from_utf8(installation.expose())
+            .ok()
+            .and_then(|text| text.parse::<u64>().ok())
+            .ok_or(StoreError::MintFailed)?;
+        let lane = self.app.clone().ok_or(StoreError::MintFailed)?;
+        let mut tx = self.pool.begin().await?;
+        self.require_capability(&mut tx, user_id, CredentialKind::GithubApp)
+            .await?;
+        let repo: String = sqlx::query_scalar(LATEST_JOB_REPO)
+            .bind(user_id)
+            .fetch_optional(&mut *tx)
+            .await?
+            .ok_or(StoreError::NoJobRepo)?;
+        tx.commit().await?;
+        let token = lane.mint_installation(installation, &repo).await?;
+        lane.revoke(&token).await;
         Ok(())
     }
 

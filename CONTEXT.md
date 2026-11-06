@@ -264,7 +264,7 @@ A shell command with no completion event. fleetd measures it as a `BgShell` **Sp
 _Avoid_: detached command, async shell
 
 **GitHub App credential**:
-The `github_app` **Credential kind**: a **User**'s installation id for the operator's GitHub App. The App id and private key are server config, never stored. Built: the kind, the installation id parser, the mint client with response validation, the App id and key file config, the mint audit schema, the tombstone and the `forge:github_app` capability gate. `PutCredential` and the web form still refuse the kind until the save path lands (ADR-0058). The release path mints the token after the capability check and the transaction commit (ADR-0058, SEC-011). Not built: the allowlists, the mint audit rows, the post-mint recheck beyond the lease and the capability and fleetd (ADR-0058).
+The `github_app` **Credential kind**: a **User**'s installation id for the operator's GitHub App. The App id and private key are server config, never stored. Built: the kind, the installation id parser, the mint client with response validation, the App id and key file config, the mint audit schema, the tombstone and the `forge:github_app` capability gate. `PutCredential` and the web form save the kind for a **User** with the capability, and `VerifyCredential` mints once and drops the token (ADR-0058). The release path mints the token after the capability check and the transaction commit (ADR-0058, SEC-011). Not built: the allowlists, the mint audit rows, the post-mint recheck beyond the lease and the capability and fleetd (ADR-0058).
 _Avoid_: app token, app key
 
 **Installation token**:
@@ -272,11 +272,11 @@ The one-hour GitHub token the server mints from a **GitHub App credential** for 
 _Avoid_: app token
 
 **Bot identity**:
-The git name and email (`GitIdentity`) a Job commits under when it uses a **GitHub App credential**. The server sends it and fleetd re-validates it. Not built (ADR-0058).
+The git name and email (`GitIdentity`) a Job commits under when it uses a **GitHub App credential**. The server sends it and fleetd re-validates it. Built on the server from `FLEET_GITHUB_APP_BOT_NAME` and `FLEET_GITHUB_APP_BOT_EMAIL`. fleetd does not use it yet (ADR-0058).
 _Avoid_: bot user
 
 **Forge credential**:
-A **Credential** for a **Forge**: a `github_pat` today, or a **GitHub App credential** (ADR-0043, ADR-0058). The App kind cannot be saved yet, and fleetd does not consume its token yet (ADR-0058).
+A **Credential** for a **Forge**: a `github_pat` today, or a **GitHub App credential** (ADR-0043, ADR-0058). The App kind can be saved, and fleetd does not consume its token yet (ADR-0058).
 
 ## Relationships
 

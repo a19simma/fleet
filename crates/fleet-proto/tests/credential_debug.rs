@@ -18,6 +18,8 @@ fn job() -> JobCredential {
         kind: "forge".into(),
         shape: "token".into(),
         value: SECRET.into(),
+        expires_at_ms: None,
+        git_identity: None,
     }
 }
 
@@ -40,6 +42,20 @@ fn job_credential_debug_hides_the_value() {
         assert!(text.contains("JobCredential"), "{text}");
         assert!(text.contains("<redacted>"), "{text}");
     }
+}
+
+#[test]
+fn job_credential_debug_shows_the_expiry_and_identity_but_not_the_value() {
+    let mut message = job();
+    message.expires_at_ms = Some(1_234_567);
+    message.git_identity = Some(fleet_proto::v1::GitIdentity {
+        name: "fleet-bot[bot]".into(),
+        email: "1+fleet-bot[bot]@users.noreply.github.com".into(),
+    });
+    let text = format!("{message:?}");
+    assert!(!text.contains(SECRET), "{text}");
+    assert!(text.contains("1234567"), "{text}");
+    assert!(text.contains("fleet-bot[bot]"), "{text}");
 }
 
 #[test]
