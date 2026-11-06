@@ -29,6 +29,8 @@ pub enum CredentialKind {
     ClaudeSubscriptionToken,
     /// GitHub fine-grained personal access token.
     GithubPat,
+    /// GitHub App installation, minted into short-lived installation tokens.
+    GithubApp,
     /// Kimi membership key.
     KimiMembershipKey,
     /// Kimi platform key.
@@ -39,10 +41,11 @@ pub enum CredentialKind {
 
 impl CredentialKind {
     /// Every kind, in declaration order.
-    pub const ALL: [Self; 6] = [
+    pub const ALL: [Self; 7] = [
         Self::AnthropicApiKey,
         Self::ClaudeSubscriptionToken,
         Self::GithubPat,
+        Self::GithubApp,
         Self::KimiMembershipKey,
         Self::KimiPlatformKey,
         Self::CodexApiKey,
@@ -54,10 +57,24 @@ impl CredentialKind {
             Self::AnthropicApiKey => "anthropic_api_key",
             Self::ClaudeSubscriptionToken => "claude_subscription_token",
             Self::GithubPat => "github_pat",
+            Self::GithubApp => "github_app",
             Self::KimiMembershipKey => "kimi_membership_key",
             Self::KimiPlatformKey => "kimi_platform_key",
             Self::CodexApiKey => "codex_api_key",
         }
+    }
+
+    /// True for kinds a user may store through `PutCredential` and the web form.
+    ///
+    /// `github_app` is refused until the capability check and the save path land (ADR-0058).
+    /// The save path lifts the refusal by removing this exception.
+    pub const fn is_storable(self) -> bool {
+        !matches!(self, Self::GithubApp)
+    }
+
+    /// True for kinds that authenticate against the git forge.
+    pub const fn is_forge(self) -> bool {
+        matches!(self, Self::GithubPat | Self::GithubApp)
     }
 
     /// Parses a wire name.
@@ -69,7 +86,7 @@ impl CredentialKind {
         match self {
             Self::AnthropicApiKey | Self::ClaudeSubscriptionToken => Some("sk-ant-"),
             Self::KimiMembershipKey => Some("sk-kimi-"),
-            Self::GithubPat | Self::KimiPlatformKey | Self::CodexApiKey => None,
+            Self::GithubPat | Self::GithubApp | Self::KimiPlatformKey | Self::CodexApiKey => None,
         }
     }
 }
@@ -91,6 +108,53 @@ impl CredentialShape {
             Self::RefreshingFile => "refreshing_file",
         }
     }
+}
+
+/// Longest accepted GitHub App installation id, in digits. It is the width of `u64::MAX`.
+pub const MAX_INSTALLATION_ID_LEN: usize = 20;
+
+/// Why an installation id was rejected. Messages are fixed and carry no input text.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InstallationIdError {
+    /// The id is empty, longer than [`MAX_INSTALLATION_ID_LEN`], or holds a non-digit.
+    Malformed,
+    /// The id starts with a zero, which includes zero itself.
+    LeadingZero,
+    /// The id does not fit in a `u64`.
+    OutOfRange,
+}
+
+impl fmt::Display for InstallationIdError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Self::Malformed => "installation id must be 1 to 20 ASCII digits",
+            Self::LeadingZero => "installation id must not start with zero",
+            Self::OutOfRange => "installation id is out of range",
+        })
+    }
+}
+
+impl std::error::Error for InstallationIdError {}
+
+/// Parses a GitHub App installation id.
+///
+/// The id is 1 to 20 ASCII digits, has no leading zero and fits in a `u64`. Nothing else
+/// passes, so the value is safe to place in a URL path.
+///
+/// # Errors
+///
+/// Returns an [`InstallationIdError`] for any other input.
+pub fn parse_installation_id(value: &str) -> Result<u64, InstallationIdError> {
+    if value.is_empty()
+        || value.len() > MAX_INSTALLATION_ID_LEN
+        || !value.bytes().all(|b| b.is_ascii_digit())
+    {
+        return Err(InstallationIdError::Malformed);
+    }
+    if value.starts_with('0') {
+        return Err(InstallationIdError::LeadingZero);
+    }
+    value.parse().map_err(|_| InstallationIdError::OutOfRange)
 }
 
 /// A secret value. Zeroed on drop, never printed, never serialised.
@@ -155,6 +219,8 @@ pub enum CredentialError {
     UnsupportedShape,
     /// The GitHub token is not a fine-grained `github_pat_` token.
     GithubNotFineGrained,
+    /// The `github_app` value is not an installation id.
+    GithubAppInstallationId,
 }
 
 impl fmt::Display for CredentialError {
@@ -168,6 +234,7 @@ impl fmt::Display for CredentialError {
             Self::GithubNotFineGrained => {
                 "github credential must be a fine-grained token starting with github_pat_"
             }
+            Self::GithubAppInstallationId => "github_app value must be an installation id",
         })
     }
 }
@@ -186,10 +253,15 @@ pub struct Validated {
 /// Prefix checks for Anthropic and Kimi keys are lenient because the exact prefixes are
 /// unverified: a mismatch sets [`Validated::unknown_prefix`] and still succeeds.
 ///
+/// A `github_app` value must satisfy [`parse_installation_id`]. It skips the length bounds,
+/// which suit tokens and not ids. Whether a user may store the kind at all is
+/// [`CredentialKind::is_storable`], checked by the callers.
+///
 /// # Errors
 ///
 /// Returns a [`CredentialError`] for an unsupported shape, an empty, short, long or
-/// whitespace-containing value, or a GitHub token that is not fine-grained.
+/// whitespace-containing value, a GitHub token that is not fine-grained, or a `github_app`
+/// value that is not an installation id. The error text never carries the value.
 ///
 /// The whitespace check uses Unicode whitespace and control characters, so zero-width
 /// characters pass. Length bounds count bytes.
@@ -206,6 +278,13 @@ pub fn validate(
     }
     if value.chars().any(|c| c.is_whitespace() || c.is_control()) {
         return Err(CredentialError::Whitespace);
+    }
+    if kind == CredentialKind::GithubApp {
+        return parse_installation_id(value)
+            .map(|_| Validated {
+                unknown_prefix: false,
+            })
+            .map_err(|_| CredentialError::GithubAppInstallationId);
     }
     if value.len() < MIN_CREDENTIAL_LEN {
         return Err(CredentialError::TooShort);
@@ -261,6 +340,137 @@ mod tests {
     fn assert_zeroize_on_drop<T: ZeroizeOnDrop>() {}
 
     #[test]
+    fn github_app_is_listed_and_installation_token_is_not() {
+        assert!(CredentialKind::ALL.contains(&CredentialKind::GithubApp));
+        assert_eq!(
+            CredentialKind::from_wire_name("github_app"),
+            Some(CredentialKind::GithubApp)
+        );
+        assert_eq!(
+            CredentialKind::from_wire_name("github_installation_token"),
+            None
+        );
+    }
+
+    #[test]
+    fn only_github_app_is_not_storable() {
+        for kind in CredentialKind::ALL {
+            assert_eq!(
+                kind.is_storable(),
+                kind != CredentialKind::GithubApp,
+                "{}",
+                kind.wire_name()
+            );
+        }
+    }
+
+    #[test]
+    fn github_app_validates_as_an_installation_id() {
+        for ok in ["1", "12345678", "18446744073709551615"] {
+            assert!(
+                validate(CredentialKind::GithubApp, STATIC, ok).is_ok(),
+                "{ok}"
+            );
+        }
+        for bad in [
+            "0",
+            "012",
+            "12a",
+            "-1",
+            "1/..",
+            "18446744073709551616",
+            "99999999999999999999",
+            "123456789012345678901",
+            "github_pat_11ABCDEFG0abcdefghijklmnop",
+        ] {
+            let err = validate(CredentialKind::GithubApp, STATIC, bad).unwrap_err();
+            assert_eq!(err, CredentialError::GithubAppInstallationId, "{bad}");
+            assert!(!err.to_string().contains(bad), "{bad}");
+        }
+        assert_eq!(
+            validate(CredentialKind::GithubApp, STATIC, "").unwrap_err(),
+            CredentialError::Empty
+        );
+        assert_eq!(
+            validate(CredentialKind::GithubApp, STATIC, "1 2").unwrap_err(),
+            CredentialError::Whitespace
+        );
+    }
+
+    #[test]
+    fn only_github_kinds_are_forge() {
+        for kind in CredentialKind::ALL {
+            let want = matches!(kind, CredentialKind::GithubPat | CredentialKind::GithubApp);
+            assert_eq!(kind.is_forge(), want, "{}", kind.wire_name());
+        }
+    }
+
+    #[test]
+    fn installation_id_accepts_valid_values() {
+        assert_eq!(parse_installation_id("1"), Ok(1));
+        assert_eq!(parse_installation_id("12345678"), Ok(12_345_678));
+        assert_eq!(parse_installation_id("18446744073709551615"), Ok(u64::MAX));
+    }
+
+    #[test]
+    fn installation_id_hostile_input_table() {
+        let malformed = [
+            "",
+            " ",
+            " 1",
+            "1 ",
+            "1 2",
+            "\t1",
+            "1\n",
+            "1\r\n",
+            "\u{85}1",
+            "1\u{2028}",
+            "+1",
+            "-1",
+            "1.0",
+            "1e3",
+            "0x10",
+            "1_000",
+            "\u{0661}",
+            "\u{ff11}",
+            "1\u{200b}",
+            "12a",
+            "1/2",
+            "1/..",
+            "..",
+            "../1",
+            "1?x",
+            "1#x",
+            "1%2f",
+            "1%2F2",
+            "1\\2",
+            "123456789012345678901",
+            "000000000000000000000",
+        ];
+        for input in malformed {
+            assert_eq!(
+                parse_installation_id(input),
+                Err(InstallationIdError::Malformed),
+                "{input:?}"
+            );
+        }
+        for input in ["0", "00", "01", "007", "01234567890123456789"] {
+            assert_eq!(
+                parse_installation_id(input),
+                Err(InstallationIdError::LeadingZero),
+                "{input:?}"
+            );
+        }
+        for input in ["18446744073709551616", "99999999999999999999"] {
+            assert_eq!(
+                parse_installation_id(input),
+                Err(InstallationIdError::OutOfRange),
+                "{input:?}"
+            );
+        }
+    }
+
+    #[test]
     fn wire_names_round_trip_for_every_kind() {
         let names: Vec<_> = CredentialKind::ALL.iter().map(|k| k.wire_name()).collect();
         assert_eq!(
@@ -269,6 +479,7 @@ mod tests {
                 "anthropic_api_key",
                 "claude_subscription_token",
                 "github_pat",
+                "github_app",
                 "kimi_membership_key",
                 "kimi_platform_key",
                 "codex_api_key"

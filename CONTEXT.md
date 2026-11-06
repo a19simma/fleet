@@ -128,7 +128,7 @@ One secret a **User** stores for a Job: an agent key or token, or a forge token.
 _Avoid_: token, secret, key
 
 **Credential kind**:
-Which service a **Credential** is for: `anthropic_api_key`, `claude_subscription_token`, `github_pat`, `kimi_membership_key`, `kimi_platform_key` or `codex_api_key` (ADR-0043).
+Which service a **Credential** is for: `anthropic_api_key`, `claude_subscription_token`, `github_pat`, `github_app`, `kimi_membership_key`, `kimi_platform_key` or `codex_api_key` (ADR-0043, ADR-0058).
 _Avoid_: credential type, provider
 
 **Credential shape**:
@@ -264,19 +264,19 @@ A shell command with no completion event. fleetd measures it as a `BgShell` **Sp
 _Avoid_: detached command, async shell
 
 **GitHub App credential**:
-The `github_app` **Credential kind**: a **User**'s installation id for the operator's GitHub App. The App id and private key are server config, never stored. Proposed, not built (ADR-0058).
+The `github_app` **Credential kind**: a **User**'s installation id for the operator's GitHub App. The App id and private key are server config, never stored. Built: the kind, the installation id parser, the mint audit schema and the tombstone. Saving is refused until the capability check and the save path land (ADR-0058). Not built: minting, the capability, the config and fleetd (ADR-0058).
 _Avoid_: app token, app key
 
 **Installation token**:
-The one-hour GitHub token the server mints from a **GitHub App credential** for one Job, clamped to the Job repository and delivered as wire kind `github_installation_token`. It is never stored. Proposed, not built (ADR-0058).
+The one-hour GitHub token the server mints from a **GitHub App credential** for one Job, clamped to the Job repository and delivered as wire kind `github_installation_token`. It is never stored. Not built: no minting yet (ADR-0058).
 _Avoid_: app token
 
 **Bot identity**:
-The git name and email (`GitIdentity`) a Job commits under when it uses a **GitHub App credential**. The server sends it and fleetd re-validates it. Proposed, not built (ADR-0058).
+The git name and email (`GitIdentity`) a Job commits under when it uses a **GitHub App credential**. The server sends it and fleetd re-validates it. Not built (ADR-0058).
 _Avoid_: bot user
 
 **Forge credential**:
-A **Credential** for a **Forge**: a `github_pat` today, or a **GitHub App credential** (ADR-0043, ADR-0058). Proposed, not built (ADR-0058).
+A **Credential** for a **Forge**: a `github_pat` today, or a **GitHub App credential** (ADR-0043, ADR-0058). The App kind exists but cannot be saved or released yet (ADR-0058).
 
 ## Relationships
 

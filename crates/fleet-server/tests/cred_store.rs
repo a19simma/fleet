@@ -114,6 +114,79 @@ async fn put_rejects_an_invalid_value(pool: PgPool) {
 }
 
 #[sqlx::test]
+async fn put_validates_a_github_app_installation_id(pool: PgPool) {
+    let store = store(&pool, "app-id").unwrap();
+    let alice = user(&pool, "alice").await.unwrap();
+    for bad in ["0", "12a", "99999999999999999999", "1/.."] {
+        let err = store
+            .put(
+                alice,
+                CredentialKind::GithubApp,
+                STATIC,
+                Secret::new(bad.into()),
+                None,
+                None,
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(err, StoreError::Invalid(_)), "{bad}");
+    }
+    assert_eq!(store.list(alice).await.unwrap().len(), 0);
+    store
+        .put(
+            alice,
+            CredentialKind::GithubApp,
+            STATIC,
+            Secret::new("12345678".into()),
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+}
+
+#[sqlx::test]
+async fn a_tombstoned_credential_is_not_listed_or_opened(pool: PgPool) {
+    let store = store(&pool, "tomb").unwrap();
+    let alice = user(&pool, "alice").await.unwrap();
+    let kept = store
+        .put(
+            alice,
+            CredentialKind::AnthropicApiKey,
+            STATIC,
+            Secret::new(ANT.into()),
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+    let gone = store
+        .put(
+            alice,
+            CredentialKind::GithubPat,
+            STATIC,
+            Secret::new(PAT.into()),
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+    sqlx::query("UPDATE credentials SET tombstoned_at = now() WHERE id = $1")
+        .bind(gone.id)
+        .execute(&pool)
+        .await
+        .unwrap();
+    assert_eq!(store.list(alice).await.unwrap(), vec![kept]);
+    let err = store
+        .open_for_use(alice, gone.id, "job-1")
+        .await
+        .unwrap_err();
+    assert!(matches!(err, StoreError::NotFound));
+    let err = store.open_for_verify(alice, gone.id).await.unwrap_err();
+    assert!(matches!(err, StoreError::NotFound));
+}
+
+#[sqlx::test]
 async fn put_rejects_an_expiry_outside_the_range(pool: PgPool) {
     let store = store(&pool, "expiry").unwrap();
     let alice = user(&pool, "alice").await.unwrap();

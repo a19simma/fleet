@@ -258,6 +258,23 @@ async fn unreachable_github_is_unavailable_and_stores_nothing(pool: PgPool) {
 }
 
 #[sqlx::test]
+async fn put_refuses_github_app_and_stores_nothing(pool: PgPool) {
+    let mut h = harness(pool, FakeGithub::ok()).await;
+    for value in ["12345678", "not-an-id", PAT] {
+        let err = h
+            .client
+            .put_credential(as_user(&h.alice, put("github_app", value)))
+            .await
+            .unwrap_err();
+        assert_eq!(err.code(), Code::PermissionDenied, "{value}");
+        assert_eq!(err.message(), "github_app credentials cannot be stored yet");
+        assert!(!format!("{err:?}").contains(value), "{value}");
+    }
+    assert_eq!(h.github.calls(), 0);
+    assert_eq!(stored(&h.pool).await, 0);
+}
+
+#[sqlx::test]
 async fn other_kinds_store_without_a_network_call(pool: PgPool) {
     let mut h = harness(pool, FakeGithub::ok()).await;
     let mut request = put("anthropic_api_key", ANT);
@@ -404,7 +421,7 @@ async fn box_token_is_denied(pool: PgPool) {
 #[sqlx::test]
 async fn out_of_range_expiry_is_invalid_argument_for_every_kind(pool: PgPool) {
     let mut h = harness(pool, FakeGithub::ok()).await;
-    for kind in CredentialKind::ALL {
+    for kind in CredentialKind::ALL.into_iter().filter(|k| k.is_storable()) {
         let value = if kind == CredentialKind::GithubPat {
             PAT
         } else {

@@ -1,6 +1,6 @@
 //! GitHub App key loading and RS256 JWT signing (ADR-0058, SEC-007, SEC-013, SEC-020).
 //!
-//! JWT `Debug` redaction (SEC-020) is deferred to APP-4.
+//! JWT `Debug` redaction (SEC-020) is deferred until the JWT is wired.
 //!
 //! Built, not wired: no runtime path calls this module yet.
 //!

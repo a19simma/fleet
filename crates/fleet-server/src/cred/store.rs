@@ -30,12 +30,12 @@ const STORE_SEALED: &str = "UPDATE credentials SET ciphertext = $1, key_id = $2 
 const LIST: &str = "\
 SELECT id, kind, shape, fingerprint, login, \
 (EXTRACT(EPOCH FROM expires_at) * 1000)::bigint AS expires_ms \
-FROM credentials WHERE user_id = $1 ORDER BY id";
+FROM credentials WHERE user_id = $1 AND tombstoned_at IS NULL ORDER BY id";
 
 const DELETE: &str = "DELETE FROM credentials WHERE id = $1 AND user_id = $2";
 
 const SELECT_FOR_USE: &str = "\
-SELECT kind, ciphertext, key_id FROM credentials WHERE id = $1 AND user_id = $2 FOR SHARE";
+SELECT kind, ciphertext, key_id FROM credentials WHERE id = $1 AND user_id = $2 AND tombstoned_at IS NULL FOR SHARE";
 
 const SELECT_LEASE: &str = "\
 SELECT user_id, agent FROM jobs \
@@ -44,7 +44,7 @@ AND lease_expires_at > now() FOR SHARE";
 
 const SELECT_RELEASABLE: &str = "\
 SELECT id, kind, (expires_at IS NOT NULL AND expires_at <= now()) AS expired \
-FROM credentials WHERE user_id = $1 AND kind = ANY($2) ORDER BY id";
+FROM credentials WHERE user_id = $1 AND kind = ANY($2) AND tombstoned_at IS NULL ORDER BY id";
 
 const INSERT_USE: &str = "INSERT INTO credential_use (credential_id, job_id) VALUES ($1, $2)";
 

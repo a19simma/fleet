@@ -241,6 +241,37 @@ async fn the_lease_holder_gets_the_owner_agent_and_github_credentials(pool: PgPo
     assert_eq!(used, vec![job.job_id.clone()]);
 }
 
+async fn tombstone_then_fetch(pool: PgPool, kind: &str) -> (Status, i64) {
+    let mut w = world(pool).await;
+    w.put(w.alice, CredentialKind::AnthropicApiKey, ANT, None)
+        .await;
+    w.put(w.alice, CredentialKind::GithubPat, PAT, None).await;
+    let job = w.running(w.alice, "claude", "k1").await;
+    sqlx::query("UPDATE credentials SET tombstoned_at = now() WHERE kind = $1")
+        .bind(kind)
+        .execute(&w.pool)
+        .await
+        .unwrap();
+    let err = w.fetch(&job, job.attempt, &box_a()).await.unwrap_err();
+    (err, w.uses().await)
+}
+
+#[sqlx::test]
+async fn a_tombstoned_github_credential_is_not_released(pool: PgPool) {
+    let (err, uses) = tombstone_then_fetch(pool, "github_pat").await;
+    assert_eq!(err.code(), Code::FailedPrecondition);
+    assert_eq!(err.message(), fleet_proto::PRECONDITION_NO_GITHUB);
+    assert_eq!(uses, 0);
+}
+
+#[sqlx::test]
+async fn a_tombstoned_agent_credential_is_not_released(pool: PgPool) {
+    let (err, uses) = tombstone_then_fetch(pool, "anthropic_api_key").await;
+    assert_eq!(err.code(), Code::FailedPrecondition);
+    assert_eq!(err.message(), fleet_proto::PRECONDITION_NO_AGENT);
+    assert_eq!(uses, 0);
+}
+
 #[sqlx::test]
 async fn a_codex_job_gets_only_codex_and_github(pool: PgPool) {
     let mut w = world(pool).await;

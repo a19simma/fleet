@@ -29,6 +29,7 @@ use super::layout::{Nav, shell};
 use super::pages::{auth, csrf_matches, current, fail, signed_in};
 use super::passkeys::AuthError;
 use crate::cred::CredentialService;
+use crate::cred::api::GITHUB_APP_REFUSED;
 
 const STATIC_SECRET: &str = "static_secret";
 
@@ -67,6 +68,7 @@ fn notice_text(code: &str) -> Option<&'static str> {
         "unavailable" => "A backing service is unavailable. Try again later.",
         "not_found" => "No such credential.",
         "no_verifier" => "This kind cannot be verified.",
+        "github_app_unavailable" => "GitHub App credentials cannot be saved yet.",
         "failed" => "The request failed.",
         _ => return None,
     })
@@ -90,6 +92,9 @@ fn notice_for(status: &Status) -> &'static str {
             "github_refused"
         }
         Code::InvalidArgument => "invalid",
+        Code::PermissionDenied if status.message() == GITHUB_APP_REFUSED => {
+            "github_app_unavailable"
+        }
         Code::Unavailable => "unavailable",
         Code::NotFound => "not_found",
         Code::FailedPrecondition => "no_verifier",
@@ -220,7 +225,7 @@ async fn credentials_page(cx: &Cx) -> Result<impl View> {
                     <fieldset class="fieldset">
                         <label class="label" for="credential-kind">"Kind"</label>
                         <select class="select select-sm" id="credential-kind" name="kind">
-                            for kind in CredentialKind::ALL {
+                            for kind in CredentialKind::ALL.into_iter().filter(|k| k.is_storable()) {
                                 <option value=(kind.wire_name())>(kind.wire_name())</option>
                             }
                         </select>

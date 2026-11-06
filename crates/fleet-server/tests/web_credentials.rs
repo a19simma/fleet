@@ -315,6 +315,35 @@ async fn the_page_lists_every_kind_and_no_refreshing_file_option(pool: PgPool) {
 }
 
 #[sqlx::test]
+async fn the_kind_dropdown_omits_github_app(pool: PgPool) {
+    let h = Harness::start(pool).await;
+    let alice = h.session("alice", 'a').await;
+    let page = h.page(&alice, "").await;
+    let start = page.body.find("id=\"credential-kind\"").unwrap();
+    let select = &page.body[start..];
+    let select = &select[..select.find("</select>").unwrap()];
+    assert!(select.contains("github_pat"));
+    assert!(!select.contains("github_app"));
+    h.finish().await;
+}
+
+#[sqlx::test]
+async fn saving_github_app_is_refused_and_stores_nothing(pool: PgPool) {
+    let h = Harness::start(pool).await;
+    let alice = h.session("alice", 'a').await;
+    for value in ["12345678", "not-an-id"] {
+        let put = h.put(&alice, "github_app", value).await;
+        assert_eq!(
+            put.location(),
+            "/credentials?notice=github_app_unavailable",
+            "{value}"
+        );
+    }
+    assert_eq!(stored(&h.pool).await, 0);
+    h.finish().await;
+}
+
+#[sqlx::test]
 async fn put_shows_login_fingerprint_and_expiry_and_never_the_value(pool: PgPool) {
     let h = Harness::start(pool).await;
     let alice = h.session("alice", 'a').await;

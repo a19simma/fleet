@@ -13,6 +13,7 @@ A user stores the credentials their agent and their forge need. This ADR lists t
 | `anthropic_api_key` | Anthropic Console | Static key, sealed by ADR-0040. No prefix check. |
 | `claude_subscription_token` | `claude setup-token` | Valid one year. Passed to the agent as `CLAUDE_CODE_OAUTH_TOKEN`. |
 | `github_pat` | GitHub | Fine-grained `github_pat_` tokens only. |
+| `github_app` | GitHub App installation | The sealed value is the installation id, `static_secret` shape (ADR-0058). Saving is refused until the capability check and the save path land (ADR-0058). |
 | `kimi_membership_key` | Kimi Code Console | `sk-kimi-` prefix, checked on save. Prefix unverified. |
 | `kimi_platform_key` | Kimi platform | Static key, sealed by ADR-0040. No prefix check. |
 | `codex_api_key` | OpenAI | Static key, sealed by ADR-0040. No prefix check. |
@@ -27,7 +28,7 @@ A user stores the credentials their agent and their forge need. This ADR lists t
 - Only fine-grained `github_pat_` tokens are accepted.
 - Classic `ghp_` tokens are rejected. They carry account-wide scope and cannot be limited to a repository.
 - On save, the UI shows the `login`, the `fingerprint` and the expiry, so the user sees which identity and how long the token lives.
-- A GitHub App route is later work.
+- The `github_app` kind exists. ADR-0058 covers the rest of the App route.
 
 ### Standing decision
 
@@ -71,4 +72,4 @@ The Anthropic legal page says developers "may not collect, store, or intermediat
 
 ## Amendment (ADR-0058)
 
-ADR-0058 (proposed, not built) adds the kind `github_app`, shape `static_secret`, holding the installation id. The wire kind `github_installation_token` is delivered to a Box only and `PutCredential` refuses it. When a User holds both GitHub kinds, the App wins.
+ADR-0058 (proposed, partly built) adds the kind `github_app`, shape `static_secret`, holding the installation id. The wire kind `github_installation_token` is delivered to a Box only and `PutCredential` refuses it. When a User holds both GitHub kinds, the App wins.

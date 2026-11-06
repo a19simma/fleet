@@ -67,6 +67,7 @@ async fn every_known_kind_and_shape_is_accepted(pool: PgPool) {
         "anthropic_api_key",
         "claude_subscription_token",
         "github_pat",
+        "github_app",
         "kimi_membership_key",
         "kimi_platform_key",
         "codex_api_key",
@@ -80,6 +81,294 @@ async fn every_known_kind_and_shape_is_accepted(pool: PgPool) {
         };
         credential(&pool, id, kind, shape).await.unwrap();
     }
+}
+
+async fn mint(
+    pool: &PgPool,
+    cred: i64,
+    attempt: &str,
+    outcome: &str,
+) -> Result<sqlx::postgres::PgQueryResult, sqlx::Error> {
+    sqlx::query(
+        "INSERT INTO github_app_mint (mint_id, attempt_id, credential_id, job_id, repo, \
+         installation_id, requested_permissions, outcome) \
+         VALUES (gen_random_uuid(), $1::uuid, $2, 'job', 'o/r', '42', 'contents:read', $3)",
+    )
+    .bind(attempt)
+    .bind(cred)
+    .bind(outcome)
+    .execute(pool)
+    .await
+}
+
+const ATTEMPT: &str = "11111111-1111-1111-1111-111111111111";
+
+#[sqlx::test]
+async fn github_app_mint_accepts_every_outcome(pool: PgPool) {
+    let id = user(&pool, "alice").await.unwrap();
+    let cred = credential(&pool, id, "github_app", "static_secret")
+        .await
+        .unwrap();
+    for outcome in [
+        "attempt",
+        "minted",
+        "failed",
+        "denied",
+        "revoked",
+        "revoke_failed",
+    ] {
+        mint(&pool, cred, ATTEMPT, outcome).await.unwrap();
+    }
+    let err = mint(&pool, cred, ATTEMPT, "bogus").await.unwrap_err();
+    assert_eq!(code(&err), "23514");
+}
+
+async fn mint_with(
+    pool: &PgPool,
+    cred: i64,
+    column: &str,
+    value: &str,
+) -> Result<sqlx::postgres::PgQueryResult, sqlx::Error> {
+    let mut row = [
+        ("job_id", "job"),
+        ("repo", "o/r"),
+        ("installation_id", "42"),
+        ("requested_permissions", "contents:read"),
+        ("reason", "ok"),
+    ];
+    for (name, slot) in &mut row {
+        if *name == column {
+            *slot = value;
+        }
+    }
+    sqlx::query(
+        "INSERT INTO github_app_mint (mint_id, attempt_id, credential_id, job_id, repo, \
+         installation_id, requested_permissions, outcome, reason) \
+         VALUES (gen_random_uuid(), gen_random_uuid(), $1, $2, $3, $4, $5, 'attempt', $6)",
+    )
+    .bind(cred)
+    .bind(row[0].1)
+    .bind(row[1].1)
+    .bind(row[2].1)
+    .bind(row[3].1)
+    .bind(row[4].1)
+    .execute(pool)
+    .await
+}
+
+#[sqlx::test]
+async fn github_app_mint_text_columns_are_bounded(pool: PgPool) {
+    let id = user(&pool, "alice").await.unwrap();
+    let cred = credential(&pool, id, "github_app", "static_secret")
+        .await
+        .unwrap();
+    for (column, max) in [
+        ("job_id", 64),
+        ("repo", 140),
+        ("requested_permissions", 512),
+        ("reason", 200),
+    ] {
+        mint_with(&pool, cred, column, &"a".repeat(max))
+            .await
+            .unwrap();
+        let err = mint_with(&pool, cred, column, &"a".repeat(max + 1))
+            .await
+            .unwrap_err();
+        assert_eq!(code(&err), "23514", "{column}");
+    }
+    for column in ["job_id", "repo", "requested_permissions"] {
+        let err = mint_with(&pool, cred, column, "").await.unwrap_err();
+        assert_eq!(code(&err), "23514", "{column} empty");
+    }
+}
+
+#[sqlx::test]
+async fn github_app_mint_installation_id_is_bounded_to_u64(pool: PgPool) {
+    let id = user(&pool, "alice").await.unwrap();
+    let cred = credential(&pool, id, "github_app", "static_secret")
+        .await
+        .unwrap();
+    mint_with(&pool, cred, "installation_id", "18446744073709551615")
+        .await
+        .unwrap();
+    for bad in ["18446744073709551616", "99999999999999999999"] {
+        let err = mint_with(&pool, cred, "installation_id", bad)
+            .await
+            .unwrap_err();
+        assert_eq!(code(&err), "23514", "{bad}");
+    }
+}
+
+#[sqlx::test]
+async fn a_tombstoned_credential_cannot_be_untombstoned(pool: PgPool) {
+    let id = user(&pool, "alice").await.unwrap();
+    let cred = credential(&pool, id, "github_app", "static_secret")
+        .await
+        .unwrap();
+    sqlx::query("UPDATE credentials SET tombstoned_at = NULL WHERE id = $1")
+        .bind(cred)
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query("UPDATE credentials SET tombstoned_at = now() WHERE id = $1")
+        .bind(cred)
+        .execute(&pool)
+        .await
+        .unwrap();
+    let err = sqlx::query("UPDATE credentials SET tombstoned_at = NULL WHERE id = $1")
+        .bind(cred)
+        .execute(&pool)
+        .await
+        .unwrap_err();
+    assert_eq!(code(&err), "23001");
+    assert!(err.to_string().contains("tombstone"), "{err}");
+    sqlx::query("UPDATE credentials SET shape = 'static_secret' WHERE id = $1")
+        .bind(cred)
+        .execute(&pool)
+        .await
+        .unwrap();
+    let still: bool =
+        sqlx::query_scalar("SELECT tombstoned_at IS NOT NULL FROM credentials WHERE id = $1")
+            .bind(cred)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert!(still);
+}
+
+#[sqlx::test]
+async fn github_app_mint_rejects_update_delete_and_truncate(pool: PgPool) {
+    let id = user(&pool, "alice").await.unwrap();
+    let cred = credential(&pool, id, "github_app", "static_secret")
+        .await
+        .unwrap();
+    mint(&pool, cred, ATTEMPT, "attempt").await.unwrap();
+    for statement in [
+        "UPDATE github_app_mint SET reason = 'x'",
+        "DELETE FROM github_app_mint",
+        "TRUNCATE github_app_mint",
+    ] {
+        let err = sqlx::query(statement).execute(&pool).await.unwrap_err();
+        let message = err.to_string();
+        assert!(message.contains("insert-only"), "{statement}: {message}");
+    }
+    let count: i64 = sqlx::query_scalar("SELECT count(*) FROM github_app_mint")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(count, 1);
+}
+
+#[sqlx::test]
+async fn github_app_mint_attempt_and_outcome_pair_is_unique(pool: PgPool) {
+    let id = user(&pool, "alice").await.unwrap();
+    let cred = credential(&pool, id, "github_app", "static_secret")
+        .await
+        .unwrap();
+    mint(&pool, cred, ATTEMPT, "attempt").await.unwrap();
+    let err = mint(&pool, cred, ATTEMPT, "attempt").await.unwrap_err();
+    assert_eq!(code(&err), "23505");
+    mint(
+        &pool,
+        cred,
+        "22222222-2222-2222-2222-222222222222",
+        "attempt",
+    )
+    .await
+    .unwrap();
+}
+
+#[sqlx::test]
+async fn github_app_mint_expires_at_only_on_minted_rows(pool: PgPool) {
+    let id = user(&pool, "alice").await.unwrap();
+    let cred = credential(&pool, id, "github_app", "static_secret")
+        .await
+        .unwrap();
+    let insert = |outcome: &'static str| {
+        sqlx::query(
+            "INSERT INTO github_app_mint (mint_id, attempt_id, credential_id, job_id, repo, \
+             installation_id, requested_permissions, outcome, expires_at) \
+             VALUES (gen_random_uuid(), gen_random_uuid(), $1, 'j', 'o/r', '42', 'p', $2, now())",
+        )
+        .bind(cred)
+        .bind(outcome)
+        .execute(&pool)
+    };
+    insert("minted").await.unwrap();
+    assert_eq!(code(&insert("failed").await.unwrap_err()), "23514");
+}
+
+#[sqlx::test]
+async fn github_app_mint_rejects_bad_installation_ids(pool: PgPool) {
+    let id = user(&pool, "alice").await.unwrap();
+    let cred = credential(&pool, id, "github_app", "static_secret")
+        .await
+        .unwrap();
+    for bad in ["0", "01", "", "1 ", "+1", "123456789012345678901"] {
+        let err = sqlx::query(
+            "INSERT INTO github_app_mint (mint_id, attempt_id, credential_id, job_id, repo, \
+             installation_id, requested_permissions, outcome) \
+             VALUES (gen_random_uuid(), gen_random_uuid(), $1, 'j', 'o/r', $2, 'p', 'attempt')",
+        )
+        .bind(cred)
+        .bind(bad)
+        .execute(&pool)
+        .await
+        .unwrap_err();
+        assert_eq!(code(&err), "23514", "{bad:?}");
+    }
+}
+
+#[sqlx::test]
+async fn credential_with_mint_history_cannot_be_deleted_but_can_be_tombstoned(pool: PgPool) {
+    let id = user(&pool, "alice").await.unwrap();
+    let cred = credential(&pool, id, "github_app", "static_secret")
+        .await
+        .unwrap();
+    mint(&pool, cred, ATTEMPT, "attempt").await.unwrap();
+    let err = sqlx::query("DELETE FROM credentials WHERE id = $1")
+        .bind(cred)
+        .execute(&pool)
+        .await
+        .unwrap_err();
+    assert!(err.to_string().contains("mint history"), "{err}");
+    sqlx::query("UPDATE credentials SET tombstoned_at = now() WHERE id = $1")
+        .bind(cred)
+        .execute(&pool)
+        .await
+        .unwrap();
+    let tombstoned: bool =
+        sqlx::query_scalar("SELECT tombstoned_at IS NOT NULL FROM credentials WHERE id = $1")
+            .bind(cred)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert!(tombstoned);
+}
+
+#[sqlx::test]
+async fn mint_credential_foreign_key_is_no_action(pool: PgPool) {
+    let action: String = sqlx::query_scalar(
+        "SELECT confdeltype::text FROM pg_constraint \
+         WHERE conrelid = 'github_app_mint'::regclass AND contype = 'f'",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(action, "a");
+}
+
+#[sqlx::test]
+async fn credential_without_mint_history_can_be_deleted(pool: PgPool) {
+    let id = user(&pool, "alice").await.unwrap();
+    let cred = credential(&pool, id, "github_app", "static_secret")
+        .await
+        .unwrap();
+    sqlx::query("DELETE FROM credentials WHERE id = $1")
+        .bind(cred)
+        .execute(&pool)
+        .await
+        .unwrap();
 }
 
 #[sqlx::test]

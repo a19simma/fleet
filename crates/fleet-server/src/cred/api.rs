@@ -17,6 +17,9 @@ use tonic::Status;
 use super::github::{GithubApi, GithubError, GithubUser, MAX_EXPIRY_MS};
 use super::store::{CredentialStore, CredentialSummary, StoreError};
 
+/// The fixed refusal for a `github_app` save. Refused until the capability check and the save path land (ADR-0058).
+pub const GITHUB_APP_REFUSED: &str = "github_app credentials cannot be stored yet";
+
 /// The credential RPC logic over a sealed store and a GitHub seam.
 #[derive(Clone)]
 pub struct CredentialService {
@@ -86,8 +89,10 @@ impl CredentialService {
     /// # Errors
     ///
     /// `INVALID_ARGUMENT` for an unknown kind, an unsupported shape, an invalid value or a
-    /// token GitHub refuses, `RESOURCE_EXHAUSTED` past the per-user cap, `UNAVAILABLE` when
-    /// GitHub or storage cannot answer. Nothing is stored on any error.
+    /// token GitHub refuses, `PERMISSION_DENIED` with [`GITHUB_APP_REFUSED`] for kind
+    /// `github_app` whatever the value (until the save path lands), `RESOURCE_EXHAUSTED` past the
+    /// per-user cap, `UNAVAILABLE` when GitHub or storage cannot answer. Nothing is stored on
+    /// any error.
     pub async fn put(
         &self,
         user_id: i64,
@@ -95,6 +100,9 @@ impl CredentialService {
     ) -> Result<CredentialInfo, Status> {
         let kind = CredentialKind::from_wire_name(&request.kind)
             .ok_or_else(|| Status::invalid_argument("unknown credential kind"))?;
+        if !kind.is_storable() {
+            return Err(Status::permission_denied(GITHUB_APP_REFUSED));
+        }
         if request.shape != CredentialShape::StaticSecret.wire_name() {
             return Err(Status::invalid_argument(
                 "credential shape is not supported in v1",
