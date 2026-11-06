@@ -67,8 +67,9 @@ The Deployment sets `FLEET_LISTEN`, `FLEET_HEALTH_LISTEN`, `FLEET_DATABASE_URL`,
 | Variable | Meaning |
 | --- | --- |
 | `FLEET_UPDATE_MANIFEST` | path of the signed update manifest. The signature is the file of the same name with `.minisig` appended. Unset or empty means no manifest. The Deployment mounts no manifest file, and ConfigMap and Secret are outside the allowed kinds, so delivering the manifest to the pod is an open item for the operator. |
+| `FLEET_MODEL_ALLOWLIST` | comma-separated list of exact, case-sensitive model ids a Job may use. Unset means the server applies no model restriction. An empty list, an empty entry, a duplicate, an over-long entry or a disallowed character stops startup. The server checks it at Profile save, Job submit, batch submit and when it serves the Profile blob to a leased Box (ADR-0054). |
 
-`FLEET_ALLOW_PROFILE_TOOLS` is removed. The server stops startup while it is set, to any value, so unset it. An admin grants the `profile:tools` capability per user instead. A Box also needs the `[mise]` section, see [deploy/README.md](../deploy/README.md#bundled-mise-and-the-mise-section).
+The ADR-0048 server switch for Profile `tools` is removed. The server stops startup while that variable is set, to any value, so unset it. An admin grants the `profile:tools` capability per user instead (ADR-0054). Set `FLEET_MODEL_ALLOWLIST` and also set `model_allowlist` in each Box's `/etc/fleetd/config.toml`: fleetd re-checks the model before spawn, and with no `model_allowlist` the Box trusts the server alone. A Box also needs the `[mise]` section, see [deploy/README.md](../deploy/README.md#bundled-mise-and-the-mise-section).
 
 ## Image tag
 
