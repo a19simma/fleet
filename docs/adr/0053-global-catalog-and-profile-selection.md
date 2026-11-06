@@ -1,6 +1,6 @@
 # Global catalog and profile selection
 
-Status: Proposed 2026-11-02. Save-time selection validation, the `fleet profile item` and `fleet profile prompt` commands, the Kimi dropped-subagent notes in the job event stream, and the web profile page selection editor (toggles per kind, authored prompt) are built, as are the Catalog store, its admin RPCs and pages, `fleet_core::catalog::resolve` and the submit snapshot. Not built: the Profile preview, and showing the snapshot notes on `fleet show` and in the web job view. Amends ADR-0034 (what a Profile holds) and ADR-0035 (what the hash covers). Builds on ADR-0044 and ADR-0048. Tool items need the owner capability `profile:tools` of ADR-0054.
+Status: Proposed 2026-11-02. Save-time selection validation, a re-save equal to an older version moving "latest", the `fleet profile item` and `fleet profile prompt` commands, the Kimi dropped-subagent notes in the job event stream, and the web profile page selection editor (toggles per kind, authored prompt) are built, as are the Catalog store, its admin RPCs and pages, `fleet_core::catalog::resolve` and the submit snapshot. Not built: the Profile preview, and showing the snapshot notes on `fleet show` and in the web job view. Amends ADR-0034 (what a Profile holds) and ADR-0035 (what the hash covers). Builds on ADR-0044 and ADR-0048. Tool items need the owner capability `profile:tools` of ADR-0054.
 
 ADR-0034 defines a Profile as a bundle of content: `claude_md`, inline skills, context files and rules. Every Profile repeats the content it needs, and nothing says which skills, subagents or tools exist on the server. This ADR adds a server-managed catalog and turns a Profile into a selection over it.
 
@@ -78,7 +78,7 @@ The Floor is unchanged. A Catalog item cannot loosen it, and a `subagent` tool l
 - Each Job records exactly what ran: the effective set, the item versions and the notes.
 - A Catalog edit changes the future of every Profile. Admin review of an item is the control point, and the preview is the user's.
 - The Profile hash no longer covers Catalog content. The Job snapshot is the record of that content.
-- Known gap: the server keeps one version per distinct content, so an edit equal to an older version returns that version and leaves the latest unchanged. `fleet profile item` then fails with `FailedPrecondition`, which can happen when an item is switched back on after it was switched off, until the server moves "latest".
+- The server keeps one version per distinct content. A save equal to an older version returns that version with `created` false and moves "latest" to it (`profile.latest_version`), so switching an item off and on again returns the Profile to its first version. The history keeps one row per hash.
 
 ## Considered and rejected
 

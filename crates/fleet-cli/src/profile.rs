@@ -9,7 +9,6 @@ use fleet_proto::v1::{
     CreateProfileRequest, GetProfileRequest, ListProfilesRequest, ProfileSummary, ProfileVersion,
     ProfileVisibility, ShareProfileRequest, UnshareProfileRequest,
 };
-use tonic::Status;
 use tonic::service::interceptor::InterceptedService;
 use tonic::transport::Channel;
 
@@ -30,7 +29,6 @@ const BAD_ITEM: &str =
     "invalid item id: use 1 to 64 characters of a-z, 0-9, _ and -, starting with a letter or digit";
 const BAD_PROMPT: &str = "invalid prompt: at most 65536 bytes, no control characters but newline and tab, no CR, U+2028, U+2029 or bidirectional control";
 const BAD_STORED: &str = "server returned a profile this client cannot edit";
-const NOT_LATEST: &str = "the edited profile equals an older version, so it cannot become the latest; change something else or recreate it";
 const BAD_RESULT: &str = "the edited profile is not valid";
 const BAD_TARGET: &str =
     "invalid profile: use <name> or <name>@<version> with a version of 1 or more";
@@ -170,15 +168,11 @@ fn canonical(profile: &Profile) -> Result<String, CliError> {
 /// `fleet profile item` and `prompt`: reads the latest version, applies `change` to its
 /// content and saves the result through `CreateProfile`, so the server checks the
 /// selection and keeps the version when the content hash is unchanged. Prints the version.
+/// An edit equal to an older version makes that version the latest again.
 ///
 /// Selection is keyed by item id only: the kind is not part of the stored entry.
 ///
-/// The server keeps one version per distinct content. When the edit equals an older
-/// version than the one read, `CreateProfile` returns that older version and leaves the
-/// latest unchanged, so the command fails with `FailedPrecondition` and prints nothing.
-/// Known gap: switching an item back on after it was switched off can hit this, until the
-/// server moves "latest". Another save between the read and the write is overwritten: the
-/// last writer wins.
+/// Another save between the read and the write is overwritten: the last writer wins.
 ///
 /// A profile that sets `tools` cannot be saved as JSON, so the server refuses it.
 pub(crate) async fn edit(
@@ -204,9 +198,6 @@ pub(crate) async fn edit(
         })
         .await?
         .into_inner();
-    if !reply.created && reply.version != current.version {
-        return Err(CliError::Rpc(Status::failed_precondition(NOT_LATEST)));
-    }
     write_version(out, scrub, &reply)?;
     writeln!(out, "created: {}", if reply.created { "yes" } else { "no" })?;
     Ok(())

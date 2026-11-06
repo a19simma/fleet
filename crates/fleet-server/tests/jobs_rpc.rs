@@ -1022,6 +1022,29 @@ async fn submit_with_a_profile_stores_the_frozen_set(pool: PgPool) {
 }
 
 #[sqlx::test]
+async fn submit_pins_the_version_a_re_save_moved_latest_to(pool: PgPool) {
+    let store = store(pool.clone()).await;
+    seed(&pool).await;
+    let (user, token) = user_with_token(&pool, "ann").await;
+    profile(&pool, user, "alpha", SELECT_S2_OFF).await;
+    profile(&pool, user, "alpha", r#"{"claude_md":"other"}"#).await;
+    profile(&pool, user, "alpha", SELECT_S2_OFF).await;
+    let mut jobs = client(serve_users(&pool, &store), &token);
+    let job = jobs
+        .submit_job(with_profile("k1", "alpha", ""))
+        .await
+        .unwrap()
+        .into_inner();
+    let pinned: Option<i32> =
+        sqlx::query_scalar("SELECT profile_version FROM jobs WHERE job_id = $1")
+            .bind(&job.job_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(pinned, Some(1));
+}
+
+#[sqlx::test]
 async fn the_runner_kind_decides_what_is_dropped(pool: PgPool) {
     let store = store(pool.clone()).await;
     seed(&pool).await;

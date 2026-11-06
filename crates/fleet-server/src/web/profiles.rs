@@ -50,15 +50,14 @@ const KIMI_NOTE: &str = "A Kimi job drops this item: Kimi has no subagent mechan
 
 const LIST: &str = "SELECT p.id, p.name, u.username, p.owner_user_id = $1 AS mine, \
      p.visibility = 'shared' AS shared, \
-     (SELECT max(version) FROM profile_version WHERE profile_id = p.id) AS latest \
+     p.latest_version AS latest \
      FROM profile p JOIN users u ON u.id = p.owner_user_id \
      WHERE p.owner_user_id = $1 OR p.visibility = 'shared' \
      ORDER BY mine DESC, p.name, p.id LIMIT $2";
 const DETAIL: &str = "SELECT p.id, p.name, u.username, p.owner_user_id = $1 AS mine, \
      p.visibility = 'shared' AS shared, v.version AS latest, b.content \
      FROM profile p JOIN users u ON u.id = p.owner_user_id \
-     LEFT JOIN LATERAL (SELECT version, hash FROM profile_version \
-         WHERE profile_id = p.id ORDER BY version DESC LIMIT 1) v ON true \
+     LEFT JOIN profile_version v ON v.profile_id = p.id AND v.version = p.latest_version \
      LEFT JOIN profile_blob b ON b.hash = v.hash \
      WHERE p.id = $2 AND (p.owner_user_id = $1 OR p.visibility = 'shared')";
 

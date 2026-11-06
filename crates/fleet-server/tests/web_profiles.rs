@@ -167,9 +167,9 @@ impl Harness {
 
     async fn latest(&self, id: i64) -> (i32, serde_json::Value) {
         let (version, content): (i32, Vec<u8>) = sqlx::query_as(
-            "SELECT v.version, b.content FROM profile_version v \
-             JOIN profile_blob b ON b.hash = v.hash \
-             WHERE v.profile_id = $1 ORDER BY v.version DESC LIMIT 1",
+            "SELECT v.version, b.content FROM profile p \
+             JOIN profile_version v ON v.profile_id = p.id AND v.version = p.latest_version \
+             JOIN profile_blob b ON b.hash = v.hash WHERE p.id = $1",
         )
         .bind(id)
         .fetch_one(&self.pool)
@@ -536,6 +536,36 @@ async fn saving_stores_the_switched_off_items_and_the_prompt(pool: PgPool) {
         serde_json::json!([{"item_id": "sk-on", "enabled": false}])
     );
     assert!(json.get("authored_prompt").is_none());
+    h.finish().await;
+}
+
+#[sqlx::test]
+async fn switching_an_item_off_then_on_returns_to_the_first_version(pool: PgPool) {
+    let h = Harness::start(pool.clone()).await;
+    let alice = h.session("alice", 'a').await;
+    h.item("sk-on", "skill", true).await;
+    let id = h.profile(&alice, "mine", "{}", false).await;
+    let path = format!("/profiles/{id}/selection");
+    let off = format!("csrf={}&prompt=", alice.csrf);
+    assert_eq!(h.post(&alice, &path, &off).await.status, 303);
+    let page = h.get(&alice, &format!("/profiles/{id}")).await;
+    assert!(page.body.contains("<dd>2</dd>"), "{}", page.body);
+    assert!(!checkbox(&page.body, "on_sk-on").contains("checked"));
+    let on = format!("csrf={}&on_sk-on=1&prompt=", alice.csrf);
+    assert_eq!(h.post(&alice, &path, &on).await.status, 303);
+    let page = h.get(&alice, &format!("/profiles/{id}")).await;
+    assert!(page.body.contains("<dd>1</dd>"), "{}", page.body);
+    assert!(checkbox(&page.body, "on_sk-on").contains("checked"));
+    let listing = h.get(&alice, "/profiles").await;
+    assert!(listing.body.contains("<td>1</td>"), "{}", listing.body);
+    assert!(!listing.body.contains("<td>2</td>"), "{}", listing.body);
+    let rows: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM profile_version WHERE profile_id = $1")
+            .bind(id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(rows, 2);
     h.finish().await;
 }
 

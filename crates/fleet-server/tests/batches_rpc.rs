@@ -257,6 +257,28 @@ async fn resubmit_after_a_new_version_keeps_the_batch(pool: PgPool) {
 }
 
 #[sqlx::test]
+async fn a_batch_pins_the_version_a_re_save_moved_latest_to(pool: PgPool) {
+    let store = store(pool.clone()).await;
+    two_profiles(&pool).await;
+    shared(&pool, "gamma", r#"{"claude_md":"a"}"#).await;
+    shared(&pool, "gamma", r#"{"claude_md":"b"}"#).await;
+    shared(&pool, "gamma", r#"{"claude_md":"a"}"#).await;
+    let mut client = batches(serve(&store), as_client);
+    let made = client
+        .submit_batch(request("k1", &["gamma"]))
+        .await
+        .unwrap()
+        .into_inner();
+    let pinned: Vec<i32> =
+        sqlx::query_scalar("SELECT profile_version FROM jobs WHERE batch_id = $1")
+            .bind(&made.batch_id)
+            .fetch_all(&pool)
+            .await
+            .unwrap();
+    assert_eq!(pinned, [1]);
+}
+
+#[sqlx::test]
 async fn same_key_with_other_parameters_is_refused(pool: PgPool) {
     let store = store(pool.clone()).await;
     two_profiles(&pool).await;

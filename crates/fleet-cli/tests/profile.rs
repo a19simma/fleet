@@ -643,7 +643,7 @@ async fn prompt_sets_replaces_and_keeps_other_fields(pool: PgPool) {
 }
 
 #[sqlx::test]
-async fn an_edit_equal_to_an_older_version_fails_and_the_latest_stays(pool: PgPool) {
+async fn an_edit_equal_to_an_older_version_makes_it_the_latest_again(pool: PgPool) {
     let admin = serve_admin(pool).await;
     run_as(
         &admin,
@@ -662,13 +662,12 @@ async fn an_edit_equal_to_an_older_version_fails_and_the_latest_stays(pool: PgPo
     .0
     .unwrap();
     let (result, out) = run_as(&admin, &["profile", "prompt", "alpha", "--file", "-"], b"").await;
-    let text = result.unwrap_err().to_string();
-    assert!(text.contains("FailedPrecondition"), "{text}");
-    assert!(text.contains("older version"), "{text}");
-    assert_eq!(out, "");
+    result.unwrap();
+    assert_eq!(field(&out, "version"), "1");
+    assert_eq!(field(&out, "created"), "no");
     let shown = show_as(&admin, "alpha").await;
-    assert_eq!(field(&shown, "version"), "2");
-    assert_eq!(field(&shown, "prompt"), "hi");
+    assert_eq!(field(&shown, "version"), "1");
+    assert_eq!(field(&shown, "prompt"), "-");
 }
 
 #[sqlx::test]

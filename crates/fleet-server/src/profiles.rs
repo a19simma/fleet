@@ -168,7 +168,7 @@ const LOCK_OWNER: &str = "SELECT id FROM users WHERE id = $1 FOR SHARE";
 const INSERT_PROFILE: &str = "INSERT INTO profile (owner_user_id, name, visibility) \
      VALUES ($1, $2, $3) ON CONFLICT (owner_user_id, name) DO NOTHING";
 const LOCK_PROFILE: &str =
-    "SELECT id FROM profile WHERE owner_user_id = $1 AND name = $2 FOR SHARE";
+    "SELECT id FROM profile WHERE owner_user_id = $1 AND name = $2 FOR UPDATE";
 const LOCK_PROFILE_FOR_WRITE: &str =
     "SELECT owner_user_id, visibility, name FROM profile WHERE id = $1 FOR UPDATE";
 const PROFILE_HAS_VERSIONS: &str =
@@ -177,24 +177,25 @@ const DELETE_PROFILE: &str = "DELETE FROM profile WHERE id = $1";
 const LOCK_PROFILE_ID: &str = "SELECT pg_advisory_xact_lock($1)";
 const SELECT_VERSION_BY_HASH: &str =
     "SELECT version FROM profile_version WHERE profile_id = $1 AND hash = $2";
+const MOVE_LATEST: &str = "UPDATE profile SET latest_version = $2 WHERE id = $1";
 const INSERT_VERSION: &str = "INSERT INTO profile_version (profile_id, version, hash) \
      SELECT $1, COALESCE(MAX(version), 0) + 1, $2 FROM profile_version WHERE profile_id = $1 \
      RETURNING version";
 const SELECT_VISIBLE: &str = "SELECT v.version, v.hash, b.content, p.visibility, \
      u.username AS owner FROM \
-     (SELECT id, owner_user_id, visibility FROM profile \
+     (SELECT id, owner_user_id, visibility, latest_version FROM profile \
       WHERE name = $1 AND (owner_user_id = $2 OR visibility = 'shared') \
       ORDER BY (owner_user_id = $2) DESC NULLS LAST, id LIMIT 1) p \
      JOIN users u ON u.id = p.owner_user_id \
      JOIN profile_version v ON v.profile_id = p.id \
      JOIN profile_blob b ON b.hash = v.hash \
-     WHERE $3::int IS NULL OR v.version = $3 ORDER BY v.version DESC LIMIT 1";
+     WHERE v.version = COALESCE($3::int, p.latest_version) LIMIT 1";
 const SELECT_PINNED_FOR_SUBMIT: &str = "SELECT p.id, v.version, v.hash, b.content FROM \
-     (SELECT id FROM profile WHERE name = $1 AND (owner_user_id = $2 OR visibility = 'shared') \
+     (SELECT id, latest_version FROM profile \
+      WHERE name = $1 AND (owner_user_id = $2 OR visibility = 'shared') \
       ORDER BY (owner_user_id = $2) DESC NULLS LAST, id LIMIT 1 FOR SHARE) p \
-     JOIN profile_version v ON v.profile_id = p.id \
-     JOIN profile_blob b ON b.hash = v.hash \
-     ORDER BY v.version DESC LIMIT 1";
+     JOIN profile_version v ON v.profile_id = p.id AND v.version = p.latest_version \
+     JOIN profile_blob b ON b.hash = v.hash LIMIT 1";
 const READ_TOOLS_GRANT: &str =
     "SELECT user_id FROM user_capabilities WHERE user_id = $1 AND capability = $2 FOR SHARE";
 const LOCK_SELECTED: &str =
@@ -211,10 +212,10 @@ const SELECT_LEASED_BLOB: &str = "SELECT j.profile_name, j.profile_version, j.pr
 const LIST: &str = "SELECT DISTINCT ON (p.name) p.name, v.version, v.hash, p.visibility, \
      u.username AS owner FROM profile p \
      JOIN users u ON u.id = p.owner_user_id \
-     JOIN profile_version v ON v.profile_id = p.id \
+     JOIN profile_version v ON v.profile_id = p.id AND v.version = p.latest_version \
      WHERE ($1::text IS NULL OR p.name > $1) \
      AND (p.owner_user_id = $3 OR p.visibility = 'shared') \
-     ORDER BY p.name, (p.owner_user_id = $3) DESC NULLS LAST, v.version DESC LIMIT $2";
+     ORDER BY p.name, (p.owner_user_id = $3) DESC NULLS LAST LIMIT $2";
 
 /// Why a profile request was refused. The variants carry no client input.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -419,7 +420,8 @@ fn text_of(bytes: Vec<u8>) -> Result<String, StoreError> {
 /// meanwhile cannot gain a profile, and a caller that is not a stored user is refused. The
 /// first create of a name by this owner inserts the private `profile` row; a repeat leaves
 /// it as is. Versions are keyed by that profile's id, so two owners of one name keep
-/// separate streams even for identical content.
+/// separate streams even for identical content. Content equal to an existing version of
+/// that profile returns that version with `created` false and makes it the latest.
 ///
 /// # Errors
 ///
@@ -535,7 +537,13 @@ async fn push_version(
         .fetch_optional(&mut *tx)
         .await?;
     let (version, created) = if let Some(row) = existing {
-        (row.try_get::<i32, _>("version")?, false)
+        let version = row.try_get::<i32, _>("version")?;
+        sqlx::query(MOVE_LATEST)
+            .bind(profile_id)
+            .bind(version)
+            .execute(&mut *tx)
+            .await?;
+        (version, false)
     } else {
         let row = sqlx::query(INSERT_VERSION)
             .bind(profile_id)
@@ -581,7 +589,8 @@ async fn lock_for_owner(
 ///
 /// The content is validated before any query. The profile row is then locked `FOR UPDATE`
 /// inside the transaction and its owner compared with `caller`. Identical content returns
-/// the existing version with `created` false.
+/// the existing version with `created` false and makes it the latest, so content equal to
+/// an older version moves latest back to that version without a new row.
 ///
 /// # Errors
 ///

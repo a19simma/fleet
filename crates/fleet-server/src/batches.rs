@@ -31,9 +31,9 @@ const LOCK_VISIBLE_PROFILE: &str = "SELECT id FROM profile \
      WHERE name = $1 AND (owner_user_id = $2 OR visibility = 'shared') \
      ORDER BY (owner_user_id = $2) DESC, id LIMIT 1 FOR SHARE";
 const LOCK_PROFILE_ID: &str = "SELECT pg_advisory_xact_lock($1)";
-const SELECT_LATEST: &str = "SELECT v.version, v.hash, b.content FROM profile_version v \
-     JOIN profile_blob b ON b.hash = v.hash WHERE v.profile_id = $1 \
-     ORDER BY v.version DESC LIMIT 1";
+const SELECT_LATEST: &str = "SELECT v.version, v.hash, b.content FROM profile p \
+     JOIN profile_version v ON v.profile_id = p.id AND v.version = p.latest_version \
+     JOIN profile_blob b ON b.hash = v.hash WHERE p.id = $1";
 const INSERT_BATCH_JOB: &str = "INSERT INTO jobs (job_id, prompt, repo, base_ref, branch, open_pr, \
      batch_id, repeat_idx, batch_pos, profile_name, profile_id, profile_version, profile_hash, \
      user_id, agent, profile_tools_granted) \

@@ -202,6 +202,67 @@ async fn same_content_same_version(pool: PgPool) {
 }
 
 #[sqlx::test]
+async fn a_re_save_equal_to_an_older_version_moves_latest_there(pool: PgPool) {
+    let store = store(pool.clone()).await;
+    let mut profiles = spawn(&pool, &store);
+    let first = profiles
+        .create_profile(create("alpha", ONE))
+        .await
+        .unwrap()
+        .into_inner();
+    let second = profiles
+        .create_profile(create("alpha", TWO))
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(second.version, 2);
+    let back = profiles
+        .create_profile(create("alpha", ONE))
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!((back.version, back.created), (1, false));
+    let latest = profiles
+        .get_profile(get("alpha", None))
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(latest.version, 1);
+    assert_eq!(latest.hash, first.hash);
+    let listed = profiles
+        .list_profiles(ListProfilesRequest::default())
+        .await
+        .unwrap()
+        .into_inner()
+        .profiles;
+    assert_eq!(listed[0].latest_version, 1);
+    assert_eq!(listed[0].hash, first.hash);
+    let rows: i64 = sqlx::query_scalar("SELECT count(*) FROM profile_version")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(rows, 2);
+    let forward = profiles
+        .create_profile(create("alpha", TWO))
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!((forward.version, forward.created), (2, false));
+    let latest = profiles
+        .get_profile(get("alpha", None))
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(latest.version, 2);
+    let fresh = profiles
+        .create_profile(create("alpha", r#"{"claude_md":"three"}"#))
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!((fresh.version, fresh.created), (3, true));
+}
+
+#[sqlx::test]
 async fn different_content_gets_a_new_version(pool: PgPool) {
     let store = store(pool.clone()).await;
     let mut profiles = spawn(&pool, &store);

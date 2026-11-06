@@ -14,9 +14,6 @@
 //! `InvalidArgument`, `FailedPrecondition` and `AlreadyExists` are 400. A 400 body carries the
 //! message and is compared as text.
 //!
-//! Known server gap, not exercised: re-saving content equal to an older version does not move
-//! the latest version, so item on after item off is left out and item off is used alone.
-//!
 //! The tests need a Postgres superuser URL in `DATABASE_URL` and live in their own binary
 //! because they bind a socket.
 
@@ -596,9 +593,9 @@ impl Rig {
 
     async fn latest(&self, id: i64) -> (i32, State) {
         let (version, content): (i32, Vec<u8>) = sqlx::query_as(
-            "SELECT v.version, b.content FROM profile_version v \
-             JOIN profile_blob b ON b.hash = v.hash \
-             WHERE v.profile_id = $1 ORDER BY v.version DESC LIMIT 1",
+            "SELECT v.version, b.content FROM profile p \
+             JOIN profile_version v ON v.profile_id = p.id AND v.version = p.latest_version \
+             JOIN profile_blob b ON b.hash = v.hash WHERE p.id = $1",
         )
         .bind(id)
         .fetch_one(&self.pool)
