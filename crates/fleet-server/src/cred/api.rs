@@ -46,6 +46,9 @@ fn store_status(err: &StoreError) -> Status {
             Status::permission_denied(super::capability::ERR_CAPABILITY_NOT_GRANTED)
         }
         StoreError::MintFailed => Status::failed_precondition(fleet_proto::PRECONDITION_APP_MINT),
+        StoreError::MintCapReached => {
+            Status::failed_precondition(fleet_proto::PRECONDITION_APP_MINT_CAP)
+        }
         StoreError::NoJobRepo => {
             Status::failed_precondition(fleet_proto::PRECONDITION_NO_VERIFY_REPO)
         }
@@ -215,15 +218,17 @@ impl CredentialService {
     /// `ERR_CAPABILITY_NOT_GRANTED` when the owner lost the capability a stored kind needs.
     ///
     /// `FAILED_PRECONDITION` with `PRECONDITION_APP_MINT` when the App token cannot be minted,
-    /// and with another message when the owner has no GitHub credential, no credential the
-    /// agent accepts, or a needed credential is expired.
+    /// with `PRECONDITION_APP_MINT_CAP` when the per-Job mint cap or the per-User mint rate
+    /// limit is reached (no PAT fallback), and with another message when the owner has no
+    /// GitHub credential, no credential the agent accepts, or a needed credential is expired.
     ///
     /// `NOT_FOUND` when a credential row vanishes during release.
     ///
     /// `INTERNAL` when a sealed value cannot be opened, a stored kind is unknown or a value is
     /// not text.
     ///
-    /// `UNAVAILABLE` when storage fails. Nothing is recorded on error.
+    /// `UNAVAILABLE` when storage fails. No use row is written on error; mint attempts write
+    /// `github_app_mint` audit rows.
     pub async fn job_credentials(
         &self,
         job_id: &str,

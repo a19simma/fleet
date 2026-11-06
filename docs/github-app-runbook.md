@@ -8,7 +8,7 @@ Unverified claims: this runbook states four things about GitHub that nobody chec
 
 ## What the lane does
 
-A User who holds a `github_app` credential and the `forge:github_app` capability gets an installation token for the Job repository, which lasts one hour (see Unverified claims) instead of a PAT. The Job commits, pushes and opens its pull request as the App's bot. A PAT Job is unchanged and keeps the fixed identity `Fleet Job <fleet-job@fleet.invalid>`. When a User holds both credentials, the App wins. A mint failure never falls back to the PAT (ADR-0058, SEC-008). The server answers `FAILED_PRECONDITION` with the status text `github app token unavailable`, which fleetd discards. The Job reports `credentials could not be fetched`. Search the server log for `github app token mint failed`, which the server logs when the call to GitHub fails or its response fails validation (refusal, timeout, transport error, malformed or invalid body). If that line is absent, check the lane config: App id or key unset, a malformed installation id, or a signing failure, none of which log.
+A User who holds a `github_app` credential and the `forge:github_app` capability gets an installation token for the Job repository, which lasts one hour (see Unverified claims) instead of a PAT. The Job commits, pushes and opens its pull request as the App's bot. A PAT Job is unchanged and keeps the fixed identity `Fleet Job <fleet-job@fleet.invalid>`. When a User holds both credentials, the App wins. A mint failure never falls back to the PAT (ADR-0058, SEC-008). The server answers `FAILED_PRECONDITION` with the status text `github app token unavailable`, which fleetd discards. A mint failure at the first fetch reports `credentials could not be fetched`; a refresh whose mint fails keeps the last good token until it expires. Search the server log for `github app token mint failed`, which the server logs when the call to GitHub fails or its response fails validation (refusal, timeout, transport error, malformed or invalid body). If that line is absent, check the lane config: App id or key unset, a malformed installation id, or a signing failure, none of which log.
 
 The end-to-end check is in `crates/fleetd/tests/daemon_jobs.rs`: `an_app_job_commits_as_the_bot_and_the_token_reaches_only_the_forge_call` and `a_pat_job_in_the_same_harness_keeps_the_fixed_identity`. They run the real daemon against a local bare git remote and a local fake REST endpoint for the pull request.
 
@@ -21,7 +21,7 @@ The end-to-end check is in `crates/fleetd/tests/daemon_jobs.rs`: `an_app_job_com
 5. Generate a private key in the App settings. GitHub lets an App hold several keys at once, which the rotation below uses.
 6. Look up the bot id: `gh api '/users/<slug>[bot]' --jq .id`. The bot email is `<bot-id>+<slug>[bot]@users.noreply.github.com`.
 
-Not yet built, so do not rely on them: the installation allowlist, the repository allowlist, the per-User mint rate limit, the mint audit rows and the fleetd token refresh and revoke (ADR-0058, Status). Until the repository allowlist exists, any holder of `forge:github_app` can mint a write token for any repository in the installation. Grant the capability with that in mind.
+Not yet built, so do not rely on them: the installation allowlist, the repository allowlist, refresh of the mirror fetch and the broker token, a revoke that survives a daemon exit and the delete path that sets the credential tombstone (ADR-0058, Status; see Refresh, limits and audit). Until the repository allowlist exists, any holder of `forge:github_app` can mint a write token for any repository in the installation. Grant the capability with that in mind.
 
 ## Server variables
 
@@ -63,9 +63,9 @@ The server holds one parsed key for the life of the process and reads the file o
 2. Update the key Secret with the new key. Keep the same file name and mode.
 3. Restart the server pods. A bad file stops the new pod at startup and the old pod keeps serving, so a rolling restart does not take the lane down. Pods that have not restarted still sign with the old key.
 4. Check the pod logs for `github app key loaded` on every pod.
-5. Delete the old key in the App settings only after every pod runs the new one. Deleting it earlier makes the old pods fail their mints. The Job reports `credentials could not be fetched`, and the server log shows `github app token mint failed`.
+5. Delete the old key in the App settings only after every pod runs the new one. Deleting it earlier makes the old pods fail their mints. A Job in its first fetch reports `credentials could not be fetched`; a refresh whose mint fails keeps the last good token until it expires. The server log shows `github app token mint failed`.
 
-Running Jobs are not lost. The server never stores the token, so a restart does not touch a token a Box already holds. That token lasts one hour (see Unverified claims). fleetd does not refresh it yet, so a Job that outlives the hour loses GitHub access whether or not you rotate (ADR-0058, Status).
+Running Jobs are not lost. The server never stores the token, so a restart does not touch a token a Box already holds. That token lasts one hour (see Unverified claims). fleetd refreshes it before a push or `gh` child, and a refresh uses whichever key the server signs with at that time, so keep the old key until every pod runs the new one.
 
 ## Grant the capability and store the credential
 
@@ -82,8 +82,31 @@ Running Jobs are not lost. The server never stores the token, so a restart does 
 
 1. Submit one Job as that User against a repository the installation covers. `fleet credential verify` mints against the repository of the User's latest Job, so a User with no Job gets `FAILED_PRECONDITION` and the CLI notice for no job.
 2. Run `fleet credential list` to read the credential id, then `fleet credential verify <id>`.
-3. The server mints once, revokes the token at once and returns no token text. Success prints `GitHub accepted the stored credential.`, and a refused token prints `GitHub refused the stored credential.`. Any mint failure prints the invalid token notice, with no detail. For the cause, read the server log and check, in order: the App id, the key, the installation id, the granted permissions and the repository.
+3. The server mints once, revokes the token best effort and returns no token text. Success prints `GitHub accepted the stored credential.`, and a refused token prints `GitHub refused the stored credential.`. Any mint failure prints the invalid token notice, with no detail. For the cause, read the server log and check, in order: the App id, the key, the installation id, the granted permissions and the repository.
 4. Run an App Job to the end. The pull request shows the bot as author (see Unverified claims). `git log` on the pushed branch shows `<name>` and `<email>` from the server variables for author and committer.
+
+## Refresh, limits and audit
+
+Built (ADR-0058):
+
+- fleetd refreshes the installation token before a push or `gh` child when under 10 minutes of it remain. The mirror fetch and the broker token are not refreshed.
+- The server allows `MAX_APP_MINTS_PER_JOB` (34) mint attempts per Job and `MAX_APP_MINTS_PER_USER_PER_MINUTE` (20) per User. Past either, the release answers `FAILED_PRECONDITION` with `github app token limit reached` (`PRECONDITION_APP_MINT_CAP`). There is no PAT fallback.
+- fleetd revokes the token a refresh replaced, and the held token when the Job ends, with `DELETE /installation/token`. The revoke is best effort with a 10 second bound. A failed revoke logs a fixed string and never fails the Job, so that token lives until its expiry.
+- Every mint writes rows to `github_app_mint`: `attempt`, then `minted`, `failed` or `denied`, and `revoked` or `revoke_failed` when the server revokes after a failed recheck.
+
+Not built: the installation and repository allowlists, refresh of the mirror fetch and the broker token, a revoke that survives a daemon exit, and the delete path that sets the credential tombstone.
+
+When the cap is hit, the step fails with the Job reason `github app token limit reached`. A plain mint failure reports `credentials could not be fetched` instead. A refresh whose mint fails keeps the last good token until it expires. To see the cause, list the denied rows. The table has no user column, so join through the credential:
+
+```
+SELECT m.at, m.job_id, m.reason
+FROM github_app_mint m
+JOIN credentials c ON c.id = m.credential_id
+WHERE c.user_id = <user-id> AND m.outcome = 'denied'
+ORDER BY m.at DESC;
+```
+
+Reason `job mint cap` means the Job used its 34 attempts. Reason `user mint rate` means the User started 20 mints in the last minute. A `denied` row is not repeated for one Job while one with the same reason is under 60 seconds old. Rows with outcome `failed` carry the mint failure reason.
 
 ## Upgrade note
 
@@ -93,7 +116,7 @@ Applies when you move to a server and fleetd that carry the GitHub App lane (ADR
 - Mount the key file first. A key file that is group or other accessible, not a regular file, over 16 KiB or not RSA stops startup.
 - Database: the server migrations add the `github_app_mint` audit table and the `credentials.tombstoned_at` column (0033) and the `forge:github_app` capability CHECK (0034). They run with the server.
 - fleetd: upgrade every Box before you grant `forge:github_app`. The Box needs the code that accepts the `github_installation_token` wire kind and the `GitIdentity`. How an older fleetd answers that kind is unverified.
-- Behaviour change for a User who holds `github_app` and `forge:github_app`: Jobs use the App token, not the PAT, even when a PAT is stored. Commits, pushes and pull requests carry the bot identity. There is no PAT fallback: a mint failure fails the Job. The Job reports `credentials could not be fetched`. A failed call to GitHub, or a response that fails validation, logs `github app token mint failed`; a lane config fault logs nothing.
+- Behaviour change for a User who holds `github_app` and `forge:github_app`: Jobs use the App token, not the PAT, even when a PAT is stored. Commits, pushes and pull requests carry the bot identity. There is no PAT fallback: a mint failure at the first fetch fails the Job, and a refresh whose mint fails keeps the last good token until it expires. A failed first fetch reports `credentials could not be fetched`. A failed call to GitHub, or a response that fails validation, logs `github app token mint failed`; a lane config fault logs nothing.
 - A User who holds `github_app` without `forge:github_app` fails the Job. The server answers `PERMISSION_DENIED`, fleetd maps every such answer to a lease mismatch, and the Job reports `credentials refused: lease does not match`. The server does not fall back to the PAT.
 - No change for a User with only a PAT. Those Jobs keep `Fleet Job <fleet-job@fleet.invalid>` and the PAT.
-- The token lasts one hour (see Unverified claims) and fleetd does not refresh it. A Job that runs longer loses push and `gh` access.
+- The token lasts one hour (see Unverified claims). fleetd refreshes it before a push or `gh` child when under 10 minutes remain, within the per-Job and per-User mint limits (see Refresh, limits and audit). The mirror fetch and the broker token are not refreshed.

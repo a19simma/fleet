@@ -750,10 +750,10 @@ pub(crate) fn build(
     let token = Token::new(raw_token.clone());
     let channel: Channel = channel(&url)?;
     let reporter = GrpcReporter::new(channel.clone(), &token)?;
-    let book = Arc::new(CredentialBook::new(CredentialClient::new(
-        channel.clone(),
-        &raw_token,
-    )?));
+    let book = Arc::new(
+        CredentialBook::new(CredentialClient::new(channel.clone(), &raw_token)?)
+            .with_revoker(Arc::new(crate::revoke::Revoker::github())),
+    );
     let mut run = agent_binaries(config);
     run.jobs_dir = Some(config.jobs_dir.clone());
     run.job_gid = job_gid(config)?;

@@ -29,6 +29,7 @@ pub(crate) struct Captured {
 pub(crate) enum CaptureError {
     Start,
     Timeout,
+    Credentials(crate::cred::CredentialFailure),
 }
 
 /// Runs `command` in its own process group with no stdin, then kills the group. Each stream

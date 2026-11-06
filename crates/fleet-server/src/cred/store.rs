@@ -14,7 +14,7 @@ use fleet_proto::MAX_CREDENTIALS_PER_USER;
 use sqlx::{PgPool, Row};
 
 use super::app_jwt::AppKey;
-use super::app_mint::{AppClient, InstallationToken};
+use super::app_mint::{AppClient, InstallationToken, REQUESTED_PERMISSIONS};
 use super::capability::ERR_CAPABILITY_NOT_GRANTED;
 use super::github::MAX_EXPIRY_MS;
 use super::seal::{Aad, SealError, Sealer};
@@ -58,6 +58,230 @@ const READ_CAPABILITY: &str =
     "SELECT user_id FROM user_capabilities WHERE user_id = $1 AND capability = $2 FOR SHARE";
 
 const INSERT_USE: &str = "INSERT INTO credential_use (credential_id, job_id) VALUES ($1, $2)";
+
+const LOCK_CREDENTIAL: &str =
+    "SELECT id FROM credentials WHERE id = $1 AND tombstoned_at IS NULL FOR UPDATE";
+
+const COUNT_ATTEMPTS: &str =
+    "SELECT count(*) FROM github_app_mint WHERE job_id = $1 AND outcome = 'attempt'";
+
+const COUNT_USER_ATTEMPTS: &str = "\
+SELECT count(*) FROM github_app_mint m JOIN credentials c ON c.id = m.credential_id \
+WHERE c.user_id = $1 AND m.outcome = 'attempt' AND m.at > now() - $2::bigint * interval '1 second'";
+
+const DENIED_RECENTLY: &str = "\
+SELECT EXISTS (SELECT 1 FROM github_app_mint WHERE job_id = $1 AND outcome = 'denied' \
+AND reason = $2 AND at > now() - $3::bigint * interval '1 second')";
+
+const INSERT_ROOT: &str = "\
+WITH fresh AS (SELECT gen_random_uuid() AS id) \
+INSERT INTO github_app_mint (mint_id, attempt_id, credential_id, job_id, repo, installation_id, \
+requested_permissions, outcome, reason) \
+SELECT id, id, $1, $2, $3, $4, $5, $6, $7 FROM fresh RETURNING attempt_id::text";
+
+const INSERT_OUTCOME: &str = "\
+INSERT INTO github_app_mint (mint_id, attempt_id, credential_id, job_id, repo, installation_id, \
+requested_permissions, outcome, reason, expires_at) \
+VALUES (gen_random_uuid(), $1::uuid, $2, $3, $4, $5, $6, $7, $8, to_timestamp($9::bigint))";
+
+/// The longest a Job may run that the mint cap plans for, in seconds (ADR-0058, SEC-004).
+pub const MAX_JOB_DURATION_SECS: u64 = 24 * 60 * 60;
+
+/// Seconds between refreshes: the one-hour token life less the ten-minute refresh window.
+pub const REFRESH_INTERVAL_SECS: u64 = 50 * 60;
+
+/// Mints beyond the planned ones, for retries and a re-claimed attempt.
+pub const MINT_CAP_MARGIN: u32 = 4;
+
+/// Most `attempt` rows one Job may hold.
+///
+/// The cap counts the first mint, one refresh per [`REFRESH_INTERVAL_SECS`] across the
+/// longest Job of [`MAX_JOB_DURATION_SECS`] (29 refreshes) and a margin of
+/// [`MINT_CAP_MARGIN`] (4), which makes 34 (ADR-0058, SEC-004, SEC-011). A release past it fails
+/// with [`StoreError::MintCapReached`].
+pub const MAX_APP_MINTS_PER_JOB: u32 = 1 + 29 + MINT_CAP_MARGIN;
+
+const _: () = assert!(
+    MAX_JOB_DURATION_SECS.div_ceil(REFRESH_INTERVAL_SECS) == 29,
+    "MAX_APP_MINTS_PER_JOB assumes 29 refreshes"
+);
+
+/// Most mint attempts one User may start in [`MINT_RATE_WINDOW_SECS`] (ADR-0058, SEC-003).
+pub const MAX_APP_MINTS_PER_USER_PER_MINUTE: u32 = 20;
+
+/// The window, in seconds, over which [`MAX_APP_MINTS_PER_USER_PER_MINUTE`] counts.
+pub const MINT_RATE_WINDOW_SECS: i64 = 60;
+
+/// A `denied` row for a Job is not written again while one with the same reason is younger than
+/// this many seconds, so a Box that retries at the cap cannot grow the audit table.
+pub const DENIED_DEDUPE_SECS: i64 = 60;
+
+const REASON_CAP: &str = "job mint cap";
+const REASON_USER_RATE: &str = "user mint rate";
+const REASON_MINT_FAILED: &str = "mint failed";
+const REASON_LEASE: &str = "lease lost after mint";
+const REASON_CAPABILITY: &str = "capability gone after mint";
+const REASON_OUTCOME: &str = "outcome write failed";
+const REASON_REVOKE: &str = "revoke refused";
+
+#[derive(Clone)]
+struct MintRecord {
+    credential_id: i64,
+    job_id: String,
+    repo: String,
+    installation: String,
+}
+
+fn requested_permissions_text() -> String {
+    REQUESTED_PERMISSIONS
+        .iter()
+        .map(|(name, level)| format!("{name}:{level}"))
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
+impl MintRecord {
+    async fn root(
+        &self,
+        conn: &mut sqlx::PgConnection,
+        outcome: &str,
+        reason: Option<&str>,
+    ) -> Result<String, sqlx::Error> {
+        sqlx::query_scalar(INSERT_ROOT)
+            .bind(self.credential_id)
+            .bind(&self.job_id)
+            .bind(&self.repo)
+            .bind(&self.installation)
+            .bind(requested_permissions_text())
+            .bind(outcome)
+            .bind(reason)
+            .fetch_one(conn)
+            .await
+    }
+
+    async fn outcome(
+        &self,
+        conn: &mut sqlx::PgConnection,
+        attempt_id: &str,
+        outcome: &str,
+        reason: Option<&str>,
+        expires_at: Option<u64>,
+    ) -> Result<(), sqlx::Error> {
+        sqlx::query(INSERT_OUTCOME)
+            .bind(attempt_id)
+            .bind(self.credential_id)
+            .bind(&self.job_id)
+            .bind(&self.repo)
+            .bind(&self.installation)
+            .bind(requested_permissions_text())
+            .bind(outcome)
+            .bind(reason)
+            .bind(expires_at.and_then(|at| i64::try_from(at).ok()))
+            .execute(conn)
+            .await
+            .map(|_| ())
+    }
+
+    async fn outcome_pooled(
+        &self,
+        pool: &PgPool,
+        attempt_id: &str,
+        outcome: &str,
+        reason: Option<&str>,
+    ) {
+        let written = async {
+            let mut conn = pool.acquire().await?;
+            self.outcome(&mut conn, attempt_id, outcome, reason, None)
+                .await
+        }
+        .await;
+        if let Err(err) = written {
+            tracing::error!(%err, outcome, "github app mint audit row not written");
+        }
+    }
+}
+
+struct Armed {
+    lane: Arc<AppLane>,
+    pool: PgPool,
+    record: MintRecord,
+    attempt_id: String,
+    token: InstallationToken,
+}
+
+impl Armed {
+    async fn revoke(self) {
+        let revoked = self.lane.revoke(&self.token).await;
+        let (outcome, reason) = if revoked {
+            ("revoked", None)
+        } else {
+            ("revoke_failed", Some(REASON_REVOKE))
+        };
+        self.record
+            .outcome_pooled(&self.pool, &self.attempt_id, outcome, reason)
+            .await;
+    }
+}
+
+struct RevokeGuard {
+    armed: Option<Armed>,
+}
+
+impl RevokeGuard {
+    async fn revoke(&mut self) {
+        if let Some(armed) = self.armed.take() {
+            armed.revoke().await;
+        }
+    }
+
+    fn disarm(&mut self) -> Option<InstallationToken> {
+        self.armed.take().map(|a| a.token)
+    }
+}
+
+impl Drop for RevokeGuard {
+    fn drop(&mut self) {
+        let Some(armed) = self.armed.take() else {
+            return;
+        };
+        if let Ok(runtime) = tokio::runtime::Handle::try_current() {
+            runtime.spawn(armed.revoke());
+        }
+    }
+}
+
+fn wanted_kinds(agent: &str) -> Vec<&'static str> {
+    let mut wanted: Vec<&'static str> = agent_kinds(agent)
+        .iter()
+        .map(|kind| kind.wire_name())
+        .collect();
+    wanted.extend(
+        CredentialKind::ALL
+            .into_iter()
+            .filter(|kind| kind.is_forge())
+            .map(CredentialKind::wire_name),
+    );
+    wanted
+}
+
+struct AppCredential {
+    lane: Arc<AppLane>,
+    id: i64,
+}
+
+struct Minted<'a> {
+    record: &'a MintRecord,
+    attempt_id: &'a str,
+    expires_at: u64,
+}
+
+struct Release<'a> {
+    job_id: &'a str,
+    attempt: i32,
+    box_name: &'a str,
+    user_id: i64,
+    repo: &'a str,
+}
 
 /// The GitHub App mint lane: the parsed key, the App id, the token client and the bot identity
 /// a Job commits under (ADR-0058).
@@ -109,9 +333,13 @@ impl AppLane {
         }
     }
 
-    async fn revoke(&self, token: &InstallationToken) {
-        if let Err(err) = self.client.revoke(token).await {
-            tracing::warn!(error = %err, "github app token revoke failed");
+    async fn revoke(&self, token: &InstallationToken) -> bool {
+        match self.client.revoke(token).await {
+            Ok(()) => true,
+            Err(err) => {
+                tracing::warn!(error = %err, "github app token revoke failed");
+                false
+            }
         }
     }
 
@@ -254,6 +482,10 @@ pub enum StoreError {
     CapabilityDenied,
     /// The GitHub App token could not be minted. One fixed error covers every cause.
     MintFailed,
+    /// The Job already holds [`MAX_APP_MINTS_PER_JOB`] mint attempts (ADR-0058, SEC-011), or its
+    /// User started [`MAX_APP_MINTS_PER_USER_PER_MINUTE`] in the last minute (SEC-003). Both
+    /// share one fixed message.
+    MintCapReached,
     /// The owner has no Job whose repository a verify mint can be scoped to.
     NoJobRepo,
     /// The database failed.
@@ -273,6 +505,7 @@ impl fmt::Display for StoreError {
             Self::Expired => f.write_str("credential expired"),
             Self::CapabilityDenied => f.write_str(ERR_CAPABILITY_NOT_GRANTED),
             Self::MintFailed => f.write_str(fleet_proto::PRECONDITION_APP_MINT),
+            Self::MintCapReached => f.write_str(fleet_proto::PRECONDITION_APP_MINT_CAP),
             Self::NoJobRepo => f.write_str(fleet_proto::PRECONDITION_NO_VERIFY_REPO),
             Self::Seal(e) => e.fmt(f),
             Self::Db(_) => f.write_str("credential store database error"),
@@ -308,6 +541,9 @@ pub struct CredentialStore {
     limit: usize,
     gate: fn(CredentialKind) -> Option<Capability>,
     app: Option<Arc<AppLane>>,
+    mint_cap: u32,
+    user_rate: u32,
+    denied_dedupe_secs: i64,
 }
 
 impl fmt::Debug for CredentialStore {
@@ -342,7 +578,38 @@ impl CredentialStore {
             limit,
             gate: required_capability,
             app: None,
+            mint_cap: MAX_APP_MINTS_PER_JOB,
+            user_rate: MAX_APP_MINTS_PER_USER_PER_MINUTE,
+            denied_dedupe_secs: DENIED_DEDUPE_SECS,
         }
+    }
+
+    /// Replaces the per-User mint limit, [`MAX_APP_MINTS_PER_USER_PER_MINUTE`] by default.
+    ///
+    /// A seam for tests, which cross the limit with a small value.
+    #[must_use]
+    pub const fn with_user_mint_limit(mut self, limit: u32) -> Self {
+        self.user_rate = limit;
+        self
+    }
+
+    /// Replaces the `denied` row dedupe window, [`DENIED_DEDUPE_SECS`] by default. Zero writes
+    /// every denial.
+    ///
+    /// A seam for tests.
+    #[must_use]
+    pub const fn with_denied_dedupe_secs(mut self, secs: i64) -> Self {
+        self.denied_dedupe_secs = secs;
+        self
+    }
+
+    /// Replaces the per-Job mint cap, [`MAX_APP_MINTS_PER_JOB`] by default.
+    ///
+    /// A seam for tests, which cross the cap with a small value.
+    #[must_use]
+    pub const fn with_mint_cap(mut self, cap: u32) -> Self {
+        self.mint_cap = cap;
+        self
     }
 
     /// Attaches the GitHub App mint lane. Without it a release for a User holding a
@@ -550,6 +817,23 @@ impl CredentialStore {
     /// the token is revoked best effort. Any mint failure returns [`StoreError::MintFailed`]
     /// and writes no use row. A wrong lease never reaches the mint.
     ///
+    /// Every call that reaches the mint step is a mint, the first fetch and each refresh alike
+    /// (ADR-0058, SEC-004). The first transaction takes `FOR UPDATE` on the `github_app`
+    /// credential row (SEC-021) and counts the Job's `attempt` rows in `github_app_mint`. The
+    /// Job count must stay under [`MAX_APP_MINTS_PER_JOB`], or under the cap set with
+    /// [`CredentialStore::with_mint_cap`]. The transaction also counts the User's `attempt`
+    /// rows of the last [`MINT_RATE_WINDOW_SECS`] across every Job and credential row of the
+    /// User. That count must stay under [`MAX_APP_MINTS_PER_USER_PER_MINUTE`], or under the
+    /// limit set with [`CredentialStore::with_user_mint_limit`]. Under both limits the
+    /// transaction inserts a fresh `attempt` row and commits before the mint (SEC-003,
+    /// SEC-011, SEC-022). At either limit it writes a `denied` row, unless one with the same
+    /// reason younger than [`DENIED_DEDUPE_SECS`] exists for the Job. It then commits and fails
+    /// with [`StoreError::MintCapReached`] without a mint. After the mint the second
+    /// transaction writes the `minted` row with the token expiry together with the use rows.
+    /// A mint failure writes `failed`. A failed recheck writes `denied` or `failed`, the token
+    /// is revoked and a `revoked` or `revoke_failed` row follows. A guard revokes the token on
+    /// a task when this future is dropped between the mint and the reply.
+    ///
     /// Expired credentials of an agent kind are skipped. The release fails with
     /// [`StoreError::Expired`] only when the GitHub credential is expired or when every
     /// credential of a kind the agent accepts is expired. Checks run in this order: lease,
@@ -561,14 +845,18 @@ impl CredentialStore {
     ///
     /// # Errors
     ///
-    /// Returns [`StoreError::LeaseDenied`] when no job matches the lease (also after the mint, when the recheck fails),
-    /// [`StoreError::NoGithub`] when the owner has no GitHub credential,
-    /// [`StoreError::Expired`] when a needed credential is past its expiry,
-    /// [`StoreError::CapabilityDenied`] when the owner lacks the capability a stored kind needs (also after the mint, when the recheck fails),
-    /// [`StoreError::NoAgentCredential`] when the owner has none the agent accepts,
-    /// [`StoreError::MintFailed`] when the App token cannot be minted,
+    /// Returns [`StoreError::LeaseDenied`] when no job matches the lease, which also happens
+    /// after the mint when the recheck fails. Returns [`StoreError::NoGithub`] when the owner
+    /// has no GitHub credential. Returns [`StoreError::Expired`] when a needed credential is
+    /// past its expiry. Returns [`StoreError::CapabilityDenied`] when the owner lacks the
+    /// capability a stored kind needs, which also happens after the mint when the recheck
+    /// fails. Returns [`StoreError::NoAgentCredential`] when the owner has none the agent
+    /// accepts. Returns [`StoreError::MintFailed`] when the App token cannot be minted.
+    /// Returns [`StoreError::MintCapReached`] when the Job already holds the cap of mint
+    /// attempts or the User started the per-minute limit of them. Returns
     /// [`StoreError::Seal`] when a value cannot be opened and [`StoreError::Db`] for a
-    /// database failure. No use row is written on any error.
+    /// database failure, which includes an audit row that cannot be written before the mint.
+    /// No use row is written on any error.
     pub async fn release_for_job(
         &self,
         job_id: &str,
@@ -587,16 +875,7 @@ impl CredentialStore {
         let user_id: i64 = lease.try_get("user_id")?;
         let agent: String = lease.try_get("agent")?;
         let repo: String = lease.try_get("repo")?;
-        let mut wanted: Vec<&str> = agent_kinds(&agent)
-            .iter()
-            .map(|kind| kind.wire_name())
-            .collect();
-        wanted.extend(
-            CredentialKind::ALL
-                .into_iter()
-                .filter(|kind| kind.is_forge())
-                .map(CredentialKind::wire_name),
-        );
+        let wanted = wanted_kinds(&agent);
         let rows = sqlx::query(SELECT_RELEASABLE)
             .bind(user_id)
             .bind(&wanted)
@@ -630,6 +909,22 @@ impl CredentialStore {
         if forge_expired || found.iter().all(|(_, kind, _)| kind.is_forge()) {
             return Err(StoreError::Expired);
         }
+        let lane = if forge == CredentialKind::GithubApp {
+            let lane = self.app.clone().ok_or(StoreError::MintFailed)?;
+            let app_id = found
+                .iter()
+                .find(|(_, kind, _)| *kind == CredentialKind::GithubApp)
+                .map(|(id, _, _)| *id)
+                .ok_or(StoreError::MintFailed)?;
+            sqlx::query(LOCK_CREDENTIAL)
+                .bind(app_id)
+                .fetch_optional(&mut *tx)
+                .await?
+                .ok_or(StoreError::MintFailed)?;
+            Some(AppCredential { lane, id: app_id })
+        } else {
+            None
+        };
         let mut released = Vec::with_capacity(found.len());
         let mut ids = Vec::with_capacity(found.len());
         for (id, _, _) in found {
@@ -643,21 +938,122 @@ impl CredentialStore {
                 git_identity: None,
             });
         }
-        if forge != CredentialKind::GithubApp {
+        let Some(app) = lane else {
             record_uses(&mut tx, &ids, job_id).await?;
             tx.commit().await?;
             return Ok(released);
+        };
+        self.mint_released(
+            tx,
+            &Release {
+                job_id,
+                attempt,
+                box_name,
+                user_id,
+                repo: &repo,
+            },
+            app,
+            released,
+            ids,
+        )
+        .await
+    }
+
+    async fn mint_released(
+        &self,
+        mut tx: sqlx::Transaction<'_, sqlx::Postgres>,
+        release: &Release<'_>,
+        app: AppCredential,
+        mut released: Vec<ReleasedCredential>,
+        ids: Vec<i64>,
+    ) -> Result<Vec<ReleasedCredential>, StoreError> {
+        let Release {
+            job_id,
+            attempt,
+            box_name,
+            user_id,
+            repo,
+        } = *release;
+        let AppCredential { lane, id: app_id } = app;
+        let installation = released
+            .iter()
+            .find(|c| c.kind == CredentialKind::GithubApp)
+            .and_then(|c| std::str::from_utf8(c.value.expose()).ok())
+            .and_then(|text| text.parse::<u64>().ok())
+            .ok_or(StoreError::MintFailed)?;
+        let record = MintRecord {
+            credential_id: app_id,
+            job_id: job_id.to_owned(),
+            repo: repo.to_owned(),
+            installation: installation.to_string(),
+        };
+        let attempts: i64 = sqlx::query_scalar(COUNT_ATTEMPTS)
+            .bind(job_id)
+            .fetch_one(&mut *tx)
+            .await?;
+        if attempts >= i64::from(self.mint_cap) {
+            self.deny(&mut tx, &record, REASON_CAP).await?;
+            tx.commit().await?;
+            return Err(StoreError::MintCapReached);
         }
-        let lane = self.app.clone().ok_or(StoreError::MintFailed)?;
+        let recent: i64 = sqlx::query_scalar(COUNT_USER_ATTEMPTS)
+            .bind(user_id)
+            .bind(MINT_RATE_WINDOW_SECS)
+            .fetch_one(&mut *tx)
+            .await?;
+        if recent >= i64::from(self.user_rate) {
+            self.deny(&mut tx, &record, REASON_USER_RATE).await?;
+            tx.commit().await?;
+            return Err(StoreError::MintCapReached);
+        }
+        let attempt_id = record.root(&mut tx, "attempt", None).await?;
         tx.commit().await?;
-        let token = lane.mint(&released, &repo).await?;
+        let token = match lane.mint(&released, repo).await {
+            Ok(token) => token,
+            Err(err) => {
+                record
+                    .outcome_pooled(&self.pool, &attempt_id, "failed", Some(REASON_MINT_FAILED))
+                    .await;
+                return Err(err);
+            }
+        };
+        let expires_at = token.expires_at();
+        let mut guard = RevokeGuard {
+            armed: Some(Armed {
+                lane: Arc::clone(&lane),
+                pool: self.pool.clone(),
+                record: record.clone(),
+                attempt_id: attempt_id.clone(),
+                token,
+            }),
+        };
         let rechecked = self
-            .record_after_mint(job_id, attempt, box_name, user_id, &ids)
+            .record_after_mint(
+                job_id,
+                attempt,
+                box_name,
+                user_id,
+                &ids,
+                &Minted {
+                    record: &record,
+                    attempt_id: &attempt_id,
+                    expires_at,
+                },
+            )
             .await;
         if let Err(err) = rechecked {
-            lane.revoke(&token).await;
+            let (outcome, reason) = match err {
+                StoreError::LeaseDenied => ("denied", REASON_LEASE),
+                StoreError::CapabilityDenied => ("denied", REASON_CAPABILITY),
+                _ => ("failed", REASON_OUTCOME),
+            };
+            record
+                .outcome_pooled(&self.pool, &attempt_id, outcome, Some(reason))
+                .await;
+            guard.revoke().await;
             return Err(err);
         }
+        let token = guard.disarm().ok_or(StoreError::MintFailed)?;
         for credential in &mut released {
             if credential.kind == CredentialKind::GithubApp {
                 credential.value = Secret::new(token.expose().to_owned());
@@ -668,6 +1064,24 @@ impl CredentialStore {
         Ok(released)
     }
 
+    async fn deny(
+        &self,
+        tx: &mut sqlx::PgConnection,
+        record: &MintRecord,
+        reason: &str,
+    ) -> Result<(), sqlx::Error> {
+        let recent: bool = sqlx::query_scalar(DENIED_RECENTLY)
+            .bind(&record.job_id)
+            .bind(reason)
+            .bind(self.denied_dedupe_secs)
+            .fetch_one(&mut *tx)
+            .await?;
+        if !recent {
+            record.root(tx, "denied", Some(reason)).await?;
+        }
+        Ok(())
+    }
+
     async fn record_after_mint(
         &self,
         job_id: &str,
@@ -675,7 +1089,13 @@ impl CredentialStore {
         box_name: &str,
         user_id: i64,
         ids: &[i64],
+        minted: &Minted<'_>,
     ) -> Result<(), StoreError> {
+        let Minted {
+            record,
+            attempt_id,
+            expires_at,
+        } = *minted;
         let mut tx = self.pool.begin().await?;
         sqlx::query(SELECT_LEASE)
             .bind(job_id)
@@ -687,6 +1107,9 @@ impl CredentialStore {
         self.require_capability(&mut tx, user_id, CredentialKind::GithubApp)
             .await?;
         record_uses(&mut tx, ids, job_id).await?;
+        record
+            .outcome(&mut tx, attempt_id, "minted", None, Some(expires_at))
+            .await?;
         tx.commit().await?;
         Ok(())
     }

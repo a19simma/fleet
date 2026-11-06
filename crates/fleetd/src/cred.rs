@@ -14,7 +14,18 @@
 //! and the bot [`BotIdentity`] the server sent with it (ADR-0058). The token takes the place of
 //! the PAT as the git and `gh` token. fleetd validates the identity again with
 //! [`BotIdentity::new`] and fails the job before any clone when the identity is missing or
-//! outside the grammar. `expires_at_ms` is held for a later refresh and nothing reads it yet.
+//! outside the grammar.
+//!
+//! An installation token lasts one hour. [`CredentialBook::refresh_if_due`] calls
+//! `GetJobCredentials` again when fewer than [`REFRESH_WINDOW_MS`] of the held token remain,
+//! on the injected [`Clock`], and swaps in the new token. A refresh that fails with a transient
+//! reason keeps the last good token until it expires. The server's mint cap is terminal: it
+//! fails the step with [`ERR_MINT_CAP`] and there is no PAT fallback (ADR-0058, SEC-004).
+//!
+//! With a [`Revoker`] attached the book revokes the token a refresh replaced, and the held
+//! token when the job ends (ADR-0058, SEC-010). Each revoke runs on its own task, is best effort
+//! and never fails the job; a failure logs [`REVOKE_FAILED`] and nothing else. A PAT job revokes
+//! nothing.
 
 use std::collections::{HashMap, HashSet};
 use std::fmt;
@@ -29,7 +40,7 @@ use fleet_proto::v1::fleet_worker_client::FleetWorkerClient;
 use fleet_proto::v1::{GetJobCredentialsReply, GetJobCredentialsRequest};
 use fleet_proto::{
     GITHUB_INSTALLATION_TOKEN_KIND, MAX_CREDENTIAL_VALUE_BYTES, MAX_CREDENTIALS_PER_USER,
-    PRECONDITION_EXPIRED, PRECONDITION_NO_AGENT, PRECONDITION_NO_GITHUB,
+    PRECONDITION_APP_MINT_CAP, PRECONDITION_EXPIRED, PRECONDITION_NO_AGENT, PRECONDITION_NO_GITHUB,
     PRECONDITION_NOT_CONFIGURED,
 };
 use tonic::metadata::MetadataValue;
@@ -41,6 +52,7 @@ use zeroize::Zeroizing;
 
 use crate::Error;
 use crate::poller::{CALL_BACKSTOP, TOKEN_ENV};
+use crate::revoke::{REVOKE_FAILED, Revoker};
 
 /// Largest `GetJobCredentials` reply the client decodes, in bytes: the most credentials one
 /// user holds, each at the longest value plus 64 bytes of framing and field overhead.
@@ -76,6 +88,21 @@ pub const ERR_APP_IDENTITY_INVALID: &str = "github app git identity is invalid";
 /// Prefix of every GitHub App installation token.
 const APP_TOKEN_PREFIX: &str = "ghs_";
 
+/// Job failure reason: the Job reached its mint cap or its User reached the per-minute mint
+/// limit (ADR-0058, SEC-003, SEC-004, SEC-011).
+pub const ERR_MINT_CAP: &str = "github app token limit reached";
+
+/// Refresh the installation token when fewer than this many milliseconds remain: 10 minutes
+/// (ADR-0058, Lifetime and refresh). Exactly this much left is not yet due.
+pub const REFRESH_WINDOW_MS: u64 = 10 * 60 * 1000;
+
+/// The wait after a failed refresh.
+///
+/// It also applies after a refresh that returned a token still inside the window. It keeps a
+/// failing server from being asked once per step and the Job's mint cap from being spent on
+/// retries.
+pub const REFRESH_RETRY_MS: u64 = 30 * 1000;
+
 /// Job failure reason: the reply broke a rule the server keeps.
 pub const ERR_MALFORMED: &str = "credentials reply was invalid";
 
@@ -92,6 +119,10 @@ pub enum CredentialFailure {
     Expired,
     /// `FAILED_PRECONDITION` `credentials are not configured`.
     NotConfigured,
+    /// `FAILED_PRECONDITION` `github app token limit reached`: the Job reached its mint cap
+    /// or its User reached the per-minute mint limit (SEC-003, SEC-004, SEC-011). Terminal,
+    /// never retried.
+    MintCap,
     /// Any other status, a timeout or a transport error.
     Unavailable,
     /// The reply carries wire kind `github_installation_token` and no git identity.
@@ -117,6 +148,7 @@ impl CredentialFailure {
             Self::NoAgent => ERR_NO_AGENT,
             Self::Expired => ERR_EXPIRED,
             Self::NotConfigured => ERR_NOT_CONFIGURED,
+            Self::MintCap => ERR_MINT_CAP,
             Self::Unavailable => ERR_UNAVAILABLE,
             Self::AppIdentityMissing => ERR_APP_IDENTITY_MISSING,
             Self::AppIdentityInvalid => ERR_APP_IDENTITY_INVALID,
@@ -131,6 +163,7 @@ impl CredentialFailure {
             (Code::FailedPrecondition, PRECONDITION_NO_AGENT) => Self::NoAgent,
             (Code::FailedPrecondition, PRECONDITION_EXPIRED) => Self::Expired,
             (Code::FailedPrecondition, PRECONDITION_NOT_CONFIGURED) => Self::NotConfigured,
+            (Code::FailedPrecondition, PRECONDITION_APP_MINT_CAP) => Self::MintCap,
             _ => Self::Unavailable,
         }
     }
@@ -145,10 +178,10 @@ impl fmt::Display for CredentialFailure {
 impl std::error::Error for CredentialFailure {}
 
 /// One credential of a job: its kind, its secret value and the expiry the server sent.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct Credential {
     kind: CredentialKind,
-    value: Secret,
+    value: Arc<Secret>,
     expires_at_ms: Option<u64>,
 }
 
@@ -161,12 +194,12 @@ impl Credential {
 
     /// The secret value. Hand it to a child or a client, never to a log or a file.
     #[must_use]
-    pub const fn value(&self) -> &Secret {
+    pub fn value(&self) -> &Secret {
         &self.value
     }
 
     /// The expiry the server sent, in milliseconds since the Unix epoch. Only an installation
-    /// token carries one. Nothing refreshes it yet.
+    /// token carries one. [`CredentialBook::refresh_if_due`] reads it.
     #[must_use]
     pub const fn expires_at_ms(&self) -> Option<u64> {
         self.expires_at_ms
@@ -210,7 +243,7 @@ impl JobCredentials {
             }
             items.push(Credential {
                 kind,
-                value: Secret::new(std::mem::take(&mut *value)),
+                value: Arc::new(Secret::new(std::mem::take(&mut *value))),
                 expires_at_ms: wire.expires_at_ms,
             });
         }
@@ -256,6 +289,45 @@ impl JobCredentials {
     #[must_use]
     pub const fn git_identity(&self) -> Option<&BotIdentity> {
         self.identity.as_ref()
+    }
+
+    /// The expiry of the installation token, in milliseconds since the Unix epoch. `None` for a
+    /// PAT job or a token the server sent with no expiry.
+    #[must_use]
+    pub fn app_expires_at_ms(&self) -> Option<u64> {
+        self.items
+            .iter()
+            .find(|c| c.kind == CredentialKind::GithubApp)
+            .and_then(Credential::expires_at_ms)
+    }
+
+    fn refreshed(&self, fresh: &Self) -> Result<Self, CredentialFailure> {
+        let is_app = |c: &&Credential| c.kind == CredentialKind::GithubApp;
+        let (Some(_), Some(token)) = (
+            self.items.iter().find(is_app),
+            fresh.items.iter().find(is_app),
+        ) else {
+            return Err(CredentialFailure::Malformed);
+        };
+        if token.expires_at_ms.is_none() {
+            return Err(CredentialFailure::Malformed);
+        }
+        let items = self
+            .items
+            .iter()
+            .map(|c| if is_app(&c) { token.clone() } else { c.clone() })
+            .collect();
+        Ok(Self {
+            items,
+            identity: fresh.identity.clone(),
+        })
+    }
+
+    fn app_token(&self) -> Option<&Secret> {
+        self.items
+            .iter()
+            .find(|c| c.kind == CredentialKind::GithubApp)
+            .map(Credential::value)
     }
 
     /// The credentials, in reply order.
@@ -382,11 +454,48 @@ impl CredentialClient {
     }
 }
 
+/// The time source of the refresh decision, in milliseconds since the Unix epoch. A test
+/// injects its own.
+pub trait Clock: Send + Sync + fmt::Debug {
+    /// The current time.
+    fn now_ms(&self) -> u64;
+}
+
+/// The wall clock.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct SystemClock;
+
+impl Clock for SystemClock {
+    fn now_ms(&self) -> u64 {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX))
+    }
+}
+
+#[derive(Debug)]
+struct Held {
+    credentials: Arc<JobCredentials>,
+    attempt: u32,
+    box_name: String,
+    retry_at_ms: u64,
+    turn: Arc<tokio::sync::Mutex<()>>,
+}
+
+struct Snapshot {
+    credentials: Arc<JobCredentials>,
+    attempt: u32,
+    box_name: String,
+    retry_at_ms: u64,
+}
+
 /// Fetches and holds the credentials of the jobs that run on this box.
 #[derive(Debug)]
 pub struct CredentialBook {
     client: CredentialClient,
-    held: Mutex<HashMap<String, Arc<JobCredentials>>>,
+    held: Mutex<HashMap<String, Held>>,
+    clock: Arc<dyn Clock>,
+    revoker: Option<Arc<Revoker>>,
 }
 
 impl CredentialBook {
@@ -396,7 +505,23 @@ impl CredentialBook {
         Self {
             client,
             held: Mutex::new(HashMap::new()),
+            clock: Arc::new(SystemClock),
+            revoker: None,
         }
+    }
+
+    /// Attaches the client that revokes installation tokens. Without one nothing is revoked.
+    #[must_use]
+    pub fn with_revoker(mut self, revoker: Arc<Revoker>) -> Self {
+        self.revoker = Some(revoker);
+        self
+    }
+
+    /// Replaces the clock the refresh decision reads, [`SystemClock`] by default.
+    #[must_use]
+    pub fn with_clock(mut self, clock: Arc<dyn Clock>) -> Self {
+        self.clock = clock;
+        self
     }
 
     /// Fetches the credentials of a claimed job and holds them under its id.
@@ -420,8 +545,214 @@ impl CredentialBook {
         self.held
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
-            .insert(job_id.to_owned(), Arc::clone(&credentials));
+            .insert(
+                job_id.to_owned(),
+                Held {
+                    credentials: Arc::clone(&credentials),
+                    attempt,
+                    box_name: box_name.to_owned(),
+                    retry_at_ms: 0,
+                    turn: Arc::new(tokio::sync::Mutex::new(())),
+                },
+            );
         Ok(credentials)
+    }
+
+    /// Asks the server for a new installation token when fewer than [`REFRESH_WINDOW_MS`] of
+    /// the held one remain, and swaps it in. Returns the new credentials when it swapped and
+    /// `None` when nothing was due, the job holds no installation token, the retry wait has
+    /// not passed, or a transient failure left the last good token in place.
+    ///
+    /// Call it before every use of the token. Calls for one job serialize, so two steps that
+    /// find the token due make one request. Nothing is due while the retry wait has not passed:
+    /// after a failure, or a token still inside the window, the next request waits
+    /// [`REFRESH_RETRY_MS`]. The old value is not forgotten by the book: the caller keeps it in
+    /// the job redactor. With a [`Revoker`] attached, a swap revokes the replaced token on its
+    /// own task.
+    ///
+    /// This is [`CredentialBook::refresh_if_due_with`] with no hook.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CredentialFailure::MintCap`] when the server's per-Job mint cap or per-User
+    /// mint rate limit is reached, and any other server refusal (lease lost, capability gone)
+    /// as its own variant. A reply with a bad identity returns
+    /// [`CredentialFailure::AppIdentityMissing`] or
+    /// [`CredentialFailure::AppIdentityInvalid`]. None of these keeps the old token or falls
+    /// back to a PAT; the caller fails the step. [`CredentialFailure::Unavailable`] and
+    /// [`CredentialFailure::Expired`] are returned only once the held token has expired,
+    /// because before that the last good token stays in use. [`CredentialFailure::Malformed`]
+    /// is returned when the reply holds no installation token, no expiry, or one already in
+    /// the past.
+    pub async fn refresh_if_due(
+        &self,
+        job_id: &str,
+    ) -> Result<Option<Arc<JobCredentials>>, CredentialFailure> {
+        self.refresh_if_due_with(job_id, |_| {}).await
+    }
+
+    /// [`CredentialBook::refresh_if_due`] with a hook that sees the new credentials before the
+    /// book makes them readable.
+    ///
+    /// `before_swap` runs once per successful refresh, under the job's refresh lock, after the
+    /// reply is validated and before [`CredentialBook::get`] can return the new token. The
+    /// caller uses it to add the new value to the job redactor, so no step reads a token that
+    /// is not yet masked. It runs even when the job ended during the call. When the job ended
+    /// the book revokes the token it just got, because nothing will hold it.
+    ///
+    /// # Errors
+    ///
+    /// The same as [`CredentialBook::refresh_if_due`].
+    pub async fn refresh_if_due_with(
+        &self,
+        job_id: &str,
+        before_swap: impl FnOnce(&JobCredentials),
+    ) -> Result<Option<Arc<JobCredentials>>, CredentialFailure> {
+        let Some(turn) = self.turn(job_id) else {
+            return Ok(None);
+        };
+        let _turn = turn.lock().await;
+        let now = self.clock.now_ms();
+        let Some(Snapshot {
+            credentials: current,
+            attempt,
+            box_name,
+            retry_at_ms,
+        }) = self.snapshot(job_id)
+        else {
+            return Ok(None);
+        };
+        let Some(expiry) = current.app_expires_at_ms() else {
+            return Ok(None);
+        };
+        if expiry.saturating_sub(now) >= REFRESH_WINDOW_MS {
+            return Ok(None);
+        }
+        let usable = now < expiry;
+        if now < retry_at_ms {
+            return if usable {
+                Ok(None)
+            } else {
+                Err(CredentialFailure::Unavailable)
+            };
+        }
+        let renewed = match self.client.fetch(job_id, attempt, &box_name).await {
+            Ok(fresh) => {
+                current
+                    .refreshed(&fresh)
+                    .and_then(|next| match next.app_expires_at_ms() {
+                        Some(at) if at > now => Ok(next),
+                        _ => Err(CredentialFailure::Malformed),
+                    })
+            }
+            Err(failure) => Err(failure),
+        };
+        match renewed {
+            Ok(next) => {
+                let still_due = next
+                    .app_expires_at_ms()
+                    .is_some_and(|at| at.saturating_sub(now) < REFRESH_WINDOW_MS);
+                let next = Arc::new(next);
+                before_swap(&next);
+                let swapped = self.store(
+                    job_id,
+                    Arc::clone(&next),
+                    if still_due { now + REFRESH_RETRY_MS } else { 0 },
+                );
+                if swapped {
+                    self.revoke_replaced(&current, &next);
+                } else {
+                    self.revoke_app_token(&next);
+                }
+                Ok(swapped.then_some(next))
+            }
+            Err(failure) => {
+                self.back_off(job_id, now + REFRESH_RETRY_MS);
+                let transient = matches!(
+                    failure,
+                    CredentialFailure::Unavailable | CredentialFailure::Expired
+                );
+                if usable && transient {
+                    tracing::warn!(
+                        reason = failure.reason(),
+                        "token refresh failed, keeping the held token"
+                    );
+                    Ok(None)
+                } else {
+                    Err(failure)
+                }
+            }
+        }
+    }
+
+    fn turn(&self, job_id: &str) -> Option<Arc<tokio::sync::Mutex<()>>> {
+        self.held
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .get(job_id)
+            .map(|entry| Arc::clone(&entry.turn))
+    }
+
+    fn snapshot(&self, job_id: &str) -> Option<Snapshot> {
+        let guard = self.held.lock().unwrap_or_else(PoisonError::into_inner);
+        let snap = guard.get(job_id).map(|entry| Snapshot {
+            credentials: Arc::clone(&entry.credentials),
+            attempt: entry.attempt,
+            box_name: entry.box_name.clone(),
+            retry_at_ms: entry.retry_at_ms,
+        });
+        drop(guard);
+        snap
+    }
+
+    fn revoke_replaced(&self, old: &JobCredentials, new: &JobCredentials) {
+        if old.app_token().map(Secret::expose) != new.app_token().map(Secret::expose) {
+            self.revoke_app_token(old);
+        }
+    }
+
+    fn revoke_app_token(&self, credentials: &JobCredentials) {
+        let Some(revoker) = &self.revoker else {
+            return;
+        };
+        let Some(token) = credentials.app_token() else {
+            return;
+        };
+        let Ok(token) = std::str::from_utf8(token.expose()).map(|t| Zeroizing::new(t.to_owned()))
+        else {
+            return;
+        };
+        let Ok(runtime) = tokio::runtime::Handle::try_current() else {
+            tracing::warn!(reason = REVOKE_FAILED, "no runtime to revoke the token");
+            return;
+        };
+        let revoker = Arc::clone(revoker);
+        drop(runtime.spawn(async move {
+            if revoker.revoke(&token).await.is_err() {
+                tracing::warn!(reason = REVOKE_FAILED, "token revoke failed");
+            }
+        }));
+    }
+
+    fn store(&self, job_id: &str, next: Arc<JobCredentials>, retry_at_ms: u64) -> bool {
+        let mut guard = self.held.lock().unwrap_or_else(PoisonError::into_inner);
+        let found = guard.get_mut(job_id).map(|entry| {
+            entry.credentials = next;
+            entry.retry_at_ms = retry_at_ms;
+        });
+        drop(guard);
+        found.is_some()
+    }
+
+    fn back_off(&self, job_id: &str, retry_at_ms: u64) {
+        if let Some(entry) = self
+            .held
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .get_mut(job_id)
+        {
+            entry.retry_at_ms = retry_at_ms;
+        }
     }
 
     /// The credentials held for `job_id`.
@@ -431,7 +762,7 @@ impl CredentialBook {
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .get(job_id)
-            .cloned()
+            .map(|entry| Arc::clone(&entry.credentials))
     }
 
     /// Drops the credentials of `job_id`. The buffers zero when the last borrower lets go.
@@ -443,10 +774,25 @@ impl CredentialBook {
             .remove(job_id);
     }
 
-    /// The job end hook: pass it to [`crate::runner::JobEnd::on_end`].
+    /// Drops the credentials of `job_id` and revokes the installation token it held, on its own
+    /// task and best effort (ADR-0058, SEC-010). A PAT job, an unknown id and a second call
+    /// revoke nothing.
+    pub fn end(&self, job_id: &str) {
+        let removed = self
+            .held
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .remove(job_id);
+        if let Some(entry) = removed {
+            self.revoke_app_token(&entry.credentials);
+        }
+    }
+
+    /// The job end hook: pass it to [`crate::runner::JobEnd::on_end`]. It runs
+    /// [`CredentialBook::end`], so it revokes the held installation token.
     pub fn end_hook(self: &Arc<Self>) -> impl Fn(&str) + Send + Sync + 'static {
         let book = Arc::clone(self);
-        move |job_id| book.forget(job_id)
+        move |job_id| book.end(job_id)
     }
 }
 

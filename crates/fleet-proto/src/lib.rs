@@ -208,6 +208,11 @@ pub const GITHUB_INSTALLATION_TOKEN_KIND: &str = "github_installation_token";
 /// every cause.
 pub const PRECONDITION_APP_MINT: &str = "github app token unavailable";
 
+/// `FAILED_PRECONDITION` message: the Job reached its mint cap or its User reached the
+/// per-minute mint limit (ADR-0058, SEC-003, SEC-004, SEC-011). The Job or step fails and never
+/// falls back to a PAT.
+pub const PRECONDITION_APP_MINT_CAP: &str = "github app token limit reached";
+
 /// `FAILED_PRECONDITION` message: a `github_app` verify has no Job repository to scope its mint to.
 pub const PRECONDITION_NO_VERIFY_REPO: &str = "no job to verify the github app against";
 

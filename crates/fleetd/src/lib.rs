@@ -46,6 +46,7 @@ pub mod poller;
 mod proc;
 pub mod profile_apply;
 pub mod publish;
+pub mod revoke;
 pub mod runner;
 mod runtime;
 pub mod shell_timing;

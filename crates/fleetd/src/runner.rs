@@ -1772,6 +1772,11 @@ impl<R: Reporter> AgentRunner<R> {
         limit: u64,
         tail: bool,
     ) -> Result<Captured, CaptureError> {
+        if let Scope::Push(id) | Scope::Gh(id) = scope {
+            self.refresh_token(id)
+                .await
+                .map_err(CaptureError::Credentials)?;
+        }
         let home = dir.join(HOME_DIR);
         let mut command = Command::new(bin);
         command
@@ -2714,6 +2719,7 @@ impl IntoFailure for CaptureError {
         match self {
             Self::Start => Failure::bare(start),
             Self::Timeout => Failure::bare(ERR_FINISH_TIMEOUT),
+            Self::Credentials(failure) => Failure::bare(failure.reason()),
         }
     }
 }

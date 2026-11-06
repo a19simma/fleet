@@ -111,6 +111,34 @@ impl<R: Reporter> AgentRunner<R> {
         }
     }
 
+    /// Adds the values of `fresh` to the redactor of `job_id` in one update of its entry. A job
+    /// with no entry has ended, so nothing is inserted.
+    fn mask_refreshed(&self, job_id: &str, fresh: &JobCredentials) {
+        let mut redactors = self
+            .job_redactors
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        if let Some(entry) = redactors.get_mut(job_id) {
+            *entry = Arc::new(entry.merged(&fresh.redactor()));
+        }
+    }
+
+    /// Renews the installation token of `job_id` when fewer than ten minutes of it remain, and
+    /// keeps both the old and the new value in the job redactor. The redactor is updated before
+    /// the book hands out the new token. A runner with no book, a PAT
+    /// job and a job with a fresh token do nothing.
+    pub(crate) async fn refresh_token(
+        &self,
+        job_id: &str,
+    ) -> Result<(), crate::cred::CredentialFailure> {
+        let Some(book) = &self.credentials else {
+            return Ok(());
+        };
+        book.refresh_if_due_with(job_id, |fresh| self.mask_refreshed(job_id, fresh))
+            .await?;
+        Ok(())
+    }
+
     /// Merges the redactor of `held` into the job's redactor until [`AgentRunner::end_job`].
     pub(crate) fn adopt_credentials(&self, job_id: &str, held: &JobCredentials) {
         let merged = Arc::new(self.redactor.merged(&held.redactor()));
@@ -143,7 +171,7 @@ impl<R: Reporter> AgentRunner<R> {
 mod tests {
     use std::collections::BTreeSet;
     use std::path::Path;
-    use std::sync::Arc;
+    use std::sync::{Arc, PoisonError};
 
     use fleet_core::Redactor;
     use fleet_proto::v1::fleet_worker_server::{FleetWorker, FleetWorkerServer};
@@ -183,7 +211,19 @@ mod tests {
     const BOT_NAME: &str = "fleet-bot[bot]";
     const BOT_EMAIL: &str = "123456+fleet-bot[bot]@users.noreply.github.com";
 
-    struct Stub(&'static str, bool);
+    const NEW_APP_TOKEN: &str = "ghs_ZyXwVuTsRqPoNmLkJiHgFeDcBa9876543210";
+    const EXPIRES_MS: u64 = 4_000_000_000_000;
+
+    #[derive(Debug)]
+    struct Clock(std::sync::atomic::AtomicU64);
+
+    impl crate::cred::Clock for Clock {
+        fn now_ms(&self) -> u64 {
+            self.0.load(std::sync::atomic::Ordering::SeqCst)
+        }
+    }
+
+    struct Stub(&'static str, bool, std::sync::atomic::AtomicUsize);
 
     #[tonic::async_trait]
     impl FleetWorker for Stub {
@@ -219,14 +259,18 @@ mod tests {
                 expires_at_ms: None,
                 git_identity: None,
             };
+            let call = self.2.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             let github = if self.1 {
                 JobCredential {
-                    expires_at_ms: Some(1),
+                    expires_at_ms: Some(EXPIRES_MS),
                     git_identity: Some(fleet_proto::v1::GitIdentity {
                         name: BOT_NAME.into(),
                         email: BOT_EMAIL.into(),
                     }),
-                    ..wire("github_installation_token", APP_TOKEN)
+                    ..wire(
+                        "github_installation_token",
+                        if call == 0 { APP_TOKEN } else { NEW_APP_TOKEN },
+                    )
                 }
             } else {
                 wire("github_pat", HOLDER)
@@ -280,17 +324,26 @@ mod tests {
         kind: &'static str,
         app: bool,
     ) -> Result<Fixture, Box<dyn std::error::Error>> {
+        fixture_clocked(attach, kind, app, Arc::new(crate::cred::SystemClock)).await
+    }
+
+    async fn fixture_clocked(
+        attach: bool,
+        kind: &'static str,
+        app: bool,
+        clock: Arc<dyn crate::cred::Clock>,
+    ) -> Result<Fixture, Box<dyn std::error::Error>> {
         let listener = TcpListener::bind(("127.0.0.1", 0)).await?;
         let url = format!("http://{}", listener.local_addr()?);
         tokio::spawn(
             tonic::transport::Server::builder()
-                .add_service(FleetWorkerServer::new(Stub(kind, app)))
+                .add_service(FleetWorkerServer::new(Stub(kind, app, 0.into())))
                 .serve_with_incoming(TcpListenerStream::new(listener)),
         );
-        let book = Arc::new(CredentialBook::new(CredentialClient::new(
-            channel(&url)?,
-            "tok-0123456789",
-        )?));
+        let book = Arc::new(
+            CredentialBook::new(CredentialClient::new(channel(&url)?, "tok-0123456789")?)
+                .with_clock(clock),
+        );
         book.fetch("job1", 1, "box").await?;
         let dir = tempfile::tempdir()?;
         let mut config = RunConfig::new("claude-fake", false);
@@ -368,6 +421,117 @@ mod tests {
         assert_eq!(keys(&env), expected);
         assert_eq!(value(&env, "GH_TOKEN"), Some(HOLDER));
         assert!(env.iter().all(|(_, v)| v != BOX_PAT && v != BOX_ENT));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_push_or_gh_child_refreshes_a_due_token_and_masks_both_values()
+    -> Result<(), Box<dyn std::error::Error>> {
+        for gh in [false, true] {
+            let now = EXPIRES_MS - 10 * 60 * 1000 + 1000;
+            let clock = Arc::new(Clock(now.into()));
+            let (runner, book, dir) =
+                fixture_clocked(true, "anthropic_api_key", true, clock).await?;
+            let held = book.get("job1").ok_or("held")?;
+            runner.adopt_credentials("job1", &held);
+            let scope = if gh {
+                Scope::Gh("job1")
+            } else {
+                Scope::Push("job1")
+            };
+            let env = env_of(&runner, dir.path(), scope).await?;
+            assert_eq!(value(&env, "GH_TOKEN"), Some(NEW_APP_TOKEN));
+            assert_eq!(runner.github_token("job1").as_deref(), Some(NEW_APP_TOKEN));
+            let text = format!("{APP_TOKEN} {NEW_APP_TOKEN}");
+            assert_eq!(
+                runner.job_redactor("job1").redact_str(&text),
+                "[REDACTED] [REDACTED]"
+            );
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_refresh_for_a_job_that_ended_adds_no_redactor_entry()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let now = EXPIRES_MS - 10 * 60 * 1000 + 1000;
+        let clock = Arc::new(Clock(now.into()));
+        let (runner, book, _dir) = fixture_clocked(true, "anthropic_api_key", true, clock).await?;
+        let held = book.get("job1").ok_or("held")?;
+        runner.adopt_credentials("job1", &held);
+        runner.forget_job_redactor("job1");
+        runner.refresh_token("job1").await?;
+        assert!(
+            runner
+                .job_redactors
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .is_empty()
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn the_redactor_masks_the_new_token_before_the_book_hands_it_out()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let now = EXPIRES_MS - 10 * 60 * 1000 + 1000;
+        let clock = Arc::new(Clock(now.into()));
+        let (runner, book, _dir) = fixture_clocked(true, "anthropic_api_key", true, clock).await?;
+        let held = book.get("job1").ok_or("held")?;
+        runner.adopt_credentials("job1", &held);
+        let masked_when_readable = std::sync::Mutex::new(None);
+        book.refresh_if_due_with("job1", |fresh| {
+            runner.mask_refreshed("job1", fresh);
+            *masked_when_readable
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner) = Some(
+                runner.job_redactor("job1").redact_str(NEW_APP_TOKEN) == "[REDACTED]"
+                    && book
+                        .get("job1")
+                        .and_then(|c| c.github().map(|s| s.expose().to_vec()))
+                        .as_deref()
+                        == Some(APP_TOKEN.as_bytes()),
+            );
+        })
+        .await?;
+        assert_eq!(
+            masked_when_readable
+                .into_inner()
+                .unwrap_or_else(PoisonError::into_inner),
+            Some(true)
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_token_with_time_left_is_not_refreshed_by_a_child()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let clock = Arc::new(Clock((EXPIRES_MS - 10 * 60 * 1000).into()));
+        let (runner, _book, dir) = fixture_clocked(true, "anthropic_api_key", true, clock).await?;
+        let env = env_of(&runner, dir.path(), Scope::Push("job1")).await?;
+        assert_eq!(value(&env, "GH_TOKEN"), Some(APP_TOKEN));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_failed_refresh_fails_the_step_and_spawns_nothing()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let clock = Arc::new(Clock((EXPIRES_MS + 1).into()));
+        let (runner, _book, dir) = fixture_clocked(true, "anthropic_api_key", true, clock).await?;
+        let got = runner
+            .helper(
+                Path::new("/usr/bin/env"),
+                dir.path(),
+                &[],
+                Scope::Push("job1"),
+            )
+            .await;
+        assert_eq!(
+            got.err(),
+            Some(crate::proc::CaptureError::Credentials(
+                crate::cred::CredentialFailure::Malformed
+            ))
+        );
         Ok(())
     }
 
