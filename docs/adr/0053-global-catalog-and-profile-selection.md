@@ -1,6 +1,6 @@
 # Global catalog and profile selection
 
-Status: Proposed 2026-11-02. Save-time selection validation and the `fleet profile item` and `fleet profile prompt` commands are built, the rest is not. Amends ADR-0034 (what a Profile holds) and ADR-0035 (what the hash covers). Builds on ADR-0044 and ADR-0048. Tool items need the owner capability `profile:tools` of ADR-0054.
+Status: Proposed 2026-11-02. Save-time selection validation, the `fleet profile item` and `fleet profile prompt` commands, and the Kimi dropped-subagent notes in the job event stream are built, the rest is not. Amends ADR-0034 (what a Profile holds) and ADR-0035 (what the hash covers). Builds on ADR-0044 and ADR-0048. Tool items need the owner capability `profile:tools` of ADR-0054.
 
 ADR-0034 defines a Profile as a bundle of content: `claude_md`, inline skills, context files and rules. Every Profile repeats the content it needs, and nothing says which skills, subagents or tools exist on the server. This ADR adds a server-managed catalog and turns a Profile into a selection over it.
 
@@ -56,6 +56,8 @@ The server calls `resolve` at submit, in the same transaction that inserts the J
 
 Job notes show on `fleet show` and in the web job view next to the Job status. A dropped Kimi subagent is a note, not a failure.
 
+Built: fleetd re-resolves the selection against the validated blob catalog only to name the Kimi subagents the runner drops. Each dropped item gets one `phase` event in the job event stream; more than 64 collapse into one "and N more dropped" event. The events count against the per-job event cap (`MAX_EVENTS_PER_JOB`). The server stores the snapshot notes, but showing them on `fleet show` and in the web job view is not built.
+
 ### Consequence of opt-out
 
 An item that an admin enables reaches every Profile at its next submit, with no action by the Profile owner. That includes a Profile that has not changed in months. Two mitigations:
@@ -81,7 +83,7 @@ The Floor is unchanged. A Catalog item cannot loosen it, and a `subagent` tool l
 ## Considered and rejected
 
 - **Opt-in selection** (`{item_id, enabled}` entries that a user adds). It keeps every Profile unchanged when an admin adds an item, and a Profile hash then covers the exact selection. It was rejected because the owner wants one global list with selective switch-off, and opt-in makes every user pick each item by hand.
-- **Resolve at fleetd.** It needs the Catalog on every Box and makes the result depend on Box state. Resolve at submit keeps it pure and in one place.
+- **Resolve at fleetd.** It needs the Catalog on every Box and makes the result depend on Box state. Resolve at submit keeps it pure and in one place. The fleetd resolve that is built is narrow: it only names dropped Kimi subagents for notes and never changes what the Job runs.
 - **Resolve at claim time.** A queued Job would change between submit and start.
 - **Failing a Kimi Job that has subagent items.** The Profile is valid for other agents, so a visible note is enough.
 - **Per-Profile Catalog copies.** It is the bundle model this ADR replaces.

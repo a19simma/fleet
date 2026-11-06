@@ -54,6 +54,7 @@ use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::Duration;
 
 use fleet_core::Redactor;
+use fleet_proto::v1 as pb;
 use fleet_proto::v1::{
     GetJobTranscriptReply, GetJobTranscriptRequest, GetProfileBlobReply, GetProfileBlobRequest,
     Job, JobCi, JobKind, JobState, JobVerdict, ReportJobReply, ReportJobRequest, TranscriptChunk,
@@ -790,6 +791,7 @@ pub struct AgentRunner<R> {
     carries: Mutex<HashMap<String, Carry>>,
     phases: Mutex<HashMap<String, Phases>>,
     profiles: Mutex<HashMap<String, Arc<Applied>>>,
+    notes: Mutex<HashMap<String, Vec<pb::JobEvent>>>,
     tool_paths: Mutex<HashMap<String, String>>,
     tool_preflight: Option<ToolPreflight>,
     pub(crate) clock: Arc<dyn Clock>,
@@ -828,6 +830,7 @@ impl<R: Reporter> AgentRunner<R> {
             carries: Mutex::new(HashMap::new()),
             phases: Mutex::new(HashMap::new()),
             profiles: Mutex::new(HashMap::new()),
+            notes: Mutex::new(HashMap::new()),
             tool_paths: Mutex::new(HashMap::new()),
             tool_preflight: None,
             clock: Arc::new(SystemClock::new()),
@@ -962,11 +965,62 @@ impl<R: Reporter> AgentRunner<R> {
                 "profile allow rules dropped by the floor"
             );
         }
+        self.queue_dropped_notes(job, &reply);
         self.profiles
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .insert(Self::carry_key(job), Arc::new(applied));
         Ok(())
+    }
+
+    /// Keeps a note for each subagent the job's runner drops, collapsed past `MAX_DROPPED_NOTES`,
+    /// for the first stream of the job.
+    ///
+    /// The catalog comes from the blob [`profile_apply::load_stamped`] just validated, and the
+    /// selection from its Profile. A catalog or selection that does not resolve, or a runner
+    /// that drops no subagent, keeps nothing.
+    fn queue_dropped_notes(&self, job: &Job, reply: &GetProfileBlobReply) {
+        let Ok(profile) = fleet_core::Profile::from_stored_json(&reply.content) else {
+            return;
+        };
+        let Ok(catalog) = profile_apply::validated_catalog(&reply.catalog) else {
+            return;
+        };
+        let notes = crate::agent::notes::dropped_subagent_events(
+            &job.agent,
+            &profile.selection,
+            &catalog,
+            &self.job_redactor(&job.job_id),
+            0,
+            0,
+        );
+        match notes {
+            Ok(notes) if !notes.is_empty() => {
+                self.notes
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .insert(Self::carry_key(job), notes);
+            }
+            Ok(_) => {}
+            Err(_) => tracing::warn!("profile selection did not resolve against the catalog"),
+        }
+    }
+
+    fn take_notes(&self, job: &Job) -> Vec<pb::JobEvent> {
+        self.notes
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .remove(&Self::carry_key(job))
+            .unwrap_or_default()
+    }
+
+    fn feed_notes(&self, job: &Job, stream: &Stream<'_, R>) {
+        let notes = self.take_notes(job);
+        if !notes.is_empty() {
+            stream
+                .feed()
+                .queue_notes(&self.job_redactor(&job.job_id), notes);
+        }
     }
 
     /// Fetches the stored transcript `job` grades, over `GetJobTranscript`, and writes it to
@@ -1091,6 +1145,14 @@ impl<R: Reporter> AgentRunner<R> {
     }
 
     #[cfg(test)]
+    pub(crate) fn has_notes(&self, job: &Job) -> bool {
+        self.notes
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .contains_key(&Self::carry_key(job))
+    }
+
+    #[cfg(test)]
     pub(crate) fn has_profile(&self, job: &Job) -> bool {
         self.profile_for(job).is_some()
     }
@@ -1101,6 +1163,7 @@ impl<R: Reporter> AgentRunner<R> {
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .remove(&Self::carry_key(job));
+        self.take_notes(job);
         self.clear_tool_path(job);
     }
 
@@ -1162,6 +1225,10 @@ impl<R: Reporter> AgentRunner<R> {
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .remove(&key);
+        self.notes
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .remove(&key);
         self.gathered
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
@@ -1209,6 +1276,7 @@ impl<R: Reporter> AgentRunner<R> {
             self.feed_book(&job.job_id),
         );
         stream.feed().record(self.take_phases(job));
+        self.feed_notes(job, &stream);
         stream
     }
 
@@ -1333,6 +1401,7 @@ impl<R: Reporter> AgentRunner<R> {
             self.feed_book(&job.job_id),
         );
         stream.feed().record(self.take_phases(job));
+        self.feed_notes(job, &stream);
         let result = self
             .run_stream(job, cwd, shutdown, &mut stream, launch)
             .await;
@@ -3378,6 +3447,143 @@ mod tests {
         assert!(home.is_dir());
         runner.end_job(&job);
         assert!(!home.exists());
+    }
+
+    struct Recording {
+        blob: GetProfileBlobReply,
+        events: Arc<Mutex<Vec<fleet_proto::v1::JobEvent>>>,
+    }
+
+    impl Reporter for Recording {
+        fn report(
+            &self,
+            request: ReportJobRequest,
+        ) -> impl Future<Output = Result<ReportJobReply, Status>> + Send {
+            self.events
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .extend(request.events);
+            std::future::ready(Ok(ReportJobReply::default()))
+        }
+
+        fn profile_blob(
+            &self,
+            _request: GetProfileBlobRequest,
+        ) -> impl Future<Output = Result<GetProfileBlobReply, Status>> + Send {
+            std::future::ready(Ok(self.blob.clone()))
+        }
+    }
+
+    fn subagent_catalog(count: usize) -> Vec<fleet_proto::v1::CatalogItem> {
+        (0..count)
+            .map(|index| {
+                let id = format!("agent-{index}");
+                let item = fleet_core::catalog::CatalogItem::new(
+                    fleet_core::catalog::CatalogKind::Subagent,
+                    &id,
+                    &id,
+                    "body",
+                )
+                .expect("item");
+                fleet_proto::v1::CatalogItem {
+                    id: id.clone(),
+                    kind: fleet_proto::v1::CatalogKind::Subagent.into(),
+                    name: id,
+                    content: "body".to_owned(),
+                    digest: item.digest().to_vec(),
+                    admin_enabled: true,
+                }
+            })
+            .collect()
+    }
+
+    async fn notes_reported(agent: &str, subagents: usize) -> Vec<fleet_proto::v1::JobEvent> {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (mut job, mut blob) = profile_job(&Profile::default());
+        job.agent = agent.into();
+        blob.catalog = subagent_catalog(subagents);
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let mut config = test_config(dir.path());
+        config.disposable = true;
+        let runner = AgentRunner::new(
+            config,
+            Recording {
+                blob,
+                events: Arc::clone(&events),
+            },
+            Redactor::default(),
+        )
+        .with_launcher(Arc::new(FakeLauncher::new(ExitStatus::from_raw(0), false)));
+        runner.load_profile(&job, "b").await.expect("load");
+        let (_trigger, shutdown) = Shutdown::channel();
+        let outcome = runner.run(&job, dir.path(), shutdown).await;
+        assert_eq!(outcome.ok(), Some(AgentOutcome::Succeeded));
+        events
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()
+    }
+
+    #[tokio::test]
+    async fn a_kimi_profile_load_queues_one_note_per_dropped_subagent_in_the_event_stream() {
+        let events = notes_reported("kimi", 3).await;
+        let details: Vec<_> = events
+            .iter()
+            .map(|event| event.detail.clone().unwrap_or_default())
+            .collect();
+        assert_eq!(
+            details,
+            [
+                "kimi has no subagents: dropped agent-0",
+                "kimi has no subagents: dropped agent-1",
+                "kimi has no subagents: dropped agent-2",
+            ]
+        );
+        for (index, event) in events.iter().enumerate() {
+            assert_eq!(event.seq, u32::try_from(index).expect("small"));
+            assert_eq!(event.kind, i32::from(fleet_proto::v1::JobEventKind::Phase));
+        }
+    }
+
+    #[tokio::test]
+    async fn a_claude_profile_load_queues_no_note() {
+        assert_eq!(notes_reported("claude", 3).await.len(), 0);
+    }
+
+    #[tokio::test]
+    async fn a_resumed_stream_carries_the_notes_and_end_job_forgets_untaken_ones() {
+        let (mut job, mut blob) = profile_job(&Profile::default());
+        job.agent = "kimi".into();
+        blob.catalog = subagent_catalog(2);
+        let runner = AgentRunner::new(
+            test_config(Path::new("/jobs")),
+            Served(blob),
+            Redactor::default(),
+        );
+        runner.load_profile(&job, "b").await.expect("load");
+        let stream = runner.resume(&job);
+        assert_eq!(stream.feed().batch().len(), 2);
+        drop(stream);
+        runner.load_profile(&job, "b").await.expect("load");
+        assert!(runner.has_notes(&job));
+        runner.end_job(&job);
+        assert!(!runner.has_notes(&job));
+    }
+
+    #[tokio::test]
+    async fn ending_the_job_forgets_notes_that_were_never_taken() {
+        let (mut job, mut blob) = profile_job(&Profile::default());
+        job.agent = "kimi".into();
+        blob.catalog = subagent_catalog(2);
+        let runner = AgentRunner::new(
+            test_config(Path::new("/jobs")),
+            Served(blob),
+            Redactor::default(),
+        );
+        runner.load_profile(&job, "b").await.expect("load");
+        assert!(runner.has_notes(&job));
+        runner.clear_profile(&job);
+        assert!(!runner.has_notes(&job));
     }
 
     fn applied_with_model(model: &str) -> crate::profile_apply::Applied {

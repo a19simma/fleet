@@ -20,6 +20,7 @@ use fleet_proto::MAX_EVENTS_PER_REPORT;
 use fleet_proto::v1 as pb;
 use tokio::time::Instant;
 
+use crate::agent::notes::{MAX_DROPPED_NOTES, sanitise_note};
 use crate::phase::Phases;
 use crate::runner::{UNKNOWN_STAMP, VersionStamp};
 use crate::telemetry::{
@@ -30,6 +31,8 @@ use crate::toolhook::ToolReport;
 pub(crate) const MAX_LINE_BYTES: usize = 1 << 20;
 pub(crate) const MAX_FED_BYTES: u64 = 32 << 20;
 pub(crate) const MAX_PENDING_EVENTS: usize = 4096;
+/// One more than [`MAX_DROPPED_NOTES`], for the summary note that replaces the overflow.
+pub(crate) const MAX_QUEUED_NOTES: usize = MAX_DROPPED_NOTES + 1;
 pub(crate) const MAX_HOOKED_IDS: usize = 4096;
 pub(crate) const MAX_WAITING_HOOKS: usize = 256;
 const PARSER_MISSING: &str = "parser";
@@ -90,7 +93,7 @@ impl Feed {
     /// Marks the feed as belonging to a runner with no output parser (Codex and Kimi).
     ///
     /// Such a feed reads none of the agent's lines, and its summary carries no figure, is
-    /// incomplete and lists `parser` as missing (ADR-0044). Fetch events still reach it.
+    /// incomplete and lists `parser` as missing (ADR-0044). Fetch events and dropped-subagent notes still reach it.
     pub(crate) fn set_unparsed(&mut self, unparsed: bool) {
         self.unparsed = unparsed;
     }
@@ -101,6 +104,29 @@ impl Feed {
 
     pub(crate) fn set_stamp(&mut self, stamp: VersionStamp) {
         self.stamp = stamp;
+    }
+
+    /// Queues job notes as phase events behind the events already queued.
+    ///
+    /// Only the `detail` and `ts_ms` of each note are kept: the parser assigns the `seq`, so a
+    /// note cannot collide with a fetch or parser event. Each detail goes through
+    /// [`sanitise_note`] again with `redactor`. At most [`MAX_QUEUED_NOTES`] notes are taken and
+    /// the rest are counted as dropped. A feed whose parser is gone keeps none.
+    pub(crate) fn queue_notes(&mut self, redactor: &Redactor, notes: Vec<pb::JobEvent>) {
+        let over = notes.len().saturating_sub(MAX_QUEUED_NOTES);
+        self.counters.dropped += u64::try_from(over).unwrap_or(u64::MAX);
+        let mut stored = Vec::new();
+        let Some(parser) = self.parser.as_mut() else {
+            self.counters.dropped += u64::try_from(notes.len() - over).unwrap_or(u64::MAX);
+            return;
+        };
+        for note in notes.into_iter().take(MAX_QUEUED_NOTES) {
+            let detail = sanitise_note(note.detail.as_deref().unwrap_or_default(), redactor);
+            parser.record_note(&detail, note.ts_ms, &mut stored);
+        }
+        for event in stored {
+            self.queue(convert(redactor, event));
+        }
     }
 
     #[cfg(test)]
@@ -413,6 +439,126 @@ mod tests {
     use crate::telemetry::MAX_FETCH_URL_BYTES;
 
     const SECRET: &str = "pa\"ss-word-xyz";
+
+    fn note(detail: &str) -> pb::JobEvent {
+        pb::JobEvent {
+            seq: 900,
+            ts_ms: 5,
+            kind: pb::JobEventKind::Phase.into(),
+            detail: Some(detail.to_owned()),
+            ..pb::JobEvent::default()
+        }
+    }
+
+    fn details(feed: &Feed) -> Vec<String> {
+        feed.batch()
+            .iter()
+            .map(|event| event.detail.clone().unwrap_or_default())
+            .collect()
+    }
+
+    #[test]
+    fn notes_take_the_next_seq_behind_fetch_events_and_keep_their_text() {
+        let (mut feed, start) = fresh();
+        feed.record_fetch(
+            &redactor(),
+            "https://example.test/a",
+            FetchPhase::Intent,
+            start,
+        )
+        .expect("fetch");
+        feed.queue_notes(&redactor(), vec![note("one"), note("two")]);
+        assert_eq!(seqs(&feed.batch()), [0, 1, 2]);
+        assert_eq!(details(&feed)[1..], ["one", "two"]);
+        let batch = feed.batch();
+        assert_eq!(batch[1].ts_ms, 5);
+        assert_eq!(batch[1].kind, i32::from(pb::JobEventKind::Phase));
+    }
+
+    #[test]
+    fn hostile_note_text_is_stripped_redacted_and_cut() {
+        let hostile = [
+            "a\rb",
+            "a\r\nb",
+            "a\u{85}b",
+            "a\u{2028}b",
+            "a\\b",
+            "a\0b",
+            "caf\u{e9}",
+            "x\u{202e}y",
+        ];
+        let (mut feed, _) = fresh();
+        feed.queue_notes(&redactor(), hostile.iter().map(|text| note(text)).collect());
+        assert_eq!(
+            details(&feed),
+            ["ab", "ab", "ab", "ab", "a\\b", "ab", "caf\u{e9}", "xy"]
+        );
+        let (mut feed, _) = fresh();
+        feed.queue_notes(
+            &redactor(),
+            vec![note(&format!("dropped {SECRET}")), note(&"z".repeat(5000))],
+        );
+        let texts = details(&feed);
+        assert!(!texts[0].contains(SECRET));
+        assert_eq!(
+            texts[1].len(),
+            fleet_proto::MAX_EVENT_DETAIL_BYTES.min(1024)
+        );
+    }
+
+    #[test]
+    fn notes_are_capped_and_the_overflow_is_counted() {
+        let (mut feed, _) = fresh();
+        let many: Vec<_> = (0..MAX_QUEUED_NOTES + 3)
+            .map(|i| note(&format!("n{i}")))
+            .collect();
+        feed.queue_notes(&redactor(), many);
+        assert_eq!(feed.batch().len(), MAX_QUEUED_NOTES);
+        assert_eq!(feed.counters().dropped, 3);
+    }
+
+    #[test]
+    fn a_full_dropped_list_and_its_summary_note_all_fit() {
+        let (mut feed, _) = fresh();
+        let all: Vec<_> = (0..=MAX_DROPPED_NOTES)
+            .map(|i| note(&format!("n{i}")))
+            .collect();
+        feed.queue_notes(&redactor(), all);
+        assert_eq!(feed.batch().len(), MAX_DROPPED_NOTES + 1);
+        assert_eq!(feed.counters().dropped, 0);
+    }
+
+    #[test]
+    fn a_note_is_cut_at_the_parser_detail_cap() {
+        let limits = Limits {
+            detail_cap: 8,
+            ..Limits::default()
+        };
+        let mut feed = Feed::with(Instant::now(), limits, Telemetry::feed_line_with);
+        feed.queue_notes(&redactor(), vec![note("0123456789abcdef")]);
+        assert_eq!(details(&feed), ["01234567"]);
+    }
+
+    #[test]
+    fn a_feed_without_a_parser_counts_every_note_once_over_the_cap_too() {
+        let (mut feed, _) = fresh();
+        feed.parser = None;
+        let many: Vec<_> = (0..MAX_QUEUED_NOTES + 3)
+            .map(|i| note(&format!("n{i}")))
+            .collect();
+        let total = u64::try_from(many.len()).expect("small");
+        feed.queue_notes(&redactor(), many);
+        assert_eq!(feed.counters().dropped, total);
+    }
+
+    #[test]
+    fn a_feed_without_a_parser_keeps_no_note() {
+        let (mut feed, _) = fresh();
+        feed.parser = None;
+        feed.queue_notes(&redactor(), vec![note("one")]);
+        assert!(feed.backlog_empty());
+        assert_eq!(feed.counters().dropped, 1);
+    }
 
     fn fresh() -> (Feed, Instant) {
         let start = Instant::now();

@@ -409,6 +409,20 @@ impl Telemetry {
         out
     }
 
+    /// Store one note as a phase event with `detail`, pushing what was stored into `out`.
+    ///
+    /// The detail is cut at the detail cap. Past the event cap the truncation marker is
+    /// stored in its place, as for any other event.
+    pub fn record_note(&mut self, detail: &str, ts_ms: u64, out: &mut Vec<JobEvent>) {
+        let event = JobEvent {
+            ts_ms,
+            kind: EventKind::Phase,
+            detail: Some(cap(detail, self.limits.detail_cap)),
+            ..JobEvent::default()
+        };
+        self.emit(event, out);
+    }
+
     /// Store one fetch event, pushing what was stored into `out`.
     ///
     /// Fails with [`FetchRecordError::Truncated`] when the event is the one that goes past the
