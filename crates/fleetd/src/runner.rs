@@ -1600,6 +1600,12 @@ impl<R: Reporter> AgentRunner<R> {
                         match Box::pin(self.watch_ci(job, cwd, url, &progress, &mut ctl)).await {
                             ci::Watched::Done(ci) => Some(ci),
                             ci::Watched::Lost => return Ok(FinishOutcome::Lost),
+                            ci::Watched::Failed(error) => {
+                                stream
+                                    .end_published(JobState::Failed, Some(error), &published)
+                                    .await;
+                                return Ok(FinishOutcome::Failed { error });
+                            }
                             stopped => {
                                 let cancelled = matches!(stopped, ci::Watched::Cancelled);
                                 let (state, error) = if cancelled {
@@ -1729,6 +1735,18 @@ impl<R: Reporter> AgentRunner<R> {
         redacted.get(start..).unwrap_or_default().to_owned()
     }
 
+    /// Runs `bin` in `dir` with a scrubbed environment and captures up to [`CAPTURE_BYTES`] of
+    /// each stream, keeping the head.
+    ///
+    /// A [`Scope::Push`] or [`Scope::Gh`] child first refreshes the installation token of its
+    /// job and holds a lease on that token until the child exits, so a later refresh cannot
+    /// revoke it mid-run. The other scopes take no lease.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CaptureError::Start`] when the child cannot start, [`CaptureError::Timeout`]
+    /// when it outlives the finish timeout, and [`CaptureError::Credentials`] when the token
+    /// refresh before a Push or Gh child fails for good.
     pub(crate) async fn helper(
         &self,
         bin: &Path,
@@ -1740,6 +1758,17 @@ impl<R: Reporter> AgentRunner<R> {
             .await
     }
 
+    /// [`Self::helper`] with a capture `limit` in bytes per stream.
+    ///
+    /// A [`Scope::Push`] or [`Scope::Gh`] child first refreshes the installation token of its
+    /// job and holds a lease on that token until the child exits, so a later refresh cannot
+    /// revoke it mid-run. The other scopes take no lease.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CaptureError::Start`] when the child cannot start, [`CaptureError::Timeout`]
+    /// when it outlives the finish timeout, and [`CaptureError::Credentials`] when the token
+    /// refresh before a Push or Gh child fails for good.
     pub(crate) async fn helper_limited(
         &self,
         bin: &Path,
@@ -1763,6 +1792,18 @@ impl<R: Reporter> AgentRunner<R> {
             .await
     }
 
+    /// [`Self::helper_limited`] that keeps the tail of each stream when `tail` is set, else the
+    /// head.
+    ///
+    /// A [`Scope::Push`] or [`Scope::Gh`] child first refreshes the installation token of its
+    /// job and holds a lease on that token until the child exits, so a later refresh cannot
+    /// revoke it mid-run. The other scopes take no lease.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CaptureError::Start`] when the child cannot start, [`CaptureError::Timeout`]
+    /// when it outlives the finish timeout, and [`CaptureError::Credentials`] when the token
+    /// refresh before a Push or Gh child fails for good.
     async fn helper_keeping(
         &self,
         bin: &Path,
@@ -1772,11 +1813,16 @@ impl<R: Reporter> AgentRunner<R> {
         limit: u64,
         tail: bool,
     ) -> Result<Captured, CaptureError> {
-        if let Scope::Push(id) | Scope::Gh(id) = scope {
+        let leased = if let Scope::Push(id) | Scope::Gh(id) = scope {
             self.refresh_token(id)
                 .await
                 .map_err(CaptureError::Credentials)?;
-        }
+            self.credentials
+                .as_ref()
+                .and_then(|book| book.lease_held(id))
+        } else {
+            None
+        };
         let home = dir.join(HOME_DIR);
         let mut command = Command::new(bin);
         command
@@ -1836,8 +1882,12 @@ impl<R: Reporter> AgentRunner<R> {
                 .env("GH_PAGER", "cat")
                 .env("PAGER", "cat"),
         };
-        if let Scope::Push(id) | Scope::Gh(id) = scope {
-            self.apply_github_token(&mut command, id, matches!(scope, Scope::Gh(_)));
+        if let Scope::Push(_) | Scope::Gh(_) = scope {
+            self.apply_github_token(
+                &mut command,
+                leased.as_ref().map(|(held, _)| held.as_ref()),
+                matches!(scope, Scope::Gh(_)),
+            );
         }
         if let Scope::Tree(id, work) = scope {
             command
@@ -1846,7 +1896,9 @@ impl<R: Reporter> AgentRunner<R> {
                 .envs(self.git_env(id));
         }
         let keep = if tail { Keep::Tail } else { Keep::Head };
-        capture_keeping(command, self.config.finish_timeout, limit, keep).await
+        let captured = capture_keeping(command, self.config.finish_timeout, limit, keep).await;
+        drop(leased);
+        captured
     }
 
     async fn drive(

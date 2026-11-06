@@ -93,12 +93,12 @@ Built (ADR-0058):
 
 - fleetd refreshes the installation token before a push or `gh` child when under 10 minutes of it remain. The mirror fetch and the broker token are not refreshed.
 - The server allows `MAX_APP_MINTS_PER_JOB` (34) mint attempts per Job and `MAX_APP_MINTS_PER_USER_PER_MINUTE` (20) per User. Past either, the release answers `FAILED_PRECONDITION` with `github app token limit reached` (`PRECONDITION_APP_MINT_CAP`). There is no PAT fallback.
-- fleetd revokes the token a refresh replaced, and the held token when the Job ends, with `DELETE /installation/token`. The revoke is best effort with a 10 second bound. A failed revoke logs a fixed string and never fails the Job, so that token lives until its expiry.
+- fleetd revokes the token a refresh replaced, and the held token when the Job ends, with `DELETE /installation/token`. A replaced token is revoked after the push or `gh` children that started with it have exited, at most 15 minutes later. The revoke is best effort with a 10 second bound. A failed revoke logs a fixed string and never fails the Job, so that token lives until its expiry.
 - Every mint writes rows to `github_app_mint`: `attempt`, then `minted`, `failed` or `denied`, and `revoked` or `revoke_failed` when the server revokes after a failed recheck.
 
 Not built: the installation and repository allowlists, refresh of the mirror fetch and the broker token, and a revoke that survives a daemon exit.
 
-When the cap is hit, the step fails with the Job reason `github app token limit reached`. A plain mint failure reports `credentials could not be fetched` instead. A refresh whose mint fails keeps the last good token until it expires. To see the cause, list the denied rows. The table has no user column, so join through the credential:
+When the cap is hit, the step fails with the Job reason `github app token limit reached`. A plain mint failure reports `credentials could not be fetched` instead. A refresh whose mint fails keeps the last good token until it expires. A box whose clock runs ahead of the server's refreshes every 45 minutes and never fails a step on the expiry. A box clock that runs behind cannot be detected: its steps fail at GitHub once the token has expired. To see the cause, list the denied rows. The table has no user column, so join through the credential:
 
 ```
 SELECT m.at, m.job_id, m.reason

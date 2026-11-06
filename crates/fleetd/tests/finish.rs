@@ -7,17 +7,26 @@ use std::future::{Future, ready};
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, PoisonError};
 use std::time::Duration;
 
 use fleet_core::Redactor;
 use fleet_proto::MAX_CI_LOG_BYTES;
+use fleet_proto::PRECONDITION_APP_MINT_CAP;
 use fleet_proto::is_ci_log;
+use fleet_proto::v1::fleet_worker_server::{FleetWorker, FleetWorkerServer};
 use fleet_proto::v1::{CiState, Job, JobState, ReportJobReply, ReportJobRequest};
+use fleet_proto::v1::{
+    ClaimJobReply, ClaimJobRequest, GetJobCredentialsReply, GetJobCredentialsRequest,
+    GetJobTranscriptReply, GetJobTranscriptRequest, GetProfileBlobReply, GetProfileBlobRequest,
+    GitIdentity, JobCredential,
+};
 use fleetd::AgentLauncher;
 use fleetd::broker::{
     Broker, Denial, GhCli, Limits, MAX_BODY_BYTES, MAX_TITLE_CHARS, MirrorGit, Response,
 };
+use fleetd::cred::{CredentialBook, CredentialClient, ERR_MINT_CAP};
 use fleetd::phase::Clock;
 use fleetd::poller::Shutdown;
 use fleetd::publish::{PublishGh, PublishGit};
@@ -2025,6 +2034,163 @@ async fn a_cancel_during_the_wait_reports_cancelled_with_no_ci_state() -> TestRe
         assert!(last.ci.is_none());
         assert_eq!(last.pr_url.as_deref(), Some(CI_PR));
         assert_eq!(last.branch.as_deref(), Some("swarm/job1"));
+        Ok(())
+    }))
+    .await
+}
+
+const APP_TOKEN: &str = "ghs_AbCdEfGhIjKlMnOpQrStUvWxYz0123456789";
+const START_MS: u64 = 1_700_000_000_000;
+const MINUTE_MS: u64 = 60_000;
+
+#[derive(Debug)]
+struct SteppedClock(AtomicU64);
+
+impl fleetd::cred::Clock for SteppedClock {
+    fn now_ms(&self) -> u64 {
+        self.0.load(Ordering::SeqCst)
+    }
+}
+
+struct MintStub(AtomicUsize);
+
+fn stub_credential(kind: &str, value: &str, expires_at_ms: Option<u64>) -> JobCredential {
+    JobCredential {
+        kind: kind.into(),
+        shape: "static_secret".into(),
+        value: value.into(),
+        expires_at_ms,
+        git_identity: expires_at_ms.map(|_| GitIdentity {
+            name: "fleet-bot[bot]".into(),
+            email: "123456+fleet-bot[bot]@users.noreply.github.com".into(),
+        }),
+    }
+}
+
+#[tonic::async_trait]
+impl FleetWorker for MintStub {
+    async fn claim_job(
+        &self,
+        _: tonic::Request<ClaimJobRequest>,
+    ) -> Result<tonic::Response<ClaimJobReply>, Status> {
+        Err(Status::unimplemented("unused"))
+    }
+
+    async fn get_profile_blob(
+        &self,
+        _: tonic::Request<GetProfileBlobRequest>,
+    ) -> Result<tonic::Response<GetProfileBlobReply>, Status> {
+        Err(Status::unimplemented("unused"))
+    }
+
+    async fn get_job_transcript(
+        &self,
+        _: tonic::Request<GetJobTranscriptRequest>,
+    ) -> Result<tonic::Response<GetJobTranscriptReply>, Status> {
+        Err(Status::unimplemented("unused"))
+    }
+
+    async fn get_job_credentials(
+        &self,
+        _: tonic::Request<GetJobCredentialsRequest>,
+    ) -> Result<tonic::Response<GetJobCredentialsReply>, Status> {
+        if self.0.fetch_add(1, Ordering::SeqCst) > 0 {
+            return Err(Status::failed_precondition(PRECONDITION_APP_MINT_CAP));
+        }
+        Ok(tonic::Response::new(GetJobCredentialsReply {
+            credentials: vec![
+                stub_credential(
+                    "github_installation_token",
+                    APP_TOKEN,
+                    Some(START_MS + 30 * MINUTE_MS),
+                ),
+                stub_credential(
+                    "anthropic_api_key",
+                    "agent-key-value-0123456789abcdef",
+                    None,
+                ),
+            ],
+        }))
+    }
+
+    async fn report_job(
+        &self,
+        _: tonic::Request<ReportJobRequest>,
+    ) -> Result<tonic::Response<ReportJobReply>, Status> {
+        Err(Status::unimplemented("unused"))
+    }
+
+    async fn report_shell_log(
+        &self,
+        _: tonic::Request<fleet_proto::v1::ReportShellLogRequest>,
+    ) -> Result<tonic::Response<fleet_proto::v1::ReportShellLogReply>, Status> {
+        Err(Status::unimplemented("unused"))
+    }
+
+    async fn report_timing(
+        &self,
+        _: tonic::Request<fleet_proto::v1::ReportTimingRequest>,
+    ) -> Result<tonic::Response<fleet_proto::v1::ReportTimingReply>, Status> {
+        Err(Status::unimplemented("unused"))
+    }
+}
+
+#[tokio::test]
+async fn a_token_refresh_refused_during_the_wait_fails_the_job_with_its_reason() -> TestResult {
+    common::bounded(Box::pin(async {
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0)).await?;
+        let url = format!("http://{}", listener.local_addr()?);
+        tokio::spawn(
+            tonic::transport::Server::builder()
+                .add_service(FleetWorkerServer::new(MintStub(AtomicUsize::new(0))))
+                .serve_with_incoming(tokio_stream::wrappers::TcpListenerStream::new(listener)),
+        );
+        let clock = Arc::new(SteppedClock(AtomicU64::new(START_MS)));
+        let book = Arc::new(
+            CredentialBook::new(CredentialClient::new(
+                fleetd::poller::channel(&url)?,
+                "cred-test-token-0123456789",
+            )?)
+            .with_clock(clock.clone()),
+        );
+        book.fetch("job1", 1, "boxa").await?;
+        let rig = rig("ok").await?;
+        commit(&rig)?;
+        set_ci(&rig, "pending")?;
+        let (agent, mut rx) = agent_waiting(
+            &rig,
+            Duration::from_secs(30),
+            Reply::Ok,
+            Duration::from_secs(30),
+        );
+        let agent = agent.with_credentials(book);
+        let watched = rig.dir.path().to_path_buf();
+        tokio::spawn(async move {
+            while !watched.join("checks.calls").exists() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            clock.0.store(START_MS + 25 * MINUTE_MS, Ordering::SeqCst);
+        });
+        let (_trigger, shutdown) = Shutdown::channel();
+        let outcome = agent
+            .finish(&job(&rig, true), &rig.worktree, shutdown)
+            .await?;
+        assert_eq!(
+            outcome,
+            FinishOutcome::Failed {
+                error: ERR_MINT_CAP
+            }
+        );
+        let reports = drain(&mut rx);
+        let last = terminal(&reports)?;
+        assert_eq!(last.terminal_state, Some(JobState::Failed.into()));
+        assert_eq!(last.error.as_deref(), Some(ERR_MINT_CAP));
+        assert_ne!(
+            last.error.as_deref(),
+            Some("agent stopped by daemon shutdown")
+        );
+        assert_eq!(last.pr_url.as_deref(), Some(CI_PR));
+        assert!(last.ci.is_none());
         Ok(())
     }))
     .await

@@ -259,7 +259,7 @@ impl<R: Reporter> AgentRunner<R> {
         .await
         .map_err(|e| e.failure(ERR_PR))?;
         book.pr_attempted = true;
-        let url = match self.existing_pr(job, &branch, dir).await {
+        let url = match self.existing_pr(job, &branch, dir).await? {
             Some(url) => url,
             None => self.create_pr(job, &branch, dir, title, body).await?,
         };
@@ -274,13 +274,26 @@ impl<R: Reporter> AgentRunner<R> {
         branch: &str,
         dir: &Path,
     ) -> Result<String, Failure> {
-        match self.existing_pr(job, branch, dir).await {
+        match self.existing_pr(job, branch, dir).await? {
             Some(url) => Ok(url),
             None => self.open_pr(job, branch, dir).await,
         }
     }
 
-    async fn existing_pr(&self, job: &Job, branch: &str, dir: &Path) -> Option<String> {
+    /// Looks up the open pull request of `branch`. `None` when there is none, or when the
+    /// listing failed to start, timed out or exited nonzero: the caller then opens one.
+    ///
+    /// # Errors
+    ///
+    /// A credential failure of the token refresh before the call, such as the mint cap or a
+    /// lost lease, is terminal: it fails the step with the failure's reason and never reads
+    /// as "no pull request".
+    pub(crate) async fn existing_pr(
+        &self,
+        job: &Job,
+        branch: &str,
+        dir: &Path,
+    ) -> Result<Option<String>, Failure> {
         let listed = self
             .helper(
                 &self.config.gh_bin,
@@ -291,12 +304,11 @@ impl<R: Reporter> AgentRunner<R> {
                 ],
                 Scope::Gh(&job.job_id),
             )
-            .await
-            .ok()?;
-        if listed.success {
-            pr_url(&listed.stdout)
-        } else {
-            None
+            .await;
+        match listed {
+            Err(CaptureError::Credentials(failure)) => Err(Failure::bare(failure.reason())),
+            Ok(listed) if listed.success => Ok(pr_url(&listed.stdout)),
+            Ok(_) | Err(_) => Ok(None),
         }
     }
 

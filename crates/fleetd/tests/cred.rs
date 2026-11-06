@@ -25,7 +25,7 @@ use fleetd::DaemonRunner;
 use fleetd::cred::{
     Clock, CredentialBook, CredentialClient, CredentialFailure, ERR_APP_IDENTITY_INVALID,
     ERR_APP_IDENTITY_MISSING, ERR_EXPIRED, ERR_LEASE, ERR_MALFORMED, ERR_MINT_CAP, ERR_NO_AGENT,
-    ERR_NO_GITHUB, ERR_NOT_CONFIGURED, ERR_UNAVAILABLE,
+    ERR_NO_GITHUB, ERR_NOT_CONFIGURED, ERR_UNAVAILABLE, REFRESH_SKEW_MS,
 };
 use fleetd::poller::{JobRunner, Shutdown, channel};
 use fleetd::revoke::{RevokeError, Revoker};
@@ -337,6 +337,12 @@ fn app_wire(value: &str, name: &str, email: &str) -> JobCredential {
     }
 }
 
+fn app_without_expiry() -> JobCredential {
+    let mut app = app_wire(APP_TOKEN, BOT_NAME, BOT_EMAIL);
+    app.expires_at_ms = None;
+    app
+}
+
 fn agent_wire() -> JobCredential {
     wire("anthropic_api_key", "static_secret", AGENT)
 }
@@ -541,6 +547,7 @@ async fn a_broken_installation_token_reply_is_malformed() -> TestResult {
             agent_wire(),
         ],
         vec![pat_identity, agent_wire()],
+        vec![app_without_expiry(), agent_wire()],
     ];
     for credentials in replies {
         let (got, book) = app_fetch(credentials).await?;
@@ -1248,7 +1255,7 @@ async fn the_new_token_is_masked_and_the_old_one_stays_masked() -> TestResult {
     assert_eq!(merged.redact_str(&text), "a [REDACTED] b [REDACTED]");
     assert_eq!(
         fresh.redactor().redact_str(&text),
-        format!("a {APP_TOKEN} b [REDACTED]")
+        "a [REDACTED] b [REDACTED]"
     );
     Ok(())
 }
@@ -1357,19 +1364,114 @@ async fn every_non_transient_refusal_fails_the_step_and_keeps_the_held_token() -
 }
 
 #[tokio::test]
-async fn a_refreshed_expiry_in_the_past_or_missing_is_refused_and_the_old_token_stays() -> TestResult
-{
-    for expiry in [Some(NOW_MS), Some(NOW_MS - 1), Some(0), None] {
-        let (book, fake, _clock) = held_app(5 * MINUTE_MS).await?;
-        set_reply(&fake, Ok(app_reply(NEW_TOKEN, expiry)));
-        let got = book.refresh_if_due("job1").await;
-        assert_eq!(got.err(), Some(CredentialFailure::Malformed), "{expiry:?}");
-        assert_eq!(github_text(&book).as_deref(), Some(APP_TOKEN));
-    }
+async fn a_refreshed_token_without_an_expiry_is_refused_and_the_old_token_stays() -> TestResult {
     let (book, fake, _clock) = held_app(5 * MINUTE_MS).await?;
-    set_reply(&fake, Ok(app_reply(NEW_TOKEN, Some(NOW_MS + 1))));
+    set_reply(&fake, Ok(app_reply(NEW_TOKEN, None)));
+    let got = book.refresh_if_due("job1").await;
+    assert_eq!(got.err(), Some(CredentialFailure::Malformed));
+    assert_eq!(github_text(&book).as_deref(), Some(APP_TOKEN));
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_refreshed_expiry_in_the_past_is_clock_skew_and_the_new_token_is_taken() -> TestResult {
+    for expiry in [NOW_MS + 1, NOW_MS, NOW_MS - 1, 0] {
+        let (book, fake, _clock) = held_app(5 * MINUTE_MS).await?;
+        set_reply(&fake, Ok(app_reply(NEW_TOKEN, Some(expiry))));
+        assert!(book.refresh_if_due("job1").await?.is_some(), "{expiry}");
+        assert_eq!(github_text(&book).as_deref(), Some(NEW_TOKEN));
+    }
+    Ok(())
+}
+
+async fn skewed(
+    ahead_ms: u64,
+) -> Result<(Arc<CredentialBook>, Arc<Fake>, Arc<TestClock>), Box<dyn std::error::Error>> {
+    let (book, fake, clock) = held_app(5 * MINUTE_MS).await?;
+    set_reply(
+        &fake,
+        Ok(app_reply(NEW_TOKEN, Some(NOW_MS + 60 * MINUTE_MS))),
+    );
+    clock.set(NOW_MS + ahead_ms);
     assert!(book.refresh_if_due("job1").await?.is_some());
+    assert_eq!(calls(&fake), 2);
+    Ok((book, fake, clock))
+}
+
+#[tokio::test]
+async fn a_clock_ahead_of_the_server_does_not_burn_the_mint_cap_or_fail_a_step() -> TestResult {
+    for ahead in [55 * MINUTE_MS, 2 * 60 * MINUTE_MS, 10 * 24 * 60 * MINUTE_MS] {
+        let (book, fake, clock) = skewed(ahead).await?;
+        for later in [0, 1000, 31_000, 10 * MINUTE_MS, REFRESH_SKEW_MS - 1] {
+            clock.set(NOW_MS + ahead + later);
+            assert!(
+                book.refresh_if_due("job1").await?.is_none(),
+                "{ahead} {later}"
+            );
+        }
+        assert_eq!(calls(&fake), 2, "{ahead}");
+        assert_eq!(github_text(&book).as_deref(), Some(NEW_TOKEN));
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_skewed_clock_refreshes_by_elapsed_time_every_skew_interval() -> TestResult {
+    let ahead = 2 * 60 * MINUTE_MS;
+    let (book, fake, clock) = skewed(ahead).await?;
+    set_reply(
+        &fake,
+        Ok(app_reply(APP_TOKEN, Some(NOW_MS + 60 * MINUTE_MS))),
+    );
+    clock.set(NOW_MS + ahead + REFRESH_SKEW_MS);
+    assert!(book.refresh_if_due("job1").await?.is_some());
+    assert_eq!(calls(&fake), 3);
+    assert!(book.refresh_if_due("job1").await?.is_none());
+    assert_eq!(calls(&fake), 3);
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_clock_stepped_back_does_not_leave_a_skewed_entry_waiting_past_the_skew_interval()
+-> TestResult {
+    let ahead = 2 * 60 * MINUTE_MS;
+    let (book, fake, clock) = skewed(ahead).await?;
+    set_reply(
+        &fake,
+        Ok(app_reply(APP_TOKEN, Some(NOW_MS + 120 * MINUTE_MS))),
+    );
+    clock.set(NOW_MS + 55 * MINUTE_MS);
+    assert!(book.refresh_if_due("job1").await?.is_some());
+    assert_eq!(calls(&fake), 3);
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_skewed_entry_keeps_its_token_through_a_transient_failure() -> TestResult {
+    let ahead = 2 * 60 * MINUTE_MS;
+    let (book, fake, clock) = skewed(ahead).await?;
+    set_reply(&fake, Err(Status::unavailable("down")));
+    clock.set(NOW_MS + ahead + REFRESH_SKEW_MS);
+    assert!(book.refresh_if_due("job1").await?.is_none());
+    assert_eq!(calls(&fake), 3);
+    clock.set(NOW_MS + ahead + REFRESH_SKEW_MS + 1000);
+    assert!(book.refresh_if_due("job1").await?.is_none());
+    assert_eq!(calls(&fake), 3);
     assert_eq!(github_text(&book).as_deref(), Some(NEW_TOKEN));
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_skewed_entry_still_fails_a_step_on_the_mint_cap() -> TestResult {
+    let ahead = 2 * 60 * MINUTE_MS;
+    let (book, fake, clock) = skewed(ahead).await?;
+    set_reply(
+        &fake,
+        Err(Status::failed_precondition(PRECONDITION_APP_MINT_CAP)),
+    );
+    clock.set(NOW_MS + ahead + REFRESH_SKEW_MS);
+    let got = book.refresh_if_due("job1").await;
+    assert_eq!(got.err(), Some(CredentialFailure::MintCap));
     Ok(())
 }
 
@@ -1558,14 +1660,25 @@ async fn revoking(
     status: &'static str,
     hang: bool,
 ) -> Result<(Arc<CredentialBook>, Arc<Fake>, Arc<Revokes>), Box<dyn std::error::Error>> {
+    revoking_draining(expires_in_ms, status, hang, None).await
+}
+
+async fn revoking_draining(
+    expires_in_ms: u64,
+    status: &'static str,
+    hang: bool,
+    drain_limit: Option<Duration>,
+) -> Result<(Arc<CredentialBook>, Arc<Fake>, Arc<Revokes>), Box<dyn std::error::Error>> {
     let (url, fake) = spawn_fake(Ok(app_reply(APP_TOKEN, Some(NOW_MS + expires_in_ms)))).await?;
     let (endpoint, revokes) = revoke_endpoint(status, hang).await?;
     let client = CredentialClient::new(channel(&url)?, TOKEN)?;
-    let book = Arc::new(
-        CredentialBook::new(client)
-            .with_clock(TestClock::at(NOW_MS))
-            .with_revoker(Arc::new(endpoint)),
-    );
+    let mut book = CredentialBook::new(client)
+        .with_clock(TestClock::at(NOW_MS))
+        .with_revoker(Arc::new(endpoint));
+    if let Some(limit) = drain_limit {
+        book = book.with_drain_limit(limit);
+    }
+    let book = Arc::new(book);
     book.fetch("job1", 4, &box_name()).await?;
     Ok((book, fake, revokes))
 }
@@ -1704,7 +1817,6 @@ async fn a_refresh_that_fails_never_revokes_the_last_good_token() -> TestResult 
         Err(Status::permission_denied("lease")),
         Ok(good()),
         Ok(app_reply(NEW_TOKEN, None)),
-        Ok(app_reply(NEW_TOKEN, Some(NOW_MS - MINUTE_MS))),
     ] {
         let (book, fake, revokes) = revoking(5 * MINUTE_MS, "204 No Content", false).await?;
         set_reply(&fake, failure);
@@ -1824,5 +1936,135 @@ async fn a_slow_refresh_of_one_job_does_not_hold_another() -> TestResult {
     assert!(other?.is_some());
     fake.release.notify_one();
     assert!(slow.await??.is_some());
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_second_fetch_revokes_the_token_the_first_one_held() -> TestResult {
+    let (book, fake, revokes) = revoking(30 * MINUTE_MS, "204 No Content", false).await?;
+    set_reply(&fake, fresh_reply());
+    book.fetch("job1", 5, &box_name()).await?;
+    eventually_count(&revokes, 1).await?;
+    assert_eq!(revokes.tokens(), [format!("Bearer {APP_TOKEN}")]);
+    assert_eq!(github_text(&book).as_deref(), Some(NEW_TOKEN));
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_failed_second_fetch_still_revokes_the_token_the_first_one_held() -> TestResult {
+    let (book, fake, revokes) = revoking(30 * MINUTE_MS, "204 No Content", false).await?;
+    set_reply(&fake, Err(Status::unavailable("down")));
+    let got = book.fetch("job1", 5, &box_name()).await;
+    assert_eq!(got.err(), Some(CredentialFailure::Unavailable));
+    eventually_count(&revokes, 1).await?;
+    assert_eq!(revokes.tokens(), [format!("Bearer {APP_TOKEN}")]);
+    assert!(book.get("job1").is_none());
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_first_fetch_and_a_pat_refetch_revoke_nothing() -> TestResult {
+    let (url, _fake) = spawn_fake(Ok(good())).await?;
+    let (endpoint, revokes) = revoke_endpoint("204 No Content", false).await?;
+    let client = CredentialClient::new(channel(&url)?, TOKEN)?;
+    let book = CredentialBook::new(client).with_revoker(Arc::new(endpoint));
+    book.fetch("job1", 1, &box_name()).await?;
+    book.fetch("job1", 2, &box_name()).await?;
+    quiet(&revokes).await;
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_replaced_token_is_not_revoked_while_a_child_holds_it() -> TestResult {
+    let (book, fake, revokes) = revoking(5 * MINUTE_MS, "204 No Content", false).await?;
+    let lease = book.lease("job1").ok_or("no lease")?;
+    set_reply(&fake, fresh_reply());
+    assert!(book.refresh_if_due("job1").await?.is_some());
+    quiet(&revokes).await;
+    drop(lease);
+    eventually_count(&revokes, 1).await?;
+    assert_eq!(revokes.tokens(), [format!("Bearer {APP_TOKEN}")]);
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_replaced_token_waits_for_every_child_that_holds_it() -> TestResult {
+    let (book, fake, revokes) = revoking(5 * MINUTE_MS, "204 No Content", false).await?;
+    let first = book.lease("job1").ok_or("no lease")?;
+    let second = book.lease("job1").ok_or("no lease")?;
+    set_reply(&fake, fresh_reply());
+    assert!(book.refresh_if_due("job1").await?.is_some());
+    drop(first);
+    quiet(&revokes).await;
+    drop(second);
+    eventually_count(&revokes, 1).await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_leased_read_returns_the_token_the_lease_covers_across_a_swap() -> TestResult {
+    let (book, fake, revokes) = revoking(5 * MINUTE_MS, "204 No Content", false).await?;
+    assert!(book.lease_held("nobody").is_none());
+    let (held, lease) = book.lease_held("job1").ok_or("no lease")?;
+    set_reply(&fake, fresh_reply());
+    assert!(book.refresh_if_due("job1").await?.is_some());
+    assert_eq!(
+        held.github().map(Secret::expose),
+        Some(APP_TOKEN.as_bytes())
+    );
+    assert_eq!(github_text(&book).as_deref(), Some(NEW_TOKEN));
+    quiet(&revokes).await;
+    drop(lease);
+    eventually_count(&revokes, 1).await?;
+    assert_eq!(revokes.tokens(), [format!("Bearer {APP_TOKEN}")]);
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_child_started_after_the_swap_does_not_delay_the_old_revoke() -> TestResult {
+    let (book, fake, revokes) = revoking(5 * MINUTE_MS, "204 No Content", false).await?;
+    set_reply(&fake, fresh_reply());
+    assert!(book.refresh_if_due("job1").await?.is_some());
+    let lease = book.lease("job1").ok_or("no lease")?;
+    eventually_count(&revokes, 1).await?;
+    assert_eq!(revokes.tokens(), [format!("Bearer {APP_TOKEN}")]);
+    drop(lease);
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_replaced_token_is_revoked_after_the_drain_limit_when_a_child_never_ends() -> TestResult {
+    let (book, fake, revokes) = revoking_draining(
+        5 * MINUTE_MS,
+        "204 No Content",
+        false,
+        Some(Duration::from_millis(150)),
+    )
+    .await?;
+    let lease = book.lease("job1").ok_or("no lease")?;
+    set_reply(&fake, fresh_reply());
+    assert!(book.refresh_if_due("job1").await?.is_some());
+    eventually_count(&revokes, 1).await?;
+    assert_eq!(revokes.tokens(), [format!("Bearer {APP_TOKEN}")]);
+    drop(lease);
+    Ok(())
+}
+
+#[tokio::test]
+async fn the_job_end_revokes_the_held_token_without_waiting_for_a_child() -> TestResult {
+    let (book, _fake, revokes) = revoking(30 * MINUTE_MS, "204 No Content", false).await?;
+    let lease = book.lease("job1").ok_or("no lease")?;
+    book.end("job1");
+    eventually_count(&revokes, 1).await?;
+    drop(lease);
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_lease_needs_a_held_job() -> TestResult {
+    let (book, _fake, _revokes) = revoking(30 * MINUTE_MS, "204 No Content", false).await?;
+    assert!(book.lease("job9").is_none());
+    book.forget("job1");
+    assert!(book.lease("job1").is_none());
     Ok(())
 }

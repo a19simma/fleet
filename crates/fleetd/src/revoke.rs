@@ -7,6 +7,7 @@
 //! goes into one header marked sensitive, and no error holds it or any text from the network.
 
 use std::fmt;
+#[cfg(any(test, feature = "testing"))]
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
@@ -63,8 +64,13 @@ impl std::error::Error for RevokeError {}
 
 #[derive(Clone)]
 enum Target {
-    Tls { config: Arc<ClientConfig> },
-    Plain { addr: SocketAddr },
+    Tls {
+        config: Arc<ClientConfig>,
+    },
+    #[cfg(any(test, feature = "testing"))]
+    Plain {
+        addr: SocketAddr,
+    },
 }
 
 /// The client that revokes installation tokens.
@@ -93,7 +99,9 @@ impl Revoker {
     }
 
     /// A client that talks plain HTTP to `addr`. A seam for tests that stand in for GitHub with
-    /// a loopback server.
+    /// a loopback server. It exists only in test builds and under the `testing` feature, so
+    /// the shipped binary cannot be pointed at a plain endpoint.
+    #[cfg(any(test, feature = "testing"))]
     #[must_use]
     pub const fn plain(addr: SocketAddr) -> Self {
         Self {
@@ -129,6 +137,7 @@ impl Revoker {
 
     async fn exchange(&self, auth: hyper::header::HeaderValue) -> Result<(), RevokeError> {
         match &self.target {
+            #[cfg(any(test, feature = "testing"))]
             Target::Plain { addr } => {
                 let tcp = TcpStream::connect(addr)
                     .await

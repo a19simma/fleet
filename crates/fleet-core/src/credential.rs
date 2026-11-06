@@ -14,6 +14,9 @@ pub const MIN_CREDENTIAL_LEN: usize = 20;
 /// Longest accepted credential, in bytes.
 pub const MAX_CREDENTIAL_LEN: usize = 512;
 
+/// Prefix of every GitHub App installation token. The rest is letters, digits and underscores.
+pub const GITHUB_INSTALLATION_TOKEN_PREFIX: &str = "ghs_";
+
 /// Number of hex characters in a fingerprint. It must be even: an odd value would cut off
 /// its last half byte without warning.
 pub const FINGERPRINT_HEX_LEN: usize = 12;

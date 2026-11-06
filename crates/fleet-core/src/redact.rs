@@ -3,19 +3,28 @@ use std::borrow::Cow;
 use serde_json::{Map, Value};
 
 use crate::Envelope;
+use crate::credential::GITHUB_INSTALLATION_TOKEN_PREFIX;
 
 /// Secrets shorter than this many bytes are ignored, since replacing them would shred
 /// ordinary text.
 pub const MIN_SECRET_LEN: usize = 8;
+
+/// Fewest characters after the installation token prefix that count as a token.
+///
+/// [`Redactor::with_installation_tokens`] treats a run of this many letters, digits or
+/// underscores after the prefix as a token. With the prefix it makes the shortest accepted
+/// credential, 20 bytes.
+pub const INSTALLATION_TOKEN_MIN_BODY: usize = 16;
 
 /// Text that replaces a scrubbed value.
 pub const PLACEHOLDER: &str = "[REDACTED]";
 
 /// Scrubs exact secret values out of strings.
 ///
-/// Redaction is exact-match and best effort. It does not catch base64, URL-encoded or
-/// split forms of a secret. It covers the payload and the free-form `session_id` and
-/// `prompt_id` of an envelope. It leaves `kind`, `box`, `hostname`, `machine_id` and
+/// Redaction is exact-match and best effort, plus an opt-in shape mode,
+/// [`Redactor::with_installation_tokens`], for GitHub App installation tokens. It does not
+/// catch base64, URL-encoded or split forms of a secret. It covers the payload and the
+/// free-form `session_id` and `prompt_id` of an envelope. It leaves `kind`, `box`, `hostname`, `machine_id` and
 /// `boot_id` alone.
 ///
 /// Replacement runs in one pass over the original text: the match ranges of all secrets
@@ -28,6 +37,7 @@ pub const PLACEHOLDER: &str = "[REDACTED]";
 pub struct Redactor {
     secrets: Vec<String>,
     skipped: Vec<String>,
+    installation_tokens: bool,
 }
 
 impl std::fmt::Debug for Redactor {
@@ -35,6 +45,7 @@ impl std::fmt::Debug for Redactor {
         f.debug_struct("Redactor")
             .field("secrets", &self.secrets.len())
             .field("skipped_keys", &self.skipped)
+            .field("installation_tokens", &self.installation_tokens)
             .finish()
     }
 }
@@ -76,7 +87,24 @@ impl Redactor {
         }
         secrets.sort_by(|a, b| b.len().cmp(&a.len()).then_with(|| a.cmp(b)));
         secrets.dedup();
-        Self { secrets, skipped }
+        Self {
+            secrets,
+            skipped,
+            installation_tokens: false,
+        }
+    }
+
+    /// The same redactor, also masking every GitHub App installation token by its shape: the
+    /// [`GITHUB_INSTALLATION_TOKEN_PREFIX`] followed by at least
+    /// [`INSTALLATION_TOKEN_MIN_BODY`] letters, digits or underscores.
+    ///
+    /// A job that holds an installation token gets a new one every hour. A copy of the redactor
+    /// made before a refresh holds only the old value, so it matches by shape and masks the new
+    /// token too. The flag survives [`Redactor::merged`] and a clone.
+    #[must_use]
+    pub const fn with_installation_tokens(mut self) -> Self {
+        self.installation_tokens = true;
+        self
     }
 
     /// Builds a redactor from the text of an env file.
@@ -100,7 +128,11 @@ impl Redactor {
         secrets.dedup();
         let mut skipped = self.skipped.clone();
         skipped.extend(other.skipped.iter().cloned());
-        Self { secrets, skipped }
+        Self {
+            secrets,
+            skipped,
+            installation_tokens: self.installation_tokens || other.installation_tokens,
+        }
     }
 
     /// Names of env file keys whose values were skipped as too short or trivial.
@@ -138,6 +170,9 @@ impl Redactor {
                         .map_or(1, char::len_utf8);
             }
         }
+        if self.installation_tokens {
+            installation_token_ranges(input, &mut ranges);
+        }
         if ranges.is_empty() {
             return Cow::Borrowed(input);
         }
@@ -169,7 +204,7 @@ impl Redactor {
 
     /// Scrubs every string, object key included, in a JSON value.
     pub fn redact_value(&self, value: &mut Value) {
-        if self.secrets.is_empty() {
+        if self.secrets.is_empty() && !self.installation_tokens {
             return;
         }
         match value {
@@ -196,6 +231,25 @@ impl Redactor {
         {
             self.scrub(text);
         }
+    }
+}
+
+fn installation_token_ranges(input: &str, ranges: &mut Vec<(usize, usize)>) {
+    let mut from = 0;
+    while let Some(found) = input
+        .get(from..)
+        .and_then(|rest| rest.find(GITHUB_INSTALLATION_TOKEN_PREFIX))
+    {
+        let body = from + found + GITHUB_INSTALLATION_TOKEN_PREFIX.len();
+        let run = input.get(body..).map_or(0, |rest| {
+            rest.bytes()
+                .take_while(|b| b.is_ascii_alphanumeric() || *b == b'_')
+                .count()
+        });
+        if run >= INSTALLATION_TOKEN_MIN_BODY {
+            ranges.push((from + found, body + run));
+        }
+        from = body + run;
     }
 }
 
@@ -281,6 +335,77 @@ mod tests {
         assert_eq!(overlap.redact_str("abcdefgh-one-ijklmn"), PLACEHOLDER);
         assert_eq!(a.len(), 2);
         assert!(Redactor::default().merged(&Redactor::default()).is_empty());
+    }
+
+    const APP: &str = "ghs_AbCdEfGhIjKlMnOpQrStUvWxYz0123456789";
+    const NEWER: &str = "ghs_ZyXwVuTsRqPoNmLkJiHgFeDcBa9876543210";
+
+    #[test]
+    fn the_installation_token_mode_masks_any_token_by_its_shape() {
+        let r = Redactor::default().with_installation_tokens();
+        assert_eq!(
+            r.redact_str(&format!("a {APP} b {NEWER} c")),
+            format!("a {PLACEHOLDER} b {PLACEHOLDER} c")
+        );
+        let under = format!("{GITHUB_INSTALLATION_TOKEN_PREFIX}ab_cd_ef_gh_ij_kl_mn");
+        assert_eq!(r.redact_str(&under), PLACEHOLDER);
+        let shortest = format!(
+            "{GITHUB_INSTALLATION_TOKEN_PREFIX}{}",
+            "a".repeat(INSTALLATION_TOKEN_MIN_BODY)
+        );
+        assert_eq!(r.redact_str(&shortest), PLACEHOLDER);
+        let one_short = format!(
+            "{GITHUB_INSTALLATION_TOKEN_PREFIX}{}",
+            "a".repeat(INSTALLATION_TOKEN_MIN_BODY - 1)
+        );
+        assert_eq!(r.redact_str(&one_short), one_short);
+        assert_eq!(r.redact_str("ghs_"), "ghs_");
+        assert_eq!(r.redact_str("ghs_ghs_"), "ghs_ghs_");
+    }
+
+    #[test]
+    fn the_installation_token_mode_stops_at_the_first_foreign_byte() {
+        let r = Redactor::default().with_installation_tokens();
+        assert_eq!(
+            r.redact_str(&format!("{APP}-tail {APP}\u{e9}")),
+            format!("{PLACEHOLDER}-tail {PLACEHOLDER}\u{e9}")
+        );
+        assert_eq!(r.redact_str(&format!("x{APP}")), format!("x{PLACEHOLDER}"));
+        assert_eq!(
+            r.redact_str(&format!("{APP}{APP}")),
+            PLACEHOLDER,
+            "back to back tokens read as one run"
+        );
+    }
+
+    #[test]
+    fn a_redactor_without_the_mode_leaves_a_token_alone_and_the_mode_survives_merge_and_clone() {
+        assert_eq!(Redactor::default().redact_str(APP), APP);
+        let on = Redactor::new(["other-secret-1"]).with_installation_tokens();
+        let text = format!("{APP} other-secret-1");
+        let want = format!("{PLACEHOLDER} {PLACEHOLDER}");
+        let copy = on.clone();
+        assert_eq!(copy.redact_str(&text), want);
+        assert_eq!(on.merged(&Redactor::default()).redact_str(&text), want);
+        assert_eq!(Redactor::default().merged(&on).redact_str(&text), want);
+        assert_eq!(
+            Redactor::default()
+                .merged(&Redactor::default())
+                .redact_str(APP),
+            APP
+        );
+    }
+
+    #[test]
+    fn the_installation_token_mode_reaches_json_values_keys_and_envelopes() {
+        let r = Redactor::default().with_installation_tokens();
+        let mut value = json!({ (APP): [NEWER, { "k": format!("x {APP}") }] });
+        r.redact_value(&mut value);
+        assert_eq!(
+            value,
+            json!({ PLACEHOLDER: [PLACEHOLDER, { "k": format!("x {PLACEHOLDER}") }] })
+        );
+        assert!(r.is_empty());
     }
 
     #[test]

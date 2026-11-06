@@ -268,7 +268,7 @@ The `github_app` **Credential kind**: a **User**'s installation id for the opera
 _Avoid_: app token, app key
 
 **Installation token**:
-The one-hour GitHub token the server mints from a **GitHub App credential** for one Job, clamped to the Job repository and delivered as wire kind `github_installation_token`. It is never stored. Built: `GetJobCredentials` mints it for a User who holds a `github_app` credential and the capability, and the App wins over a `github_pat`. fleetd holds it as the git and `gh` token of the Job and carries its expiry, and refreshes it before a Push or Gh child when fewer than 10 minutes remain, up to a per-Job mint cap and a per-User rate limit. The mirror fetch and the broker token are not refreshed. fleetd revokes the replaced token and, at Job end, the held one (ADR-0058).
+The one-hour GitHub token the server mints from a **GitHub App credential** for one Job, clamped to the Job repository and delivered as wire kind `github_installation_token`. It is never stored. Built: `GetJobCredentials` mints it for a User who holds a `github_app` credential and the capability, and the App wins over a `github_pat`. fleetd holds it as the git and `gh` token of the Job and carries its expiry, and refreshes it before a Push or Gh child when fewer than 10 minutes remain, up to a per-Job mint cap and a per-User rate limit. The mirror fetch and the broker token are not refreshed. fleetd revokes the replaced token once the children that started with it have exited and, at Job end, the held one. A token with no expiry is refused at the first fetch, and a box clock ahead of the server's refreshes every 45 minutes (ADR-0058).
 _Avoid_: app token
 
 **Bot identity**:

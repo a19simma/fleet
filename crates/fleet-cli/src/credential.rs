@@ -17,6 +17,7 @@ use fleet_proto::{CredentialNotice, MAX_CREDENTIAL_VALUE_BYTES};
 use tonic::Status;
 use tonic::service::interceptor::InterceptedService;
 use tonic::transport::Channel;
+use zeroize::Zeroizing;
 
 use super::{Bearer, CliError, Scrub};
 
@@ -112,26 +113,30 @@ pub(crate) fn no_stray(rest: &[String]) -> Result<(), CliError> {
     }
 }
 
-/// Reads the secret from `source`, at most [`MAX_CREDENTIAL_VALUE_BYTES`] plus one trailing
-/// line ending, which is removed.
+/// Reads the secret from `source`: at most [`MAX_CREDENTIAL_VALUE_BYTES`] of secret, followed
+/// by line endings. Every trailing CR and LF is removed, so a pipe that adds `\r\n\r\n` stores
+/// the same value as one that adds nothing. The read stops three bytes past the cap, so longer
+/// input is refused without being held.
+///
+/// The buffer and the returned value zero when they drop.
 ///
 /// # Errors
 ///
 /// Returns [`CliError::Credential`] with [`CredentialNotice::Invalid`] for input over the
 /// cap or not valid UTF-8, and [`CliError::Io`] when the read fails.
-pub(crate) fn read_secret(source: &mut impl Read) -> Result<String, CliError> {
+pub(crate) fn read_secret(source: &mut impl Read) -> Result<Zeroizing<String>, CliError> {
     let cap = MAX_CREDENTIAL_VALUE_BYTES as u64;
-    let mut bytes = Vec::new();
+    let mut bytes = Zeroizing::new(Vec::with_capacity(MAX_CREDENTIAL_VALUE_BYTES + 3));
     source.take(cap + 3).read_to_end(&mut bytes)?;
-    if bytes.ends_with(b"\r\n") {
-        bytes.truncate(bytes.len() - 2);
-    } else if bytes.ends_with(b"\n") {
-        bytes.truncate(bytes.len() - 1);
+    while bytes.last().is_some_and(|b| matches!(b, b'\r' | b'\n')) {
+        bytes.pop();
     }
     if bytes.len() as u64 > cap {
         return Err(CliError::Credential(CredentialNotice::Invalid));
     }
-    String::from_utf8(bytes).map_err(|_| CliError::Credential(CredentialNotice::Invalid))
+    std::str::from_utf8(&bytes)
+        .map(|text| Zeroizing::new(text.to_owned()))
+        .map_err(|_| CliError::Credential(CredentialNotice::Invalid))
 }
 
 fn row(scrub: &Scrub, info: &CredentialInfo) -> String {
@@ -172,6 +177,10 @@ pub(crate) async fn list(
 
 /// Stores `value` under `kind` and prints the stored row.
 ///
+/// The request takes the string out of `value`, so the zeroing buffer is left empty. The
+/// request owns the plain copy until tonic has encoded and dropped it, which this crate cannot
+/// zero.
+///
 /// # Errors
 ///
 /// Returns [`CliError::Credential`] for any server refusal and [`CliError::Io`] when
@@ -180,14 +189,14 @@ pub(crate) async fn put(
     client: &mut CredentialsClient,
     scrub: &Scrub,
     kind: CredentialKind,
-    value: String,
+    mut value: Zeroizing<String>,
     out: &mut impl Write,
 ) -> Result<(), CliError> {
     let info = client
         .put_credential(PutCredentialRequest {
             kind: kind.wire_name().to_owned(),
             shape: STATIC_SECRET.to_owned(),
-            value,
+            value: std::mem::take(&mut *value),
             expires_at_ms: None,
         })
         .await
@@ -263,5 +272,59 @@ mod tests {
             );
         }
         assert!(matches!(parse_id("7"), Ok(7)));
+    }
+
+    fn secret(input: &[u8]) -> Result<String, CliError> {
+        read_secret(&mut &*input).map(|value| value.as_str().to_owned())
+    }
+
+    #[test]
+    fn every_trailing_line_ending_is_trimmed_and_inner_ones_stay() {
+        let cases: [(&[u8], &str); 9] = [
+            (b"key\n", "key"),
+            (b"key\r\n", "key"),
+            (b"key\r\n\r\n", "key"),
+            (b"key\n\n\n", "key"),
+            (b"key\r", "key"),
+            (b"key\n\r\n\r", "key"),
+            (b"key", "key"),
+            (b"", ""),
+            (b"a\nb\r\n", "a\nb"),
+        ];
+        for (input, want) in cases {
+            assert_eq!(secret(input).ok().as_deref(), Some(want), "{input:?}");
+        }
+    }
+
+    #[test]
+    fn the_cap_counts_the_secret_and_not_its_line_endings() {
+        let cap = MAX_CREDENTIAL_VALUE_BYTES;
+        let at_cap = "k".repeat(cap);
+        for tail in ["", "\n", "\r\n", "\n\n\n"] {
+            let input = format!("{at_cap}{tail}");
+            assert_eq!(
+                secret(input.as_bytes()).ok().as_deref(),
+                Some(at_cap.as_str()),
+                "{tail:?}"
+            );
+        }
+        for input in [
+            format!("{at_cap}k"),
+            format!("{at_cap}k\n"),
+            format!("{at_cap}kkk"),
+        ] {
+            assert!(
+                matches!(
+                    secret(input.as_bytes()),
+                    Err(CliError::Credential(CredentialNotice::Invalid))
+                ),
+                "{}",
+                input.len()
+            );
+        }
+        assert!(matches!(
+            secret(b"\xff\xfe"),
+            Err(CliError::Credential(CredentialNotice::Invalid))
+        ));
     }
 }

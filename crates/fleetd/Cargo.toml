@@ -39,7 +39,11 @@ zeroize.workspace = true
 minisign-verify = "0.3.0"
 flate2 = { version = "1.1.10", default-features = false, features = ["rust_backend"] }
 
+[features]
+testing = []
+
 [dev-dependencies]
+fleetd = { path = ".", features = ["testing"] }
 ring = "0.17.14"
 rcgen = { version = "0.14.10", default-features = false, features = ["pem", "ring"] }
 fleet-cli = { path = "../fleet-cli" }

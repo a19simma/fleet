@@ -20,6 +20,7 @@ pub mod tools;
 mod validate;
 
 pub use box_name::BoxName;
+pub use credential::GITHUB_INSTALLATION_TOKEN_PREFIX;
 pub use ct::constant_time_eq;
 pub use envelope::{Envelope, Identity, Priority, SCHEMA_VERSION, Source, kind};
 pub use error::Error;
@@ -31,7 +32,7 @@ pub use profile::{
     ProfileError, ProfileHash, PromptText, PromptTextError, Selection, SelectionError, Settings,
     SettingsPermissions, Skill, Visibility, VisibilityError,
 };
-pub use redact::{MIN_SECRET_LEN, PLACEHOLDER, Redactor};
+pub use redact::{INSTALLATION_TOKEN_MIN_BODY, MIN_SECRET_LEN, PLACEHOLDER, Redactor};
 pub use validate::{
     ENV_FLAG_ALLOWLIST, MAX_BUDGET_CENTS, MAX_COMPONENT_BYTES, MAX_ENTRIES, MAX_FILE_BYTES,
     MAX_MODEL_BYTES, MAX_PATH_BYTES, MAX_RULE_BYTES, MAX_RULES, MAX_SKILL_NAME_LEN, MAX_TOOLS,

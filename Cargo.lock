@@ -902,6 +902,7 @@ dependencies = [
  "tokio",
  "tokio-stream",
  "tonic",
+ "zeroize",
 ]
 
 [[package]]
@@ -974,6 +975,7 @@ dependencies = [
  "fleet-core",
  "fleet-proto",
  "fleet-server",
+ "fleetd",
  "http-body-util",
  "hyper",
  "hyper-util",

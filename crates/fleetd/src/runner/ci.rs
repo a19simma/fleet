@@ -13,7 +13,9 @@ use tonic::Code;
 
 use super::{AgentRunner, Ctl, Interrupt, Reporter, Scope, Stop, report_request};
 use crate::broker::{ExecError, GhExecutor, GitExecutor, PushTarget};
+use crate::cred::CredentialFailure;
 use crate::forge::{CiResult, Forge, GitHubForge};
+use crate::proc::CaptureError;
 use crate::publish::Scratch;
 
 /// What one `gh pr checks` call showed.
@@ -25,11 +27,22 @@ pub(super) enum Seen {
 }
 
 /// How the watch ended.
+#[derive(Debug)]
 pub(super) enum Watched {
     Done(JobCi),
     Lost,
     Cancelled,
     Shutdown,
+    /// A token refresh failed for good, such as the mint cap or a lost lease. The job fails
+    /// with this reason and the watch never reads it as a pull request still waiting.
+    Failed(&'static str),
+}
+
+/// Why a poll of the checks stopped before they settled.
+#[derive(Debug)]
+pub(super) enum PollStop {
+    Interrupt(Interrupt),
+    Credentials(CredentialFailure),
 }
 
 /// Passing polls in a row that end the watch as a success. The first poll may list only the
@@ -203,8 +216,13 @@ impl<R: Reporter> AgentRunner<R> {
                     .await
             }
             Ok(Ok(Ok(done))) => Watched::Done(done),
-            Ok(Ok(Err(Interrupt::Lost)) | Err(Interrupt::Lost)) => Watched::Lost,
-            Ok(Ok(Err(Interrupt::Cancelled)) | Err(Interrupt::Cancelled)) => Watched::Cancelled,
+            Ok(Ok(Err(PollStop::Credentials(failure)))) => Watched::Failed(failure.reason()),
+            Ok(Ok(Err(PollStop::Interrupt(Interrupt::Lost))) | Err(Interrupt::Lost)) => {
+                Watched::Lost
+            }
+            Ok(Ok(Err(PollStop::Interrupt(Interrupt::Cancelled))) | Err(Interrupt::Cancelled)) => {
+                Watched::Cancelled
+            }
             Err(Stop::Timeout) => Watched::Done(ci(CiState::Timeout, last_url, None)),
             Err(Stop::Shutdown) => Watched::Shutdown,
         }
@@ -212,7 +230,7 @@ impl<R: Reporter> AgentRunner<R> {
 
     /// Fetches the log of an observed failure under its own budget. A slow or failing fetch
     /// leaves the failure without a log, and never turns it into a timeout.
-    async fn attach_log(
+    pub(super) async fn attach_log(
         &self,
         job: &Job,
         dir: &Path,
@@ -231,10 +249,11 @@ impl<R: Reporter> AgentRunner<R> {
             ))
             .await;
         match fetched {
-            Ok(Ok(log)) => {
+            Ok(Ok(Ok(log))) => {
                 done.failure_log = log;
                 Watched::Done(done)
             }
+            Ok(Ok(Err(failure))) => Watched::Failed(failure.reason()),
             Ok(Err(Interrupt::Lost)) => Watched::Lost,
             Ok(Err(Interrupt::Cancelled)) => Watched::Cancelled,
             Err(Stop::Timeout) => Watched::Done(done),
@@ -242,18 +261,29 @@ impl<R: Reporter> AgentRunner<R> {
         }
     }
 
-    async fn poll_ci(
+    /// Polls the checks of `pr_url` until they settle and returns the settled state.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PollStop::Interrupt`] when the lease is lost or the job is cancelled while the
+    /// poll waits, and [`PollStop::Credentials`] when a token refresh before a check fails for
+    /// good.
+    pub(super) async fn poll_ci(
         &self,
         job: &Job,
         dir: &Path,
         pr_url: &str,
         progress: &str,
         last_url: &mut Option<String>,
-    ) -> Result<JobCi, Interrupt> {
+    ) -> Result<JobCi, PollStop> {
         let mut pause = self.config.ci_poll_initial;
         let mut passes = 0;
         loop {
-            let (url, settled) = match self.check_pr(job, dir, pr_url).await {
+            let (url, settled) = match self
+                .check_pr(job, dir, pr_url)
+                .await
+                .map_err(PollStop::Credentials)?
+            {
                 Seen::Passed { url } => {
                     passes += 1;
                     (url, passes >= SETTLED_POLLS)
@@ -274,9 +304,11 @@ impl<R: Reporter> AgentRunner<R> {
             request.ci = Some(ci(CiState::Pending, last_url.clone(), None));
             match self.reporter.report(request).await {
                 Err(status) if status.code() == Code::FailedPrecondition => {
-                    return Err(Interrupt::Lost);
+                    return Err(PollStop::Interrupt(Interrupt::Lost));
                 }
-                Ok(reply) if reply.cancel_requested => return Err(Interrupt::Cancelled),
+                Ok(reply) if reply.cancel_requested => {
+                    return Err(PollStop::Interrupt(Interrupt::Cancelled));
+                }
                 _ => {}
             }
             tokio::time::sleep(pause).await;
@@ -287,9 +319,19 @@ impl<R: Reporter> AgentRunner<R> {
     /// Runs `gh pr checks` and reads it with [`read_checks`]. An answer cut by the capture
     /// limit, a failed start and a nonzero exit with an all-pass list read as [`Seen::Waiting`],
     /// never as a pass.
-    async fn check_pr(&self, job: &Job, dir: &Path, pr_url: &str) -> Seen {
+    ///
+    /// # Errors
+    ///
+    /// A credential failure of the token refresh before the call, such as the mint cap or a
+    /// lost lease, is terminal and is returned, never read as [`Seen::Waiting`].
+    pub(super) async fn check_pr(
+        &self,
+        job: &Job,
+        dir: &Path,
+        pr_url: &str,
+    ) -> Result<Seen, CredentialFailure> {
         let Ok(target) = PushTarget::from_job(job) else {
-            return Seen::Waiting { url: None };
+            return Ok(Seen::Waiting { url: None });
         };
         let checked = self
             .helper(
@@ -300,14 +342,30 @@ impl<R: Reporter> AgentRunner<R> {
             )
             .await;
         match checked {
-            Ok(out) => read_checks(&target, pr_url, &out.stdout, out.truncated, out.success).await,
-            Err(_) => Seen::Waiting { url: None },
+            Ok(out) => {
+                Ok(read_checks(&target, pr_url, &out.stdout, out.truncated, out.success).await)
+            }
+            Err(CaptureError::Credentials(failure)) => Err(failure),
+            Err(_) => Ok(Seen::Waiting { url: None }),
         }
     }
 
-    async fn failure_log(&self, job: &Job, dir: &Path, url: Option<&str>) -> Option<String> {
-        let id = actions_job_id(url?)?;
-        let out = self
+    /// Fetches the failed log of the Actions job at `url`. `Ok(None)` when there is none to
+    /// show or the fetch failed to run.
+    ///
+    /// # Errors
+    ///
+    /// A credential failure of the token refresh before the call is terminal and is returned.
+    pub(super) async fn failure_log(
+        &self,
+        job: &Job,
+        dir: &Path,
+        url: Option<&str>,
+    ) -> Result<Option<String>, CredentialFailure> {
+        let Some(id) = url.and_then(actions_job_id) else {
+            return Ok(None);
+        };
+        let fetched = self
             .helper_tail(
                 &self.config.gh_bin,
                 dir,
@@ -322,11 +380,15 @@ impl<R: Reporter> AgentRunner<R> {
                 ],
                 Scope::Gh(&job.job_id),
             )
-            .await
-            .ok()?;
-        out.success
-            .then(|| clean_log(&out.stdout, &self.job_redactor(&job.job_id)))
-            .flatten()
+            .await;
+        match fetched {
+            Ok(out) => Ok(out
+                .success
+                .then(|| clean_log(&out.stdout, &self.job_redactor(&job.job_id)))
+                .flatten()),
+            Err(CaptureError::Credentials(failure)) => Err(failure),
+            Err(_) => Ok(None),
+        }
     }
 }
 

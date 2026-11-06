@@ -22,19 +22,29 @@
 //! reason keeps the last good token until it expires. The server's mint cap is terminal: it
 //! fails the step with [`ERR_MINT_CAP`] and there is no PAT fallback (ADR-0058, SEC-004).
 //!
+//! A fresh token that already looks expired, or inside the window, means the box clock runs
+//! ahead of the server's. The book keeps it and refreshes again only after
+//! [`REFRESH_SKEW_MS`], so a skewed clock neither fails a step nor spends the mint cap.
+//!
 //! With a [`Revoker`] attached the book revokes the token a refresh replaced, and the held
-//! token when the job ends (ADR-0058, SEC-010). Each revoke runs on its own task, is best effort
-//! and never fails the job; a failure logs [`REVOKE_FAILED`] and nothing else. A PAT job revokes
-//! nothing.
+//! token when the job ends (ADR-0058, SEC-010).
+//!
+//! A [`TokenLease`] holds a replaced token live until the child that started with it exits, up
+//! to [`DRAIN_LIMIT`].
+//!
+//! Each revoke runs on its own task, is best effort and never fails the job; a failure logs
+//! [`REVOKE_FAILED`] and nothing else. A PAT job revokes nothing.
 
 use std::collections::{HashMap, HashSet};
 use std::fmt;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
 use fleet_core::Redactor;
 use fleet_core::credential::{
-    BotIdentity, CredentialKind, CredentialShape, MAX_CREDENTIAL_LEN, MIN_CREDENTIAL_LEN, Secret,
+    BotIdentity, CredentialKind, CredentialShape, GITHUB_INSTALLATION_TOKEN_PREFIX,
+    MAX_CREDENTIAL_LEN, MIN_CREDENTIAL_LEN, Secret,
 };
 use fleet_proto::v1::fleet_worker_client::FleetWorkerClient;
 use fleet_proto::v1::{GetJobCredentialsReply, GetJobCredentialsRequest};
@@ -85,9 +95,6 @@ pub const ERR_APP_IDENTITY_MISSING: &str = "github app credential has no git ide
 /// Job failure reason: the git identity of a GitHub App credential is outside the grammar.
 pub const ERR_APP_IDENTITY_INVALID: &str = "github app git identity is invalid";
 
-/// Prefix of every GitHub App installation token.
-const APP_TOKEN_PREFIX: &str = "ghs_";
-
 /// Job failure reason: the Job reached its mint cap or its User reached the per-minute mint
 /// limit (ADR-0058, SEC-003, SEC-004, SEC-011).
 pub const ERR_MINT_CAP: &str = "github app token limit reached";
@@ -98,10 +105,21 @@ pub const REFRESH_WINDOW_MS: u64 = 10 * 60 * 1000;
 
 /// The wait after a failed refresh.
 ///
-/// It also applies after a refresh that returned a token still inside the window. It keeps a
-/// failing server from being asked once per step and the Job's mint cap from being spent on
-/// retries.
+/// It keeps a failing server from being asked once per step and the Job's mint cap from being
+/// spent on retries. A refresh that returned a token the box clock cannot judge waits
+/// [`REFRESH_SKEW_MS`] instead.
 pub const REFRESH_RETRY_MS: u64 = 30 * 1000;
+
+/// The wait between refreshes of a token whose lifetime the box clock cannot judge.
+///
+/// A freshly minted installation token lasts one hour. When a fresh token already looks
+/// expired, or inside [`REFRESH_WINDOW_MS`], by the box clock, the box clock runs ahead of the
+/// server's. The book then keeps the token, never fails a step on the expiry and refreshes
+/// every [`REFRESH_SKEW_MS`] by elapsed time alone, so a skewed clock spends one mint per
+/// interval and not one per step. A box clock that runs behind the server's cannot be
+/// detected: the token then expires on the server before the box thinks it is due, and the
+/// step that uses it fails at GitHub.
+pub const REFRESH_SKEW_MS: u64 = 45 * 60 * 1000;
 
 /// Job failure reason: the reply broke a rule the server keeps.
 pub const ERR_MALFORMED: &str = "credentials reply was invalid";
@@ -230,6 +248,7 @@ impl JobCredentials {
                 || !(MIN_CREDENTIAL_LEN..=MAX_CREDENTIAL_LEN).contains(&value.len())
                 || !seen.insert(wire.kind)
                 || (is_app && !is_app_token(&value))
+                || (is_app && wire.expires_at_ms.is_none())
                 || (!is_app && wire.git_identity.is_some())
                 || (kind == CredentialKind::GithubApp && !is_app)
             {
@@ -323,6 +342,10 @@ impl JobCredentials {
         })
     }
 
+    fn has_app_token(&self) -> bool {
+        self.app_token().is_some()
+    }
+
     fn app_token(&self) -> Option<&Secret> {
         self.items
             .iter()
@@ -344,11 +367,16 @@ impl JobCredentials {
     /// drops. The copies live as long as the redactor, so drop it when the job ends.
     #[must_use]
     pub fn redactor(&self) -> Redactor {
-        Redactor::new(self.items.iter().filter_map(|c| {
+        let redactor = Redactor::new(self.items.iter().filter_map(|c| {
             std::str::from_utf8(c.value.expose())
                 .ok()
                 .map(str::to_owned)
-        }))
+        }));
+        if self.has_app_token() {
+            redactor.with_installation_tokens()
+        } else {
+            redactor
+        }
     }
 }
 
@@ -363,7 +391,7 @@ impl<'a> IntoIterator for &'a JobCredentials {
 
 fn is_app_token(value: &str) -> bool {
     value
-        .strip_prefix(APP_TOKEN_PREFIX)
+        .strip_prefix(GITHUB_INSTALLATION_TOKEN_PREFIX)
         .is_some_and(|rest| rest.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_'))
 }
 
@@ -479,7 +507,30 @@ struct Held {
     attempt: u32,
     box_name: String,
     retry_at_ms: u64,
+    skewed: bool,
+    generation: Arc<Generation>,
     turn: Arc<tokio::sync::Mutex<()>>,
+}
+
+#[derive(Debug, Default)]
+struct Generation {
+    users: AtomicUsize,
+    idle: tokio::sync::Notify,
+}
+
+impl Generation {
+    async fn drained(&self, limit: Duration) {
+        let wait = async {
+            loop {
+                let notified = self.idle.notified();
+                if self.users.load(Ordering::SeqCst) == 0 {
+                    return;
+                }
+                notified.await;
+            }
+        };
+        let _ = tokio::time::timeout(limit, wait).await;
+    }
 }
 
 struct Snapshot {
@@ -487,6 +538,7 @@ struct Snapshot {
     attempt: u32,
     box_name: String,
     retry_at_ms: u64,
+    skewed: bool,
 }
 
 /// Fetches and holds the credentials of the jobs that run on this box.
@@ -496,6 +548,29 @@ pub struct CredentialBook {
     held: Mutex<HashMap<String, Held>>,
     clock: Arc<dyn Clock>,
     revoker: Option<Arc<Revoker>>,
+    drain_limit: Duration,
+}
+
+/// The longest a replaced token waits for the children that hold it before it is revoked.
+pub const DRAIN_LIMIT: Duration = Duration::from_secs(15 * 60);
+
+/// A hold on the installation token a child was started with.
+///
+/// While a lease is alive the book does not revoke the token a refresh replaced, up to
+/// [`DRAIN_LIMIT`]: the child keeps the old value in its environment and would fail mid-run
+/// on a revoked token. Dropping the lease lets the revoke go ahead once every lease of that
+/// token has dropped.
+#[derive(Debug)]
+pub struct TokenLease {
+    generation: Arc<Generation>,
+}
+
+impl Drop for TokenLease {
+    fn drop(&mut self) {
+        if self.generation.users.fetch_sub(1, Ordering::SeqCst) == 1 {
+            self.generation.idle.notify_waiters();
+        }
+    }
 }
 
 impl CredentialBook {
@@ -507,7 +582,46 @@ impl CredentialBook {
             held: Mutex::new(HashMap::new()),
             clock: Arc::new(SystemClock),
             revoker: None,
+            drain_limit: DRAIN_LIMIT,
         }
+    }
+
+    /// Replaces the longest wait of a replaced token for the children that hold it,
+    /// [`DRAIN_LIMIT`] by default. A seam for tests.
+    #[must_use]
+    pub const fn with_drain_limit(mut self, limit: Duration) -> Self {
+        self.drain_limit = limit;
+        self
+    }
+
+    /// Holds the token of `job_id` for a child that is about to start with it. `None` when the
+    /// book holds nothing for the job.
+    ///
+    /// Keep the lease until the child exits. The job end revokes the held token without waiting
+    /// for any lease. To read the token the child starts with, use
+    /// [`CredentialBook::lease_held`], which pairs the credentials and the lease.
+    #[must_use]
+    pub fn lease(&self, job_id: &str) -> Option<TokenLease> {
+        self.lease_held(job_id).map(|(_, lease)| lease)
+    }
+
+    /// The credentials held for `job_id` and a [`TokenLease`] on the same token, taken in one
+    /// step so no refresh can swap between the read and the lease. `None` when the book holds
+    /// nothing for the job.
+    #[must_use]
+    pub fn lease_held(&self, job_id: &str) -> Option<(Arc<JobCredentials>, TokenLease)> {
+        let guard = self.held.lock().unwrap_or_else(PoisonError::into_inner);
+        let lease = guard.get(job_id).map(|entry| {
+            entry.generation.users.fetch_add(1, Ordering::SeqCst);
+            (
+                Arc::clone(&entry.credentials),
+                TokenLease {
+                    generation: Arc::clone(&entry.generation),
+                },
+            )
+        });
+        drop(guard);
+        lease
     }
 
     /// Attaches the client that revokes installation tokens. Without one nothing is revoked.
@@ -526,9 +640,9 @@ impl CredentialBook {
 
     /// Fetches the credentials of a claimed job and holds them under its id.
     ///
-    /// Call it once the lease is held and before the agent starts. A fetch first drops any
-    /// entry held for the same id, so a second fetch replaces the first and a failed one
-    /// leaves nothing readable.
+    /// Call it once the lease is held and before the agent starts. A fetch first ends any
+    /// entry held for the same id and revokes its installation token, so a second fetch
+    /// replaces the first and a failed one leaves nothing readable.
     ///
     /// # Errors
     ///
@@ -540,7 +654,7 @@ impl CredentialBook {
         attempt: u32,
         box_name: &str,
     ) -> Result<Arc<JobCredentials>, CredentialFailure> {
-        self.forget(job_id);
+        self.end(job_id);
         let credentials = Arc::new(self.client.fetch(job_id, attempt, box_name).await?);
         self.held
             .lock()
@@ -552,6 +666,8 @@ impl CredentialBook {
                     attempt,
                     box_name: box_name.to_owned(),
                     retry_at_ms: 0,
+                    skewed: false,
+                    generation: Arc::new(Generation::default()),
                     turn: Arc::new(tokio::sync::Mutex::new(())),
                 },
             );
@@ -565,10 +681,15 @@ impl CredentialBook {
     ///
     /// Call it before every use of the token. Calls for one job serialize, so two steps that
     /// find the token due make one request. Nothing is due while the retry wait has not passed:
-    /// after a failure, or a token still inside the window, the next request waits
-    /// [`REFRESH_RETRY_MS`]. The old value is not forgotten by the book: the caller keeps it in
-    /// the job redactor. With a [`Revoker`] attached, a swap revokes the replaced token on its
-    /// own task.
+    /// after a failure the next request waits [`REFRESH_RETRY_MS`].
+    ///
+    /// A fresh token that already looks expired, or inside the window, means the box clock runs
+    /// ahead of the server's. The book takes it, marks the entry skewed and refreshes it again
+    /// only after [`REFRESH_SKEW_MS`]. A skewed token counts as usable whatever the clock says.
+    ///
+    /// The old value is not forgotten by the book: the caller keeps it in the job redactor.
+    /// With a [`Revoker`] attached, a swap revokes the replaced token on its own task, after
+    /// every [`TokenLease`] on it has dropped or [`DRAIN_LIMIT`] has passed.
     ///
     /// This is [`CredentialBook::refresh_if_due_with`] with no hook.
     ///
@@ -581,9 +702,12 @@ impl CredentialBook {
     /// [`CredentialFailure::AppIdentityInvalid`]. None of these keeps the old token or falls
     /// back to a PAT; the caller fails the step. [`CredentialFailure::Unavailable`] and
     /// [`CredentialFailure::Expired`] are returned only once the held token has expired,
-    /// because before that the last good token stays in use. [`CredentialFailure::Malformed`]
-    /// is returned when the reply holds no installation token, no expiry, or one already in
-    /// the past.
+    /// because before that the last good token stays in use. A skewed entry counts as usable
+    /// whatever the clock says, so it never returns either of them. A recorded retry wait more
+    /// than [`REFRESH_SKEW_MS`] ahead of the clock (the stale-wait guard, `wait_is_stale`) is
+    /// ignored and the refresh goes ahead, so a clock that moved back cannot hold it off for
+    /// longer than that. [`CredentialFailure::Malformed`] is returned when the reply holds no
+    /// installation token or no expiry.
     pub async fn refresh_if_due(
         &self,
         job_id: &str,
@@ -602,7 +726,8 @@ impl CredentialBook {
     ///
     /// # Errors
     ///
-    /// The same as [`CredentialBook::refresh_if_due`].
+    /// The same as [`CredentialBook::refresh_if_due`], including the skewed-entry rule and the
+    /// stale-wait guard.
     pub async fn refresh_if_due_with(
         &self,
         job_id: &str,
@@ -618,6 +743,7 @@ impl CredentialBook {
             attempt,
             box_name,
             retry_at_ms,
+            skewed,
         }) = self.snapshot(job_id)
         else {
             return Ok(None);
@@ -628,8 +754,9 @@ impl CredentialBook {
         if expiry.saturating_sub(now) >= REFRESH_WINDOW_MS {
             return Ok(None);
         }
-        let usable = now < expiry;
-        if now < retry_at_ms {
+        let usable = skewed || now < expiry;
+        let wait_is_stale = retry_at_ms.saturating_sub(now) > REFRESH_SKEW_MS;
+        if now < retry_at_ms && !wait_is_stale {
             return if usable {
                 Ok(None)
             } else {
@@ -637,34 +764,24 @@ impl CredentialBook {
             };
         }
         let renewed = match self.client.fetch(job_id, attempt, &box_name).await {
-            Ok(fresh) => {
-                current
-                    .refreshed(&fresh)
-                    .and_then(|next| match next.app_expires_at_ms() {
-                        Some(at) if at > now => Ok(next),
-                        _ => Err(CredentialFailure::Malformed),
-                    })
-            }
+            Ok(fresh) => current.refreshed(&fresh),
             Err(failure) => Err(failure),
         };
         match renewed {
             Ok(next) => {
-                let still_due = next
+                let skew = next
                     .app_expires_at_ms()
                     .is_some_and(|at| at.saturating_sub(now) < REFRESH_WINDOW_MS);
                 let next = Arc::new(next);
                 before_swap(&next);
-                let swapped = self.store(
-                    job_id,
-                    Arc::clone(&next),
-                    if still_due { now + REFRESH_RETRY_MS } else { 0 },
-                );
-                if swapped {
-                    self.revoke_replaced(&current, &next);
+                let retry_at_ms = if skew { now + REFRESH_SKEW_MS } else { 0 };
+                let replaced = self.store(job_id, Arc::clone(&next), retry_at_ms, skew);
+                if let Some(generation) = &replaced {
+                    self.revoke_replaced(&current, &next, generation);
                 } else {
-                    self.revoke_app_token(&next);
+                    self.revoke_app_token(&next, None);
                 }
-                Ok(swapped.then_some(next))
+                Ok(replaced.map(|_| next))
             }
             Err(failure) => {
                 self.back_off(job_id, now + REFRESH_RETRY_MS);
@@ -700,18 +817,24 @@ impl CredentialBook {
             attempt: entry.attempt,
             box_name: entry.box_name.clone(),
             retry_at_ms: entry.retry_at_ms,
+            skewed: entry.skewed,
         });
         drop(guard);
         snap
     }
 
-    fn revoke_replaced(&self, old: &JobCredentials, new: &JobCredentials) {
+    fn revoke_replaced(
+        &self,
+        old: &JobCredentials,
+        new: &JobCredentials,
+        generation: &Arc<Generation>,
+    ) {
         if old.app_token().map(Secret::expose) != new.app_token().map(Secret::expose) {
-            self.revoke_app_token(old);
+            self.revoke_app_token(old, Some(Arc::clone(generation)));
         }
     }
 
-    fn revoke_app_token(&self, credentials: &JobCredentials) {
+    fn revoke_app_token(&self, credentials: &JobCredentials, drain: Option<Arc<Generation>>) {
         let Some(revoker) = &self.revoker else {
             return;
         };
@@ -727,21 +850,33 @@ impl CredentialBook {
             return;
         };
         let revoker = Arc::clone(revoker);
+        let limit = self.drain_limit;
         drop(runtime.spawn(async move {
+            if let Some(generation) = drain {
+                generation.drained(limit).await;
+            }
             if revoker.revoke(&token).await.is_err() {
                 tracing::warn!(reason = REVOKE_FAILED, "token revoke failed");
             }
         }));
     }
 
-    fn store(&self, job_id: &str, next: Arc<JobCredentials>, retry_at_ms: u64) -> bool {
+    fn store(
+        &self,
+        job_id: &str,
+        next: Arc<JobCredentials>,
+        retry_at_ms: u64,
+        skewed: bool,
+    ) -> Option<Arc<Generation>> {
         let mut guard = self.held.lock().unwrap_or_else(PoisonError::into_inner);
-        let found = guard.get_mut(job_id).map(|entry| {
+        let replaced = guard.get_mut(job_id).map(|entry| {
             entry.credentials = next;
             entry.retry_at_ms = retry_at_ms;
+            entry.skewed = skewed;
+            std::mem::take(&mut entry.generation)
         });
         drop(guard);
-        found.is_some()
+        replaced
     }
 
     fn back_off(&self, job_id: &str, retry_at_ms: u64) {
@@ -766,7 +901,8 @@ impl CredentialBook {
     }
 
     /// Drops the credentials of `job_id`. The buffers zero when the last borrower lets go.
-    /// Dropping an id that is not held does nothing.
+    /// Dropping an id that is not held does nothing. Does not revoke an installation token; see
+    /// [`CredentialBook::end`].
     pub fn forget(&self, job_id: &str) {
         self.held
             .lock()
@@ -784,7 +920,7 @@ impl CredentialBook {
             .unwrap_or_else(PoisonError::into_inner)
             .remove(job_id);
         if let Some(entry) = removed {
-            self.revoke_app_token(&entry.credentials);
+            self.revoke_app_token(&entry.credentials, None);
         }
     }
 

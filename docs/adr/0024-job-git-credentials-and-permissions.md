@@ -27,7 +27,7 @@ Pushing a branch and opening a pull request need write access to the repo, and A
 - With skip-permissions the agent has a full shell, so the Box is the sandbox. Its blast radius is the Box plus its Claude token plus the git PAT, which the agent can read (see Known limit).
 - The mirror fetch now carries `GH_TOKEN`, so a private repo on the token host prepares. A hostile mirror `config` planted inside the reset-to-fetch window cannot read the token through a global `credential.helper`, `http.proxy` or `http.sslVerify`, because the pins override those global keys. It can through url-scoped keys: `[http "https://github.com/"] proxy` and `sslVerify=false` beat the pins, so the token could go through an attacker proxy with TLS off. The window needs a process that outlives the process-group kill of the agent, and the agent shares fleetd's uid and reads the token from `/proc` anyway (Known limit), so this adds no exposure beyond that limit.
 - A leaked client token (ADR-0023) can make a Box clone any repo the PAT reads and push to any it writes, until the allowlist exists.
-- A Job prompt can make the agent print files it can read. The redactor masks exact values only.
+- A Job prompt can make the agent print files it can read. The redactor masks exact values only, except an App job, which also masks any `ghs_` token by shape (ADR-0058).
 
 ## Known limit
 

@@ -26,6 +26,7 @@ fleet-core.workspace = true
 fleet-proto.workspace = true
 tokio.workspace = true
 tonic.workspace = true
+zeroize.workspace = true
 
 [dev-dependencies]
 fleet-server = { path = "../fleet-server" }

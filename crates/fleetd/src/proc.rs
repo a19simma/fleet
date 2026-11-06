@@ -29,6 +29,7 @@ pub(crate) struct Captured {
 pub(crate) enum CaptureError {
     Start,
     Timeout,
+    /// The installation token refresh before a Push or Gh child failed for good.
     Credentials(crate::cred::CredentialFailure),
 }
 

@@ -64,14 +64,25 @@ impl<R: Reporter> AgentRunner<R> {
         ]
     }
 
-    pub(crate) fn apply_github_token(&self, command: &mut Command, job_id: &str, gh: bool) {
+    /// Puts the GitHub token of `held` into `command`. `held` is the credentials the caller
+    /// leased in the same step, so the token is the one the lease covers.
+    pub(crate) fn apply_github_token(
+        &self,
+        command: &mut Command,
+        held: Option<&JobCredentials>,
+        gh: bool,
+    ) {
         if self.credentials.is_none() {
             return;
         }
         let Some(host) = self.config.repo_policy.token_host() else {
             return;
         };
-        let Some(token) = self.github_token(job_id) else {
+        let Some(token) = held
+            .and_then(JobCredentials::github)
+            .and_then(|secret| std::str::from_utf8(secret.expose()).ok())
+            .map(str::to_owned)
+        else {
             return;
         };
         command.env("GH_TOKEN", &token);
@@ -185,9 +196,12 @@ mod tests {
     use tonic::{Request, Response, Status};
 
     use crate::agent_config::{JOB_EMAIL, JOB_NAME};
-    use crate::cred::{CredentialBook, CredentialClient};
+    use crate::cred::{CredentialBook, CredentialClient, CredentialFailure};
     use crate::poller::channel;
+    use crate::runner::Ctl;
+    use crate::runner::ci::{PollStop, Watched};
     use crate::runner::{AgentRunner, Reporter, RunConfig, Scope};
+    use fleet_proto::PRECONDITION_APP_MINT_CAP;
 
     const HOLDER: &str = "holder-pat-0123456789abcdef";
     const AGENT: &str = "agent-key-0123456789abcdef";
@@ -223,7 +237,12 @@ mod tests {
         }
     }
 
-    struct Stub(&'static str, bool, std::sync::atomic::AtomicUsize);
+    struct Stub(
+        &'static str,
+        bool,
+        std::sync::atomic::AtomicUsize,
+        Option<Status>,
+    );
 
     #[tonic::async_trait]
     impl FleetWorker for Stub {
@@ -260,6 +279,11 @@ mod tests {
                 git_identity: None,
             };
             let call = self.2.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            if call > 0
+                && let Some(refusal) = &self.3
+            {
+                return Err(refusal.clone());
+            }
             let github = if self.1 {
                 JobCredential {
                     expires_at_ms: Some(EXPIRES_MS),
@@ -333,17 +357,38 @@ mod tests {
         app: bool,
         clock: Arc<dyn crate::cred::Clock>,
     ) -> Result<Fixture, Box<dyn std::error::Error>> {
+        fixture_full(attach, kind, app, clock, None, None).await
+    }
+
+    async fn fixture_refusing(
+        refusal: Status,
+        clock: Arc<dyn crate::cred::Clock>,
+    ) -> Result<Fixture, Box<dyn std::error::Error>> {
+        fixture_full(true, "anthropic_api_key", true, clock, Some(refusal), None).await
+    }
+
+    async fn fixture_full(
+        attach: bool,
+        kind: &'static str,
+        app: bool,
+        clock: Arc<dyn crate::cred::Clock>,
+        refusal: Option<Status>,
+        revoker: Option<Arc<crate::revoke::Revoker>>,
+    ) -> Result<Fixture, Box<dyn std::error::Error>> {
         let listener = TcpListener::bind(("127.0.0.1", 0)).await?;
         let url = format!("http://{}", listener.local_addr()?);
         tokio::spawn(
             tonic::transport::Server::builder()
-                .add_service(FleetWorkerServer::new(Stub(kind, app, 0.into())))
+                .add_service(FleetWorkerServer::new(Stub(kind, app, 0.into(), refusal)))
                 .serve_with_incoming(TcpListenerStream::new(listener)),
         );
-        let book = Arc::new(
+        let mut book =
             CredentialBook::new(CredentialClient::new(channel(&url)?, "tok-0123456789")?)
-                .with_clock(clock),
-        );
+                .with_clock(clock);
+        if let Some(revoker) = revoker {
+            book = book.with_revoker(revoker);
+        }
+        let book = Arc::new(book);
         book.fetch("job1", 1, "box").await?;
         let dir = tempfile::tempdir()?;
         let mut config = RunConfig::new("claude-fake", false);
@@ -516,8 +561,9 @@ mod tests {
     #[tokio::test]
     async fn a_failed_refresh_fails_the_step_and_spawns_nothing()
     -> Result<(), Box<dyn std::error::Error>> {
-        let clock = Arc::new(Clock((EXPIRES_MS + 1).into()));
-        let (runner, _book, dir) = fixture_clocked(true, "anthropic_api_key", true, clock).await?;
+        let clock = Arc::new(Clock((EXPIRES_MS - 5 * 60 * 1000).into()));
+        let refusal = Status::failed_precondition(PRECONDITION_APP_MINT_CAP);
+        let (runner, _book, dir) = fixture_refusing(refusal, clock).await?;
         let got = runner
             .helper(
                 Path::new("/usr/bin/env"),
@@ -529,7 +575,7 @@ mod tests {
         assert_eq!(
             got.err(),
             Some(crate::proc::CaptureError::Credentials(
-                crate::cred::CredentialFailure::Malformed
+                CredentialFailure::MintCap
             ))
         );
         Ok(())
@@ -1176,6 +1222,231 @@ mod tests {
                 }
             }
             assert!(record.truncated);
+        }
+        Ok(())
+    }
+
+    const PR: &str = "https://example.invalid/o/r/pull/1";
+    const RUN_LINK: &str = "https://example.invalid/actions/runs/9/job/41";
+
+    fn job1() -> Job {
+        Job {
+            job_id: "job1".into(),
+            repo: "o/r".into(),
+            ..Job::default()
+        }
+    }
+
+    fn due_clock() -> Arc<Clock> {
+        Arc::new(Clock((EXPIRES_MS - 5 * 60 * 1000).into()))
+    }
+
+    fn refusals() -> [(Status, CredentialFailure); 2] {
+        [
+            (
+                Status::failed_precondition(PRECONDITION_APP_MINT_CAP),
+                CredentialFailure::MintCap,
+            ),
+            (
+                Status::permission_denied("lease"),
+                CredentialFailure::LeaseMismatch,
+            ),
+        ]
+    }
+
+    #[tokio::test]
+    async fn a_refresh_failure_is_returned_by_check_pr_and_never_read_as_waiting()
+    -> Result<(), Box<dyn std::error::Error>> {
+        for (refusal, want) in refusals() {
+            let (runner, _book, dir) = fixture_refusing(refusal, due_clock()).await?;
+            let got = runner.check_pr(&job1(), dir.path(), PR).await;
+            assert_eq!(got, Err(want));
+        }
+        let (runner, _book, dir) =
+            fixture_clocked(true, "anthropic_api_key", true, due_clock()).await?;
+        assert!(runner.check_pr(&job1(), dir.path(), PR).await.is_ok());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_refresh_failure_is_returned_by_failure_log_and_a_missing_url_is_none()
+    -> Result<(), Box<dyn std::error::Error>> {
+        for (refusal, want) in refusals() {
+            let (runner, _book, dir) = fixture_refusing(refusal, due_clock()).await?;
+            let got = runner
+                .failure_log(&job1(), dir.path(), Some(RUN_LINK))
+                .await;
+            assert_eq!(got, Err(want));
+            assert_eq!(
+                runner.failure_log(&job1(), dir.path(), None).await,
+                Ok(None)
+            );
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_refresh_failure_stops_the_poll_with_its_reason()
+    -> Result<(), Box<dyn std::error::Error>> {
+        for (refusal, want) in refusals() {
+            let (runner, _book, dir) = fixture_refusing(refusal, due_clock()).await?;
+            let mut last = None;
+            let got = runner.poll_ci(&job1(), dir.path(), PR, "", &mut last).await;
+            assert!(
+                matches!(got, Err(PollStop::Credentials(failure)) if failure == want),
+                "{got:?}"
+            );
+        }
+        Ok(())
+    }
+
+    fn ctl() -> (tokio::sync::watch::Sender<bool>, Ctl) {
+        let (trigger, shutdown) = crate::poller::Shutdown::channel();
+        (
+            trigger,
+            Ctl {
+                deadline: Box::pin(tokio::time::sleep(std::time::Duration::from_secs(60))),
+                shutdown,
+            },
+        )
+    }
+
+    #[tokio::test]
+    async fn a_refresh_failure_ends_the_ci_watch_as_failed_with_its_reason()
+    -> Result<(), Box<dyn std::error::Error>> {
+        for (refusal, want) in refusals() {
+            let (runner, _book, dir) = fixture_refusing(refusal, due_clock()).await?;
+            let (_shutdown, mut ctl) = ctl();
+            let got = runner.watch_ci(&job1(), dir.path(), PR, "", &mut ctl).await;
+            assert!(
+                matches!(got, Watched::Failed(reason) if reason == want.reason()),
+                "{got:?}"
+            );
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_refresh_failure_while_fetching_the_log_ends_the_watch_as_failed()
+    -> Result<(), Box<dyn std::error::Error>> {
+        for (refusal, want) in refusals() {
+            let (runner, _book, dir) = fixture_refusing(refusal, due_clock()).await?;
+            let (_shutdown, mut ctl) = ctl();
+            let done = fleet_proto::v1::JobCi {
+                state: fleet_proto::v1::CiState::Failure.into(),
+                url: Some(RUN_LINK.to_owned()),
+                failure_log: None,
+            };
+            let got = runner
+                .attach_log(&job1(), dir.path(), "", &mut ctl, done)
+                .await;
+            assert!(
+                matches!(got, Watched::Failed(reason) if reason == want.reason()),
+                "{got:?}"
+            );
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_refresh_failure_is_returned_by_existing_pr_and_never_read_as_no_pull_request()
+    -> Result<(), Box<dyn std::error::Error>> {
+        for (refusal, want) in refusals() {
+            let (runner, _book, dir) = fixture_refusing(refusal, due_clock()).await?;
+            let got = runner.existing_pr(&job1(), "swarm/job1", dir.path()).await;
+            assert_eq!(got.err().map(|f| f.error), Some(want.reason()));
+        }
+        let (runner, _book, dir) =
+            fixture_clocked(true, "anthropic_api_key", true, due_clock()).await?;
+        let got = runner.existing_pr(&job1(), "swarm/job1", dir.path()).await;
+        assert!(matches!(got, Ok(None)));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_token_the_job_never_held_is_masked_in_a_redactor_cloned_before_the_refresh()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let stranger = "ghs_QqWwEeRrTtYyUuIiOoPp1234567890";
+        let (runner, book, _dir) = fixture_app().await?;
+        let held = book.get("job1").ok_or("held")?;
+        runner.adopt_credentials("job1", &held);
+        let early = runner.job_redactor("job1").as_ref().clone();
+        assert_eq!(early.redact_str(stranger), "[REDACTED]");
+        let (pat_runner, pat_book, _pat_dir) = fixture(true).await?;
+        let pat = pat_book.get("job1").ok_or("held")?;
+        pat_runner.adopt_credentials("job1", &pat);
+        assert_eq!(
+            pat_runner.job_redactor("job1").redact_str(stranger),
+            stranger
+        );
+        Ok(())
+    }
+
+    async fn counting_revoke_endpoint() -> Result<
+        (std::net::SocketAddr, Arc<std::sync::atomic::AtomicUsize>),
+        Box<dyn std::error::Error>,
+    > {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = TcpListener::bind(("127.0.0.1", 0)).await?;
+        let addr = listener.local_addr()?;
+        let count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let seen = Arc::clone(&count);
+        tokio::spawn(async move {
+            while let Ok((mut stream, _)) = listener.accept().await {
+                let seen = Arc::clone(&seen);
+                tokio::spawn(async move {
+                    let mut buf = [0u8; 2048];
+                    let _ = stream.read(&mut buf).await;
+                    seen.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    let _ = stream
+                        .write_all(b"HTTP/1.1 204 No Content\r\nconnection: close\r\n\r\n")
+                        .await;
+                });
+            }
+        });
+        Ok((addr, count))
+    }
+
+    #[tokio::test]
+    async fn a_gh_child_holds_its_token_until_it_exits_when_a_refresh_replaces_it()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use std::sync::atomic::Ordering;
+        let (endpoint_addr, hits) = counting_revoke_endpoint().await?;
+        let clock = Arc::new(Clock((EXPIRES_MS - 20 * 60 * 1000).into()));
+        let revoker = Arc::new(crate::revoke::Revoker::plain(endpoint_addr));
+        let (runner, book, dir) = fixture_full(
+            true,
+            "anthropic_api_key",
+            true,
+            clock.clone(),
+            None,
+            Some(revoker),
+        )
+        .await?;
+        let child = runner.helper(
+            Path::new("/bin/sleep"),
+            dir.path(),
+            &["1"],
+            Scope::Gh("job1"),
+        );
+        let swap = async {
+            tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+            clock.0.store(EXPIRES_MS - 5 * 60 * 1000, Ordering::SeqCst);
+            let swapped = book.refresh_if_due("job1").await;
+            tokio::time::sleep(std::time::Duration::from_millis(400)).await;
+            (
+                swapped.map(|got| got.is_some()),
+                hits.load(Ordering::SeqCst),
+            )
+        };
+        let (child, (swapped, during)) = tokio::join!(child, swap);
+        assert!(child.is_ok());
+        assert_eq!(swapped, Ok(true));
+        assert_eq!(during, 0);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while hits.load(Ordering::SeqCst) == 0 {
+            assert!(std::time::Instant::now() < deadline, "never revoked");
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
         }
         Ok(())
     }
