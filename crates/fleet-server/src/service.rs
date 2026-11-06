@@ -394,6 +394,9 @@ fn worker_error(err: &StoreError) -> Status {
         StoreError::NotFound => Status::not_found("job not found"),
         StoreError::LeaseDenied => Status::permission_denied("lease does not match"),
         StoreError::UnknownProfile => Status::not_found("profile not found"),
+        StoreError::ToolsNotGranted => {
+            Status::permission_denied(profiles::ERR_PROFILE_TOOLS_NOT_GRANTED)
+        }
         other => storage_unavailable(other),
     }
 }
@@ -591,6 +594,9 @@ fn profiles_error(err: &StoreError) -> Status {
         }
         StoreError::InvalidProfile(fault) => Status::invalid_argument(fault.to_string()),
         StoreError::NotFound => Status::not_found("profile not found"),
+        StoreError::ToolsNotGranted => {
+            Status::permission_denied(profiles::ERR_PROFILE_TOOLS_NOT_GRANTED)
+        }
         other => storage_unavailable(other),
     }
 }

@@ -45,7 +45,7 @@ fleetd reads `/etc/fleetd/config.toml` when it exists, then these environment va
 | `FLEETD_TOOL_CACHE_UID` | numeric uid that owns `/var/lib/fleet/tools`, normally `fleet-job`. Required when the `[mise]` table is set. Root and 4294967295 are refused. Wins over `tool_cache_uid` in the file. See [Bundled mise](#bundled-mise-and-the-mise-section) | unset |
 | `FLEETD_ALLOW_PLAINTEXT_CREDENTIALS` | `1` lets a plain `http://` `FLEET_SERVER_URL` pass off loopback. Any other value keeps the refusal | unset |
 
-`FLEET_UPDATE_MANIFEST` and `FLEET_ALLOW_PROFILE_TOOLS` are fleet-server variables, not fleetd settings. They are in [Server variables](#server-variables) and in `infra/README.md`.
+`FLEET_UPDATE_MANIFEST` is a fleet-server variable, not a fleetd setting. They are in [Server variables](#server-variables) and in `infra/README.md`.
 
 The default jobs dir is `/var/lib/fleetd/jobs`, inside `StateDirectory=fleetd`, so the unit needs no extra path for it. fleetd removes a job's worktree after the job ends, and keeps the mirror cache. A failed workspace prepare, a shutdown during prepare and a killed fleetd leave a worktree behind, and nothing removes it, so clear old directories from the jobs dir by hand. If you set `FLEETD_JOBS_DIR` or `jobs_dir` elsewhere, add that path to `ReadWritePaths=` with a drop-in (`systemctl edit fleetd`), or the worktree and mirror writes fail under `ProtectSystem=strict`. `claude_bin` and `gh_bin` are config-file keys only, with no env variable. They default to `claude` and `gh`, resolved through `PATH`. Set absolute paths in `/etc/fleetd/config.toml` when the unit's `PATH` does not include them.
 
@@ -497,4 +497,5 @@ These are fleet-server settings. `infra/README.md` carries the same rows.
 | Variable | Meaning |
 | --- | --- |
 | `FLEET_UPDATE_MANIFEST` | path of the signed update manifest. The signature is the file of the same name with `.minisig` appended. Unset or empty means no manifest. |
-| `FLEET_ALLOW_PROFILE_TOOLS` | `true` or `false`, default `false`, and an empty value counts as `false`. Any other value stops startup. While `false` the server refuses a Profile with `tools`. Tools are accepted only in TOML Profile content (`content_toml`): the JSON form rejects them. The `fleet` CLI sends JSON only and no web page in this tree sends `content_toml`, so only a direct gRPC client can create a Profile with tools. `true` does not run a tool by itself: the Box also needs `[mise]`, see [Bundled mise](#bundled-mise-and-the-mise-section). |
+
+`FLEET_ALLOW_PROFILE_TOOLS` is removed and stops startup if set, to any value. Profile `tools` need the `profile:tools` capability on the saving user, on the submitting user, and on the job owner when the server serves the blob to a leased Box. Tools are accepted only in TOML Profile content (`content_toml`). A Box still needs `[mise]`, see [Bundled mise](#bundled-mise-and-the-mise-section).

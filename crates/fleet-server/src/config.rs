@@ -150,9 +150,6 @@ pub struct Config {
     pub web_origin: Option<String>,
     /// `WebAuthn` relying party id, from `FLEET_WEB_RP_ID`. `None` means the host of the origin.
     pub web_rp_id: Option<String>,
-    /// Whether profiles with tools are accepted, from `FLEET_ALLOW_PROFILE_TOOLS`: `true` or
-    /// `false`, default `false`.
-    pub allow_profile_tools: bool,
     /// Bootstrap password for the first admin, from `FLEET_BOOTSTRAP_PASSWORD`. `None` when
     /// unset or empty. The server hashes it at startup and ignores it once a user exists.
     pub bootstrap_password: Option<Secret>,
@@ -287,13 +284,20 @@ fn number(
     }
 }
 
-fn flag(lookup: &impl Fn(&str) -> Option<String>, var: &'static str) -> Result<bool, ConfigError> {
-    match lookup(var).as_deref() {
-        None | Some("" | "false") => Ok(false),
-        Some("true") => Ok(true),
+const REMOVED_PROFILE_TOOLS_VAR: &str = "FLEET_ALLOW_PROFILE_TOOLS";
+
+/// Refuses the removed `FLEET_ALLOW_PROFILE_TOOLS` switch when it is set to any value, the
+/// empty string and `false` included. The reason never carries the value.
+fn refuse_removed_profile_tools(
+    lookup: &impl Fn(&str) -> Option<String>,
+) -> Result<(), ConfigError> {
+    match lookup(REMOVED_PROFILE_TOOLS_VAR) {
+        None => Ok(()),
         Some(_) => Err(ConfigError::Invalid {
-            var,
-            reason: "must be true or false".to_owned(),
+            var: REMOVED_PROFILE_TOOLS_VAR,
+            reason: "this switch was removed; unset it and grant the profile:tools capability \
+                     to each user that needs it (ADR-0054)"
+                .to_owned(),
         }),
     }
 }
@@ -353,6 +357,7 @@ impl Config {
     ///
     /// Same as [`Config::from_env`].
     pub fn from_lookup(lookup: impl Fn(&str) -> Option<String>) -> Result<Self, ConfigError> {
+        refuse_removed_profile_tools(&lookup)?;
         let database_url = lookup("FLEET_DATABASE_URL")
             .filter(|v| !v.is_empty())
             .ok_or(ConfigError::Missing("FLEET_DATABASE_URL"))?;
@@ -383,7 +388,6 @@ impl Config {
                 .map(PathBuf::from),
             web_origin: lookup("FLEET_WEB_ORIGIN").filter(|v| !v.is_empty()),
             web_rp_id: lookup("FLEET_WEB_RP_ID").filter(|v| !v.is_empty()),
-            allow_profile_tools: flag(&lookup, "FLEET_ALLOW_PROFILE_TOOLS")?,
             bootstrap_password: lookup("FLEET_BOOTSTRAP_PASSWORD")
                 .filter(|v| !v.is_empty())
                 .map(Secret::new),
@@ -445,37 +449,33 @@ mod tests {
     }
 
     #[test]
-    fn profile_tools_gate_is_strict_and_defaults_off() {
+    fn the_removed_profile_tools_switch_fails_startup_for_any_value() {
         let base = [
             ("FLEET_DATABASE_URL", "postgres://u:pw@h/db"),
             ("FLEET_TOKEN", TOKEN),
         ];
-        assert!(
-            !Config::from_lookup(lookup(&base))
-                .unwrap()
-                .allow_profile_tools
-        );
-        for (text, want) in [("", false), ("false", false), ("true", true)] {
-            let config = Config::from_lookup(lookup(&[
+        assert!(Config::from_lookup(lookup(&base)).is_ok());
+        for text in ["true", "false", "", "1", "zzz-echo-probe"] {
+            let err = Config::from_lookup(lookup(&[
                 base[0],
                 base[1],
                 ("FLEET_ALLOW_PROFILE_TOOLS", text),
             ]))
-            .unwrap();
-            assert_eq!(config.allow_profile_tools, want, "{text:?}");
-        }
-        for bad in [
-            "1", "0", "yes", "TRUE", "True", " true", "true ", "on", "tru",
-        ] {
-            let err = Config::from_lookup(lookup(&[
-                base[0],
-                base[1],
-                ("FLEET_ALLOW_PROFILE_TOOLS", bad),
-            ]))
             .unwrap_err();
+            let shown = err.to_string();
+            assert!(shown.contains("FLEET_ALLOW_PROFILE_TOOLS"), "{text:?}");
+            assert!(shown.contains("profile:tools"), "{text:?}");
+            assert!(shown.contains("ADR-0054"), "{text:?}");
+            assert!(text.is_empty() || !shown.contains(text), "{text:?}");
             assert!(
-                err.to_string().contains("FLEET_ALLOW_PROFILE_TOOLS"),
-                "{bad:?}"
+                matches!(
+                    err,
+                    ConfigError::Invalid {
+                        var: "FLEET_ALLOW_PROFILE_TOOLS",
+                        ..
+                    }
+                ),
+                "{text:?}"
             );
         }
     }

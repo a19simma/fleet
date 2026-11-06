@@ -75,7 +75,6 @@ async fn shared(pool: &PgPool, name: &str, json: &str) {
         Some(system),
         name,
         fleet_server::profiles::ProfileContent::Json(json),
-        false,
     )
     .await
     .unwrap();

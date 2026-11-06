@@ -10,8 +10,7 @@ use fleet_proto::v1::{
     ProfileVersion, ProfileVisibility,
 };
 use fleet_proto::{
-    ERR_PROFILE_CONTENT_CHOICE, ERR_PROFILE_TOOLS_DISABLED, MAX_PROFILE_JSON_BYTES,
-    selection_to_wire, visibility_to_wire,
+    ERR_PROFILE_CONTENT_CHOICE, MAX_PROFILE_JSON_BYTES, selection_to_wire, visibility_to_wire,
 };
 use sqlx::{PgConnection, PgPool, Row};
 
@@ -57,7 +56,8 @@ impl From<Option<i64>> for Viewer {
 /// [`ProfileFault::Unowned`].
 pub const ERR_PROFILE_SUBMIT_UNOWNED: &str = "profile submit needs a user token";
 
-/// The refusal text for a submit of a profile with `tools` by a user without `profile:tools`.
+/// The refusal text for a save, submit or blob serve of a profile with `tools` by a user without
+/// `profile:tools`.
 pub const ERR_PROFILE_TOOLS_NOT_GRANTED: &str = "profile tools need the profile:tools capability";
 
 const LOCK_OWN_PROFILE_FOR_UPDATE: &str =
@@ -188,7 +188,7 @@ const LOCK_CATALOG: &str = "SELECT id, kind, name, content, admin_enabled FROM c
      ORDER BY id LIMIT $1 FOR SHARE";
 const SELECT_LEASED_BLOB: &str = "SELECT j.profile_name, j.profile_version, j.profile_hash, \
      j.snapshot_catalog::text AS snapshot_catalog, j.snapshot_notes::text AS snapshot_notes, \
-     j.snapshot_hash, v.hash AS version_hash, b.content FROM jobs j \
+     j.snapshot_hash, j.user_id, v.hash AS version_hash, b.content FROM jobs j \
      LEFT JOIN profile_version v ON v.profile_id = j.profile_id AND v.version = j.profile_version \
      LEFT JOIN profile_blob b ON b.hash = j.profile_hash \
      WHERE j.job_id = $1 AND j.attempt = $2 AND j.box = $3 AND j.state = 'RUNNING' \
@@ -213,8 +213,6 @@ pub enum ProfileFault {
     Malformed(ProfileError),
     /// The Profile breaks a validation rule.
     Invalid(ProfileInvalid),
-    /// The Profile has tools and the server gate is off.
-    ToolsDisabled,
     /// The request set both or neither of the JSON and TOML content.
     ContentChoice,
     /// The caller is not a stored user. The handler maps this to `PERMISSION_DENIED`.
@@ -233,7 +231,6 @@ impl fmt::Display for ProfileFault {
             Self::TooLarge => f.write_str("profile json is too large"),
             Self::Malformed(err) => err.fmt(f),
             Self::Invalid(err) => err.fmt(f),
-            Self::ToolsDisabled => f.write_str(ERR_PROFILE_TOOLS_DISABLED),
             Self::ContentChoice => f.write_str(ERR_PROFILE_CONTENT_CHOICE),
             Self::Unowned => f.write_str(ERR_PROFILE_UNOWNED),
             Self::NotOwner => f.write_str("only the owner can change this profile"),
@@ -280,12 +277,14 @@ pub struct NewProfile {
     name: String,
     canonical: Vec<u8>,
     hash: ProfileHash,
+    has_tools: bool,
 }
 
 /// A validated Profile body without a name: the canonical JSON and its hash.
 struct Body {
     canonical: Vec<u8>,
     hash: ProfileHash,
+    has_tools: bool,
 }
 
 /// Validates a profile name.
@@ -306,7 +305,9 @@ pub fn validate_name(name: &str) -> Result<(), ProfileFault> {
     }
 }
 
-/// Validates a create request. This is the only check on these fields.
+/// Validates a create request. This is the only check on these fields. Tools are not gated
+/// here: the store checks the `profile:tools` capability of the saving user inside its
+/// transaction.
 ///
 /// # Errors
 ///
@@ -314,18 +315,22 @@ pub fn validate_name(name: &str) -> Result<(), ProfileFault> {
 pub fn validate_create(
     name: &str,
     content: ProfileContent<'_>,
-    allow_tools: bool,
 ) -> Result<NewProfile, ProfileFault> {
     validate_name(name)?;
-    let Body { canonical, hash } = validate_body(content, allow_tools)?;
+    let Body {
+        canonical,
+        hash,
+        has_tools,
+    } = validate_body(content)?;
     Ok(NewProfile {
         name: name.to_owned(),
         canonical,
         hash,
+        has_tools,
     })
 }
 
-fn validate_body(content: ProfileContent<'_>, allow_tools: bool) -> Result<Body, ProfileFault> {
+fn validate_body(content: ProfileContent<'_>) -> Result<Body, ProfileFault> {
     if content.text().len() > MAX_PROFILE_JSON_BYTES {
         return Err(ProfileFault::TooLarge);
     }
@@ -334,13 +339,11 @@ fn validate_body(content: ProfileContent<'_>, allow_tools: bool) -> Result<Body,
         ProfileContent::Toml(text) => Profile::from_toml(text),
     }
     .map_err(ProfileFault::Malformed)?;
-    if !allow_tools && !profile.tools.is_empty() {
-        return Err(ProfileFault::ToolsDisabled);
-    }
     profile.validate().map_err(ProfileFault::Invalid)?;
     Ok(Body {
         canonical: profile.canonical_json(),
         hash: profile.hash(),
+        has_tools: !profile.tools.is_empty(),
     })
 }
 
@@ -373,16 +376,16 @@ fn text_of(bytes: Vec<u8>) -> Result<String, StoreError> {
 /// # Errors
 ///
 /// Returns [`ProfileFault::Unowned`] with nothing written when `caller` is `None` or not a
-/// stored user, any validation fault of [`validate_create`], and a database error.
+/// stored user, any validation fault of [`validate_create`], [`StoreError::ToolsNotGranted`]
+/// when the profile has tools and the owner lacks `profile:tools`, and a database error.
 pub async fn create_owned(
     pool: &PgPool,
     caller: Option<i64>,
     name: &str,
     content: ProfileContent<'_>,
-    allow_tools: bool,
 ) -> Result<ProfileVersion, StoreError> {
     let owner = caller.ok_or(ProfileFault::Unowned)?;
-    let new = validate_create(name, content, allow_tools)?;
+    let new = validate_create(name, content)?;
     store_version(pool, owner, new).await
 }
 
@@ -399,6 +402,9 @@ async fn store_version(
         .fetch_optional(&mut *tx)
         .await?
         .ok_or(ProfileFault::Unowned)?;
+    if new.has_tools {
+        require_tools_grant(&mut tx, owner).await?;
+    }
     sqlx::query(INSERT_BLOB)
         .bind(new.hash.as_bytes().as_slice())
         .bind(new.canonical.as_slice())
@@ -420,8 +426,18 @@ async fn store_version(
         name,
         canonical,
         hash,
+        has_tools,
     } = new;
-    let stored = push_version(&mut tx, profile_id, Body { canonical, hash }).await?;
+    let stored = push_version(
+        &mut tx,
+        profile_id,
+        Body {
+            canonical,
+            hash,
+            has_tools,
+        },
+    )
+    .await?;
     tx.commit().await?;
     version_reply(name, stored)
 }
@@ -510,21 +526,24 @@ async fn lock_for_owner(
 ///
 /// Returns [`ProfileFault::Unowned`] for a `None` caller, any validation fault of the
 /// content, [`StoreError::NotFound`] for an absent profile or a private one owned by someone
-/// else, [`ProfileFault::NotOwner`] for a shared one owned by someone else, and a database
-/// error. Every refusal writes nothing.
+/// else, [`ProfileFault::NotOwner`] for a shared one owned by someone else,
+/// [`StoreError::ToolsNotGranted`] when the content has tools and `caller` lacks
+/// `profile:tools`, and a database error. Every refusal writes nothing.
 pub async fn update_owned(
     pool: &PgPool,
     caller: Option<i64>,
     profile_id: i64,
     content: ProfileContent<'_>,
-    allow_tools: bool,
 ) -> Result<ProfileVersion, StoreError> {
     let caller = caller.ok_or(ProfileFault::Unowned)?;
-    let body = validate_body(content, allow_tools)?;
+    let body = validate_body(content)?;
     let size = i32::try_from(body.canonical.len())
         .map_err(|_| StoreError::OutOfRange("profile content"))?;
     let mut tx = pool.begin().await?;
     let locked = lock_for_owner(&mut tx, caller, profile_id).await?;
+    if body.has_tools {
+        require_tools_grant(&mut tx, caller).await?;
+    }
     sqlx::query(INSERT_BLOB)
         .bind(body.hash.as_bytes().as_slice())
         .bind(body.canonical.as_slice())
@@ -621,19 +640,24 @@ fn wire_visibility(text: &str) -> Result<i32, StoreError> {
         .map_err(|_| StoreError::OutOfRange("profile visibility"))
 }
 
+/// Reads the profile blob a leased job pins.
+///
+/// A blob with `tools` is served only while the job owner (`jobs.user_id`, the user who
+/// submitted and was checked at submit) holds `profile:tools`. The grant is read live in the
+/// same transaction as the blob, under `FOR SHARE`. The profile owner's grant does not count.
 pub(crate) async fn blob_for_lease(
     pool: &PgPool,
     job_id: &str,
     attempt: u32,
     box_name: &str,
-    allow_tools: bool,
 ) -> Result<GetProfileBlobReply, StoreError> {
     let attempt = i32::try_from(attempt).map_err(|_| StoreError::LeaseDenied)?;
+    let mut tx = pool.begin().await?;
     let row = sqlx::query(SELECT_LEASED_BLOB)
         .bind(job_id)
         .bind(attempt)
         .bind(box_name)
-        .fetch_optional(pool)
+        .fetch_optional(&mut *tx)
         .await?
         .ok_or(StoreError::LeaseDenied)?;
     let Some(name) = row.try_get::<Option<String>, _>("profile_name")? else {
@@ -656,11 +680,13 @@ pub(crate) async fn blob_for_lease(
         return Err(corrupt());
     }
     let profile = serde_json::from_slice::<Profile>(&content).map_err(|_| corrupt())?;
-    if (!allow_tools && !profile.tools.is_empty())
-        || profile.hash().as_bytes().as_slice() != pinned.as_slice()
+    if profile.hash().as_bytes().as_slice() != pinned.as_slice()
         || profile.canonical_json() != content
     {
         return Err(corrupt());
+    }
+    if !profile.tools.is_empty() {
+        require_tools_grant(&mut tx, row.try_get("user_id")?).await?;
     }
     let catalog = match (
         row.try_get::<Option<String>, _>("snapshot_catalog")?,
@@ -673,6 +699,7 @@ pub(crate) async fn blob_for_lease(
             .wire_items(),
         _ => return Err(corrupt()),
     };
+    tx.commit().await?;
     Ok(GetProfileBlobReply {
         profile: Some(ProfileRef {
             name,
@@ -704,6 +731,18 @@ async fn read_tools_grant(conn: &mut PgConnection, owner: i64) -> Result<bool, S
         .fetch_optional(&mut *conn)
         .await?;
     Ok(held.is_some())
+}
+
+/// Refuses with [`StoreError::ToolsNotGranted`] unless `user` holds `profile:tools` now.
+///
+/// The `users` row and the `user_capabilities` row are read `FOR SHARE` on `conn`, so a revoke
+/// in flight finishes first and a later one waits for the caller's transaction.
+async fn require_tools_grant(conn: &mut PgConnection, user: i64) -> Result<(), StoreError> {
+    if read_tools_grant(conn, user).await? {
+        Ok(())
+    } else {
+        Err(StoreError::ToolsNotGranted)
+    }
 }
 
 async fn lock_catalog(conn: &mut PgConnection) -> Result<Vec<CatalogEntry>, StoreError> {
@@ -828,33 +867,21 @@ mod tests {
     }
 
     #[test]
-    fn tools_need_the_gate_and_toml() {
-        let toml = ProfileContent::Toml(TOOLS_TOML);
-        assert_eq!(
-            validate_create("p", toml, false),
-            Err(ProfileFault::ToolsDisabled)
-        );
-        let on = validate_create("p", toml, true).unwrap();
+    fn tools_are_flagged_and_only_toml_carries_them() {
+        let on = validate_create("p", ProfileContent::Toml(TOOLS_TOML)).unwrap();
+        assert!(on.has_tools);
         assert!(
             String::from_utf8(on.canonical)
                 .unwrap()
                 .contains("\"tools\"")
         );
-        let plain = ProfileContent::Toml("model = \"m\"\n");
-        assert!(validate_create("p", plain, false).is_ok());
-        assert!(validate_create("p", plain, true).is_ok());
-        for allow in [false, true] {
-            let err = validate_create(
-                "p",
-                json(r#"{"tools":[{"name":"node","version":"20.11.1"}]}"#),
-                allow,
-            );
-            assert!(matches!(err, Err(ProfileFault::Malformed(_))), "{allow}");
-        }
-        assert_eq!(
-            ProfileFault::ToolsDisabled.to_string(),
-            ERR_PROFILE_TOOLS_DISABLED
+        let plain = validate_create("p", ProfileContent::Toml("model = \"m\"\n")).unwrap();
+        assert!(!plain.has_tools);
+        let err = validate_create(
+            "p",
+            json(r#"{"tools":[{"name":"node","version":"20.11.1"}]}"#),
         );
+        assert!(matches!(err, Err(ProfileFault::Malformed(_))));
     }
 
     #[test]
@@ -895,15 +922,13 @@ mod tests {
 
     #[test]
     fn create_canonicalises_and_hashes() {
-        let a = validate_create("p", json(r#"{"model": "m", "max_turns": 3}"#), false)
-            .unwrap_or_else(|e| {
+        let a =
+            validate_create("p", json(r#"{"model": "m", "max_turns": 3}"#)).unwrap_or_else(|e| {
                 panic!("{e}");
             });
-        let b = validate_create("p", json(r#"{"max_turns":3,"model":"m"}"#), false).unwrap_or_else(
-            |e| {
-                panic!("{e}");
-            },
-        );
+        let b = validate_create("p", json(r#"{"max_turns":3,"model":"m"}"#)).unwrap_or_else(|e| {
+            panic!("{e}");
+        });
         assert_eq!(a.hash, b.hash);
         assert_eq!(a.canonical, b.canonical);
     }
@@ -911,15 +936,11 @@ mod tests {
     #[test]
     fn faults_do_not_echo_input() {
         let secret = "zzz-private-input";
-        let err = validate_create(
-            "p",
-            ProfileContent::Json(&format!("{{\"{secret}\":1}}")),
-            false,
-        )
-        .unwrap_err();
+        let err =
+            validate_create("p", ProfileContent::Json(&format!("{{\"{secret}\":1}}"))).unwrap_err();
         assert!(!err.to_string().contains(secret));
         let bad_name = "zzz private input";
-        let err = validate_create(bad_name, json("{}"), false).unwrap_err();
+        let err = validate_create(bad_name, json("{}")).unwrap_err();
         assert!(!err.to_string().contains("private"));
     }
 }

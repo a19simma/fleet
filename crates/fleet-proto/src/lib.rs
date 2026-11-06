@@ -42,9 +42,6 @@ pub fn update_within_caps(reply: &v1::HeartbeatReply) -> bool {
 /// this sits above the 4 MiB text cap of the validator.
 pub const MAX_PROFILE_JSON_BYTES: usize = 8 * 1024 * 1024;
 
-/// Refusal text when a profile with tools is created while the server gate is off.
-pub const ERR_PROFILE_TOOLS_DISABLED: &str = "profile tools are disabled on this server";
-
 /// Refusal text when a create request sets both or neither of `content_json` and
 /// `content_toml`.
 pub const ERR_PROFILE_CONTENT_CHOICE: &str = "set exactly one of content_json and content_toml";

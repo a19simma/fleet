@@ -948,7 +948,7 @@ async fn item(pool: &PgPool, id: &str, kind: &str, content: &str, enabled: bool)
 }
 
 async fn profile(pool: &PgPool, owner: i64, name: &str, json: &str) {
-    profiles::create_owned(pool, Some(owner), name, ProfileContent::Json(json), false)
+    profiles::create_owned(pool, Some(owner), name, ProfileContent::Json(json))
         .await
         .unwrap();
 }
@@ -1468,7 +1468,7 @@ const TOOLS_TOML: &str = "[[tools]]\nname = \"node\"\nversion = \"20.11.1\"\n";
 const PLAIN_TOML: &str = "claude_md = \"x\"\n";
 
 async fn saved(pool: &PgPool, owner: i64, name: &str, toml: &str) {
-    profiles::create_owned(pool, Some(owner), name, ProfileContent::Toml(toml), true)
+    profiles::create_owned(pool, Some(owner), name, ProfileContent::Toml(toml))
         .await
         .unwrap();
 }
@@ -1538,8 +1538,18 @@ async fn a_revoke_between_save_and_submit_refuses_the_queued_submit(pool: PgPool
 #[sqlx::test]
 async fn a_user_who_never_held_the_capability_is_refused_a_tools_profile(pool: PgPool) {
     let store = store(pool.clone()).await;
-    let (user, token) = user_with_token(&pool, "ann").await;
-    saved(&pool, user, "alpha", TOOLS_TOML).await;
+    let (_, token) = user_with_token(&pool, "ann").await;
+    let (author, _) = user_with_token(&pool, "bob").await;
+    let root = admin(&pool).await;
+    Capabilities::new(pool.clone())
+        .grant(root, author, PROFILE_TOOLS)
+        .await
+        .unwrap();
+    saved(&pool, author, "alpha", TOOLS_TOML).await;
+    sqlx::query("UPDATE profile SET visibility = 'shared'")
+        .execute(&pool)
+        .await
+        .unwrap();
     let mut jobs = client(serve_users(&pool, &store), &token);
     let err = jobs
         .submit_job(with_profile("k1", "alpha", ""))

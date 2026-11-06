@@ -67,7 +67,8 @@ The Deployment sets `FLEET_LISTEN`, `FLEET_HEALTH_LISTEN`, `FLEET_DATABASE_URL`,
 | Variable | Meaning |
 | --- | --- |
 | `FLEET_UPDATE_MANIFEST` | path of the signed update manifest. The signature is the file of the same name with `.minisig` appended. Unset or empty means no manifest. The Deployment mounts no manifest file, and ConfigMap and Secret are outside the allowed kinds, so delivering the manifest to the pod is an open item for the operator. |
-| `FLEET_ALLOW_PROFILE_TOOLS` | `true` or `false`, default `false`, empty counts as `false`, anything else stops startup. While `false` the server refuses a Profile with `tools`. Tools are accepted only in TOML Profile content. A Box also needs the `[mise]` section, see [deploy/README.md](../deploy/README.md#bundled-mise-and-the-mise-section). |
+
+`FLEET_ALLOW_PROFILE_TOOLS` is removed. The server stops startup while it is set, to any value, so unset it. An admin grants the `profile:tools` capability per user instead. A Box also needs the `[mise]` section, see [deploy/README.md](../deploy/README.md#bundled-mise-and-the-mise-section).
 
 ## Image tag
 

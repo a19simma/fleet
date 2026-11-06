@@ -12,6 +12,7 @@ use fleet_proto::v1::{CreateProfileRequest, GetProfileRequest, ListProfilesReque
 use fleet_server::auth::BearerAuth;
 use fleet_server::config::Token;
 use fleet_server::cred::Users;
+use fleet_server::cred::capability::{Capabilities, PROFILE_TOOLS};
 use fleet_server::profiles::{self, ProfileContent, ProfileFault, Viewer};
 use fleet_server::service::router;
 use fleet_server::store::{Store, StoreError};
@@ -113,29 +114,10 @@ async fn counts(pool: &PgPool) -> (i64, i64) {
 }
 
 #[sqlx::test]
-async fn gate_off_refuses_tools_and_stores_nothing(pool: PgPool) {
+async fn a_granted_client_saves_tools_and_the_hash_round_trips(pool: PgPool) {
     let store = store(pool.clone()).await;
-    let mut profiles = spawn(&pool, &store);
-    let err = profiles
-        .create_profile(create_toml("alpha", TOOLS_TOML))
-        .await
-        .unwrap_err();
-    assert_eq!(err.code(), Code::InvalidArgument);
-    assert_eq!(err.message(), fleet_proto::ERR_PROFILE_TOOLS_DISABLED);
-    assert_eq!(counts(&pool).await, (0, 0));
-    let json = r#"{"tools":[{"name":"node","version":"20.11.1"}]}"#;
-    let err = profiles
-        .create_profile(create("alpha", json))
-        .await
-        .unwrap_err();
-    assert_eq!(err.code(), Code::InvalidArgument);
-    assert_ne!(err.message(), fleet_proto::ERR_PROFILE_TOOLS_DISABLED);
-    assert_eq!(counts(&pool).await, (0, 0));
-}
-
-#[sqlx::test]
-async fn gate_on_accepts_tools_and_the_hash_round_trips(pool: PgPool) {
-    let store = store(pool.clone()).await.with_profile_tools(true);
+    let bootstrap = Users::new(pool.clone()).bootstrap_user().await.unwrap();
+    grant_tools(&pool, bootstrap).await;
     let mut profiles = spawn(&pool, &store);
     let created = profiles
         .create_profile(create_toml("alpha", TOOLS_TOML))
@@ -163,24 +145,8 @@ async fn gate_on_accepts_tools_and_the_hash_round_trips(pool: PgPool) {
 }
 
 #[sqlx::test]
-async fn profiles_without_tools_ignore_the_gate(pool: PgPool) {
-    let mut hashes = Vec::new();
-    for allow in [false, true] {
-        let store = store(pool.clone()).await.with_profile_tools(allow);
-        let mut profiles = spawn(&pool, &store);
-        for request in [create("alpha", ONE), create_toml("beta", PLAIN_TOML)] {
-            let reply = profiles.create_profile(request).await.unwrap().into_inner();
-            hashes.push(reply.hash);
-        }
-    }
-    assert_eq!(hashes[0], hashes[1]);
-    assert_eq!(hashes[0], hashes[2]);
-    assert_eq!(hashes[0], hashes[3]);
-}
-
-#[sqlx::test]
 async fn exactly_one_content_field_must_be_set(pool: PgPool) {
-    let store = store(pool.clone()).await.with_profile_tools(true);
+    let store = store(pool.clone()).await;
     let mut profiles = spawn(&pool, &store);
     let both = CreateProfileRequest {
         name: "alpha".to_owned(),
@@ -510,7 +476,7 @@ async fn owners(pool: &PgPool) -> Vec<(i64, String)> {
 }
 
 async fn owned(pool: &PgPool, caller: Option<i64>, name: &str, json: &str) -> Result<(), String> {
-    profiles::create_owned(pool, caller, name, ProfileContent::Json(json), false)
+    profiles::create_owned(pool, caller, name, ProfileContent::Json(json))
         .await
         .map(|_| ())
         .map_err(|err| err.to_string())
@@ -564,15 +530,9 @@ async fn forged_owner_in_the_content_does_not_stick(pool: PgPool) {
 }
 
 async fn put(pool: &PgPool, caller: i64, json: &str) -> fleet_proto::v1::ProfileVersion {
-    profiles::create_owned(
-        pool,
-        Some(caller),
-        "alpha",
-        ProfileContent::Json(json),
-        false,
-    )
-    .await
-    .unwrap()
+    profiles::create_owned(pool, Some(caller), "alpha", ProfileContent::Json(json))
+        .await
+        .unwrap()
 }
 
 const SHARED_CONTENT: &str = r#"{"claude_md":"same"}"#;
@@ -664,7 +624,7 @@ async fn update(
     id: i64,
     json: &str,
 ) -> Result<fleet_proto::v1::ProfileVersion, StoreError> {
-    profiles::update_owned(pool, caller, id, ProfileContent::Json(json), false).await
+    profiles::update_owned(pool, caller, id, ProfileContent::Json(json)).await
 }
 
 const NEXT: &str = r#"{"claude_md":"next"}"#;
@@ -1010,14 +970,7 @@ async fn create_waits_for_a_concurrent_user_delete_and_is_then_refused(pool: PgP
     let task = tokio::spawn({
         let pool = pool.clone();
         async move {
-            profiles::create_owned(
-                &pool,
-                Some(alice),
-                "alpha",
-                ProfileContent::Json(ONE),
-                false,
-            )
-            .await
+            profiles::create_owned(&pool, Some(alice), "alpha", ProfileContent::Json(ONE)).await
         }
     });
     tokio::time::sleep(Duration::from_millis(400)).await;
@@ -1763,4 +1716,141 @@ async fn not_visible_and_absent_profiles_give_one_status_over_rpc(pool: PgPool) 
         listed.profiles[0].visibility,
         fleet_proto::v1::ProfileVisibility::Shared as i32
     );
+}
+
+const TOOLS_TOML_TWO: &str = "[[tools]]\nname = \"node\"\nversion = \"20.11.2\"\n";
+
+async fn root(pool: &PgPool) -> i64 {
+    sqlx::query_scalar(
+        "INSERT INTO users (username, is_admin) VALUES ('root', true) \
+         ON CONFLICT (lower(username)) DO UPDATE SET is_admin = true RETURNING id",
+    )
+    .fetch_one(pool)
+    .await
+    .unwrap()
+}
+
+async fn grant_tools(pool: &PgPool, user: i64) {
+    let admin = root(pool).await;
+    Capabilities::new(pool.clone())
+        .grant(admin, user, PROFILE_TOOLS)
+        .await
+        .unwrap();
+}
+
+async fn revoke_tools(pool: &PgPool, user: i64) {
+    let admin = root(pool).await;
+    assert!(
+        Capabilities::new(pool.clone())
+            .revoke(admin, user, PROFILE_TOOLS)
+            .await
+            .unwrap()
+    );
+}
+
+#[sqlx::test]
+async fn saving_tools_without_the_capability_is_denied_and_stores_nothing(pool: PgPool) {
+    let store = store(pool.clone()).await;
+    let alice = user(&pool, "alice").await;
+    let addr = serve(&pool, &store);
+    let mut as_alice = bearer_client(addr, api_token(&pool, alice).await);
+    let err = as_alice
+        .create_profile(create_toml("alpha", TOOLS_TOML))
+        .await
+        .unwrap_err();
+    assert_eq!(err.code(), Code::PermissionDenied);
+    assert_eq!(err.message(), profiles::ERR_PROFILE_TOOLS_NOT_GRANTED);
+    assert!(!err.message().contains("node"));
+    assert_eq!(counts(&pool).await, (0, 0));
+    let json = r#"{"tools":[{"name":"node","version":"20.11.1"}]}"#;
+    let err = as_alice
+        .create_profile(create("alpha", json))
+        .await
+        .unwrap_err();
+    assert_eq!(err.code(), Code::InvalidArgument);
+    assert_eq!(counts(&pool).await, (0, 0));
+    let mut as_client = client_for(addr, as_client);
+    let err = as_client
+        .create_profile(create_toml("alpha", TOOLS_TOML))
+        .await
+        .unwrap_err();
+    assert_eq!(err.code(), Code::PermissionDenied);
+    assert_eq!(err.message(), profiles::ERR_PROFILE_TOOLS_NOT_GRANTED);
+    nothing_written(&pool).await;
+}
+
+#[sqlx::test]
+async fn a_grant_is_per_user_and_covers_only_tools(pool: PgPool) {
+    let store = store(pool.clone()).await;
+    let alice = user(&pool, "alice").await;
+    let bob = user(&pool, "bob").await;
+    grant_tools(&pool, alice).await;
+    let addr = serve(&pool, &store);
+    let mut as_alice = bearer_client(addr, api_token(&pool, alice).await);
+    let mut as_bob = bearer_client(addr, api_token(&pool, bob).await);
+    let created = as_alice
+        .create_profile(create_toml("alpha", TOOLS_TOML))
+        .await
+        .unwrap()
+        .into_inner();
+    let expected = fleet_core::Profile::from_toml(TOOLS_TOML).unwrap();
+    assert!(created.created);
+    assert_eq!(created.hash, expected.hash().to_string());
+    assert_eq!(created.content_json.as_bytes(), expected.canonical_json());
+    let err = as_bob
+        .create_profile(create_toml("alpha", TOOLS_TOML))
+        .await
+        .unwrap_err();
+    assert_eq!(err.code(), Code::PermissionDenied);
+    as_bob
+        .create_profile(create_toml("beta", PLAIN_TOML))
+        .await
+        .unwrap();
+    assert_eq!(
+        owners(&pool).await,
+        [(alice, "alpha".to_owned()), (bob, "beta".to_owned())]
+    );
+}
+
+#[sqlx::test]
+async fn a_revoke_between_saves_refuses_the_second_save(pool: PgPool) {
+    let store = store(pool.clone()).await;
+    let alice = user(&pool, "alice").await;
+    grant_tools(&pool, alice).await;
+    let mut as_alice = bearer_client(serve(&pool, &store), api_token(&pool, alice).await);
+    as_alice
+        .create_profile(create_toml("alpha", TOOLS_TOML))
+        .await
+        .unwrap();
+    assert_eq!(counts(&pool).await, (1, 1));
+    revoke_tools(&pool, alice).await;
+    for content in [TOOLS_TOML_TWO, TOOLS_TOML] {
+        let err = as_alice
+            .create_profile(create_toml("alpha", content))
+            .await
+            .unwrap_err();
+        assert_eq!(err.code(), Code::PermissionDenied);
+        assert_eq!(err.message(), profiles::ERR_PROFILE_TOOLS_NOT_GRANTED);
+    }
+    assert_eq!(counts(&pool).await, (1, 1));
+    as_alice.create_profile(create("alpha", ONE)).await.unwrap();
+    assert_eq!(counts(&pool).await, (2, 2));
+}
+
+#[sqlx::test]
+async fn updating_with_tools_needs_the_capability(pool: PgPool) {
+    store(pool.clone()).await;
+    let alice = user(&pool, "alice").await;
+    owned(&pool, Some(alice), "alpha", ONE).await.unwrap();
+    let id = profile_id(&pool, alice, "alpha").await;
+    let before = counts(&pool).await;
+    let err = profiles::update_owned(&pool, Some(alice), id, ProfileContent::Toml(TOOLS_TOML))
+        .await
+        .unwrap_err();
+    assert!(matches!(err, StoreError::ToolsNotGranted), "{err}");
+    assert_eq!(counts(&pool).await, before);
+    grant_tools(&pool, alice).await;
+    profiles::update_owned(&pool, Some(alice), id, ProfileContent::Toml(TOOLS_TOML))
+        .await
+        .unwrap();
 }

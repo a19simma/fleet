@@ -120,9 +120,7 @@ async fn credential_service(
 }
 
 fn configured_store(pool: sqlx::PgPool, config: &Config) -> Store {
-    Store::new(pool)
-        .with_max_ci_retries(config.max_ci_retries)
-        .with_profile_tools(config.allow_profile_tools)
+    Store::new(pool).with_max_ci_retries(config.max_ci_retries)
 }
 
 async fn log_setup_path(users: &Users) -> Result<(), BoxError> {

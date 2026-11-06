@@ -89,7 +89,7 @@ async fn shared_with(
         .fetch_one(pool)
         .await
         .unwrap();
-    let made = fleet_server::profiles::create_owned(pool, Some(system), name, content, true)
+    let made = fleet_server::profiles::create_owned(pool, Some(system), name, content)
         .await
         .unwrap();
     sqlx::query("UPDATE profile SET visibility = 'shared' WHERE owner_user_id = $1 AND name = $2")
@@ -163,34 +163,6 @@ async fn the_lease_holder_reads_the_pinned_blob(pool: PgPool) {
 }
 
 const TOOLS_TOML: &str = "[[tools]]\nname = \"node\"\nversion = \"20.11.1\"\n";
-
-#[sqlx::test]
-async fn a_profile_with_tools_is_served_only_while_the_gate_is_on(pool: PgPool) {
-    let on = store(pool.clone()).await.with_profile_tools(true);
-    let created = shared_with(&pool, "alpha", ProfileContent::Toml(TOOLS_TOML)).await;
-    let id = batch_job(&on, "alpha").await;
-    let mut worker = worker(serve(&on), as_box);
-    let job = claim(&mut worker, &name(1)).await;
-    let reply = worker
-        .get_profile_blob(blob(&id, job.attempt, &name(1)))
-        .await
-        .unwrap()
-        .into_inner();
-    assert_eq!(reply.content, created.content_json.as_bytes());
-    assert_eq!(reply.profile.unwrap().hash, created.hash);
-    let off = on.clone().with_profile_tools(false);
-    let mut gated = self::worker(serve(&off), as_box);
-    let err = gated
-        .get_profile_blob(blob(&id, job.attempt, &name(1)))
-        .await
-        .unwrap_err();
-    assert_ne!(err.code(), Code::Ok);
-    assert!(
-        !String::from_utf8_lossy(err.message().as_bytes()).contains("node"),
-        "{}",
-        err.message()
-    );
-}
 
 #[sqlx::test]
 async fn a_job_without_a_profile_carries_none_and_has_no_blob(pool: PgPool) {
@@ -413,7 +385,6 @@ async fn the_blob_follows_the_pin_of_either_owner(pool: PgPool) {
             Some(owner),
             "alpha",
             ProfileContent::Json(json),
-            false,
         )
         .await
         .unwrap();
@@ -460,7 +431,6 @@ async fn submitted_job(pool: &PgPool, store: &Store) -> (String, fleet_proto::v1
         Some(user),
         "alpha",
         ProfileContent::Json(r#"{"claude_md":"one","selection":[{"item_id":"s2"}]}"#),
-        false,
     )
     .await
     .unwrap();
@@ -550,4 +520,78 @@ async fn a_tampered_snapshot_is_refused_and_never_served(pool: PgPool) {
         assert_eq!(err.code(), Code::Unavailable, "{tamper}");
         assert!(!err.message().contains("evil"));
     }
+}
+
+async fn user_id(pool: &PgPool, name: &str, admin: bool) -> i64 {
+    sqlx::query_scalar("INSERT INTO users (username, is_admin) VALUES ($1, $2) RETURNING id")
+        .bind(name)
+        .bind(admin)
+        .fetch_one(pool)
+        .await
+        .unwrap()
+}
+
+async fn tools_job(store: &Store, submitter: i64) -> String {
+    let request = SubmitBatchRequest {
+        idempotency_key: "tools-key".to_owned(),
+        prompt: "fix the bug".to_owned(),
+        repo: REPO.to_owned(),
+        base_sha: SHA.to_owned(),
+        repeats: 0,
+        profiles: vec!["alpha".to_owned()],
+        agent: String::new(),
+    };
+    store
+        .submit_batch_for(Some(submitter), &request)
+        .await
+        .unwrap()
+        .job_ids
+        .remove(0)
+}
+
+#[sqlx::test]
+async fn a_tools_blob_follows_the_live_grant_of_the_job_owner(pool: PgPool) {
+    let store = store(pool.clone()).await;
+    let root = user_id(&pool, "root", true).await;
+    let ann = user_id(&pool, "ann", false).await;
+    let system: i64 = sqlx::query_scalar("SELECT system_user_id()")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    let caps = fleet_server::cred::capability::Capabilities::new(pool.clone());
+    let tools = fleet_server::cred::capability::PROFILE_TOOLS;
+    caps.grant(root, system, tools).await.unwrap();
+    let created = shared_with(&pool, "alpha", ProfileContent::Toml(TOOLS_TOML)).await;
+    caps.grant(root, ann, tools).await.unwrap();
+    let id = tools_job(&store, ann).await;
+    let mut worker = worker(serve(&store), as_box);
+    let job = claim(&mut worker, &name(1)).await;
+    let reply = worker
+        .get_profile_blob(blob(&id, job.attempt, &name(1)))
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(reply.content, created.content_json.as_bytes());
+    assert_eq!(reply.profile.unwrap().hash, created.hash);
+    assert!(caps.revoke(root, system, tools).await.unwrap());
+    worker
+        .get_profile_blob(blob(&id, job.attempt, &name(1)))
+        .await
+        .unwrap();
+    assert!(caps.revoke(root, ann, tools).await.unwrap());
+    let err = worker
+        .get_profile_blob(blob(&id, job.attempt, &name(1)))
+        .await
+        .unwrap_err();
+    assert_eq!(err.code(), Code::PermissionDenied);
+    assert_eq!(
+        err.message(),
+        fleet_server::profiles::ERR_PROFILE_TOOLS_NOT_GRANTED
+    );
+    assert!(!err.message().contains("node"));
+    caps.grant(root, ann, tools).await.unwrap();
+    worker
+        .get_profile_blob(blob(&id, job.attempt, &name(1)))
+        .await
+        .unwrap();
 }

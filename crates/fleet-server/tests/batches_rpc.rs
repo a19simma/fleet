@@ -108,7 +108,7 @@ async fn shared_with(
         .fetch_one(pool)
         .await
         .unwrap();
-    let made = profiles::create_owned(pool, Some(system), name, content, true)
+    let made = profiles::create_owned(pool, Some(system), name, content)
         .await
         .unwrap();
     sqlx::query("UPDATE profile SET visibility = 'shared' WHERE owner_user_id = $1 AND name = $2")
@@ -830,15 +830,9 @@ async fn a_batch_pins_the_submitters_own_profile_and_never_a_foreign_private_one
     let make = |owner, json: &'static str| {
         let pool = pool.clone();
         async move {
-            profiles::create_owned(
-                &pool,
-                Some(owner),
-                "alpha",
-                ProfileContent::Json(json),
-                false,
-            )
-            .await
-            .unwrap()
+            profiles::create_owned(&pool, Some(owner), "alpha", ProfileContent::Json(json))
+                .await
+                .unwrap()
         }
     };
     let a = make(alice, ONE).await;
@@ -889,15 +883,9 @@ async fn a_private_profile_wins_over_a_shared_one_of_the_same_name(pool: PgPool)
     let store = store(pool.clone()).await;
     let theirs = shared(&pool, "alpha", TWO).await;
     let alice = user(&pool, "alice").await;
-    let own = profiles::create_owned(
-        &pool,
-        Some(alice),
-        "alpha",
-        ProfileContent::Json(ONE),
-        false,
-    )
-    .await
-    .unwrap();
+    let own = profiles::create_owned(&pool, Some(alice), "alpha", ProfileContent::Json(ONE))
+        .await
+        .unwrap();
     let batch = store
         .submit_batch_for(Some(alice), &request("ka", &["alpha"]))
         .await

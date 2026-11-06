@@ -1,6 +1,6 @@
 # User capabilities and model allowlist
 
-Status: Proposed 2026-11-02. Not built. Amends ADR-0048 (the server gate for `tools`). Builds on ADR-0035, ADR-0042 and ADR-0044. Amended by ADR-0056.
+Status: Proposed 2026-11-02. Built: the `profile:tools` capability (save, submit, blob serve) and the startup refusal of `FLEET_ALLOW_PROFILE_TOOLS`. Not built: `FLEET_MODEL_ALLOWLIST` and the fleetd `model_allowlist`. Amends ADR-0048 (the server gate for `tools`). Builds on ADR-0035, ADR-0042 and ADR-0044. Amended by ADR-0056.
 
 ADR-0048 gates Profile `tools` with one server switch, `FLEET_ALLOW_PROFILE_TOOLS`, because the server then had only box and client scopes. The server now has Users and an admin, a user with `users.is_admin` (ADR-0042, ADR-0056), so a grant can attach to a principal. A global switch lets every client install toolchains once an operator flips it. This ADR replaces it with a per-user capability and adds a model allowlist so a Job cannot select a model the operator never approved.
 
@@ -9,9 +9,9 @@ ADR-0048 gates Profile `tools` with one server switch, `FLEET_ALLOW_PROFILE_TOOL
 ### Capability `profile:tools`
 
 - `profile:tools` is a capability on a User. An admin grants and revokes it.
-- The server checks it twice: at profile save (`CreateProfile` with a `tools` list) and again at Job submit when the Job pins a Profile that has `tools`. The second check catches a revoke between save and submit.
+- The server checks it at profile save (`CreateProfile` with a `tools` list), at Job submit when the Job pins a Profile that has `tools`, and when it serves the pinned blob to a leased Box. The blob check uses the job owner's (`jobs.user_id`) grant, read live in the same transaction.
 - A User without the capability gets a fixed refusal that names `profile:tools`. The store is not written.
-- A Job already leased keeps running. Revoke affects later saves and submits only.
+- A revoke refuses a leased Job that has not yet fetched its blob. A Job whose Box already holds the blob keeps running.
 - The client token (`FLEET_CLIENT_TOKEN`) carries no User. A request under it never holds the capability, so it cannot save or submit a Profile with `tools`.
 
 ### Removal of `FLEET_ALLOW_PROFILE_TOOLS`
@@ -32,7 +32,7 @@ ADR-0048 gates Profile `tools` with one server switch, `FLEET_ALLOW_PROFILE_TOOL
 ## Consequences
 
 - An operator upgrading must remove `FLEET_ALLOW_PROFILE_TOOLS` and grant `profile:tools` to each user that needs it, or the server does not start.
-- Existing Profiles with `tools` stay stored and keep their hash. Submitting a Job that uses one needs a User with the capability.
+- Existing Profiles with `tools` stay stored and keep their hash. Submitting a Job that uses one needs a User with the capability, and a revoke refuses a leased Job of that owner before it fetches its blob.
 - The admin RPC and the admin UI gain grant and revoke for the capability. `fleet-server admin` gains `grant-admin` and `revoke-admin` instead (ADR-0056).
 - A fleetd with an allowlist and a server without one still enforces on the Box. A server with one and a fleetd without one enforces at submit only.
 - Model ids that vendors rename need an allowlist edit in both configs.

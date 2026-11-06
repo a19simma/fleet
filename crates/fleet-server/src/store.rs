@@ -393,8 +393,8 @@ pub enum StoreError {
     /// A batch named a profile that has no version. The handler maps this to gRPC
     /// `NOT_FOUND`. The error carries no data.
     UnknownProfile,
-    /// A submit pinned a profile with `tools` for an owner who does not hold `profile:tools`.
-    /// The handler maps this to gRPC `PERMISSION_DENIED`. The error carries no data.
+    /// A save, a submit or a blob serve involved a profile with `tools` and the responsible user
+    /// does not hold `profile:tools`. The handler maps this to gRPC `PERMISSION_DENIED`. The error carries no data.
     ToolsNotGranted,
     /// A profile blob read did not match a live lease, or no such job exists. The handler
     /// maps this to gRPC `PERMISSION_DENIED`. The error carries no data.
@@ -779,7 +779,6 @@ pub struct Store {
     pool: PgPool,
     lease: Duration,
     max_ci_retries: u32,
-    allow_profile_tools: bool,
     #[cfg(test)]
     snapshot_gate: Option<std::sync::Arc<SnapshotGate>>,
 }
@@ -798,7 +797,6 @@ impl Store {
             pool,
             lease: DEFAULT_LEASE,
             max_ci_retries: DEFAULT_CI_RETRIES,
-            allow_profile_tools: false,
             #[cfg(test)]
             snapshot_gate: None,
         }
@@ -807,14 +805,6 @@ impl Store {
     /// The connection pool, for modules that own their own tables.
     pub(crate) fn pool(&self) -> &PgPool {
         &self.pool
-    }
-
-    /// Allows profiles with tools, off otherwise. When off, creating one is refused and a
-    /// stored one is not served to a worker.
-    #[must_use]
-    pub fn with_profile_tools(mut self, allow: bool) -> Self {
-        self.allow_profile_tools = allow;
-        self
     }
 
     /// The lease a claim grants and a report renews.
@@ -967,7 +957,7 @@ impl Store {
     /// Returns [`StoreError::InvalidJob`] when the request fails validation or its profile
     /// set cannot be frozen, [`ProfileFault::Unowned`] for a profile with no user,
     /// [`StoreError::UnknownProfile`] when the user cannot read the profile,
-    /// [`StoreError::ToolsNotGranted`] when the profile has `tools` and the owner no longer
+    /// [`StoreError::ToolsNotGranted`] when the profile has `tools` and the submitting user no longer
     /// holds `profile:tools`,
     /// [`StoreError::KeyConflict`] when the key exists with different parameters, and
     /// [`StoreError::Database`] when a query fails.
@@ -1407,31 +1397,24 @@ impl Store {
         name: &str,
         content_json: &str,
     ) -> Result<fleet_proto::v1::ProfileVersion, StoreError> {
-        profiles::create_owned(
-            &self.pool,
-            caller,
-            name,
-            ProfileContent::Json(content_json),
-            self.allow_profile_tools,
-        )
-        .await
+        profiles::create_owned(&self.pool, caller, name, ProfileContent::Json(content_json)).await
     }
 
-    /// Stores a profile from either input form, gated like [`Store::create_profile`].
+    /// Stores a profile from either input form, checked like [`Store::create_profile`].
     ///
-    /// TOML content may carry tools, which [`Store::with_profile_tools`] must allow.
+    /// TOML content may carry tools, which need the `profile:tools` capability of `caller`.
     ///
     /// # Errors
     ///
-    /// Same as [`Store::create_profile`], and [`StoreError::InvalidProfile`] with
-    /// [`ProfileFault::ToolsDisabled`] when tools are present and the gate is off.
+    /// Same as [`Store::create_profile`], and [`StoreError::ToolsNotGranted`] when tools are
+    /// present and `caller` does not hold the capability.
     pub async fn create_profile_content(
         &self,
         caller: Option<i64>,
         name: &str,
         content: ProfileContent<'_>,
     ) -> Result<fleet_proto::v1::ProfileVersion, StoreError> {
-        profiles::create_owned(&self.pool, caller, name, content, self.allow_profile_tools).await
+        profiles::create_owned(&self.pool, caller, name, content).await
     }
 
     /// Reads a profile version as `viewer`, or the latest one when `version` is `None`.
@@ -1556,8 +1539,9 @@ impl Store {
     /// Returns [`StoreError::InvalidJob`] when `job_id` fails validation,
     /// [`StoreError::LeaseDenied`] when no job matches the lease,
     /// [`StoreError::UnknownProfile`] when the leased job pins no profile,
-    /// [`StoreError::OutOfRange`] when the stored blob fails the hash check and
-    /// [`StoreError::Database`] when the query fails.
+    /// [`StoreError::ToolsNotGranted`] when the blob has tools and the job owner no longer
+    /// holds `profile:tools`, [`StoreError::OutOfRange`] when the stored blob fails the hash
+    /// check and [`StoreError::Database`] when the query fails.
     pub async fn get_profile_blob(
         &self,
         job_id: &str,
@@ -1565,14 +1549,7 @@ impl Store {
         box_name: &BoxName,
     ) -> Result<GetProfileBlobReply, StoreError> {
         validate_job_id(job_id)?;
-        profiles::blob_for_lease(
-            &self.pool,
-            job_id,
-            attempt,
-            box_name.as_str(),
-            self.allow_profile_tools,
-        )
-        .await
+        profiles::blob_for_lease(&self.pool, job_id, attempt, box_name.as_str()).await
     }
 
     /// Reads the whole transcript of the job a running judge job targets, authorised against

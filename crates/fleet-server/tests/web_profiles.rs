@@ -127,7 +127,6 @@ impl Harness {
             Some(owner.user_id),
             name,
             ProfileContent::Json(json),
-            false,
         )
         .await
         .unwrap();
