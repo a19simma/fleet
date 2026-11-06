@@ -6,10 +6,11 @@
 
 use topcoat::{
     Result,
+    context::Cx,
     view::{Child, View, component, view},
 };
 
-use super::pages::STYLE_PATH;
+use super::pages::{STYLE_PATH, auth, current, fail};
 
 /// The sidebar entry a page marks as current.
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -18,19 +19,32 @@ pub(super) enum Nav {
     Profiles,
     Tokens,
     Credentials,
+    Catalog,
     Account,
 }
 
-const NAV_ITEMS: [(Nav, &str, &str); 5] = [
+const NAV_ITEMS: [(Nav, &str, &str); 6] = [
     (Nav::Jobs, "/jobs", "Jobs"),
     (Nav::Profiles, "/profiles", "Profiles"),
     (Nav::Tokens, "/tokens", "Tokens"),
     (Nav::Credentials, "/credentials", "Credentials"),
+    (Nav::Catalog, "/catalog", "Catalog"),
     (Nav::Account, "/account", "Account"),
 ];
 
+/// Whether the viewer is an admin right now: a live `users.is_admin` read, never cached on the
+/// session, so a demoted admin loses the Catalog entry on the next request.
+async fn viewer_is_admin(cx: &Cx) -> Result<bool> {
+    let auth = auth(cx)?;
+    match current(cx, auth).await? {
+        Some(session) => auth.is_admin(session.user_id).await.map_err(fail),
+        None => Ok(false),
+    }
+}
+
 #[component]
 pub(super) async fn shell(
+    cx: &Cx,
     title: &str,
     active: Nav,
     user: &str,
@@ -38,6 +52,7 @@ pub(super) async fn shell(
     mode: &str,
     child: Child<'_>,
 ) -> Result<impl View> {
+    let admin = viewer_is_admin(cx).await?;
     Ok(view! {
         <!DOCTYPE html>
         <html lang="en">
@@ -54,13 +69,15 @@ pub(super) async fn shell(
                         <ul class="menu menu-sm w-full">
                             <li class="menu-title">"fleet"</li>
                             for item in NAV_ITEMS {
-                                <li>
-                                    if item.0 == active {
-                                        <a class="menu-active" href=(item.1) aria-current="page">(item.2)</a>
-                                    } else {
-                                        <a href=(item.1)>(item.2)</a>
-                                    }
-                                </li>
+                                if admin || item.0 != Nav::Catalog {
+                                    <li>
+                                        if item.0 == active {
+                                            <a class="menu-active" href=(item.1) aria-current="page">(item.2)</a>
+                                        } else {
+                                            <a href=(item.1)>(item.2)</a>
+                                        }
+                                    </li>
+                                }
                             }
                         </ul>
                         <div class="mt-auto flex flex-col gap-2 border-t border-base-300 p-2 text-xs">

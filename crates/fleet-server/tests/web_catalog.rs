@@ -666,3 +666,62 @@ async fn adding_the_same_kind_and_name_under_a_new_id_is_refused(pool: PgPool) {
     assert_eq!(h.snapshot().await, before);
     h.finish().await;
 }
+
+const LINK: &str = "href=\"/catalog\"";
+const LINK_CURRENT: &str =
+    "<a class=\"menu-active\" href=\"/catalog\" aria-current=\"page\">Catalog</a>";
+const LINK_PLAIN: &str = "<a href=\"/catalog\">Catalog</a>";
+
+#[sqlx::test]
+async fn an_admin_sees_the_catalog_link_on_other_pages_unmarked(pool: PgPool) {
+    let h = Harness::start(pool).await;
+    let root = h.session("root", 'b', true).await;
+    for path in ["/account", "/jobs", "/tokens"] {
+        let (status, _, page) = h.fetch("GET", path, Some(&root.cookie), None).await;
+        assert_eq!(status, 200, "{path}");
+        assert!(page.contains(LINK_PLAIN), "{path}");
+        assert!(!page.contains(LINK_CURRENT), "{path}");
+    }
+    h.finish().await;
+}
+
+#[sqlx::test]
+async fn a_non_admin_sees_no_catalog_link(pool: PgPool) {
+    let h = Harness::start(pool).await;
+    let alice = h.session("alice", 'a', false).await;
+    for path in ["/account", "/jobs", "/tokens"] {
+        let (status, _, page) = h.fetch("GET", path, Some(&alice.cookie), None).await;
+        assert_eq!(status, 200, "{path}");
+        assert!(!page.contains(LINK), "{path}");
+        assert!(page.contains("href=\"/account\""), "{path}");
+    }
+    h.finish().await;
+}
+
+#[sqlx::test]
+async fn a_demoted_admin_loses_the_catalog_link_on_the_next_request(pool: PgPool) {
+    let h = Harness::start(pool).await;
+    let root = h.session("root", 'b', true).await;
+    let (_, _, page) = h.fetch("GET", "/account", Some(&root.cookie), None).await;
+    assert!(page.contains(LINK_PLAIN));
+    h.users.set_admin(root.user_id, false).await.unwrap();
+    let (status, _, page) = h.fetch("GET", "/account", Some(&root.cookie), None).await;
+    assert_eq!(status, 200);
+    assert!(!page.contains(LINK));
+    h.finish().await;
+}
+
+#[sqlx::test]
+async fn the_catalog_pages_mark_the_link_current(pool: PgPool) {
+    let h = Harness::start(pool).await;
+    let root = h.session("root", 'b', true).await;
+    h.add(&root, "greet", "skill", "say hello").await;
+    for path in ["/catalog", "/catalog/greet"] {
+        let (status, _, page) = h.fetch("GET", path, Some(&root.cookie), None).await;
+        assert_eq!(status, 200, "{path}");
+        assert!(page.contains(LINK_CURRENT), "{path}");
+        assert!(!page.contains(LINK_PLAIN), "{path}");
+        assert_eq!(page.matches("aria-current=\"page\"").count(), 1, "{path}");
+    }
+    h.finish().await;
+}

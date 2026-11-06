@@ -202,7 +202,7 @@ async fn catalog_page(cx: &Cx) -> Result<impl View> {
         .map_err(|err| internal(&err))?;
     let csrf = String::from_utf8_lossy(session.csrf.expose()).into_owned();
     Ok(view! {
-        shell(title: "fleet catalog", active: Nav::Account, user: session.username.as_str(), csrf: csrf.as_str(), mode: "",
+        shell(title: "fleet catalog", active: Nav::Catalog, user: session.username.as_str(), csrf: csrf.as_str(), mode: "",
                 <header class="mb-3 flex items-center gap-3 border-b border-base-300 pb-2 text-xs">
                     <span class="text-primary">"$"</span>
                     <h1 class="text-sm font-bold">"Catalog"</h1>
@@ -306,7 +306,7 @@ async fn item_page(cx: &Cx) -> Result<impl View> {
     let csrf = String::from_utf8_lossy(session.csrf.expose()).into_owned();
     let action = format!("/catalog/{}", found.id);
     Ok(view! {
-        shell(title: "fleet catalog item", active: Nav::Account, user: session.username.as_str(), csrf: csrf.as_str(), mode: "",
+        shell(title: "fleet catalog item", active: Nav::Catalog, user: session.username.as_str(), csrf: csrf.as_str(), mode: "",
                 <header class="mb-3 flex items-center gap-3 border-b border-base-300 pb-2 text-xs">
                     <span class="text-primary">"$"</span>
                     <h1 class="text-sm font-bold">(found.name.as_str())</h1>
