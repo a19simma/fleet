@@ -377,20 +377,14 @@ async fn older_boot_does_not_overwrite_newer_identity(pool: PgPool) {
 
 #[sqlx::test]
 async fn far_future_timestamp_cannot_freeze_identity(pool: PgPool) {
-    let store = Store::new(pool);
+    let store = Store::new(pool.clone());
     let future = at(
         on_boot(prompt("a", "go"), "boot-future"),
         fleet_server::store::MAX_TS_MS,
     );
     store.ingest(&[(1, future)]).await.unwrap();
-    let now_ms = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap()
-        .as_millis();
-    let later = at(
-        on_boot(prompt("b", "go"), "boot-new"),
-        u64::try_from(now_ms).unwrap() + 1_000,
-    );
+    let now_ms = db_now_ms(&pool).await.unwrap();
+    let later = at(on_boot(prompt("b", "go"), "boot-new"), now_ms + 1_000);
     store.ingest(&[(2, later)]).await.unwrap();
     assert_eq!(fleet(&store).await.unwrap().boot_id, "boot-new");
 }
