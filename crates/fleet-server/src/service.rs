@@ -398,6 +398,7 @@ fn worker_error(err: &StoreError) -> Status {
             Status::permission_denied(profiles::ERR_PROFILE_TOOLS_NOT_GRANTED)
         }
         StoreError::ModelDenied(denied) => Status::permission_denied(denied.to_string()),
+        StoreError::CatalogTooLarge => Status::unavailable(profiles::ERR_BLOB_CATALOG_TOO_LARGE),
         other => storage_unavailable(other),
     }
 }
@@ -1287,6 +1288,7 @@ mod tests {
                 Code::InvalidArgument,
             ),
             (StoreError::NotFound, Code::NotFound),
+            (StoreError::CatalogTooLarge, Code::Unavailable),
             (
                 StoreError::Database(sqlx::Error::PoolTimedOut),
                 Code::Unavailable,

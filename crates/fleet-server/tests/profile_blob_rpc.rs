@@ -524,6 +524,195 @@ async fn a_tampered_snapshot_is_refused_and_never_served(pool: PgPool) {
     }
 }
 
+async fn claimed_blob(pool: &PgPool) -> (Worker, String, u32) {
+    let store = store(pool.clone()).await;
+    let (id, _) = submitted_job(pool, &store).await;
+    let mut worker = worker(serve(&store), as_box);
+    let job = claim(&mut worker, &name(1)).await;
+    (worker, id, job.attempt)
+}
+
+fn entries(count: usize, body_len: usize) -> Vec<fleet_core::catalog::CatalogEntry> {
+    (0..count)
+        .map(|n| {
+            let id = format!("s{n}");
+            let item = fleet_core::catalog::CatalogItem::new(
+                fleet_core::catalog::CatalogKind::Skill,
+                &id,
+                &id,
+                &"x".repeat(body_len),
+            )
+            .unwrap();
+            fleet_core::catalog::CatalogEntry::new(item, true)
+        })
+        .collect()
+}
+
+async fn freeze_into(pool: &PgPool, items: &[fleet_core::catalog::CatalogEntry]) {
+    let set = fleet_core::catalog::resolve(
+        fleet_core::catalog::RunnerKind::Claude,
+        &fleet_core::Selection::default(),
+        items,
+    )
+    .unwrap();
+    let snapshot = fleet_server::jobs::Snapshot::freeze(&set).unwrap();
+    sqlx::query(
+        "UPDATE jobs SET snapshot_catalog = $1::jsonb, snapshot_notes = $2::jsonb, \
+         snapshot_hash = $3",
+    )
+    .bind(snapshot.catalog_json())
+    .bind(snapshot.notes_json())
+    .bind(snapshot.hash().as_slice())
+    .execute(pool)
+    .await
+    .unwrap();
+}
+
+async fn raw_snapshot(pool: &PgPool, count: usize, body_len: usize) {
+    sqlx::query("ALTER TABLE jobs DROP CONSTRAINT jobs_snapshot_catalog_shape")
+        .execute(pool)
+        .await
+        .unwrap();
+    let catalog = serde_json::Value::Array(
+        (0..count)
+            .map(|n| {
+                serde_json::json!({
+                    "id": format!("s{n}"),
+                    "kind": "skill",
+                    "name": format!("s{n}"),
+                    "content": "x".repeat(body_len),
+                })
+            })
+            .collect(),
+    );
+    sqlx::query(
+        "UPDATE jobs SET snapshot_catalog = $1::jsonb, snapshot_notes = '[]'::jsonb, \
+         snapshot_hash = decode(repeat('11', 32), 'hex')",
+    )
+    .bind(catalog.to_string())
+    .execute(pool)
+    .await
+    .unwrap();
+}
+
+#[sqlx::test]
+async fn an_admin_disable_or_delete_after_submit_leaves_the_reply_unchanged(pool: PgPool) {
+    let (mut worker, id, attempt) = claimed_blob(&pool).await;
+    let first = worker
+        .get_profile_blob(blob(&id, attempt, &name(1)))
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(first.catalog.len(), 1);
+    for change in [
+        "UPDATE catalog_items SET name = name || '-x', content = 'edited'",
+        "UPDATE catalog_items SET admin_enabled = false",
+        "DELETE FROM catalog_items",
+    ] {
+        sqlx::query(change).execute(&pool).await.unwrap();
+        let again = worker
+            .get_profile_blob(blob(&id, attempt, &name(1)))
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(again, first, "{change}");
+    }
+}
+
+#[sqlx::test]
+async fn an_empty_snapshot_gives_an_empty_catalog(pool: PgPool) {
+    let (mut worker, id, attempt) = claimed_blob(&pool).await;
+    freeze_into(&pool, &[]).await;
+    let reply = worker
+        .get_profile_blob(blob(&id, attempt, &name(1)))
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(reply.catalog.len(), 0);
+}
+
+#[sqlx::test]
+async fn a_snapshot_at_the_item_cap_is_served(pool: PgPool) {
+    let (mut worker, id, attempt) = claimed_blob(&pool).await;
+    freeze_into(&pool, &entries(fleet_proto::MAX_BLOB_CATALOG_ITEMS, 1)).await;
+    let reply = worker
+        .get_profile_blob(blob(&id, attempt, &name(1)))
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(reply.catalog.len(), fleet_proto::MAX_BLOB_CATALOG_ITEMS);
+}
+
+#[sqlx::test]
+async fn a_snapshot_over_the_item_cap_fails_closed(pool: PgPool) {
+    let (mut worker, id, attempt) = claimed_blob(&pool).await;
+    raw_snapshot(&pool, fleet_proto::MAX_BLOB_CATALOG_ITEMS + 1, 1).await;
+    let err = worker
+        .get_profile_blob(blob(&id, attempt, &name(1)))
+        .await
+        .unwrap_err();
+    assert_eq!(err.code(), Code::Unavailable);
+    assert_eq!(
+        err.message(),
+        fleet_server::profiles::ERR_BLOB_CATALOG_TOO_LARGE
+    );
+}
+
+#[sqlx::test]
+async fn a_snapshot_at_the_byte_cap_is_served(pool: PgPool) {
+    let (mut worker, id, attempt) = claimed_blob(&pool).await;
+    let per = fleet_core::catalog::MAX_BODY_BYTES;
+    let full = fleet_proto::MAX_BLOB_CATALOG_BYTES / per;
+    assert_eq!(full * per, fleet_proto::MAX_BLOB_CATALOG_BYTES);
+    freeze_into(&pool, &entries(full, per)).await;
+    let reply = worker
+        .get_profile_blob(blob(&id, attempt, &name(1)))
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(reply.catalog.len(), full);
+}
+
+#[sqlx::test]
+async fn a_snapshot_over_the_byte_cap_fails_closed(pool: PgPool) {
+    let (mut worker, id, attempt) = claimed_blob(&pool).await;
+    let per = fleet_core::catalog::MAX_BODY_BYTES;
+    let full = fleet_proto::MAX_BLOB_CATALOG_BYTES / per;
+    raw_snapshot(&pool, full + 1, per).await;
+    let err = worker
+        .get_profile_blob(blob(&id, attempt, &name(1)))
+        .await
+        .unwrap_err();
+    assert_eq!(err.code(), Code::Unavailable);
+    assert_eq!(
+        err.message(),
+        fleet_server::profiles::ERR_BLOB_CATALOG_TOO_LARGE
+    );
+}
+
+#[sqlx::test]
+async fn a_failed_lease_never_serves_catalog_data(pool: PgPool) {
+    let (mut worker, id, attempt) = claimed_blob(&pool).await;
+    for (probe, label) in [
+        (blob(&id, attempt, &name(2)), "wrong box"),
+        (blob(&id, attempt + 1, &name(1)), "wrong attempt"),
+    ] {
+        let err = worker.get_profile_blob(probe).await.unwrap_err();
+        assert_eq!(err.code(), Code::PermissionDenied, "{label}");
+        assert_eq!(err.message(), DENIED, "{label}");
+    }
+    sqlx::query("UPDATE jobs SET lease_expires_at = now() - interval '1 minute'")
+        .execute(&pool)
+        .await
+        .unwrap();
+    let err = worker
+        .get_profile_blob(blob(&id, attempt, &name(1)))
+        .await
+        .unwrap_err();
+    assert_eq!(err.code(), Code::PermissionDenied);
+    assert_eq!(err.message(), DENIED);
+}
+
 async fn user_id(pool: &PgPool, name: &str, admin: bool) -> i64 {
     sqlx::query_scalar("INSERT INTO users (username, is_admin) VALUES ($1, $2) RETURNING id")
         .bind(name)

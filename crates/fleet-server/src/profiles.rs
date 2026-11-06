@@ -11,8 +11,10 @@ use fleet_proto::v1::{
     ProfileVersion, ProfileVisibility,
 };
 use fleet_proto::{
-    ERR_PROFILE_CONTENT_CHOICE, MAX_PROFILE_JSON_BYTES, selection_to_wire, visibility_to_wire,
+    ERR_PROFILE_CONTENT_CHOICE, MAX_BLOB_CATALOG_BYTES, MAX_BLOB_CATALOG_ITEMS,
+    MAX_PROFILE_JSON_BYTES, selection_to_wire, visibility_to_wire,
 };
+use serde_json::Value;
 use sqlx::{PgConnection, PgPool, Row};
 
 use crate::cred::capability::PROFILE_TOOLS;
@@ -60,6 +62,10 @@ pub const ERR_PROFILE_SUBMIT_UNOWNED: &str = "profile submit needs a user token"
 /// The refusal text for a save, submit or blob serve of a profile with `tools` by a user without
 /// `profile:tools`.
 pub const ERR_PROFILE_TOOLS_NOT_GRANTED: &str = "profile tools need the profile:tools capability";
+
+/// The `UNAVAILABLE` message for a blob read whose stored catalog snapshot passes the item or
+/// byte cap of the wire contract. It echoes no stored data.
+pub const ERR_BLOB_CATALOG_TOO_LARGE: &str = "profile catalog snapshot too large";
 
 const LOCK_OWN_PROFILE_FOR_UPDATE: &str =
     "SELECT id, visibility FROM profile WHERE owner_user_id = $1 AND name = $2 FOR UPDATE";
@@ -679,6 +685,22 @@ fn wire_visibility(text: &str) -> Result<i32, StoreError> {
 /// same transaction as the blob, under `FOR SHARE`. The profile owner's grant does not count.
 /// The pinned model is checked against `allowlist` too, so a job queued before the list was set
 /// or narrowed is refused here. The list is process configuration and takes no lock.
+///
+/// The reply catalog is the snapshot stored on the job row at submit, read in the same query
+/// as the lease. The live catalog is never read, so an admin edit, disable or delete after
+/// submit changes nothing.
+///
+/// # Errors
+///
+/// Returns [`StoreError::LeaseDenied`] when no `RUNNING` job matches the id, attempt, box and
+/// an unexpired lease (or the attempt does not fit the column),
+/// [`StoreError::UnknownProfile`] when the job pins no profile,
+/// [`StoreError::ToolsNotGranted`] when the blob has tools and the job owner lacks
+/// `profile:tools`, [`StoreError::ModelDenied`] when the pinned model is outside `allowlist`,
+/// [`StoreError::CatalogTooLarge`] when the stored snapshot passes [`MAX_BLOB_CATALOG_ITEMS`]
+/// items or [`MAX_BLOB_CATALOG_BYTES`] content bytes, [`StoreError::OutOfRange`] when the
+/// stored blob or snapshot is malformed, partial or fails its hash check, and
+/// [`StoreError::Database`] when a query fails.
 pub(crate) async fn blob_for_lease(
     pool: &PgPool,
     job_id: &str,
@@ -730,9 +752,14 @@ pub(crate) async fn blob_for_lease(
         row.try_get::<Option<Vec<u8>>, _>("snapshot_hash")?,
     ) {
         (None, None, None) => Vec::new(),
-        (Some(catalog), Some(notes), Some(hash)) => Snapshot::from_stored(&catalog, &notes, &hash)
-            .ok_or_else(corrupt)?
-            .wire_items(),
+        (Some(catalog), Some(notes), Some(hash)) => {
+            if catalog_over_cap(&catalog, MAX_BLOB_CATALOG_ITEMS, MAX_BLOB_CATALOG_BYTES) {
+                return Err(StoreError::CatalogTooLarge);
+            }
+            Snapshot::from_stored(&catalog, &notes, &hash)
+                .ok_or_else(corrupt)?
+                .wire_items()
+        }
         _ => return Err(corrupt()),
     };
     tx.commit().await?;
@@ -745,6 +772,17 @@ pub(crate) async fn blob_for_lease(
         content,
         catalog,
     })
+}
+
+fn catalog_over_cap(catalog: &str, max_items: usize, max_bytes: usize) -> bool {
+    let Ok(Value::Array(items)) = serde_json::from_str::<Value>(catalog) else {
+        return false;
+    };
+    let bytes = items
+        .iter()
+        .filter_map(|item| item.get("content")?.as_str())
+        .fold(0usize, |sum, text| sum.saturating_add(text.len()));
+    items.len() > max_items || bytes > max_bytes
 }
 
 /// The profile version a job pins, with the effective catalog set frozen for it.
@@ -918,6 +956,27 @@ mod tests {
     use super::*;
 
     const TOOLS_TOML: &str = "[[tools]]\nname = \"node\"\nversion = \"20.11.1\"\n";
+
+    fn stored(contents: &[&str]) -> String {
+        Value::Array(
+            contents
+                .iter()
+                .map(|text| serde_json::json!({ "content": text }))
+                .collect(),
+        )
+        .to_string()
+    }
+
+    #[test]
+    fn catalog_cap_passes_at_the_limit_and_fails_one_over() {
+        assert!(!catalog_over_cap(&stored(&["a", "b"]), 2, 10));
+        assert!(catalog_over_cap(&stored(&["a", "b", "c"]), 2, 10));
+        assert!(!catalog_over_cap(&stored(&["abcde", "fghij"]), 2, 10));
+        assert!(catalog_over_cap(&stored(&["abcde", "fghijk"]), 2, 10));
+        assert!(!catalog_over_cap("[]", 0, 0));
+        assert!(!catalog_over_cap("not json", 0, 0));
+        assert!(!catalog_over_cap("{}", 0, 0));
+    }
 
     fn json(text: &str) -> ProfileContent<'_> {
         ProfileContent::Json(text)

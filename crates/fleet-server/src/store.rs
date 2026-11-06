@@ -403,6 +403,9 @@ pub enum StoreError {
     /// handler maps this to gRPC `PERMISSION_DENIED`. The name is escaped and capped by
     /// [`ModelDenied`].
     ModelDenied(ModelDenied),
+    /// The catalog snapshot stored on a leased job passes the item or byte cap of the wire
+    /// contract. The handler maps this to gRPC `UNAVAILABLE` with a fixed message.
+    CatalogTooLarge,
     /// A profile blob read did not match a live lease, or no such job exists. The handler
     /// maps this to gRPC `PERMISSION_DENIED`. The error carries no data.
     LeaseDenied,
@@ -427,6 +430,7 @@ impl fmt::Display for StoreError {
             Self::ToolsNotGranted => f.write_str(profiles::ERR_PROFILE_TOOLS_NOT_GRANTED),
             Self::ModelDenied(denied) => denied.fmt(f),
             Self::LeaseDenied => f.write_str("lease does not match"),
+            Self::CatalogTooLarge => f.write_str(profiles::ERR_BLOB_CATALOG_TOO_LARGE),
         }
     }
 }
@@ -449,7 +453,8 @@ impl std::error::Error for StoreError {
             | Self::NotFound
             | Self::UnknownProfile
             | Self::ToolsNotGranted
-            | Self::LeaseDenied => None,
+            | Self::LeaseDenied
+            | Self::CatalogTooLarge => None,
         }
     }
 }
@@ -1585,7 +1590,8 @@ impl Store {
         Ok(reply)
     }
 
-    /// Reads the profile blob a running job pins, authorised against its lease.
+    /// Reads the profile blob a running job pins, authorised against its lease. The reply catalog
+    /// is the snapshot frozen on the job at submit, never the live catalog.
     ///
     /// The job must be `RUNNING` at `attempt` on `box_name` with an unexpired lease. A job
     /// that does not exist gives the same error as a lease mismatch. The model allowlist is
@@ -1598,8 +1604,9 @@ impl Store {
     /// [`StoreError::UnknownProfile`] when the leased job pins no profile,
     /// [`StoreError::ToolsNotGranted`] when the blob has tools and the job owner no longer
     /// holds `profile:tools`, [`StoreError::ModelDenied`] when the pinned model is outside the
-    /// configured allowlist, [`StoreError::OutOfRange`] when the stored blob fails the hash
-    /// check and [`StoreError::Database`] when the query fails.
+    /// configured allowlist, [`StoreError::CatalogTooLarge`] when the job's stored catalog
+    /// snapshot passes the item or byte cap, [`StoreError::OutOfRange`] when the stored blob or
+    /// snapshot fails the hash check and [`StoreError::Database`] when the query fails.
     pub async fn get_profile_blob(
         &self,
         job_id: &str,
