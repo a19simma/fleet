@@ -42,11 +42,24 @@ impl GithubApi for NoGithub {
 }
 
 fn sealer() -> FileSealer {
-    let path = std::env::temp_dir().join(format!("fleet-web-shell-{}.keys", std::process::id()));
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let n = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let path =
+        std::env::temp_dir().join(format!("fleet-web-shell-{}-{n}.keys", std::process::id()));
     std::fs::write(&path, format!("k1:{}\n", "ab".repeat(32))).unwrap();
     let sealer = FileSealer::load(&path);
     std::fs::remove_file(&path).unwrap();
     sealer.unwrap()
+}
+
+#[test]
+fn sealers_built_in_parallel_do_not_share_a_key_file() {
+    let threads: Vec<_> = (0..16)
+        .map(|_| std::thread::spawn(|| drop(sealer())))
+        .collect();
+    for t in threads {
+        t.join().unwrap();
+    }
 }
 
 struct Reply {
