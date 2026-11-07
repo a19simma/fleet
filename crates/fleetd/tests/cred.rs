@@ -2059,7 +2059,7 @@ async fn a_first_fetch_and_a_pat_refetch_revoke_nothing() -> TestResult {
 #[tokio::test]
 async fn a_replaced_token_is_not_revoked_while_a_child_holds_it() -> TestResult {
     let (book, fake, revokes) = revoking(5 * MINUTE_MS, "204 No Content", false).await?;
-    let lease = book.lease("job1").ok_or("no lease")?;
+    let lease = book.lease_held("job1").ok_or("no lease")?.1;
     set_reply(&fake, fresh_reply());
     assert!(book.refresh_if_due("job1").await?.is_some());
     quiet(&revokes).await;
@@ -2072,8 +2072,8 @@ async fn a_replaced_token_is_not_revoked_while_a_child_holds_it() -> TestResult 
 #[tokio::test]
 async fn a_replaced_token_waits_for_every_child_that_holds_it() -> TestResult {
     let (book, fake, revokes) = revoking(5 * MINUTE_MS, "204 No Content", false).await?;
-    let first = book.lease("job1").ok_or("no lease")?;
-    let second = book.lease("job1").ok_or("no lease")?;
+    let first = book.lease_held("job1").ok_or("no lease")?.1;
+    let second = book.lease_held("job1").ok_or("no lease")?.1;
     set_reply(&fake, fresh_reply());
     assert!(book.refresh_if_due("job1").await?.is_some());
     drop(first);
@@ -2107,7 +2107,7 @@ async fn a_child_started_after_the_swap_does_not_delay_the_old_revoke() -> TestR
     let (book, fake, revokes) = revoking(5 * MINUTE_MS, "204 No Content", false).await?;
     set_reply(&fake, fresh_reply());
     assert!(book.refresh_if_due("job1").await?.is_some());
-    let lease = book.lease("job1").ok_or("no lease")?;
+    let lease = book.lease_held("job1").ok_or("no lease")?.1;
     eventually_count(&revokes, 1).await?;
     assert_eq!(revokes.tokens(), [format!("Bearer {APP_TOKEN}")]);
     drop(lease);
@@ -2123,7 +2123,7 @@ async fn a_replaced_token_is_revoked_after_the_drain_limit_when_a_child_never_en
         Some(Duration::from_millis(150)),
     )
     .await?;
-    let lease = book.lease("job1").ok_or("no lease")?;
+    let lease = book.lease_held("job1").ok_or("no lease")?.1;
     set_reply(&fake, fresh_reply());
     assert!(book.refresh_if_due("job1").await?.is_some());
     eventually_count(&revokes, 1).await?;
@@ -2135,7 +2135,7 @@ async fn a_replaced_token_is_revoked_after_the_drain_limit_when_a_child_never_en
 #[tokio::test]
 async fn the_job_end_revokes_the_held_token_without_waiting_for_a_child() -> TestResult {
     let (book, _fake, revokes) = revoking(30 * MINUTE_MS, "204 No Content", false).await?;
-    let lease = book.lease("job1").ok_or("no lease")?;
+    let lease = book.lease_held("job1").ok_or("no lease")?.1;
     book.end("job1");
     eventually_count(&revokes, 1).await?;
     drop(lease);
@@ -2145,9 +2145,9 @@ async fn the_job_end_revokes_the_held_token_without_waiting_for_a_child() -> Tes
 #[tokio::test]
 async fn a_lease_needs_a_held_job() -> TestResult {
     let (book, _fake, _revokes) = revoking(30 * MINUTE_MS, "204 No Content", false).await?;
-    assert!(book.lease("job9").is_none());
+    assert!(book.lease_held("job9").is_none());
     book.forget("job1");
-    assert!(book.lease("job1").is_none());
+    assert!(book.lease_held("job1").is_none());
     Ok(())
 }
 

@@ -748,20 +748,12 @@ impl CredentialBook {
         self
     }
 
-    /// Holds the token of `job_id` for a child that is about to start with it. `None` when the
-    /// book holds nothing for the job.
-    ///
-    /// Keep the lease until the child exits. The job end revokes the held token without waiting
-    /// for any lease. To read the token the child starts with, use
-    /// [`CredentialBook::lease_held`], which pairs the credentials and the lease.
-    #[must_use]
-    pub fn lease(&self, job_id: &str) -> Option<TokenLease> {
-        self.lease_held(job_id).map(|(_, lease)| lease)
-    }
-
     /// The credentials held for `job_id` and a [`TokenLease`] on the same token, taken in one
     /// step so no refresh can swap between the read and the lease. `None` when the book holds
     /// nothing for the job.
+    ///
+    /// Keep the lease until the child exits. The job end revokes the held token without waiting
+    /// for any lease.
     #[must_use]
     pub fn lease_held(&self, job_id: &str) -> Option<(Arc<JobCredentials>, TokenLease)> {
         let guard = self.held.lock().unwrap_or_else(PoisonError::into_inner);
