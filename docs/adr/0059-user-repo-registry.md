@@ -10,8 +10,13 @@ documented in `infra/README.md` and `crates/fleet-server/README.md`). Also built
 the `FleetRepos` proto (`AddRepo`, `ListRepos`, `RemoveRepo`, `RepoInfo`), migration 0036 (the
 `user_repos` table and the nullable `github_app_mint.job_id`, required only for scope `job`), the
 five `PRECONDITION_REPO_*` constants in `fleet-proto` with their `Reason` variants and
-`CredentialNotice` mappings. Not built: the `FleetRepos` server handlers, `RepoVerifier`,
-`REPO_CHECK_BUDGET`, the `credentials.host` column and the `forgejo_pat` kind. The `path` column
+`CredentialNotice` mappings. Also built: the shared https helper (`cred::https`), the SSRF-safe
+resolver and connector (`cred::pinned`), the `RepoVerifier` trait with the GitHub verifier and the
+`RepoVerifiers` registry (`cred::repo_verify`), `REPO_CHECK_BUDGET` (7 s, a total deadline) and the
+public `FakeVerifier` (`cred::repo_fake`). GitHub answers a renamed repository with a 301. Redirects
+are never followed, so a rename gives `UPSTREAM_UNAVAILABLE`. The App probe mints with no job.
+Not built: the `FleetRepos` server handlers, the store, the CLI, the Forgejo verifier (the registry
+has a slot only), the `credentials.host` column and the `forgejo_pat` kind. The `path` column
 holds at most 141 bytes: a Forgejo owner of 40, a slash and a name of 100.
 
 A User names the repositories they work on, so the CLI and the web page can list them and later

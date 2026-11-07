@@ -943,6 +943,7 @@ dependencies = [
  "hyper-util",
  "openssl",
  "pem",
+ "rcgen",
  "ring",
  "rustix",
  "rustls",

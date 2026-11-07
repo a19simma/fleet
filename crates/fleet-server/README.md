@@ -23,6 +23,12 @@ The hosted Fleet service. It stores box state, jobs, transcripts, job timing and
 
 - `catalog`: the global Catalog of skill, subagent, tool and context items (ADR-0053). An admin creates and enables items through `FleetCatalogAdmin` or the `/catalog` pages. A Profile switches items off and the effective set is resolved at submit.
 - `cred::capability`: per-user capability grants. `profile:tools` (ADR-0054) lets a user save a Profile with tools. `forge:github_app` (ADR-0058) gates the `github_app` credential kind at put, release and verify through `cred::store::required_capability`, which maps the `github_app` kind. Migration 0034 widens the table CHECK to both names, and the admin capability page lists, grants and revokes each one.
+- `cred::https`, `cred::pinned`: the shared https client plumbing and the SSRF-safe forge connector (ADR-0059). The connector:
+  - resolves a host once and vets every address with `is_vetted`;
+  - admits global unicast only: metadata addresses, loopback, link-local, CGNAT `100.64/10`, documentation and 6to4 ranges are always refused, and `allow_private` admits only RFC 1918 and ULA;
+  - dials the vetted IP with SNI and certificate checks by host name;
+  - follows no redirect and caps the body at 256 KiB.
+- `cred::repo_verify`, `cred::repo_fake`: the `RepoVerifier` trait, the GitHub verifier and the `RepoVerifiers` registry. A check runs under `REPO_CHECK_BUDGET` (7 s, below `CALL_BUDGET`) and refuses with one of five `RepoRefusal` values, one per `PRECONDITION_REPO_*` reason. The transport is an injected seam. `FakeVerifier` models every state for handler tests. Callers parse a repository with `RepoRef::parse_as` using the kind the registry reports.
 - `timing`: stores the `ReportTiming` breakdown and the shell command logs a box reports, and serves `GetJobTiming` and `StreamShellLog` (ADR-0055). The pages are `/jobs/{job_id}/timing` and `/jobs/{job_id}/shell/{command_id}/log`.
 - `profiles`: owner-scoped Profiles with `private` and `shared` visibility (ADR-0052).
 - `retention`: the telemetry retention sweep. See the root `README.md` for the variables.

@@ -178,6 +178,7 @@ impl CredentialStore {
             .bind(reason)
             .bind(self.policy.denied_dedupe_secs)
             .bind(record.scope.wire())
+            .bind(record.credential_id)
             .fetch_one(&mut *tx)
             .await?;
         if !recent {

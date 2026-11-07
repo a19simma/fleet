@@ -8,18 +8,17 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use fleet_core::credential::Secret;
-use http_body_util::{BodyExt, Empty, Limited};
+use http_body_util::Empty;
 use hyper::body::Bytes;
-use hyper::header::{ACCEPT, AUTHORIZATION, HOST, HeaderValue, USER_AGENT};
+use hyper::header::{ACCEPT, AUTHORIZATION, HOST, USER_AGENT};
 use hyper::{Request, StatusCode};
-use hyper_util::rt::TokioIo;
+use rustls::ClientConfig;
 use rustls::pki_types::ServerName;
-use rustls::{ClientConfig, RootCertStore};
 use tokio::net::TcpStream;
-use tokio::task::JoinHandle;
 use tokio::time::timeout;
 use tokio_rustls::TlsConnector;
-use zeroize::Zeroizing;
+
+use super::https::{bearer_header, read_capped, send, tls_config};
 
 const API_HOST: &str = "api.github.com";
 const EXPIRY_HEADER: &str = "github-authentication-token-expiration";
@@ -87,12 +86,13 @@ impl HttpsGithub {
     ///
     /// Returns [`GithubError::Unavailable`] when the TLS stack cannot be set up.
     pub fn new() -> Result<Self, GithubError> {
-        Ok(Self { tls: tls_config()? })
+        Ok(Self {
+            tls: tls_config().map_err(unavailable)?,
+        })
     }
 
     async fn request(&self, token: &Secret) -> Result<GithubUser, GithubError> {
-        let bearer =
-            Zeroizing::new(String::from_utf8(token.expose().to_vec()).map_err(unavailable)?);
+        let header = bearer_header(token.expose()).ok_or(GithubError::Unavailable)?;
         let tcp = TcpStream::connect((API_HOST, 443))
             .await
             .map_err(unavailable)?;
@@ -101,14 +101,6 @@ impl HttpsGithub {
             .connect(name, tcp)
             .await
             .map_err(unavailable)?;
-        let (mut sender, connection) = hyper::client::conn::http1::handshake(TokioIo::new(tls))
-            .await
-            .map_err(unavailable)?;
-        let _guard = AbortOnDrop(tokio::spawn(connection));
-        let mut header =
-            HeaderValue::from_str(&Zeroizing::new(format!("Bearer {}", bearer.as_str())))
-                .map_err(unavailable)?;
-        header.set_sensitive(true);
         let request = Request::builder()
             .uri("/user")
             .header(HOST, API_HOST)
@@ -117,7 +109,7 @@ impl HttpsGithub {
             .header(AUTHORIZATION, header)
             .body(Empty::<Bytes>::new())
             .map_err(unavailable)?;
-        let response = sender.send_request(request).await.map_err(unavailable)?;
+        let (response, _guard) = send(tls, request).await.map_err(unavailable)?;
         match response.status() {
             StatusCode::OK => {}
             StatusCode::UNAUTHORIZED => return Err(GithubError::Rejected),
@@ -128,11 +120,9 @@ impl HttpsGithub {
             .get(EXPIRY_HEADER)
             .and_then(|value| value.to_str().ok())
             .and_then(parse_expiry);
-        let body = Limited::new(response.into_body(), MAX_BODY_BYTES)
-            .collect()
+        let body = read_capped(response.into_body(), MAX_BODY_BYTES)
             .await
-            .map_err(|_| GithubError::Unavailable)?
-            .to_bytes();
+            .map_err(unavailable)?;
         let login = login_of(&body).ok_or(GithubError::Unavailable)?;
         Ok(GithubUser {
             login,
@@ -147,34 +137,6 @@ impl GithubApi for HttpsGithub {
         timeout(TOTAL_TIMEOUT, self.request(token))
             .await
             .unwrap_or(Err(GithubError::Unavailable))
-    }
-}
-
-/// Builds the TLS client config: ring, the bundled webpki roots and HTTP/1.1 only.
-///
-/// # Errors
-///
-/// Returns [`GithubError::Unavailable`] when ring does not support the default protocol
-/// versions.
-pub(super) fn tls_config() -> Result<Arc<ClientConfig>, GithubError> {
-    let roots = RootCertStore {
-        roots: webpki_roots::TLS_SERVER_ROOTS.to_vec(),
-    };
-    let provider = Arc::new(rustls::crypto::ring::default_provider());
-    let mut config = ClientConfig::builder_with_provider(provider)
-        .with_safe_default_protocol_versions()
-        .map_err(|_| GithubError::Unavailable)?
-        .with_root_certificates(roots)
-        .with_no_client_auth();
-    config.alpn_protocols = vec![b"http/1.1".to_vec()];
-    Ok(Arc::new(config))
-}
-
-pub(super) struct AbortOnDrop(pub(super) JoinHandle<Result<(), hyper::Error>>);
-
-impl Drop for AbortOnDrop {
-    fn drop(&mut self) {
-        self.0.abort();
     }
 }
 

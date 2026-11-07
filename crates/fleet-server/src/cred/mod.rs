@@ -14,8 +14,12 @@ pub mod app_mint;
 pub mod app_policy;
 pub mod capability;
 pub mod github;
+pub mod https;
 pub mod limiter;
 pub mod password;
+pub mod pinned;
+pub mod repo_fake;
+pub mod repo_verify;
 pub mod seal;
 pub mod store;
 #[cfg(test)]

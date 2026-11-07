@@ -84,8 +84,7 @@ const READ_CAPABILITY: &str =
 
 const INSERT_USE: &str = "INSERT INTO credential_use (credential_id, job_id) VALUES ($1, $2)";
 
-const LOCK_CREDENTIAL: &str =
-    "SELECT id FROM credentials WHERE id = $1 AND tombstoned_at IS NULL FOR UPDATE";
+const LOCK_CREDENTIAL: &str = "SELECT id FROM credentials WHERE id = $1 AND user_id = $2 AND kind = 'github_app' AND tombstoned_at IS NULL FOR UPDATE";
 
 const COUNT_ATTEMPTS: &str = "SELECT count(*) FROM github_app_mint WHERE job_id = $1 AND scope = 'job' AND outcome = 'attempt'";
 
@@ -94,7 +93,7 @@ SELECT count(*) FROM github_app_mint m JOIN credentials c ON c.id = m.credential
 WHERE c.user_id = $1 AND m.outcome = 'attempt' AND m.at > clock_timestamp() - $2::bigint * interval '1 second'";
 
 const DENIED_RECENTLY: &str = "\
-SELECT EXISTS (SELECT 1 FROM github_app_mint WHERE job_id = $1 AND scope = $4 AND outcome = 'denied' \
+SELECT EXISTS (SELECT 1 FROM github_app_mint WHERE job_id IS NOT DISTINCT FROM $1 AND credential_id = $5 AND scope = $4 AND outcome = 'denied' \
 AND reason = $2 AND at > now() - $3::bigint * interval '1 second')";
 
 const INSERT_ROOT: &str = "\
@@ -189,7 +188,7 @@ fn refusal_reason(err: &StoreError) -> &'static str {
 #[derive(Clone)]
 struct MintRecord {
     credential_id: i64,
-    job_id: String,
+    job_id: Option<String>,
     repo: String,
     installation: String,
     scope: MintScope,
@@ -327,6 +326,32 @@ impl Drop for RevokeGuard {
     }
 }
 
+/// What a probe mint is scoped to.
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum ProbeTarget<'a> {
+    /// The repository of the User's most recent Job, which also names the audit row's Job.
+    LatestJob,
+    /// The given repository, with no Job.
+    Repo(&'a str),
+}
+
+/// A probe-scope installation token held for one call. Dropping it revokes the token.
+pub(crate) struct ProbeLease {
+    guard: RevokeGuard,
+}
+
+impl ProbeLease {
+    /// The token text, or `None` once the lease is finished.
+    pub(crate) fn token(&self) -> Option<&str> {
+        self.guard.armed.as_ref().map(|armed| armed.token.expose())
+    }
+
+    /// Revokes the token and reports whether GitHub accepted the revoke.
+    pub(crate) async fn finish(mut self) -> bool {
+        self.guard.revoke().await
+    }
+}
+
 /// Closes an `attempt` row as `failed` when the future that holds it is dropped before the mint
 /// returns.
 ///
@@ -384,7 +409,7 @@ pub(super) fn armed_guard_for_test(
             pool,
             record: MintRecord {
                 credential_id: 1,
-                job_id: "job".to_owned(),
+                job_id: Some("job".to_owned()),
                 repo: "o/widget".to_owned(),
                 installation: "1".to_owned(),
                 scope: MintScope::Job,
@@ -1285,6 +1310,7 @@ impl CredentialStore {
                 .ok_or(StoreError::MintFailed)?;
             sqlx::query(LOCK_CREDENTIAL)
                 .bind(app_id)
+                .bind(user_id)
                 .fetch_optional(&mut *tx)
                 .await?
                 .ok_or(StoreError::MintFailed)?;
@@ -1350,7 +1376,7 @@ impl CredentialStore {
             .ok_or(StoreError::MintFailed)?;
         let record = MintRecord {
             credential_id: app_id,
-            job_id: job_id.to_owned(),
+            job_id: Some(job_id.to_owned()),
             repo: audit_repo(repo),
             installation: installation.to_string(),
             scope: MintScope::Job,
@@ -1477,6 +1503,34 @@ impl CredentialStore {
         credential_id: i64,
         installation: &Secret,
     ) -> Result<(), StoreError> {
+        let lease = self
+            .probe_lease(user_id, credential_id, installation, ProbeTarget::LatestJob)
+            .await?;
+        if lease.finish().await {
+            Ok(())
+        } else {
+            Err(StoreError::MintFailed)
+        }
+    }
+
+    /// Mints a probe-scope installation token and hands it to the caller as a [`ProbeLease`].
+    ///
+    /// The gate is [`CredentialStore::probe_app`]'s: capability, credential lock, per-User
+    /// rate, allowlists, the write-ahead `attempt` row and a mint outside any lock. The token is
+    /// scoped to `target`. A repository target has no Job, so the audit row carries no Job id.
+    /// Dropping the lease revokes the token.
+    ///
+    /// # Errors
+    ///
+    /// The errors of [`CredentialStore::probe_app`], where [`StoreError::NoJobRepo`] applies to
+    /// [`ProbeTarget::LatestJob`] only.
+    pub(crate) async fn probe_lease(
+        &self,
+        user_id: i64,
+        credential_id: i64,
+        installation: &Secret,
+        target: ProbeTarget<'_>,
+    ) -> Result<ProbeLease, StoreError> {
         let installation = std::str::from_utf8(installation.expose())
             .ok()
             .and_then(|text| text.parse::<u64>().ok())
@@ -1487,14 +1541,21 @@ impl CredentialStore {
             .await?;
         sqlx::query(LOCK_CREDENTIAL)
             .bind(credential_id)
-            .fetch_optional(&mut *tx)
-            .await?
-            .ok_or(StoreError::NotFound)?;
-        let (job_id, repo): (String, String) = sqlx::query_as(LATEST_JOB)
             .bind(user_id)
             .fetch_optional(&mut *tx)
             .await?
-            .ok_or(StoreError::NoJobRepo)?;
+            .ok_or(StoreError::NotFound)?;
+        let (job_id, repo) = match target {
+            ProbeTarget::LatestJob => {
+                let (job_id, repo): (String, String) = sqlx::query_as(LATEST_JOB)
+                    .bind(user_id)
+                    .fetch_optional(&mut *tx)
+                    .await?
+                    .ok_or(StoreError::NoJobRepo)?;
+                (Some(job_id), repo)
+            }
+            ProbeTarget::Repo(repo) => (None, repo.to_owned()),
+        };
         let record = MintRecord {
             credential_id,
             job_id,
@@ -1503,7 +1564,7 @@ impl CredentialStore {
             scope: MintScope::Probe,
         };
         let MintedToken {
-            mut guard,
+            guard,
             attempt_id,
             expires_at,
         } = self
@@ -1524,13 +1585,8 @@ impl CredentialStore {
                 .await
         }
         .await;
-        let revoked = guard.revoke().await;
         minted?;
-        if revoked {
-            Ok(())
-        } else {
-            Err(StoreError::MintFailed)
-        }
+        Ok(ProbeLease { guard })
     }
 
     /// Unseals the user's credential for `job_id` and records the use in the same transaction.

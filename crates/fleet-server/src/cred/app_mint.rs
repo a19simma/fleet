@@ -42,7 +42,8 @@ use tokio_rustls::TlsConnector;
 use zeroize::Zeroizing;
 
 use super::app_jwt::AppJwt;
-use super::github::{AbortOnDrop, parse_expiry, tls_config};
+use super::github::parse_expiry;
+use super::https::{AbortOnDrop, tls_config};
 
 const API_HOST: &str = "api.github.com";
 const API_VERSION: &str = "2022-11-28";

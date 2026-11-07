@@ -18,7 +18,9 @@ use super::app_mint::{AppClient, Limits};
 use super::app_policy::AppPolicy;
 use super::capability::Capabilities;
 use super::seal::FileSealer;
-use super::store::{AppLane, CredentialStore, DENIED_DEDUPE_SECS, MintPolicy, StoreError};
+use super::store::{
+    AppLane, CredentialStore, DENIED_DEDUPE_SECS, MintPolicy, ProbeTarget, StoreError,
+};
 use crate::store::Store;
 
 const PAT: &str = "github_pat_11ABCDEFG0abcdefghijklmnop";
@@ -820,6 +822,109 @@ async fn verify_scopes_the_mint_to_the_most_recent_job_repository(pool: PgPool) 
     service.verify(w.alice, &request).await.unwrap();
     let mint = &fake.first_mint();
     assert!(mint.contains(r#""repositories":["gadget"]"#), "{mint}");
+}
+
+#[sqlx::test]
+async fn the_repo_probe_mints_for_the_given_repository_without_a_job_and_revokes(pool: PgPool) {
+    let fake = fake("201 Created", None).await;
+    let w = world(pool, Some(client(&fake))).await;
+    w.seed(true).await;
+    sqlx::query("DELETE FROM jobs")
+        .execute(&w.pool)
+        .await
+        .unwrap();
+    let installation = Secret::new(INSTALLATION.to_string());
+    let lease = w
+        .creds
+        .probe_lease(
+            w.alice,
+            app_id(&w).await.try_into().unwrap(),
+            &installation,
+            ProbeTarget::Repo("o/widget"),
+        )
+        .await
+        .unwrap();
+    assert_eq!(lease.token(), Some(TOKEN));
+    assert!(fake.first_mint().contains(r#""repositories":["widget"]"#));
+    assert!(lease.finish().await);
+    let rows: Vec<(Option<String>, String, String)> =
+        sqlx::query_as("SELECT job_id, scope, outcome FROM github_app_mint ORDER BY id")
+            .fetch_all(&w.pool)
+            .await
+            .unwrap();
+    let outcomes: Vec<&str> = rows.iter().map(|r| r.2.as_str()).collect();
+    assert_eq!(outcomes, ["attempt", "minted", "revoked"]);
+    assert!(rows.iter().all(|r| r.0.is_none() && r.1 == "probe"));
+    assert_eq!(w.uses().await, 0);
+}
+
+#[sqlx::test]
+async fn a_repo_probe_outside_the_allowlist_mints_nothing_and_dedupes_its_denial(pool: PgPool) {
+    let fake = fake("201 Created", None).await;
+    let w = world_with(pool, Some(client(&fake)), policy("4242", "o/widget")).await;
+    w.seed(true).await;
+    let installation = Secret::new(INSTALLATION.to_string());
+    let id: i64 = app_id(&w).await.try_into().unwrap();
+    for _ in 0..2 {
+        let denied = w
+            .creds
+            .probe_lease(w.alice, id, &installation, ProbeTarget::Repo("o/gadget"))
+            .await;
+        assert!(matches!(denied, Err(StoreError::RepoDenied)));
+    }
+    assert_eq!(fake.mints(), 0);
+    assert_eq!(w.outcomes().await, ["denied"]);
+}
+
+#[sqlx::test]
+async fn a_repo_probe_denial_of_one_user_does_not_hide_another_users_denial(pool: PgPool) {
+    let fake = fake("201 Created", None).await;
+    let w = world_with(pool, Some(client(&fake)), policy("4242", "o/widget")).await;
+    w.seed(true).await;
+    w.caps.grant(w.admin, w.admin, CAP).await.unwrap();
+    w.creds
+        .put(
+            w.admin,
+            CredentialKind::GithubApp,
+            STATIC,
+            Secret::new(INSTALLATION.to_string()),
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+    let ids: Vec<(i64, i64)> =
+        sqlx::query_as("SELECT user_id, id FROM credentials WHERE kind = 'github_app' ORDER BY id")
+            .fetch_all(&w.pool)
+            .await
+            .unwrap();
+    assert_eq!(ids.len(), 2);
+    let installation = Secret::new(INSTALLATION.to_string());
+    for (user, id) in ids {
+        let denied = w
+            .creds
+            .probe_lease(user, id, &installation, ProbeTarget::Repo("o/gadget"))
+            .await;
+        assert!(matches!(denied, Err(StoreError::RepoDenied)));
+    }
+    assert_eq!(w.outcomes().await, ["denied", "denied"]);
+}
+
+#[sqlx::test]
+async fn a_repo_probe_on_another_users_credential_is_not_found_and_mints_nothing(pool: PgPool) {
+    let fake = fake("201 Created", None).await;
+    let w = world(pool, Some(client(&fake))).await;
+    w.seed(true).await;
+    w.caps.grant(w.admin, w.admin, CAP).await.unwrap();
+    let installation = Secret::new(INSTALLATION.to_string());
+    let id: i64 = app_id(&w).await.try_into().unwrap();
+    let result = w
+        .creds
+        .probe_lease(w.admin, id, &installation, ProbeTarget::Repo("o/widget"))
+        .await;
+    assert!(matches!(result, Err(StoreError::NotFound)));
+    assert_eq!(fake.mints(), 0);
+    assert_eq!(w.outcomes().await.len(), 0);
 }
 
 #[sqlx::test]

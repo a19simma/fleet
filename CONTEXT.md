@@ -188,7 +188,7 @@ A forge hostname the operator allows in the operator host list, with its **Forge
 _Avoid_: git server, remote
 
 **Forge kind**:
-The family of a **Repo host**: `github` and `forgejo` are built, `gitlab` is planned. The config `Forge` enum and the core `ForgeKind` enum are separate types. It will select the **Repo verifier**. It is set per host in operator config, never by the User (ADR-0059).
+The family of a **Repo host**: `github` and `forgejo` are built, `gitlab` is planned. The config `Forge` enum and the core `ForgeKind` enum are separate types. It selects the **Repo verifier**. It is set per host in operator config, never by the User (ADR-0059).
 _Avoid_: forge type, provider
 
 **Repo key**:
@@ -196,7 +196,7 @@ The `(user, host, path)` triple that names a **Registered repository**. It diffe
 _Avoid_: repo id
 
 **Repo verifier**:
-The server-side `RepoVerifier` implementation of one **Forge kind**. `fleet repo add` runs it before the insert: it reads the repository with the User's own stored credential and records push as optional. `add` is refused when the host has no verifier or the User has no credential for it (ADR-0059).
+The server-side `RepoVerifier` implementation of one **Forge kind**. `fleet repo add` runs it before the insert: it reads the repository with the User's own stored credential and records push as optional. `add` is refused when the host has no verifier or the User has no credential for it. Built: the trait, the GitHub verifier, the registry and the public `FakeVerifier`. Not built: the Forgejo verifier and the `add` handler (ADR-0059).
 _Avoid_: repo checker, forge check
 
 **Registered repository**:
