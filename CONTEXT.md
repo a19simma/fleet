@@ -1,6 +1,6 @@
 # Fleet
 
-Fleet runs coding-agent Jobs on Boxes and records what each Job did. This file defines the terms of the ADRs on telemetry and metrics (0029, 0030), profiles (0034, 0035, 0052, 0053, 0057), capabilities and the model allowlist (0054), job timing (0055), the job socket, broker and registration (0036, 0037, 0039), fetch policy (0038), credentials and users (0040, 0042, 0043), the GitHub App lane (0058), agent runners and forges (0044, 0045) the mirror key (0046) and the update trust root (0047, 0050).
+Fleet runs coding-agent Jobs on Boxes and records what each Job did. This file defines the terms of the ADRs on telemetry and metrics (0029, 0030), profiles (0034, 0035, 0052, 0053, 0057), capabilities and the model allowlist (0054), job timing (0055), the job socket, broker and registration (0036, 0037, 0039), fetch policy (0038), credentials and users (0040, 0042, 0043), the GitHub App lane (0058), agent runners and forges (0044, 0045), the mirror key (0046), the update trust root (0047, 0050), and the release feed (0060, 0061).
 
 ## Language
 
@@ -230,6 +230,22 @@ _Avoid_: trust anchor, signing key
 **Baked key**:
 The default minisign public key embedded in the fleetd binary from `crates/fleetd/trust/update.pub` (`BAKED_TRUST_KEY`). Only a new fleetd build changes it (ADR-0050).
 _Avoid_: update.pub, signing key
+
+**Release feed**:
+The signed `manifest.json` and `manifest.json.minisig` of the latest published GitHub release of `FLEET_UPDATE_REPO`, which the server fetches itself on a timer. File mode (`FLEET_UPDATE_MANIFEST`) stays as break-glass (ADR-0060, ADR-0061).
+_Avoid_: update channel, manifest URL
+
+**Update relay**:
+The server component, `UpdateRelay`, that holds the **Last good pair** and passes it to boxes in `HeartbeatReply`. It signs and verifies nothing (ADR-0047, ADR-0060).
+_Avoid_: update server, mirror
+
+**Last good pair**:
+The manifest bytes and signature bytes the **Update relay** last accepted, held in memory with no maximum age. A failed fetch never evicts it (ADR-0060).
+_Avoid_: cache entry, current manifest
+
+**Seq gate**:
+The server rule that replaces the **Last good pair** only for a higher `seq`, and rejects a lower `seq` or an equal `seq` with different bytes. A sanity check on storage, not a trust decision: fleetd still checks `seq` itself (ADR-0060).
+_Avoid_: version check, replay guard
 
 **Console theme**:
 The dark, dense daisyUI theme named `console`, defined in `crates/fleet-server/ui/input.css` and described in `DESIGN.md`. Every web page renders through the shared shell in `src/web/layout.rs` (ADR-0051).
