@@ -1184,6 +1184,7 @@ async fn no_secret_or_upstream_body_reaches_logs_or_replies(pool: PgPool) {
         reply: ForgeReply {
             status: StatusCode::INTERNAL_SERVER_ERROR,
             body: body.as_bytes().to_vec(),
+            location: None,
         },
     };
     let verifier = GithubVerifier::new(Arc::new(transport), None);
@@ -1212,6 +1213,7 @@ async fn a_real_github_reply_is_parsed_for_path_and_push(pool: PgPool) {
             status: StatusCode::OK,
             body: br#"{"full_name":"Octo/Hello","permissions":{"pull":true,"push":false}}"#
                 .to_vec(),
+            location: None,
         },
     };
     let verifier = GithubVerifier::new(Arc::new(transport), None);

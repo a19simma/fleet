@@ -133,9 +133,14 @@ pub struct ForgeGet<'a> {
     pub path: &'a str,
     /// Whether RFC 1918 and unique-local addresses are acceptable for this host.
     pub allow_private: bool,
-    /// The `Authorization` value, marked sensitive.
-    pub authorization: &'a HeaderValue,
+    /// The `Authorization` value, marked sensitive, or `None` to send no such header.
+    pub authorization: Option<&'a HeaderValue>,
+    /// The `Accept` header value.
+    pub accept: &'a str,
 }
+
+/// Longest `Location` value kept on a [`ForgeReply`], in bytes. A longer value fails the call.
+pub const MAX_LOCATION_BYTES: usize = 2048;
 
 /// What a forge answered. The body of a 3xx is never read.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -144,6 +149,9 @@ pub struct ForgeReply {
     pub status: StatusCode,
     /// The body, at most the transport cap, empty for a 3xx.
     pub body: Vec<u8>,
+    /// The `Location` value of a 3xx reply: exactly one header, UTF-8, at most
+    /// [`MAX_LOCATION_BYTES`]. `None` on any other status or a 3xx without the header.
+    pub location: Option<String>,
 }
 
 /// Why a forge call gave no reply.

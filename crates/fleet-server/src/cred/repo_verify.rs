@@ -244,7 +244,8 @@ impl GithubVerifier {
                 host: api_host,
                 path: &path,
                 allow_private: host.allow_private,
-                authorization: &authorization,
+                authorization: Some(&authorization),
+                accept: "application/json",
             })
             .await
             .map_err(|err| {
@@ -454,6 +455,7 @@ mod tests {
             Self::new(Ok(ForgeReply {
                 status: StatusCode::from_u16(status).unwrap(),
                 body: body.as_bytes().to_vec(),
+                location: None,
             }))
         }
 
@@ -469,9 +471,10 @@ mod tests {
                 host: request.host.to_owned(),
                 path: request.path.to_owned(),
                 allow_private: request.allow_private,
-                authorization: String::from_utf8_lossy(request.authorization.as_bytes())
-                    .into_owned(),
-                sensitive: request.authorization.is_sensitive(),
+                authorization: request.authorization.map_or_else(String::new, |value| {
+                    String::from_utf8_lossy(value.as_bytes()).into_owned()
+                }),
+                sensitive: request.authorization.is_some_and(HeaderValue::is_sensitive),
             });
             self.reply.clone()
         }
@@ -915,7 +918,8 @@ mod tests {
                     host: "h",
                     path: "/",
                     allow_private: false,
-                    authorization: &header
+                    authorization: Some(&header),
+                    accept: "application/json",
                 }
             )
             .contains("Bearer")

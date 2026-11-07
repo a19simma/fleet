@@ -21,7 +21,8 @@ use tokio::time::timeout;
 use tokio_rustls::TlsConnector;
 
 use super::https::{
-    FetchError, ForgeGet, ForgeReply, ForgeTransport, TlsError, read_capped, send, tls_config,
+    FetchError, ForgeGet, ForgeReply, ForgeTransport, MAX_LOCATION_BYTES, TlsError, read_capped,
+    send, tls_config,
 };
 
 /// The only port dialled in v1.
@@ -238,6 +239,21 @@ impl<R: Resolve, D: Dial> PinnedHttps<R, D> {
     }
 }
 
+/// The one `Location` value of a 3xx reply, `None` when absent. Several headers, a non-UTF-8
+/// value or one over [`MAX_LOCATION_BYTES`] fail closed.
+fn single_location(headers: &hyper::HeaderMap) -> Result<Option<String>, FetchError> {
+    let mut values = headers.get_all(hyper::header::LOCATION).iter().take(2);
+    let Some(first) = values.next() else {
+        return Ok(None);
+    };
+    if values.next().is_some() || first.as_bytes().len() > MAX_LOCATION_BYTES {
+        return Err(FetchError::Unavailable);
+    }
+    std::str::from_utf8(first.as_bytes())
+        .map(|text| Some(text.to_owned()))
+        .map_err(|_| FetchError::Unavailable)
+}
+
 #[tonic::async_trait]
 impl<R: Resolve, D: Dial> ForgeTransport for PinnedHttps<R, D> {
     async fn get(&self, request: &ForgeGet<'_>) -> Result<ForgeReply, FetchError> {
@@ -258,10 +274,13 @@ impl<R: Resolve, D: Dial> ForgeTransport for PinnedHttps<R, D> {
             .uri(request.path)
             .header(HOST, request.host)
             .header(USER_AGENT, "fleet-server")
-            .header(ACCEPT, "application/json")
-            .header(AUTHORIZATION, request.authorization.clone())
-            .body(Empty::<Bytes>::new())
-            .map_err(|_| FetchError::Unavailable)?;
+            .header(ACCEPT, request.accept);
+        let wire = match request.authorization {
+            Some(value) => wire.header(AUTHORIZATION, value.clone()),
+            None => wire,
+        }
+        .body(Empty::<Bytes>::new())
+        .map_err(|_| FetchError::Unavailable)?;
         let connected = async {
             let tcp = self.dialer.dial(SocketAddr::new(ip, FORGE_PORT)).await?;
             TlsConnector::from(Arc::clone(&self.tls))
@@ -275,9 +294,11 @@ impl<R: Resolve, D: Dial> ForgeTransport for PinnedHttps<R, D> {
         let (response, _guard) = send(tls, wire).await.map_err(|_| FetchError::Unavailable)?;
         let status = response.status();
         if status.is_redirection() {
+            let location = single_location(response.headers())?;
             return Ok(ForgeReply {
                 status,
                 body: Vec::new(),
+                location,
             });
         }
         let body = read_capped(response.into_body(), MAX_BODY_BYTES)
@@ -289,6 +310,7 @@ impl<R: Resolve, D: Dial> ForgeTransport for PinnedHttps<R, D> {
         Ok(ForgeReply {
             status,
             body: body.to_vec(),
+            location: None,
         })
     }
 }
@@ -675,7 +697,8 @@ mod tests {
             host,
             path: "/repos/acme/widget",
             allow_private: private,
-            authorization: &auth,
+            authorization: Some(&auth),
+            accept: "application/json",
         })
         .await
     }
@@ -814,7 +837,8 @@ mod tests {
             host,
             path: "/",
             allow_private: false,
-            authorization: &auth,
+            authorization: Some(&auth),
+            accept: "application/json",
         })
         .await
     }
@@ -887,6 +911,96 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(200)).await;
         assert_eq!(f.seen.lock().unwrap().len(), 1);
         assert_eq!(f.aim.dialled.lock().unwrap().len(), 1);
+    }
+
+    async fn redirect_get(reply: Vec<u8>) -> Result<ForgeReply, FetchError> {
+        let f = forge(HOST_NAME, reply, false).await;
+        let c = connector(vec![IpAddr::V4(PUBLIC)], &f);
+        get(&c, HOST_NAME, false).await
+    }
+
+    #[tokio::test]
+    async fn a_redirect_location_is_captured_and_still_not_followed() {
+        let f = forge(
+            HOST_NAME,
+            http("302 Found", "location: https://evil.test/x\r\n", b"zz"),
+            false,
+        )
+        .await;
+        let c = connector(vec![IpAddr::V4(PUBLIC)], &f);
+        let reply = get(&c, HOST_NAME, false).await.unwrap();
+        assert_eq!(reply.status, 302);
+        assert_eq!(reply.location.as_deref(), Some("https://evil.test/x"));
+        assert_eq!(reply.body.len(), 0);
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert_eq!(f.seen.lock().unwrap().len(), 1);
+        assert_eq!(f.aim.dialled.lock().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn location_is_absent_on_non_redirects_and_on_a_bare_redirect() {
+        let ok = redirect_get(http("200 OK", "location: https://a.test/\r\n", b"{}")).await;
+        assert_eq!(ok.unwrap().location, None);
+        let bare = redirect_get(http("302 Found", "", b"")).await.unwrap();
+        assert_eq!(bare.location, None);
+    }
+
+    fn location_of(len: usize) -> Vec<u8> {
+        let value = format!(
+            "https://a.test/{}",
+            "p".repeat(len - "https://a.test/".len())
+        );
+        assert_eq!(value.len(), len);
+        http("302 Found", &format!("location: {value}\r\n"), b"")
+    }
+
+    #[tokio::test]
+    async fn a_location_of_2048_bytes_is_kept_and_2049_is_unavailable() {
+        let at = redirect_get(location_of(MAX_LOCATION_BYTES)).await.unwrap();
+        assert_eq!(at.location.map(|l| l.len()), Some(MAX_LOCATION_BYTES));
+        assert_eq!(
+            redirect_get(location_of(MAX_LOCATION_BYTES + 1)).await,
+            Err(FetchError::Unavailable)
+        );
+    }
+
+    #[tokio::test]
+    async fn a_non_utf8_location_fails_closed() {
+        let mut reply = b"HTTP/1.1 302 Found\r\ncontent-length: 0\r\nconnection: close\r\nlocation: https://a.test/".to_vec();
+        reply.extend_from_slice(&[0xff, 0xfe]);
+        reply.extend_from_slice(b"\r\n\r\n");
+        assert_eq!(redirect_get(reply).await, Err(FetchError::Unavailable));
+    }
+
+    #[tokio::test]
+    async fn several_location_headers_fail_closed() {
+        let reply = http(
+            "302 Found",
+            "location: https://a.test/1\r\nlocation: https://a.test/2\r\n",
+            b"",
+        );
+        assert_eq!(redirect_get(reply).await, Err(FetchError::Unavailable));
+    }
+
+    #[tokio::test]
+    async fn no_authorization_header_is_sent_without_one_and_accept_is_the_callers() {
+        let f = forge(HOST_NAME, http("200 OK", "", b"{}"), false).await;
+        let c = connector(vec![IpAddr::V4(PUBLIC)], &f);
+        c.get(&ForgeGet {
+            host: HOST_NAME,
+            path: "/x",
+            allow_private: false,
+            authorization: None,
+            accept: "application/octet-stream",
+        })
+        .await
+        .unwrap();
+        let request = f.seen.lock().unwrap().join("").to_ascii_lowercase();
+        assert!(!request.contains("authorization"), "{request}");
+        assert!(
+            request.contains("accept: application/octet-stream\r\n"),
+            "{request}"
+        );
     }
 
     #[tokio::test]

@@ -1,11 +1,13 @@
 # Redirects for release downloads over the no-redirect transport
 
-Status: Proposed 2026-11-07, not built. The operator decided every point below. Amends the scope
+Status: Proposed 2026-11-07, partly built (FEED-3). The operator decided every point below. Amends the scope
 of the "follows no redirect" rule of ADR-0059. Builds on ADR-0060. The build is tasks FEED-2 to
 FEED-7.
 
-Not built: every item below. `PinnedHttps` (`crates/fleet-server/src/cred/pinned.rs`) resolves a
-host once, vets every address, dials the vetted one and returns a 3xx unread. ADR-0059 made that
+Built (FEED-3): the three Request shape items below and the 2048-byte `Location` cap, which
+`PinnedHttps` enforces, not the wrapper. Not built: `ReleaseFetcher`, the hop rules, the host
+allowlist, `Location` URL parsing and everything after. `PinnedHttps` (`crates/fleet-server/src/cred/pinned.rs`) resolves a
+host once, vets every address, dials the vetted one and returns a 3xx with its body unread and its `Location` captured. ADR-0059 made that
 rule for the repository verifier, where a redirect means a renamed repository and an
 `Authorization` header must not travel. A release download is different: GitHub answers
 `/releases/latest/download/<asset>` with a 302 to a signed asset URL on another host (unverified, to be confirmed against GitHub docs before FEED-4). ADR-0060
