@@ -60,7 +60,7 @@ impl PueueClient for &Fake {
             if all.len() > 1 {
                 all.remove(0)
             } else {
-                all.first().cloned().unwrap_or(Err(PueueError::Run))
+                all.first().cloned().unwrap_or(Err(PueueError::Status))
             }
         };
         let hang = self.hang;
@@ -421,11 +421,11 @@ async fn tracking_stops_at_the_cap_and_counts_the_rest() {
 
 #[tokio::test(start_paused = true)]
 async fn start_fails_when_the_status_cannot_be_read() {
-    let fake = Fake::scripted(vec![Err(PueueError::Run)]);
+    let fake = Fake::scripted(vec![Err(PueueError::Status)]);
     let result = BgWatcher::start(&fake, Redactor::new([SECRET]), anchor(), config()).await;
     assert_eq!(
         result.err().map(|e| e.to_string()),
-        Some("pueue call failed".into())
+        Some("pueue exited with a failure".into())
     );
     let fake = Fake::scripted(vec![Ok("not json".into())]);
     assert!(
@@ -459,7 +459,7 @@ async fn repeated_poll_errors_end_the_watch_as_poll_failed() {
     let script = vec![
         Ok(status(&[])),
         Ok(status(&[task(1, &running())])),
-        Err(PueueError::Run),
+        Err(PueueError::Status),
     ];
     let fake = Fake::scripted(script);
     let w = watcher(&fake).await;
@@ -641,7 +641,7 @@ async fn a_failed_log_read_still_records_the_task() {
     fake.logs
         .lock()
         .expect("lock")
-        .insert(1, Err(PueueError::Run));
+        .insert(1, Err(PueueError::Status));
     let (out, cut, failed) = output_of(&fake).await;
     assert_eq!((out.as_str(), cut, failed), ("", false, true));
 }
@@ -701,12 +701,10 @@ async fn the_cli_client_caps_and_fails_closed() {
     let echo = PueueCli::new("/bin/echo", Vec::new());
     assert_eq!(echo.status_json().await.expect("echo"), "status --json\n");
     assert_eq!(echo.log(1, 10).await.err(), Some(PueueError::Parse));
-    let yes = PueueCli::new("/usr/bin/yes", Vec::new());
-    assert_eq!(yes.status_json().await.err(), Some(PueueError::TooLarge));
     let no = PueueCli::new("/usr/bin/false", Vec::new());
-    assert_eq!(no.status_json().await.err(), Some(PueueError::Run));
+    assert_eq!(no.status_json().await.err(), Some(PueueError::Status));
     let missing = PueueCli::new("/nonexistent/pueue", Vec::new());
-    assert_eq!(missing.status_json().await.err(), Some(PueueError::Run));
+    assert_eq!(missing.status_json().await.err(), Some(PueueError::Spawn));
 }
 
 #[derive(Default)]
@@ -1225,7 +1223,7 @@ async fn a_failed_log_read_of_a_finished_task_is_retried_then_ends_without_data(
     fake.logs
         .lock()
         .expect("lock")
-        .insert(1, Err(PueueError::Run));
+        .insert(1, Err(PueueError::Status));
     set_tasks(&fake, &[finished_task(1)]);
     p.poll(t0).await.expect("poll");
     assert_eq!(rec.all().len(), 0, "retry before giving up");

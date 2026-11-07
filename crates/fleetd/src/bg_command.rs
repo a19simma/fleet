@@ -62,7 +62,7 @@ use fleet_proto::{
 };
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
-use tokio::io::AsyncReadExt;
+use tokio::io::{AsyncRead, AsyncReadExt};
 use tokio::process::Command;
 use tokio::time::Instant;
 
@@ -100,8 +100,14 @@ pub const LOG_LINES: usize = 1000;
 /// Why a pueue call failed.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PueueError {
-    /// The command could not run or exited with a failure.
-    Run,
+    /// The command could not be spawned.
+    Spawn,
+    /// The spawned command gave no stdout pipe.
+    NoStdout,
+    /// Reading the command's stdout failed before the cap was crossed.
+    Read,
+    /// The command exited with a failure.
+    Status,
     /// The reply exceeded its byte cap.
     TooLarge,
     /// The reply was not the expected JSON.
@@ -113,7 +119,10 @@ pub enum PueueError {
 impl fmt::Display for PueueError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(match self {
-            Self::Run => "pueue call failed",
+            Self::Spawn => "pueue could not be spawned",
+            Self::NoStdout => "pueue gave no stdout pipe",
+            Self::Read => "reading pueue output failed",
+            Self::Status => "pueue exited with a failure",
             Self::TooLarge => "pueue reply is too large",
             Self::Parse => "pueue reply is not valid",
             Self::Timeout => "pueue call timed out",
@@ -201,22 +210,132 @@ impl PueueCli {
             .stdout(std::process::Stdio::piped())
             .kill_on_drop(true)
             .spawn()
-            .map_err(|_| PueueError::Run)?;
+            .map_err(|_| PueueError::Spawn)?;
         let mut out = Vec::new();
-        let read = match child.stdout.take() {
-            Some(stdout) => stdout.take(cap as u64 + 1).read_to_end(&mut out).await,
-            None => return Err(PueueError::Run),
+        let read_ok = match child.stdout.take() {
+            Some(stdout) => read_capped(stdout, cap, &mut out).await,
+            None => return Err(PueueError::NoStdout),
         };
         let _ = child.start_kill();
         let status = child.wait().await;
-        read.map_err(|_| PueueError::Run)?;
-        if out.len() > cap {
-            return Err(PueueError::TooLarge);
+        verdict(out.len(), cap, read_ok, status.is_ok_and(|s| s.success()))?;
+        Ok(out)
+    }
+}
+
+async fn read_capped<R: AsyncRead + Unpin>(reader: R, cap: usize, out: &mut Vec<u8>) -> bool {
+    reader.take(cap as u64 + 1).read_to_end(out).await.is_ok()
+}
+
+fn verdict(len: usize, cap: usize, read_ok: bool, exited_ok: bool) -> Result<(), PueueError> {
+    if len > cap {
+        return Err(PueueError::TooLarge);
+    }
+    if !read_ok {
+        return Err(PueueError::Read);
+    }
+    if !exited_ok {
+        return Err(PueueError::Status);
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{PueueCli, PueueError, STATUS_READ_CAP, read_capped, verdict};
+    use std::io;
+    use std::pin::Pin;
+    use std::task::{Context, Poll};
+    use tokio::io::{AsyncRead, ReadBuf};
+
+    struct FailAfter {
+        left: usize,
+    }
+
+    impl AsyncRead for FailAfter {
+        fn poll_read(
+            mut self: Pin<&mut Self>,
+            _: &mut Context<'_>,
+            buf: &mut ReadBuf<'_>,
+        ) -> Poll<io::Result<()>> {
+            if self.left == 0 {
+                return Poll::Ready(Err(io::Error::other("boom")));
+            }
+            let n = self.left.min(buf.remaining());
+            buf.put_slice(&vec![b'y'; n]);
+            self.left -= n;
+            Poll::Ready(Ok(()))
         }
-        match status {
-            Ok(s) if s.success() => Ok(out),
-            _ => Err(PueueError::Run),
+    }
+
+    async fn judge(fail_after: usize, cap: usize) -> Result<(), PueueError> {
+        let mut out = Vec::new();
+        let read_ok = read_capped(FailAfter { left: fail_after }, cap, &mut out).await;
+        verdict(out.len(), cap, read_ok, true)
+    }
+
+    #[tokio::test]
+    async fn a_read_failure_under_the_cap_is_a_read_error() {
+        assert_eq!(judge(5, 10).await, Err(PueueError::Read));
+    }
+
+    #[tokio::test]
+    async fn a_read_failure_after_the_cap_is_too_large() {
+        assert_eq!(judge(11, 10).await, Err(PueueError::TooLarge));
+        assert_eq!(judge(50, 10).await, Err(PueueError::TooLarge));
+    }
+
+    fn sh(script: &str) -> Vec<String> {
+        vec!["-c".to_owned(), script.to_owned()]
+    }
+
+    #[tokio::test]
+    async fn a_child_that_floods_stdout_is_too_large() {
+        let cli = PueueCli::new("/bin/sh", Vec::new());
+        let got = cli.run(&sh("exec yes"), STATUS_READ_CAP).await;
+        assert_eq!(got.err(), Some(PueueError::TooLarge));
+    }
+
+    #[tokio::test]
+    async fn a_child_that_exits_with_a_failure_is_a_status_error() {
+        let cli = PueueCli::new("/bin/sh", Vec::new());
+        let got = cli.run(&sh("echo partial; exit 3"), STATUS_READ_CAP).await;
+        assert_eq!(got.err(), Some(PueueError::Status));
+    }
+
+    #[test]
+    fn output_over_the_cap_is_too_large_whatever_else_failed() {
+        for read_ok in [true, false] {
+            for exited_ok in [true, false] {
+                assert_eq!(
+                    verdict(11, 10, read_ok, exited_ok),
+                    Err(PueueError::TooLarge)
+                );
+            }
         }
+    }
+
+    #[test]
+    fn a_failure_within_the_cap_names_its_cause() {
+        assert_eq!(verdict(10, 10, false, false), Err(PueueError::Read));
+        assert_eq!(verdict(10, 10, true, false), Err(PueueError::Status));
+        assert_eq!(verdict(10, 10, true, true), Ok(()));
+    }
+
+    #[test]
+    fn each_variant_has_its_own_text() {
+        let all = [
+            PueueError::Spawn,
+            PueueError::NoStdout,
+            PueueError::Read,
+            PueueError::Status,
+            PueueError::TooLarge,
+            PueueError::Parse,
+            PueueError::Timeout,
+        ];
+        let texts: std::collections::BTreeSet<String> =
+            all.iter().map(ToString::to_string).collect();
+        assert_eq!(texts.len(), all.len());
     }
 }
 
