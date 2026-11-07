@@ -8,8 +8,8 @@ Facts for running real end-to-end tests of fleet from the maintainer's Mac. Ever
 - The live server is `https://fleet.simonmalm.com`.
 - `FLEET_SERVER_URL` is not set in the shell. Pass `--server https://fleet.simonmalm.com` on every command, or export the variable for the session.
 - The CLI finds its own credentials. Authentication succeeded with `fleet list` and `fleet jobs` and no extra flags. Never read, print or copy the token or any CLI config file while testing.
-- One box is registered: `box-1`, state `LIVE`.
-- Jobs run as kind `agent` on `box-1`, on branches named `swarm/<job-id>`.
+- One box is registered, state `LIVE`.
+- Jobs run as kind `agent` on that box, on branches named `swarm/<job-id>`.
 
 ## Repos
 
@@ -33,7 +33,7 @@ Facts for running real end-to-end tests of fleet from the maintainer's Mac. Ever
 
 ## A safe first test
 
-1. Run `fleet list` and confirm `box-1` is `LIVE` with a recent last-seen time.
+1. Run `fleet list` and confirm the box is `LIVE` with a recent last-seen time.
 2. Submit a small read-only prompt against `a19simma/radiant` with `--no-pr` and a unique `--idempotency-key`.
 3. Run `fleet watch <id>`. Exit code 0 means the job succeeded.
 4. Run `fleet logs <id>` and read the transcript.
