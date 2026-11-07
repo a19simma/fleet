@@ -57,6 +57,12 @@ pub enum CredentialNotice {
     RepoUpstreamUnavailable,
     /// The repository check timed out.
     RepoTimeout,
+    /// The repository reference is outside the grammar of its forge.
+    RepoInvalid,
+    /// The user has no such repository registered.
+    RepoMissing,
+    /// A check rate, a concurrency cap or the per-User row cap refused the call.
+    RepoLimit,
     /// Any other failure.
     Failed,
 }
@@ -87,6 +93,9 @@ impl CredentialNotice {
         Self::RepoNotFound,
         Self::RepoUpstreamUnavailable,
         Self::RepoTimeout,
+        Self::RepoInvalid,
+        Self::RepoMissing,
+        Self::RepoLimit,
         Self::Failed,
     ];
 
@@ -117,6 +126,9 @@ impl CredentialNotice {
             Self::RepoNotFound => "repo_not_found",
             Self::RepoUpstreamUnavailable => "repo_upstream_unavailable",
             Self::RepoTimeout => "repo_timeout",
+            Self::RepoInvalid => "repo_invalid",
+            Self::RepoMissing => "repo_missing",
+            Self::RepoLimit => "repo_limit",
             Self::Failed => "failed",
         }
     }
@@ -172,7 +184,29 @@ impl CredentialNotice {
             }
             Self::RepoUpstreamUnavailable => "The repository host is unavailable. Try again later.",
             Self::RepoTimeout => "The repository check timed out. Try again later.",
+            Self::RepoInvalid => {
+                "The repository reference was refused. Use host/owner/name or an https URL."
+            }
+            Self::RepoMissing => "No such repository.",
+            Self::RepoLimit => {
+                "Too many repository checks or repositories. Remove one or try again later."
+            }
             Self::Failed => "The request failed.",
+        }
+    }
+
+    /// Classifies a `FleetRepos` refusal into a fixed notice.
+    ///
+    /// It maps the statuses a repository call adds: `INVALID_ARGUMENT` to [`Self::RepoInvalid`],
+    /// `NOT_FOUND` to [`Self::RepoMissing`] and `RESOURCE_EXHAUSTED` to [`Self::RepoLimit`]. Every
+    /// other status reads the same closed set as [`Self::for_status`].
+    #[must_use]
+    pub fn for_repo_status(status: &Status) -> Self {
+        match status.code() {
+            Code::InvalidArgument => Self::RepoInvalid,
+            Code::NotFound => Self::RepoMissing,
+            Code::ResourceExhausted => Self::RepoLimit,
+            _ => Self::for_status(status),
         }
     }
 

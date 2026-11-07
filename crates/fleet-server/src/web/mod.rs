@@ -17,6 +17,7 @@ mod pages;
 mod panic;
 mod passkeys;
 mod profiles;
+mod repos;
 mod serve;
 mod timing;
 mod tokens;

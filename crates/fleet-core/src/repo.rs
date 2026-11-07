@@ -10,7 +10,7 @@
 //! to a loopback, private or link-local address. The fetcher must resolve the host once, vet every
 //! returned address, and dial the vetted address.
 
-use std::fmt;
+use std::fmt::{self, Write as _};
 
 /// Longest accepted input, in bytes.
 pub const MAX_INPUT_BYTES: usize = 1024;
@@ -163,23 +163,7 @@ impl RepoRef {
     ///
     /// Returns a [`RepoError`] naming the first rule the input breaks.
     pub fn parse_as(input: &str, kind: ForgeKind) -> Result<Self, RepoError> {
-        screen(input)?;
-        let rest = match input.strip_prefix(HTTPS_PREFIX) {
-            Some(rest) => rest,
-            None if input.contains("://") => return Err(RepoError::Scheme),
-            None => input,
-        };
-        let (authority, path) = rest.split_once('/').unwrap_or((rest, ""));
-        let host = host_of(authority)?;
-        let mut segments = path.split('/');
-        let (Some(owner), Some(name), None) = (segments.next(), segments.next(), segments.next())
-        else {
-            return Err(RepoError::Segments);
-        };
-        if [owner, name].iter().any(|s| matches!(*s, "" | "." | "..")) {
-            return Err(RepoError::Segments);
-        }
-        let name = strip_git_suffix(name);
+        let (host, owner, name) = split(input)?;
         if !valid_owner(owner, kind) {
             return Err(RepoError::Owner);
         }
@@ -192,6 +176,25 @@ impl RepoRef {
             path: display_path.to_ascii_lowercase(),
             display_path,
         })
+    }
+
+    /// Splits a reference into its lowercase host and lowercase `owner/name` without applying
+    /// any forge grammar.
+    ///
+    /// It applies every structural rule of [`RepoRef::parse_as`] (charset, scheme, host, exactly
+    /// two segments, one `.git` strip) and the segment byte set, but not the owner and name
+    /// rules of a forge. A caller that looks up a stored row uses it: the row was stored under
+    /// the grammar of the kind the server holds for its host, which the caller cannot know.
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`RepoError`] naming the first structural rule the input breaks.
+    pub fn locate(input: &str) -> Result<(String, String), RepoError> {
+        let (host, owner, name) = split(input)?;
+        if !segment_bytes_ok(owner) || !segment_bytes_ok(name) {
+            return Err(RepoError::Name);
+        }
+        Ok((host, format!("{owner}/{name}").to_ascii_lowercase()))
     }
 
     /// The lowercase host.
@@ -211,6 +214,45 @@ impl RepoRef {
     pub fn display_path(&self) -> &str {
         &self.display_path
     }
+}
+
+/// Shows `text` in printable ASCII only: every other character becomes `\u{hex}`.
+///
+/// A stored host is punycode (`xn--` labels), because [`RepoRef::parse`] refuses non-ASCII input.
+/// For a valid row this returns the text unchanged. A value that reached storage by another route
+/// is shown with its code points visible, so a lookalike letter or a bidirectional mark can never
+/// pass for the plain host.
+#[must_use]
+pub fn ascii_form(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    for c in text.chars() {
+        if c.is_ascii_graphic() {
+            out.push(c);
+        } else {
+            let _ = write!(out, "\\u{{{:x}}}", u32::from(c));
+        }
+    }
+    out
+}
+
+fn split(input: &str) -> Result<(String, &str, &str), RepoError> {
+    screen(input)?;
+    let rest = match input.strip_prefix(HTTPS_PREFIX) {
+        Some(rest) => rest,
+        None if input.contains("://") => return Err(RepoError::Scheme),
+        None => input,
+    };
+    let (authority, path) = rest.split_once('/').unwrap_or((rest, ""));
+    let host = host_of(authority)?;
+    let mut segments = path.split('/');
+    let (Some(owner), Some(name), None) = (segments.next(), segments.next(), segments.next())
+    else {
+        return Err(RepoError::Segments);
+    };
+    if [owner, name].iter().any(|s| matches!(*s, "" | "." | "..")) {
+        return Err(RepoError::Segments);
+    }
+    Ok((host, owner, strip_git_suffix(name)))
 }
 
 fn strip_git_suffix(name: &str) -> &str {
@@ -356,6 +398,53 @@ fn valid_name(name: &str, kind: ForgeKind) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn ascii_form_keeps_printable_ascii_and_spells_out_everything_else() {
+        assert_eq!(
+            ascii_form("xn--bcher-kva.example/o_r-1"),
+            "xn--bcher-kva.example/o_r-1"
+        );
+        let cases = [
+            ("b\u{fc}cher.example", "b\\u{fc}cher.example"),
+            ("\u{430}pple.example", "\\u{430}pple.example"),
+            ("a\u{202e}b", "a\\u{202e}b"),
+            ("a\u{200f}b", "a\\u{200f}b"),
+            ("a\r\nb", "a\\u{d}\\u{a}b"),
+            ("a\u{85}b\u{2028}", "a\\u{85}b\\u{2028}"),
+            ("a b", "a\\u{20}b"),
+            ("a\0b", "a\\u{0}b"),
+            ("\u{1f600}", "\\u{1f600}"),
+            ("", ""),
+        ];
+        for (input, want) in cases {
+            assert_eq!(ascii_form(input), want, "{input:?}");
+        }
+    }
+
+    #[test]
+    fn locate_skips_the_forge_grammar_but_keeps_every_structural_rule() {
+        assert_eq!(
+            RepoRef::locate("https://GHE.example.com/Admin/Hello.git").ok(),
+            Some(("ghe.example.com".to_owned(), "admin/hello".to_owned()))
+        );
+        assert!(RepoRef::parse("ghe.example.com/admin/hello").is_err());
+        for bad in [
+            "",
+            "github.com/octo",
+            "github.com/a/b/c",
+            "http://github.com/a/b",
+            "github.com/a/%41",
+            "github.com/a b/c",
+            "github.com/a/b;c",
+            "github.com/a;b/c",
+            "github.com/./b",
+            "[::1]/a/b",
+            "example.com:80/a/b",
+        ] {
+            assert!(RepoRef::locate(bad).is_err(), "{bad:?}");
+        }
+    }
 
     fn long(n: usize, c: char) -> String {
         std::iter::repeat_n(c, n).collect()

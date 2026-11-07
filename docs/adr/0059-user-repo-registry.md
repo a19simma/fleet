@@ -20,9 +20,18 @@ transaction: `FOR UPDATE` on the users row, `FOR SHARE` on the credential row, t
 upsert) and the check limiter (`cred::repo_limit`: 10 checks per User per 60 s, 8 concurrent). The
 per-User limiter admits a call before it takes a global permit. Until migration 0037, `add` uses a
 stored GitHub credential for `github.com` only: any other github-kind host is refused with
-`NO_CREDENTIAL`. Not built: the CLI, the Forgejo verifier (the registry has a slot only), the
-`credentials.host` column and the `forgejo_pat` kind. The `path` column holds at most 141 bytes: a
-Forgejo owner of 40, a slash and a name of 100.
+`NO_CREDENTIAL`. Also built: `fleet repo add`, `list` and `remove` (`crates/fleet-cli/src/repo.rs`)
+and the repositories page (`crates/fleet-server/src/web/repos.rs`), both ending in the shared
+`CredentialNotice` texts, with `repo_invalid`, `repo_missing` and `repo_limit` added for the
+statuses a repository call adds. A refusal exits 1. Hosts print in punycode form through
+`fleet_core::repo::ascii_form`. `fleet repo remove` applies only the structural rules of
+`RepoRef::locate` and sends the host and path, so a row stored under a configured kind is removable
+whatever the grammar of its owner. The CLI and the page show the verified time as the UTC stamp of
+`fleet_core::stamp::utc_stamp`, `YYYY-MM-DD HH:MM UTC`. `crates/fleet-cli/tests/parity_repos.rs`
+holds one scenario per action and outcome, each run through the CLI and the page on one server, plus
+a separate test for the box token, which the page cannot send. Not built: the Forgejo verifier (the
+registry has a slot only), the `credentials.host` column and the `forgejo_pat` kind. The `path`
+column holds at most 141 bytes: a Forgejo owner of 40, a slash and a name of 100.
 
 A User names the repositories they work on, so the CLI and the web page can list them and later
 features can offer them. Today a repository exists only as a field on a Job. This ADR adds a

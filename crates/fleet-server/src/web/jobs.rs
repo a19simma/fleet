@@ -28,7 +28,6 @@ pub const MAX_RENDER_BYTES: usize = 256 * 1024;
 
 const LIST_LIMIT: u32 = 100;
 const CHUNK_LIMIT: u32 = 100;
-const MS_PER_DAY: i64 = 86_400_000;
 
 pub(super) struct ConsoleSlot(pub Option<Arc<Store>>);
 
@@ -41,28 +40,8 @@ fn store(cx: &Cx) -> Result<&Store> {
         .ok_or_else(|| not_found().into())
 }
 
-fn civil(days: i64) -> (i64, i64, i64) {
-    let z = days + 719_468;
-    let era = z.div_euclid(146_097);
-    let doe = z.rem_euclid(146_097);
-    let yoe = (doe - doe / 1_460 + doe / 36_524 - doe / 146_096) / 365;
-    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
-    let mp = (5 * doy + 2) / 153;
-    let day = doy - (153 * mp + 2) / 5 + 1;
-    let month = if mp < 10 { mp + 3 } else { mp - 9 };
-    let year = yoe + era * 400 + i64::from(month <= 2);
-    (year, month, day)
-}
-
-fn when(ms: u64) -> String {
-    let ms = i64::try_from(ms).unwrap_or(i64::MAX);
-    let (year, month, day) = civil(ms.div_euclid(MS_PER_DAY));
-    let minutes = ms.rem_euclid(MS_PER_DAY) / 60_000;
-    format!(
-        "{year:04}-{month:02}-{day:02} {:02}:{:02} UTC",
-        minutes / 60,
-        minutes % 60
-    )
+pub(super) fn when(ms: u64) -> String {
+    fleet_core::stamp::utc_stamp(ms)
 }
 
 fn cut_at(text: &str, max: usize) -> &str {

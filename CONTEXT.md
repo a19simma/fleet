@@ -200,7 +200,7 @@ The server-side `RepoVerifier` implementation of one **Forge kind**. The `AddRep
 _Avoid_: repo checker, forge check
 
 **Registered repository**:
-A row in a User's repository registry, keyed by **Repo key**. It is a record only and grants nothing: the App repository ceiling and the `forge:github_app` capability stay the only App grants. Submit does not enforce it in v1 (ADR-0059). Elsewhere in this file "repo" means the repository of a Job, not a **Registered repository**.
+A row in a User's repository registry, keyed by **Repo key**. It is a record only and grants nothing: the App repository ceiling and the `forge:github_app` capability stay the only App grants. Submit does not enforce it in v1 (ADR-0059). The CLI (`fleet repo`) and the web page list its host in punycode form. Elsewhere in this file "repo" means the repository of a Job, not a **Registered repository**.
 _Avoid_: project, saved repo
 
 **CI result**:

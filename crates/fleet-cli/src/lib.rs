@@ -7,6 +7,7 @@ pub mod credential;
 pub mod list;
 pub mod logs;
 pub mod profile;
+pub mod repo;
 pub mod stats;
 pub mod telemetry;
 pub mod timing;
@@ -22,6 +23,7 @@ use fleet_proto::v1::fleet_credentials_client::FleetCredentialsClient;
 use fleet_proto::v1::fleet_jobs_client::FleetJobsClient;
 use fleet_proto::v1::fleet_profiles_client::FleetProfilesClient;
 use fleet_proto::v1::fleet_query_client::FleetQueryClient;
+use fleet_proto::v1::fleet_repos_client::FleetReposClient;
 use fleet_proto::v1::{
     CancelJobRequest, GetJobRequest, Job, JobState, ListJobsRequest, SubmitJobRequest,
 };
@@ -193,6 +195,12 @@ pub enum Command {
         /// The credential action.
         #[command(subcommand)]
         action: credential::CredentialAction,
+    },
+    /// Add, list and remove the repositories you work on. Each add is checked with the forge.
+    Repo {
+        /// The repository action.
+        #[command(subcommand)]
+        action: repo::RepoAction,
     },
 }
 
@@ -600,6 +608,7 @@ struct Session {
     profiles: profile::ProfilesClient,
     batches: batch::BatchesClient,
     credentials: credential::CredentialsClient,
+    repos: repo::ReposClient,
     scrub: Scrub,
 }
 
@@ -756,7 +765,9 @@ async fn session(env: &Resolution, timeouts: bool) -> Result<Session, CliError> 
             .max_decoding_message_size(MAX_PROFILE_MESSAGE_BYTES),
         batches: FleetBatchesClient::with_interceptor(channel.clone(), token.clone())
             .max_decoding_message_size(MAX_DECODE_BYTES),
-        credentials: FleetCredentialsClient::with_interceptor(channel, token)
+        credentials: FleetCredentialsClient::with_interceptor(channel.clone(), token.clone())
+            .max_decoding_message_size(MAX_DECODE_BYTES),
+        repos: FleetReposClient::with_interceptor(channel, token)
             .max_decoding_message_size(MAX_DECODE_BYTES),
     })
 }
@@ -880,6 +891,31 @@ async fn run_credential(
             let id = credential::parse_id(&id)?;
             let mut session = session(env, timeouts).await?;
             credential::verify(&mut session.credentials, &session.scrub, id, out).await
+        }
+    }
+}
+
+async fn run_repo(
+    action: repo::RepoAction,
+    env: &Resolution,
+    timeouts: bool,
+    out: &mut impl Write,
+) -> Result<(), CliError> {
+    repo::no_stray(action.rest())?;
+    match action {
+        repo::RepoAction::List { .. } => {
+            let mut session = session(env, timeouts).await?;
+            repo::list(&mut session.repos, &session.scrub, out).await
+        }
+        repo::RepoAction::Add { repo: text, .. } => {
+            let parsed = repo::parse_ref(&text)?;
+            let mut session = session(env, timeouts).await?;
+            repo::add(&mut session.repos, &session.scrub, &parsed, out).await
+        }
+        repo::RepoAction::Remove { repo: text, .. } => {
+            let (host, path) = repo::locate_ref(&text)?;
+            let mut session = session(env, timeouts).await?;
+            repo::remove(&mut session.repos, host, path, out).await
         }
     }
 }
@@ -1117,6 +1153,7 @@ async fn dispatch(
             run_profile(action, env, timeouts, stdin, out).await?;
         }
         Command::Credential { action } => run_credential(action, env, timeouts, stdin, out).await?,
+        Command::Repo { action } => run_repo(action, env, timeouts, out).await?,
         Command::Cancel { id } => {
             let session = session(env, timeouts).await?;
             cancel(session.jobs, &session.scrub, id, out).await?;

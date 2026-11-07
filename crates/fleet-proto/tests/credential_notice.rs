@@ -27,6 +27,63 @@ fn codes_are_unique_and_round_trip() {
 }
 
 #[test]
+fn a_repo_call_maps_its_own_statuses_and_leaves_the_rest_to_the_credential_mapping() {
+    let cases = [
+        (
+            Code::InvalidArgument,
+            "echoes <input>",
+            CredentialNotice::RepoInvalid,
+        ),
+        (
+            Code::NotFound,
+            "echoes <input>",
+            CredentialNotice::RepoMissing,
+        ),
+        (
+            Code::ResourceExhausted,
+            "echoes <input>",
+            CredentialNotice::RepoLimit,
+        ),
+        (
+            Code::Unavailable,
+            "storage unavailable",
+            CredentialNotice::Unavailable,
+        ),
+        (Code::Internal, "echoes <input>", CredentialNotice::Failed),
+    ];
+    for (code, message, want) in cases {
+        let status = Status::new(code, message);
+        assert_eq!(CredentialNotice::for_repo_status(&status), want, "{code:?}");
+    }
+    for (reason, want) in [
+        (
+            PRECONDITION_REPO_NOT_ALLOWED_HOST,
+            CredentialNotice::RepoHostRefused,
+        ),
+        (
+            PRECONDITION_REPO_NO_CREDENTIAL,
+            CredentialNotice::RepoNoCredential,
+        ),
+        (
+            PRECONDITION_REPO_NOT_FOUND_OR_NO_ACCESS,
+            CredentialNotice::RepoNotFound,
+        ),
+        (
+            PRECONDITION_REPO_UPSTREAM_UNAVAILABLE,
+            CredentialNotice::RepoUpstreamUnavailable,
+        ),
+        (PRECONDITION_REPO_TIMEOUT, CredentialNotice::RepoTimeout),
+    ] {
+        let status = Status::failed_precondition(reason);
+        assert_eq!(CredentialNotice::for_repo_status(&status), want, "{reason}");
+    }
+    assert_eq!(CredentialNotice::RepoInvalid.code(), "repo_invalid");
+    assert_eq!(CredentialNotice::RepoMissing.code(), "repo_missing");
+    assert_eq!(CredentialNotice::RepoLimit.code(), "repo_limit");
+    assert_eq!(CredentialNotice::RepoMissing.text(), "No such repository.");
+}
+
+#[test]
 fn pinned_texts() {
     assert_eq!(
         CredentialNotice::NoJob.text(),
