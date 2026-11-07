@@ -411,6 +411,122 @@ fn parse_api_base(api: &str, host: &str, forge: Forge) -> Result<String, RepoHos
     Ok(format!("https://{authority}{prefix}"))
 }
 
+/// Longest GitHub owner login, in bytes.
+pub const MAX_UPDATE_OWNER_LEN: usize = 39;
+
+/// Longest GitHub repository name, in bytes.
+pub const MAX_UPDATE_REPO_LEN: usize = 100;
+
+/// Default pause between release feed polls, in seconds.
+pub const DEFAULT_UPDATE_POLL_SECS: u64 = 900;
+
+/// Shortest accepted `FLEET_UPDATE_POLL_SECS`.
+pub const MIN_UPDATE_POLL_SECS: u64 = 60;
+
+/// Longest accepted `FLEET_UPDATE_POLL_SECS`: one day.
+pub const MAX_UPDATE_POLL_SECS: u64 = 86_400;
+
+const UPDATE_REPO_VAR: &str = "FLEET_UPDATE_REPO";
+const UPDATE_MANIFEST_VAR: &str = "FLEET_UPDATE_MANIFEST";
+const UPDATE_POLL_VAR: &str = "FLEET_UPDATE_POLL_SECS";
+
+/// Why an `owner/repo` value was refused. No variant carries the value.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum UpdateRepoError {
+    /// The value has no slash or more than one. `/r` returns [`Self::Owner`] and `o/` returns
+    /// [`Self::Repo`].
+    Shape,
+    /// The owner is empty, over [`MAX_UPDATE_OWNER_LEN`] bytes or holds a byte outside
+    /// `[A-Za-z0-9-]`.
+    Owner,
+    /// The repository is empty, over [`MAX_UPDATE_REPO_LEN`] bytes, `.` or `..`, or holds a byte
+    /// outside `[A-Za-z0-9._-]`.
+    Repo,
+}
+
+impl fmt::Display for UpdateRepoError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Shape => f.write_str("must be owner/repo with exactly one slash"),
+            Self::Owner => write!(
+                f,
+                "owner must be 1 to {MAX_UPDATE_OWNER_LEN} bytes of letters, digits and `-`"
+            ),
+            Self::Repo => write!(
+                f,
+                concat!(
+                    "repository must be 1 to {} bytes of letters, digits, ",
+                    "`.`, `_` and `-`, and not `.` or `..`"
+                ),
+                MAX_UPDATE_REPO_LEN
+            ),
+        }
+    }
+}
+
+impl std::error::Error for UpdateRepoError {}
+
+/// The repository whose latest release carries the update manifest, parsed from
+/// `FLEET_UPDATE_REPO` (ADR-0060). The fields are private so every value passed the grammar.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UpdateRepo {
+    owner: String,
+    repo: String,
+}
+
+impl UpdateRepo {
+    /// Parses `owner/repo` strictly. The owner is 1 to [`MAX_UPDATE_OWNER_LEN`] bytes of
+    /// `[A-Za-z0-9-]`. The repository is 1 to [`MAX_UPDATE_REPO_LEN`] bytes of `[A-Za-z0-9._-]`
+    /// and not `.` or `..`. Case is kept. There is no trimming.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`UpdateRepoError`] for any value outside that grammar.
+    pub fn parse(raw: &str) -> Result<Self, UpdateRepoError> {
+        let mut parts = raw.split('/');
+        let (Some(owner), Some(repo), None) = (parts.next(), parts.next(), parts.next()) else {
+            return Err(UpdateRepoError::Shape);
+        };
+        let owner_ok = (1..=MAX_UPDATE_OWNER_LEN).contains(&owner.len())
+            && owner
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b == b'-');
+        if !owner_ok {
+            return Err(UpdateRepoError::Owner);
+        }
+        let repo_ok = (1..=MAX_UPDATE_REPO_LEN).contains(&repo.len())
+            && repo != "."
+            && repo != ".."
+            && repo
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-'));
+        if !repo_ok {
+            return Err(UpdateRepoError::Repo);
+        }
+        Ok(Self {
+            owner: owner.to_owned(),
+            repo: repo.to_owned(),
+        })
+    }
+
+    /// The owner.
+    pub fn owner(&self) -> &str {
+        &self.owner
+    }
+
+    /// The repository name.
+    pub fn repo(&self) -> &str {
+        &self.repo
+    }
+}
+
+impl fmt::Display for UpdateRepo {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}/{}", self.owner, self.repo)
+    }
+}
+
 /// Server settings.
 #[derive(Debug, Clone)]
 pub struct Config {
@@ -440,6 +556,12 @@ pub struct Config {
     /// Path of the signed update manifest, from `FLEET_UPDATE_MANIFEST`. The signature is the
     /// file of the same name with `.minisig` appended. `None` when unset or empty.
     pub update_manifest: Option<PathBuf>,
+    /// Repository whose latest release carries the manifest, from `FLEET_UPDATE_REPO`. `None`
+    /// when unset or empty. Setting it together with `FLEET_UPDATE_MANIFEST` refuses start.
+    pub update_repo: Option<UpdateRepo>,
+    /// Pause between release feed polls, from `FLEET_UPDATE_POLL_SECS`: [`MIN_UPDATE_POLL_SECS`]
+    /// to [`MAX_UPDATE_POLL_SECS`], default [`DEFAULT_UPDATE_POLL_SECS`].
+    pub update_poll: Duration,
     /// Public origin of the web UI, from `FLEET_WEB_ORIGIN` (for example
     /// `https://fleet.example.com`). `None` when unset or empty, which turns web login off.
     pub web_origin: Option<String>,
@@ -810,7 +932,9 @@ impl Config {
     /// checked against the allowlist grammar and an unset one allows nothing. The App also requires
     /// `FLEET_MASTER_KEY_FILE`. A set `FLEET_REPO_HOSTS` that fails [`RepoHosts::parse`] is
     /// [`ConfigError::Invalid`] for that variable. The App key file and the master key file are
-    /// made absolute against the working directory here.
+    /// made absolute against the working directory here. `FLEET_UPDATE_REPO` must pass
+    /// [`UpdateRepo::parse`], must not be set with `FLEET_UPDATE_MANIFEST`, and
+    /// `FLEET_UPDATE_POLL_SECS` runs from 60 to 86400 and defaults to 900.
     pub fn from_env() -> Result<Self, ConfigError> {
         Self::from_lookup(|var| std::env::var(var).ok())
     }
@@ -851,6 +975,30 @@ impl Config {
                 reason: format!("required when {GITHUB_APP_ID_VAR} is set"),
             });
         }
+        let update_manifest = lookup(UPDATE_MANIFEST_VAR)
+            .filter(|v| !v.is_empty())
+            .map(PathBuf::from);
+        let update_repo = lookup(UPDATE_REPO_VAR)
+            .filter(|v| !v.is_empty())
+            .map(|raw| {
+                UpdateRepo::parse(&raw).map_err(|err| ConfigError::Invalid {
+                    var: UPDATE_REPO_VAR,
+                    reason: err.to_string(),
+                })
+            })
+            .transpose()?;
+        if update_repo.is_some() && update_manifest.is_some() {
+            return Err(ConfigError::Invalid {
+                var: UPDATE_REPO_VAR,
+                reason: format!("must not be set together with {UPDATE_MANIFEST_VAR}"),
+            });
+        }
+        let update_poll = Duration::from_secs(number(
+            &lookup,
+            UPDATE_POLL_VAR,
+            DEFAULT_UPDATE_POLL_SECS,
+            MIN_UPDATE_POLL_SECS..=MAX_UPDATE_POLL_SECS,
+        )?);
         Ok(Self {
             listen: address(&lookup, "FLEET_LISTEN", DEFAULT_LISTEN)?,
             health_listen: address(&lookup, "FLEET_HEALTH_LISTEN", DEFAULT_HEALTH_LISTEN)?,
@@ -863,9 +1011,9 @@ impl Config {
             github_app,
             repo_hosts: repo_hosts(&lookup)?,
             master_key_file,
-            update_manifest: lookup("FLEET_UPDATE_MANIFEST")
-                .filter(|v| !v.is_empty())
-                .map(PathBuf::from),
+            update_manifest,
+            update_repo,
+            update_poll,
             web_origin: lookup("FLEET_WEB_ORIGIN").filter(|v| !v.is_empty()),
             web_rp_id: lookup("FLEET_WEB_RP_ID").filter(|v| !v.is_empty()),
             bootstrap_password: lookup("FLEET_BOOTSTRAP_PASSWORD")
@@ -1046,6 +1194,212 @@ mod tests {
             set.update_manifest,
             Some(PathBuf::from("/etc/fleet/manifest.json"))
         );
+    }
+
+    fn with_update(pairs: &[(&str, &str)]) -> Result<Config, ConfigError> {
+        let mut all = vec![
+            ("FLEET_DATABASE_URL", "postgres://u:pw@h/db"),
+            ("FLEET_TOKEN", TOKEN),
+        ];
+        all.extend_from_slice(pairs);
+        Config::from_lookup(lookup(&all))
+    }
+
+    #[test]
+    fn update_repo_accepts_the_grammar() {
+        for raw in [
+            "o/r",
+            "Owner-1/Repo.name_x-y",
+            "a/.hidden",
+            "a/..x",
+            "a/x..",
+            "a/...",
+            "A/B",
+            "-/-",
+        ] {
+            let parsed = UpdateRepo::parse(raw).unwrap_or_else(|err| panic!("{raw:?}: {err}"));
+            assert_eq!(parsed.to_string(), raw);
+        }
+        let parsed = UpdateRepo::parse("Acme/Fleet.rs").unwrap();
+        assert_eq!(parsed.owner(), "Acme");
+        assert_eq!(parsed.repo(), "Fleet.rs");
+    }
+
+    #[test]
+    fn update_repo_hostile_input_table() {
+        let long_owner = format!("{}/r", "a".repeat(MAX_UPDATE_OWNER_LEN + 1));
+        let long_repo = format!("o/{}", "a".repeat(MAX_UPDATE_REPO_LEN + 1));
+        let table: Vec<(&str, String, UpdateRepoError)> = vec![
+            ("empty", String::new(), UpdateRepoError::Shape),
+            ("no slash", "owner".into(), UpdateRepoError::Shape),
+            ("extra slash", "o/r/x".into(), UpdateRepoError::Shape),
+            ("trailing slash", "o/r/".into(), UpdateRepoError::Shape),
+            ("leading slash", "/o/r".into(), UpdateRepoError::Shape),
+            ("empty owner", "/r".into(), UpdateRepoError::Owner),
+            ("empty repo", "o/".into(), UpdateRepoError::Repo),
+            ("only slash", "/".into(), UpdateRepoError::Owner),
+            ("cr", "o/r\r".into(), UpdateRepoError::Repo),
+            ("crlf", "o/r\r\n".into(), UpdateRepoError::Repo),
+            ("lf", "o/r\n".into(), UpdateRepoError::Repo),
+            ("cr in owner", "o\r/r".into(), UpdateRepoError::Owner),
+            ("nel", "o/r\u{85}".into(), UpdateRepoError::Repo),
+            ("u2028", "o/r\u{2028}".into(), UpdateRepoError::Repo),
+            ("u2029", "o/r\u{2029}".into(), UpdateRepoError::Repo),
+            ("userinfo at", "user@host/r".into(), UpdateRepoError::Owner),
+            ("at in repo", "o/r@h".into(), UpdateRepoError::Repo),
+            ("backslash owner", "o\\x/r".into(), UpdateRepoError::Owner),
+            ("backslash repo", "o/r\\x".into(), UpdateRepoError::Repo),
+            ("colon owner", "o:1/r".into(), UpdateRepoError::Owner),
+            ("colon repo", "o/r:1".into(), UpdateRepoError::Repo),
+            ("scheme", "https://o/r".into(), UpdateRepoError::Shape),
+            ("ipv6", "[::1]/r".into(), UpdateRepoError::Owner),
+            ("ipv6 repo", "o/[::1]".into(), UpdateRepoError::Repo),
+            ("space owner", " o/r".into(), UpdateRepoError::Owner),
+            ("space repo", "o/r ".into(), UpdateRepoError::Repo),
+            ("tab", "o/r\t".into(), UpdateRepoError::Repo),
+            ("inner space", "o/r r".into(), UpdateRepoError::Repo),
+            ("nbsp", "o/r\u{a0}".into(), UpdateRepoError::Repo),
+            ("non-ascii owner", "ö/r".into(), UpdateRepoError::Owner),
+            ("non-ascii repo", "o/rö".into(), UpdateRepoError::Repo),
+            (
+                "fullwidth slash",
+                "o\u{ff0f}r".into(),
+                UpdateRepoError::Shape,
+            ),
+            ("dot owner", "./r".into(), UpdateRepoError::Owner),
+            ("underscore owner", "o_x/r".into(), UpdateRepoError::Owner),
+            ("dot repo", "o/.".into(), UpdateRepoError::Repo),
+            ("dotdot repo", "o/..".into(), UpdateRepoError::Repo),
+            ("dotdot owner", "../r".into(), UpdateRepoError::Owner),
+            ("percent", "o/%2e%2e".into(), UpdateRepoError::Repo),
+            ("query", "o/r?x=1".into(), UpdateRepoError::Repo),
+            ("fragment", "o/r#x".into(), UpdateRepoError::Repo),
+            ("nul", "o/r\0".into(), UpdateRepoError::Repo),
+            ("over-long owner", long_owner, UpdateRepoError::Owner),
+            ("over-long repo", long_repo, UpdateRepoError::Repo),
+        ];
+        for (label, raw, want) in table {
+            assert_eq!(UpdateRepo::parse(&raw), Err(want), "{label}");
+            if raw.is_empty() {
+                continue;
+            }
+            let err = with_update(&[("FLEET_UPDATE_REPO", &raw)]).unwrap_err();
+            match err {
+                ConfigError::Invalid { var, reason } => {
+                    assert_eq!(var, "FLEET_UPDATE_REPO", "{label}");
+                    assert_eq!(reason, want.to_string(), "{label}");
+                }
+                other => panic!("{label}: {other}"),
+            }
+        }
+    }
+
+    #[test]
+    fn update_repo_limits_hold_at_the_boundary_and_just_over() {
+        let owner = |n: usize| format!("{}/r", "a".repeat(n));
+        let repo = |n: usize| format!("o/{}", "a".repeat(n));
+        assert!(UpdateRepo::parse(&owner(MAX_UPDATE_OWNER_LEN)).is_ok());
+        assert!(UpdateRepo::parse(&owner(1)).is_ok());
+        assert_eq!(
+            UpdateRepo::parse(&owner(MAX_UPDATE_OWNER_LEN + 1)),
+            Err(UpdateRepoError::Owner)
+        );
+        assert!(UpdateRepo::parse(&repo(MAX_UPDATE_REPO_LEN)).is_ok());
+        assert!(UpdateRepo::parse(&repo(1)).is_ok());
+        assert_eq!(
+            UpdateRepo::parse(&repo(MAX_UPDATE_REPO_LEN + 1)),
+            Err(UpdateRepoError::Repo)
+        );
+        assert_eq!(MAX_UPDATE_OWNER_LEN, 39);
+        assert_eq!(MAX_UPDATE_REPO_LEN, 100);
+    }
+
+    #[test]
+    fn update_repo_is_read_from_the_environment() {
+        assert_eq!(with_update(&[]).unwrap().update_repo, None);
+        assert_eq!(
+            with_update(&[("FLEET_UPDATE_REPO", "")])
+                .unwrap()
+                .update_repo,
+            None
+        );
+        let set = with_update(&[("FLEET_UPDATE_REPO", "Acme/fleet")]).unwrap();
+        assert_eq!(
+            set.update_repo,
+            Some(UpdateRepo::parse("Acme/fleet").unwrap())
+        );
+    }
+
+    #[test]
+    fn update_repo_with_update_manifest_refuses_start() {
+        let err = with_update(&[
+            ("FLEET_UPDATE_REPO", "acme/fleet"),
+            ("FLEET_UPDATE_MANIFEST", "/etc/fleet/manifest.json"),
+        ])
+        .unwrap_err();
+        match err {
+            ConfigError::Invalid { var, reason } => {
+                assert_eq!(var, "FLEET_UPDATE_REPO");
+                assert!(reason.contains("FLEET_UPDATE_MANIFEST"));
+            }
+            other => panic!("{other}"),
+        }
+        assert!(
+            with_update(&[
+                ("FLEET_UPDATE_REPO", ""),
+                ("FLEET_UPDATE_MANIFEST", "/etc/fleet/manifest.json"),
+            ])
+            .is_ok()
+        );
+        assert!(
+            with_update(&[
+                ("FLEET_UPDATE_REPO", "acme/fleet"),
+                ("FLEET_UPDATE_MANIFEST", ""),
+            ])
+            .is_ok()
+        );
+    }
+
+    #[test]
+    fn update_poll_secs_defaults_and_enforces_its_range() {
+        assert_eq!(
+            with_update(&[]).unwrap().update_poll,
+            Duration::from_secs(900)
+        );
+        for (value, ok) in [
+            ("59", false),
+            ("60", true),
+            ("61", true),
+            ("900", true),
+            ("86399", true),
+            ("86400", true),
+            ("86401", false),
+            ("0", false),
+            ("-1", false),
+            ("x", false),
+            ("1e3", false),
+            (" 900", false),
+            ("18446744073709551616", false),
+        ] {
+            let got = with_update(&[("FLEET_UPDATE_POLL_SECS", value)]);
+            assert_eq!(got.is_ok(), ok, "{value:?}");
+            match got {
+                Ok(config) => assert_eq!(
+                    config.update_poll,
+                    Duration::from_secs(value.parse().unwrap())
+                ),
+                Err(ConfigError::Invalid { var, .. }) => {
+                    assert_eq!(var, "FLEET_UPDATE_POLL_SECS", "{value:?}");
+                }
+                Err(other) => panic!("{value:?}: {other}"),
+            }
+        }
+    }
+
+    #[test]
+    fn update_poll_secs_range_error_names_the_range() {
+        let err = with_update(&[("FLEET_UPDATE_POLL_SECS", "59")]).unwrap_err();
+        assert!(err.to_string().contains("between 60 and 86400"), "{err}");
     }
 
     #[test]

@@ -1,10 +1,12 @@
 # The server fetches the release manifest
 
-Status: Proposed 2026-11-07, not built. The operator decided every point below. Amends the relay
-description of ADR-0047 only. The trust model of ADR-0047 and ADR-0050 is unchanged. The build is
-tasks FEED-2 to FEED-7.
+Status: Proposed 2026-11-07, partly built (FEED-2). The operator decided every point below. Amends
+the relay description of ADR-0047 only. The trust model of ADR-0047 and ADR-0050 is unchanged. The
+build is tasks FEED-2 to FEED-7.
 
-Not built: every item below. Today `UpdateRelay` (`crates/fleet-server/src/service.rs`) reads the
+Built (FEED-2): parsing of `FLEET_UPDATE_REPO` and `FLEET_UPDATE_POLL_SECS`, a poll range of 60 to
+86400 with default 900, and startup refusal of `FLEET_UPDATE_REPO` together with
+`FLEET_UPDATE_MANIFEST`. Not built: the fetch, the poll loop and the relay (FEED-4 to FEED-7). Today `UpdateRelay` (`crates/fleet-server/src/service.rs`) reads the
 manifest from a file named by `FLEET_UPDATE_MANIFEST` (`crates/fleet-server/src/config.rs`) and
 the signature from the same path plus `.minisig`. It relays both verbatim in `HeartbeatReply`. An
 operator must copy two files onto the server host after each release, and nobody does it. Boxes
@@ -27,8 +29,9 @@ bytes come from: the server fetches them from GitHub Releases itself.
 - No GitHub API call and no token. The two downloads are public.
 - There is no free-form URL variable. The operator names a repository and the server owns the URL
   shape, so the variable cannot aim the server at an arbitrary host.
-- `owner/repo` is parsed with the grammar of `fleet_core::repo::RepoRef` before it is placed in a
-  URL.
+- `owner/repo` is parsed by `UpdateRepo` before it is placed in a URL, with the GitHub owner and
+  name rules: owner 1 to 39 bytes of `[A-Za-z0-9-]`, repo 1 to 100 bytes of `[A-Za-z0-9._-]` and
+  not `.` or `..`, exactly one slash, ASCII only.
 
 ### Polling
 
