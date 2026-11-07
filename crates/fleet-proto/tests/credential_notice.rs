@@ -8,6 +8,9 @@ use fleet_proto::{
     PRECONDITION_APP_MINT_CAP, PRECONDITION_APP_MINT_RATE, PRECONDITION_APP_REPO,
     PRECONDITION_CREDENTIAL_TOMBSTONED, PRECONDITION_EXPIRED, PRECONDITION_NO_AGENT,
     PRECONDITION_NO_GITHUB, PRECONDITION_NO_VERIFY_REPO, PRECONDITION_NOT_CONFIGURED,
+    PRECONDITION_REPO_NO_CREDENTIAL, PRECONDITION_REPO_NOT_ALLOWED_HOST,
+    PRECONDITION_REPO_NOT_FOUND_OR_NO_ACCESS, PRECONDITION_REPO_TIMEOUT,
+    PRECONDITION_REPO_UPSTREAM_UNAVAILABLE,
 };
 use tonic::{Code, Status};
 
@@ -75,6 +78,42 @@ fn the_allowlist_refusals_have_fixed_codes_texts_and_messages() {
                 "{code:?}"
             );
         }
+    }
+}
+
+#[test]
+fn the_repo_reasons_have_fixed_messages_and_notices() {
+    assert_eq!(
+        PRECONDITION_REPO_NOT_ALLOWED_HOST,
+        "repository host is not allowed"
+    );
+    assert_eq!(
+        PRECONDITION_REPO_NO_CREDENTIAL,
+        "no credential for the repository host"
+    );
+    assert_eq!(
+        PRECONDITION_REPO_NOT_FOUND_OR_NO_ACCESS,
+        "repository not found or no access"
+    );
+    assert_eq!(
+        PRECONDITION_REPO_UPSTREAM_UNAVAILABLE,
+        "repository host unavailable"
+    );
+    assert_eq!(PRECONDITION_REPO_TIMEOUT, "repository check timed out");
+    let pairs = [
+        (CredentialNotice::RepoHostRefused, "repo_host_refused"),
+        (CredentialNotice::RepoNoCredential, "repo_no_credential"),
+        (CredentialNotice::RepoNotFound, "repo_not_found"),
+        (
+            CredentialNotice::RepoUpstreamUnavailable,
+            "repo_upstream_unavailable",
+        ),
+        (CredentialNotice::RepoTimeout, "repo_timeout"),
+    ];
+    for (notice, code) in pairs {
+        assert_eq!(notice.code(), code);
+        assert_eq!(CredentialNotice::from_code(code), Some(notice));
+        assert!(notice.text().ends_with('.'), "{code}");
     }
 }
 
@@ -170,6 +209,21 @@ fn every_code_and_message_pair_maps_to_one_notice() {
         (fp, PRECONDITION_APP_INSTALLATION, N::InstallationRefused),
         (fp, PRECONDITION_APP_REPO, N::RepoRefused),
         (fp, PRECONDITION_APP_MINT_RATE, N::RateLimited),
+        (fp, PRECONDITION_REPO_NOT_ALLOWED_HOST, N::RepoHostRefused),
+        (fp, PRECONDITION_REPO_NO_CREDENTIAL, N::RepoNoCredential),
+        (
+            fp,
+            PRECONDITION_REPO_NOT_FOUND_OR_NO_ACCESS,
+            N::RepoNotFound,
+        ),
+        (
+            fp,
+            PRECONDITION_REPO_UPSTREAM_UNAVAILABLE,
+            N::RepoUpstreamUnavailable,
+        ),
+        (fp, PRECONDITION_REPO_TIMEOUT, N::RepoTimeout),
+        (Code::Internal, PRECONDITION_REPO_TIMEOUT, N::Failed),
+        (Code::NotFound, PRECONDITION_REPO_NO_CREDENTIAL, N::NotFound),
         (fp, PRECONDITION_NO_GITHUB, N::NoVerifier),
         (fp, PRECONDITION_NO_AGENT, N::NoVerifier),
         (fp, PRECONDITION_EXPIRED, N::NoVerifier),

@@ -67,6 +67,12 @@ service FleetCredentials {
   rpc VerifyCredential(VerifyCredentialRequest) returns (VerifyCredentialReply);
 }
 
+service FleetRepos {
+  rpc AddRepo(AddRepoRequest) returns (RepoInfo);
+  rpc ListRepos(ListReposRequest) returns (ListReposReply);
+  rpc RemoveRepo(RemoveRepoRequest) returns (RemoveRepoReply);
+}
+
 service FleetWorker {
   rpc ClaimJob(ClaimJobRequest) returns (ClaimJobReply);
   rpc ReportJob(ReportJobRequest) returns (ReportJobReply);
@@ -114,6 +120,32 @@ message VerifyCredentialReply {
   optional string login = 2;
   optional uint64 expires_at_ms = 3;
 }
+
+message AddRepoRequest {
+  string repo = 1;
+}
+
+message RepoInfo {
+  string host = 1;
+  string path = 2;
+  string forge_kind = 3;
+  bool runnable = 4;
+  uint64 verified_at_ms = 5;
+  optional bool push = 6;
+}
+
+message ListReposRequest {}
+
+message ListReposReply {
+  repeated RepoInfo repos = 1;
+}
+
+message RemoveRepoRequest {
+  string host = 1;
+  string path = 2;
+}
+
+message RemoveRepoReply {}
 
 message GetJobCredentialsRequest {
   string job_id = 1;

@@ -7,7 +7,9 @@ use crate::{
     PRECONDITION_APP_INSTALLATION, PRECONDITION_APP_MINT, PRECONDITION_APP_MINT_CAP,
     PRECONDITION_APP_MINT_RATE, PRECONDITION_APP_REPO, PRECONDITION_CREDENTIAL_TOMBSTONED,
     PRECONDITION_EXPIRED, PRECONDITION_NO_AGENT, PRECONDITION_NO_GITHUB,
-    PRECONDITION_NO_VERIFY_REPO, PRECONDITION_NOT_CONFIGURED,
+    PRECONDITION_NO_VERIFY_REPO, PRECONDITION_NOT_CONFIGURED, PRECONDITION_REPO_NO_CREDENTIAL,
+    PRECONDITION_REPO_NOT_ALLOWED_HOST, PRECONDITION_REPO_NOT_FOUND_OR_NO_ACCESS,
+    PRECONDITION_REPO_TIMEOUT, PRECONDITION_REPO_UPSTREAM_UNAVAILABLE,
 };
 
 /// A fixed server refusal, named by the code and message the server sends.
@@ -35,6 +37,16 @@ pub enum Reason {
     NoVerifyRepo,
     /// `FAILED_PRECONDITION`: the credential is a tombstone.
     Tombstoned,
+    /// `FAILED_PRECONDITION`: the repository host is not allowed or has no verifier.
+    RepoNotAllowedHost,
+    /// `FAILED_PRECONDITION`: the User has no credential for the repository host.
+    RepoNoCredential,
+    /// `FAILED_PRECONDITION`: the forge answered 404 or 403 for the repository.
+    RepoNotFoundOrNoAccess,
+    /// `FAILED_PRECONDITION`: the forge could not be reached or answered badly.
+    RepoUpstreamUnavailable,
+    /// `FAILED_PRECONDITION`: the repository check ran out of budget.
+    RepoTimeout,
     /// `PERMISSION_DENIED`: the user lacks a capability.
     CapabilityNotGranted,
     /// `PERMISSION_DENIED`: a per-user token is needed.
@@ -61,6 +73,19 @@ pub fn classify(code: Code, message: &str) -> Option<Reason> {
         (Code::FailedPrecondition, PRECONDITION_APP_REPO) => Some(Reason::AppRepo),
         (Code::FailedPrecondition, PRECONDITION_NO_VERIFY_REPO) => Some(Reason::NoVerifyRepo),
         (Code::FailedPrecondition, PRECONDITION_CREDENTIAL_TOMBSTONED) => Some(Reason::Tombstoned),
+        (Code::FailedPrecondition, PRECONDITION_REPO_NOT_ALLOWED_HOST) => {
+            Some(Reason::RepoNotAllowedHost)
+        }
+        (Code::FailedPrecondition, PRECONDITION_REPO_NO_CREDENTIAL) => {
+            Some(Reason::RepoNoCredential)
+        }
+        (Code::FailedPrecondition, PRECONDITION_REPO_NOT_FOUND_OR_NO_ACCESS) => {
+            Some(Reason::RepoNotFoundOrNoAccess)
+        }
+        (Code::FailedPrecondition, PRECONDITION_REPO_UPSTREAM_UNAVAILABLE) => {
+            Some(Reason::RepoUpstreamUnavailable)
+        }
+        (Code::FailedPrecondition, PRECONDITION_REPO_TIMEOUT) => Some(Reason::RepoTimeout),
         (Code::PermissionDenied, ERR_CAPABILITY_NOT_GRANTED) => Some(Reason::CapabilityNotGranted),
         (Code::PermissionDenied, ERR_NEEDS_USER_TOKEN) => Some(Reason::NeedsUserToken),
         (Code::PermissionDenied, ERR_LEASE_MISMATCH) => Some(Reason::LeaseMismatch),
@@ -77,7 +102,9 @@ mod tests {
         PRECONDITION_APP_INSTALLATION, PRECONDITION_APP_MINT, PRECONDITION_APP_MINT_CAP,
         PRECONDITION_APP_MINT_RATE, PRECONDITION_APP_REPO, PRECONDITION_CREDENTIAL_TOMBSTONED,
         PRECONDITION_EXPIRED, PRECONDITION_NO_AGENT, PRECONDITION_NO_GITHUB,
-        PRECONDITION_NO_VERIFY_REPO, PRECONDITION_NOT_CONFIGURED,
+        PRECONDITION_NO_VERIFY_REPO, PRECONDITION_NOT_CONFIGURED, PRECONDITION_REPO_NO_CREDENTIAL,
+        PRECONDITION_REPO_NOT_ALLOWED_HOST, PRECONDITION_REPO_NOT_FOUND_OR_NO_ACCESS,
+        PRECONDITION_REPO_TIMEOUT, PRECONDITION_REPO_UPSTREAM_UNAVAILABLE,
     };
     use tonic::Code;
 
@@ -97,6 +124,27 @@ mod tests {
             (fp, PRECONDITION_APP_REPO, Reason::AppRepo),
             (fp, PRECONDITION_NO_VERIFY_REPO, Reason::NoVerifyRepo),
             (fp, PRECONDITION_CREDENTIAL_TOMBSTONED, Reason::Tombstoned),
+            (
+                fp,
+                PRECONDITION_REPO_NOT_ALLOWED_HOST,
+                Reason::RepoNotAllowedHost,
+            ),
+            (
+                fp,
+                PRECONDITION_REPO_NO_CREDENTIAL,
+                Reason::RepoNoCredential,
+            ),
+            (
+                fp,
+                PRECONDITION_REPO_NOT_FOUND_OR_NO_ACCESS,
+                Reason::RepoNotFoundOrNoAccess,
+            ),
+            (
+                fp,
+                PRECONDITION_REPO_UPSTREAM_UNAVAILABLE,
+                Reason::RepoUpstreamUnavailable,
+            ),
+            (fp, PRECONDITION_REPO_TIMEOUT, Reason::RepoTimeout),
             (pd, ERR_CAPABILITY_NOT_GRANTED, Reason::CapabilityNotGranted),
             (pd, ERR_NEEDS_USER_TOKEN, Reason::NeedsUserToken),
             (pd, ERR_LEASE_MISMATCH, Reason::LeaseMismatch),

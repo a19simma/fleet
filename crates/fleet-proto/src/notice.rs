@@ -47,6 +47,16 @@ pub enum CredentialNotice {
     RepoRefused,
     /// The User reached the per-minute GitHub App mint limit. Retry later.
     RateLimited,
+    /// The repository host is not on the operator list or has no verifier.
+    RepoHostRefused,
+    /// The User has no credential for the repository host.
+    RepoNoCredential,
+    /// The forge reports no such repository, or the credential cannot see it.
+    RepoNotFound,
+    /// The repository host could not be reached.
+    RepoUpstreamUnavailable,
+    /// The repository check timed out.
+    RepoTimeout,
     /// Any other failure.
     Failed,
 }
@@ -72,6 +82,11 @@ impl CredentialNotice {
         Self::InstallationRefused,
         Self::RepoRefused,
         Self::RateLimited,
+        Self::RepoHostRefused,
+        Self::RepoNoCredential,
+        Self::RepoNotFound,
+        Self::RepoUpstreamUnavailable,
+        Self::RepoTimeout,
         Self::Failed,
     ];
 
@@ -97,6 +112,11 @@ impl CredentialNotice {
             Self::InstallationRefused => "installation_refused",
             Self::RepoRefused => "repo_refused",
             Self::RateLimited => "rate_limited",
+            Self::RepoHostRefused => "repo_host_refused",
+            Self::RepoNoCredential => "repo_no_credential",
+            Self::RepoNotFound => "repo_not_found",
+            Self::RepoUpstreamUnavailable => "repo_upstream_unavailable",
+            Self::RepoTimeout => "repo_timeout",
             Self::Failed => "failed",
         }
     }
@@ -143,6 +163,15 @@ impl CredentialNotice {
                 "The repository is not allowed for the GitHub App. Ask the operator."
             }
             Self::RateLimited => "Too many GitHub App token requests. Try again in a minute.",
+            Self::RepoHostRefused => "This repository host is not allowed on this server.",
+            Self::RepoNoCredential => {
+                "Store a credential for this repository host first, then add the repository."
+            }
+            Self::RepoNotFound => {
+                "The repository was not found, or your credential cannot access it."
+            }
+            Self::RepoUpstreamUnavailable => "The repository host is unavailable. Try again later.",
+            Self::RepoTimeout => "The repository check timed out. Try again later.",
             Self::Failed => "The request failed.",
         }
     }
@@ -176,6 +205,11 @@ impl CredentialNotice {
                 Some(Reason::AppInstallation) => Self::InstallationRefused,
                 Some(Reason::AppRepo) => Self::RepoRefused,
                 Some(Reason::AppMintRate) => Self::RateLimited,
+                Some(Reason::RepoNotAllowedHost) => Self::RepoHostRefused,
+                Some(Reason::RepoNoCredential) => Self::RepoNoCredential,
+                Some(Reason::RepoNotFoundOrNoAccess) => Self::RepoNotFound,
+                Some(Reason::RepoUpstreamUnavailable) => Self::RepoUpstreamUnavailable,
+                Some(Reason::RepoTimeout) => Self::RepoTimeout,
                 _ => Self::NoVerifier,
             },
             _ => Self::Failed,

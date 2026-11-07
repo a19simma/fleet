@@ -6,9 +6,13 @@ Relation to the App ceiling).
 
 Built: the repository reference parser in fleet-core (`crates/fleet-core/src/repo.rs`: `RepoRef`,
 `ForgeKind`, `RepoVerdict`) and the `FLEET_REPO_HOSTS` config (`crates/fleet-server/src/config.rs`,
-documented in `infra/README.md` and `crates/fleet-server/README.md`). Not built: `RepoVerifier`,
-`REPO_CHECK_BUDGET`, the registry table, the `FleetRepos` RPCs, the `credentials.host` column and
-the `forgejo_pat` kind.
+documented in `infra/README.md` and `crates/fleet-server/README.md`). Also built, as contract only:
+the `FleetRepos` proto (`AddRepo`, `ListRepos`, `RemoveRepo`, `RepoInfo`), migration 0036 (the
+`user_repos` table and the nullable `github_app_mint.job_id`, required only for scope `job`), the
+five `PRECONDITION_REPO_*` constants in `fleet-proto` with their `Reason` variants and
+`CredentialNotice` mappings. Not built: the `FleetRepos` server handlers, `RepoVerifier`,
+`REPO_CHECK_BUDGET`, the `credentials.host` column and the `forgejo_pat` kind. The `path` column
+holds at most 141 bytes: a Forgejo owner of 40, a slash and a name of 100.
 
 A User names the repositories they work on, so the CLI and the web page can list them and later
 features can offer them. Today a repository exists only as a field on a Job. This ADR adds a

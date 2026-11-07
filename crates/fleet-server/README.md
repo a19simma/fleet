@@ -12,6 +12,7 @@ The hosted Fleet service. It stores box state, jobs, transcripts, job timing and
 | `FleetJobs` | `SubmitJob`, `GetJob`, `ListJobs`, `CancelJob`, `ReadTranscript`, `ReadJobEvents`, `GetStats`, `GetJobTiming`, `StreamShellLog` | client |
 | `FleetProfiles` | `CreateProfile`, `GetProfile`, `ListProfiles`, `ShareProfile`, `UnshareProfile` | client |
 | `FleetCatalog` | `ListCatalog` | client scope, admin user only |
+| `FleetRepos` | `AddRepo`, `ListRepos`, `RemoveRepo` (contract only, no handler yet, ADR-0059) | client scope, interactive user only |
 | `FleetJudge`, `FleetBatches`, `FleetCredentials` | see `crates/fleet-proto/proto/fleet/v1/fleet.proto` | client |
 | `FleetCatalogAdmin` | `UpsertCatalogItem`, `SetCatalogItemEnabled` | admin user API token |
 | `FleetCapabilityAdmin` | `GrantCapability`, `RevokeCapability`, `ListCapabilities` | admin user API token |

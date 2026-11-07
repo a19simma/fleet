@@ -250,6 +250,25 @@ pub const PRECONDITION_NO_VERIFY_REPO: &str = "no job to verify the github app a
 pub const PRECONDITION_CREDENTIAL_TOMBSTONED: &str =
     "credential was deleted and cannot be replaced";
 
+/// `FAILED_PRECONDITION` message: `AddRepo` named a host outside the operator host list, or a host
+/// with no verifier (ADR-0059).
+pub const PRECONDITION_REPO_NOT_ALLOWED_HOST: &str = "repository host is not allowed";
+
+/// `FAILED_PRECONDITION` message: `AddRepo` found no credential of the User for the host
+/// (ADR-0059).
+pub const PRECONDITION_REPO_NO_CREDENTIAL: &str = "no credential for the repository host";
+
+/// `FAILED_PRECONDITION` message: the forge answered 404 or 403, which collapse into one reason so
+/// a caller cannot probe for private repositories (ADR-0059).
+pub const PRECONDITION_REPO_NOT_FOUND_OR_NO_ACCESS: &str = "repository not found or no access";
+
+/// `FAILED_PRECONDITION` message: the forge could not be reached or its reply was unusable.
+/// Upstream bodies and addresses go to server logs only (ADR-0059).
+pub const PRECONDITION_REPO_UPSTREAM_UNAVAILABLE: &str = "repository host unavailable";
+
+/// `FAILED_PRECONDITION` message: the repository check ran out of its time budget (ADR-0059).
+pub const PRECONDITION_REPO_TIMEOUT: &str = "repository check timed out";
+
 /// `FAILED_PRECONDITION` message: the server runs without a credential store.
 pub const PRECONDITION_NOT_CONFIGURED: &str = "credentials are not configured";
 
