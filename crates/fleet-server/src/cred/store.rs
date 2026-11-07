@@ -1,6 +1,8 @@
 //! Postgres credential store over a [`Sealer`] (ADR-0040).
 //!
-//! Plaintext exists only inside [`Secret`] values. No error or `Debug` output carries it.
+//! Plaintext is held in [`Secret`] values, which zero their buffer on drop. The release reply
+//! copies each value into a plain `String` for the wire, and that copy is not zeroed. No error
+//! or `Debug` output carries it.
 
 use std::fmt;
 use std::sync::Arc;
@@ -1150,8 +1152,10 @@ impl CredentialStore {
     /// token is minted after the capability check and after the first transaction commits, so no
     /// row lock is held across the network call. A second transaction then re-reads the lease
     /// and the capability and writes the use rows, only after the mint succeeded. If that fails
-    /// the token is revoked best effort. Any mint failure returns [`StoreError::MintFailed`]
-    /// and writes no use row. A wrong lease never reaches the mint.
+    /// the token is revoked best effort. A failed mint step returns [`StoreError::MintFailed`]
+    /// and a refusal by the allowlists or the installation binding returns
+    /// [`StoreError::InstallationDenied`] or [`StoreError::RepoDenied`]. None of them writes a
+    /// use row. A wrong lease never reaches the mint.
     ///
     /// Every call that reaches the mint step is a mint, the first fetch and each refresh alike
     /// (ADR-0058, SEC-004). The first transaction takes `FOR UPDATE` on the `github_app`
@@ -1166,7 +1170,8 @@ impl CredentialStore {
     /// reason younger than [`DENIED_DEDUPE_SECS`] exists for the Job. It then commits and fails
     /// with [`StoreError::MintCapReached`] without a mint. After the mint the second
     /// transaction writes the `minted` row with the token expiry together with the use rows.
-    /// A mint failure writes `failed`. A failed recheck writes `denied` or `failed`, the token
+    /// A mint failure writes `failed`, except that an installation binding refusal writes
+    /// `denied` with reason `installation binding refused`. A failed recheck writes `denied` or `failed`, the token
     /// is revoked and a `revoked` or `revoke_failed` row follows. A guard revokes the token on
     /// a task when this future is dropped between the mint and the reply.
     ///
@@ -1175,9 +1180,9 @@ impl CredentialStore {
     /// credential of a kind the agent accepts is expired. Checks run in this order: lease,
     /// GitHub, agent, expiry.
     ///
-    /// The opened plaintext is copied into a [`Secret`] and the intermediate buffers are not
-    /// zeroed. This is accepted: the value is also in the reply sent to the Box, so zeroing the
-    /// server copy would not shrink the exposure.
+    /// The opened plaintext moves into a [`Secret`] without a copy, and the [`Secret`] zeroes
+    /// its buffer on drop. The reply built for the Box holds a plain `String` copy of each
+    /// value that is not zeroed, so the server copy being zeroed does not shrink the exposure.
     ///
     /// # Errors
     ///
@@ -1190,9 +1195,10 @@ impl CredentialStore {
     /// Returns [`StoreError::NoAgentCredential`] when the owner has none the agent accepts.
     /// Returns [`StoreError::NotFound`] when the credential row is gone or tombstoned after
     /// the mint.
-    /// Returns [`StoreError::MintFailed`] when the App token cannot be minted, which covers a
-    /// failed installation lookup, a signing failure and a lookup plus mint that outlasts
-    /// [`MINT_BUDGET`]. A future dropped before the mint returns closes its `attempt` row as
+    /// Returns [`StoreError::MintFailed`] when the App lane is absent, the installation id is
+    /// malformed, the credential row is gone before the mint, or the App token cannot be
+    /// minted, which covers a failed installation lookup, a signing failure and a lookup plus
+    /// mint that outlasts [`MINT_BUDGET`]. A future dropped before the mint returns closes its `attempt` row as
     /// `failed` with reason `mint cancelled`; the row keeps its slot against the cap.
     /// Returns [`StoreError::MintCapReached`] when the Job already holds the cap of mint
     /// attempts or the User started the per-minute limit of them.
@@ -1517,8 +1523,9 @@ impl CredentialStore {
     /// row and counts the User's attempts of the last minute against the per-User rate limit. The
     /// row has scope `probe`, so it never counts toward the per-Job cap of any Job. Under
     /// that limit it writes an `attempt` row and commits, and then the mint runs: no row
-    /// lock is held across the network call. A mint failure writes `failed`, and so does a future
-    /// dropped before the mint returns, with reason `mint cancelled`. A mint writes
+    /// lock is held across the network call. A mint failure writes `failed`, except that an
+    /// installation binding refusal writes `denied`. A future dropped before the mint returns
+    /// writes `failed` with reason `mint cancelled`. A mint writes
     /// `minted`, and the revoke then writes `revoked` or `revoke_failed`. A guard revokes the
     /// token when this future is dropped between the mint and the revoke. The token never
     /// leaves this function. No use row is written.

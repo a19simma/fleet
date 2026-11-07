@@ -142,8 +142,9 @@ impl<R: Reporter> AgentRunner<R> {
         }
     }
 
-    /// Puts the holder's model credential into `env` and drops every model secret the box
-    /// environment passed.
+    /// Puts the holder's model credential into `env` and drops `ANTHROPIC_API_KEY` and
+    /// `CLAUDE_CODE_OAUTH_TOKEN` from the box environment. The Codex and Kimi runners clear
+    /// their own key variables.
     ///
     /// With a book attached, a job gets `ANTHROPIC_API_KEY` or `CLAUDE_CODE_OAUTH_TOKEN` from
     /// its held credentials only. A job with none held gets neither, and the box values never

@@ -33,7 +33,7 @@ The operator owns everything this directory leaves out.
 - The operator patches `FLEET_WEB_RP_ID` (the bare host) and `FLEET_WEB_ORIGIN` (`https://` plus the host) on the Deployment so both match the route host. The Deployment keeps the placeholders `fleet.example.com` and `https://fleet.example.com`. The web UI needs both set.
 - Both routes share one host and one listener. The Gateway API spec says an implementation MAY reject one of them (the oldest wins). Cilium behaviour is unverified here. The operator checks the `Accepted` status of each route.
 - The gateway must redirect HTTP to HTTPS. Browsers honour `Strict-Transport-Security` only when it arrives over HTTPS, so the header does not protect a first plain HTTP request.
-- Header and idle timeouts for the shared HTTP/1.1 and h2c port (SEC-001) are not route fields. The operator sets them in the gateway implementation's policy, for example a client traffic policy with a client request header timeout and an idle timeout, and keeps them short enough to bound slow clients.
+- Header and idle timeouts for the shared HTTP/1.1 and h2c port are not route fields. The operator sets them in the gateway implementation's policy, for example a client traffic policy with a client request header timeout and an idle timeout, and keeps them short enough to bound slow clients.
 
 ## Master key
 
@@ -62,7 +62,7 @@ The operator must enable etcd encryption at rest. Without it the Secret sits in 
 
 ## Server variables
 
-The Deployment sets `FLEET_LISTEN`, `FLEET_HEALTH_LISTEN`, `FLEET_DATABASE_URL`, `FLEET_TOKEN`, `FLEET_CLIENT_TOKEN`, `FLEET_WEB_RP_ID`, `FLEET_WEB_ORIGIN` and `FLEET_MASTER_KEY_FILE`. Its only volume is the master key. These fleet-server variables are not set by default:
+The Deployment sets `FLEET_LISTEN`, `FLEET_HEALTH_LISTEN`, `FLEET_DATABASE_URL`, `FLEET_TOKEN`, `FLEET_CLIENT_TOKEN`, `FLEET_WEB_RP_ID`, `FLEET_WEB_ORIGIN`, `FLEET_MASTER_KEY_FILE`, `FLEET_BOOTSTRAP_PASSWORD` (optional, see [Bootstrap password](#bootstrap-password)) and `FLEET_TRUSTED_PROXY_HOPS`. Its only volume is the master key. These fleet-server variables are not set by default:
 
 | Variable | Meaning |
 | --- | --- |

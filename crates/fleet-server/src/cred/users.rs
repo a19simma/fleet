@@ -293,8 +293,10 @@ impl Users {
     ///
     /// # Errors
     ///
-    /// Returns [`UserError::BadSetupCode`], [`UserError::SetupClosed`], a username error or
-    /// [`UserError::Db`].
+    /// Returns [`UserError::BadSetupCode`], [`UserError::SetupClosed`],
+    /// [`UserError::InvalidUsername`] or [`UserError::ReservedUsername`] for a refused username,
+    /// [`UserError::Taken`] when the username exists, or [`UserError::Db`], which includes a
+    /// failed commit.
     #[expect(
         clippy::significant_drop_tightening,
         reason = "commit consumes the redemption; the lint cannot see the move"
@@ -314,8 +316,9 @@ impl Users {
     ///
     /// # Errors
     ///
-    /// Returns [`UserError::BadSetupCode`], [`UserError::SetupClosed`], a username error or
-    /// [`UserError::Db`].
+    /// Returns [`UserError::BadSetupCode`], [`UserError::SetupClosed`],
+    /// [`UserError::InvalidUsername`] or [`UserError::ReservedUsername`] for a refused username,
+    /// [`UserError::Taken`] when the username exists, or [`UserError::Db`].
     pub async fn begin_redeem_setup(
         &self,
         code: &[u8],
@@ -378,8 +381,10 @@ impl Users {
     ///
     /// # Errors
     ///
-    /// Returns [`UserError::SetupClosed`] once a user or a revocation exists, a username
-    /// error (the reserved `bootstrap` name included) or [`UserError::Db`].
+    /// Returns [`UserError::SetupClosed`] once a user or a revocation exists,
+    /// [`UserError::InvalidUsername`] or [`UserError::ReservedUsername`] for a refused username
+    /// (the reserved `bootstrap` name included), [`UserError::Taken`] when the username exists,
+    /// or [`UserError::Db`].
     pub async fn begin_redeem_password(
         &self,
         username: &str,

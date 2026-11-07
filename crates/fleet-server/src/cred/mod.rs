@@ -1,8 +1,11 @@
 //! Credentials, users and capabilities.
 //!
-//! Sealing of secrets at rest (ADR-0040), the credential store and its release path
-//! (ADR-0043), the GitHub App lane with its mint client, policy and audit (ADR-0058), and the
-//! user, token and capability stores.
+//! Sealing of secrets at rest and the credential store (ADR-0040), credential kinds and shapes
+//! with GitHub token verification (ADR-0043), the `FleetCredentials` handlers (`api`), the
+//! GitHub App lane (ADR-0058: key and JWT in `app_jwt`, mint client in `app_mint`, allowlists
+//! in `app_policy`, mint audit rows in `store`), users, API tokens and the setup code
+//! (ADR-0042: `users`, `password`, `limiter`), per-user capabilities (`capability`) and the
+//! `admin` subcommand.
 
 pub mod admin;
 pub mod api;

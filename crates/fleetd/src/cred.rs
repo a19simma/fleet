@@ -251,8 +251,9 @@ impl Credential {
         &self.value
     }
 
-    /// The expiry the server sent, in milliseconds since the Unix epoch. Only an installation
-    /// token carries one. [`CredentialBook::refresh_if_due`] reads it.
+    /// The expiry the server sent, in milliseconds since the Unix epoch. The server sends one
+    /// for an installation token and none for a stored secret, and fleetd keeps what the reply
+    /// carries. [`CredentialBook::refresh_if_due`] reads the expiry of the installation token.
     #[must_use]
     pub const fn expires_at_ms(&self) -> Option<u64> {
         self.expires_at_ms
@@ -475,7 +476,8 @@ impl CredentialClient {
     ///
     /// # Errors
     ///
-    /// Fails when the token is not a valid header value. The error never contains it.
+    /// Returns [`Error::InvalidValue`] when the token is not a valid header value. The error
+    /// never contains it.
     pub fn new(channel: Channel, token: &str) -> Result<Self, Error> {
         Ok(Self {
             channel,
@@ -532,11 +534,17 @@ impl From<CredentialFailure> for Rejected {
     }
 }
 
+/// The installation tokens of a rejected reply that are worth revoking: those of the GitHub
+/// installation kind that pass [`is_app_token`] and fit [`MAX_CREDENTIAL_LEN`], at most
+/// [`MAX_CREDENTIALS_PER_USER`] of them. A value outside those bounds is not a token GitHub
+/// minted, so it is never sent to the revoke call.
 fn app_tokens(reply: &GetJobCredentialsReply) -> Vec<Zeroizing<String>> {
     reply
         .credentials
         .iter()
         .filter(|wire| wire.kind == GITHUB_INSTALLATION_TOKEN_KIND)
+        .filter(|wire| wire.value.len() <= MAX_CREDENTIAL_LEN && is_app_token(&wire.value))
+        .take(MAX_CREDENTIALS_PER_USER)
         .map(|wire| Zeroizing::new(wire.value.clone()))
         .collect()
 }
@@ -626,7 +634,8 @@ pub struct LeasedToken {
 }
 
 impl LeasedToken {
-    /// `token`, held by `lease` when it is an installation token the book tracks.
+    /// `token`, held by the `lease` the book gave for the job. The book leases any job it
+    /// holds, a PAT job included, so `lease` is `None` when the runner has no book or the book holds nothing for the job.
     #[must_use]
     pub const fn new(token: String, lease: Option<TokenLease>) -> Self {
         Self { token, lease }
@@ -667,13 +676,17 @@ pub trait TokenSource: Send + Sync + fmt::Debug {
     ///
     /// # Errors
     ///
-    /// Returns the [`CredentialFailure`] of a refresh that failed for good. The caller fails
-    /// the step and never falls back to another token.
+    /// Returns the [`CredentialFailure`] of [`CredentialBook::refresh_if_due`]: `MintCap`,
+    /// `InstallationRefused`, `RepoRefused`, `LeaseMismatch`, `NoGithub`, `NoAgent`,
+    /// `NotConfigured`, `Malformed`, `AppIdentityMissing`, `AppIdentityInvalid`, or
+    /// `Unavailable` or `Expired` once the held token is no longer usable. The caller fails the
+    /// step and never falls back to another token.
     fn lease(&self) -> LeaseFuture<'_>;
 }
 
-/// A hold on the installation token a child was started with.
+/// A hold on the credentials a child was started with.
 ///
+/// The book only revokes an installation token, so a lease on a PAT job holds nothing back.
 /// While a lease is alive the book does not revoke the token a refresh replaced, up to
 /// [`DRAIN_LIMIT`]: the child keeps the old value in its environment and would fail mid-run
 /// on a revoked token. Dropping the lease lets the revoke go ahead once every lease of that
@@ -773,8 +786,10 @@ impl CredentialBook {
     /// [`CredentialFailure::RepoRefused`]. Any other status, a timeout or a transport error is
     /// [`CredentialFailure::Unavailable`]. A reply that breaks a rule is
     /// [`CredentialFailure::Malformed`], [`CredentialFailure::AppIdentityMissing`] or
-    /// [`CredentialFailure::AppIdentityInvalid`]; the installation token in such a reply is
-    /// revoked, because the server already minted and committed it.
+    /// [`CredentialFailure::AppIdentityInvalid`]; the well-formed installation token in such a
+    /// reply is revoked, because the server already minted and committed it. A reply that holds no
+    /// GitHub credential or no agent credential is [`CredentialFailure::NoGithub`] or
+    /// [`CredentialFailure::NoAgent`], the same as the server's own answer.
     pub async fn fetch(
         &self,
         job_id: &str,
@@ -829,18 +844,21 @@ impl CredentialBook {
     /// Returns [`CredentialFailure::MintCap`] when the server's per-Job mint cap or per-User
     /// mint rate limit is reached, [`CredentialFailure::InstallationRefused`] or
     /// [`CredentialFailure::RepoRefused`] when the allowlists now refuse the installation or
-    /// the repository, and any other server refusal (lease lost, capability gone) as its own
-    /// variant. A reply with a bad identity returns
+    /// the repository, and any other server refusal as the variant [`CredentialBook::fetch`]
+    /// maps it to ([`CredentialFailure::LeaseMismatch`] for a lost lease or a capability that
+    /// is gone, [`CredentialFailure::NoGithub`], [`CredentialFailure::NoAgent`],
+    /// [`CredentialFailure::NotConfigured`]). A reply with a bad identity returns
     /// [`CredentialFailure::AppIdentityMissing`] or
-    /// [`CredentialFailure::AppIdentityInvalid`], and the installation token in that reply is
+    /// [`CredentialFailure::AppIdentityInvalid`], and the well-formed installation token in that reply is
     /// revoked, as is the token of a [`CredentialFailure::Malformed`] reply and the fresh token
     /// of a reply whose swap `refreshed` refuses. None of these keeps the old token or falls back to a PAT; the caller fails the
-    /// step. [`CredentialFailure::Unavailable`] and
-    /// [`CredentialFailure::Expired`] are returned only once the held token has expired,
-    /// because before that the last good token stays in use. A skewed entry has no expiry the
-    /// box clock can judge, so it counts as usable until [`REFRESH_SKEW_MS`] plus
-    /// [`REFRESH_SKEW_SLACK_MS`] have passed since it was fetched, and past that a transient
-    /// failure returns [`CredentialFailure::Expired`]. A recorded retry wait more
+    /// step. A transient failure, [`CredentialFailure::Unavailable`] or the server's
+    /// [`CredentialFailure::Expired`], returns `Ok(None)` while the held token is usable and
+    /// keeps it. Once it is not usable, an entry that is not skewed returns
+    /// [`CredentialFailure::Unavailable`] and a skewed entry returns
+    /// [`CredentialFailure::Expired`], whichever transient failure it was. A skewed entry has
+    /// no expiry the box clock can judge, so it counts as usable until [`REFRESH_SKEW_MS`]
+    /// plus [`REFRESH_SKEW_SLACK_MS`] have passed since it was fetched. A recorded retry wait more
     /// than [`REFRESH_SKEW_MS`] ahead of the clock (the stale-wait guard, `wait_is_stale`) is
     /// ignored and the refresh goes ahead, so a clock that moved back cannot hold it off for
     /// longer than that. An allowlist refusal ([`CredentialFailure::InstallationRefused`] or
@@ -870,8 +888,10 @@ impl CredentialBook {
     ///
     /// # Errors
     ///
-    /// The same as [`CredentialBook::refresh_if_due`], including the skewed-entry rule and the
-    /// stale-wait guard.
+    /// The same variants as [`CredentialBook::refresh_if_due`], with the same skewed-entry rule
+    /// and stale-wait guard: `MintCap`, `InstallationRefused`, `RepoRefused`, `LeaseMismatch`,
+    /// `NoGithub`, `NoAgent`, `NotConfigured`, `Malformed`, `AppIdentityMissing`,
+    /// `AppIdentityInvalid`, and `Unavailable` or `Expired` once the held token is not usable.
     pub async fn refresh_if_due_with(
         &self,
         job_id: &str,
@@ -1150,10 +1170,12 @@ impl CredentialBook {
 #[cfg(test)]
 mod tests {
     use super::{
-        Arc, Credential, CredentialBook, CredentialClient, CredentialKind, JobCredentials, Secret,
-        bearer_header,
+        Arc, Credential, CredentialBook, CredentialClient, CredentialKind,
+        GITHUB_INSTALLATION_TOKEN_KIND, GetJobCredentialsReply, JobCredentials, MAX_CREDENTIAL_LEN,
+        MAX_CREDENTIALS_PER_USER, Secret, app_tokens, bearer_header,
     };
     use crate::revoke::Revoker;
+    use fleet_proto::v1::JobCredential;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::Duration;
     use tokio::io::AsyncReadExt;
@@ -1195,6 +1217,53 @@ mod tests {
             assert!(std::time::Instant::now() < deadline, "no revoke arrived");
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
+    }
+
+    fn app_wire(value: &str) -> JobCredential {
+        JobCredential {
+            kind: GITHUB_INSTALLATION_TOKEN_KIND.into(),
+            shape: "static_secret".into(),
+            value: value.into(),
+            expires_at_ms: None,
+            git_identity: None,
+        }
+    }
+
+    fn held(reply: &GetJobCredentialsReply) -> Vec<String> {
+        app_tokens(reply)
+            .iter()
+            .map(|token| token.as_str().to_owned())
+            .collect()
+    }
+
+    #[test]
+    fn only_a_well_formed_installation_token_is_collected_for_revocation() {
+        let good = "ghs_Good0123456789".to_owned();
+        let at_cap = format!("ghs_{}", "a".repeat(MAX_CREDENTIAL_LEN - 4));
+        let reply = GetJobCredentialsReply {
+            credentials: vec![
+                app_wire(&good),
+                app_wire("ghs_bad token"),
+                app_wire("not-a-token"),
+                app_wire(&format!("ghs_{}", "a".repeat(MAX_CREDENTIAL_LEN - 3))),
+                app_wire(&at_cap),
+                JobCredential {
+                    kind: "github_pat".into(),
+                    ..app_wire("ghs_Other0123456789")
+                },
+            ],
+        };
+        assert_eq!(held(&reply), vec![good, at_cap]);
+    }
+
+    #[test]
+    fn the_collected_tokens_are_capped_at_the_per_user_limit() {
+        let reply = GetJobCredentialsReply {
+            credentials: (0..MAX_CREDENTIALS_PER_USER + 5)
+                .map(|n| app_wire(&format!("ghs_Tok{n:010}")))
+                .collect(),
+        };
+        assert_eq!(held(&reply).len(), MAX_CREDENTIALS_PER_USER);
     }
 
     #[test]

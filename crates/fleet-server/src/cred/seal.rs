@@ -209,8 +209,12 @@ impl FileSealer {
     ///
     /// # Errors
     ///
-    /// Returns a [`KeyRingError`] for a missing or unreadable file, a malformed line, a key
-    /// that is not 32 bytes, a repeated key id or an empty ring.
+    /// Returns [`KeyRingError::Missing`] when the file does not exist,
+    /// [`KeyRingError::Unreadable`] for any other read failure or text that is not UTF-8,
+    /// [`KeyRingError::Malformed`] for a line that is not `key_id:hex` or has a bad key id or
+    /// non-hex digits, [`KeyRingError::BadKeyLength`] for a key that is not 32 bytes,
+    /// [`KeyRingError::DuplicateKeyId`] for a repeated key id and [`KeyRingError::Empty`] for a
+    /// file with no keys.
     pub fn load(path: &Path) -> Result<Self, KeyRingError> {
         let raw = std::fs::read(path).map_err(|e| {
             if e.kind() == std::io::ErrorKind::NotFound {

@@ -12,8 +12,9 @@
 //! not parse but its `token` field reads. No error carries text from the network.
 //!
 //! [`AppClient::installation`] reads `GET /app/installations/{id}` for the owner binding
-//! (SEC-013, SEC-014). A reply with a missing or null `suspended_at`, `app_id`, `id` or
-//! `account.login` is malformed, so a missing field never reads as "not suspended".
+//! (SEC-013, SEC-014). A reply with a missing `suspended_at`, `app_id`, `id` or
+//! `account.login` is malformed, so a missing field never reads as "not suspended". A `null`
+//! `suspended_at` is the active state.
 //!
 //! The release path in `cred::store` calls the client after the capability check and the
 //! transaction commit (SEC-011).
@@ -227,7 +228,8 @@ pub trait InstallationDirectory: Send + Sync {
     ///
     /// # Errors
     ///
-    /// Returns [`MintError`] when the call fails or the reply is not a complete installation.
+    /// Returns [`MintError`] as [`AppClient::installation`] does: `Setup`, `Status`, `Timeout`,
+    /// `Transport` or `TooLarge` for a failed call, and `Malformed` for an incomplete reply.
     async fn installation(&self, jwt: &AppJwt, id: u64) -> Result<Installation, MintError>;
 }
 

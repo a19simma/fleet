@@ -176,7 +176,8 @@ impl Capabilities {
     /// [`Capabilities::grant_stored`].
     ///
     /// # Errors
-    /// Those of [`Capabilities::grant_stored`].
+    /// [`CapabilityError::UnknownCapability`], [`CapabilityError::NoSuchActor`],
+    /// [`CapabilityError::NotAdmin`], [`CapabilityError::NoSuchUser`] or [`CapabilityError::Db`].
     pub async fn grant(
         &self,
         actor: i64,
@@ -345,7 +346,8 @@ const REASON_NO_SUCH_USER_RANGE: &str = "user id out of range";
 ///
 /// # Errors
 /// `INVALID_ARGUMENT` for a user id over `i64::MAX` or an unknown capability, `NOT_FOUND` for an
-/// unknown user, `PERMISSION_DENIED` when `actor` is not an admin, `INTERNAL` on a storage failure.
+/// unknown user, `PERMISSION_DENIED` when `actor` is not an admin or does not exist, `INTERNAL`
+/// on a storage failure or a stored value that does not fit the wire type.
 pub async fn grant(
     caps: &Capabilities,
     actor: i64,
@@ -363,7 +365,8 @@ pub async fn grant(
 ///
 /// # Errors
 /// `INVALID_ARGUMENT` for a user id over `i64::MAX` or an unknown capability, `NOT_FOUND` for an
-/// unknown user, `PERMISSION_DENIED` when `actor` is not an admin, `INTERNAL` on a storage failure.
+/// unknown user, `PERMISSION_DENIED` when `actor` is not an admin or does not exist, `INTERNAL`
+/// on a storage failure.
 pub async fn revoke(
     caps: &Capabilities,
     actor: i64,
@@ -381,7 +384,8 @@ pub async fn revoke(
 ///
 /// # Errors
 /// `INVALID_ARGUMENT` for a user id over `i64::MAX`, `NOT_FOUND` for an unknown user,
-/// `PERMISSION_DENIED` when `actor` is not an admin, `INTERNAL` on a storage failure.
+/// `PERMISSION_DENIED` when `actor` is not an admin or does not exist, `INTERNAL` on a storage
+/// failure or a stored value that does not fit the wire type.
 pub async fn list(
     caps: &Capabilities,
     actor: i64,
