@@ -392,7 +392,7 @@ fn worker_error(err: &StoreError) -> Status {
             Status::invalid_argument("too many telemetry events in one report")
         }
         StoreError::NotFound => Status::not_found("job not found"),
-        StoreError::LeaseDenied => Status::permission_denied("lease does not match"),
+        StoreError::LeaseDenied => Status::permission_denied(fleet_proto::ERR_LEASE_MISMATCH),
         StoreError::UnknownProfile => Status::not_found("profile not found"),
         StoreError::ToolsNotGranted => {
             Status::permission_denied(profiles::ERR_PROFILE_TOOLS_NOT_GRANTED)
@@ -1279,6 +1279,13 @@ mod tests {
             assert_eq!(status.code(), Code::PermissionDenied);
             assert_eq!(status.message(), "model gpt-5 is not in the allowlist");
         }
+    }
+
+    #[test]
+    fn a_lost_lease_answers_with_the_shared_constant() {
+        let status = worker_error(&StoreError::LeaseDenied);
+        assert_eq!(status.code(), Code::PermissionDenied);
+        assert_eq!(status.message(), fleet_proto::ERR_LEASE_MISMATCH);
     }
 
     #[test]

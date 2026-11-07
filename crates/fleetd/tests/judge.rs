@@ -434,7 +434,7 @@ async fn a_verdict_without_a_model_name_fails() -> TestResult {
 async fn a_failed_fetch_refuses_the_job_with_a_fixed_reason() -> TestResult {
     common::bounded(Box::pin(async {
         let rig = rig(
-            Err(Status::permission_denied("lease does not match")),
+            Err(Status::permission_denied(fleet_proto::ERR_LEASE_MISMATCH)),
             Some(MODEL),
             "",
         )?;

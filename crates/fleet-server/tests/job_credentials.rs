@@ -42,7 +42,7 @@ const ANT: &str = "sk-ant-api03-abcdefghijklmnopqrstuv";
 const OAT: &str = "sk-ant-oat01-abcdefghijklmnopqrstuv";
 const CODEX: &str = "sk-abcdefghijklmnopqrstuvwxyz0123";
 const BOB_PAT: &str = "github_pat_22ZYXWVUT9zyxwvutsrqponmlk";
-const DENIED: &str = "lease does not match";
+const DENIED: &str = fleet_proto::ERR_LEASE_MISMATCH;
 const STATIC: CredentialShape = CredentialShape::StaticSecret;
 
 static KEY_FILES: AtomicUsize = AtomicUsize::new(0);

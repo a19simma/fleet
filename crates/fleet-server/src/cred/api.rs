@@ -32,44 +32,15 @@ impl std::fmt::Debug for CredentialService {
 
 fn store_status(err: &StoreError) -> Status {
     match err {
-        StoreError::Invalid(fault) => Status::invalid_argument(fault.to_string()),
-        StoreError::InvalidExpiry => Status::invalid_argument("invalid expiry"),
-        StoreError::NotFound => Status::not_found("credential not found"),
-        StoreError::TooMany => Status::resource_exhausted("too many credentials"),
-        StoreError::LeaseDenied => Status::permission_denied("lease does not match"),
-        StoreError::NoGithub => Status::failed_precondition(fleet_proto::PRECONDITION_NO_GITHUB),
-        StoreError::NoAgentCredential => {
-            Status::failed_precondition(fleet_proto::PRECONDITION_NO_AGENT)
-        }
-        StoreError::Expired => Status::failed_precondition(fleet_proto::PRECONDITION_EXPIRED),
-        StoreError::CapabilityDenied => {
-            Status::permission_denied(super::capability::ERR_CAPABILITY_NOT_GRANTED)
-        }
-        StoreError::MintFailed => Status::failed_precondition(fleet_proto::PRECONDITION_APP_MINT),
-        StoreError::MintCapReached => {
-            Status::failed_precondition(fleet_proto::PRECONDITION_APP_MINT_CAP)
-        }
-        StoreError::MintRateLimited => {
-            Status::failed_precondition(fleet_proto::PRECONDITION_APP_MINT_RATE)
-        }
-        StoreError::InstallationDenied => {
-            Status::failed_precondition(fleet_proto::PRECONDITION_APP_INSTALLATION)
-        }
-        StoreError::RepoDenied => Status::failed_precondition(fleet_proto::PRECONDITION_APP_REPO),
-        StoreError::NoJobRepo => {
-            Status::failed_precondition(fleet_proto::PRECONDITION_NO_VERIFY_REPO)
-        }
-        StoreError::Tombstoned => {
-            Status::failed_precondition(fleet_proto::PRECONDITION_CREDENTIAL_TOMBSTONED)
-        }
         StoreError::Seal(_) => {
             tracing::error!(%err, "credential sealing failed");
-            Status::internal("credential store error")
+            Status::new(err.code(), "credential store error")
         }
         StoreError::Db(_) => {
             tracing::error!(%err, "credential storage failed");
-            Status::unavailable("storage unavailable")
+            Status::new(err.code(), "storage unavailable")
         }
+        _ => Status::new(err.code(), err.to_string()),
     }
 }
 
@@ -357,5 +328,128 @@ impl CredentialService {
             }),
             Err(err) => Err(github_status(err)),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use fleet_core::credential::CredentialError;
+    use tonic::Code;
+
+    use super::super::seal::SealError;
+    use super::*;
+
+    #[test]
+    fn every_store_error_keeps_its_wire_code_and_message() {
+        let cases = [
+            (
+                StoreError::Invalid(CredentialError::Empty),
+                Code::InvalidArgument,
+                None,
+            ),
+            (
+                StoreError::InvalidExpiry,
+                Code::InvalidArgument,
+                Some("invalid expiry"),
+            ),
+            (
+                StoreError::NotFound,
+                Code::NotFound,
+                Some("credential not found"),
+            ),
+            (
+                StoreError::TooMany,
+                Code::ResourceExhausted,
+                Some("too many credentials"),
+            ),
+            (
+                StoreError::LeaseDenied,
+                Code::PermissionDenied,
+                Some("lease does not match"),
+            ),
+            (
+                StoreError::NoGithub,
+                Code::FailedPrecondition,
+                Some("no github credential"),
+            ),
+            (
+                StoreError::NoAgentCredential,
+                Code::FailedPrecondition,
+                Some("no agent credential"),
+            ),
+            (
+                StoreError::Expired,
+                Code::FailedPrecondition,
+                Some("credential expired"),
+            ),
+            (
+                StoreError::CapabilityDenied,
+                Code::PermissionDenied,
+                Some("credential kind needs a capability the user lacks"),
+            ),
+            (
+                StoreError::MintFailed,
+                Code::FailedPrecondition,
+                Some("github app token unavailable"),
+            ),
+            (
+                StoreError::MintCapReached,
+                Code::FailedPrecondition,
+                Some("github app token limit reached"),
+            ),
+            (
+                StoreError::MintRateLimited,
+                Code::FailedPrecondition,
+                Some("github app token rate limited"),
+            ),
+            (
+                StoreError::NoJobRepo,
+                Code::FailedPrecondition,
+                Some("no job to verify the github app against"),
+            ),
+            (
+                StoreError::Tombstoned,
+                Code::FailedPrecondition,
+                Some("credential was deleted and cannot be replaced"),
+            ),
+            (
+                StoreError::InstallationDenied,
+                Code::FailedPrecondition,
+                Some("github app installation is not allowed"),
+            ),
+            (
+                StoreError::RepoDenied,
+                Code::FailedPrecondition,
+                Some("repository is not allowed for the github app"),
+            ),
+            (
+                StoreError::Seal(SealError::Open),
+                Code::Internal,
+                Some("credential store error"),
+            ),
+            (
+                StoreError::Db(sqlx::Error::PoolTimedOut),
+                Code::Unavailable,
+                Some("storage unavailable"),
+            ),
+        ];
+        for (err, code, message) in cases {
+            let status = store_status(&err);
+            assert_eq!(status.code(), code, "{err}");
+            assert_eq!(err.code(), code, "{err}");
+            if let Some(message) = message {
+                assert_eq!(status.message(), message, "{err}");
+            }
+        }
+    }
+
+    #[test]
+    fn a_lost_lease_answers_with_the_shared_constant() {
+        let status = store_status(&StoreError::LeaseDenied);
+        assert_eq!(status.message(), fleet_proto::ERR_LEASE_MISMATCH);
+        assert_eq!(
+            StoreError::LeaseDenied.to_string(),
+            fleet_proto::ERR_LEASE_MISMATCH
+        );
     }
 }

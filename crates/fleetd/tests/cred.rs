@@ -18,9 +18,9 @@ use fleet_proto::v1::{
     Job, JobCredential, JobState, ProfileRef, ReportJobReply, ReportJobRequest,
 };
 use fleet_proto::{
-    PRECONDITION_APP_INSTALLATION, PRECONDITION_APP_MINT_CAP, PRECONDITION_APP_MINT_RATE,
-    PRECONDITION_APP_REPO, PRECONDITION_EXPIRED, PRECONDITION_NO_AGENT, PRECONDITION_NO_GITHUB,
-    PRECONDITION_NOT_CONFIGURED,
+    ERR_LEASE_MISMATCH, PRECONDITION_APP_INSTALLATION, PRECONDITION_APP_MINT_CAP,
+    PRECONDITION_APP_MINT_RATE, PRECONDITION_APP_REPO, PRECONDITION_EXPIRED, PRECONDITION_NO_AGENT,
+    PRECONDITION_NO_GITHUB, PRECONDITION_NOT_CONFIGURED,
 };
 use fleetd::DaemonRunner;
 use fleetd::cred::{
@@ -228,11 +228,17 @@ async fn a_fetch_sends_the_lease_and_the_bearer_and_holds_both_values() -> TestR
     Ok(())
 }
 
+#[test]
+fn the_lease_failure_reason_ends_with_the_shared_text() {
+    assert!(ERR_LEASE.ends_with(ERR_LEASE_MISMATCH));
+    assert_eq!(ERR_LEASE, "credentials refused: lease does not match");
+}
+
 #[tokio::test]
 async fn each_fixed_server_error_maps_to_its_own_failure_and_holds_nothing() -> TestResult {
     let cases = [
         (
-            Status::permission_denied("lease does not match"),
+            Status::permission_denied(ERR_LEASE_MISMATCH),
             CredentialFailure::LeaseMismatch,
             ERR_LEASE,
         ),
@@ -799,7 +805,7 @@ async fn a_failed_fetch_leaves_nothing_readable_from_an_earlier_one() -> TestRes
     book.fetch("job1", 1, &box_name()).await?;
     assert!(book.get("job1").is_some());
     *fake.reply.lock().unwrap_or_else(PoisonError::into_inner) =
-        Some(Err(Status::permission_denied("lease does not match")));
+        Some(Err(Status::permission_denied(ERR_LEASE_MISMATCH)));
     let got = book.fetch("job1", 2, &box_name()).await;
     assert_eq!(got.err(), Some(CredentialFailure::LeaseMismatch));
     assert!(book.get("job1").is_none());

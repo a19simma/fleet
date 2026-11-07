@@ -7,7 +7,7 @@ use super::{
     AppLane, Armed, AttemptGuard, COUNT_ATTEMPTS, COUNT_USER_ATTEMPTS, CredentialStore,
     DENIED_DEDUPE_SECS, DENIED_RECENTLY, InstallationToken, MAX_APP_MINTS_PER_JOB,
     MAX_APP_MINTS_PER_USER_PER_MINUTE, MINT_RATE_WINDOW_SECS, MintRecord, REASON_CAP,
-    REASON_USER_RATE, RevokeGuard, StoreError, mint_failure_outcome, refusal_reason,
+    REASON_USER_RATE, RevokeGuard, StoreError, refusal_reason,
 };
 
 /// Which gate an `attempt` row is counted against.
@@ -92,7 +92,7 @@ impl CredentialStore {
         let token = match minted {
             Ok(token) => token,
             Err(err) => {
-                let (outcome, reason) = mint_failure_outcome(&err);
+                let (outcome, reason) = err.audit();
                 record
                     .outcome_pooled(&self.pool, &attempt_id, outcome, Some(reason))
                     .await;

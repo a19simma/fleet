@@ -186,13 +186,6 @@ fn refusal_reason(err: &StoreError) -> &'static str {
     }
 }
 
-fn mint_failure_outcome(err: &StoreError) -> (&'static str, &'static str) {
-    match err {
-        StoreError::InstallationDenied => ("denied", REASON_INSTALLATION_BINDING),
-        _ => ("failed", REASON_MINT_FAILED),
-    }
-}
-
 #[derive(Clone)]
 struct MintRecord {
     credential_id: i64,
@@ -782,7 +775,7 @@ impl fmt::Display for StoreError {
             Self::InvalidExpiry => f.write_str("invalid expiry"),
             Self::NotFound => f.write_str("credential not found"),
             Self::TooMany => f.write_str("too many credentials"),
-            Self::LeaseDenied => f.write_str("lease does not match"),
+            Self::LeaseDenied => f.write_str(fleet_proto::ERR_LEASE_MISMATCH),
             Self::NoGithub => f.write_str("no github credential"),
             Self::NoAgentCredential => f.write_str("no agent credential"),
             Self::Expired => f.write_str("credential expired"),
@@ -796,6 +789,42 @@ impl fmt::Display for StoreError {
             Self::RepoDenied => f.write_str(fleet_proto::PRECONDITION_APP_REPO),
             Self::Seal(e) => e.fmt(f),
             Self::Db(_) => f.write_str("credential store database error"),
+        }
+    }
+}
+
+impl StoreError {
+    /// The gRPC status code the credential RPCs answer with for this error.
+    #[must_use]
+    pub const fn code(&self) -> tonic::Code {
+        match self {
+            Self::Invalid(_) | Self::InvalidExpiry => tonic::Code::InvalidArgument,
+            Self::NotFound => tonic::Code::NotFound,
+            Self::TooMany => tonic::Code::ResourceExhausted,
+            Self::LeaseDenied | Self::CapabilityDenied => tonic::Code::PermissionDenied,
+            Self::NoGithub
+            | Self::NoAgentCredential
+            | Self::Expired
+            | Self::MintFailed
+            | Self::MintCapReached
+            | Self::MintRateLimited
+            | Self::NoJobRepo
+            | Self::Tombstoned
+            | Self::InstallationDenied
+            | Self::RepoDenied => tonic::Code::FailedPrecondition,
+            Self::Seal(_) => tonic::Code::Internal,
+            Self::Db(_) => tonic::Code::Unavailable,
+        }
+    }
+
+    /// The outcome and reason a failed mint writes to its audit row.
+    ///
+    /// An installation that fails the binding is `denied`. Every other error is `failed`.
+    #[must_use]
+    pub const fn audit(&self) -> (&'static str, &'static str) {
+        match self {
+            Self::InstallationDenied => ("denied", REASON_INSTALLATION_BINDING),
+            _ => ("failed", REASON_MINT_FAILED),
         }
     }
 }
@@ -1526,5 +1555,30 @@ impl CredentialStore {
             .await?;
         tx.commit().await?;
         Ok(secret)
+    }
+}
+
+#[cfg(test)]
+mod audit_tests {
+    use super::*;
+
+    #[test]
+    fn an_installation_refusal_audits_as_denied() {
+        assert_eq!(
+            StoreError::InstallationDenied.audit(),
+            ("denied", "installation binding refused")
+        );
+    }
+
+    #[test]
+    fn every_other_error_audits_as_a_failed_mint() {
+        for err in [
+            StoreError::MintFailed,
+            StoreError::RepoDenied,
+            StoreError::LeaseDenied,
+            StoreError::MintCapReached,
+        ] {
+            assert_eq!(err.audit(), ("failed", "mint failed"), "{err}");
+        }
     }
 }

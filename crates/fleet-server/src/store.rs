@@ -429,7 +429,7 @@ impl fmt::Display for StoreError {
             Self::UnknownProfile => f.write_str("profile not found"),
             Self::ToolsNotGranted => f.write_str(profiles::ERR_PROFILE_TOOLS_NOT_GRANTED),
             Self::ModelDenied(denied) => denied.fmt(f),
-            Self::LeaseDenied => f.write_str("lease does not match"),
+            Self::LeaseDenied => f.write_str(fleet_proto::ERR_LEASE_MISMATCH),
             Self::CatalogTooLarge => f.write_str(profiles::ERR_BLOB_CATALOG_TOO_LARGE),
         }
     }
@@ -2310,6 +2310,14 @@ mod tests {
     use super::*;
 
     const GATE_TIMEOUT: Duration = Duration::from_secs(5);
+
+    #[test]
+    fn a_lost_lease_displays_the_shared_constant() {
+        assert_eq!(
+            StoreError::LeaseDenied.to_string(),
+            fleet_proto::ERR_LEASE_MISMATCH
+        );
+    }
 
     #[derive(Clone, Default)]
     struct Captured(Arc<Mutex<Vec<u8>>>);

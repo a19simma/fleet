@@ -254,6 +254,13 @@ pub const PRECONDITION_NOT_CONFIGURED: &str = "credentials are not configured";
 /// `PERMISSION_DENIED` message: the credential kind needs a capability the user lacks.
 pub const ERR_CAPABILITY_NOT_GRANTED: &str = "credential kind needs a capability the user lacks";
 
+/// `PERMISSION_DENIED` message: no running job holds the lease the caller named.
+///
+/// A wrong box, a wrong attempt, a job that is not running, an expired lease and an unknown job
+/// all give this one text. fleetd maps every `PERMISSION_DENIED` credential answer to a lease
+/// mismatch.
+pub const ERR_LEASE_MISMATCH: &str = "lease does not match";
+
 /// `PERMISSION_DENIED` message: credentials need a per-user token.
 pub const ERR_NEEDS_USER_TOKEN: &str = "credentials need a user token";
 

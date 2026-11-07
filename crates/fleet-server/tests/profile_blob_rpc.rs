@@ -28,7 +28,7 @@ const SHA: &str = "0123456789abcdef0123456789abcdef01234567";
 const REPO: &str = "https://example.com/org/repo.git";
 const ONE: &str = r#"{"claude_md":"one"}"#;
 const TWO: &str = r#"{"claude_md":"two"}"#;
-const DENIED: &str = "lease does not match";
+const DENIED: &str = fleet_proto::ERR_LEASE_MISMATCH;
 
 type Interceptor = fn(Request<()>) -> Result<Request<()>, Status>;
 type Worker = FleetWorkerClient<InterceptedService<Channel, Interceptor>>;

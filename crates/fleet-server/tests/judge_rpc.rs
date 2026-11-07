@@ -27,7 +27,7 @@ use tonic::{Code, Request, Status};
 const CLIENT: &str = "test-token-0123456789abcdef0123456789";
 const BOX: &str = "box-token-0123456789abcdef0123456789";
 const REPO: &str = "https://example.com/org/repo.git";
-const DENIED: &str = "lease does not match";
+const DENIED: &str = fleet_proto::ERR_LEASE_MISMATCH;
 const MODEL: &str = "judge-model-1";
 
 type Interceptor = fn(Request<()>) -> Result<Request<()>, Status>;
