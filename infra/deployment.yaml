@@ -71,6 +71,8 @@ spec:
                   optional: true
             - name: FLEET_TRUSTED_PROXY_HOPS
               value: "1"
+            - name: FLEET_UPDATE_REPO
+              value: a19simma/fleet
           volumeMounts:
             - name: master-key
               mountPath: /etc/fleet/master-key
