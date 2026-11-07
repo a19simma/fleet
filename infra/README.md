@@ -6,7 +6,7 @@ Kubernetes manifests for fleet-server. An Argo CD Application in the cluster ope
 
 - `deployment.yaml`: the fleet-server Deployment in namespace `fleet-server`.
 - `service.yaml`: a ClusterIP Service for the gRPC port (7070) and the health port (7072).
-- `kustomization.yaml`: lists the manifests and pins the image `ghcr.io/a19simma/fleet-server` to tag 0.3.3. That tag is a baseline floor.
+- `kustomization.yaml`: lists the manifests and pins the image `ghcr.io/a19simma/fleet-server` to tag 0.3.6. That tag is a baseline floor.
 - `master-key-generator.yaml` and `master-key-externalsecret.yaml`: an external-secrets Password generator and an ExternalSecret that create Secret `fleet-master-key` once. See Master key. `bootstrap-password-generator.yaml` and `bootstrap-password-externalsecret.yaml` do the same for the bootstrap password. See Bootstrap password.
 - `check-master-key-kind.sh`: creates a uniquely named kind cluster, installs external-secrets, applies both objects, and proves a restricted pod reads the key ring file, the mount is read-only, and the key survives a forced sync, a controller restart and an ExternalSecret recreate. It deletes only its own cluster. Needs `kind`, `kubectl`, `helm` and network access.
 - `check-kinds.sh`: renders the kustomization and fails on any kind outside Deployment, Service, ExternalSecret, Password, and on any container or initContainer in a Deployment that lacks requests for cpu, memory and ephemeral-storage or limits for memory and ephemeral-storage. A cpu limit is allowed but not required.
