@@ -1,6 +1,6 @@
 # Agent credential kinds and shapes
 
-Status: Proposed 2026-10-29. Built in fleet-server and fleet-core: the kind and shape checks, the sealed store, the GitHub verify call and the credentials page. The page shows no last-used time, because `CredentialSummary` carries none. Builds on ADR-0040 for storage and sealing. Supersedes the standing decision "PAT in `/etc/swarm/secrets.env`" for user Jobs only. Leaves the Gitea and Forgejo path to ADR-0045. Amended by ADR-0058.
+Status: Proposed 2026-10-29. Built in fleet-server and fleet-core: the kind and shape checks, the sealed store, the GitHub verify call and the credentials page. The page shows no last-used time, because `CredentialSummary` carries none. Builds on ADR-0040 for storage and sealing. Supersedes the standing decision "PAT in `/etc/swarm/secrets.env`" for user Jobs only. Leaves the Gitea and Forgejo path to ADR-0045. Amended by ADR-0058 and ADR-0059.
 
 A user stores the credentials their agent and their forge need. This ADR lists the kinds the store accepts, the shapes they take and the risks the user takes on.
 

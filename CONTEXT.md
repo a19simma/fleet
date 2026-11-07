@@ -183,6 +183,26 @@ _Avoid_: agent, model
 The git host of a repository: GitHub, Gitea or Forgejo (ADR-0043, ADR-0045).
 _Avoid_: git server, SCM
 
+**Repo host**:
+A forge hostname the operator allows in the operator host list, with its **Forge kind** and an `allow_private` opt-in. A User registers repositories only on a **Repo host** (ADR-0059).
+_Avoid_: git server, remote
+
+**Forge kind**:
+The family of a **Repo host**: `github` and `forgejo` are built, `gitlab` is planned. The config `Forge` enum and the core `ForgeKind` enum are separate types. It will select the **Repo verifier**. It is set per host in operator config, never by the User (ADR-0059).
+_Avoid_: forge type, provider
+
+**Repo key**:
+The `(user, host, path)` triple that names a **Registered repository**. It differs from the Mirror key, which is the (user, repo) pair (ADR-0059).
+_Avoid_: repo id
+
+**Repo verifier**:
+The server-side `RepoVerifier` implementation of one **Forge kind**. `fleet repo add` runs it before the insert: it reads the repository with the User's own stored credential and records push as optional. `add` is refused when the host has no verifier or the User has no credential for it (ADR-0059).
+_Avoid_: repo checker, forge check
+
+**Registered repository**:
+A row in a User's repository registry, keyed by **Repo key**. It is a record only and grants nothing: the App repository ceiling and the `forge:github_app` capability stay the only App grants. Submit does not enforce it in v1 (ADR-0059). Elsewhere in this file "repo" means the repository of a Job, not a **Registered repository**.
+_Avoid_: project, saved repo
+
 **CI result**:
 The pass or fail outcome of a forge check on a Job's pull request, read through the **Broker** (ADR-0028, ADR-0037).
 _Avoid_: build status
