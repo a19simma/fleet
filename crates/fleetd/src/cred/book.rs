@@ -76,10 +76,109 @@ struct Snapshot {
     credentials: Arc<JobCredentials>,
     attempt: u32,
     box_name: String,
+    schedule: Schedule,
+}
+
+/// What the refresh decision reads from an entry: the held token's expiry and the entry's
+/// retry and skew bookkeeping.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Schedule {
+    expiry: Option<u64>,
     retry_at_ms: u64,
     skewed: bool,
     fetched_at_ms: u64,
     refused: Option<CredentialFailure>,
+}
+
+/// Where one refresh call stands, decided by [`plan`] before any fetch.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RefreshState {
+    /// An allowlist refusal is recorded: return it, fetch nothing.
+    Refused(CredentialFailure),
+    /// No expiry to chase, or the held token has [`REFRESH_WINDOW_MS`] or more left.
+    NotDue,
+    /// Due, but an earlier failure set a retry time that has not come: keep the held token while
+    /// `usable`, else fail with the lapse reason.
+    Waiting { usable: bool, skewed: bool },
+    /// Due and free to fetch.
+    Due { usable: bool, skewed: bool },
+}
+
+/// What a failed fetch changes and returns, decided by [`after_failure`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct FailurePlan {
+    sticky: bool,
+    retry_at_ms: Option<u64>,
+    result: Result<(), CredentialFailure>,
+}
+
+const fn lapse_reason(skewed: bool) -> CredentialFailure {
+    if skewed {
+        CredentialFailure::Expired
+    } else {
+        CredentialFailure::Unavailable
+    }
+}
+
+const fn is_terminal(failure: CredentialFailure) -> bool {
+    matches!(
+        failure,
+        CredentialFailure::InstallationRefused | CredentialFailure::RepoRefused
+    )
+}
+
+const fn is_transient(failure: CredentialFailure) -> bool {
+    matches!(
+        failure,
+        CredentialFailure::Unavailable
+            | CredentialFailure::Expired
+            | CredentialFailure::RateLimited
+    )
+}
+
+fn plan(now: u64, schedule: &Schedule) -> RefreshState {
+    if let Some(refused) = schedule.refused {
+        return RefreshState::Refused(refused);
+    }
+    let Some(expiry) = schedule.expiry else {
+        return RefreshState::NotDue;
+    };
+    if expiry.saturating_sub(now) >= REFRESH_WINDOW_MS {
+        return RefreshState::NotDue;
+    }
+    let skewed = schedule.skewed;
+    let usable = if skewed {
+        now < schedule
+            .fetched_at_ms
+            .saturating_add(REFRESH_SKEW_MS)
+            .saturating_add(REFRESH_SKEW_SLACK_MS)
+    } else {
+        now < expiry
+    };
+    let wait_is_stale = schedule.retry_at_ms.saturating_sub(now) > REFRESH_SKEW_MS;
+    if now < schedule.retry_at_ms && !wait_is_stale {
+        RefreshState::Waiting { usable, skewed }
+    } else {
+        RefreshState::Due { usable, skewed }
+    }
+}
+
+fn after_failure(failure: CredentialFailure, usable: bool, skewed: bool, now: u64) -> FailurePlan {
+    let terminal = is_terminal(failure);
+    let result = if is_transient(failure) {
+        if usable {
+            Ok(())
+        } else {
+            Err(lapse_reason(skewed))
+        }
+    } else {
+        Err(failure)
+    };
+    FailurePlan {
+        sticky: terminal,
+        retry_at_ms: (!terminal).then(|| now + REFRESH_RETRY_MS),
+        result,
+    }
 }
 
 /// Fetches and holds the credentials of the jobs that run on this box.
@@ -106,8 +205,9 @@ pub struct LeasedToken {
 }
 
 impl LeasedToken {
-    /// `token`, held by the `lease` the book gave for the job. The book leases any job it
-    /// holds, a PAT job included, so `lease` is `None` when the runner has no book or the book holds nothing for the job.
+    /// `token`, held by the `lease` the book gave for the job. The book leases any job it holds, a
+    /// PAT job included, so `lease` is `None` when the runner has no book or the book holds nothing
+    /// for the job.
     #[must_use]
     pub const fn new(token: String, lease: Option<TokenLease>) -> Self {
         Self { token, lease }
@@ -246,23 +346,21 @@ impl CredentialBook {
 
     /// Fetches the credentials of a claimed job and holds them under its id.
     ///
-    /// Call it once the lease is held and before the agent starts. A fetch first ends any
-    /// entry held for the same id and revokes its installation token, so a second fetch
-    /// replaces the first and a failed one leaves nothing readable.
+    /// Call it once the lease is held and before the agent starts. A fetch first ends any entry
+    /// held for the same id and revokes its installation token, so a second fetch replaces the
+    /// first and a failed one leaves nothing readable.
     ///
     /// # Errors
     ///
-    /// Returns the failure whose [`CredentialFailure::reason`] the job reports. Nothing is
-    /// held for `job_id` after an error. The server's answer maps to
-    /// [`CredentialFailure::LeaseMismatch`] (any `PERMISSION_DENIED`),
-    /// [`CredentialFailure::NoGithub`], [`CredentialFailure::NoAgent`],
+    /// Returns the failure whose [`CredentialFailure::reason`] the job reports. Nothing is held for
+    /// `job_id` after an error. The server's answer maps to [`CredentialFailure::LeaseMismatch`]
+    /// (any `PERMISSION_DENIED`), [`CredentialFailure::NoGithub`], [`CredentialFailure::NoAgent`],
     /// [`CredentialFailure::Expired`], [`CredentialFailure::NotConfigured`],
     /// [`CredentialFailure::MintCap`], [`CredentialFailure::RateLimited`],
-    /// [`CredentialFailure::InstallationRefused`] and
-    /// [`CredentialFailure::RepoRefused`]. A `RateLimited` answer is waited out
-    /// [`RATE_RETRIES`] times, [`RATE_RETRY_DELAY`] apart, before it is returned. Any other
-    /// status, a timeout or a transport error is [`CredentialFailure::Unavailable`]. A reply that
-    /// breaks a rule is
+    /// [`CredentialFailure::InstallationRefused`] and [`CredentialFailure::RepoRefused`]. A
+    /// `RateLimited` answer is waited out [`RATE_RETRIES`] times, [`RATE_RETRY_DELAY`] apart,
+    /// before it is returned. Any other status, a timeout or a transport error is
+    /// [`CredentialFailure::Unavailable`]. A reply that breaks a rule is
     /// [`CredentialFailure::Malformed`], [`CredentialFailure::AppIdentityMissing`] or
     /// [`CredentialFailure::AppIdentityInvalid`]; the well-formed installation token in such a
     /// reply is revoked, because the server already minted and committed it. A reply that holds no
@@ -297,55 +395,53 @@ impl CredentialBook {
         Ok(credentials)
     }
 
-    /// Asks the server for a new installation token when fewer than [`REFRESH_WINDOW_MS`] of
-    /// the held one remain, and swaps it in. Returns the new credentials when it swapped and
-    /// `None` when nothing was due, the job holds no installation token, the retry wait has
-    /// not passed, or a transient failure left the last good token in place.
+    /// Asks the server for a new installation token when fewer than [`REFRESH_WINDOW_MS`] of the
+    /// held one remain, and swaps it in. Returns the new credentials when it swapped and `None`
+    /// when nothing was due, the job holds no installation token, the retry wait has not passed, or
+    /// a transient failure left the last good token in place.
     ///
-    /// Call it before every use of the token. Calls for one job serialize, so two steps that
-    /// find the token due make one request. Nothing is due while the retry wait has not passed:
-    /// after a failure the next request waits [`REFRESH_RETRY_MS`].
+    /// Call it before every use of the token. Calls for one job serialize, so two steps that find
+    /// the token due make one request. Nothing is due while the retry wait has not passed: after a
+    /// failure the next request waits [`REFRESH_RETRY_MS`].
     ///
     /// A fresh token that already looks expired, or inside the window, means the box clock runs
-    /// ahead of the server's. The book takes it, marks the entry skewed and refreshes it again
-    /// only after [`REFRESH_SKEW_MS`]. A skewed token counts as usable until
-    /// [`REFRESH_SKEW_MS`] plus [`REFRESH_SKEW_SLACK_MS`] have passed since it was fetched.
+    /// ahead of the server's. The book takes it, marks the entry skewed and refreshes it again only
+    /// after [`REFRESH_SKEW_MS`]. A skewed token counts as usable until [`REFRESH_SKEW_MS`] plus
+    /// [`REFRESH_SKEW_SLACK_MS`] have passed since it was fetched.
     ///
-    /// The old value is not forgotten by the book: the caller keeps it in the job redactor.
-    /// With a [`Revoker`] attached, a swap revokes the replaced token on its own task, after
-    /// every [`TokenLease`] on it has dropped or [`DRAIN_LIMIT`] has passed.
+    /// The old value is not forgotten by the book: the caller keeps it in the job redactor. With a
+    /// [`Revoker`] attached, a swap revokes the replaced token on its own task, after every
+    /// [`TokenLease`] on it has dropped or [`DRAIN_LIMIT`] has passed.
     ///
     /// This is [`CredentialBook::refresh_if_due_with`] with no hook.
     ///
     /// # Errors
     ///
     /// Returns [`CredentialFailure::MintCap`] when the server's per-Job mint cap is reached,
-    /// [`CredentialFailure::InstallationRefused`] or
-    /// [`CredentialFailure::RepoRefused`] when the allowlists now refuse the installation or
-    /// the repository, and any other server refusal as the variant [`CredentialBook::fetch`]
-    /// maps it to ([`CredentialFailure::LeaseMismatch`] for a lost lease or a capability that
-    /// is gone, [`CredentialFailure::NoGithub`], [`CredentialFailure::NoAgent`],
-    /// [`CredentialFailure::NotConfigured`]). A reply with a bad identity returns
-    /// [`CredentialFailure::AppIdentityMissing`] or
-    /// [`CredentialFailure::AppIdentityInvalid`], and the well-formed installation token in that reply is
-    /// revoked, as is the token of a [`CredentialFailure::Malformed`] reply and the fresh token
-    /// of a reply whose swap `refreshed` refuses. None of these keeps the old token or falls back
-    /// to a PAT; the caller fails the step. A transient failure,
-    /// [`CredentialFailure::Unavailable`], the server's
-    /// [`CredentialFailure::Expired`] or the per-User [`CredentialFailure::RateLimited`], returns
-    /// `Ok(None)` while the held token is usable and keeps it. Once it is not usable, an
-    /// entry that is not skewed returns
+    /// [`CredentialFailure::InstallationRefused`] or [`CredentialFailure::RepoRefused`] when the
+    /// allowlists now refuse the installation or the repository, and any other server refusal as
+    /// the variant [`CredentialBook::fetch`] maps it to ([`CredentialFailure::LeaseMismatch`] for a
+    /// lost lease or a capability that is gone, [`CredentialFailure::NoGithub`],
+    /// [`CredentialFailure::NoAgent`], [`CredentialFailure::NotConfigured`]). A reply with a bad
+    /// identity returns [`CredentialFailure::AppIdentityMissing`] or
+    /// [`CredentialFailure::AppIdentityInvalid`], and the well-formed installation token in that
+    /// reply is revoked, as is the token of a [`CredentialFailure::Malformed`] reply and the fresh
+    /// token of a reply whose swap `refreshed` refuses. None of these keeps the old token or falls
+    /// back to a PAT; the caller fails the step. A transient failure,
+    /// [`CredentialFailure::Unavailable`], the server's [`CredentialFailure::Expired`] or the
+    /// per-User [`CredentialFailure::RateLimited`], returns `Ok(None)` while the held token is
+    /// usable and keeps it. Once it is not usable, an entry that is not skewed returns
     /// [`CredentialFailure::Unavailable`] and a skewed entry returns
-    /// [`CredentialFailure::Expired`], whichever transient failure it was. A skewed entry has
-    /// no expiry the box clock can judge, so it counts as usable until [`REFRESH_SKEW_MS`]
-    /// plus [`REFRESH_SKEW_SLACK_MS`] have passed since it was fetched. A recorded retry wait more
-    /// than [`REFRESH_SKEW_MS`] ahead of the clock (the stale-wait guard, `wait_is_stale`) is
-    /// ignored and the refresh goes ahead, so a clock that moved back cannot hold it off for
-    /// longer than that. An allowlist refusal ([`CredentialFailure::InstallationRefused`] or
-    /// [`CredentialFailure::RepoRefused`]) is sticky: the entry records it, and every later
-    /// call returns it with no fetch and no retry wait, so the held token is not reused for the
-    /// rest of the job. [`CredentialFailure::Malformed`] is returned when the reply holds no
-    /// installation token or no expiry, or breaks any other reply rule.
+    /// [`CredentialFailure::Expired`], whichever transient failure it was. A skewed entry has no
+    /// expiry the box clock can judge, so it counts as usable until [`REFRESH_SKEW_MS`] plus
+    /// [`REFRESH_SKEW_SLACK_MS`] have passed since it was fetched. A recorded retry wait more than
+    /// [`REFRESH_SKEW_MS`] ahead of the clock (the stale-wait guard, `wait_is_stale`) is ignored
+    /// and the refresh goes ahead, so a clock that moved back cannot hold it off for longer than
+    /// that. An allowlist refusal ([`CredentialFailure::InstallationRefused`] or
+    /// [`CredentialFailure::RepoRefused`]) is sticky: the entry records it, and every later call
+    /// returns it with no fetch and no retry wait, so the held token is not reused for the rest of
+    /// the job. [`CredentialFailure::Malformed`] is returned when the reply holds no installation
+    /// token or no expiry, or breaks any other reply rule.
     ///
     /// Returns `Ok(None)` when no refresh was due, and also when a `fetch` for the same job id
     /// replaced the entry while the refresh ran: the fresh token is then revoked and stored
@@ -386,39 +482,23 @@ impl CredentialBook {
             credentials: current,
             attempt,
             box_name,
-            retry_at_ms,
-            skewed,
-            fetched_at_ms,
-            refused,
+            schedule,
         }) = self.snapshot(job_id)
         else {
             return Ok(None);
         };
-        if let Some(refused) = refused {
-            return Err(refused);
-        }
-        let Some(expiry) = current.app_expires_at_ms() else {
-            return Ok(None);
+        let (usable, skewed) = match plan(now, &schedule) {
+            RefreshState::Refused(refused) => return Err(refused),
+            RefreshState::NotDue => return Ok(None),
+            RefreshState::Waiting { usable, skewed } => {
+                return if usable {
+                    Ok(None)
+                } else {
+                    Err(lapse_reason(skewed))
+                };
+            }
+            RefreshState::Due { usable, skewed } => (usable, skewed),
         };
-        if expiry.saturating_sub(now) >= REFRESH_WINDOW_MS {
-            return Ok(None);
-        }
-        let usable = if skewed {
-            now < fetched_at_ms
-                .saturating_add(REFRESH_SKEW_MS)
-                .saturating_add(REFRESH_SKEW_SLACK_MS)
-        } else {
-            now < expiry
-        };
-        let lapsed = if skewed {
-            CredentialFailure::Expired
-        } else {
-            CredentialFailure::Unavailable
-        };
-        let wait_is_stale = retry_at_ms.saturating_sub(now) > REFRESH_SKEW_MS;
-        if now < retry_at_ms && !wait_is_stale {
-            return if usable { Ok(None) } else { Err(lapsed) };
-        }
         let renewed = match self.fetch_checked(job_id, attempt, &box_name).await {
             Ok(fresh) => self.renewed(&current, &fresh),
             Err(failure) => Err(failure),
@@ -440,31 +520,20 @@ impl CredentialBook {
                 Ok(replaced.map(|_| next))
             }
             Err(failure) => {
-                if matches!(
-                    failure,
-                    CredentialFailure::InstallationRefused | CredentialFailure::RepoRefused
-                ) {
+                let outcome = after_failure(failure, usable, skewed, now);
+                if outcome.sticky {
                     self.refuse(job_id, failure);
-                } else {
-                    self.back_off(job_id, now + REFRESH_RETRY_MS);
                 }
-                let transient = matches!(
-                    failure,
-                    CredentialFailure::Unavailable
-                        | CredentialFailure::Expired
-                        | CredentialFailure::RateLimited
-                );
-                if usable && transient {
+                if let Some(retry_at_ms) = outcome.retry_at_ms {
+                    self.back_off(job_id, retry_at_ms);
+                }
+                if outcome.result.is_ok() {
                     tracing::warn!(
                         reason = failure.reason(),
                         "token refresh failed, keeping the held token"
                     );
-                    Ok(None)
-                } else if transient {
-                    Err(lapsed)
-                } else {
-                    Err(failure)
                 }
+                outcome.result.map(|()| None)
             }
         }
     }
@@ -532,10 +601,13 @@ impl CredentialBook {
             credentials: Arc::clone(&entry.credentials),
             attempt: entry.attempt,
             box_name: entry.box_name.clone(),
-            retry_at_ms: entry.retry_at_ms,
-            skewed: entry.skewed,
-            fetched_at_ms: entry.fetched_at_ms,
-            refused: entry.refused,
+            schedule: Schedule {
+                expiry: entry.credentials.app_expires_at_ms(),
+                retry_at_ms: entry.retry_at_ms,
+                skewed: entry.skewed,
+                fetched_at_ms: entry.fetched_at_ms,
+                refused: entry.refused,
+            },
         });
         drop(guard);
         snap
@@ -673,7 +745,11 @@ impl CredentialBook {
 
 #[cfg(test)]
 mod tests {
-    use super::{CredentialBook, RATE_RETRIES, RATE_RETRY_DELAY};
+    use super::{
+        CredentialBook, CredentialFailure, FailurePlan, RATE_RETRIES, RATE_RETRY_DELAY,
+        REFRESH_RETRY_MS, REFRESH_SKEW_MS, REFRESH_SKEW_SLACK_MS, REFRESH_WINDOW_MS, RefreshState,
+        Schedule, after_failure, plan,
+    };
     use crate::cred::{Credential, CredentialClient, JobCredentials};
     use crate::revoke::Revoker;
     use fleet_core::credential::{CredentialKind, Secret};
@@ -730,5 +806,212 @@ mod tests {
             assert!(std::time::Instant::now() < deadline, "no revoke arrived");
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
+    }
+
+    const NOW: u64 = 1_000_000_000;
+
+    fn schedule(expiry: Option<u64>, retry_at_ms: u64, skewed: bool) -> Schedule {
+        Schedule {
+            expiry,
+            retry_at_ms,
+            skewed,
+            fetched_at_ms: NOW - 1000,
+            refused: None,
+        }
+    }
+
+    #[test]
+    fn plan_decides_refusal_and_window() {
+        let due_in = |left: u64| schedule(Some(NOW + left), 0, false);
+        let refused = Schedule {
+            refused: Some(CredentialFailure::RepoRefused),
+            ..schedule(None, 0, false)
+        };
+        let due = |usable, skewed| RefreshState::Due { usable, skewed };
+        let rows = [
+            (
+                "refusal wins over no expiry",
+                refused,
+                RefreshState::Refused(CredentialFailure::RepoRefused),
+            ),
+            (
+                "refusal wins over a token far from expiry",
+                Schedule {
+                    expiry: Some(NOW + REFRESH_WINDOW_MS * 5),
+                    ..refused
+                },
+                RefreshState::Refused(CredentialFailure::RepoRefused),
+            ),
+            ("no expiry", schedule(None, 0, false), RefreshState::NotDue),
+            (
+                "exactly the window left",
+                due_in(REFRESH_WINDOW_MS),
+                RefreshState::NotDue,
+            ),
+            (
+                "one ms inside the window",
+                due_in(REFRESH_WINDOW_MS - 1),
+                due(true, false),
+            ),
+            ("one ms left", due_in(1), due(true, false)),
+            ("expires now", due_in(0), due(false, false)),
+            (
+                "expired already",
+                schedule(Some(NOW - 5), 0, false),
+                due(false, false),
+            ),
+        ];
+        for (name, row, want) in rows {
+            assert_eq!(plan(NOW, &row), want, "{name}");
+        }
+    }
+
+    #[test]
+    fn plan_decides_retry_wait_and_skew() {
+        let skewed_at = |fetched_at_ms: u64| Schedule {
+            fetched_at_ms,
+            ..schedule(Some(NOW), 0, true)
+        };
+        let skew_end = REFRESH_SKEW_MS + REFRESH_SKEW_SLACK_MS;
+        let due = |usable, skewed| RefreshState::Due { usable, skewed };
+        let waiting = |usable, skewed| RefreshState::Waiting { usable, skewed };
+        let rows = [
+            (
+                "retry in the future, token usable",
+                schedule(Some(NOW + 1000), NOW + 1, false),
+                waiting(true, false),
+            ),
+            (
+                "retry in the future, token expired",
+                schedule(Some(NOW - 1000), NOW + 1, false),
+                waiting(false, false),
+            ),
+            (
+                "retry time reached",
+                schedule(Some(NOW + 1000), NOW, false),
+                due(true, false),
+            ),
+            (
+                "retry one ms before now",
+                schedule(Some(NOW + 1000), NOW - 1, false),
+                due(true, false),
+            ),
+            (
+                "retry exactly one skew interval ahead still waits",
+                schedule(Some(NOW + 1000), NOW + REFRESH_SKEW_MS, false),
+                waiting(true, false),
+            ),
+            (
+                "retry more than one skew interval ahead is stale",
+                schedule(Some(NOW + 1000), NOW + REFRESH_SKEW_MS + 1, false),
+                due(true, false),
+            ),
+            (
+                "skewed token one ms before the skew limit",
+                skewed_at(NOW + 1 - skew_end),
+                due(true, true),
+            ),
+            (
+                "skewed token at the skew limit",
+                skewed_at(NOW - skew_end),
+                due(false, true),
+            ),
+            (
+                "skewed token usable past its own expiry",
+                Schedule {
+                    expiry: Some(NOW - 1),
+                    ..skewed_at(NOW)
+                },
+                due(true, true),
+            ),
+            (
+                "skewed token waiting",
+                Schedule {
+                    retry_at_ms: NOW + 10,
+                    ..skewed_at(NOW)
+                },
+                waiting(true, true),
+            ),
+            (
+                "skewed token waiting past the skew limit",
+                Schedule {
+                    retry_at_ms: NOW + 10,
+                    ..skewed_at(NOW - skew_end)
+                },
+                waiting(false, true),
+            ),
+        ];
+        for (name, row, want) in rows {
+            assert_eq!(plan(NOW, &row), want, "{name}");
+        }
+    }
+
+    #[test]
+    fn after_failure_decides_the_retry_and_the_result_per_failure() {
+        use CredentialFailure as F;
+        let retry = Some(NOW + REFRESH_RETRY_MS);
+        let keep = FailurePlan {
+            sticky: false,
+            retry_at_ms: retry,
+            result: Ok(()),
+        };
+        let lapse = |failure| FailurePlan {
+            sticky: false,
+            retry_at_ms: retry,
+            result: Err(failure),
+        };
+        let sticky = |failure| FailurePlan {
+            sticky: true,
+            retry_at_ms: None,
+            result: Err(failure),
+        };
+        let rows = [
+            (F::Unavailable, true, false, keep),
+            (F::Expired, true, false, keep),
+            (F::RateLimited, true, false, keep),
+            (F::Unavailable, true, true, keep),
+            (F::Unavailable, false, false, lapse(F::Unavailable)),
+            (F::Expired, false, false, lapse(F::Unavailable)),
+            (F::RateLimited, false, false, lapse(F::Unavailable)),
+            (F::Unavailable, false, true, lapse(F::Expired)),
+            (F::RateLimited, false, true, lapse(F::Expired)),
+            (
+                F::InstallationRefused,
+                true,
+                false,
+                sticky(F::InstallationRefused),
+            ),
+            (
+                F::InstallationRefused,
+                false,
+                true,
+                sticky(F::InstallationRefused),
+            ),
+            (F::RepoRefused, true, false, sticky(F::RepoRefused)),
+            (F::RepoRefused, false, false, sticky(F::RepoRefused)),
+            (F::MintCap, true, false, lapse(F::MintCap)),
+            (F::MintCap, false, true, lapse(F::MintCap)),
+            (F::LeaseMismatch, true, false, lapse(F::LeaseMismatch)),
+            (F::Malformed, true, false, lapse(F::Malformed)),
+            (F::NoGithub, true, false, lapse(F::NoGithub)),
+            (
+                F::AppIdentityMissing,
+                true,
+                true,
+                lapse(F::AppIdentityMissing),
+            ),
+        ];
+        for (failure, usable, skewed, want) in rows {
+            assert_eq!(
+                after_failure(failure, usable, skewed, NOW),
+                want,
+                "{failure:?} usable={usable} skewed={skewed}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_failure_retry_delay_is_thirty_seconds() {
+        assert_eq!(REFRESH_RETRY_MS, 30_000);
     }
 }
