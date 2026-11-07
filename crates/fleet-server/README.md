@@ -39,6 +39,7 @@ The hosted Fleet service. It stores box state, jobs, transcripts, job timing and
 | `FLEET_GITHUB_APP_BOT_NAME`, `FLEET_GITHUB_APP_BOT_EMAIL` | Git author name and email for App Jobs. Required when the App is set, checked by the identity grammar (ADR-0058 SEC-006). |
 | `FLEET_GITHUB_APP_ACCOUNT` | Operator GitHub login that owns the installation. Required when the App is set (ADR-0058 SEC-014). |
 | `FLEET_GITHUB_APP_INSTALLATIONS`, `FLEET_GITHUB_APP_REPOS` | Comma separated installation ids and `owner/name` or `owner/*` repository entries. Unset allows nothing (ADR-0058 SEC-001, SEC-002). |
+| `FLEET_REPO_HOSTS` | Repository hosts a User may add: `host=H,forge=github\|forgejo,api=URL[,allow_private=true\|false]` entries joined by `;`. Unset allows `github.com`. Empty refuses every add. The last host label must start with a letter, an `api` path segment is at most 64 bytes, and `.` and `..` segments are refused. A bad value stops startup without echoing it. Full rules in `infra/README.md`. |
 | `FLEET_MAX_CI_RETRIES` | Automatic CI retry cap, 0 to 5. |
 | `FLEET_LISTEN`, `FLEET_HEALTH_LISTEN` | Listen addresses. |
 | `FLEET_EVENTS_RETENTION_DAYS`, `FLEET_SUMMARIES_RETENTION_DAYS`, `FLEET_RETENTION_INTERVAL_SECS` | Retention sweep. |

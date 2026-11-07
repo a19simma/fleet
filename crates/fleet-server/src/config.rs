@@ -121,6 +121,296 @@ impl Token {
     }
 }
 
+/// Most entries `FLEET_REPO_HOSTS` may hold.
+pub const MAX_REPO_HOSTS: usize = 16;
+
+/// Longest `FLEET_REPO_HOSTS` value, in bytes.
+pub const MAX_REPO_HOSTS_VALUE_LEN: usize = 4096;
+
+const REPO_HOSTS_VAR: &str = "FLEET_REPO_HOSTS";
+const MAX_HOST_LEN: usize = 253;
+const MAX_LABEL_LEN: usize = 63;
+const MAX_PATH_SEGMENT_LEN: usize = 64;
+const MAX_PATH_SEGMENTS: usize = 8;
+const GITHUB_HOST: &str = "github.com";
+const GITHUB_API_HOST: &str = "api.github.com";
+const GITHUB_API_BASE: &str = "https://api.github.com";
+
+/// The kind of forge behind a repository host.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum Forge {
+    /// GitHub, or a GitHub Enterprise server.
+    Github,
+    /// Forgejo or Gitea.
+    Forgejo,
+}
+
+/// One operator-approved repository host.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HostConfig {
+    /// Lowercase ASCII DNS name, with no port and no trailing dot.
+    pub host: String,
+    /// The forge API dialect.
+    pub forge: Forge,
+    /// The HTTPS API base with no trailing slash. Its host equals [`HostConfig::host`], except that
+    /// a `github` entry for `github.com` may use `api.github.com`.
+    pub api_base: String,
+    /// Whether the host may resolve to a private address. Defaults to `false`.
+    pub allow_private: bool,
+}
+
+/// Why a `FLEET_REPO_HOSTS` value was refused. The text is fixed and never echoes the value.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum RepoHostsError {
+    /// The value is longer than [`MAX_REPO_HOSTS_VALUE_LEN`] bytes.
+    TooLong,
+    /// More than [`MAX_REPO_HOSTS`] entries.
+    TooManyEntries,
+    /// An entry is empty or a field is not `key=value`.
+    Malformed,
+    /// A field name is not `host`, `forge`, `api` or `allow_private`.
+    UnknownField,
+    /// A field appears twice in one entry.
+    DuplicateField,
+    /// `host` is missing.
+    MissingHost,
+    /// `forge` is missing.
+    MissingForge,
+    /// `api` is missing.
+    MissingApi,
+    /// `host` is not a lowercase ASCII DNS name without port, userinfo or trailing dot.
+    InvalidHost,
+    /// `forge` is not `github` or `forgejo`.
+    InvalidForge,
+    /// `allow_private` is not `true` or `false`.
+    InvalidAllowPrivate,
+    /// `api` is not an HTTPS base URL with no userinfo, port, query or fragment.
+    InvalidApi,
+    /// The host of `api` differs from `host`.
+    ApiHostMismatch,
+    /// `api` has a path that is not a plain subpath prefix.
+    InvalidApiPath,
+    /// Two entries name the same host.
+    DuplicateHost,
+}
+
+impl fmt::Display for RepoHostsError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Self::TooLong => "value is too long",
+            Self::TooManyEntries => "too many entries",
+            Self::Malformed => "an entry is empty or a field is not key=value",
+            Self::UnknownField => "an entry has an unknown field",
+            Self::DuplicateField => "an entry repeats a field",
+            Self::MissingHost => "an entry has no host",
+            Self::MissingForge => "an entry has no forge",
+            Self::MissingApi => "an entry has no api",
+            Self::InvalidHost => "a host is not a lowercase ASCII DNS name",
+            Self::InvalidForge => "a forge is not github or forgejo",
+            Self::InvalidAllowPrivate => "allow_private is not true or false",
+            Self::InvalidApi => "an api is not a plain https base URL",
+            Self::ApiHostMismatch => "an api host differs from its entry host",
+            Self::InvalidApiPath => "an api path is not a plain subpath prefix",
+            Self::DuplicateHost => "two entries name the same host",
+        })
+    }
+}
+
+impl std::error::Error for RepoHostsError {}
+
+/// The operator repository host list.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RepoHosts {
+    hosts: Vec<HostConfig>,
+}
+
+impl Default for RepoHosts {
+    fn default() -> Self {
+        Self {
+            hosts: vec![HostConfig {
+                host: GITHUB_HOST.to_owned(),
+                forge: Forge::Github,
+                api_base: GITHUB_API_BASE.to_owned(),
+                allow_private: false,
+            }],
+        }
+    }
+}
+
+impl RepoHosts {
+    /// A list with no hosts, which refuses every repository.
+    pub fn none() -> Self {
+        Self { hosts: Vec::new() }
+    }
+
+    /// The entry for `host`, matched exactly. Callers pass a lowercase host.
+    pub fn lookup(&self, host: &str) -> Option<&HostConfig> {
+        self.hosts.iter().find(|entry| entry.host == host)
+    }
+
+    /// The entries in the order configured.
+    pub fn iter(&self) -> impl Iterator<Item = &HostConfig> {
+        self.hosts.iter()
+    }
+
+    /// How many hosts are configured.
+    pub fn len(&self) -> usize {
+        self.hosts.len()
+    }
+
+    /// Whether no host is configured.
+    pub fn is_empty(&self) -> bool {
+        self.hosts.is_empty()
+    }
+
+    /// Parses a `FLEET_REPO_HOSTS` value: entries separated by `;`, each a comma separated list of
+    /// `host=`, `forge=`, `api=` and optional `allow_private=` fields. The empty string is an empty
+    /// list. No field is trimmed, so any whitespace refuses the value.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RepoHostsError`] when the value or an entry breaks the grammar, a host or API base
+    /// is invalid, or two entries share a host.
+    pub fn parse(raw: &str) -> Result<Self, RepoHostsError> {
+        if raw.bytes().take(MAX_REPO_HOSTS_VALUE_LEN + 1).count() > MAX_REPO_HOSTS_VALUE_LEN {
+            return Err(RepoHostsError::TooLong);
+        }
+        if raw.is_empty() {
+            return Ok(Self::none());
+        }
+        let parts: Vec<&str> = raw.split(';').take(MAX_REPO_HOSTS + 1).collect();
+        if parts.len() > MAX_REPO_HOSTS {
+            return Err(RepoHostsError::TooManyEntries);
+        }
+        let mut hosts: Vec<HostConfig> = Vec::with_capacity(parts.len());
+        for part in parts {
+            let parsed = parse_host_entry(part)?;
+            if hosts.iter().any(|seen| seen.host == parsed.host) {
+                return Err(RepoHostsError::DuplicateHost);
+            }
+            hosts.push(parsed);
+        }
+        Ok(Self { hosts })
+    }
+}
+
+fn parse_host_entry(part: &str) -> Result<HostConfig, RepoHostsError> {
+    if part.is_empty() {
+        return Err(RepoHostsError::Malformed);
+    }
+    let mut host = None;
+    let mut forge = None;
+    let mut api = None;
+    let mut allow_private = None;
+    for field in part.split(',') {
+        let (key, value) = field.split_once('=').ok_or(RepoHostsError::Malformed)?;
+        let slot = match key {
+            "host" => &mut host,
+            "forge" => &mut forge,
+            "api" => &mut api,
+            "allow_private" => &mut allow_private,
+            _ => return Err(RepoHostsError::UnknownField),
+        };
+        if slot.replace(value).is_some() {
+            return Err(RepoHostsError::DuplicateField);
+        }
+    }
+    let host = host.ok_or(RepoHostsError::MissingHost)?;
+    let forge = forge.ok_or(RepoHostsError::MissingForge)?;
+    let api = api.ok_or(RepoHostsError::MissingApi)?;
+    if !is_dns_host(host) {
+        return Err(RepoHostsError::InvalidHost);
+    }
+    let forge = match forge {
+        "github" => Forge::Github,
+        "forgejo" => Forge::Forgejo,
+        _ => return Err(RepoHostsError::InvalidForge),
+    };
+    let allow_private = match allow_private {
+        None | Some("false") => false,
+        Some("true") => true,
+        Some(_) => return Err(RepoHostsError::InvalidAllowPrivate),
+    };
+    Ok(HostConfig {
+        host: host.to_owned(),
+        forge,
+        api_base: parse_api_base(api, host, forge)?,
+        allow_private,
+    })
+}
+
+/// Whether `host` is a lowercase ASCII DNS name: labels of 1 to 63 letters, digits and hyphens,
+/// none starting or ending with a hyphen, at most 253 bytes in all. The last label must start with
+/// an ASCII lowercase letter, as every real top-level domain does, which refuses IPv4 in decimal,
+/// hex and octal forms such as `0x7f000001`. A single label such as `localhost` is accepted by
+/// design: the fetcher enforces the private-address check at connect time, unless `allow_private`
+/// is set.
+fn is_dns_host(host: &str) -> bool {
+    if host.is_empty() || host.len() > MAX_HOST_LEN {
+        return false;
+    }
+    let mut last = "";
+    for label in host.split('.') {
+        let edge = |b: Option<&u8>| b == Some(&b'-');
+        let ok = !label.is_empty()
+            && label.len() <= MAX_LABEL_LEN
+            && label
+                .bytes()
+                .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
+            && !edge(label.as_bytes().first())
+            && !edge(label.as_bytes().last());
+        if !ok {
+            return false;
+        }
+        last = label;
+    }
+    has_letter_tld(last)
+}
+
+fn has_letter_tld(host: &str) -> bool {
+    host.rsplit('.')
+        .next()
+        .is_some_and(|last| last.starts_with(|c: char| c.is_ascii_lowercase()))
+}
+
+fn parse_api_base(api: &str, host: &str, forge: Forge) -> Result<String, RepoHostsError> {
+    let rest = api
+        .strip_prefix("https://")
+        .ok_or(RepoHostsError::InvalidApi)?;
+    let (authority, path) = rest.find('/').map_or((rest, ""), |at| rest.split_at(at));
+    if authority.is_empty()
+        || !has_letter_tld(authority)
+        || !authority
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'.' || b == b'-')
+    {
+        return Err(RepoHostsError::InvalidApi);
+    }
+    let github_api = forge == Forge::Github && host == GITHUB_HOST && authority == GITHUB_API_HOST;
+    if authority != host && !github_api {
+        return Err(RepoHostsError::ApiHostMismatch);
+    }
+    let prefix = path.strip_suffix('/').unwrap_or(path);
+    if !prefix.is_empty() {
+        let segments: Vec<&str> = prefix[1..].split('/').take(MAX_PATH_SEGMENTS + 1).collect();
+        let plain = |segment: &&str| {
+            !segment.is_empty()
+                && segment.len() <= MAX_PATH_SEGMENT_LEN
+                && *segment != "."
+                && *segment != ".."
+                && segment
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'~' | b'-'))
+        };
+        if segments.len() > MAX_PATH_SEGMENTS || !segments.iter().all(plain) {
+            return Err(RepoHostsError::InvalidApiPath);
+        }
+    }
+    Ok(format!("https://{authority}{prefix}"))
+}
+
 /// Server settings.
 #[derive(Debug, Clone)]
 pub struct Config {
@@ -174,6 +464,10 @@ pub struct Config {
     /// the installation and repository lists are optional and an unset list allows nothing.
     /// `None` when the id and the key file are unset or empty.
     pub github_app: Option<GithubAppConfig>,
+    /// Repository hosts a User may add, from `FLEET_REPO_HOSTS`. Unset gives the `github.com`
+    /// entry; the empty string gives no hosts, which refuses every add. A set value that does not
+    /// parse refuses start without echoing it.
+    pub repo_hosts: RepoHosts,
 }
 
 /// The GitHub App id, the path of its private key, the bot identity and the allowlist policy
@@ -455,6 +749,15 @@ fn github_app(
     }))
 }
 
+fn repo_hosts(lookup: &impl Fn(&str) -> Option<String>) -> Result<RepoHosts, ConfigError> {
+    lookup(REPO_HOSTS_VAR)
+        .map_or_else(|| Ok(RepoHosts::default()), |raw| RepoHosts::parse(&raw))
+        .map_err(|err| ConfigError::Invalid {
+            var: REPO_HOSTS_VAR,
+            reason: err.to_string(),
+        })
+}
+
 fn ci_retries(lookup: &impl Fn(&str) -> Option<String>) -> Result<u32, ConfigError> {
     let value = number(
         lookup,
@@ -494,20 +797,20 @@ impl Config {
     ///
     /// # Errors
     ///
-    /// Returns [`ConfigError`] when `FLEET_DATABASE_URL` or `FLEET_TOKEN` is missing or
-    /// empty, `FLEET_CLIENT_TOKEN` is set but invalid or equal to `FLEET_TOKEN`, an
-    /// address does not parse, or a retention setting is out of range. Retention days run
-    /// from 1 to 3650, `FLEET_SUMMARIES_RETENTION_DAYS` must not be below
-    /// `FLEET_EVENTS_RETENTION_DAYS`, and `FLEET_RETENTION_INTERVAL_SECS` is at least 60.
-    /// `FLEET_MAX_CI_RETRIES` runs from 0 to 5 and defaults to 0. `FLEET_GITHUB_APP_ID` without
-    /// `FLEET_GITHUB_APP_KEY_FILE`, or the reverse, is an error, and so is an App id that is
-    /// not 1 to 20 ASCII digits without a leading zero that fits a `u64`. With the App set,
-    /// `FLEET_GITHUB_APP_BOT_NAME` and `FLEET_GITHUB_APP_BOT_EMAIL` are required and must pass
-    /// [`BotIdentity::new`], and so is `FLEET_GITHUB_APP_ACCOUNT`, a GitHub login. The
-    /// optional `FLEET_GITHUB_APP_INSTALLATIONS` and `FLEET_GITHUB_APP_REPOS` are checked
-    /// against the allowlist grammar and an unset one allows nothing. The App also requires
-    /// `FLEET_MASTER_KEY_FILE`. The App key file and the master key file are made absolute against
-    /// the working directory here.
+    /// Returns [`ConfigError`] when `FLEET_DATABASE_URL` or `FLEET_TOKEN` is missing or empty,
+    /// `FLEET_CLIENT_TOKEN` is set but invalid or equal to `FLEET_TOKEN`, an address does not
+    /// parse, or a retention setting is out of range. Retention days run from 1 to 3650,
+    /// `FLEET_SUMMARIES_RETENTION_DAYS` must not be below `FLEET_EVENTS_RETENTION_DAYS`, and
+    /// `FLEET_RETENTION_INTERVAL_SECS` is at least 60. `FLEET_MAX_CI_RETRIES` runs from 0 to 5 and
+    /// defaults to 0. `FLEET_GITHUB_APP_ID` without `FLEET_GITHUB_APP_KEY_FILE`, or the reverse, is
+    /// an error, and so is an App id that is not 1 to 20 ASCII digits without a leading zero that
+    /// fits a `u64`. With the App set, `FLEET_GITHUB_APP_BOT_NAME` and `FLEET_GITHUB_APP_BOT_EMAIL`
+    /// are required and must pass [`BotIdentity::new`], and so is `FLEET_GITHUB_APP_ACCOUNT`, a
+    /// GitHub login. The optional `FLEET_GITHUB_APP_INSTALLATIONS` and `FLEET_GITHUB_APP_REPOS` are
+    /// checked against the allowlist grammar and an unset one allows nothing. The App also requires
+    /// `FLEET_MASTER_KEY_FILE`. A set `FLEET_REPO_HOSTS` that fails [`RepoHosts::parse`] is
+    /// [`ConfigError::Invalid`] for that variable. The App key file and the master key file are
+    /// made absolute against the working directory here.
     pub fn from_env() -> Result<Self, ConfigError> {
         Self::from_lookup(|var| std::env::var(var).ok())
     }
@@ -558,6 +861,7 @@ impl Config {
             max_ci_retries: ci_retries(&lookup)?,
             model_allowlist: model_allowlist(&lookup)?,
             github_app,
+            repo_hosts: repo_hosts(&lookup)?,
             master_key_file,
             update_manifest: lookup("FLEET_UPDATE_MANIFEST")
                 .filter(|v| !v.is_empty())
@@ -1340,5 +1644,579 @@ mod tests {
         let shown = format!("{config:?} {:?}", config.token);
         assert!(!shown.contains("hunter2"));
         assert!(!shown.contains("s3cret-token"));
+    }
+
+    const GH_ENTRY: &str = "host=github.com,forge=github,api=https://api.github.com";
+    const FJ_ENTRY: &str = "host=git.example.com,forge=forgejo,api=https://git.example.com";
+
+    fn hosts(raw: &str) -> Result<RepoHosts, RepoHostsError> {
+        RepoHosts::parse(raw)
+    }
+
+    fn with_hosts(raw: &str) -> Result<Config, ConfigError> {
+        let mut vars: Vec<(&str, &str)> = base();
+        vars.push(("FLEET_REPO_HOSTS", raw));
+        Config::from_lookup(lookup(&vars))
+    }
+
+    fn entry(host: &str, forge: &str, api: &str) -> String {
+        format!("host={host},forge={forge},api={api}")
+    }
+
+    #[test]
+    fn repo_hosts_default_is_github_when_unset() {
+        let config = with(&[]).unwrap();
+        assert_eq!(config.repo_hosts.len(), 1);
+        let github = config.repo_hosts.lookup("github.com").unwrap();
+        assert_eq!(github.forge, Forge::Github);
+        assert_eq!(github.api_base, "https://api.github.com");
+        assert!(!github.allow_private);
+        assert_eq!(config.repo_hosts, RepoHosts::default());
+    }
+
+    #[test]
+    fn repo_hosts_empty_string_means_no_hosts() {
+        let config = with(&[("FLEET_REPO_HOSTS", "")]).unwrap();
+        assert!(config.repo_hosts.is_empty());
+        assert_eq!(config.repo_hosts.lookup("github.com"), None);
+        assert_eq!(config.repo_hosts, RepoHosts::none());
+    }
+
+    #[test]
+    fn repo_hosts_parse_two_entries() {
+        let raw = format!("{GH_ENTRY};{FJ_ENTRY},allow_private=true");
+        let config = with_hosts(&raw).unwrap();
+        let hosts = config.repo_hosts;
+        assert_eq!(hosts.len(), 2);
+        assert_eq!(hosts.iter().count(), 2);
+        let github = hosts.lookup("github.com").unwrap();
+        assert!(!github.allow_private);
+        let forgejo = hosts.lookup("git.example.com").unwrap();
+        assert_eq!(forgejo.forge, Forge::Forgejo);
+        assert_eq!(forgejo.api_base, "https://git.example.com");
+        assert!(forgejo.allow_private);
+        assert_eq!(hosts.lookup("GIT.example.com"), None);
+        assert_eq!(hosts.lookup("other.example.com"), None);
+    }
+
+    #[test]
+    fn repo_hosts_allow_private_false_is_accepted() {
+        let raw = format!("{FJ_ENTRY},allow_private=false");
+        assert!(
+            !hosts(&raw)
+                .unwrap()
+                .lookup("git.example.com")
+                .unwrap()
+                .allow_private
+        );
+    }
+
+    #[test]
+    fn repo_hosts_api_path_is_normalised() {
+        for (api, want) in [
+            ("https://git.example.com/", "https://git.example.com"),
+            (
+                "https://git.example.com/api/v1",
+                "https://git.example.com/api/v1",
+            ),
+            (
+                "https://git.example.com/api/v1/",
+                "https://git.example.com/api/v1",
+            ),
+        ] {
+            let parsed = hosts(&entry("git.example.com", "forgejo", api)).unwrap();
+            assert_eq!(
+                parsed.lookup("git.example.com").unwrap().api_base,
+                want,
+                "{api}"
+            );
+        }
+    }
+
+    #[test]
+    fn repo_hosts_api_path_limits_accept_the_edge() {
+        let segment = "a".repeat(MAX_PATH_SEGMENT_LEN);
+        let deep = ["b"; MAX_PATH_SEGMENTS].join("/");
+        for path in [segment, deep, "a.b_c~d-e".to_owned()] {
+            let api = format!("https://git.example.com/{path}");
+            assert!(
+                hosts(&entry("git.example.com", "forgejo", &api)).is_ok(),
+                "{path}"
+            );
+        }
+    }
+
+    #[test]
+    fn repo_hosts_github_api_host_exception_is_narrow() {
+        assert!(hosts(GH_ENTRY).is_ok());
+        let cases = [
+            entry("github.com", "forgejo", "https://api.github.com"),
+            entry("example.com", "github", "https://api.github.com"),
+            entry("ghe.example.com", "github", "https://api.github.com"),
+            entry("github.com", "github", "https://api.github.com.evil.com"),
+            entry("github.com", "github", "https://evil.com"),
+            entry("git.example.com", "forgejo", "https://api.git.example.com"),
+            entry("git.example.com", "forgejo", "https://Git.example.com"),
+        ];
+        for raw in cases {
+            assert_eq!(hosts(&raw), Err(RepoHostsError::ApiHostMismatch), "{raw}");
+        }
+    }
+
+    #[test]
+    fn repo_hosts_hostile_host_is_refused() {
+        let over_long = format!("{}com", "a.".repeat((MAX_HOST_LEN - 3) / 2 + 1));
+        let long_label = format!("{}.com", "a".repeat(MAX_LABEL_LEN + 1));
+        let cases: Vec<(&str, String)> = vec![
+            ("empty", String::new()),
+            ("uppercase", "Git.example.com".into()),
+            ("cr", "git.example.com\r".into()),
+            ("crlf", "git.example.com\r\n".into()),
+            ("lf", "git.example.com\n".into()),
+            ("nel", "git.example.com\u{85}".into()),
+            ("line separator", "git.example.com\u{2028}".into()),
+            ("userinfo", "user@git.example.com".into()),
+            ("userinfo password", "user:pw@git.example.com".into()),
+            ("port", "git.example.com:8443".into()),
+            ("backslash", "git.example.com\\evil.com".into()),
+            ("ipv6", "[::1]".into()),
+            ("ipv6 bare", "::1".into()),
+            ("ipv4", "10.0.0.1".into()),
+            ("empty label", "git..example.com".into()),
+            ("leading dot", ".example.com".into()),
+            ("trailing dot", "git.example.com.".into()),
+            ("leading hyphen", "-git.example.com".into()),
+            ("trailing hyphen", "git-.example.com".into()),
+            ("underscore", "git_x.example.com".into()),
+            ("slash", "git.example.com/x".into()),
+            ("space", "git.example.com ".into()),
+            ("inner space", "git .example.com".into()),
+            ("tab", "git.example.com\t".into()),
+            ("non-ascii", "g\u{131}t.example.com".into()),
+            ("fullwidth dot", "git\u{ff0e}example.com".into()),
+            ("over-long", over_long),
+            ("over-long label", long_label),
+            ("hex ipv4", "0x7f000001".into()),
+            ("dotted hex ipv4", "127.0.0.0x1".into()),
+            ("hex last label", "a.0x".into()),
+            ("bare hex", "0x".into()),
+            ("dotted hex all", "0xa.0x0.0x0.0x1".into()),
+            ("digit-led last label", "a.1com".into()),
+            ("hyphen-led last label", "a.-com".into()),
+        ];
+        for (name, host) in cases {
+            let raw = entry(&host, "forgejo", "https://git.example.com");
+            assert_eq!(hosts(&raw), Err(RepoHostsError::InvalidHost), "{name}");
+        }
+        assert!(hosts(&entry("localhost", "forgejo", "https://localhost")).is_ok());
+        for ok in [
+            "example.com",
+            "git.example.com",
+            "a.xn--p1ai",
+            "1.example.com",
+        ] {
+            let api = format!("https://{ok}");
+            assert!(hosts(&entry(ok, "forgejo", &api)).is_ok(), "{ok}");
+        }
+        let max_label = format!("{}.com", "a".repeat(MAX_LABEL_LEN));
+        let api = format!("https://{max_label}");
+        assert!(hosts(&entry(&max_label, "forgejo", &api)).is_ok());
+        let max_host = format!("{}com", "a.".repeat((MAX_HOST_LEN - 3) / 2));
+        assert_eq!(max_host.len(), MAX_HOST_LEN);
+        let api = format!("https://{max_host}");
+        assert!(hosts(&entry(&max_host, "forgejo", &api)).is_ok());
+        let one_over = format!("a{max_host}");
+        assert_eq!(one_over.len(), MAX_HOST_LEN + 1);
+        let api = format!("https://{one_over}");
+        assert_eq!(
+            hosts(&entry(&one_over, "forgejo", &api)),
+            Err(RepoHostsError::InvalidHost)
+        );
+        let hyphen = "git-x.example.com";
+        assert!(hosts(&entry(hyphen, "forgejo", &format!("https://{hyphen}"))).is_ok());
+    }
+
+    fn assert_api_cases(cases: Vec<(&str, String, RepoHostsError)>) {
+        for (name, api, want) in cases {
+            let raw = entry("git.example.com", "forgejo", &api);
+            assert_eq!(hosts(&raw), Err(want), "{name}");
+        }
+    }
+
+    #[test]
+    fn repo_hosts_hostile_api_authority_is_refused() {
+        let cases: Vec<(&str, String, RepoHostsError)> = vec![
+            (
+                "http",
+                "http://git.example.com".into(),
+                RepoHostsError::InvalidApi,
+            ),
+            (
+                "scheme case",
+                "HTTPS://git.example.com".into(),
+                RepoHostsError::InvalidApi,
+            ),
+            (
+                "no scheme",
+                "git.example.com".into(),
+                RepoHostsError::InvalidApi,
+            ),
+            (
+                "ftp",
+                "ftp://git.example.com".into(),
+                RepoHostsError::InvalidApi,
+            ),
+            ("empty", String::new(), RepoHostsError::InvalidApi),
+            ("empty host", "https://".into(), RepoHostsError::InvalidApi),
+            (
+                "empty host path",
+                "https:///x".into(),
+                RepoHostsError::InvalidApi,
+            ),
+            (
+                "userinfo",
+                "https://u@git.example.com".into(),
+                RepoHostsError::InvalidApi,
+            ),
+            (
+                "userinfo pw",
+                "https://u:p@git.example.com".into(),
+                RepoHostsError::InvalidApi,
+            ),
+            (
+                "port",
+                "https://git.example.com:8443".into(),
+                RepoHostsError::InvalidApi,
+            ),
+            (
+                "port path",
+                "https://git.example.com:443/x".into(),
+                RepoHostsError::InvalidApi,
+            ),
+            ("ipv6", "https://[::1]".into(), RepoHostsError::InvalidApi),
+            (
+                "hex ipv4 authority",
+                "https://0x7f000001".into(),
+                RepoHostsError::InvalidApi,
+            ),
+            (
+                "dotted hex authority",
+                "https://127.0.0.0x1".into(),
+                RepoHostsError::InvalidApi,
+            ),
+            (
+                "hex last label authority",
+                "https://a.0x".into(),
+                RepoHostsError::InvalidApi,
+            ),
+            (
+                "bare hex authority",
+                "https://0x".into(),
+                RepoHostsError::InvalidApi,
+            ),
+            (
+                "dotted hex all authority",
+                "https://0xa.0x0.0x0.0x1".into(),
+                RepoHostsError::InvalidApi,
+            ),
+            (
+                "uppercase last label authority",
+                "https://git.example.COM".into(),
+                RepoHostsError::InvalidApi,
+            ),
+            (
+                "ipv4 authority",
+                "https://10.0.0.1".into(),
+                RepoHostsError::InvalidApi,
+            ),
+            (
+                "query",
+                "https://git.example.com?x=1".into(),
+                RepoHostsError::InvalidApi,
+            ),
+        ];
+        assert_api_cases(cases);
+        let ok = ["https://git.example.com", "https://a.xn--p1ai"];
+        for api in ok {
+            let host = api.trim_start_matches("https://");
+            assert!(hosts(&entry(host, "forgejo", api)).is_ok(), "{api}");
+        }
+    }
+
+    #[test]
+    fn repo_hosts_hostile_api_path_is_refused() {
+        let over_long = format!(
+            "https://git.example.com/{}",
+            "a".repeat(MAX_PATH_SEGMENT_LEN + 1)
+        );
+        let deep = format!(
+            "https://git.example.com/{}",
+            "a/".repeat(MAX_PATH_SEGMENTS + 1)
+        );
+        let cases: Vec<(&str, String, RepoHostsError)> = vec![
+            (
+                "query path",
+                "https://git.example.com/api?x=1".into(),
+                RepoHostsError::InvalidApiPath,
+            ),
+            (
+                "fragment",
+                "https://git.example.com#x".into(),
+                RepoHostsError::InvalidApi,
+            ),
+            (
+                "fragment path",
+                "https://git.example.com/api#x".into(),
+                RepoHostsError::InvalidApiPath,
+            ),
+            (
+                "backslash",
+                "https://git.example.com\\x".into(),
+                RepoHostsError::InvalidApi,
+            ),
+            (
+                "backslash path",
+                "https://git.example.com/a\\b".into(),
+                RepoHostsError::InvalidApiPath,
+            ),
+            (
+                "dot segment",
+                "https://git.example.com/./x".into(),
+                RepoHostsError::InvalidApiPath,
+            ),
+            (
+                "dotdot segment",
+                "https://git.example.com/../x".into(),
+                RepoHostsError::InvalidApiPath,
+            ),
+            (
+                "empty segment",
+                "https://git.example.com/a//b".into(),
+                RepoHostsError::InvalidApiPath,
+            ),
+            (
+                "over-long segment",
+                over_long,
+                RepoHostsError::InvalidApiPath,
+            ),
+            ("too deep", deep, RepoHostsError::InvalidApiPath),
+        ];
+        assert_api_cases(cases);
+    }
+
+    #[test]
+    fn repo_hosts_hostile_api_bytes_are_refused() {
+        let cases: Vec<(&str, String, RepoHostsError)> = vec![
+            (
+                "cr",
+                "https://git.example.com\r".into(),
+                RepoHostsError::InvalidApi,
+            ),
+            (
+                "crlf path",
+                "https://git.example.com/a\r\n".into(),
+                RepoHostsError::InvalidApiPath,
+            ),
+            (
+                "nel",
+                "https://git.example.com/a\u{85}".into(),
+                RepoHostsError::InvalidApiPath,
+            ),
+            (
+                "line separator",
+                "https://git.example.com/a\u{2028}".into(),
+                RepoHostsError::InvalidApiPath,
+            ),
+            (
+                "space",
+                "https://git.example.com/a b".into(),
+                RepoHostsError::InvalidApiPath,
+            ),
+            (
+                "trailing space",
+                "https://git.example.com ".into(),
+                RepoHostsError::InvalidApi,
+            ),
+            (
+                "non-ascii host",
+                "https://g\u{131}t.example.com".into(),
+                RepoHostsError::InvalidApi,
+            ),
+            (
+                "non-ascii path",
+                "https://git.example.com/\u{e9}".into(),
+                RepoHostsError::InvalidApiPath,
+            ),
+            (
+                "percent",
+                "https://git.example.com/%2e%2e".into(),
+                RepoHostsError::InvalidApiPath,
+            ),
+        ];
+        assert_api_cases(cases);
+    }
+
+    #[test]
+    fn repo_hosts_hostile_forge_is_refused() {
+        for forge in [
+            "",
+            "GitHub",
+            "gitea",
+            "github ",
+            "github\r\n",
+            "github\u{2028}",
+            "g\u{131}thub",
+            "github\\",
+        ] {
+            let raw = entry("git.example.com", forge, "https://git.example.com");
+            assert_eq!(hosts(&raw), Err(RepoHostsError::InvalidForge), "{forge:?}");
+        }
+    }
+
+    #[test]
+    fn repo_hosts_hostile_allow_private_is_refused() {
+        for value in [
+            "",
+            "True",
+            "TRUE",
+            "1",
+            "yes",
+            "false ",
+            "true\r\n",
+            "true\u{85}",
+            "tru\u{131}e",
+        ] {
+            let raw = format!("{FJ_ENTRY},allow_private={value}");
+            assert_eq!(
+                hosts(&raw),
+                Err(RepoHostsError::InvalidAllowPrivate),
+                "{value:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn repo_hosts_each_required_field_is_needed() {
+        let cases = [
+            (
+                "forge=forgejo,api=https://git.example.com",
+                RepoHostsError::MissingHost,
+            ),
+            (
+                "host=git.example.com,api=https://git.example.com",
+                RepoHostsError::MissingForge,
+            ),
+            (
+                "host=git.example.com,forge=forgejo",
+                RepoHostsError::MissingApi,
+            ),
+            ("allow_private=true", RepoHostsError::MissingHost),
+        ];
+        for (raw, want) in cases {
+            assert_eq!(hosts(raw), Err(want), "{raw}");
+        }
+    }
+
+    #[test]
+    fn repo_hosts_grammar_errors() {
+        let cases = [
+            (format!("{FJ_ENTRY};"), RepoHostsError::Malformed),
+            (format!(";{FJ_ENTRY}"), RepoHostsError::Malformed),
+            (format!("{FJ_ENTRY};;{GH_ENTRY}"), RepoHostsError::Malformed),
+            (";".to_owned(), RepoHostsError::Malformed),
+            (format!("{FJ_ENTRY},"), RepoHostsError::Malformed),
+            ("host".to_owned(), RepoHostsError::Malformed),
+            (format!("{FJ_ENTRY},extra"), RepoHostsError::Malformed),
+            (" ".to_owned(), RepoHostsError::Malformed),
+            (
+                format!("{FJ_ENTRY},color=red"),
+                RepoHostsError::UnknownField,
+            ),
+            (format!("{FJ_ENTRY},Host=x"), RepoHostsError::UnknownField),
+            (
+                format!("{FJ_ENTRY},host=other.example.com"),
+                RepoHostsError::DuplicateField,
+            ),
+            (
+                format!("{FJ_ENTRY},forge=github"),
+                RepoHostsError::DuplicateField,
+            ),
+            (
+                format!("{FJ_ENTRY},api=https://git.example.com"),
+                RepoHostsError::DuplicateField,
+            ),
+            (
+                format!("{FJ_ENTRY},allow_private=true,allow_private=true"),
+                RepoHostsError::DuplicateField,
+            ),
+        ];
+        for (raw, want) in cases {
+            assert_eq!(hosts(&raw), Err(want), "{raw}");
+        }
+    }
+
+    #[test]
+    fn repo_hosts_duplicate_hosts_are_refused() {
+        let same = format!("{GH_ENTRY};{GH_ENTRY}");
+        assert_eq!(hosts(&same), Err(RepoHostsError::DuplicateHost));
+        let other_forge = format!(
+            "{FJ_ENTRY};{}",
+            entry("git.example.com", "github", "https://git.example.com")
+        );
+        assert_eq!(hosts(&other_forge), Err(RepoHostsError::DuplicateHost));
+        let apart = format!("{GH_ENTRY};{FJ_ENTRY};{GH_ENTRY}");
+        assert_eq!(hosts(&apart), Err(RepoHostsError::DuplicateHost));
+    }
+
+    #[test]
+    fn repo_hosts_caps_apply() {
+        let at_cap: Vec<String> = (0..MAX_REPO_HOSTS)
+            .map(|n| {
+                entry(
+                    &format!("h{n}.example.com"),
+                    "forgejo",
+                    &format!("https://h{n}.example.com"),
+                )
+            })
+            .collect();
+        assert_eq!(hosts(&at_cap.join(";")).unwrap().len(), MAX_REPO_HOSTS);
+        let over: Vec<String> = (0..=MAX_REPO_HOSTS)
+            .map(|n| {
+                entry(
+                    &format!("h{n}.example.com"),
+                    "forgejo",
+                    &format!("https://h{n}.example.com"),
+                )
+            })
+            .collect();
+        assert_eq!(hosts(&over.join(";")), Err(RepoHostsError::TooManyEntries));
+        let many_empty = ";".repeat(MAX_REPO_HOSTS + 1);
+        assert_eq!(hosts(&many_empty), Err(RepoHostsError::TooManyEntries));
+        let long = "x".repeat(MAX_REPO_HOSTS_VALUE_LEN + 1);
+        assert_eq!(hosts(&long), Err(RepoHostsError::TooLong));
+        let padded = "x".repeat(MAX_REPO_HOSTS_VALUE_LEN);
+        assert_eq!(hosts(&padded), Err(RepoHostsError::Malformed));
+    }
+
+    #[test]
+    fn a_bad_repo_hosts_value_refuses_start_without_echoing_it() {
+        let secret = "sentinel-host-9f3a";
+        let cases = [
+            format!("host={secret}\r\n,forge=forgejo,api=https://{secret}"),
+            format!("host={secret}.example.com,forge=nope,api=https://{secret}.example.com"),
+            format!("host=u@{secret}.example.com,forge=forgejo,api=https://{secret}.example.com"),
+            secret.to_owned(),
+            format!("host={secret}.com,forge=forgejo,api=https://other.com/{secret}"),
+        ];
+        for raw in cases {
+            match with_hosts(&raw).unwrap_err() {
+                ConfigError::Invalid { var, reason } => {
+                    assert_eq!(var, "FLEET_REPO_HOSTS");
+                    assert!(!reason.contains(secret), "{reason}");
+                    assert_ne!(reason, "");
+                }
+                other => panic!("unexpected {other:?}"),
+            }
+        }
     }
 }

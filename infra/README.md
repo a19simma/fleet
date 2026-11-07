@@ -75,6 +75,26 @@ The Deployment sets `FLEET_LISTEN`, `FLEET_HEALTH_LISTEN`, `FLEET_DATABASE_URL`,
 | `FLEET_GITHUB_APP_ACCOUNT` | GitHub login of the operator account that owns the installation. Required when `FLEET_GITHUB_APP_ID` is set (ADR-0058 SEC-014). |
 | `FLEET_GITHUB_APP_INSTALLATIONS` | comma separated allowed installation ids. Not set by default, which refuses every installation (ADR-0058 SEC-001). |
 | `FLEET_GITHUB_APP_REPOS` | comma separated `owner/name` or `owner/*` entries, each owned by `FLEET_GITHUB_APP_ACCOUNT`. Not set by default, which refuses every repository (ADR-0058 SEC-002, SEC-009). |
+| `FLEET_REPO_HOSTS` | repository hosts a User may add: entries separated by `;`, each `host=H,forge=github\|forgejo,api=URL[,allow_private=true\|false]`. Unset allows `github.com` only. Empty refuses every add. The last host label must start with a letter, an `api` path segment is at most 64 bytes, and `.` and `..` segments are refused. A bad value stops startup. See below. |
+
+`FLEET_REPO_HOSTS` is the operator list of repository hosts. Unset, it holds one entry:
+`host=github.com,forge=github,api=https://api.github.com`. The empty string holds no hosts, so
+every add is refused. A set value that breaks the rules below stops startup, and the error names
+the variable and the rule, never the value.
+
+- `host` is a lowercase ASCII DNS name: no port, no userinfo, no trailing dot, no IP literal. The
+  last label must start with a letter, which refuses numeric and hex IP forms. The same holds for
+  the `api` host. A single label such as `localhost` passes; the private-address check at connect
+  time, set by `allow_private`, covers it.
+- `forge` is `github` or `forgejo`.
+- `api` is an `https://` base URL with no userinfo, port, query or fragment. Its host equals
+  `host`. The one exception: a `github` entry for `github.com` may use `api.github.com`. The
+  path is empty, `/`, or a plain subpath prefix such as `/api/v1` (up to 8 segments of letters,
+  digits and `. _ ~ -`). Each segment is at most 64 bytes, and `.` and `..` segments are
+  refused. A trailing slash is dropped.
+- `allow_private` is `true` or `false` and defaults to `false`.
+- Hosts are unique. At most 16 entries and 4096 bytes. Nothing is trimmed: whitespace refuses
+  the value.
 
 The server limits App mints to `MAX_APP_MINTS_PER_JOB` (34) per Job and `MAX_APP_MINTS_PER_USER_PER_MINUTE` (20) per User. Past the Job cap, the release answers `github app token limit reached` and the Job fails. Past the User limit, it answers `github app token rate limited` and fleetd waits and retries; the denied rows are in `github_app_mint`. Mounting the App key, rotating it, the capability grant, the verify steps, the limits and audit queries and the upgrade note are in [docs/github-app-runbook.md](../docs/github-app-runbook.md).
 
