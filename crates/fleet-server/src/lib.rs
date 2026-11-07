@@ -16,4 +16,5 @@ pub mod store;
 pub mod supervise;
 pub mod telemetry;
 pub mod timing;
+pub mod update_feed;
 pub mod web;
