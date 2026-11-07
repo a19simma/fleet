@@ -15,6 +15,7 @@ use fleet_proto::{MAX_CREDENTIAL_VALUE_BYTES, MAX_CREDENTIALS_PER_USER};
 use tonic::Status;
 
 use super::github::{GithubApi, GithubError, GithubUser, MAX_EXPIRY_MS};
+use super::repo_api::RepoService;
 use super::store::{CredentialStore, CredentialSummary, StoreError};
 
 /// The credential RPC logic over a sealed store and a GitHub seam.
@@ -22,6 +23,7 @@ use super::store::{CredentialStore, CredentialSummary, StoreError};
 pub struct CredentialService {
     store: CredentialStore,
     github: Arc<dyn GithubApi>,
+    repos: Option<RepoService>,
 }
 
 impl std::fmt::Debug for CredentialService {
@@ -77,7 +79,23 @@ fn row_id(id: u64) -> Result<i64, Status> {
 impl CredentialService {
     /// Builds the service over `store`, verifying GitHub tokens through `github`.
     pub fn new(store: CredentialStore, github: Arc<dyn GithubApi>) -> Self {
-        Self { store, github }
+        Self {
+            store,
+            github,
+            repos: None,
+        }
+    }
+
+    /// Enables the repository registry RPCs.
+    #[must_use]
+    pub fn with_repos(mut self, repos: RepoService) -> Self {
+        self.repos = Some(repos);
+        self
+    }
+
+    /// The repository registry, when enabled.
+    pub fn repos(&self) -> Option<&RepoService> {
+        self.repos.as_ref()
     }
 
     /// Validates, verifies where the kind allows it and stores a credential for `user_id`.

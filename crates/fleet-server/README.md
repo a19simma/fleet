@@ -12,7 +12,7 @@ The hosted Fleet service. It stores box state, jobs, transcripts, job timing and
 | `FleetJobs` | `SubmitJob`, `GetJob`, `ListJobs`, `CancelJob`, `ReadTranscript`, `ReadJobEvents`, `GetStats`, `GetJobTiming`, `StreamShellLog` | client |
 | `FleetProfiles` | `CreateProfile`, `GetProfile`, `ListProfiles`, `ShareProfile`, `UnshareProfile` | client |
 | `FleetCatalog` | `ListCatalog` | client scope, admin user only |
-| `FleetRepos` | `AddRepo`, `ListRepos`, `RemoveRepo` (contract only, no handler yet, ADR-0059) | client scope, interactive user only |
+| `FleetRepos` | `AddRepo`, `ListRepos`, `RemoveRepo` (ADR-0059): verify before insert, per-User rows, at most 100 repositories per User, 10 checks per User per 60 s, 8 concurrent checks | client scope, interactive user only |
 | `FleetJudge`, `FleetBatches`, `FleetCredentials` | see `crates/fleet-proto/proto/fleet/v1/fleet.proto` | client |
 | `FleetCatalogAdmin` | `UpsertCatalogItem`, `SetCatalogItemEnabled` | admin user API token |
 | `FleetCapabilityAdmin` | `GrantCapability`, `RevokeCapability`, `ListCapabilities` | admin user API token |
@@ -28,6 +28,7 @@ The hosted Fleet service. It stores box state, jobs, transcripts, job timing and
   - admits global unicast only: metadata addresses, loopback, link-local, CGNAT `100.64/10`, documentation and 6to4 ranges are always refused, and `allow_private` admits only RFC 1918 and ULA;
   - dials the vetted IP with SNI and certificate checks by host name;
   - follows no redirect and caps the body at 256 KiB.
+- `cred::repo_api`, `cred::repo_store`, `cred::repo_limit`: the `FleetRepos` handlers, the per-User registry table and the per-User check limiter (ADR-0059). Until migration 0037 adds `credentials.host`, `add` binds an unhosted GitHub credential to `github.com`: another github-kind host answers `NO_CREDENTIAL`.
 - `cred::repo_verify`, `cred::repo_fake`: the `RepoVerifier` trait, the GitHub verifier and the `RepoVerifiers` registry. A check runs under `REPO_CHECK_BUDGET` (7 s, below `CALL_BUDGET`) and refuses with one of five `RepoRefusal` values, one per `PRECONDITION_REPO_*` reason. The transport is an injected seam. `FakeVerifier` models every state for handler tests. Callers parse a repository with `RepoRef::parse_as` using the kind the registry reports.
 - `timing`: stores the `ReportTiming` breakdown and the shell command logs a box reports, and serves `GetJobTiming` and `StreamShellLog` (ADR-0055). The pages are `/jobs/{job_id}/timing` and `/jobs/{job_id}/shell/{command_id}/log`.
 - `profiles`: owner-scoped Profiles with `private` and `shared` visibility (ADR-0052).

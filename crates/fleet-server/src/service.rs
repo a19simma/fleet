@@ -17,19 +17,21 @@ use fleet_proto::v1::fleet_jobs_server::{FleetJobs, FleetJobsServer};
 use fleet_proto::v1::fleet_judge_server::{FleetJudge, FleetJudgeServer};
 use fleet_proto::v1::fleet_profiles_server::{FleetProfiles, FleetProfilesServer};
 use fleet_proto::v1::fleet_query_server::{FleetQuery, FleetQueryServer};
+use fleet_proto::v1::fleet_repos_server::{FleetRepos, FleetReposServer};
 use fleet_proto::v1::fleet_worker_server::{FleetWorker, FleetWorkerServer};
 use fleet_proto::v1::{
-    CancelJobRequest, CatalogItem, ClaimJobReply, ClaimJobRequest, CreateProfileRequest,
-    CredentialInfo, DeleteCredentialReply, DeleteCredentialRequest, GetBatchReply, GetBatchRequest,
-    GetJobCredentialsReply, GetJobCredentialsRequest, GetJobRequest, GetJobTimingReply,
-    GetJobTimingRequest, GetJobTranscriptReply, GetJobTranscriptRequest, GetProfileBlobReply,
-    GetProfileBlobRequest, GetProfileRequest, GetStatsReply, GetStatsRequest,
-    GrantCapabilityRequest, HeartbeatReply, HeartbeatRequest, Job, ListCapabilitiesReply,
-    ListCapabilitiesRequest, ListCatalogReply, ListCatalogRequest, ListCredentialsReply,
-    ListCredentialsRequest, ListFleetReply, ListFleetRequest, ListJobsReply, ListJobsRequest,
-    ListProfilesReply, ListProfilesRequest, Profile, ProfileVersion, PushEventsReply,
-    PushEventsRequest, PutCredentialRequest, QueuedEvent, ReadJobEventsReply, ReadJobEventsRequest,
-    ReadTranscriptReply, ReadTranscriptRequest, Rejection, ReportJobReply, ReportJobRequest,
+    AddRepoRequest, CancelJobRequest, CatalogItem, ClaimJobReply, ClaimJobRequest,
+    CreateProfileRequest, CredentialInfo, DeleteCredentialReply, DeleteCredentialRequest,
+    GetBatchReply, GetBatchRequest, GetJobCredentialsReply, GetJobCredentialsRequest,
+    GetJobRequest, GetJobTimingReply, GetJobTimingRequest, GetJobTranscriptReply,
+    GetJobTranscriptRequest, GetProfileBlobReply, GetProfileBlobRequest, GetProfileRequest,
+    GetStatsReply, GetStatsRequest, GrantCapabilityRequest, HeartbeatReply, HeartbeatRequest, Job,
+    ListCapabilitiesReply, ListCapabilitiesRequest, ListCatalogReply, ListCatalogRequest,
+    ListCredentialsReply, ListCredentialsRequest, ListFleetReply, ListFleetRequest, ListJobsReply,
+    ListJobsRequest, ListProfilesReply, ListProfilesRequest, ListReposReply, ListReposRequest,
+    Profile, ProfileVersion, PushEventsReply, PushEventsRequest, PutCredentialRequest, QueuedEvent,
+    ReadJobEventsReply, ReadJobEventsRequest, ReadTranscriptReply, ReadTranscriptRequest,
+    Rejection, RemoveRepoReply, RemoveRepoRequest, RepoInfo, ReportJobReply, ReportJobRequest,
     ReportShellLogReply, ReportShellLogRequest, ReportTimingReply, ReportTimingRequest,
     RevokeCapabilityReply, RevokeCapabilityRequest, SetCatalogItemEnabledRequest,
     ShareProfileRequest, StreamShellLogChunk, StreamShellLogRequest, SubmitBatchReply,
@@ -47,8 +49,8 @@ use tower::layer::util::{Identity, Stack};
 
 use crate::auth::{ADMIN_REQUIRED, BearerAuth, Caller};
 use crate::catalog;
-use crate::cred::CredentialService;
 use crate::cred::capability::{self, Capabilities};
+use crate::cred::{CredentialService, RepoService};
 use crate::jobs::validate_job_id;
 use crate::profiles::{self, ProfileContent, ProfileFault, Viewer};
 use crate::store::{Store, StoreError};
@@ -247,6 +249,17 @@ impl FleetService {
         let service = self
             .credentials
             .as_ref()
+            .ok_or_else(|| Status::failed_precondition(fleet_proto::PRECONDITION_NOT_CONFIGURED))?;
+        Ok((service, user_id))
+    }
+
+    fn repo_owner<T>(&self, request: &Request<T>) -> Result<(&RepoService, i64), Status> {
+        let user_id = caller_of(request)
+            .ok_or_else(|| Status::permission_denied(fleet_proto::ERR_NEEDS_USER_TOKEN))?;
+        let service = self
+            .credentials
+            .as_ref()
+            .and_then(CredentialService::repos)
             .ok_or_else(|| Status::failed_precondition(fleet_proto::PRECONDITION_NOT_CONFIGURED))?;
         Ok((service, user_id))
     }
@@ -546,6 +559,37 @@ impl FleetCredentials for FleetService {
         let (service, user_id) = self.credential_owner(&request)?;
         Ok(Response::new(
             service.verify(user_id, request.get_ref()).await?,
+        ))
+    }
+}
+
+#[tonic::async_trait]
+impl FleetRepos for FleetService {
+    async fn add_repo(
+        &self,
+        request: Request<AddRepoRequest>,
+    ) -> Result<Response<RepoInfo>, Status> {
+        let (service, user_id) = self.repo_owner(&request)?;
+        Ok(Response::new(
+            service.add(user_id, request.get_ref()).await?,
+        ))
+    }
+
+    async fn list_repos(
+        &self,
+        request: Request<ListReposRequest>,
+    ) -> Result<Response<ListReposReply>, Status> {
+        let (service, user_id) = self.repo_owner(&request)?;
+        Ok(Response::new(service.list(user_id).await?))
+    }
+
+    async fn remove_repo(
+        &self,
+        request: Request<RemoveRepoRequest>,
+    ) -> Result<Response<RemoveRepoReply>, Status> {
+        let (service, user_id) = self.repo_owner(&request)?;
+        Ok(Response::new(
+            service.remove(user_id, request.get_ref()).await?,
         ))
     }
 }
@@ -1075,6 +1119,7 @@ fn routes(store: &Store, credentials: Option<CredentialService>, update: UpdateR
         FleetBatchesServer::new(service.clone()).max_decoding_message_size(MAX_MESSAGE_BYTES);
     let credentials = FleetCredentialsServer::new(service.clone())
         .max_decoding_message_size(MAX_CREDENTIAL_MESSAGE_BYTES);
+    let repos = FleetReposServer::new(service.clone());
     let catalog = FleetCatalogServer::new(service.clone());
     let catalog_admin = FleetCatalogAdminServer::new(service.clone())
         .max_decoding_message_size(MAX_PROFILE_MESSAGE_BYTES);
@@ -1089,6 +1134,7 @@ fn routes(store: &Store, credentials: Option<CredentialService>, update: UpdateR
         .add_service(profiles)
         .add_service(batches)
         .add_service(credentials)
+        .add_service(repos)
         .add_service(catalog)
         .add_service(catalog_admin)
         .add_service(capability_admin)

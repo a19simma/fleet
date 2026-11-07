@@ -269,6 +269,22 @@ pub const PRECONDITION_REPO_UPSTREAM_UNAVAILABLE: &str = "repository host unavai
 /// `FAILED_PRECONDITION` message: the repository check ran out of its time budget (ADR-0059).
 pub const PRECONDITION_REPO_TIMEOUT: &str = "repository check timed out";
 
+/// Most repositories one User may register, and so the most one `ListRepos` reply carries
+/// (ADR-0059).
+pub const MAX_REPOS_PER_USER: usize = 100;
+
+/// `RESOURCE_EXHAUSTED` message: the User holds [`MAX_REPOS_PER_USER`] repositories.
+pub const ERR_REPO_LIMIT: &str = "too many repositories";
+
+/// `RESOURCE_EXHAUSTED` message: the User started too many repository checks in the last window.
+pub const ERR_REPO_RATE_LIMITED: &str = "too many repository checks, retry later";
+
+/// `RESOURCE_EXHAUSTED` message: the server runs its most concurrent repository checks.
+pub const ERR_REPO_BUSY: &str = "repository checks are busy, retry later";
+
+/// `NOT_FOUND` message of `RemoveRepo`. A missing row and another User's row give this one text.
+pub const ERR_REPO_NOT_FOUND: &str = "repository not found";
+
 /// `FAILED_PRECONDITION` message: the server runs without a credential store.
 pub const PRECONDITION_NOT_CONFIGURED: &str = "credentials are not configured";
 

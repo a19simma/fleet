@@ -6,8 +6,8 @@ Relation to the App ceiling).
 
 Built: the repository reference parser in fleet-core (`crates/fleet-core/src/repo.rs`: `RepoRef`,
 `ForgeKind`, `RepoVerdict`) and the `FLEET_REPO_HOSTS` config (`crates/fleet-server/src/config.rs`,
-documented in `infra/README.md` and `crates/fleet-server/README.md`). Also built, as contract only:
-the `FleetRepos` proto (`AddRepo`, `ListRepos`, `RemoveRepo`, `RepoInfo`), migration 0036 (the
+documented in `infra/README.md` and `crates/fleet-server/README.md`). Also built: the
+`FleetRepos` proto (`AddRepo`, `ListRepos`, `RemoveRepo`, `RepoInfo`), migration 0036 (the
 `user_repos` table and the nullable `github_app_mint.job_id`, required only for scope `job`), the
 five `PRECONDITION_REPO_*` constants in `fleet-proto` with their `Reason` variants and
 `CredentialNotice` mappings. Also built: the shared https helper (`cred::https`), the SSRF-safe
@@ -15,9 +15,14 @@ resolver and connector (`cred::pinned`), the `RepoVerifier` trait with the GitHu
 `RepoVerifiers` registry (`cred::repo_verify`), `REPO_CHECK_BUDGET` (7 s, a total deadline) and the
 public `FakeVerifier` (`cred::repo_fake`). GitHub answers a renamed repository with a 301. Redirects
 are never followed, so a rename gives `UPSTREAM_UNAVAILABLE`. The App probe mints with no job.
-Not built: the `FleetRepos` server handlers, the store, the CLI, the Forgejo verifier (the registry
-has a slot only), the `credentials.host` column and the `forgejo_pat` kind. The `path` column
-holds at most 141 bytes: a Forgejo owner of 40, a slash and a name of 100.
+Also built: the `FleetRepos` handlers (`cred::repo_api`), the store (`cred::repo_store`, one
+transaction: `FOR UPDATE` on the users row, `FOR SHARE` on the credential row, the 100 row cap, an
+upsert) and the check limiter (`cred::repo_limit`: 10 checks per User per 60 s, 8 concurrent). The
+per-User limiter admits a call before it takes a global permit. Until migration 0037, `add` uses a
+stored GitHub credential for `github.com` only: any other github-kind host is refused with
+`NO_CREDENTIAL`. Not built: the CLI, the Forgejo verifier (the registry has a slot only), the
+`credentials.host` column and the `forgejo_pat` kind. The `path` column holds at most 141 bytes: a
+Forgejo owner of 40, a slash and a name of 100.
 
 A User names the repositories they work on, so the CLI and the web page can list them and later
 features can offer them. Today a repository exists only as a field on a Job. This ADR adds a
@@ -81,7 +86,7 @@ The verifier's outbound call follows these rules:
 - Follow no redirects.
 - Trust the webpki roots only, a public CA, so a host with a private CA is unsupported.
 - Port 443 only in v1.
-- The whole check fits `REPO_CHECK_BUDGET` (planned, 7 seconds), under `fleet_proto::CALL_BUDGET`
+- The whole check fits `REPO_CHECK_BUDGET` (built, 7 seconds), under `fleet_proto::CALL_BUDGET`
   (10 seconds, `crates/fleet-proto/src/lib.rs`), so the server answers before the client's
   deadline. This is the same arrangement as `MINT_BUDGET` in ADR-0058.
 
@@ -146,7 +151,8 @@ a vetted address only. Vetting reruns on every call, with no cache. `allow_priva
 private ranges for that host and never loopback, link-local or metadata.
 
 Outbound call. The credential is selected by the exact `(user, host)` pair and never another
-host's. TLS SNI and certificate verification use the hostname, not the IP. TLS 1.2 is the minimum
+host's. Until migration 0037 adds `credentials.host`, an unhosted GitHub credential serves
+`github.com` only. TLS SNI and certificate verification use the hostname, not the IP. TLS 1.2 is the minimum
 and no option skips verification. Test seams are injected parameters. The `Authorization` header
 is never sent on a redirect: a 3xx is an error and its body is not parsed. The forge response body
 is read with `take(cap + 1)` and a truncated JSON body fails. The token is opaque, with no format

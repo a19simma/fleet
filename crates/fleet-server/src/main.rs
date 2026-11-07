@@ -9,14 +9,17 @@ use std::time::Duration;
 use axum::Router;
 use axum::routing::get;
 use fleet_server::auth::BearerAuth;
-use fleet_server::config::{Config, CredentialsState, exposed_binds, is_loopback};
+use fleet_server::config::{Config, CredentialsState, Forge, exposed_binds, is_loopback};
 use fleet_server::cred::admin::{AdminError, SETUP_CODE_TTL_HOURS, parse_args, run as run_admin};
 use fleet_server::cred::app_mint::AppClient;
 use fleet_server::cred::github::HttpsGithub;
 use fleet_server::cred::limiter::Limiter;
 use fleet_server::cred::password::BootstrapPassword;
+use fleet_server::cred::pinned::PinnedHttps;
+use fleet_server::cred::repo_store::RepoStore;
+use fleet_server::cred::repo_verify::{GithubVerifier, RepoVerifiers};
 use fleet_server::cred::store::{AppIdCheck, AppLane, CredentialStore};
-use fleet_server::cred::{CredentialService, Users};
+use fleet_server::cred::{CredentialService, RepoService, Users};
 use fleet_server::reaper::{DEFAULT_REAP_PERIOD, run_reaper};
 use fleet_server::retention::run_retention;
 use fleet_server::service::{UpdateRelay, serve_with_credentials};
@@ -119,7 +122,17 @@ async fn credential_service(
     if let Some(lane) = github_app {
         store = store.with_github_app(lane);
     }
-    Ok(Some(CredentialService::new(store, Arc::new(github))))
+    let transport = PinnedHttps::system()?;
+    let github_verifier = GithubVerifier::new(Arc::new(transport), Some(Arc::new(store.clone())));
+    let verifiers = RepoVerifiers::new(config.repo_hosts.clone())
+        .with(Forge::Github, Arc::new(github_verifier));
+    let repos = RepoService::new(
+        RepoStore::new(pool.clone(), store.clone()),
+        Arc::new(verifiers),
+    );
+    Ok(Some(
+        CredentialService::new(store, Arc::new(github)).with_repos(repos),
+    ))
 }
 
 fn configured_store(pool: sqlx::PgPool, config: &Config) -> Store {
