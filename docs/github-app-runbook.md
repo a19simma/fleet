@@ -54,7 +54,7 @@ The server loads the file once at startup and refuses it when:
 | `mode & 0o077` is not zero. | `github app key file must not be group or other accessible` |
 | The file is over 16 KiB, or is not a PEM RSA private key of 2048 to 8192 bits. | `github app key is not a PEM RSA private key of at least 2048 bits` |
 
-Why the mode check exists: the key mints tokens that write to every installed repository. A group or other readable file lets any other uid in the pod or on the node read it. Mode `0400` or `0600` passes. `0440` fails, because the group bit is inside `0o077`. The server also refuses a file owned by another uid than its own effective uid, so a stolen copy placed by another user does not load. The file should be writable by no one else.
+Why the mode check exists: the key mints tokens that write to every installed repository. A group or other readable file lets any other uid in the pod or on the node read it. Mode `0400` or `0600` passes. `0440` fails, because the group bit is inside `0o077`. The server also refuses a file owned by another uid than its own effective uid, so a stolen copy placed by another user does not load. No other user may write the file.
 
 Symlinks are followed, because Kubernetes Secret mounts are symlinks. The server checks the file the link points at. It accepts PKCS#1 (`RSA PRIVATE KEY`) and PKCS#8 (`PRIVATE KEY`) PEM.
 
