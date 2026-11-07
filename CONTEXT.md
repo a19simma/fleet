@@ -271,6 +271,12 @@ _Avoid_: app token, app key
 The one-hour GitHub token the server mints from a **GitHub App credential** for one Job, clamped to the Job repository and delivered as wire kind `github_installation_token`. It is never stored. Built: `GetJobCredentials` mints it for a User who holds a `github_app` credential and the capability, and the App wins over a `github_pat`. fleetd holds it as the git and `gh` token of the Job and carries its expiry, and refreshes it before a Push or Gh child when fewer than 10 minutes remain, up to a terminal per-Job mint cap and a retryable per-User rate limit. The mirror fetch and the broker `gh` call resolve the token again on every call, through the same refresh and lease as a Push or Gh child, and hold the lease until the child exits. fleetd revokes the replaced token once the children that started with it have exited and, at Job end, the held one, and any token in a reply it rejects. A late refresh never overwrites an entry a re-fetch replaced. A token with no expiry is refused at the first fetch, and a box clock ahead of the server's refreshes every 45 minutes (ADR-0058). The server mints only for an installation on `FLEET_GITHUB_APP_INSTALLATIONS` that GitHub reports as active, of this App and owned by `FLEET_GITHUB_APP_ACCOUNT`, and only for a Job repository on `FLEET_GITHUB_APP_REPOS`; unset lists deny everything (ADR-0058).
 _Avoid_: app token
 
+**Mint scope**:
+`MintScope` in `cred/app_lane.rs`: `Job` for a release or refresh row that counts toward the per-Job cap and the per-User rate, `Probe` for a `VerifyCredential` row that counts toward the per-User rate only.
+
+**Mint policy**:
+`MintPolicy` in `cred/app_lane.rs`: the per-Job mint cap, the per-User rate and the `denied` row dedupe window of a credential store, set with `with_policy`.
+
 **Bot identity**:
 The git name and email (`GitIdentity`) a Job commits under when it uses a **GitHub App credential**. The server sends it and fleetd re-validates it with `BotIdentity::new`, failing the Job before the clone when it is missing or invalid. Built on the server from `FLEET_GITHUB_APP_BOT_NAME` and `FLEET_GITHUB_APP_BOT_EMAIL`. fleetd sets it as the author and committer of the Job (ADR-0058).
 _Avoid_: bot user

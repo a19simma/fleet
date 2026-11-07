@@ -18,7 +18,7 @@ use super::app_mint::{AppClient, Limits};
 use super::app_policy::AppPolicy;
 use super::capability::Capabilities;
 use super::seal::FileSealer;
-use super::store::{AppLane, CredentialStore, DENIED_DEDUPE_SECS, StoreError};
+use super::store::{AppLane, CredentialStore, DENIED_DEDUPE_SECS, MintPolicy, StoreError};
 use crate::store::Store;
 
 const PAT: &str = "github_pat_11ABCDEFG0abcdefghijklmnop";
@@ -854,7 +854,11 @@ type Row = (String, Option<String>);
 
 impl World {
     fn capped(mut self, cap: u32) -> Self {
-        self.creds = self.creds.with_mint_cap(cap);
+        let policy = MintPolicy {
+            mint_cap: cap,
+            ..self.creds.policy()
+        };
+        self.creds = self.creds.with_policy(policy);
         self
     }
 
@@ -1441,8 +1445,12 @@ impl World {
     }
 
     fn rate_limited(self, limit: u32) -> Self {
+        let policy = MintPolicy {
+            user_rate: limit,
+            ..self.creds.policy()
+        };
         Self {
-            creds: self.creds.with_user_mint_limit(limit),
+            creds: self.creds.with_policy(policy),
             ..self
         }
     }
@@ -1578,7 +1586,11 @@ async fn repeated_denials_at_a_limit_write_one_denied_row_within_the_dedupe_wind
 async fn a_zero_dedupe_window_writes_every_denial(pool: PgPool) {
     let fake = fake("201 Created", None).await;
     let mut w = limited_world(pool, &fake).await;
-    w.creds = w.creds.with_denied_dedupe_secs(0);
+    let policy = MintPolicy {
+        denied_dedupe_secs: 0,
+        ..w.creds.policy()
+    };
+    w.creds = w.creds.with_policy(policy);
     w.plant_attempts(w.alice, i64::from(LIMIT), 0).await;
     for _ in 0..3 {
         w.release_outcome().await.unwrap_err();
@@ -2357,4 +2369,44 @@ async fn the_service_maps_the_user_rate_limit_to_its_own_retryable_precondition(
         fleet_proto::PRECONDITION_APP_MINT_RATE,
         fleet_proto::PRECONDITION_APP_MINT_CAP
     );
+}
+
+async fn scopes_of(w: &World) -> Vec<(String, String)> {
+    sqlx::query_as("SELECT scope, outcome FROM github_app_mint ORDER BY id")
+        .fetch_all(&w.pool)
+        .await
+        .unwrap()
+}
+
+#[sqlx::test]
+async fn the_shared_tail_writes_job_scope_rows_and_spends_the_cap_for_a_release(pool: PgPool) {
+    let fake = fake("201 Created", None).await;
+    let w = world(pool, Some(client(&fake))).await.capped(1);
+    w.seed(true).await;
+    w.release_outcome().await.unwrap();
+    let err = w.release_outcome().await.unwrap_err();
+    assert!(matches!(err, StoreError::MintCapReached), "{err:?}");
+    assert_eq!(fake.mints(), 1);
+    let rows = scopes_of(&w).await;
+    assert!(rows.iter().all(|(scope, _)| scope == "job"), "{rows:?}");
+    let outcomes: Vec<&str> = rows.iter().map(|(_, o)| o.as_str()).collect();
+    assert_eq!(outcomes, ["attempt", "minted", "denied"]);
+}
+
+#[sqlx::test]
+async fn the_shared_tail_writes_probe_scope_rows_and_ignores_the_cap_for_a_probe(pool: PgPool) {
+    let fake = fake("201 Created", None).await;
+    let w = world(pool, Some(client(&fake))).await.capped(1);
+    w.seed(true).await;
+    w.release_outcome().await.unwrap();
+    assert!(verify_reply(&w).await.unwrap().valid);
+    assert_eq!(fake.mints(), 2);
+    let rows = scopes_of(&w).await;
+    let probe: Vec<&str> = rows
+        .iter()
+        .filter(|(scope, _)| scope == "probe")
+        .map(|(_, o)| o.as_str())
+        .collect();
+    assert_eq!(probe, ["attempt", "minted", "revoked"]);
+    assert_eq!(rows.iter().filter(|(scope, _)| scope == "job").count(), 2);
 }
