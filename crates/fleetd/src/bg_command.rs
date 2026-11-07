@@ -63,7 +63,7 @@ use fleet_proto::{
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
 use tokio::io::{AsyncRead, AsyncReadExt};
-use tokio::process::Command;
+use tokio::process::{Child, Command};
 use tokio::time::Instant;
 
 use crate::shell_timing::{ShellInput, ShellRecord, ShellRecorder, strip_redact};
@@ -211,16 +211,24 @@ impl PueueCli {
             .kill_on_drop(true)
             .spawn()
             .map_err(|_| PueueError::Spawn)?;
-        let mut out = Vec::new();
-        let read_ok = match child.stdout.take() {
-            Some(stdout) => read_capped(stdout, cap, &mut out).await,
-            None => return Err(PueueError::NoStdout),
-        };
-        let _ = child.start_kill();
-        let status = child.wait().await;
-        verdict(out.len(), cap, read_ok, status.is_ok_and(|s| s.success()))?;
-        Ok(out)
+        let stdout = child.stdout.take().ok_or(PueueError::NoStdout)?;
+        collect(&mut child, stdout, cap).await
     }
+}
+
+async fn collect<R: AsyncRead + Unpin>(
+    child: &mut Child,
+    stdout: R,
+    cap: usize,
+) -> Result<Vec<u8>, PueueError> {
+    let mut out = Vec::new();
+    let read_ok = read_capped(stdout, cap, &mut out).await;
+    if out.len() > cap || !read_ok {
+        let _ = child.start_kill();
+    }
+    let status = child.wait().await;
+    verdict(out.len(), cap, read_ok, status.is_ok_and(|s| s.success()))?;
+    Ok(out)
 }
 
 async fn read_capped<R: AsyncRead + Unpin>(reader: R, cap: usize, out: &mut Vec<u8>) -> bool {
@@ -242,7 +250,7 @@ fn verdict(len: usize, cap: usize, read_ok: bool, exited_ok: bool) -> Result<(),
 
 #[cfg(test)]
 mod tests {
-    use super::{PueueCli, PueueError, STATUS_READ_CAP, read_capped, verdict};
+    use super::{PueueCli, PueueError, STATUS_READ_CAP, collect, read_capped, verdict};
     use std::io;
     use std::pin::Pin;
     use std::task::{Context, Poll};
@@ -301,6 +309,76 @@ mod tests {
         let cli = PueueCli::new("/bin/sh", Vec::new());
         let got = cli.run(&sh("echo partial; exit 3"), STATUS_READ_CAP).await;
         assert_eq!(got.err(), Some(PueueError::Status));
+    }
+
+    #[tokio::test]
+    async fn a_child_that_closes_stdout_and_exits_later_with_success_is_ok() {
+        let cli = PueueCli::new("/bin/sh", Vec::new());
+        let got = cli
+            .run(&sh("echo ok; exec 1>&-; sleep 0.3"), STATUS_READ_CAP)
+            .await;
+        assert_eq!(got, Ok(b"ok\n".to_vec()));
+    }
+
+    #[tokio::test]
+    async fn a_child_that_closes_stdout_and_fails_later_is_a_status_error() {
+        let cli = PueueCli::new("/bin/sh", Vec::new());
+        let got = cli
+            .run(
+                &sh("echo ok; exec 1>&-; sleep 0.3; exit 3"),
+                STATUS_READ_CAP,
+            )
+            .await;
+        assert_eq!(got, Err(PueueError::Status));
+    }
+
+    #[tokio::test]
+    async fn a_child_over_the_cap_is_killed_and_reaped() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let pid_file = dir.path().join("pid");
+        let script = format!(
+            "echo $$ > {}; head -c {} /dev/zero; exec sleep 30",
+            pid_file.display(),
+            STATUS_READ_CAP + 1
+        );
+        let cli = PueueCli::new("/bin/sh", Vec::new());
+        let started = std::time::Instant::now();
+        let got = cli.run(&sh(&script), STATUS_READ_CAP).await;
+        assert_eq!(got, Err(PueueError::TooLarge));
+        assert!(started.elapsed() < std::time::Duration::from_secs(10));
+        assert_gone(&pid_file);
+    }
+
+    #[tokio::test]
+    async fn a_read_failure_kills_and_reaps_the_child() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let pid_file = dir.path().join("pid");
+        let script = format!("echo $$ > {}; exec sleep 30", pid_file.display());
+        let mut child = tokio::process::Command::new("/bin/sh")
+            .args(sh(&script))
+            .stdout(std::process::Stdio::null())
+            .kill_on_drop(true)
+            .spawn()
+            .expect("spawn");
+        while std::fs::read_to_string(&pid_file).map_or(true, |t| !t.ends_with('\n')) {
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        let started = std::time::Instant::now();
+        let got = collect(&mut child, FailAfter { left: 5 }, 10).await;
+        assert_eq!(got, Err(PueueError::Read));
+        assert!(started.elapsed() < std::time::Duration::from_secs(10));
+        assert_gone(&pid_file);
+    }
+
+    fn assert_gone(pid_file: &std::path::Path) {
+        let pid = std::fs::read_to_string(pid_file).expect("pid file");
+        let alive = std::process::Command::new("kill")
+            .args(["-0", pid.trim()])
+            .stderr(std::process::Stdio::null())
+            .status()
+            .expect("kill")
+            .success();
+        assert!(!alive, "child {} still alive", pid.trim());
     }
 
     #[test]
