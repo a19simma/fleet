@@ -9,4 +9,4 @@ resources:
   - bootstrap-password-externalsecret.yaml
 images:
   - name: ghcr.io/a19simma/fleet-server
-    newTag: 0.3.7
+    newTag: 0.3.8

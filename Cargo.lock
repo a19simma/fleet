@@ -889,7 +889,7 @@ dependencies = [
 
 [[package]]
 name = "fleet-cli"
-version = "0.3.7"
+version = "0.3.8"
 dependencies = [
  "clap",
  "fleet-core",
@@ -907,7 +907,7 @@ dependencies = [
 
 [[package]]
 name = "fleet-core"
-version = "0.3.7"
+version = "0.3.8"
 dependencies = [
  "serde",
  "serde_json",
@@ -918,7 +918,7 @@ dependencies = [
 
 [[package]]
 name = "fleet-proto"
-version = "0.3.7"
+version = "0.3.8"
 dependencies = [
  "fleet-core",
  "prost",
@@ -931,7 +931,7 @@ dependencies = [
 
 [[package]]
 name = "fleet-server"
-version = "0.3.7"
+version = "0.3.8"
 dependencies = [
  "argon2",
  "axum",
@@ -968,7 +968,7 @@ dependencies = [
 
 [[package]]
 name = "fleetd"
-version = "0.3.7"
+version = "0.3.8"
 dependencies = [
  "axum",
  "clap",
