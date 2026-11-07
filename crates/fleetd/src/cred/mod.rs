@@ -358,6 +358,14 @@ impl JobCredentials {
             .map(Credential::value)
     }
 
+    /// [`JobCredentials::github`] as text. `None` when the job holds no GitHub token or the
+    /// token is not UTF-8.
+    #[must_use]
+    pub fn github_str(&self) -> Option<&str> {
+        self.github()
+            .and_then(|secret| std::str::from_utf8(secret.expose()).ok())
+    }
+
     /// The bot identity a GitHub App job commits under. `None` for a PAT job, which keeps the
     /// fixed job identity.
     #[must_use]

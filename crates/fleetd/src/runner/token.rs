@@ -66,8 +66,7 @@ impl<R: Reporter> AgentRunner<R> {
         match &self.credentials {
             Some(book) => {
                 let held = book.get(job_id)?;
-                let secret = held.github()?;
-                std::str::from_utf8(secret.expose()).ok().map(str::to_owned)
+                held.github_str().map(str::to_owned)
             }
             None => self
                 .config
@@ -87,10 +86,7 @@ impl<R: Reporter> AgentRunner<R> {
         let Some((held, lease)) = book.lease_held(job_id) else {
             return LeasedToken::new(String::new(), None);
         };
-        let token = held
-            .github()
-            .and_then(|secret| std::str::from_utf8(secret.expose()).ok().map(str::to_owned))
-            .unwrap_or_default();
+        let token = held.github_str().map(str::to_owned).unwrap_or_default();
         LeasedToken::new(token, Some(lease))
     }
 
@@ -129,11 +125,7 @@ impl<R: Reporter> AgentRunner<R> {
         let Some(host) = self.config.repo_policy.token_host() else {
             return;
         };
-        let Some(token) = held
-            .and_then(JobCredentials::github)
-            .and_then(|secret| std::str::from_utf8(secret.expose()).ok())
-            .map(str::to_owned)
-        else {
+        let Some(token) = held.and_then(JobCredentials::github_str).map(str::to_owned) else {
             return;
         };
         command.env("GH_TOKEN", &token);

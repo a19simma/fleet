@@ -1201,8 +1201,7 @@ async fn held_app(
 }
 
 fn github_text(book: &CredentialBook) -> Option<String> {
-    let held = book.get("job1")?;
-    String::from_utf8(held.github()?.expose().to_vec()).ok()
+    book.get("job1")?.github_str().map(str::to_owned)
 }
 
 #[tokio::test]
