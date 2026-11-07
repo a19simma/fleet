@@ -106,5 +106,31 @@ class ReleaseWorkflow(unittest.TestCase):
         self.assertEqual(repacked, linux)
 
 
+class WorkflowScripts(unittest.TestCase):
+    def test_directly_invoked_scripts_are_executable(self):
+        root = WORKFLOW.parents[2]
+        listing = subprocess.run(
+            ["git", "ls-files", "-s", ".github/scripts"],
+            cwd=root,
+            capture_output=True,
+            text=True,
+            timeout=60,
+            check=True,
+        ).stdout
+        modes = {}
+        for line in listing.splitlines():
+            meta, path = line.split("\t", 1)
+            modes[path] = meta.split()[0]
+        invoked = set()
+        for workflow in WORKFLOW.parent.glob("*.yml"):
+            for line in workflow.read_text().splitlines():
+                match = re.match(r"\s*(?:-\s+)?run:\s+(\.github/scripts/[\w./-]+)", line)
+                if match:
+                    invoked.add(match.group(1))
+        self.assertTrue(invoked)
+        for path in sorted(invoked):
+            self.assertEqual(modes.get(path), "100755", path)
+
+
 if __name__ == "__main__":
     unittest.main()
