@@ -18,14 +18,16 @@ use fleet_proto::v1::{
     Job, JobCredential, JobState, ProfileRef, ReportJobReply, ReportJobRequest,
 };
 use fleet_proto::{
-    PRECONDITION_APP_MINT_CAP, PRECONDITION_EXPIRED, PRECONDITION_NO_AGENT, PRECONDITION_NO_GITHUB,
+    PRECONDITION_APP_INSTALLATION, PRECONDITION_APP_MINT_CAP, PRECONDITION_APP_REPO,
+    PRECONDITION_EXPIRED, PRECONDITION_NO_AGENT, PRECONDITION_NO_GITHUB,
     PRECONDITION_NOT_CONFIGURED,
 };
 use fleetd::DaemonRunner;
 use fleetd::cred::{
     Clock, CredentialBook, CredentialClient, CredentialFailure, ERR_APP_IDENTITY_INVALID,
-    ERR_APP_IDENTITY_MISSING, ERR_EXPIRED, ERR_LEASE, ERR_MALFORMED, ERR_MINT_CAP, ERR_NO_AGENT,
-    ERR_NO_GITHUB, ERR_NOT_CONFIGURED, ERR_UNAVAILABLE, REFRESH_SKEW_MS,
+    ERR_APP_IDENTITY_MISSING, ERR_APP_INSTALLATION, ERR_APP_REPO, ERR_EXPIRED, ERR_LEASE,
+    ERR_MALFORMED, ERR_MINT_CAP, ERR_NO_AGENT, ERR_NO_GITHUB, ERR_NOT_CONFIGURED, ERR_UNAVAILABLE,
+    REFRESH_SKEW_MS, REFRESH_SKEW_SLACK_MS,
 };
 use fleetd::poller::{JobRunner, Shutdown, channel};
 use fleetd::revoke::{RevokeError, Revoker};
@@ -255,6 +257,16 @@ async fn each_fixed_server_error_maps_to_its_own_failure_and_holds_nothing() -> 
             ERR_NOT_CONFIGURED,
         ),
         (
+            Status::failed_precondition(PRECONDITION_APP_INSTALLATION),
+            CredentialFailure::InstallationRefused,
+            ERR_APP_INSTALLATION,
+        ),
+        (
+            Status::failed_precondition(PRECONDITION_APP_REPO),
+            CredentialFailure::RepoRefused,
+            ERR_APP_REPO,
+        ),
+        (
             Status::failed_precondition("something else"),
             CredentialFailure::Unavailable,
             ERR_UNAVAILABLE,
@@ -281,7 +293,7 @@ async fn each_fixed_server_error_maps_to_its_own_failure_and_holds_nothing() -> 
         reasons.push(reason);
     }
     let distinct: std::collections::HashSet<_> = reasons.iter().collect();
-    assert_eq!(distinct.len(), 6);
+    assert_eq!(distinct.len(), 8);
     Ok(())
 }
 
@@ -633,6 +645,8 @@ async fn no_debug_or_error_text_carries_a_value() -> TestResult {
         CredentialFailure::NoAgent,
         CredentialFailure::Expired,
         CredentialFailure::NotConfigured,
+        CredentialFailure::InstallationRefused,
+        CredentialFailure::RepoRefused,
         CredentialFailure::Unavailable,
         CredentialFailure::AppIdentityMissing,
         CredentialFailure::AppIdentityInvalid,
@@ -1354,6 +1368,14 @@ async fn every_non_transient_refusal_fails_the_step_and_keeps_the_held_token() -
             Status::failed_precondition(PRECONDITION_NO_AGENT),
             CredentialFailure::NoAgent,
         ),
+        (
+            Status::failed_precondition(PRECONDITION_APP_INSTALLATION),
+            CredentialFailure::InstallationRefused,
+        ),
+        (
+            Status::failed_precondition(PRECONDITION_APP_REPO),
+            CredentialFailure::RepoRefused,
+        ),
     ] {
         let (book, fake, _clock) = held_app(5 * MINUTE_MS).await?;
         set_reply(&fake, Err(status));
@@ -1458,6 +1480,66 @@ async fn a_skewed_entry_keeps_its_token_through_a_transient_failure() -> TestRes
     assert!(book.refresh_if_due("job1").await?.is_none());
     assert_eq!(calls(&fake), 3);
     assert_eq!(github_text(&book).as_deref(), Some(NEW_TOKEN));
+    Ok(())
+}
+
+#[tokio::test]
+async fn an_allowlist_refusal_on_refresh_fails_the_step_with_its_reason_and_is_not_retried()
+-> TestResult {
+    for (status, want, reason) in [
+        (
+            Status::failed_precondition(PRECONDITION_APP_INSTALLATION),
+            CredentialFailure::InstallationRefused,
+            ERR_APP_INSTALLATION,
+        ),
+        (
+            Status::failed_precondition(PRECONDITION_APP_REPO),
+            CredentialFailure::RepoRefused,
+            ERR_APP_REPO,
+        ),
+    ] {
+        let (book, fake, clock) = held_app(5 * MINUTE_MS).await?;
+        set_reply(&fake, Err(status));
+        let got = book.refresh_if_due("job1").await.err();
+        assert_eq!(got, Some(want));
+        assert_eq!(got.map(CredentialFailure::reason), Some(reason));
+        assert_eq!(calls(&fake), 2);
+        clock.set(NOW_MS + 10_000);
+        assert_eq!(book.refresh_if_due("job1").await.err(), Some(want));
+        assert_eq!(calls(&fake), 2);
+        clock.set(NOW_MS + 10 * MINUTE_MS);
+        assert_eq!(book.refresh_if_due("job1").await.err(), Some(want));
+        assert_eq!(calls(&fake), 2);
+        assert_eq!(github_text(&book).as_deref(), Some(APP_TOKEN));
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_skewed_entry_past_its_bound_with_the_server_down_reports_expired() -> TestResult {
+    let ahead = 2 * 60 * MINUTE_MS;
+    let bound = ahead + REFRESH_SKEW_MS + REFRESH_SKEW_SLACK_MS;
+    let (book, fake, clock) = skewed(ahead).await?;
+    set_reply(&fake, Err(Status::unavailable("down")));
+    clock.set(NOW_MS + bound - 1);
+    assert!(book.refresh_if_due("job1").await?.is_none());
+    clock.set(NOW_MS + bound + 31_000);
+    let got = book.refresh_if_due("job1").await;
+    assert_eq!(got.err(), Some(CredentialFailure::Expired));
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_skewed_entry_whose_retry_wait_is_pending_reports_expired_past_its_bound() -> TestResult {
+    let ahead = 2 * 60 * MINUTE_MS;
+    let bound = ahead + REFRESH_SKEW_MS + REFRESH_SKEW_SLACK_MS;
+    let (book, fake, clock) = skewed(ahead).await?;
+    set_reply(&fake, Err(Status::unavailable("down")));
+    clock.set(NOW_MS + bound - 1000);
+    assert!(book.refresh_if_due("job1").await?.is_none());
+    clock.set(NOW_MS + bound);
+    let got = book.refresh_if_due("job1").await;
+    assert_eq!(got.err(), Some(CredentialFailure::Expired));
     Ok(())
 }
 

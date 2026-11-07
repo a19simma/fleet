@@ -13,8 +13,43 @@ use fleet_core::Redactor;
 use tokio::process::Command;
 
 use crate::agent_config::{JOB_EMAIL, JOB_NAME};
-use crate::cred::JobCredentials;
+use crate::cred::{CredentialFailure, JobCredentials, LeaseFuture, LeasedToken, TokenSource};
 use crate::runner::{AgentRunner, Reporter};
+
+/// The [`TokenSource`] of one job.
+///
+/// It refreshes the job's installation token through the runner, then leases the held one.
+struct JobTokenSource<R: Reporter> {
+    agent: Arc<AgentRunner<R>>,
+    job_id: String,
+}
+
+impl<R: Reporter> std::fmt::Debug for JobTokenSource<R> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("JobTokenSource")
+            .field("job_id", &self.job_id)
+            .finish_non_exhaustive()
+    }
+}
+
+impl<R: Reporter + Send + Sync + 'static> TokenSource for JobTokenSource<R> {
+    fn lease(&self) -> LeaseFuture<'_> {
+        Box::pin(async move {
+            self.agent.refresh_token(&self.job_id).await?;
+            Ok(self.agent.leased_github_token(&self.job_id))
+        })
+    }
+}
+
+impl<R: Reporter + Send + Sync + 'static> AgentRunner<R> {
+    /// A [`TokenSource`] that resolves the GitHub token of `job_id` on every call.
+    pub(crate) fn token_source(self: &Arc<Self>, job_id: &str) -> Arc<dyn TokenSource> {
+        Arc::new(JobTokenSource {
+            agent: Arc::clone(self),
+            job_id: job_id.to_owned(),
+        })
+    }
+}
 
 impl<R: Reporter> AgentRunner<R> {
     /// The credential book the runner reads the GitHub token from. Call it before the runner
@@ -41,6 +76,22 @@ impl<R: Reporter> AgentRunner<R> {
                 .find(|(name, _)| name == "GH_TOKEN")
                 .and_then(|(_, value)| value.to_str().map(str::to_owned)),
         }
+    }
+
+    /// The GitHub token for `job_id` with a lease on it when a book holds it. Empty when the
+    /// job holds no GitHub credential. Call it right after [`AgentRunner::refresh_token`].
+    pub(crate) fn leased_github_token(&self, job_id: &str) -> LeasedToken {
+        let Some(book) = &self.credentials else {
+            return LeasedToken::new(self.github_token(job_id).unwrap_or_default(), None);
+        };
+        let Some((held, lease)) = book.lease_held(job_id) else {
+            return LeasedToken::new(String::new(), None);
+        };
+        let token = held
+            .github()
+            .and_then(|secret| std::str::from_utf8(secret.expose()).ok().map(str::to_owned))
+            .unwrap_or_default();
+        LeasedToken::new(token, Some(lease))
     }
 
     /// The git author and committer environment for `job_id`: the bot identity of a held
@@ -138,10 +189,12 @@ impl<R: Reporter> AgentRunner<R> {
     /// keeps both the old and the new value in the job redactor. The redactor is updated before
     /// the book hands out the new token. A runner with no book, a PAT
     /// job and a job with a fresh token do nothing.
-    pub(crate) async fn refresh_token(
-        &self,
-        job_id: &str,
-    ) -> Result<(), crate::cred::CredentialFailure> {
+    ///
+    /// # Errors
+    ///
+    /// Returns the [`CredentialFailure`] of a refresh that failed for good. The caller fails the
+    /// step with its reason.
+    pub(crate) async fn refresh_token(&self, job_id: &str) -> Result<(), CredentialFailure> {
         let Some(book) = &self.credentials else {
             return Ok(());
         };
@@ -1255,6 +1308,28 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn an_allowlist_refusal_stays_refused_on_every_later_lease()
+    -> Result<(), Box<dyn std::error::Error>> {
+        for (refusal, want) in [
+            (
+                Status::failed_precondition(fleet_proto::PRECONDITION_APP_REPO),
+                CredentialFailure::RepoRefused,
+            ),
+            (
+                Status::failed_precondition(fleet_proto::PRECONDITION_APP_INSTALLATION),
+                CredentialFailure::InstallationRefused,
+            ),
+        ] {
+            let (runner, _book, _dir) = fixture_refusing(refusal, due_clock()).await?;
+            let source = Arc::new(runner).token_source("job1");
+            for _ in 0..3 {
+                assert_eq!(source.lease().await.err(), Some(want));
+            }
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn a_refresh_failure_is_returned_by_check_pr_and_never_read_as_waiting()
     -> Result<(), Box<dyn std::error::Error>> {
         for (refusal, want) in refusals() {
@@ -1448,6 +1523,125 @@ mod tests {
             assert!(std::time::Instant::now() < deadline, "never revoked");
             tokio::time::sleep(std::time::Duration::from_millis(10)).await;
         }
+        Ok(())
+    }
+
+    fn script(dir: &Path, name: &str, body: &str) -> Result<std::path::PathBuf, std::io::Error> {
+        use std::os::unix::fs::PermissionsExt;
+        let path = dir.join(name);
+        std::fs::write(&path, body)?;
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755))?;
+        Ok(path)
+    }
+
+    async fn leased_swap_fixture() -> Result<
+        (
+            Arc<AgentRunner<Quiet>>,
+            Arc<CredentialBook>,
+            Arc<Clock>,
+            Arc<std::sync::atomic::AtomicUsize>,
+            tempfile::TempDir,
+        ),
+        Box<dyn std::error::Error>,
+    > {
+        let (endpoint_addr, hits) = counting_revoke_endpoint().await?;
+        let clock = Arc::new(Clock((EXPIRES_MS - 20 * 60 * 1000).into()));
+        let revoker = Arc::new(crate::revoke::Revoker::plain(endpoint_addr));
+        let (runner, book, dir) = fixture_full(
+            true,
+            "anthropic_api_key",
+            true,
+            clock.clone(),
+            None,
+            Some(revoker),
+        )
+        .await?;
+        Ok((Arc::new(runner), book, clock, hits, dir))
+    }
+
+    async fn swap_midway(
+        book: &CredentialBook,
+        clock: &Clock,
+        hits: &std::sync::atomic::AtomicUsize,
+    ) -> Result<usize, Box<dyn std::error::Error>> {
+        use std::sync::atomic::Ordering;
+        tokio::time::sleep(std::time::Duration::from_millis(400)).await;
+        clock.0.store(EXPIRES_MS - 5 * 60 * 1000, Ordering::SeqCst);
+        assert!(book.refresh_if_due("job1").await?.is_some());
+        tokio::time::sleep(std::time::Duration::from_millis(400)).await;
+        Ok(hits.load(Ordering::SeqCst))
+    }
+
+    async fn wait_revoked(hits: &std::sync::atomic::AtomicUsize) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while hits.load(std::sync::atomic::Ordering::SeqCst) == 0 {
+            assert!(std::time::Instant::now() < deadline, "never revoked");
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn a_broker_gh_call_after_a_refresh_uses_the_new_token_and_the_old_is_revoked_after_the_call()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use crate::broker::{GhCli, GhExecutor, PushTarget};
+        let (runner, book, clock, hits, dir) = leased_swap_fixture().await?;
+        let scratch = crate::workspace::Workspace::new(dir.path().join("jobs"))
+            .create_broker_scratch("job1")?;
+        let bin = script(
+            dir.path(),
+            "gh",
+            "#!/bin/sh\nprintf '%s\\n' \"$GH_TOKEN\" >> \"$HOME/tokens\"\nsleep 1\necho '[]'\n",
+        )?;
+        let gh = GhCli::new(bin, "github.com", String::new(), &scratch)?
+            .with_token_source(runner.token_source("job1"));
+        let target = PushTarget::Own("job1".to_owned());
+        let url = "https://github.com/o/r/pull/1";
+        let (first, during) = tokio::join!(
+            gh.pr_checks(&target, url),
+            swap_midway(&book, &clock, &hits)
+        );
+        assert!(first.is_ok());
+        assert_eq!(during?, 0);
+        wait_revoked(&hits).await;
+        assert!(gh.pr_checks(&target, url).await.is_ok());
+        let tokens = std::fs::read_to_string(scratch.join("tokens"))?;
+        assert_eq!(
+            tokens.lines().collect::<Vec<_>>(),
+            [APP_TOKEN, NEW_APP_TOKEN]
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_mirror_fetch_after_a_refresh_uses_the_new_token_and_the_old_is_revoked_after_the_fetch()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use crate::workspace::{RepoPolicy, Workspace};
+        let (runner, book, clock, hits, dir) = leased_swap_fixture().await?;
+        let log = dir.path().join("tokens");
+        let git = script(
+            dir.path(),
+            "git",
+            &format!(
+                "#!/bin/sh\ncase \" $* \" in *\" fetch \"*) printf '%s\\n' \"$GH_TOKEN\" >> \"{}\"; sleep 1; exit 0;; esac\nexec /usr/bin/git \"$@\"\n",
+                log.display()
+            ),
+        )?;
+        let ws = Workspace::new(dir.path().join("jobs"))
+            .with_policy(RepoPolicy::new(["github.com"]))
+            .with_git(&git, std::time::Duration::from_secs(30))
+            .with_token_source("askpass-bin", runner.token_source("job1"));
+        let repo = "https://github.com/o/r.git";
+        let (first, during) =
+            tokio::join!(ws.fetch_mirror(repo), swap_midway(&book, &clock, &hits));
+        first?;
+        assert_eq!(during?, 0);
+        wait_revoked(&hits).await;
+        ws.fetch_mirror(repo).await?;
+        let tokens = std::fs::read_to_string(&log)?;
+        assert_eq!(
+            tokens.lines().collect::<Vec<_>>(),
+            [APP_TOKEN, NEW_APP_TOKEN]
+        );
         Ok(())
     }
 }

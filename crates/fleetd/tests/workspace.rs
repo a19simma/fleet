@@ -4,7 +4,7 @@ use std::future::Future;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::sync::OnceLock;
+use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
 use fleet_core::Redactor;
@@ -14,6 +14,7 @@ use fleetd::broker::{
     Broker, BrokerError, Denial, ExecError, GH_PATH, GhCli, GhExecutor, GitExecutor, Limits,
     MAX_CHECKS, MAX_OUTPUT_BYTES, MirrorGit, PushTarget, Request, Response,
 };
+use fleetd::cred::{CredentialFailure, LeaseFuture, LeasedToken, TokenSource};
 use fleetd::workspace::{RepoPolicy, Workspace, WorkspaceError};
 use tempfile::TempDir;
 
@@ -1304,6 +1305,107 @@ fn single_mirror(root: &Path) -> Result<PathBuf, Box<dyn std::error::Error>> {
         [one] => Ok(one.clone()),
         _ => Err("expected one mirror".into()),
     }
+}
+
+#[derive(Debug)]
+struct FixedSource(Result<&'static str, CredentialFailure>);
+
+impl TokenSource for FixedSource {
+    fn lease(&self) -> LeaseFuture<'_> {
+        Box::pin(std::future::ready(
+            self.0.map(|token| LeasedToken::new(token.to_owned(), None)),
+        ))
+    }
+}
+
+async fn fetch_with_source(
+    source: FixedSource,
+) -> Result<(Result<(), WorkspaceError>, String), Box<dyn std::error::Error>> {
+    let dir = TempDir::new()?;
+    let origin = fixture(dir.path())?;
+    let git_wrapper = logged_git(dir.path(), &origin, "0")?;
+    let root = dir.path().join("jobs");
+    let ws = production(&root, &git_wrapper).with_token_source("askpass-bin", Arc::new(source));
+    let got = ws.fetch_mirror(PRODUCTION_REPO).await;
+    let log = std::fs::read_to_string(&git_wrapper.log).unwrap_or_default();
+    Ok((got, log))
+}
+
+#[tokio::test]
+async fn a_mirror_fetch_with_a_token_source_authenticates_through_askpass() -> TestResult {
+    common::bounded(Box::pin(async {
+        let (got, log) = fetch_with_source(FixedSource(Ok("tok-from-source"))).await?;
+        got?;
+        let fetch = log
+            .lines()
+            .find(|l| l.contains(" fetch "))
+            .ok_or("no fetch logged")?;
+        assert!(fetch.contains("askpass=askpass-bin"), "{fetch}");
+        assert!(!log.contains("tok-from-source"), "token reached argv");
+        Ok(())
+    }))
+    .await
+}
+
+#[tokio::test]
+async fn a_mirror_fetch_with_an_empty_source_token_runs_without_a_credential() -> TestResult {
+    common::bounded(Box::pin(async {
+        let (got, log) = fetch_with_source(FixedSource(Ok(""))).await?;
+        got?;
+        let fetch = log
+            .lines()
+            .find(|l| l.contains(" fetch "))
+            .ok_or("no fetch logged")?;
+        assert!(!fetch.contains("askpass=askpass-bin"), "{fetch}");
+        Ok(())
+    }))
+    .await
+}
+
+#[tokio::test]
+async fn a_token_minted_by_the_lease_is_masked_in_the_fetch_stderr() -> TestResult {
+    const FRESH: &str = "fresh-lease-token-0123456789abcdef";
+    common::bounded(Box::pin(async {
+        let dir = TempDir::new()?;
+        let wrapper = dir.path().join("git-echo");
+        std::fs::write(
+            &wrapper,
+            format!(
+                "#!/bin/sh\nfor a in \"$@\"; do\n  if [ \"$a\" = fetch ]; then\n    echo \"fatal: bad $GH_TOKEN end\" >&2\n    exit 1\n  fi\ndone\nexec \"{}\" \"$@\"\n",
+                real_git()?.display()
+            ),
+        )?;
+        std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o755))?;
+        let ws = Workspace::new(dir.path().join("jobs"))
+            .with_policy(RepoPolicy::new(["github.com"]))
+            .with_git(&wrapper, Duration::from_secs(60))
+            .with_redactor(Redactor::default())
+            .with_token_source("askpass-bin", Arc::new(FixedSource(Ok(FRESH))));
+        let got = ws.fetch_mirror(PRODUCTION_REPO).await;
+        let Err(error) = got else {
+            return Err("fetch should fail".into());
+        };
+        let detail = error.detail().ok_or("no detail")?;
+        assert!(!detail.contains(FRESH), "{detail}");
+        assert!(detail.contains("[REDACTED]"), "{detail}");
+        Ok(())
+    }))
+    .await
+}
+
+#[tokio::test]
+async fn a_failing_token_source_fails_the_fetch_before_git_fetches() -> TestResult {
+    common::bounded(Box::pin(async {
+        let (got, log) =
+            fetch_with_source(FixedSource(Err(CredentialFailure::RepoRefused))).await?;
+        assert!(matches!(
+            got,
+            Err(WorkspaceError::Credentials(CredentialFailure::RepoRefused))
+        ));
+        assert!(!log.contains(" fetch "), "{log}");
+        Ok(())
+    }))
+    .await
 }
 
 #[tokio::test]

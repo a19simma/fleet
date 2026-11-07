@@ -459,7 +459,7 @@ This section collects the settings a self-hosted Box owner needs. Sources: `crat
 
 ### Credentials
 
-A job uses a fine-grained PAT (`github_pat`) scoped to throwaway repos or, for a User with a `github_app` credential, a one-hour installation token and the bot identity the server sends (ADR-0058). fleetd refreshes the token under 10 minutes before expiry, before a push or `gh` child, up to a per-Job mint cap and a per-User rate limit; the mirror fetch and the broker token are not refreshed. fleetd revokes the replaced token and, when the job ends, the held one, best effort with a 10 second bound; a token it cannot revoke expires within the hour. See [Settings](#settings) for where fleetd reads and scrubs the token.
+A job uses a fine-grained PAT (`github_pat`) scoped to throwaway repos or, for a User with a `github_app` credential, a one-hour installation token and the bot identity the server sends (ADR-0058). fleetd refreshes the token under 10 minutes before expiry, before a push or `gh` child, a mirror fetch or a broker `gh` call, up to a per-Job mint cap and a per-User rate limit. fleetd revokes the replaced token and, when the job ends, the held one, best effort with a 10 second bound; a token it cannot revoke expires within the hour. See [Settings](#settings) for where fleetd reads and scrubs the token.
 
 ### Docker mode
 

@@ -21,7 +21,7 @@ The end-to-end check is in `crates/fleetd/tests/daemon_jobs.rs`: `an_app_job_com
 5. Generate a private key in the App settings. GitHub lets an App hold several keys at once, which the rotation below uses.
 6. Look up the bot id: `gh api '/users/<slug>[bot]' --jq .id`. The bot email is `<bot-id>+<slug>[bot]@users.noreply.github.com`.
 
-Not yet built, so do not rely on them: the per-credential repository list, refresh of the mirror fetch and the broker token, a revoke that survives a daemon exit (ADR-0058, Status; see Refresh, limits and audit). Until the per-credential repository list exists, the operator list is the only repository ceiling, so any holder of `forge:github_app` can mint a write token for any repository the operator list allows. Grant the capability with that in mind.
+Not yet built, so do not rely on them: the per-credential repository list, a revoke that survives a daemon exit (ADR-0058, Status; see Refresh, limits and audit). Until the per-credential repository list exists, the operator list is the only repository ceiling, so any holder of `forge:github_app` can mint a write token for any repository the operator list allows. Grant the capability with that in mind.
 
 ## Server variables
 
@@ -83,7 +83,7 @@ Running Jobs are not lost. The server never stores the token, so a restart does 
 
    The secret is read from stdin and never from an argument. The command prints the stored row with its id.
 
-The server refuses the installation before any GitHub call when the id is not in `FLEET_GITHUB_APP_INSTALLATIONS`. It then calls `GET /app/installations/{id}` with the App JWT, at put and at every mint, and refuses an installation that is suspended, that belongs to another App id, whose `account.login` is not `FLEET_GITHUB_APP_ACCOUNT` or whose reply carries another id. The shape of that reply is unverified against a live GitHub response: check it with `fleet credential verify` before you rely on it. The Job repository is compared in full as lowercase `owner/name` against `FLEET_GITHUB_APP_REPOS`; a repository with a CR, LF, backslash, `@`, an empty segment, a non-ASCII character or an over-long name never matches. The per-credential repository list an admin sets is not built, so the operator list is the only repository check.
+The server refuses the installation before any GitHub call when the id is not in `FLEET_GITHUB_APP_INSTALLATIONS`. It then calls `GET /app/installations/{id}` with the App JWT, at put and at every mint, and refuses an installation that is suspended, that belongs to another App id, whose `account.login` is not `FLEET_GITHUB_APP_ACCOUNT` or whose reply carries another id. The shape of that reply is unverified against a live GitHub response: check it with `fleet credential verify` before you rely on it. The Job repository is compared in full as lowercase `owner/name` against `FLEET_GITHUB_APP_REPOS`; a repository with a CR, LF, backslash, `@`, an empty segment, a non-ASCII character or an over-long name never matches. The per-credential repository list an admin sets is not built, so the operator list is the only repository check. A refusal that arrives on a refresh mid-Job is sticky for that Job: fleetd does not reuse the held token and does not ask the server again.
 
 | Refusal | Cause | Server status and message | CLI and web notice | Audit row |
 | --- | --- | --- | --- | --- |
@@ -102,16 +102,16 @@ The server refuses the installation before any GitHub call when the id is not in
 
 Built (ADR-0058):
 
-- fleetd refreshes the installation token before a push or `gh` child when under 10 minutes of it remain. The mirror fetch and the broker token are not refreshed.
+- fleetd refreshes the installation token before a push or `gh` child, a mirror fetch or a broker `gh` call when under 10 minutes of it remain. Each of them holds the token it started with until it exits, so a refresh never revokes a token under a running child.
 - The server allows `MAX_APP_MINTS_PER_JOB` (34) mint attempts per Job and `MAX_APP_MINTS_PER_USER_PER_MINUTE` (20) per User. Past either, the release answers `FAILED_PRECONDITION` with `github app token limit reached` (`PRECONDITION_APP_MINT_CAP`). There is no PAT fallback.
 - fleetd revokes the token a refresh replaced, and the held token when the Job ends, with `DELETE /installation/token`. A replaced token is revoked after the push or `gh` children that started with it have exited, at most 15 minutes later. The revoke is best effort with a 10 second bound. A failed revoke logs a fixed string and never fails the Job, so that token lives until its expiry.
 - Every mint writes rows to `github_app_mint`: `attempt`, then `minted`, `failed` or `denied`, and `revoked` or `revoke_failed` when the server revokes after a failed recheck.
 
 - Deleting a credential that has mint history sets a tombstone on the `credentials` row instead of removing it, because `github_app_mint` rows reference it and are insert-only. A tombstoned credential is never released, never verified and never overwritten: `PutCredential` on it answers `PRECONDITION_CREDENTIAL_TOMBSTONED`. A credential with no mint history is removed.
 
-Not built: the per-credential repository list, the audit of revokes inside the mint client, a revoke on a cancel during the mint call itself, refresh of the mirror fetch and the broker token, and a fleetd revoke that survives a daemon exit.
+Not built: the per-credential repository list, the audit of revokes inside the mint client, a revoke on a cancel during the mint call itself, and a fleetd revoke that survives a daemon exit.
 
-When the cap is hit, the step fails with the Job reason `github app token limit reached`. A plain mint failure reports `credentials could not be fetched` instead. A refresh whose mint fails keeps the last good token until it expires. A box whose clock runs ahead of the server's refreshes every 45 minutes and never fails a step on the expiry. A box clock that runs behind cannot be detected: its steps fail at GitHub once the token has expired. To see the cause, list the denied rows. The table has no user column, so join through the credential:
+When the cap is hit, the step fails with the Job reason `github app token limit reached`. A plain mint failure reports `credentials could not be fetched` instead. A refresh whose mint fails keeps the last good token until it expires. A box whose clock runs ahead of the server's refreshes every 45 minutes, keeps the token for 50 minutes after the fetch and then fails the step with `credential expired` if the refresh still fails. A box clock that runs behind cannot be detected: its steps fail at GitHub once the token has expired. To see the cause, list the denied rows. The table has no user column, so join through the credential:
 
 ```
 SELECT m.at, m.job_id, m.reason
@@ -134,4 +134,4 @@ Applies when you move to a server and fleetd that carry the GitHub App lane (ADR
 - Behaviour change for a User who holds `github_app` and `forge:github_app`: Jobs use the App token, not the PAT, even when a PAT is stored. Commits, pushes and pull requests carry the bot identity. There is no PAT fallback: a mint failure at the first fetch fails the Job, and a refresh whose mint fails keeps the last good token until it expires. A failed first fetch reports `credentials could not be fetched`. A failed call to GitHub, or a response that fails validation, logs `github app token mint failed`; a lane config fault logs nothing.
 - A User who holds `github_app` without `forge:github_app` fails the Job. The server answers `PERMISSION_DENIED`, fleetd maps every such answer to a lease mismatch, and the Job reports `credentials refused: lease does not match`. The server does not fall back to the PAT.
 - No change for a User with only a PAT. Those Jobs keep `Fleet Job <fleet-job@fleet.invalid>` and the PAT.
-- The token lasts one hour (official docs, see Unverified claims). fleetd refreshes it before a push or `gh` child when under 10 minutes remain, within the per-Job and per-User mint limits (see Refresh, limits and audit). The mirror fetch and the broker token are not refreshed.
+- The token lasts one hour (official docs, see Unverified claims). fleetd refreshes it before a push or `gh` child, a mirror fetch or a broker `gh` call when under 10 minutes remain, within the per-Job and per-User mint limits (see Refresh, limits and audit). Each holds the token it started with until it exits.

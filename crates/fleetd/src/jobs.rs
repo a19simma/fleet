@@ -20,7 +20,7 @@ use crate::Error;
 use crate::agent_config::Bundle;
 use crate::backoff::SystemRandom;
 use crate::bg_command::{BgConfig, PueueCli};
-use crate::broker::{Broker, GhCli, MirrorGit};
+use crate::broker::{Broker, BrokerError, GhCli, MirrorGit};
 use crate::config::Config;
 use crate::connect_proxy::{ConnectProxy, ProxyLimits};
 use crate::cred::{CredentialBook, CredentialClient, ERR_NO_AGENT};
@@ -105,7 +105,7 @@ impl BrokerWiring {
     }
 }
 
-impl<R: Reporter> DaemonRunner<R> {
+impl<R: Reporter + Send + Sync + 'static> DaemonRunner<R> {
     #[cfg(test)]
     pub(crate) fn timing_enabled(&self) -> bool {
         self.agent.timing_enabled()
@@ -145,9 +145,11 @@ impl<R: Reporter> DaemonRunner<R> {
         if self.credentials.is_none() {
             return workspace;
         }
-        let token = self.agent.github_token(&job.job_id).unwrap_or_default();
         workspace
-            .with_credential(self.agent.config.askpass_bin.clone(), token)
+            .with_token_source(
+                self.agent.config.askpass_bin.clone(),
+                self.agent.token_source(&job.job_id),
+            )
             .with_redactor(self.agent.job_redactor(&job.job_id).as_ref().clone())
     }
 
@@ -363,12 +365,30 @@ impl<R: Reporter + Send + Sync + 'static> DaemonRunner<R> {
         }
     }
 
-    fn broker_token(&self, wiring: &BrokerWiring, job: &Job) -> String {
-        if self.credentials.is_some() {
-            self.agent.github_token(&job.job_id).unwrap_or_default()
+    /// The `gh` executor of `job`. With a credential book it resolves the job owner's token
+    /// through [`TokenSource`] on every call, so a refresh between two calls never leaves it
+    /// with a revoked token. Without one it keeps the wiring's token.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BrokerError::RelativeGhBin`] when the wiring's `gh` path is not absolute.
+    fn gh_cli(
+        &self,
+        wiring: &BrokerWiring,
+        job: &Job,
+        scratch: PathBuf,
+    ) -> Result<GhCli, BrokerError> {
+        let checks = GhCli::new(
+            wiring.gh_bin.clone(),
+            wiring.host.clone(),
+            wiring.token.clone(),
+            scratch,
+        )?;
+        Ok(if self.credentials.is_some() {
+            checks.with_token_source(self.agent.token_source(&job.job_id))
         } else {
-            wiring.token.clone()
-        }
+            checks
+        })
     }
 
     fn build_broker(&self, wiring: &BrokerWiring, job: &Job, cwd: &Path) -> Result<(), String> {
@@ -382,13 +402,9 @@ impl<R: Reporter + Send + Sync + 'static> DaemonRunner<R> {
             cwd.to_path_buf(),
             MirrorGit::new(self.workspace_for(job), job),
         );
-        let checks = GhCli::new(
-            wiring.gh_bin.clone(),
-            wiring.host.clone(),
-            self.broker_token(wiring, job),
-            scratch,
-        )
-        .map_err(|err| err.to_string())?;
+        let checks = self
+            .gh_cli(wiring, job, scratch)
+            .map_err(|err| err.to_string())?;
         let gh = PublishGh::new(
             Arc::clone(&self.agent),
             job.clone(),
@@ -2942,5 +2958,232 @@ mod tests {
                 wiring.assert_cleared().await
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod token_wiring_tests {
+    use std::os::unix::fs::PermissionsExt;
+    use std::path::Path;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+    use std::time::Duration;
+
+    use fleet_core::Redactor;
+    use fleet_proto::v1::fleet_worker_server::{FleetWorker, FleetWorkerServer};
+    use fleet_proto::v1::{
+        ClaimJobReply, ClaimJobRequest, GetJobCredentialsReply, GetJobCredentialsRequest,
+        GetJobTranscriptReply, GetJobTranscriptRequest, GetProfileBlobReply, GetProfileBlobRequest,
+        GitIdentity, Job, JobCredential, ReportJobReply, ReportJobRequest,
+    };
+    use tokio::net::TcpListener;
+    use tokio_stream::wrappers::TcpListenerStream;
+    use tonic::{Request, Response, Status};
+
+    use super::*;
+    use crate::broker::{GhExecutor, PushTarget};
+    use crate::cred::{Clock, CredentialClient};
+
+    const OLD: &str = "ghs_AbCdEfGhIjKlMnOpQrStUvWxYz0123456789";
+    const NEW: &str = "ghs_ZyXwVuTsRqPoNmLkJiHgFeDcBa9876543210";
+    const EXPIRES_MS: u64 = 4_000_000_000_000;
+    const MINUTE_MS: u64 = 60 * 1000;
+
+    type TestResult = Result<(), Box<dyn std::error::Error>>;
+
+    #[derive(Debug)]
+    struct TestClock(AtomicU64);
+
+    impl Clock for TestClock {
+        fn now_ms(&self) -> u64 {
+            self.0.load(Ordering::SeqCst)
+        }
+    }
+
+    struct Quiet;
+
+    impl Reporter for Quiet {
+        fn report(
+            &self,
+            _: ReportJobRequest,
+        ) -> impl Future<Output = Result<ReportJobReply, Status>> + Send {
+            std::future::ready(Ok(ReportJobReply::default()))
+        }
+    }
+
+    struct Minting(AtomicUsize);
+
+    #[tonic::async_trait]
+    impl FleetWorker for Minting {
+        async fn claim_job(
+            &self,
+            _: Request<ClaimJobRequest>,
+        ) -> Result<Response<ClaimJobReply>, Status> {
+            Err(Status::unimplemented("unused"))
+        }
+
+        async fn get_profile_blob(
+            &self,
+            _: Request<GetProfileBlobRequest>,
+        ) -> Result<Response<GetProfileBlobReply>, Status> {
+            Err(Status::unimplemented("unused"))
+        }
+
+        async fn get_job_transcript(
+            &self,
+            _: Request<GetJobTranscriptRequest>,
+        ) -> Result<Response<GetJobTranscriptReply>, Status> {
+            Err(Status::unimplemented("unused"))
+        }
+
+        async fn get_job_credentials(
+            &self,
+            _: Request<GetJobCredentialsRequest>,
+        ) -> Result<Response<GetJobCredentialsReply>, Status> {
+            let call = self.0.fetch_add(1, Ordering::SeqCst);
+            let wire = |kind: &str, value: &str| JobCredential {
+                kind: kind.into(),
+                shape: "static_secret".into(),
+                value: value.into(),
+                expires_at_ms: None,
+                git_identity: None,
+            };
+            let github = JobCredential {
+                expires_at_ms: Some(EXPIRES_MS),
+                git_identity: Some(GitIdentity {
+                    name: "fleet-bot[bot]".into(),
+                    email: "123456+fleet-bot[bot]@users.noreply.github.com".into(),
+                }),
+                ..wire(
+                    "github_installation_token",
+                    if call == 0 { OLD } else { NEW },
+                )
+            };
+            Ok(Response::new(GetJobCredentialsReply {
+                credentials: vec![
+                    github,
+                    wire("anthropic_api_key", "agent-key-0123456789abcdef"),
+                ],
+            }))
+        }
+
+        async fn report_job(
+            &self,
+            _: Request<ReportJobRequest>,
+        ) -> Result<Response<ReportJobReply>, Status> {
+            Err(Status::unimplemented("unused"))
+        }
+
+        async fn report_shell_log(
+            &self,
+            _: Request<fleet_proto::v1::ReportShellLogRequest>,
+        ) -> Result<Response<fleet_proto::v1::ReportShellLogReply>, Status> {
+            Err(Status::unimplemented("not used"))
+        }
+
+        async fn report_timing(
+            &self,
+            _: Request<fleet_proto::v1::ReportTimingRequest>,
+        ) -> Result<Response<fleet_proto::v1::ReportTimingReply>, Status> {
+            Err(Status::unimplemented("not used"))
+        }
+    }
+
+    fn script(dir: &Path, name: &str, body: &str) -> Result<PathBuf, std::io::Error> {
+        let path = dir.join(name);
+        std::fs::write(&path, body)?;
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755))?;
+        Ok(path)
+    }
+
+    async fn runner_holding(
+        dir: &Path,
+        git: &Path,
+    ) -> Result<(DaemonRunner<Quiet>, Arc<TestClock>), Box<dyn std::error::Error>> {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).await?;
+        let url = format!("http://{}", listener.local_addr()?);
+        tokio::spawn(
+            tonic::transport::Server::builder()
+                .add_service(FleetWorkerServer::new(Minting(AtomicUsize::new(0))))
+                .serve_with_incoming(TcpListenerStream::new(listener)),
+        );
+        let clock = Arc::new(TestClock((EXPIRES_MS - 20 * MINUTE_MS).into()));
+        let book = Arc::new(
+            CredentialBook::new(CredentialClient::new(channel(&url)?, "tok-0123456789")?)
+                .with_clock(clock.clone()),
+        );
+        book.fetch("job1", 1, "box").await?;
+        let workspace = Workspace::new(dir.join("jobs"))
+            .with_policy(RepoPolicy::new(["github.com"]))
+            .with_git(git, Duration::from_secs(30));
+        let agent = AgentRunner::new(RunConfig::new("claude", false), Quiet, Redactor::default());
+        Ok((
+            DaemonRunner::new(workspace, agent, "box").with_credentials(book),
+            clock,
+        ))
+    }
+
+    fn job() -> Job {
+        Job {
+            job_id: "job1".into(),
+            attempt: 1,
+            repo: "https://github.com/o/r.git".into(),
+            ..Job::default()
+        }
+    }
+
+    #[tokio::test]
+    async fn the_mirror_fetch_of_one_workspace_resolves_the_token_again_after_a_refresh()
+    -> TestResult {
+        let dir = tempfile::TempDir::new()?;
+        let log = dir.path().join("tokens");
+        let git = script(
+            dir.path(),
+            "git",
+            &format!(
+                "#!/bin/sh\ncase \" $* \" in *\" fetch \"*) printf '%s\\n' \"$GH_TOKEN\" >> \"{}\"; exit 0;; esac\nexec /usr/bin/git \"$@\"\n",
+                log.display()
+            ),
+        )?;
+        let (runner, clock) = runner_holding(dir.path(), &git).await?;
+        let job = job();
+        let workspace = runner.workspace_for(&job);
+        workspace.fetch_mirror(&job.repo).await?;
+        clock.0.store(EXPIRES_MS - 5 * MINUTE_MS, Ordering::SeqCst);
+        workspace.fetch_mirror(&job.repo).await?;
+        let tokens = std::fs::read_to_string(&log)?;
+        assert_eq!(tokens.lines().collect::<Vec<_>>(), [OLD, NEW]);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn the_broker_gh_executor_resolves_the_token_again_after_a_refresh() -> TestResult {
+        let dir = tempfile::TempDir::new()?;
+        let (runner, clock) = runner_holding(dir.path(), Path::new("/usr/bin/git")).await?;
+        let job = job();
+        let scratch = runner.workspace.create_broker_scratch("job1")?;
+        let gh_bin = script(
+            dir.path(),
+            "gh",
+            "#!/bin/sh\nprintf '%s\\n' \"$GH_TOKEN\" >> \"$HOME/tokens\"\necho '[]'\n",
+        )?;
+        let registry = PerJob::new();
+        let wiring = BrokerWiring::new(
+            registry,
+            AgentLauncher::Direct,
+            gh_bin,
+            "github.com".to_owned(),
+            "box-token".to_owned(),
+            Redactor::default(),
+        );
+        let gh = runner.gh_cli(&wiring, &job, scratch.clone())?;
+        let target = PushTarget::Own("job1".to_owned());
+        let url = "https://github.com/o/r/pull/1";
+        gh.pr_checks(&target, url).await?;
+        clock.0.store(EXPIRES_MS - 5 * MINUTE_MS, Ordering::SeqCst);
+        gh.pr_checks(&target, url).await?;
+        let tokens = std::fs::read_to_string(scratch.join("tokens"))?;
+        assert_eq!(tokens.lines().collect::<Vec<_>>(), [OLD, NEW]);
+        Ok(())
     }
 }

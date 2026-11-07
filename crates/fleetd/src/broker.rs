@@ -42,7 +42,7 @@ use std::fmt;
 use std::future::Future;
 use std::path::PathBuf;
 use std::process::Stdio;
-use std::sync::{Mutex, PoisonError};
+use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
 use fleet_core::Redactor;
@@ -55,6 +55,7 @@ use tokio::process::Command;
 use tokio::time::Instant;
 
 use crate::AgentLauncher;
+use crate::cred::TokenSource;
 use crate::group::GroupGuard;
 use crate::jobsock::{JobContext, MAX_FRAME_BYTES, ServeFuture, Service, read_frame, write_frame};
 use crate::workspace::{Workspace, scratch_is_private};
@@ -646,6 +647,7 @@ pub struct GhCli {
     bin: PathBuf,
     host: String,
     token: String,
+    source: Option<Arc<dyn TokenSource>>,
     scratch: PathBuf,
 }
 
@@ -700,11 +702,21 @@ impl GhCli {
             bin,
             host: host.into(),
             token,
+            source: None,
             scratch: scratch.into(),
         })
     }
 
-    fn command(&self, pr_url: &str) -> Command {
+    /// Resolves the token from `source` on every `gh` call and holds its lease until the child
+    /// exits, instead of the token given to [`GhCli::new`]. A refresh between two calls never
+    /// leaves a call with a revoked token.
+    #[must_use]
+    pub fn with_token_source(mut self, source: Arc<dyn TokenSource>) -> Self {
+        self.source = Some(source);
+        self
+    }
+
+    fn command(&self, pr_url: &str, token: &str) -> Command {
         let home = &self.scratch;
         let mut command = Command::new(&self.bin);
         command.env_clear();
@@ -713,13 +725,13 @@ impl GhCli {
             .env("HOME", home)
             .env("XDG_CONFIG_HOME", home.join(".config"))
             .env("GH_CONFIG_DIR", home.join("gh"))
-            .env("GH_TOKEN", &self.token)
+            .env("GH_TOKEN", token)
             .env("GH_HOST", &self.host)
             .env("GH_PROMPT_DISABLED", "1")
             .env("GH_NO_UPDATE_NOTIFIER", "1")
             .env("NO_COLOR", "1");
         if !self.host.eq_ignore_ascii_case("github.com") {
-            command.env("GH_ENTERPRISE_TOKEN", &self.token);
+            command.env("GH_ENTERPRISE_TOKEN", token);
         }
         command
             .args(["pr", "checks", pr_url, "--json", "bucket,link,name"])
@@ -736,7 +748,18 @@ impl GhCli {
         if !scratch_is_private(&self.scratch) {
             return Err(ExecError);
         }
-        let mut child = self.command(pr_url).spawn().map_err(|_| ExecError)?;
+        let leased = match &self.source {
+            Some(source) => Some(source.lease().await.map_err(|failure| {
+                tracing::warn!(
+                    reason = failure.reason(),
+                    "broker token could not be resolved"
+                );
+                ExecError
+            })?),
+            None => None,
+        };
+        let token = leased.as_ref().map_or(self.token.as_str(), |l| l.token());
+        let mut child = self.command(pr_url, token).spawn().map_err(|_| ExecError)?;
         let _guard = GroupGuard::new(child.id());
         let mut stdout = child.stdout.take().ok_or(ExecError)?;
         let mut raw = Vec::new();
@@ -749,6 +772,7 @@ impl GhCli {
             return Err(ExecError);
         }
         let _ = child.wait().await;
+        drop(leased);
         Ok(raw)
     }
 

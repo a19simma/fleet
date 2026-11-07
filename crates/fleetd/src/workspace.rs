@@ -19,6 +19,7 @@ use tokio::process::Command;
 
 use crate::agent_config::AGENT_DIR;
 use crate::askpass;
+use crate::cred::{CredentialFailure, LeasedToken, TokenSource};
 use crate::group::GroupGuard;
 
 const STDERR_KEEP: usize = 64 * 1024;
@@ -157,6 +158,8 @@ pub enum WorkspaceError {
     Git(&'static str, String),
     /// A git command ran past [`GIT_TIMEOUT`] and was killed.
     GitTimeout(&'static str),
+    /// The token for the fetch could not be resolved: its refresh failed for good.
+    Credentials(CredentialFailure),
 }
 
 impl fmt::Display for WorkspaceError {
@@ -168,6 +171,7 @@ impl fmt::Display for WorkspaceError {
             Self::Io(_) => write!(f, "workspace directory error"),
             Self::Git(step, _) => write!(f, "git {step} failed"),
             Self::GitTimeout(step) => write!(f, "git {step} timed out"),
+            Self::Credentials(failure) => write!(f, "fetch credential: {}", failure.reason()),
         }
     }
 }
@@ -176,6 +180,7 @@ impl std::error::Error for WorkspaceError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             Self::Io(err) => Some(err),
+            Self::Credentials(failure) => Some(failure),
             Self::InvalidRepo
             | Self::InvalidRef
             | Self::InvalidJobId
@@ -239,6 +244,7 @@ pub struct Workspace {
     policy: RepoPolicy,
     path_env: Option<OsString>,
     credential: Option<Credential>,
+    token_source: Option<(PathBuf, Arc<dyn TokenSource>)>,
     after_clone: Option<AfterClone>,
     redactor: Redactor,
     job_gid: Option<u32>,
@@ -257,6 +263,7 @@ impl Workspace {
             policy: RepoPolicy::default(),
             path_env: std::env::var_os("PATH"),
             credential: None,
+            token_source: None,
             after_clone: None,
             redactor: Redactor::default(),
             job_gid: None,
@@ -370,6 +377,20 @@ impl Workspace {
         self
     }
 
+    /// Lets the mirror fetch authenticate through `<askpass_bin> askpass` with the token
+    /// `source` resolves at the start of each fetch, and holds its lease until the fetch ends.
+    /// It replaces [`Workspace::with_credential`]. An empty token fetches without a credential.
+    #[must_use]
+    pub fn with_token_source(
+        mut self,
+        askpass_bin: impl Into<PathBuf>,
+        source: Arc<dyn TokenSource>,
+    ) -> Self {
+        self.credential = None;
+        self.token_source = Some((askpass_bin.into(), source));
+        self
+    }
+
     /// Uses `policy` to judge repos instead of the default, https on `github.com`.
     #[must_use]
     pub fn with_policy(mut self, policy: RepoPolicy) -> Self {
@@ -405,8 +426,9 @@ impl Workspace {
     ///
     /// # Errors
     ///
-    /// Returns a validation error before any process starts, or a fixed-message git or
-    /// filesystem error.
+    /// Returns a validation error before any process starts, a fixed-message git or
+    /// filesystem error, or [`WorkspaceError::Credentials`] when the token source of
+    /// [`Workspace::with_token_source`] fails for good.
     pub async fn prepare(
         &self,
         job_id: &str,
@@ -484,7 +506,9 @@ impl Workspace {
     /// # Errors
     ///
     /// Returns [`WorkspaceError::InvalidRepo`] before any process starts when `repo` fails the
-    /// policy, else a fixed-message git or filesystem error.
+    /// policy, [`WorkspaceError::Credentials`] when the token source of
+    /// [`Workspace::with_token_source`] fails for good, else a fixed-message git or filesystem
+    /// error.
     pub async fn fetch_mirror(&self, repo: &str) -> Result<(), WorkspaceError> {
         validate_repo(repo, &self.policy)?;
         let _held = self.mirror_lock.lock().await;
@@ -591,8 +615,7 @@ impl Workspace {
             .join(format!("{:x}.git", hash.finalize()))
     }
 
-    fn fetch_credential(&self, repo: &str) -> Option<(&Credential, &str)> {
-        let credential = self.credential.as_ref()?;
+    fn fetch_host(&self, repo: &str) -> Option<&str> {
         let token_host = self.policy.token_host()?;
         let authority = repo
             .strip_prefix("https://")?
@@ -600,7 +623,31 @@ impl Workspace {
             .next()?;
         authority
             .eq_ignore_ascii_case(token_host)
-            .then_some((credential, token_host))
+            .then_some(token_host)
+    }
+
+    async fn fetch_credential(
+        &self,
+        repo: &str,
+    ) -> Result<Option<(Credential, LeasedToken)>, WorkspaceError> {
+        if self.fetch_host(repo).is_none() {
+            return Ok(None);
+        }
+        if let Some((askpass_bin, source)) = &self.token_source {
+            let leased = source.lease().await.map_err(WorkspaceError::Credentials)?;
+            if leased.token().is_empty() {
+                return Ok(None);
+            }
+            let credential = Credential {
+                askpass_bin: askpass_bin.clone(),
+                token: leased.token().to_owned(),
+            };
+            return Ok(Some((credential, leased)));
+        }
+        Ok(self
+            .credential
+            .clone()
+            .map(|credential| (credential, LeasedToken::new(String::new(), None))))
     }
 
     /// Makes the mirror safe to fetch into, then fetches `repo` into it.
@@ -622,6 +669,8 @@ impl Workspace {
             .await
             .map_err(|_| WorkspaceError::Io(std::io::Error::other("lock sweep")))?
             .map_err(WorkspaceError::Io)?;
+        let credential = self.fetch_credential(repo).await?;
+        let host = self.fetch_host(repo);
         self.run_git(
             mirror,
             &[
@@ -633,7 +682,10 @@ impl Workspace {
                 "+refs/heads/*:refs/remotes/origin/*",
             ],
             "fetch",
-            self.fetch_credential(repo),
+            credential
+                .as_ref()
+                .zip(host)
+                .map(|((credential, _lease), host)| (credential, host)),
         )
         .await
     }
@@ -689,9 +741,15 @@ impl Workspace {
         self.run_git(dir, args, step, None).await
     }
 
-    fn detail(&self, raw: &[u8]) -> String {
+    /// The redacted tail of `raw`. `leased` is the token minted for this call: the stored
+    /// redactor was cloned before the lease, so the fresh value is merged in here.
+    fn detail(&self, raw: &[u8], leased: Option<&str>) -> String {
         let text = String::from_utf8_lossy(raw);
-        let scrubbed = self.redactor.redact_str(&text);
+        let redactor = leased.map_or_else(
+            || self.redactor.clone(),
+            |token| self.redactor.merged(&Redactor::new([token])),
+        );
+        let scrubbed = redactor.redact_str(&text);
         tail(&scrubbed, DETAIL_MAX).to_owned()
     }
 
@@ -774,7 +832,10 @@ impl Workspace {
                     }
                     None => Vec::new(),
                 };
-                Err(WorkspaceError::Git(step, self.detail(&raw)))
+                Err(WorkspaceError::Git(
+                    step,
+                    self.detail(&raw, credential.map(|(c, _)| c.token.as_str())),
+                ))
             }
             Err(_) => {
                 if let Some(task) = stderr {

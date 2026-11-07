@@ -19,12 +19,16 @@
 //! An installation token lasts one hour. [`CredentialBook::refresh_if_due`] calls
 //! `GetJobCredentials` again when fewer than [`REFRESH_WINDOW_MS`] of the held token remain,
 //! on the injected [`Clock`], and swaps in the new token. A refresh that fails with a transient
-//! reason keeps the last good token until it expires. The server's mint cap is terminal: it
-//! fails the step with [`ERR_MINT_CAP`] and there is no PAT fallback (ADR-0058, SEC-004).
+//! reason keeps the last good token until it expires. The server's mint cap and its
+//! installation and repository refusals are terminal: they fail the step with
+//! [`ERR_MINT_CAP`], [`ERR_APP_INSTALLATION`] or [`ERR_APP_REPO`] and there is no PAT fallback
+//! (ADR-0058, SEC-004, SEC-001, SEC-002).
 //!
 //! A fresh token that already looks expired, or inside the window, means the box clock runs
 //! ahead of the server's. The book keeps it and refreshes again only after
-//! [`REFRESH_SKEW_MS`], so a skewed clock neither fails a step nor spends the mint cap.
+//! [`REFRESH_SKEW_MS`], so a skewed clock does not spend the mint cap. The token stays usable until
+//! [`REFRESH_SKEW_MS`] plus [`REFRESH_SKEW_SLACK_MS`] after the fetch, and a failed refresh past
+//! that fails the step with the expired reason.
 //!
 //! With a [`Revoker`] attached the book revokes the token a refresh replaced, and the held
 //! token when the job ends (ADR-0058, SEC-010).
@@ -37,6 +41,8 @@
 
 use std::collections::{HashMap, HashSet};
 use std::fmt;
+use std::future::Future;
+use std::pin::Pin;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
@@ -50,7 +56,8 @@ use fleet_proto::v1::fleet_worker_client::FleetWorkerClient;
 use fleet_proto::v1::{GetJobCredentialsReply, GetJobCredentialsRequest};
 use fleet_proto::{
     GITHUB_INSTALLATION_TOKEN_KIND, MAX_CREDENTIAL_VALUE_BYTES, MAX_CREDENTIALS_PER_USER,
-    PRECONDITION_APP_MINT_CAP, PRECONDITION_EXPIRED, PRECONDITION_NO_AGENT, PRECONDITION_NO_GITHUB,
+    PRECONDITION_APP_INSTALLATION, PRECONDITION_APP_MINT_CAP, PRECONDITION_APP_REPO,
+    PRECONDITION_EXPIRED, PRECONDITION_NO_AGENT, PRECONDITION_NO_GITHUB,
     PRECONDITION_NOT_CONFIGURED,
 };
 use tonic::metadata::MetadataValue;
@@ -95,6 +102,14 @@ pub const ERR_APP_IDENTITY_MISSING: &str = "github app credential has no git ide
 /// Job failure reason: the git identity of a GitHub App credential is outside the grammar.
 pub const ERR_APP_IDENTITY_INVALID: &str = "github app git identity is invalid";
 
+/// Job failure reason: the GitHub App installation is off the server's allowlist or fails the
+/// owner binding (ADR-0058, SEC-001, SEC-014).
+pub const ERR_APP_INSTALLATION: &str = "github app installation is not allowed";
+
+/// Job failure reason: the Job repository is off the server's allowlist for the GitHub App
+/// (ADR-0058, SEC-002, SEC-009).
+pub const ERR_APP_REPO: &str = "repository is not allowed for the github app";
+
 /// Job failure reason: the Job reached its mint cap or its User reached the per-minute mint
 /// limit (ADR-0058, SEC-003, SEC-004, SEC-011).
 pub const ERR_MINT_CAP: &str = "github app token limit reached";
@@ -114,12 +129,19 @@ pub const REFRESH_RETRY_MS: u64 = 30 * 1000;
 ///
 /// A freshly minted installation token lasts one hour. When a fresh token already looks
 /// expired, or inside [`REFRESH_WINDOW_MS`], by the box clock, the box clock runs ahead of the
-/// server's. The book then keeps the token, never fails a step on the expiry and refreshes
+/// server's. The book then keeps the token, never fails a step on the expiry while the token
+/// is younger than [`REFRESH_SKEW_MS`] plus [`REFRESH_SKEW_SLACK_MS`], and refreshes
 /// every [`REFRESH_SKEW_MS`] by elapsed time alone, so a skewed clock spends one mint per
 /// interval and not one per step. A box clock that runs behind the server's cannot be
 /// detected: the token then expires on the server before the box thinks it is due, and the
 /// step that uses it fails at GitHub.
 pub const REFRESH_SKEW_MS: u64 = 45 * 60 * 1000;
+
+/// The grace past [`REFRESH_SKEW_MS`] a skewed token stays usable: 5 minutes.
+///
+/// A fresh installation token lasts one hour, so a skewed token whose refresh keeps failing
+/// is dropped 50 minutes after it was fetched, before the server expires it.
+pub const REFRESH_SKEW_SLACK_MS: u64 = 5 * 60 * 1000;
 
 /// Job failure reason: the reply broke a rule the server keeps.
 pub const ERR_MALFORMED: &str = "credentials reply was invalid";
@@ -142,6 +164,12 @@ pub enum CredentialFailure {
     /// or its User reached the per-minute mint limit (SEC-003, SEC-004, SEC-011). Terminal,
     /// never retried.
     MintCap,
+    /// `FAILED_PRECONDITION` `github app installation is not allowed`: the installation is off
+    /// the allowlist or fails the owner binding (SEC-001, SEC-014). Terminal, never retried.
+    InstallationRefused,
+    /// `FAILED_PRECONDITION` `repository is not allowed for the github app`: the Job
+    /// repository is off the allowlist (SEC-002, SEC-009). Terminal, never retried.
+    RepoRefused,
     /// Any other status, a timeout or a transport error.
     Unavailable,
     /// The reply carries wire kind `github_installation_token` and no git identity.
@@ -169,6 +197,8 @@ impl CredentialFailure {
             Self::Expired => ERR_EXPIRED,
             Self::NotConfigured => ERR_NOT_CONFIGURED,
             Self::MintCap => ERR_MINT_CAP,
+            Self::InstallationRefused => ERR_APP_INSTALLATION,
+            Self::RepoRefused => ERR_APP_REPO,
             Self::Unavailable => ERR_UNAVAILABLE,
             Self::AppIdentityMissing => ERR_APP_IDENTITY_MISSING,
             Self::AppIdentityInvalid => ERR_APP_IDENTITY_INVALID,
@@ -184,6 +214,8 @@ impl CredentialFailure {
             (Code::FailedPrecondition, PRECONDITION_EXPIRED) => Self::Expired,
             (Code::FailedPrecondition, PRECONDITION_NOT_CONFIGURED) => Self::NotConfigured,
             (Code::FailedPrecondition, PRECONDITION_APP_MINT_CAP) => Self::MintCap,
+            (Code::FailedPrecondition, PRECONDITION_APP_INSTALLATION) => Self::InstallationRefused,
+            (Code::FailedPrecondition, PRECONDITION_APP_REPO) => Self::RepoRefused,
             _ => Self::Unavailable,
         }
     }
@@ -510,6 +542,8 @@ struct Held {
     box_name: String,
     retry_at_ms: u64,
     skewed: bool,
+    fetched_at_ms: u64,
+    refused: Option<CredentialFailure>,
     generation: Arc<Generation>,
     turn: Arc<tokio::sync::Mutex<()>>,
 }
@@ -541,6 +575,8 @@ struct Snapshot {
     box_name: String,
     retry_at_ms: u64,
     skewed: bool,
+    fetched_at_ms: u64,
+    refused: Option<CredentialFailure>,
 }
 
 /// Fetches and holds the credentials of the jobs that run on this box.
@@ -555,6 +591,61 @@ pub struct CredentialBook {
 
 /// The longest a replaced token waits for the children that hold it before it is revoked.
 pub const DRAIN_LIMIT: Duration = Duration::from_secs(15 * 60);
+
+/// A token resolved for one child, with the [`TokenLease`] that keeps it from being revoked.
+///
+/// Keep it until the child exits. Its `Debug` output never shows the token.
+pub struct LeasedToken {
+    token: String,
+    lease: Option<TokenLease>,
+}
+
+impl LeasedToken {
+    /// `token`, held by `lease` when it is an installation token the book tracks.
+    #[must_use]
+    pub const fn new(token: String, lease: Option<TokenLease>) -> Self {
+        Self { token, lease }
+    }
+
+    /// The token value, empty when the job holds no GitHub credential.
+    #[must_use]
+    pub fn token(&self) -> &str {
+        &self.token
+    }
+
+    /// Whether a [`TokenLease`] backs the token.
+    #[must_use]
+    pub const fn is_leased(&self) -> bool {
+        self.lease.is_some()
+    }
+}
+
+impl fmt::Debug for LeasedToken {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("LeasedToken")
+            .field("leased", &self.lease.is_some())
+            .finish_non_exhaustive()
+    }
+}
+
+/// The future a [`TokenSource`] returns.
+pub type LeaseFuture<'a> =
+    Pin<Box<dyn Future<Output = Result<LeasedToken, CredentialFailure>> + Send + 'a>>;
+
+/// Resolves the GitHub token of one job at the moment a child starts.
+///
+/// A holder of a copy of the token breaks after the first refresh: the book revokes the token
+/// a refresh replaced. Every child that carries the token resolves it here instead, once per
+/// start, and keeps the returned [`LeasedToken`] until it exits.
+pub trait TokenSource: Send + Sync + fmt::Debug {
+    /// Refreshes the token when it is due, then returns the current one with its lease.
+    ///
+    /// # Errors
+    ///
+    /// Returns the [`CredentialFailure`] of a refresh that failed for good. The caller fails
+    /// the step and never falls back to another token.
+    fn lease(&self) -> LeaseFuture<'_>;
+}
 
 /// A hold on the installation token a child was started with.
 ///
@@ -652,8 +743,9 @@ impl CredentialBook {
     /// held for `job_id` after an error. The server's answer maps to
     /// [`CredentialFailure::LeaseMismatch`] (any `PERMISSION_DENIED`),
     /// [`CredentialFailure::NoGithub`], [`CredentialFailure::NoAgent`],
-    /// [`CredentialFailure::Expired`], [`CredentialFailure::NotConfigured`] and
-    /// [`CredentialFailure::MintCap`]. Any other status, a timeout or a transport error is
+    /// [`CredentialFailure::Expired`], [`CredentialFailure::NotConfigured`],
+    /// [`CredentialFailure::MintCap`], [`CredentialFailure::InstallationRefused`] and
+    /// [`CredentialFailure::RepoRefused`]. Any other status, a timeout or a transport error is
     /// [`CredentialFailure::Unavailable`]. A reply that breaks a rule is
     /// [`CredentialFailure::Malformed`], [`CredentialFailure::AppIdentityMissing`] or
     /// [`CredentialFailure::AppIdentityInvalid`].
@@ -665,6 +757,7 @@ impl CredentialBook {
     ) -> Result<Arc<JobCredentials>, CredentialFailure> {
         self.end(job_id);
         let credentials = Arc::new(self.client.fetch(job_id, attempt, box_name).await?);
+        let fetched_at_ms = self.clock.now_ms();
         self.held
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
@@ -675,7 +768,9 @@ impl CredentialBook {
                     attempt,
                     box_name: box_name.to_owned(),
                     retry_at_ms: 0,
+                    refused: None,
                     skewed: false,
+                    fetched_at_ms,
                     generation: Arc::new(Generation::default()),
                     turn: Arc::new(tokio::sync::Mutex::new(())),
                 },
@@ -694,7 +789,8 @@ impl CredentialBook {
     ///
     /// A fresh token that already looks expired, or inside the window, means the box clock runs
     /// ahead of the server's. The book takes it, marks the entry skewed and refreshes it again
-    /// only after [`REFRESH_SKEW_MS`]. A skewed token counts as usable whatever the clock says.
+    /// only after [`REFRESH_SKEW_MS`]. A skewed token counts as usable until
+    /// [`REFRESH_SKEW_MS`] plus [`REFRESH_SKEW_SLACK_MS`] have passed since it was fetched.
     ///
     /// The old value is not forgotten by the book: the caller keeps it in the job redactor.
     /// With a [`Revoker`] attached, a swap revokes the replaced token on its own task, after
@@ -705,17 +801,24 @@ impl CredentialBook {
     /// # Errors
     ///
     /// Returns [`CredentialFailure::MintCap`] when the server's per-Job mint cap or per-User
-    /// mint rate limit is reached, and any other server refusal (lease lost, capability gone)
-    /// as its own variant. A reply with a bad identity returns
+    /// mint rate limit is reached, [`CredentialFailure::InstallationRefused`] or
+    /// [`CredentialFailure::RepoRefused`] when the allowlists now refuse the installation or
+    /// the repository, and any other server refusal (lease lost, capability gone) as its own
+    /// variant. A reply with a bad identity returns
     /// [`CredentialFailure::AppIdentityMissing`] or
     /// [`CredentialFailure::AppIdentityInvalid`]. None of these keeps the old token or falls
     /// back to a PAT; the caller fails the step. [`CredentialFailure::Unavailable`] and
     /// [`CredentialFailure::Expired`] are returned only once the held token has expired,
-    /// because before that the last good token stays in use. A skewed entry counts as usable
-    /// whatever the clock says, so it never returns either of them. A recorded retry wait more
+    /// because before that the last good token stays in use. A skewed entry has no expiry the
+    /// box clock can judge, so it counts as usable until [`REFRESH_SKEW_MS`] plus
+    /// [`REFRESH_SKEW_SLACK_MS`] have passed since it was fetched, and past that a transient
+    /// failure returns [`CredentialFailure::Expired`]. A recorded retry wait more
     /// than [`REFRESH_SKEW_MS`] ahead of the clock (the stale-wait guard, `wait_is_stale`) is
     /// ignored and the refresh goes ahead, so a clock that moved back cannot hold it off for
-    /// longer than that. [`CredentialFailure::Malformed`] is returned when the reply holds no
+    /// longer than that. An allowlist refusal ([`CredentialFailure::InstallationRefused`] or
+    /// [`CredentialFailure::RepoRefused`]) is sticky: the entry records it, and every later
+    /// call returns it with no fetch and no retry wait, so the held token is not reused for the
+    /// rest of the job. [`CredentialFailure::Malformed`] is returned when the reply holds no
     /// installation token or no expiry, or breaks any other reply rule.
     pub async fn refresh_if_due(
         &self,
@@ -753,24 +856,36 @@ impl CredentialBook {
             box_name,
             retry_at_ms,
             skewed,
+            fetched_at_ms,
+            refused,
         }) = self.snapshot(job_id)
         else {
             return Ok(None);
         };
+        if let Some(refused) = refused {
+            return Err(refused);
+        }
         let Some(expiry) = current.app_expires_at_ms() else {
             return Ok(None);
         };
         if expiry.saturating_sub(now) >= REFRESH_WINDOW_MS {
             return Ok(None);
         }
-        let usable = skewed || now < expiry;
+        let usable = if skewed {
+            now < fetched_at_ms
+                .saturating_add(REFRESH_SKEW_MS)
+                .saturating_add(REFRESH_SKEW_SLACK_MS)
+        } else {
+            now < expiry
+        };
+        let lapsed = if skewed {
+            CredentialFailure::Expired
+        } else {
+            CredentialFailure::Unavailable
+        };
         let wait_is_stale = retry_at_ms.saturating_sub(now) > REFRESH_SKEW_MS;
         if now < retry_at_ms && !wait_is_stale {
-            return if usable {
-                Ok(None)
-            } else {
-                Err(CredentialFailure::Unavailable)
-            };
+            return if usable { Ok(None) } else { Err(lapsed) };
         }
         let renewed = match self.client.fetch(job_id, attempt, &box_name).await {
             Ok(fresh) => current.refreshed(&fresh),
@@ -784,7 +899,7 @@ impl CredentialBook {
                 let next = Arc::new(next);
                 before_swap(&next);
                 let retry_at_ms = if skew { now + REFRESH_SKEW_MS } else { 0 };
-                let replaced = self.store(job_id, Arc::clone(&next), retry_at_ms, skew);
+                let replaced = self.store(job_id, Arc::clone(&next), retry_at_ms, skew, now);
                 if let Some(generation) = &replaced {
                     self.revoke_replaced(&current, &next, generation);
                 } else {
@@ -793,7 +908,14 @@ impl CredentialBook {
                 Ok(replaced.map(|_| next))
             }
             Err(failure) => {
-                self.back_off(job_id, now + REFRESH_RETRY_MS);
+                if matches!(
+                    failure,
+                    CredentialFailure::InstallationRefused | CredentialFailure::RepoRefused
+                ) {
+                    self.refuse(job_id, failure);
+                } else {
+                    self.back_off(job_id, now + REFRESH_RETRY_MS);
+                }
                 let transient = matches!(
                     failure,
                     CredentialFailure::Unavailable | CredentialFailure::Expired
@@ -804,6 +926,8 @@ impl CredentialBook {
                         "token refresh failed, keeping the held token"
                     );
                     Ok(None)
+                } else if transient {
+                    Err(lapsed)
                 } else {
                     Err(failure)
                 }
@@ -827,6 +951,8 @@ impl CredentialBook {
             box_name: entry.box_name.clone(),
             retry_at_ms: entry.retry_at_ms,
             skewed: entry.skewed,
+            fetched_at_ms: entry.fetched_at_ms,
+            refused: entry.refused,
         });
         drop(guard);
         snap
@@ -876,16 +1002,29 @@ impl CredentialBook {
         next: Arc<JobCredentials>,
         retry_at_ms: u64,
         skewed: bool,
+        fetched_at_ms: u64,
     ) -> Option<Arc<Generation>> {
         let mut guard = self.held.lock().unwrap_or_else(PoisonError::into_inner);
         let replaced = guard.get_mut(job_id).map(|entry| {
             entry.credentials = next;
             entry.retry_at_ms = retry_at_ms;
             entry.skewed = skewed;
+            entry.fetched_at_ms = fetched_at_ms;
             std::mem::take(&mut entry.generation)
         });
         drop(guard);
         replaced
+    }
+
+    fn refuse(&self, job_id: &str, failure: CredentialFailure) {
+        if let Some(entry) = self
+            .held
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .get_mut(job_id)
+        {
+            entry.refused = Some(failure);
+        }
     }
 
     fn back_off(&self, job_id: &str, retry_at_ms: u64) {
