@@ -222,6 +222,19 @@ async fn two_missing_tools_share_one_unit_start_and_one_mise_toml() {
     );
 }
 
+/// Returns the ten permission characters of an `ls -l` mode field, dropping a trailing `@` or `+` marker.
+fn mode_bits(field: &str) -> &str {
+    field.get(..10).unwrap_or(field)
+}
+
+#[test]
+fn mode_bits_keeps_ten_characters_and_rejects_a_wrong_mode() {
+    assert_eq!(mode_bits("-rw-r-----"), "-rw-r-----");
+    assert_eq!(mode_bits("-rw-r-----@"), "-rw-r-----");
+    assert_eq!(mode_bits("-rw-r-----+"), "-rw-r-----");
+    assert_ne!(mode_bits("-rw-r--r--@"), "-rw-r-----");
+}
+
 #[tokio::test]
 async fn mise_toml_belongs_to_the_job_group_with_mode_0640() {
     let fx = Fx::new();
@@ -230,7 +243,11 @@ async fn mise_toml_belongs_to_the_job_group_with_mode_0640() {
     install(&installer, &[jq()]).await.unwrap();
     let listing = fs::read_to_string(fx.state.join("seen-mise-ls")).unwrap();
     let mut fields = listing.split_whitespace();
-    assert_eq!(fields.next(), Some("-rw-r-----"));
+    assert_eq!(
+        fields.next().map(mode_bits),
+        Some("-rw-r-----"),
+        "{listing}"
+    );
     assert_eq!(fields.nth(2), Some(gid.to_string().as_str()), "{listing}");
 }
 
