@@ -18,6 +18,7 @@ pub mod https;
 pub mod limiter;
 pub mod password;
 pub mod pinned;
+pub mod release;
 pub mod repo_api;
 pub mod repo_fake;
 pub mod repo_limit;

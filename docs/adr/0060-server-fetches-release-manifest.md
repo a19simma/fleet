@@ -1,12 +1,12 @@
 # The server fetches the release manifest
 
-Status: Proposed 2026-11-07, partly built (FEED-2). The operator decided every point below. Amends
+Status: Proposed 2026-11-07, partly built (FEED-2, FEED-4). The operator decided every point below. Amends
 the relay description of ADR-0047 only. The trust model of ADR-0047 and ADR-0050 is unchanged. The
 build is tasks FEED-2 to FEED-7.
 
 Built (FEED-2): parsing of `FLEET_UPDATE_REPO` and `FLEET_UPDATE_POLL_SECS`, a poll range of 60 to
 86400 with default 900, and startup refusal of `FLEET_UPDATE_REPO` together with
-`FLEET_UPDATE_MANIFEST`. Not built: the fetch, the poll loop and the relay (FEED-4 to FEED-7). Today `UpdateRelay` (`crates/fleet-server/src/service.rs`) reads the
+`FLEET_UPDATE_MANIFEST`. Built (FEED-4): the fetch, in `ReleaseFetcher`, `crates/fleet-server/src/cred/release.rs`. Not built: the poll loop and the relay (FEED-5 to FEED-7). Today `UpdateRelay` (`crates/fleet-server/src/service.rs`) reads the
 manifest from a file named by `FLEET_UPDATE_MANIFEST` (`crates/fleet-server/src/config.rs`) and
 the signature from the same path plus `.minisig`. It relays both verbatim in `HeartbeatReply`. An
 operator must copy two files onto the server host after each release, and nobody does it. Boxes
@@ -22,7 +22,7 @@ bytes come from: the server fetches them from GitHub Releases itself.
 - `FLEET_UPDATE_REPO=owner/repo` names the repository. The server derives two URLs:
   `https://github.com/<repo>/releases/latest/download/manifest.json` and the same with
   `.minisig` appended.
-- `/releases/latest` skips drafts and prereleases (unverified, to be confirmed against GitHub docs before FEED-4). The release workflow
+- `/releases/latest` skips drafts and prereleases. Evidence, by kind: REST API docs say "The latest release is the most recent non-prerelease, non-draft release, sorted by the created_at attribute." ([Get the latest release](https://docs.github.com/en/rest/releases/releases#get-the-latest-release)). That page covers the REST API. That the web URL `/releases/latest/download/<asset>` follows the same rule is an inference from one live probe on 2026-11-07 (`cli/cli` v2.103.3, 302 then 302). The release workflow
   (`.github/workflows/release.yml`) uploads `manifest.json` and `manifest.json.minisig` to the
   draft release and publishes it last in `publish-release`, so `latest` never points at a release
   without a signed manifest. The feed is latest-only: there is no prerelease channel.

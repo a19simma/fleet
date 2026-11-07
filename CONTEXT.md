@@ -232,7 +232,7 @@ The default minisign public key embedded in the fleetd binary from `crates/fleet
 _Avoid_: update.pub, signing key
 
 **Release feed**:
-Planned, not built: the signed `manifest.json` and `manifest.json.minisig` of the latest published GitHub release of `FLEET_UPDATE_REPO`, which the server fetches itself on a timer. File mode (`FLEET_UPDATE_MANIFEST`) stays as break-glass (ADR-0060, ADR-0061).
+The feed is the signed `manifest.json` and `manifest.json.minisig` of the latest published GitHub release of `FLEET_UPDATE_REPO`, which the server fetches itself on a timer. Built: the redirect-following fetcher (`ReleaseFetcher`, ADR-0061). Not built: the poller, the cache and the relay wiring. File mode (`FLEET_UPDATE_MANIFEST`) stays as break-glass (ADR-0060, ADR-0061).
 _Avoid_: update channel, manifest URL
 
 **Update relay**:

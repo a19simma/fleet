@@ -22,6 +22,15 @@ pub use notice::CredentialNotice;
 /// additive only, so a new server serves an old fleetd. An old fleetd sends 0.
 pub const PROTOCOL_VERSION: u32 = 1;
 
+/// The only host of the first hop of a release download.
+pub const UPDATE_FIRST_HOP_HOST: &str = "github.com";
+
+/// The asset hosts a redirect may name, besides the first-hop host [`UPDATE_FIRST_HOP_HOST`]. Exact names only.
+pub const UPDATE_REDIRECT_HOSTS: [&str; 2] = [
+    "objects.githubusercontent.com",
+    "release-assets.githubusercontent.com",
+];
+
 /// Longest signed update manifest, in bytes, in `HeartbeatReply.update_manifest`. The server
 /// relays no more and fleetd reads no more.
 pub const MAX_MANIFEST_BYTES: usize = 16 * 1024;

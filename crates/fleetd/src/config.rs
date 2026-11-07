@@ -45,9 +45,9 @@ const MAX_FETCH_TOTAL_SECS: u64 = 300;
 const MAX_FETCH_REDIRECTS: u64 = 10;
 const MAX_FETCH_PER_JOB: u64 = 1000;
 const DEFAULT_UPDATE_HOSTS: [&str; 3] = [
-    "github.com",
-    "objects.githubusercontent.com",
-    "release-assets.githubusercontent.com",
+    fleet_proto::UPDATE_FIRST_HOP_HOST,
+    fleet_proto::UPDATE_REDIRECT_HOSTS[0],
+    fleet_proto::UPDATE_REDIRECT_HOSTS[1],
 ];
 const DEFAULT_HOOK_EVENTS: [&str; 7] = [
     "SessionStart",
@@ -884,6 +884,14 @@ mod tests {
     use fleet_core::model_allowlist::ModelAllowlistError;
 
     use super::*;
+
+    #[test]
+    fn default_update_hosts_are_the_first_hop_host_plus_the_redirect_hosts() {
+        let expected: Vec<&str> = std::iter::once(fleet_proto::UPDATE_FIRST_HOP_HOST)
+            .chain(fleet_proto::UPDATE_REDIRECT_HOSTS)
+            .collect();
+        assert_eq!(DEFAULT_UPDATE_HOSTS.to_vec(), expected);
+    }
 
     fn caps(text: &str) -> Result<(u32, f64), Error> {
         Config::resolve(Some(text), &env_of(&[])).map(|cfg| (cfg.max_turns, cfg.max_budget_usd))

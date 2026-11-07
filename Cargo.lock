@@ -959,6 +959,7 @@ dependencies = [
  "tower",
  "tracing",
  "tracing-subscriber",
+ "url",
  "webauthn-authenticator-rs",
  "webauthn-rs",
  "webpki-roots",

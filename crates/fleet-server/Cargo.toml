@@ -41,8 +41,10 @@ rustix.workspace = true
 pem = "4.0.0"
 sqlx = { version = "0.9.0", default-features = false, features = ["runtime-tokio", "tls-rustls-ring-webpki", "postgres", "migrate", "macros"] }
 argon2 = "0.5.3"
+url = "2.5.8"
 
 [dev-dependencies]
+tokio = { workspace = true, features = ["test-util"] }
 rcgen = { version = "0.14.10", default-features = false, features = ["pem", "ring"] }
 webauthn-authenticator-rs = { version = "=0.5.5", features = ["softpasskey"] }
 
