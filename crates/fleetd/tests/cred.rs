@@ -1898,7 +1898,6 @@ async fn a_refresh_that_fails_never_revokes_the_last_good_token() -> TestResult 
         Err(Status::failed_precondition(PRECONDITION_EXPIRED)),
         Err(Status::permission_denied("lease")),
         Ok(good()),
-        Ok(app_reply(NEW_TOKEN, None)),
     ] {
         let (book, fake, revokes) = revoking(5 * MINUTE_MS, "204 No Content", false).await?;
         set_reply(&fake, failure);
@@ -2148,5 +2147,120 @@ async fn a_lease_needs_a_held_job() -> TestResult {
     assert!(book.lease("job9").is_none());
     book.forget("job1");
     assert!(book.lease("job1").is_none());
+    Ok(())
+}
+
+#[test]
+fn the_request_timeout_is_the_shared_call_budget() {
+    assert_eq!(fleetd::poller::REQUEST_TIMEOUT, fleet_proto::CALL_BUDGET);
+}
+
+const THIRD_TOKEN: &str = "ghs_ThirdTokenOfTheNewAttempt0123456789AB";
+
+fn rejected_replies() -> Vec<(&'static str, CredentialFailure, GetJobCredentialsReply)> {
+    let mut no_identity = app_wire(NEW_TOKEN, BOT_NAME, BOT_EMAIL);
+    no_identity.git_identity = None;
+    let bad_identity = app_wire(NEW_TOKEN, "bad\nname", BOT_EMAIL);
+    let ok_app = app_wire(NEW_TOKEN, BOT_NAME, BOT_EMAIL);
+    let two_forges = vec![
+        ok_app,
+        wire("github_pat", "static_secret", GITHUB),
+        agent_wire(),
+    ];
+    vec![
+        (
+            "identity missing",
+            CredentialFailure::AppIdentityMissing,
+            GetJobCredentialsReply {
+                credentials: vec![no_identity, agent_wire()],
+            },
+        ),
+        (
+            "identity invalid",
+            CredentialFailure::AppIdentityInvalid,
+            GetJobCredentialsReply {
+                credentials: vec![bad_identity, agent_wire()],
+            },
+        ),
+        (
+            "no expiry",
+            CredentialFailure::Malformed,
+            app_reply(NEW_TOKEN, None),
+        ),
+        (
+            "malformed",
+            CredentialFailure::Malformed,
+            GetJobCredentialsReply {
+                credentials: two_forges,
+            },
+        ),
+    ]
+}
+
+#[tokio::test]
+async fn a_fetch_reply_the_client_rejects_revokes_the_app_token_it_carried() -> TestResult {
+    for (name, want, reply) in rejected_replies() {
+        let (url, _fake) = spawn_fake(Ok(reply)).await?;
+        let (endpoint, revokes) = revoke_endpoint("204 No Content", false).await?;
+        let client = CredentialClient::new(channel(&url)?, TOKEN)?;
+        let book = CredentialBook::new(client).with_revoker(Arc::new(endpoint));
+        let got = book.fetch("job1", 1, &box_name()).await;
+        assert_eq!(got.err(), Some(want), "{name}");
+        eventually_count(&revokes, 1).await?;
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert_eq!(revokes.tokens(), [format!("Bearer {NEW_TOKEN}")], "{name}");
+        assert!(book.get("job1").is_none(), "{name}");
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_refresh_reply_the_client_rejects_revokes_its_token_and_keeps_the_held_one() -> TestResult
+{
+    for (name, want, reply) in rejected_replies() {
+        let (book, fake, revokes) = revoking(5 * MINUTE_MS, "204 No Content", false).await?;
+        set_reply(&fake, Ok(reply));
+        let got = book.refresh_if_due("job1").await;
+        assert_eq!(got.err(), Some(want), "{name}");
+        eventually_count(&revokes, 1).await?;
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert_eq!(revokes.tokens(), [format!("Bearer {NEW_TOKEN}")], "{name}");
+        assert_eq!(github_text(&book).as_deref(), Some(APP_TOKEN), "{name}");
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_late_refresh_cannot_overwrite_a_refetched_entry_and_its_token_is_revoked() -> TestResult
+{
+    let (book, fake, revokes) = revoking(5 * MINUTE_MS, "204 No Content", false).await?;
+    *fake.gate_job.lock().unwrap_or_else(PoisonError::into_inner) = Some("job1".to_owned());
+    let refresh = tokio::spawn({
+        let book = Arc::clone(&book);
+        async move { book.refresh_if_due("job1").await }
+    });
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    while calls(&fake) < 2 {
+        assert!(std::time::Instant::now() < deadline, "refresh never called");
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    *fake.gate_job.lock().unwrap_or_else(PoisonError::into_inner) = None;
+    set_reply(
+        &fake,
+        Ok(app_reply(THIRD_TOKEN, Some(NOW_MS + 60 * MINUTE_MS))),
+    );
+    book.fetch("job1", 5, &box_name()).await?;
+    set_reply(&fake, fresh_reply());
+    fake.release.notify_one();
+    let late = tokio::time::timeout(Duration::from_secs(5), refresh).await??;
+    assert!(late?.is_none());
+    assert_eq!(github_text(&book).as_deref(), Some(THIRD_TOKEN));
+    eventually_count(&revokes, 2).await?;
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    let mut tokens = revokes.tokens();
+    tokens.sort();
+    let mut want = vec![format!("Bearer {APP_TOKEN}"), format!("Bearer {NEW_TOKEN}")];
+    want.sort();
+    assert_eq!(tokens, want);
     Ok(())
 }

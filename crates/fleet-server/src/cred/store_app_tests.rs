@@ -210,6 +210,9 @@ async fn fake_with(
                     let (status, body) = app.lock().unwrap().clone();
                     http(status, &body)
                 } else if is_mint {
+                    if mint_status == "HANG" {
+                        tokio::time::sleep(Duration::from_secs(3600)).await;
+                    }
                     if let Some((pool, sql)) = hook {
                         let mut conn = pool.acquire().await.unwrap();
                         sqlx::query("SET lock_timeout = '500ms'")
@@ -305,6 +308,18 @@ async fn world_limited(
     policy: AppPolicy,
     limit: Option<usize>,
 ) -> World {
+    let lane = lane.map(|client| {
+        let bot = BotIdentity::new(BOT_NAME, BOT_EMAIL).unwrap();
+        AppLane::new(app_key(), "12345".to_owned(), client, bot, policy)
+    });
+    world_built(pool, lane, limit).await
+}
+
+async fn world_with_lane(pool: PgPool, lane: AppLane) -> World {
+    world_built(pool, Some(lane), None).await
+}
+
+async fn world_built(pool: PgPool, lane: Option<AppLane>, limit: Option<usize>) -> World {
     Store::new(pool.clone()).migrate().await.unwrap();
     let path = std::env::temp_dir().join(format!(
         "fleet-app-lane-{}-{}.keys",
@@ -319,15 +334,8 @@ async fn world_limited(
         Some(limit) => CredentialStore::with_limit(pool.clone(), sealer, limit),
         None => CredentialStore::new(pool.clone(), sealer),
     };
-    if let Some(client) = lane {
-        let bot = BotIdentity::new(BOT_NAME, BOT_EMAIL).unwrap();
-        creds = creds.with_github_app(AppLane::new(
-            app_key(),
-            "12345".to_owned(),
-            client,
-            bot,
-            policy.clone(),
-        ));
+    if let Some(lane) = lane {
+        creds = creds.with_github_app(lane);
     }
     World {
         caps: Capabilities::new(pool.clone()),
@@ -1244,6 +1252,98 @@ async fn a_release_dropped_after_the_mint_revokes_the_token(pool: PgPool) {
     })
     .await;
     assert_eq!(w.uses().await, 0);
+}
+
+#[sqlx::test]
+async fn a_release_dropped_mid_mint_closes_the_attempt_as_failed_and_keeps_the_cap_slot(
+    pool: PgPool,
+) {
+    let probe = fake("HANG", None).await;
+    let w = world(pool, Some(client(&probe))).await;
+    w.seed(true).await;
+    let release = tokio::time::timeout(
+        Duration::from_millis(1500),
+        w.creds.release_for_job(JOB, 1, "alpha"),
+    )
+    .await;
+    assert!(release.is_err(), "the release finished instead of hanging");
+    assert_eq!(probe.mints(), 1);
+    eventually("the failed row after the drop", || async {
+        w.rows().await
+            == [
+                ("attempt".to_owned(), None),
+                ("failed".to_owned(), Some("mint cancelled".to_owned())),
+            ]
+    })
+    .await;
+    let spent: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM github_app_mint WHERE job_id = $1 AND scope = 'job' AND outcome = 'attempt'",
+    )
+    .bind(JOB)
+    .fetch_one(&w.pool)
+    .await
+    .unwrap();
+    assert_eq!(spent, 1);
+    assert_eq!(w.uses().await, 0);
+}
+
+#[sqlx::test]
+async fn a_probe_dropped_mid_mint_closes_the_attempt_as_failed(pool: PgPool) {
+    let probe = fake("HANG", None).await;
+    let w = world(pool, Some(client(&probe))).await;
+    w.seed(true).await;
+    let credential: i64 =
+        sqlx::query_scalar("SELECT id FROM credentials WHERE kind = 'github_app'")
+            .fetch_one(&w.pool)
+            .await
+            .unwrap();
+    let dropped = tokio::time::timeout(
+        Duration::from_millis(1500),
+        w.creds
+            .probe_app(w.alice, credential, &Secret::new(INSTALLATION.to_string())),
+    )
+    .await;
+    assert!(dropped.is_err(), "the probe finished instead of hanging");
+    eventually("the failed row after the drop", || async {
+        w.outcomes().await == ["attempt", "failed"]
+    })
+    .await;
+}
+
+#[sqlx::test]
+async fn a_lookup_and_mint_that_outlast_the_budget_fail_the_release_and_close_the_attempt(
+    pool: PgPool,
+) {
+    let probe = fake("HANG", None).await;
+    let lane = bare_lane(&probe).with_budget(Duration::from_millis(400));
+    let w = world_with_lane(pool, lane).await;
+    w.seed(true).await;
+    let started = std::time::Instant::now();
+    let err = tokio::time::timeout(
+        Duration::from_secs(5),
+        w.creds.release_for_job(JOB, 1, "alpha"),
+    )
+    .await
+    .expect("the budget did not end the release")
+    .unwrap_err();
+    assert!(matches!(err, StoreError::MintFailed), "{err:?}");
+    assert!(started.elapsed() < Duration::from_secs(4));
+    assert_eq!(
+        w.rows().await,
+        [
+            ("attempt".to_owned(), None),
+            ("failed".to_owned(), Some("mint failed".to_owned())),
+        ]
+    );
+}
+
+#[test]
+fn the_server_mint_budget_fits_under_the_client_call_budget() {
+    assert!(super::store::MINT_BUDGET < fleet_proto::CALL_BUDGET);
+    assert_eq!(
+        super::store::MINT_BUDGET + super::store::MINT_HEADROOM,
+        fleet_proto::CALL_BUDGET
+    );
 }
 
 #[sqlx::test]

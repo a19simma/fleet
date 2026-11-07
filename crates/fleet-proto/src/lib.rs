@@ -113,6 +113,14 @@ pub fn is_swarm_branch(text: &str) -> bool {
 /// Longest credential value a client may put and a box may receive, in bytes.
 pub const MAX_CREDENTIAL_VALUE_BYTES: usize = fleet_core::credential::MAX_CREDENTIAL_LEN;
 
+/// The longest one `GetJobCredentials` call may take, as both sides plan it.
+///
+/// fleetd sets it as the channel timeout, which tonic sends as the `grpc-timeout` deadline, so the
+/// server drops the handler at this mark. The server fits its GitHub installation lookup and
+/// token mint inside it with headroom to record the outcome, so a mint never straddles the
+/// deadline (ADR-0058, SEC-010).
+pub const CALL_BUDGET: std::time::Duration = std::time::Duration::from_secs(10);
+
 /// Path prefix of `FleetCapabilityAdmin`, with the trailing slash the auth layer matches on.
 /// No bearer token scope covers it.
 pub const CAPABILITY_ADMIN_PATH: &str = "/fleet.v1.FleetCapabilityAdmin/";

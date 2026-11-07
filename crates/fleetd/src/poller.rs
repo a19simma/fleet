@@ -56,12 +56,16 @@ const JITTER: f64 = 0.4;
 /// Longest the poller waits after an idle reply, whatever `next_in_s` says.
 pub const MAX_IDLE_WAIT: Duration = Duration::from_secs(300);
 
-/// Timeout applied to every `ClaimJob` call.
-pub const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
+/// Timeout applied to every call on the poller channel, `ClaimJob` and `GetJobCredentials`
+/// included. It is [`fleet_proto::CALL_BUDGET`], which the server fits its mint budget inside;
+/// change it there (ADR-0058, SEC-010).
+pub const REQUEST_TIMEOUT: Duration = fleet_proto::CALL_BUDGET;
 
 /// Hard bound on a claim or report call. It exceeds [`REQUEST_TIMEOUT`] so the channel timeout
 /// fires first on a slow reply, and it catches a TLS handshake that never completes.
-pub const CALL_BACKSTOP: Duration = Duration::from_secs(11);
+pub const CALL_BACKSTOP: Duration = REQUEST_TIMEOUT.saturating_add(Duration::from_secs(1));
+
+const _: () = assert!(CALL_BACKSTOP.as_secs() > REQUEST_TIMEOUT.as_secs());
 
 /// Longest the poller waits for a claim already in flight when shutdown starts.
 pub const CLAIM_GRACE: Duration = Duration::from_secs(1);

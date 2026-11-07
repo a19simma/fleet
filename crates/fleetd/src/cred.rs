@@ -31,7 +31,8 @@
 //! that fails the step with the expired reason.
 //!
 //! With a [`Revoker`] attached the book revokes the token a refresh replaced, and the held
-//! token when the job ends (ADR-0058, SEC-010).
+//! token when the job ends (ADR-0058, SEC-010). It also revokes an installation token that sat
+//! in a reply it rejected, and the token of a refresh whose entry a later fetch replaced.
 //!
 //! A [`TokenLease`] holds a replaced token live until the child that started with it exits, up
 //! to [`DRAIN_LIMIT`].
@@ -500,7 +501,7 @@ impl CredentialClient {
         job_id: &str,
         attempt: u32,
         box_name: &str,
-    ) -> Result<JobCredentials, CredentialFailure> {
+    ) -> Result<JobCredentials, Rejected> {
         let request = GetJobCredentialsRequest {
             job_id: job_id.to_owned(),
             attempt,
@@ -509,11 +510,35 @@ impl CredentialClient {
         let mut client = self.client();
         let call = tokio::time::timeout(self.backstop, client.get_job_credentials(request)).await;
         let reply = call
-            .map_err(|_| CredentialFailure::Unavailable)?
-            .map_err(|status| CredentialFailure::from_status(&status))?
+            .map_err(|_| Rejected::from(CredentialFailure::Unavailable))?
+            .map_err(|status| Rejected::from(CredentialFailure::from_status(&status)))?
             .into_inner();
-        JobCredentials::from_reply(reply)
+        let tokens = app_tokens(&reply);
+        JobCredentials::from_reply(reply).map_err(|failure| Rejected { failure, tokens })
     }
+}
+
+struct Rejected {
+    failure: CredentialFailure,
+    tokens: Vec<Zeroizing<String>>,
+}
+
+impl From<CredentialFailure> for Rejected {
+    fn from(failure: CredentialFailure) -> Self {
+        Self {
+            failure,
+            tokens: Vec::new(),
+        }
+    }
+}
+
+fn app_tokens(reply: &GetJobCredentialsReply) -> Vec<Zeroizing<String>> {
+    reply
+        .credentials
+        .iter()
+        .filter(|wire| wire.kind == GITHUB_INSTALLATION_TOKEN_KIND)
+        .map(|wire| Zeroizing::new(wire.value.clone()))
+        .collect()
 }
 
 /// The time source of the refresh decision, in milliseconds since the Unix epoch. A test
@@ -748,7 +773,8 @@ impl CredentialBook {
     /// [`CredentialFailure::RepoRefused`]. Any other status, a timeout or a transport error is
     /// [`CredentialFailure::Unavailable`]. A reply that breaks a rule is
     /// [`CredentialFailure::Malformed`], [`CredentialFailure::AppIdentityMissing`] or
-    /// [`CredentialFailure::AppIdentityInvalid`].
+    /// [`CredentialFailure::AppIdentityInvalid`]; the installation token in such a reply is
+    /// revoked, because the server already minted and committed it.
     pub async fn fetch(
         &self,
         job_id: &str,
@@ -756,7 +782,7 @@ impl CredentialBook {
         box_name: &str,
     ) -> Result<Arc<JobCredentials>, CredentialFailure> {
         self.end(job_id);
-        let credentials = Arc::new(self.client.fetch(job_id, attempt, box_name).await?);
+        let credentials = Arc::new(self.fetch_checked(job_id, attempt, box_name).await?);
         let fetched_at_ms = self.clock.now_ms();
         self.held
             .lock()
@@ -806,8 +832,10 @@ impl CredentialBook {
     /// the repository, and any other server refusal (lease lost, capability gone) as its own
     /// variant. A reply with a bad identity returns
     /// [`CredentialFailure::AppIdentityMissing`] or
-    /// [`CredentialFailure::AppIdentityInvalid`]. None of these keeps the old token or falls
-    /// back to a PAT; the caller fails the step. [`CredentialFailure::Unavailable`] and
+    /// [`CredentialFailure::AppIdentityInvalid`], and the installation token in that reply is
+    /// revoked, as is the token of a [`CredentialFailure::Malformed`] reply and the fresh token
+    /// of a reply whose swap `refreshed` refuses. None of these keeps the old token or falls back to a PAT; the caller fails the
+    /// step. [`CredentialFailure::Unavailable`] and
     /// [`CredentialFailure::Expired`] are returned only once the held token has expired,
     /// because before that the last good token stays in use. A skewed entry has no expiry the
     /// box clock can judge, so it counts as usable until [`REFRESH_SKEW_MS`] plus
@@ -820,6 +848,10 @@ impl CredentialBook {
     /// call returns it with no fetch and no retry wait, so the held token is not reused for the
     /// rest of the job. [`CredentialFailure::Malformed`] is returned when the reply holds no
     /// installation token or no expiry, or breaks any other reply rule.
+    ///
+    /// Returns `Ok(None)` when no refresh was due, and also when a `fetch` for the same job id
+    /// replaced the entry while the refresh ran: the fresh token is then revoked and stored
+    /// nowhere.
     pub async fn refresh_if_due(
         &self,
         job_id: &str,
@@ -887,8 +919,8 @@ impl CredentialBook {
         if now < retry_at_ms && !wait_is_stale {
             return if usable { Ok(None) } else { Err(lapsed) };
         }
-        let renewed = match self.client.fetch(job_id, attempt, &box_name).await {
-            Ok(fresh) => current.refreshed(&fresh),
+        let renewed = match self.fetch_checked(job_id, attempt, &box_name).await {
+            Ok(fresh) => self.renewed(&current, &fresh),
             Err(failure) => Err(failure),
         };
         match renewed {
@@ -899,7 +931,7 @@ impl CredentialBook {
                 let next = Arc::new(next);
                 before_swap(&next);
                 let retry_at_ms = if skew { now + REFRESH_SKEW_MS } else { 0 };
-                let replaced = self.store(job_id, Arc::clone(&next), retry_at_ms, skew, now);
+                let replaced = self.store(job_id, &turn, Arc::clone(&next), retry_at_ms, skew, now);
                 if let Some(generation) = &replaced {
                     self.revoke_replaced(&current, &next, generation);
                 } else {
@@ -933,6 +965,33 @@ impl CredentialBook {
                 }
             }
         }
+    }
+
+    async fn fetch_checked(
+        &self,
+        job_id: &str,
+        attempt: u32,
+        box_name: &str,
+    ) -> Result<JobCredentials, CredentialFailure> {
+        match self.client.fetch(job_id, attempt, box_name).await {
+            Ok(credentials) => Ok(credentials),
+            Err(Rejected { failure, tokens }) => {
+                for token in tokens {
+                    self.revoke_value(token, None);
+                }
+                Err(failure)
+            }
+        }
+    }
+
+    fn renewed(
+        &self,
+        current: &JobCredentials,
+        fresh: &JobCredentials,
+    ) -> Result<JobCredentials, CredentialFailure> {
+        current
+            .refreshed(fresh)
+            .inspect_err(|_| self.revoke_app_token(fresh, None))
     }
 
     fn turn(&self, job_id: &str) -> Option<Arc<tokio::sync::Mutex<()>>> {
@@ -970,14 +1029,18 @@ impl CredentialBook {
     }
 
     fn revoke_app_token(&self, credentials: &JobCredentials, drain: Option<Arc<Generation>>) {
-        let Some(revoker) = &self.revoker else {
-            return;
-        };
         let Some(token) = credentials.app_token() else {
             return;
         };
         let Ok(token) = std::str::from_utf8(token.expose()).map(|t| Zeroizing::new(t.to_owned()))
         else {
+            return;
+        };
+        self.revoke_value(token, drain);
+    }
+
+    fn revoke_value(&self, token: Zeroizing<String>, drain: Option<Arc<Generation>>) {
+        let Some(revoker) = &self.revoker else {
             return;
         };
         let Ok(runtime) = tokio::runtime::Handle::try_current() else {
@@ -999,19 +1062,23 @@ impl CredentialBook {
     fn store(
         &self,
         job_id: &str,
+        turn: &Arc<tokio::sync::Mutex<()>>,
         next: Arc<JobCredentials>,
         retry_at_ms: u64,
         skewed: bool,
         fetched_at_ms: u64,
     ) -> Option<Arc<Generation>> {
         let mut guard = self.held.lock().unwrap_or_else(PoisonError::into_inner);
-        let replaced = guard.get_mut(job_id).map(|entry| {
-            entry.credentials = next;
-            entry.retry_at_ms = retry_at_ms;
-            entry.skewed = skewed;
-            entry.fetched_at_ms = fetched_at_ms;
-            std::mem::take(&mut entry.generation)
-        });
+        let replaced = guard
+            .get_mut(job_id)
+            .filter(|entry| Arc::ptr_eq(&entry.turn, turn))
+            .map(|entry| {
+                entry.credentials = next;
+                entry.retry_at_ms = retry_at_ms;
+                entry.skewed = skewed;
+                entry.fetched_at_ms = fetched_at_ms;
+                std::mem::take(&mut entry.generation)
+            });
         drop(guard);
         replaced
     }
@@ -1082,7 +1149,53 @@ impl CredentialBook {
 
 #[cfg(test)]
 mod tests {
-    use super::bearer_header;
+    use super::{
+        Arc, Credential, CredentialBook, CredentialClient, CredentialKind, JobCredentials, Secret,
+        bearer_header,
+    };
+    use crate::revoke::Revoker;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::time::Duration;
+    use tokio::io::AsyncReadExt;
+    use tokio::net::TcpListener;
+
+    #[tokio::test]
+    async fn a_refresh_whose_swap_fails_revokes_the_token_it_got() {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let hits = Arc::new(AtomicUsize::new(0));
+        let seen = Arc::clone(&hits);
+        tokio::spawn(async move {
+            while let Ok((mut stream, _)) = listener.accept().await {
+                let mut buf = [0_u8; 512];
+                let _ = stream.read(&mut buf).await;
+                seen.fetch_add(1, Ordering::SeqCst);
+            }
+        });
+        let channel = tonic::transport::Endpoint::from_static("http://127.0.0.1:1").connect_lazy();
+        let client = CredentialClient::new(channel, "tok").unwrap();
+        let book = CredentialBook::new(client).with_revoker(Arc::new(
+            Revoker::plain(addr).with_timeout(Duration::from_millis(300)),
+        ));
+        let held = JobCredentials {
+            items: Vec::new(),
+            identity: None,
+        };
+        let fresh = JobCredentials {
+            items: vec![Credential {
+                kind: CredentialKind::GithubApp,
+                value: Arc::new(Secret::new("ghs_Fresh0123456789".to_owned())),
+                expires_at_ms: None,
+            }],
+            identity: None,
+        };
+        assert!(book.renewed(&held, &fresh).is_err());
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while hits.load(Ordering::SeqCst) == 0 {
+            assert!(std::time::Instant::now() < deadline, "no revoke arrived");
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }
 
     #[test]
     fn the_authorization_header_is_sensitive() {

@@ -4,7 +4,7 @@
 
 use std::fmt;
 use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use fleet_core::capability::Capability;
 use fleet_core::credential::{
@@ -132,7 +132,22 @@ pub const MINT_RATE_WINDOW_SECS: i64 = 60;
 /// this many seconds, so a Box that retries at the cap cannot grow the audit table.
 pub const DENIED_DEDUPE_SECS: i64 = 60;
 
+/// The longest the installation lookup and the token mint may take together on a release, a
+/// refresh or a verify. A release or refresh finishes inside [`fleet_proto::CALL_BUDGET`] with
+/// [`MINT_HEADROOM`] left.
+pub const MINT_BUDGET: Duration = Duration::from_secs(7);
+
+/// What the server keeps of [`fleet_proto::CALL_BUDGET`] for the database writes around the
+/// mint: the outcome row, the recheck and the revoke.
+pub const MINT_HEADROOM: Duration = Duration::from_secs(3);
+
+const _: () = assert!(
+    MINT_BUDGET.as_secs() + MINT_HEADROOM.as_secs() == fleet_proto::CALL_BUDGET.as_secs(),
+    "the mint budget and its headroom must add up to the client call budget"
+);
+
 const REASON_CAP: &str = "job mint cap";
+const REASON_CANCELLED: &str = "mint cancelled";
 const REASON_USER_RATE: &str = "user mint rate";
 const REASON_MINT_FAILED: &str = "mint failed";
 const REASON_LEASE: &str = "lease lost after mint";
@@ -317,6 +332,51 @@ impl Drop for RevokeGuard {
     }
 }
 
+/// Closes an `attempt` row as `failed` when the future that holds it is dropped before the mint
+/// returns.
+///
+/// The write-ahead `attempt` row exists before the GitHub calls. A dropped handler (the client
+/// gave up, tonic enforced the deadline or the process is stopping) would leave it with no
+/// outcome. GitHub may already have created a token that nothing holds and nothing can revoke,
+/// because its value was never read. The row still counts toward the per-Job cap and the
+/// per-User rate: the token may exist, so the slot stays spent.
+struct AttemptGuard {
+    open: Option<(PgPool, MintRecord, String)>,
+}
+
+impl AttemptGuard {
+    fn open(pool: &PgPool, record: &MintRecord, attempt_id: &str) -> Self {
+        Self {
+            open: Some((pool.clone(), record.clone(), attempt_id.to_owned())),
+        }
+    }
+
+    fn close(&mut self) {
+        self.open = None;
+    }
+}
+
+impl Drop for AttemptGuard {
+    fn drop(&mut self) {
+        let Some((pool, record, attempt_id)) = self.open.take() else {
+            return;
+        };
+        if let Ok(runtime) = tokio::runtime::Handle::try_current() {
+            runtime.spawn(async move {
+                record
+                    .outcome_pooled(&pool, &attempt_id, "failed", Some(REASON_CANCELLED))
+                    .await;
+            });
+        } else {
+            tracing::error!(
+                %attempt_id,
+                credential_id = record.credential_id,
+                "github app mint attempt not closed: guard dropped outside a runtime"
+            );
+        }
+    }
+}
+
 #[cfg(test)]
 pub(super) fn armed_guard_for_test(
     lane: AppLane,
@@ -393,6 +453,7 @@ pub struct AppLane {
     identity: BotIdentity,
     policy: AppPolicy,
     directory: Option<Arc<dyn InstallationDirectory>>,
+    budget: Duration,
 }
 
 impl AppLane {
@@ -482,18 +543,22 @@ impl AppLane {
         repo: &str,
     ) -> Result<InstallationToken, StoreError> {
         let (jwt, now) = self.sign()?;
-        self.bind_installation(&jwt, installation).await?;
-        match self
-            .client
-            .mint(&jwt, installation, repo_name(repo), now)
+        let within = async {
+            self.bind_installation(&jwt, installation).await?;
+            self.client
+                .mint(&jwt, installation, repo_name(repo), now)
+                .await
+                .map_err(|err| {
+                    tracing::warn!(error = %err, "github app token mint failed");
+                    StoreError::MintFailed
+                })
+        };
+        tokio::time::timeout(self.budget, within)
             .await
-        {
-            Ok(token) => Ok(token),
-            Err(err) => {
-                tracing::warn!(error = %err, "github app token mint failed");
+            .unwrap_or_else(|_| {
+                tracing::warn!("github app lookup and mint outlasted the budget");
                 Err(StoreError::MintFailed)
-            }
-        }
+            })
     }
 
     /// Compares the configured App id with the one GitHub reports for the key.
@@ -540,7 +605,15 @@ impl AppLane {
             identity,
             policy,
             directory: None,
+            budget: MINT_BUDGET,
         }
+    }
+
+    /// Replaces the lookup and mint budget, [`MINT_BUDGET`] by default. A seam for tests.
+    #[must_use]
+    pub const fn with_budget(mut self, budget: Duration) -> Self {
+        self.budget = budget;
+        self
     }
 
     /// Reads installations through `directory` instead of the client, for tests that cannot
@@ -1118,7 +1191,9 @@ impl CredentialStore {
     /// Returns [`StoreError::NotFound`] when the credential row is gone or tombstoned after
     /// the mint.
     /// Returns [`StoreError::MintFailed`] when the App token cannot be minted, which covers a
-    /// failed installation lookup and a signing failure.
+    /// failed installation lookup, a signing failure and a lookup plus mint that outlasts
+    /// [`MINT_BUDGET`]. A future dropped before the mint returns closes its `attempt` row as
+    /// `failed` with reason `mint cancelled`; the row keeps its slot against the cap.
     /// Returns [`StoreError::MintCapReached`] when the Job already holds the cap of mint
     /// attempts or the User started the per-minute limit of them.
     /// Returns [`StoreError::InstallationDenied`] when the installation is not on the
@@ -1266,7 +1341,10 @@ impl CredentialStore {
             return Err(self.refuse(tx, &record, err).await);
         }
         let attempt_id = self.admit(tx, &record, user_id).await?;
-        let token = match lane.mint(&released, repo).await {
+        let mut open = AttemptGuard::open(&self.pool, &record, &attempt_id);
+        let minting = lane.mint(&released, repo).await;
+        open.close();
+        let token = match minting {
             Ok(token) => token,
             Err(err) => {
                 let (outcome, reason) = mint_failure_outcome(&err);
@@ -1439,7 +1517,8 @@ impl CredentialStore {
     /// row and counts the User's attempts of the last minute against the per-User rate limit. The
     /// row has scope `probe`, so it never counts toward the per-Job cap of any Job. Under
     /// that limit it writes an `attempt` row and commits, and then the mint runs: no row
-    /// lock is held across the network call. A mint failure writes `failed`. A mint writes
+    /// lock is held across the network call. A mint failure writes `failed`, and so does a future
+    /// dropped before the mint returns, with reason `mint cancelled`. A mint writes
     /// `minted`, and the revoke then writes `revoked` or `revoke_failed`. A guard revokes the
     /// token when this future is dropped between the mint and the revoke. The token never
     /// leaves this function. No use row is written.
@@ -1453,8 +1532,8 @@ impl CredentialStore {
     /// [`StoreError::InstallationDenied`] when the installation is not allowed or fails the
     /// binding, [`StoreError::RepoDenied`] when the Job repository is not allowed,
     /// [`StoreError::MintFailed`] when the lane is absent, the installation id is malformed,
-    /// the installation lookup or the mint fails or GitHub refuses the revoke, and
-    /// [`StoreError::Db`] for a database failure.
+    /// the installation lookup or the mint fails or outlasts [`MINT_BUDGET`], or GitHub refuses
+    /// the revoke, and [`StoreError::Db`] for a database failure.
     pub async fn probe_app(
         &self,
         user_id: i64,
@@ -1493,7 +1572,10 @@ impl CredentialStore {
             return Err(self.refuse(tx, &record, err).await);
         }
         let attempt_id = self.admit(tx, &record, user_id).await?;
-        let token = match lane.mint_installation(installation, &repo).await {
+        let mut open = AttemptGuard::open(&self.pool, &record, &attempt_id);
+        let minting = lane.mint_installation(installation, &repo).await;
+        open.close();
+        let token = match minting {
             Ok(token) => token,
             Err(err) => {
                 let (outcome, reason) = mint_failure_outcome(&err);
