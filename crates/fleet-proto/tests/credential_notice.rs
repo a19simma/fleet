@@ -3,11 +3,11 @@
 use std::collections::BTreeSet;
 
 use fleet_proto::{
-    CredentialNotice, ERR_CAPABILITY_NOT_GRANTED, ERR_GITHUB_REJECTED, ERR_NEEDS_USER_TOKEN,
-    PRECONDITION_APP_INSTALLATION, PRECONDITION_APP_MINT, PRECONDITION_APP_MINT_RATE,
-    PRECONDITION_APP_REPO, PRECONDITION_CREDENTIAL_TOMBSTONED, PRECONDITION_EXPIRED,
-    PRECONDITION_NO_AGENT, PRECONDITION_NO_GITHUB, PRECONDITION_NO_VERIFY_REPO,
-    PRECONDITION_NOT_CONFIGURED,
+    CredentialNotice, ERR_CAPABILITY_NOT_GRANTED, ERR_GITHUB_REJECTED, ERR_LEASE_MISMATCH,
+    ERR_NEEDS_USER_TOKEN, PRECONDITION_APP_INSTALLATION, PRECONDITION_APP_MINT,
+    PRECONDITION_APP_MINT_CAP, PRECONDITION_APP_MINT_RATE, PRECONDITION_APP_REPO,
+    PRECONDITION_CREDENTIAL_TOMBSTONED, PRECONDITION_EXPIRED, PRECONDITION_NO_AGENT,
+    PRECONDITION_NO_GITHUB, PRECONDITION_NO_VERIFY_REPO, PRECONDITION_NOT_CONFIGURED,
 };
 use tonic::{Code, Status};
 
@@ -157,4 +157,60 @@ fn status_mapping() {
         CredentialNotice::GithubRefused
     );
     let _ = PRECONDITION_NOT_CONFIGURED;
+}
+
+#[test]
+fn every_code_and_message_pair_maps_to_one_notice() {
+    use CredentialNotice as N;
+    let fp = Code::FailedPrecondition;
+    let cases = [
+        (fp, PRECONDITION_NO_VERIFY_REPO, N::NoJob),
+        (fp, PRECONDITION_NOT_CONFIGURED, N::NotConfigured),
+        (fp, PRECONDITION_CREDENTIAL_TOMBSTONED, N::Tombstoned),
+        (fp, PRECONDITION_APP_INSTALLATION, N::InstallationRefused),
+        (fp, PRECONDITION_APP_REPO, N::RepoRefused),
+        (fp, PRECONDITION_APP_MINT_RATE, N::RateLimited),
+        (fp, PRECONDITION_NO_GITHUB, N::NoVerifier),
+        (fp, PRECONDITION_NO_AGENT, N::NoVerifier),
+        (fp, PRECONDITION_EXPIRED, N::NoVerifier),
+        (fp, PRECONDITION_APP_MINT, N::NoVerifier),
+        (fp, PRECONDITION_APP_MINT_CAP, N::NoVerifier),
+        (fp, ERR_LEASE_MISMATCH, N::NoVerifier),
+        (fp, "", N::NoVerifier),
+        (
+            Code::PermissionDenied,
+            ERR_CAPABILITY_NOT_GRANTED,
+            N::CapabilityRequired,
+        ),
+        (
+            Code::PermissionDenied,
+            ERR_NEEDS_USER_TOKEN,
+            N::UserTokenRequired,
+        ),
+        (Code::PermissionDenied, ERR_LEASE_MISMATCH, N::Failed),
+        (Code::PermissionDenied, "", N::Failed),
+        (Code::InvalidArgument, ERR_GITHUB_REJECTED, N::GithubRefused),
+        (
+            Code::InvalidArgument,
+            PRECONDITION_NOT_CONFIGURED,
+            N::Invalid,
+        ),
+        (Code::NotFound, PRECONDITION_NO_VERIFY_REPO, N::NotFound),
+        (
+            Code::Unavailable,
+            PRECONDITION_APP_MINT_RATE,
+            N::Unavailable,
+        ),
+        (Code::Internal, PRECONDITION_APP_REPO, N::Failed),
+        (Code::Unknown, PRECONDITION_NOT_CONFIGURED, N::Failed),
+        (
+            Code::ResourceExhausted,
+            PRECONDITION_APP_MINT_RATE,
+            N::Failed,
+        ),
+    ];
+    for (code, message, want) in cases {
+        let got = CredentialNotice::for_status(&Status::new(code, message));
+        assert_eq!(got, want, "{code:?} {message}");
+    }
 }

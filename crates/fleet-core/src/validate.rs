@@ -3,6 +3,7 @@
 use std::collections::BTreeSet;
 use std::fmt;
 
+use crate::credential::GITHUB_INSTALLATION_TOKEN_PREFIX;
 use crate::profile::{ContextFile, Profile};
 
 /// Most entries in a Profile.
@@ -239,7 +240,9 @@ fn secret_like(text: &str) -> bool {
     text.contains("github_pat_")
         || text.contains("-----BEGIN")
         || has_prefixed(text, "ghp_", 20, |b| b.is_ascii_alphanumeric())
-        || has_prefixed(text, "ghs_", 20, |b| b.is_ascii_alphanumeric())
+        || has_prefixed(text, GITHUB_INSTALLATION_TOKEN_PREFIX, 20, |b| {
+            b.is_ascii_alphanumeric()
+        })
         || has_prefixed(text, "ghu_", 20, |b| b.is_ascii_alphanumeric())
         || has_prefixed(text, "sk-", 20, is_b64url)
         || has_prefixed(text, "AKIA", 16, |b| {

@@ -3,9 +3,11 @@
 //! The `fleet.v1` package is generated from `proto/fleet/v1/fleet.proto`. [`convert`]
 //! maps its [`v1::Envelope`] to and from [`fleet_core::Envelope`].
 
+mod classify;
 mod convert;
 
 mod notice;
+pub use classify::{Reason, classify};
 pub use convert::{
     ConvertError, ProfileConvertError, ShellCommandRecord, TimingConvertError, TimingSpanRecord,
     capability_from_text, capability_to_text, catalog_entry_from_wire, catalog_entry_to_wire,

@@ -54,10 +54,8 @@ use fleet_core::credential::{
 use fleet_proto::v1::fleet_worker_client::FleetWorkerClient;
 use fleet_proto::v1::{GetJobCredentialsReply, GetJobCredentialsRequest};
 use fleet_proto::{
-    GITHUB_INSTALLATION_TOKEN_KIND, MAX_CREDENTIAL_VALUE_BYTES, MAX_CREDENTIALS_PER_USER,
-    PRECONDITION_APP_INSTALLATION, PRECONDITION_APP_MINT_CAP, PRECONDITION_APP_MINT_RATE,
-    PRECONDITION_APP_REPO, PRECONDITION_EXPIRED, PRECONDITION_NO_AGENT, PRECONDITION_NO_GITHUB,
-    PRECONDITION_NOT_CONFIGURED,
+    GITHUB_INSTALLATION_TOKEN_KIND, MAX_CREDENTIAL_VALUE_BYTES, MAX_CREDENTIALS_PER_USER, Reason,
+    classify,
 };
 use tonic::metadata::MetadataValue;
 use tonic::service::Interceptor;
@@ -229,16 +227,18 @@ impl CredentialFailure {
     }
 
     fn from_status(status: &Status) -> Self {
-        match (status.code(), status.message()) {
-            (Code::PermissionDenied, _) => Self::LeaseMismatch,
-            (Code::FailedPrecondition, PRECONDITION_NO_GITHUB) => Self::NoGithub,
-            (Code::FailedPrecondition, PRECONDITION_NO_AGENT) => Self::NoAgent,
-            (Code::FailedPrecondition, PRECONDITION_EXPIRED) => Self::Expired,
-            (Code::FailedPrecondition, PRECONDITION_NOT_CONFIGURED) => Self::NotConfigured,
-            (Code::FailedPrecondition, PRECONDITION_APP_MINT_CAP) => Self::MintCap,
-            (Code::FailedPrecondition, PRECONDITION_APP_MINT_RATE) => Self::RateLimited,
-            (Code::FailedPrecondition, PRECONDITION_APP_INSTALLATION) => Self::InstallationRefused,
-            (Code::FailedPrecondition, PRECONDITION_APP_REPO) => Self::RepoRefused,
+        if status.code() == Code::PermissionDenied {
+            return Self::LeaseMismatch;
+        }
+        match classify(status.code(), status.message()) {
+            Some(Reason::NoGithub) => Self::NoGithub,
+            Some(Reason::NoAgent) => Self::NoAgent,
+            Some(Reason::Expired) => Self::Expired,
+            Some(Reason::NotConfigured) => Self::NotConfigured,
+            Some(Reason::AppMintCap) => Self::MintCap,
+            Some(Reason::AppMintRate) => Self::RateLimited,
+            Some(Reason::AppInstallation) => Self::InstallationRefused,
+            Some(Reason::AppRepo) => Self::RepoRefused,
             _ => Self::Unavailable,
         }
     }
@@ -581,11 +581,62 @@ fn app_tokens(reply: &GetJobCredentialsReply) -> Vec<Zeroizing<String>> {
 
 #[cfg(test)]
 mod tests {
+    use super::CredentialFailure;
     use super::{
         GITHUB_INSTALLATION_TOKEN_KIND, GetJobCredentialsReply, MAX_CREDENTIAL_LEN,
         MAX_CREDENTIALS_PER_USER, app_tokens, bearer_header,
     };
     use fleet_proto::v1::JobCredential;
+    use fleet_proto::{
+        ERR_CAPABILITY_NOT_GRANTED, ERR_LEASE_MISMATCH, ERR_NEEDS_USER_TOKEN,
+        PRECONDITION_APP_INSTALLATION, PRECONDITION_APP_MINT, PRECONDITION_APP_MINT_CAP,
+        PRECONDITION_APP_MINT_RATE, PRECONDITION_APP_REPO, PRECONDITION_CREDENTIAL_TOMBSTONED,
+        PRECONDITION_EXPIRED, PRECONDITION_NO_AGENT, PRECONDITION_NO_GITHUB,
+        PRECONDITION_NO_VERIFY_REPO, PRECONDITION_NOT_CONFIGURED,
+    };
+    use tonic::{Code, Status};
+
+    #[test]
+    fn from_status_maps_each_code_and_message_pair() {
+        use CredentialFailure as F;
+        let fp = Code::FailedPrecondition;
+        let cases = [
+            (Code::PermissionDenied, ERR_LEASE_MISMATCH, F::LeaseMismatch),
+            (Code::PermissionDenied, "anything", F::LeaseMismatch),
+            (
+                Code::PermissionDenied,
+                ERR_CAPABILITY_NOT_GRANTED,
+                F::LeaseMismatch,
+            ),
+            (
+                Code::PermissionDenied,
+                ERR_NEEDS_USER_TOKEN,
+                F::LeaseMismatch,
+            ),
+            (fp, PRECONDITION_NO_GITHUB, F::NoGithub),
+            (fp, PRECONDITION_NO_AGENT, F::NoAgent),
+            (fp, PRECONDITION_EXPIRED, F::Expired),
+            (fp, PRECONDITION_NOT_CONFIGURED, F::NotConfigured),
+            (fp, PRECONDITION_APP_MINT_CAP, F::MintCap),
+            (fp, PRECONDITION_APP_MINT_RATE, F::RateLimited),
+            (fp, PRECONDITION_APP_INSTALLATION, F::InstallationRefused),
+            (fp, PRECONDITION_APP_REPO, F::RepoRefused),
+            (fp, PRECONDITION_APP_MINT, F::Unavailable),
+            (fp, PRECONDITION_NO_VERIFY_REPO, F::Unavailable),
+            (fp, PRECONDITION_CREDENTIAL_TOMBSTONED, F::Unavailable),
+            (fp, ERR_LEASE_MISMATCH, F::Unavailable),
+            (fp, "", F::Unavailable),
+            (Code::Unavailable, PRECONDITION_NO_GITHUB, F::Unavailable),
+            (Code::NotFound, PRECONDITION_APP_REPO, F::Unavailable),
+            (Code::Internal, PRECONDITION_APP_MINT_CAP, F::Unavailable),
+            (Code::InvalidArgument, PRECONDITION_EXPIRED, F::Unavailable),
+            (Code::Unknown, "x", F::Unavailable),
+        ];
+        for (code, message, want) in cases {
+            let got = F::from_status(&Status::new(code, message));
+            assert_eq!(got, want, "{code:?} {message}");
+        }
+    }
 
     fn app_wire(value: &str) -> JobCredential {
         JobCredential {

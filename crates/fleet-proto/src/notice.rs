@@ -6,11 +6,7 @@
 use fleet_core::credential::CredentialError;
 use tonic::{Code, Status};
 
-use crate::{
-    ERR_CAPABILITY_NOT_GRANTED, ERR_GITHUB_REJECTED, ERR_NEEDS_USER_TOKEN,
-    PRECONDITION_APP_INSTALLATION, PRECONDITION_APP_MINT_RATE, PRECONDITION_APP_REPO,
-    PRECONDITION_CREDENTIAL_TOMBSTONED, PRECONDITION_NO_VERIFY_REPO, PRECONDITION_NOT_CONFIGURED,
-};
+use crate::{Reason, classify};
 
 /// One outcome of a credential operation, as shown to a person.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -156,33 +152,32 @@ impl CredentialNotice {
     #[must_use]
     pub fn for_status(status: &Status) -> Self {
         let message = status.message();
+        let reason = classify(status.code(), message);
         match status.code() {
             Code::InvalidArgument
                 if message == CredentialError::GithubNotFineGrained.to_string() =>
             {
                 Self::GithubClassic
             }
-            Code::InvalidArgument if message == ERR_GITHUB_REJECTED => Self::GithubRefused,
+            Code::InvalidArgument if reason == Some(Reason::GithubRejected) => Self::GithubRefused,
             Code::InvalidArgument => Self::Invalid,
-            Code::PermissionDenied if message == ERR_CAPABILITY_NOT_GRANTED => {
+            Code::PermissionDenied if reason == Some(Reason::CapabilityNotGranted) => {
                 Self::CapabilityRequired
             }
-            Code::PermissionDenied if message == ERR_NEEDS_USER_TOKEN => Self::UserTokenRequired,
+            Code::PermissionDenied if reason == Some(Reason::NeedsUserToken) => {
+                Self::UserTokenRequired
+            }
             Code::Unavailable => Self::Unavailable,
             Code::NotFound => Self::NotFound,
-            Code::FailedPrecondition if message == PRECONDITION_NO_VERIFY_REPO => Self::NoJob,
-            Code::FailedPrecondition if message == PRECONDITION_NOT_CONFIGURED => {
-                Self::NotConfigured
-            }
-            Code::FailedPrecondition if message == PRECONDITION_CREDENTIAL_TOMBSTONED => {
-                Self::Tombstoned
-            }
-            Code::FailedPrecondition if message == PRECONDITION_APP_INSTALLATION => {
-                Self::InstallationRefused
-            }
-            Code::FailedPrecondition if message == PRECONDITION_APP_REPO => Self::RepoRefused,
-            Code::FailedPrecondition if message == PRECONDITION_APP_MINT_RATE => Self::RateLimited,
-            Code::FailedPrecondition => Self::NoVerifier,
+            Code::FailedPrecondition => match reason {
+                Some(Reason::NoVerifyRepo) => Self::NoJob,
+                Some(Reason::NotConfigured) => Self::NotConfigured,
+                Some(Reason::Tombstoned) => Self::Tombstoned,
+                Some(Reason::AppInstallation) => Self::InstallationRefused,
+                Some(Reason::AppRepo) => Self::RepoRefused,
+                Some(Reason::AppMintRate) => Self::RateLimited,
+                _ => Self::NoVerifier,
+            },
             _ => Self::Failed,
         }
     }
