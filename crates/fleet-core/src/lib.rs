@@ -15,6 +15,7 @@ pub mod model_allowlist;
 mod normalize;
 mod profile;
 mod redact;
+pub mod repo;
 pub mod timing;
 pub mod tools;
 mod validate;
