@@ -32,7 +32,8 @@ WHERE credentials.tombstoned_at IS NULL RETURNING id";
 
 const LOCK_USER: &str = "SELECT pg_advisory_xact_lock($1)";
 
-const COUNT_OTHERS: &str = "SELECT count(*) FROM credentials WHERE user_id = $1 AND kind <> $2";
+const COUNT_OTHERS: &str =
+    "SELECT count(*) FROM credentials WHERE user_id = $1 AND kind <> $2 AND tombstoned_at IS NULL";
 
 const STORE_SEALED: &str = "UPDATE credentials SET ciphertext = $1, key_id = $2 WHERE id = $3";
 
@@ -78,27 +79,26 @@ const INSERT_USE: &str = "INSERT INTO credential_use (credential_id, job_id) VAL
 const LOCK_CREDENTIAL: &str =
     "SELECT id FROM credentials WHERE id = $1 AND tombstoned_at IS NULL FOR UPDATE";
 
-const COUNT_ATTEMPTS: &str =
-    "SELECT count(*) FROM github_app_mint WHERE job_id = $1 AND outcome = 'attempt'";
+const COUNT_ATTEMPTS: &str = "SELECT count(*) FROM github_app_mint WHERE job_id = $1 AND scope = 'job' AND outcome = 'attempt'";
 
 const COUNT_USER_ATTEMPTS: &str = "\
 SELECT count(*) FROM github_app_mint m JOIN credentials c ON c.id = m.credential_id \
 WHERE c.user_id = $1 AND m.outcome = 'attempt' AND m.at > clock_timestamp() - $2::bigint * interval '1 second'";
 
 const DENIED_RECENTLY: &str = "\
-SELECT EXISTS (SELECT 1 FROM github_app_mint WHERE job_id = $1 AND outcome = 'denied' \
+SELECT EXISTS (SELECT 1 FROM github_app_mint WHERE job_id = $1 AND scope = $4 AND outcome = 'denied' \
 AND reason = $2 AND at > now() - $3::bigint * interval '1 second')";
 
 const INSERT_ROOT: &str = "\
 WITH fresh AS (SELECT gen_random_uuid() AS id) \
 INSERT INTO github_app_mint (mint_id, attempt_id, credential_id, job_id, repo, installation_id, \
-requested_permissions, outcome, reason) \
-SELECT id, id, $1, $2, $3, $4, $5, $6, $7 FROM fresh RETURNING attempt_id::text";
+requested_permissions, outcome, reason, scope) \
+SELECT id, id, $1, $2, $3, $4, $5, $6, $7, $8 FROM fresh RETURNING attempt_id::text";
 
 const INSERT_OUTCOME: &str = "\
 INSERT INTO github_app_mint (mint_id, attempt_id, credential_id, job_id, repo, installation_id, \
-requested_permissions, outcome, reason, expires_at) \
-VALUES (gen_random_uuid(), $1::uuid, $2, $3, $4, $5, $6, $7, $8, to_timestamp($9::bigint))";
+requested_permissions, outcome, reason, expires_at, scope) \
+VALUES (gen_random_uuid(), $1::uuid, $2, $3, $4, $5, $6, $7, $8, to_timestamp($9::bigint), $10)";
 
 /// The longest a Job may run that the mint cap plans for, in seconds (ADR-0058, SEC-004).
 pub const MAX_JOB_DURATION_SECS: u64 = 24 * 60 * 60;
@@ -170,12 +170,19 @@ fn mint_failure_outcome(err: &StoreError) -> (&'static str, &'static str) {
     }
 }
 
+/// The `scope` of an `attempt` row that a release or refresh wrote; it counts toward the per-Job cap.
+const SCOPE_JOB: &str = "job";
+
+/// The `scope` of a `VerifyCredential` probe row; it counts toward the per-User rate only.
+const SCOPE_PROBE: &str = "probe";
+
 #[derive(Clone)]
 struct MintRecord {
     credential_id: i64,
     job_id: String,
     repo: String,
     installation: String,
+    scope: &'static str,
 }
 
 fn requested_permissions_text() -> String {
@@ -201,6 +208,7 @@ impl MintRecord {
             .bind(requested_permissions_text())
             .bind(outcome)
             .bind(reason)
+            .bind(self.scope)
             .fetch_one(conn)
             .await
     }
@@ -223,6 +231,7 @@ impl MintRecord {
             .bind(outcome)
             .bind(reason)
             .bind(expires_at.and_then(|at| i64::try_from(at).ok()))
+            .bind(self.scope)
             .execute(conn)
             .await
             .map(|_| ())
@@ -323,6 +332,7 @@ pub(super) fn armed_guard_for_test(
                 job_id: "job".to_owned(),
                 repo: "o/widget".to_owned(),
                 installation: "1".to_owned(),
+                scope: SCOPE_JOB,
             },
             attempt_id: "attempt-under-test".to_owned(),
             token,
@@ -1247,6 +1257,7 @@ impl CredentialStore {
             job_id: job_id.to_owned(),
             repo: audit_repo(repo),
             installation: installation.to_string(),
+            scope: SCOPE_JOB,
         };
         if let Err(err) = lane
             .allow_installation(installation)
@@ -1336,10 +1347,14 @@ impl CredentialStore {
         record: &MintRecord,
         user_id: i64,
     ) -> Result<String, StoreError> {
-        let attempts: i64 = sqlx::query_scalar(COUNT_ATTEMPTS)
-            .bind(&record.job_id)
-            .fetch_one(&mut *tx)
-            .await?;
+        let attempts: i64 = if record.scope == SCOPE_JOB {
+            sqlx::query_scalar(COUNT_ATTEMPTS)
+                .bind(&record.job_id)
+                .fetch_one(&mut *tx)
+                .await?
+        } else {
+            0
+        };
         if attempts >= i64::from(self.mint_cap) {
             self.deny(&mut tx, record, REASON_CAP).await?;
             tx.commit().await?;
@@ -1370,6 +1385,7 @@ impl CredentialStore {
             .bind(&record.job_id)
             .bind(reason)
             .bind(self.denied_dedupe_secs)
+            .bind(record.scope)
             .fetch_one(&mut *tx)
             .await?;
         if !recent {
@@ -1418,10 +1434,11 @@ impl CredentialStore {
     /// Mints one installation token for a stored `github_app` credential and drops it.
     ///
     /// The token is scoped to the repository of the user's most recent Job (ADR-0058, SEC-009).
-    /// A probe is a mint like any other and takes the same gate as a release. A short
+    /// A probe takes the release gate except the per-Job cap. A short
     /// transaction checks the capability under `FOR SHARE`, takes `FOR UPDATE` on the credential
-    /// row and counts attempts against the cap of that Job and against the per-User rate limit.
-    /// Under both limits it writes an `attempt` row and commits, and then the mint runs: no row
+    /// row and counts the User's attempts of the last minute against the per-User rate limit. The
+    /// row has scope `probe`, so it never counts toward the per-Job cap of any Job. Under
+    /// that limit it writes an `attempt` row and commits, and then the mint runs: no row
     /// lock is held across the network call. A mint failure writes `failed`. A mint writes
     /// `minted`, and the revoke then writes `revoked` or `revoke_failed`. A guard revokes the
     /// token when this future is dropped between the mint and the revoke. The token never
@@ -1432,7 +1449,7 @@ impl CredentialStore {
     /// Returns [`StoreError::CapabilityDenied`] when the user lacks the capability,
     /// [`StoreError::NotFound`] when the credential is gone or tombstoned,
     /// [`StoreError::NoJobRepo`] when the user has no Job, [`StoreError::MintCapReached`] when
-    /// that Job holds the cap of attempts or the User started the per-minute limit of them,
+    /// the User started the per-minute limit of attempts,
     /// [`StoreError::InstallationDenied`] when the installation is not allowed or fails the
     /// binding, [`StoreError::RepoDenied`] when the Job repository is not allowed,
     /// [`StoreError::MintFailed`] when the lane is absent, the installation id is malformed,
@@ -1467,6 +1484,7 @@ impl CredentialStore {
             job_id,
             repo: audit_repo(&repo),
             installation: installation.to_string(),
+            scope: SCOPE_PROBE,
         };
         if let Err(err) = lane
             .allow_installation(installation)

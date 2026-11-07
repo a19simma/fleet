@@ -93,7 +93,7 @@ The server refuses the installation before any GitHub call when the id is not in
 
 ## Verify
 
-1. Submit one Job as that User against a repository the installation covers. `fleet credential verify` mints against the repository of the User's latest Job and counts toward the per-Job cap and the per-User rate limit, so a User with no Job gets `FAILED_PRECONDITION` and the CLI notice for no job.
+1. Submit one Job as that User against a repository the installation covers. `fleet credential verify` mints against the repository of the User's latest Job and counts toward the per-User rate limit but never toward the per-Job cap (its audit rows have scope `probe`), so a User with no Job gets `FAILED_PRECONDITION` and the CLI notice for no job.
 2. Run `fleet credential list` to read the credential id, then `fleet credential verify <id>`.
 3. The server mints once and revokes the token, and returns no token text. A revoke GitHub refuses answers `valid: false`, so the CLI prints the refused notice. The call writes `attempt`, `minted` and `revoked` rows to `github_app_mint`. Success prints `GitHub accepted the stored credential.`, and a refused token prints `GitHub refused the stored credential.`. Any mint failure prints the invalid token notice, with no detail. For the cause, read the server log and check, in order: the App id, the key, the installation id, the granted permissions and the repository.
 4. Run an App Job to the end. The pull request shows the bot as author (see Unverified claims). `git log` on the pushed branch shows `<name>` and `<email>` from the server variables for author and committer.
@@ -121,7 +121,7 @@ WHERE c.user_id = <user-id> AND m.outcome = 'denied'
 ORDER BY m.at DESC;
 ```
 
-Reason `job mint cap` means the Job used its 34 attempts. Reason `user mint rate` means the User started 20 mints in the last minute. A `denied` row is not repeated for one Job while one with the same reason is under 60 seconds old. Rows with outcome `failed` carry the mint failure reason.
+Reason `job mint cap` means the Job used its 34 attempts. Reason `user mint rate` means the User started 20 mints in the last minute. A `denied` row is not repeated for one Job and scope while one with the same reason is under 60 seconds old. Rows with outcome `failed` carry the mint failure reason.
 
 ## Upgrade note
 

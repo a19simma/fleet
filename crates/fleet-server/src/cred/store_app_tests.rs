@@ -296,6 +296,15 @@ async fn world(pool: PgPool, lane: Option<AppClient>) -> World {
 }
 
 async fn world_with(pool: PgPool, lane: Option<AppClient>, policy: AppPolicy) -> World {
+    world_limited(pool, lane, policy, None).await
+}
+
+async fn world_limited(
+    pool: PgPool,
+    lane: Option<AppClient>,
+    policy: AppPolicy,
+    limit: Option<usize>,
+) -> World {
     Store::new(pool.clone()).migrate().await.unwrap();
     let path = std::env::temp_dir().join(format!(
         "fleet-app-lane-{}-{}.keys",
@@ -305,7 +314,11 @@ async fn world_with(pool: PgPool, lane: Option<AppClient>, policy: AppPolicy) ->
     std::fs::write(&path, format!("k1:{}\n", "ab".repeat(32))).unwrap();
     let sealer = FileSealer::load(&path);
     std::fs::remove_file(&path).unwrap();
-    let mut creds = CredentialStore::new(pool.clone(), Arc::new(sealer.unwrap()));
+    let sealer = Arc::new(sealer.unwrap());
+    let mut creds = match limit {
+        Some(limit) => CredentialStore::with_limit(pool.clone(), sealer, limit),
+        None => CredentialStore::new(pool.clone(), sealer),
+    };
     if let Some(client) = lane {
         let bot = BotIdentity::new(BOT_NAME, BOT_EMAIL).unwrap();
         creds = creds.with_github_app(AppLane::new(
@@ -899,6 +912,7 @@ async fn a_mint_writes_an_attempt_row_then_a_minted_row_with_the_expiry(pool: Pg
             "requested_permissions": "contents:write,pull_requests:write,checks:read,statuses:read",
             "outcome": outcome,
             "reason": null,
+            "scope": "job",
         })
     };
     let got: Vec<serde_json::Value> = json
@@ -1555,33 +1569,13 @@ async fn a_failed_verify_mint_audits_an_attempt_then_failed(pool: PgPool) {
 }
 
 #[sqlx::test]
-async fn verify_mints_spend_the_job_cap_and_the_next_one_is_refused(pool: PgPool) {
-    let fake = fake("201 Created", None).await;
-    let w = world(pool, Some(client(&fake))).await.capped(1);
-    w.seed(true).await;
-    assert!(verify_reply(&w).await.unwrap().valid);
-    let status = verify_reply(&w).await.unwrap_err();
-    assert_eq!(status.code(), tonic::Code::FailedPrecondition);
-    assert_eq!(status.message(), fleet_proto::PRECONDITION_APP_MINT_CAP);
-    assert_eq!(fake.mints(), 1);
-    assert_eq!(
-        w.rows().await.last().cloned(),
-        Some(("denied".to_owned(), Some("job mint cap".to_owned())))
-    );
-    let err = w.release_outcome().await.unwrap_err();
-    assert!(matches!(err, StoreError::MintCapReached), "{err:?}");
-    assert_eq!(fake.mints(), 1);
-}
-
-#[sqlx::test]
-async fn failed_verify_mints_spend_the_job_cap(pool: PgPool) {
+async fn failed_verify_mints_do_not_spend_the_job_cap(pool: PgPool) {
     let fake = fake("500 Internal Server Error", None).await;
     let w = world(pool, Some(client(&fake))).await.capped(1);
     w.seed(true).await;
     assert!(!verify_reply(&w).await.unwrap().valid);
-    let status = verify_reply(&w).await.unwrap_err();
-    assert_eq!(status.message(), fleet_proto::PRECONDITION_APP_MINT_CAP);
-    assert_eq!(fake.mints(), 1);
+    assert!(!verify_reply(&w).await.unwrap().valid);
+    assert_eq!(fake.mints(), 2);
 }
 
 #[sqlx::test]
@@ -1598,6 +1592,109 @@ async fn verify_obeys_the_user_rate_limit_with_a_denied_row_and_no_mint(pool: Pg
         w.rows().await.last().cloned(),
         Some(("denied".to_owned(), Some("user mint rate".to_owned())))
     );
+}
+
+#[sqlx::test]
+async fn verify_probes_never_spend_the_job_cap(pool: PgPool) {
+    let fake = fake("201 Created", None).await;
+    let w = world(pool, Some(client(&fake))).await.capped(1);
+    w.seed(true).await;
+    for _ in 0..3 {
+        assert!(verify_reply(&w).await.unwrap().valid);
+    }
+    w.release_outcome().await.unwrap();
+    assert_eq!(fake.mints(), 4);
+    let scopes: Vec<String> = sqlx::query_scalar("SELECT scope FROM github_app_mint ORDER BY id")
+        .fetch_all(&w.pool)
+        .await
+        .unwrap();
+    let mut want = vec!["probe"; 9];
+    want.extend(["job", "job"]);
+    assert_eq!(scopes, want);
+}
+
+#[sqlx::test]
+async fn a_probe_works_when_the_latest_job_already_holds_its_cap(pool: PgPool) {
+    let fake = fake("201 Created", None).await;
+    let w = world(pool, Some(client(&fake))).await.capped(1);
+    w.seed(true).await;
+    w.release_outcome().await.unwrap();
+    assert!(verify_reply(&w).await.unwrap().valid);
+    let err = w.release_outcome().await.unwrap_err();
+    assert!(matches!(err, StoreError::MintCapReached), "{err:?}");
+}
+
+#[sqlx::test]
+async fn verify_probes_count_toward_the_user_rate_for_probes_and_releases(pool: PgPool) {
+    let fake = fake("201 Created", None).await;
+    let w = world(pool, Some(client(&fake))).await.rate_limited(2);
+    w.seed(true).await;
+    assert!(verify_reply(&w).await.unwrap().valid);
+    assert!(verify_reply(&w).await.unwrap().valid);
+    let status = verify_reply(&w).await.unwrap_err();
+    assert_eq!(status.message(), fleet_proto::PRECONDITION_APP_MINT_CAP);
+    let err = w.release_outcome().await.unwrap_err();
+    assert!(matches!(err, StoreError::MintCapReached), "{err:?}");
+    assert_eq!(fake.mints(), 2);
+    assert_eq!(
+        w.rows().await.last().cloned(),
+        Some(("denied".to_owned(), Some("user mint rate".to_owned())))
+    );
+}
+
+#[sqlx::test]
+async fn a_probe_denial_is_not_hidden_by_a_job_denial_of_the_same_reason(pool: PgPool) {
+    let fake = fake("201 Created", None).await;
+    let w = world(pool, Some(client(&fake))).await.rate_limited(1);
+    w.seed(true).await;
+    w.release_outcome().await.unwrap();
+    w.release_outcome().await.unwrap_err();
+    verify_reply(&w).await.unwrap_err();
+    let scopes: Vec<String> = sqlx::query_scalar(
+        "SELECT scope FROM github_app_mint WHERE outcome = 'denied' ORDER BY id",
+    )
+    .fetch_all(&w.pool)
+    .await
+    .unwrap();
+    assert_eq!(scopes, ["job", "probe"]);
+}
+
+#[sqlx::test]
+async fn a_user_with_no_job_gets_no_probe_row(pool: PgPool) {
+    let fake = fake("201 Created", None).await;
+    let w = world(pool, Some(client(&fake))).await;
+    w.seed(true).await;
+    sqlx::query("DELETE FROM jobs")
+        .execute(&w.pool)
+        .await
+        .unwrap();
+    let status = verify_reply(&w).await.unwrap_err();
+    assert_eq!(status.message(), fleet_proto::PRECONDITION_NO_VERIFY_REPO);
+    assert_eq!(w.rows().await.len(), 0);
+}
+
+#[sqlx::test]
+async fn tombstoned_credentials_do_not_count_toward_the_per_user_limit(pool: PgPool) {
+    let fake = fake("201 Created", None).await;
+    let w = world_limited(pool, Some(client(&fake)), open_policy(), Some(2)).await;
+    w.caps.grant(w.admin, w.alice, CAP).await.unwrap();
+    w.put(CredentialKind::GithubPat, PAT).await;
+    w.put(CredentialKind::AnthropicApiKey, ANT).await;
+    sqlx::query("UPDATE credentials SET tombstoned_at = now() WHERE kind = 'github_pat'")
+        .execute(&w.pool)
+        .await
+        .unwrap();
+    w.creds
+        .put(
+            w.alice,
+            CredentialKind::GithubApp,
+            STATIC,
+            Secret::new(INSTALLATION.to_string()),
+            None,
+            None,
+        )
+        .await
+        .unwrap();
 }
 
 #[sqlx::test]
