@@ -55,16 +55,28 @@ use crate::jobs::validate_job_id;
 use crate::profiles::{self, ProfileContent, ProfileFault, Viewer};
 use crate::store::{Store, StoreError};
 use crate::timing;
+use crate::update_feed::FeedCache;
 use crate::web::{Dispatch, HEADER_READ_TIMEOUT, Web, serve};
 use fleet_proto::MAX_PROFILE_MESSAGE_BYTES;
 
+/// Where an [`UpdateRelay`] gets the pair it passes on.
+#[derive(Debug, Clone, Default)]
+enum Source {
+    #[default]
+    None,
+    File(PathBuf),
+    Feed(FeedCache),
+}
+
 /// Relays a signed update manifest to boxes in `HeartbeatReply`.
 ///
-/// The server holds no key and verifies nothing: it passes two files on, the manifest and the
-/// signature beside it. fleetd checks the signature against its own trust root.
+/// The server holds no key and verifies nothing: it passes the manifest and its signature on.
+/// The pair comes from two files ([`UpdateRelay::new`]) or from the last good pair of the
+/// release feed ([`UpdateRelay::from_feed`], ADR-0060). fleetd checks the signature against its
+/// own trust root.
 #[derive(Debug, Clone, Default)]
 pub struct UpdateRelay {
-    manifest: Option<PathBuf>,
+    source: Source,
 }
 
 impl UpdateRelay {
@@ -72,15 +84,38 @@ impl UpdateRelay {
     /// `None` relays nothing.
     #[must_use]
     pub fn new(manifest: Option<PathBuf>) -> Self {
-        Self { manifest }
+        Self {
+            source: manifest.map_or(Source::None, Source::File),
+        }
     }
 
-    /// Reads both files and returns them as `(manifest, signature)`. A missing file, a read
-    /// error, a manifest that is not JSON or a pair over the caps in
-    /// [`fleet_proto::update_within_caps`] gives `None`, so the reply carries neither.
+    /// Relays the last good pair in `cache`. An empty cache relays nothing, and the reply
+    /// carries the pair after the poller's first accepted fetch. The pair is read on every
+    /// heartbeat, so a later accepted fetch replaces it.
+    #[must_use]
+    pub fn from_feed(cache: FeedCache) -> Self {
+        Self {
+            source: Source::Feed(cache),
+        }
+    }
+
+    /// Returns the pair as `(manifest, signature)`. A file source reads both files: a missing
+    /// file, a read error, a manifest that is not JSON or a pair over the caps in
+    /// [`fleet_proto::update_within_caps`] gives `None`, so the reply carries neither. A feed
+    /// source gives the cached pair, which [`FeedCache::offer`] already held to those caps.
     async fn load(&self) -> Option<(Vec<u8>, Vec<u8>)> {
-        let path = self.manifest.as_ref()?;
-        let mut sig_path = path.clone().into_os_string();
+        match &self.source {
+            Source::None => None,
+            Source::File(path) => Self::load_files(path).await,
+            Source::Feed(cache) => {
+                let pair = cache.current()?;
+                Some((pair.manifest().to_vec(), pair.signature().to_vec()))
+            }
+        }
+    }
+
+    async fn load_files(path: &Path) -> Option<(Vec<u8>, Vec<u8>)> {
+        let mut sig_path = path.to_path_buf().into_os_string();
         sig_path.push(".minisig");
         let manifest = read_capped(path, fleet_proto::MAX_MANIFEST_BYTES).await?;
         let signature =
@@ -1286,6 +1321,41 @@ mod tests {
             relay.load().await,
             Some((b"{\"seq\":2}".to_vec(), b"two".to_vec()))
         );
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn an_empty_feed_cache_relays_nothing() {
+        assert_eq!(UpdateRelay::from_feed(FeedCache::new()).load().await, None);
+    }
+
+    #[tokio::test]
+    async fn a_feed_relays_the_cached_pair_and_follows_replacements() {
+        let cache = FeedCache::new();
+        let relay = UpdateRelay::from_feed(cache.clone());
+        cache.offer(b"{\"seq\":1}", b"one");
+        assert_eq!(
+            relay.load().await,
+            Some((b"{\"seq\":1}".to_vec(), b"one".to_vec()))
+        );
+        cache.offer(b"{\"seq\":2}", b"two");
+        assert_eq!(
+            relay.load().await,
+            Some((b"{\"seq\":2}".to_vec(), b"two".to_vec()))
+        );
+        cache.offer(b"{\"seq\":1}", b"old");
+        assert_eq!(
+            relay.load().await,
+            Some((b"{\"seq\":2}".to_vec(), b"two".to_vec()))
+        );
+    }
+
+    #[tokio::test]
+    async fn a_feed_ignores_files_on_disk() {
+        let dir = scratch("feedfile");
+        std::fs::write(dir.join("manifest.json"), b"{\"seq\":9}").unwrap();
+        std::fs::write(dir.join("manifest.json.minisig"), b"disk").unwrap();
+        assert_eq!(UpdateRelay::from_feed(FeedCache::new()).load().await, None);
         std::fs::remove_dir_all(&dir).unwrap();
     }
 

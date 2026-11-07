@@ -9,13 +9,16 @@ use std::time::Duration;
 use axum::Router;
 use axum::routing::get;
 use fleet_server::auth::BearerAuth;
-use fleet_server::config::{Config, CredentialsState, Forge, exposed_binds, is_loopback};
+use fleet_server::config::{
+    Config, CredentialsState, Forge, UpdateRepo, exposed_binds, is_loopback,
+};
 use fleet_server::cred::admin::{AdminError, SETUP_CODE_TTL_HOURS, parse_args, run as run_admin};
 use fleet_server::cred::app_mint::AppClient;
 use fleet_server::cred::github::HttpsGithub;
 use fleet_server::cred::limiter::Limiter;
 use fleet_server::cred::password::BootstrapPassword;
 use fleet_server::cred::pinned::PinnedHttps;
+use fleet_server::cred::release::ReleaseFetcher;
 use fleet_server::cred::repo_store::RepoStore;
 use fleet_server::cred::repo_verify::{GithubVerifier, RepoVerifiers};
 use fleet_server::cred::store::{AppIdCheck, AppLane, CredentialStore};
@@ -25,11 +28,13 @@ use fleet_server::retention::run_retention;
 use fleet_server::service::{UpdateRelay, serve_with_credentials};
 use fleet_server::store::Store;
 use fleet_server::supervise::{BoxError, supervise};
+use fleet_server::update_feed::{FeedCache, FeedPoller, FeedSource, ReleaseFeed, SystemJitter};
 use fleet_server::web::{Web, WebAuth};
 use sqlx::postgres::{PgConnectOptions, PgPoolOptions};
 use tokio::net::TcpListener;
 use tokio::signal::unix::{SignalKind, signal};
 use tokio::sync::watch;
+use tokio::task::JoinHandle;
 use tonic::transport::server::TcpIncoming;
 use tracing_subscriber::EnvFilter;
 
@@ -133,6 +138,59 @@ async fn credential_service(
     Ok(Some(
         CredentialService::new(store, Arc::new(github)).with_repos(repos),
     ))
+}
+
+/// Starts the release feed poller when `repo` is set and returns the cache it fills with its task.
+/// `make_source` runs only then. The poll loop runs inside the task, so a slow first fetch never
+/// delays readiness, and the task ends when `stop_rx` holds `true`.
+///
+/// # Errors
+///
+/// Returns the error of `make_source`.
+fn spawn_update_feed(
+    repo: Option<&UpdateRepo>,
+    interval: Duration,
+    stop_rx: watch::Receiver<bool>,
+    make_source: impl FnOnce(&UpdateRepo) -> Result<Arc<dyn FeedSource>, BoxError>,
+) -> Result<Option<(FeedCache, JoinHandle<()>)>, BoxError> {
+    let Some(repo) = repo else {
+        return Ok(None);
+    };
+    let source = make_source(repo)?;
+    let cache = FeedCache::new();
+    let poller = FeedPoller::new(source, cache.clone(), interval, Arc::new(SystemJitter));
+    tracing::info!(%repo, "release feed polling started");
+    Ok(Some((cache, poller.spawn(stop_rx))))
+}
+
+async fn join_feed(task: Option<JoinHandle<()>>) {
+    if let Some(task) = task
+        && let Err(err) = task.await
+    {
+        tracing::error!(panicked = err.is_panic(), "release feed task died");
+    }
+}
+
+/// The relay for `config`: the feed when `FLEET_UPDATE_REPO` is set, else the file source.
+fn update_relay(
+    config: &Config,
+    stop_rx: watch::Receiver<bool>,
+) -> Result<(UpdateRelay, Option<JoinHandle<()>>), BoxError> {
+    let feed = spawn_update_feed(
+        config.update_repo.as_ref(),
+        config.update_poll,
+        stop_rx,
+        release_source,
+    )?;
+    Ok(match feed {
+        Some((cache, task)) => (UpdateRelay::from_feed(cache), Some(task)),
+        None => (UpdateRelay::new(config.update_manifest.clone()), None),
+    })
+}
+
+fn release_source(repo: &UpdateRepo) -> Result<Arc<dyn FeedSource>, BoxError> {
+    let fetcher = ReleaseFetcher::new(Arc::new(PinnedHttps::system()?));
+    Ok(Arc::new(ReleaseFeed::new(fetcher, repo.clone())))
 }
 
 fn configured_store(pool: sqlx::PgPool, config: &Config) -> Store {
@@ -252,6 +310,7 @@ async fn run() -> Result<(), BoxError> {
         stop_rx.clone(),
         None,
     ));
+    let (update, feed_task) = update_relay(&config, stop_rx.clone())?;
     let auth = BearerAuth::new(&config.token, config.client_token.as_ref()).with_users(users);
     let grpc_server = async {
         serve_with_credentials(
@@ -259,7 +318,7 @@ async fn run() -> Result<(), BoxError> {
             &auth,
             web,
             credential_service,
-            UpdateRelay::new(config.update_manifest.clone()),
+            update,
             grpc,
             stopped(stop_rx.clone()),
         )
@@ -278,6 +337,7 @@ async fn run() -> Result<(), BoxError> {
     if let Err(err) = retention.await {
         tracing::error!(panicked = err.is_panic(), "retention task died");
     }
+    join_feed(feed_task).await;
     result?;
     tracing::info!("fleet-server stopped");
     Ok(())
@@ -357,6 +417,78 @@ mod tests {
             _ => None,
         })
         .unwrap()
+    }
+
+    struct Counting(Arc<std::sync::atomic::AtomicUsize>);
+
+    #[tonic::async_trait]
+    impl FeedSource for Counting {
+        async fn fetch_pair(
+            &self,
+        ) -> Result<(Vec<u8>, Vec<u8>), fleet_server::cred::release::ReleaseRefusal> {
+            self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok((b"{\"seq\":1}".to_vec(), b"sig".to_vec()))
+        }
+    }
+
+    #[tokio::test]
+    async fn the_feed_poller_starts_only_when_the_repo_is_set() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let calls = Arc::new(AtomicUsize::new(0));
+        let built = Arc::new(AtomicUsize::new(0));
+        let (stop_tx, stop_rx) = watch::channel(false);
+        let make = |built: &Arc<AtomicUsize>, calls: &Arc<AtomicUsize>| {
+            let (built, calls) = (Arc::clone(built), Arc::clone(calls));
+            move |_: &UpdateRepo| -> Result<Arc<dyn FeedSource>, BoxError> {
+                built.fetch_add(1, Ordering::SeqCst);
+                Ok(Arc::new(Counting(calls)))
+            }
+        };
+        let none = spawn_update_feed(
+            None,
+            Duration::from_secs(60),
+            stop_rx.clone(),
+            make(&built, &calls),
+        )
+        .unwrap();
+        assert!(none.is_none());
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert_eq!(built.load(Ordering::SeqCst), 0);
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+
+        let repo = UpdateRepo::parse("acme/fleet").unwrap();
+        let (cache, task) = spawn_update_feed(
+            Some(&repo),
+            Duration::from_secs(60),
+            stop_rx,
+            make(&built, &calls),
+        )
+        .unwrap()
+        .unwrap();
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+        while cache.current().is_none() {
+            assert!(tokio::time::Instant::now() < deadline);
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert_eq!(built.load(Ordering::SeqCst), 1);
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        stop_tx.send_replace(true);
+        tokio::time::timeout(Duration::from_secs(30), task)
+            .await
+            .unwrap()
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_source_that_cannot_be_built_fails_startup() {
+        let (_stop_tx, stop_rx) = watch::channel(false);
+        let repo = UpdateRepo::parse("acme/fleet").unwrap();
+        let err = spawn_update_feed(Some(&repo), Duration::from_secs(60), stop_rx, |_| {
+            Err("no tls".into())
+        })
+        .map(|_| ())
+        .unwrap_err();
+        assert_eq!(err.to_string(), "no tls");
     }
 
     #[sqlx::test]

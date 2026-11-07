@@ -126,8 +126,8 @@ fn seq_gate(cached: Option<&FeedPair>, seq: u64, manifest: &[u8], signature: &[u
     }
 }
 
-/// The last good pair. Shared by the poller, which writes it, and the relay, which will read it
-/// (FEED-6). Clones share one pair.
+/// The last good pair. Shared by the poller, which writes it, and the relay, which reads it
+/// ([`UpdateRelay::from_feed`](crate::service::UpdateRelay::from_feed)). Clones share one pair.
 #[derive(Debug, Clone, Default)]
 pub struct FeedCache {
     held: Arc<Mutex<Option<FeedPair>>>,

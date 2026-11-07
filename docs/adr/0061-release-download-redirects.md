@@ -1,12 +1,12 @@
 # Redirects for release downloads over the no-redirect transport
 
-Status: Proposed 2026-11-07, partly built (FEED-3, FEED-4, FEED-5). The operator decided every point below. Amends the scope
+Status: Proposed 2026-11-07, partly built (FEED-3, FEED-4, FEED-5, FEED-6). The operator decided every point below. Amends the scope
 of the "follows no redirect" rule of ADR-0059. Builds on ADR-0060. The build is tasks FEED-2 to
 FEED-7.
 
 Built (FEED-3): the three Request shape items below and the 2048-byte `Location` cap, which
 `PinnedHttps` enforces, not the wrapper. Built (FEED-4): `ReleaseFetcher`, the hop rules, the host
-allowlist and `Location` parsing. Built (FEED-5): the cache, the seq gate and the poller, in `crates/fleet-server/src/update_feed.rs`. Not built: the relay wiring and startup (FEED-6, FEED-7). `PinnedHttps` (`crates/fleet-server/src/cred/pinned.rs`) resolves a
+allowlist and `Location` parsing. Built (FEED-5): the cache, the seq gate and the poller, in `crates/fleet-server/src/update_feed.rs`. Built (FEED-6): the relay wiring and startup. Not built: FEED-7. `PinnedHttps` (`crates/fleet-server/src/cred/pinned.rs`) resolves a
 host once, vets every address, dials the vetted one and returns a 3xx with its body unread and its `Location` captured. ADR-0059 made that
 rule for the repository verifier, where a redirect means a renamed repository and an
 `Authorization` header must not travel. A release download is different: GitHub answers

@@ -1,12 +1,12 @@
 # The server fetches the release manifest
 
-Status: Proposed 2026-11-07, partly built (FEED-2, FEED-4, FEED-5). The operator decided every point below. Amends
+Status: Proposed 2026-11-07, partly built (FEED-2, FEED-4, FEED-5, FEED-6). The operator decided every point below. Amends
 the relay description of ADR-0047 only. The trust model of ADR-0047 and ADR-0050 is unchanged. The
 build is tasks FEED-2 to FEED-7.
 
 Built (FEED-2): parsing of `FLEET_UPDATE_REPO` and `FLEET_UPDATE_POLL_SECS`, a poll range of 60 to
 86400 with default 900, and startup refusal of `FLEET_UPDATE_REPO` together with
-`FLEET_UPDATE_MANIFEST`. Built (FEED-4): the fetch, in `ReleaseFetcher`, `crates/fleet-server/src/cred/release.rs`. Built (FEED-5): the cache, the seq gate and the poller, in `crates/fleet-server/src/update_feed.rs`. Not built: the relay wiring and startup (FEED-6, FEED-7). Today `UpdateRelay` (`crates/fleet-server/src/service.rs`) reads the
+`FLEET_UPDATE_MANIFEST`. Built (FEED-4): the fetch, in `ReleaseFetcher`, `crates/fleet-server/src/cred/release.rs`. Built (FEED-5): the cache, the seq gate and the poller, in `crates/fleet-server/src/update_feed.rs`. Built (FEED-6): the relay wiring and startup. `UpdateRelay` has a source of none, file or feed, and `UpdateRelay::from_feed` serves the cached pair, empty until the first accepted fetch. `main.rs` spawns the poller only when `FLEET_UPDATE_REPO` is set, hands it the shared stop signal, and never waits on its first fetch before readiness. Not built: FEED-7. Before FEED-6, `UpdateRelay` (`crates/fleet-server/src/service.rs`) read the
 manifest from a file named by `FLEET_UPDATE_MANIFEST` (`crates/fleet-server/src/config.rs`) and
 the signature from the same path plus `.minisig`. It relays both verbatim in `HeartbeatReply`. An
 operator must copy two files onto the server host after each release, and nobody does it. Boxes
