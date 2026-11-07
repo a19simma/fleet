@@ -754,10 +754,12 @@ pub enum StoreError {
     CapabilityDenied,
     /// The GitHub App token could not be minted. One fixed error covers every cause.
     MintFailed,
-    /// The Job already holds [`MAX_APP_MINTS_PER_JOB`] mint attempts (ADR-0058, SEC-011), or its
-    /// User started [`MAX_APP_MINTS_PER_USER_PER_MINUTE`] in the last minute (SEC-003). Both
-    /// share one fixed message.
+    /// The Job already holds [`MAX_APP_MINTS_PER_JOB`] mint attempts (ADR-0058, SEC-011).
+    /// Terminal.
     MintCapReached,
+    /// The User started [`MAX_APP_MINTS_PER_USER_PER_MINUTE`] mint attempts in the last minute,
+    /// of every scope (ADR-0058, SEC-003). Retryable: it has its own fixed message.
+    MintRateLimited,
     /// The owner has no Job whose repository a verify mint can be scoped to.
     NoJobRepo,
     /// The credential was deleted and kept as a tombstone because it has mint history. A
@@ -787,6 +789,7 @@ impl fmt::Display for StoreError {
             Self::CapabilityDenied => f.write_str(ERR_CAPABILITY_NOT_GRANTED),
             Self::MintFailed => f.write_str(fleet_proto::PRECONDITION_APP_MINT),
             Self::MintCapReached => f.write_str(fleet_proto::PRECONDITION_APP_MINT_CAP),
+            Self::MintRateLimited => f.write_str(fleet_proto::PRECONDITION_APP_MINT_RATE),
             Self::NoJobRepo => f.write_str(fleet_proto::PRECONDITION_NO_VERIFY_REPO),
             Self::Tombstoned => f.write_str(fleet_proto::PRECONDITION_CREDENTIAL_TOMBSTONED),
             Self::InstallationDenied => f.write_str(fleet_proto::PRECONDITION_APP_INSTALLATION),
@@ -1201,7 +1204,8 @@ impl CredentialStore {
     /// mint that outlasts [`MINT_BUDGET`]. A future dropped before the mint returns closes its `attempt` row as
     /// `failed` with reason `mint cancelled`; the row keeps its slot against the cap.
     /// Returns [`StoreError::MintCapReached`] when the Job already holds the cap of mint
-    /// attempts or the User started the per-minute limit of them.
+    /// attempts, and [`StoreError::MintRateLimited`] when the User started the per-minute
+    /// limit of them.
     /// Returns [`StoreError::InstallationDenied`] when the installation is not on the
     /// allowlist or its `GET /app/installations/{id}` binding fails, and
     /// [`StoreError::RepoDenied`] when the Job repository is outside the allowlist or its
@@ -1452,7 +1456,7 @@ impl CredentialStore {
         if recent >= i64::from(self.user_rate) {
             self.deny(&mut tx, record, REASON_USER_RATE).await?;
             tx.commit().await?;
-            return Err(StoreError::MintCapReached);
+            return Err(StoreError::MintRateLimited);
         }
         let attempt_id = record.root(&mut tx, "attempt", None).await?;
         tx.commit().await?;
@@ -1534,7 +1538,7 @@ impl CredentialStore {
     ///
     /// Returns [`StoreError::CapabilityDenied`] when the user lacks the capability,
     /// [`StoreError::NotFound`] when the credential is gone or tombstoned,
-    /// [`StoreError::NoJobRepo`] when the user has no Job, [`StoreError::MintCapReached`] when
+    /// [`StoreError::NoJobRepo`] when the user has no Job, [`StoreError::MintRateLimited`] when
     /// the User started the per-minute limit of attempts,
     /// [`StoreError::InstallationDenied`] when the installation is not allowed or fails the
     /// binding, [`StoreError::RepoDenied`] when the Job repository is not allowed,

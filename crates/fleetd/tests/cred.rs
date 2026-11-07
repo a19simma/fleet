@@ -18,16 +18,16 @@ use fleet_proto::v1::{
     Job, JobCredential, JobState, ProfileRef, ReportJobReply, ReportJobRequest,
 };
 use fleet_proto::{
-    PRECONDITION_APP_INSTALLATION, PRECONDITION_APP_MINT_CAP, PRECONDITION_APP_REPO,
-    PRECONDITION_EXPIRED, PRECONDITION_NO_AGENT, PRECONDITION_NO_GITHUB,
+    PRECONDITION_APP_INSTALLATION, PRECONDITION_APP_MINT_CAP, PRECONDITION_APP_MINT_RATE,
+    PRECONDITION_APP_REPO, PRECONDITION_EXPIRED, PRECONDITION_NO_AGENT, PRECONDITION_NO_GITHUB,
     PRECONDITION_NOT_CONFIGURED,
 };
 use fleetd::DaemonRunner;
 use fleetd::cred::{
     Clock, CredentialBook, CredentialClient, CredentialFailure, ERR_APP_IDENTITY_INVALID,
     ERR_APP_IDENTITY_MISSING, ERR_APP_INSTALLATION, ERR_APP_REPO, ERR_EXPIRED, ERR_LEASE,
-    ERR_MALFORMED, ERR_MINT_CAP, ERR_NO_AGENT, ERR_NO_GITHUB, ERR_NOT_CONFIGURED, ERR_UNAVAILABLE,
-    REFRESH_SKEW_MS, REFRESH_SKEW_SLACK_MS,
+    ERR_MALFORMED, ERR_MINT_CAP, ERR_NO_AGENT, ERR_NO_GITHUB, ERR_NOT_CONFIGURED, ERR_RATE_LIMITED,
+    ERR_UNAVAILABLE, REFRESH_SKEW_MS, REFRESH_SKEW_SLACK_MS,
 };
 use fleetd::poller::{JobRunner, Shutdown, channel};
 use fleetd::revoke::{RevokeError, Revoker};
@@ -334,6 +334,7 @@ async fn a_reply_that_breaks_a_server_rule_is_malformed() -> TestResult {
 }
 
 const APP_TOKEN: &str = "ghs_AbCdEfGhIjKlMnOpQrStUvWxYz0123456789";
+const APP_TOKEN_2: &str = "ghs_ZyXwVuTsRqPoNmLkJiHgFeDcBa9876543210";
 const BOT_NAME: &str = "fleet-bot[bot]";
 const BOT_EMAIL: &str = "123456+fleet-bot[bot]@users.noreply.github.com";
 const INSTALLATION_KIND: &str = "github_installation_token";
@@ -2262,5 +2263,104 @@ async fn a_late_refresh_cannot_overwrite_a_refetched_entry_and_its_token_is_revo
     let mut want = vec![format!("Bearer {APP_TOKEN}"), format!("Bearer {NEW_TOKEN}")];
     want.sort();
     assert_eq!(tokens, want);
+    Ok(())
+}
+
+fn rate_limited() -> Status {
+    Status::failed_precondition(PRECONDITION_APP_MINT_RATE)
+}
+
+#[tokio::test]
+async fn the_rate_limit_reason_is_distinct_from_the_job_cap() {
+    assert_eq!(ERR_RATE_LIMITED, PRECONDITION_APP_MINT_RATE);
+    assert_ne!(ERR_RATE_LIMITED, ERR_MINT_CAP);
+    assert_eq!(
+        CredentialFailure::RateLimited.reason(),
+        PRECONDITION_APP_MINT_RATE
+    );
+}
+
+#[tokio::test]
+async fn a_rate_limited_refresh_keeps_the_held_token_and_backs_off() -> TestResult {
+    let (book, fake, clock) = held_app(5 * MINUTE_MS).await?;
+    set_reply(&fake, Err(rate_limited()));
+    assert!(book.refresh_if_due("job1").await?.is_none());
+    assert_eq!(calls(&fake), 2);
+    assert_eq!(github_text(&book).as_deref(), Some(APP_TOKEN));
+    clock.set(NOW_MS + 10_000);
+    assert!(book.refresh_if_due("job1").await?.is_none());
+    assert_eq!(calls(&fake), 2);
+    clock.set(NOW_MS + 31_000);
+    assert!(book.refresh_if_due("job1").await?.is_none());
+    assert_eq!(calls(&fake), 3);
+    assert_eq!(github_text(&book).as_deref(), Some(APP_TOKEN));
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_rate_limited_refresh_recovers_when_the_limit_lifts() -> TestResult {
+    let (book, fake, clock) = held_app(5 * MINUTE_MS).await?;
+    set_reply(&fake, Err(rate_limited()));
+    assert!(book.refresh_if_due("job1").await?.is_none());
+    set_reply(
+        &fake,
+        Ok(app_reply(APP_TOKEN_2, Some(NOW_MS + 60 * MINUTE_MS))),
+    );
+    clock.set(NOW_MS + 31_000);
+    assert!(book.refresh_if_due("job1").await?.is_some());
+    assert_eq!(github_text(&book).as_deref(), Some(APP_TOKEN_2));
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_rate_limited_refresh_fails_the_step_once_the_token_lapsed() -> TestResult {
+    let (book, fake, clock) = held_app(5 * MINUTE_MS).await?;
+    set_reply(&fake, Err(rate_limited()));
+    clock.set(NOW_MS + 5 * MINUTE_MS + 1000);
+    let got = book.refresh_if_due("job1").await;
+    assert_eq!(got.err(), Some(CredentialFailure::Unavailable));
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_first_fetch_retries_the_rate_limit_and_then_gives_up() -> TestResult {
+    let (url, fake) = spawn_fake(Err(rate_limited())).await?;
+    let client = CredentialClient::new(channel(&url)?, TOKEN)?;
+    let book = CredentialBook::new(client).with_rate_retry(3, Duration::from_millis(5));
+    let got = book.fetch("job1", 1, &box_name()).await;
+    assert_eq!(got.err(), Some(CredentialFailure::RateLimited));
+    assert_eq!(calls(&fake), 4);
+    assert!(book.get("job1").is_none());
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_first_fetch_succeeds_once_the_rate_limit_lifts() -> TestResult {
+    let (url, fake) = spawn_fake(Err(rate_limited())).await?;
+    let client = CredentialClient::new(channel(&url)?, TOKEN)?;
+    let book = CredentialBook::new(client).with_rate_retry(200, Duration::from_millis(5));
+    let lifter = Arc::clone(&fake);
+    tokio::spawn(async move {
+        while calls(&lifter) < 3 {
+            tokio::time::sleep(Duration::from_millis(2)).await;
+        }
+        set_reply(&lifter, Ok(good()));
+    });
+    let held =
+        tokio::time::timeout(Duration::from_secs(20), book.fetch("job1", 1, &box_name())).await??;
+    assert_eq!(held.github().map(Secret::expose), Some(GITHUB.as_bytes()));
+    assert!(calls(&fake) >= 4);
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_first_fetch_does_not_retry_the_job_cap() -> TestResult {
+    let (url, fake) =
+        spawn_fake(Err(Status::failed_precondition(PRECONDITION_APP_MINT_CAP))).await?;
+    let client = CredentialClient::new(channel(&url)?, TOKEN)?;
+    let book = CredentialBook::new(client).with_rate_retry(3, Duration::from_millis(5));
+    let got = book.fetch("job1", 1, &box_name()).await;
+    assert_eq!(got.err(), Some(CredentialFailure::MintCap));
+    assert_eq!(calls(&fake), 1);
     Ok(())
 }

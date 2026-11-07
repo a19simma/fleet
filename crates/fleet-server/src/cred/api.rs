@@ -49,6 +49,9 @@ fn store_status(err: &StoreError) -> Status {
         StoreError::MintCapReached => {
             Status::failed_precondition(fleet_proto::PRECONDITION_APP_MINT_CAP)
         }
+        StoreError::MintRateLimited => {
+            Status::failed_precondition(fleet_proto::PRECONDITION_APP_MINT_RATE)
+        }
         StoreError::InstallationDenied => {
             Status::failed_precondition(fleet_proto::PRECONDITION_APP_INSTALLATION)
         }
@@ -244,7 +247,8 @@ impl CredentialService {
     /// with `PRECONDITION_APP_INSTALLATION` when the installation is off the allowlist or fails
     /// the owner binding, with `PRECONDITION_APP_REPO` when the Job repository is not allowed
     /// (neither falls back to a PAT), with `PRECONDITION_APP_MINT_CAP` when the per-Job mint
-    /// cap or the per-User mint rate limit is reached (no PAT fallback), and with another
+    /// cap is reached (terminal), with `PRECONDITION_APP_MINT_RATE` when the per-User mint rate
+    /// limit is reached (retryable; no PAT fallback), and with another
     /// message when the owner has no GitHub credential, no credential the agent accepts, or a
     /// needed credential is expired.
     ///
@@ -299,7 +303,7 @@ impl CredentialService {
     /// without a verifier and, for `github_app`, when the user has no Job to scope the mint to,
     /// with `PRECONDITION_APP_INSTALLATION` or `PRECONDITION_APP_REPO` when the installation or
     /// the repository of the user's latest Job is refused, and with
-    /// `PRECONDITION_APP_MINT_CAP` when the per-User mint rate limit is reached (a probe
+    /// `PRECONDITION_APP_MINT_RATE` when the per-User mint rate limit is reached (a probe
     /// never counts toward a Job's cap), `PERMISSION_DENIED` with `ERR_CAPABILITY_NOT_GRANTED` when a
     /// `github_app` owner lacks the capability, `INTERNAL` when a sealed value cannot be opened
     /// or a stored kind is unknown, `UNAVAILABLE` when GitHub or storage cannot answer.

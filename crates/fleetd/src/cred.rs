@@ -19,8 +19,9 @@
 //! An installation token lasts one hour. [`CredentialBook::refresh_if_due`] calls
 //! `GetJobCredentials` again when fewer than [`REFRESH_WINDOW_MS`] of the held token remain,
 //! on the injected [`Clock`], and swaps in the new token. A refresh that fails with a transient
-//! reason keeps the last good token until it expires. The server's mint cap and its
-//! installation and repository refusals are terminal: they fail the step with
+//! reason keeps the last good token until it expires. The per-User mint rate limit is transient
+//! too: a first fetch waits it out and a refresh keeps the held token. The server's per-Job
+//! mint cap and its installation and repository refusals are terminal: they fail the step with
 //! [`ERR_MINT_CAP`], [`ERR_APP_INSTALLATION`] or [`ERR_APP_REPO`] and there is no PAT fallback
 //! (ADR-0058, SEC-004, SEC-001, SEC-002).
 //!
@@ -57,8 +58,8 @@ use fleet_proto::v1::fleet_worker_client::FleetWorkerClient;
 use fleet_proto::v1::{GetJobCredentialsReply, GetJobCredentialsRequest};
 use fleet_proto::{
     GITHUB_INSTALLATION_TOKEN_KIND, MAX_CREDENTIAL_VALUE_BYTES, MAX_CREDENTIALS_PER_USER,
-    PRECONDITION_APP_INSTALLATION, PRECONDITION_APP_MINT_CAP, PRECONDITION_APP_REPO,
-    PRECONDITION_EXPIRED, PRECONDITION_NO_AGENT, PRECONDITION_NO_GITHUB,
+    PRECONDITION_APP_INSTALLATION, PRECONDITION_APP_MINT_CAP, PRECONDITION_APP_MINT_RATE,
+    PRECONDITION_APP_REPO, PRECONDITION_EXPIRED, PRECONDITION_NO_AGENT, PRECONDITION_NO_GITHUB,
     PRECONDITION_NOT_CONFIGURED,
 };
 use tonic::metadata::MetadataValue;
@@ -111,9 +112,21 @@ pub const ERR_APP_INSTALLATION: &str = "github app installation is not allowed";
 /// (ADR-0058, SEC-002, SEC-009).
 pub const ERR_APP_REPO: &str = "repository is not allowed for the github app";
 
-/// Job failure reason: the Job reached its mint cap or its User reached the per-minute mint
-/// limit (ADR-0058, SEC-003, SEC-004, SEC-011).
+/// Job failure reason: the Job reached its mint cap (ADR-0058, SEC-004, SEC-011).
 pub const ERR_MINT_CAP: &str = "github app token limit reached";
+
+/// Job failure reason: the User kept hitting the per-minute mint limit through every wait of
+/// the first fetch (ADR-0058, SEC-003).
+pub const ERR_RATE_LIMITED: &str = "github app token rate limited";
+
+/// How many times a first fetch asks again after the per-minute mint limit, so the fetch
+/// makes at most this many plus one calls.
+pub const RATE_RETRIES: u32 = 7;
+
+/// The wait between asks of a first fetch that hit the per-minute mint limit. With
+/// [`RATE_RETRIES`] the fetch waits 70 seconds in all, longer than the one-minute window the
+/// limit counts over.
+pub const RATE_RETRY_DELAY: Duration = Duration::from_secs(10);
 
 /// Refresh the installation token when fewer than this many milliseconds remain: 10 minutes
 /// (ADR-0058, Lifetime and refresh). Exactly this much left is not yet due.
@@ -162,9 +175,13 @@ pub enum CredentialFailure {
     /// `FAILED_PRECONDITION` `credentials are not configured`.
     NotConfigured,
     /// `FAILED_PRECONDITION` `github app token limit reached`: the Job reached its mint cap
-    /// or its User reached the per-minute mint limit (SEC-003, SEC-004, SEC-011). Terminal,
-    /// never retried.
+    /// (SEC-004, SEC-011). Terminal, never retried.
     MintCap,
+    /// `FAILED_PRECONDITION` `github app token rate limited`: the User reached the per-minute
+    /// mint limit (SEC-003). Transient: a first fetch retries after [`RATE_RETRY_DELAY`] up to
+    /// [`RATE_RETRIES`] times, and a refresh keeps the held token and waits
+    /// [`REFRESH_RETRY_MS`].
+    RateLimited,
     /// `FAILED_PRECONDITION` `github app installation is not allowed`: the installation is off
     /// the allowlist or fails the owner binding (SEC-001, SEC-014). Terminal, never retried.
     InstallationRefused,
@@ -198,6 +215,7 @@ impl CredentialFailure {
             Self::Expired => ERR_EXPIRED,
             Self::NotConfigured => ERR_NOT_CONFIGURED,
             Self::MintCap => ERR_MINT_CAP,
+            Self::RateLimited => ERR_RATE_LIMITED,
             Self::InstallationRefused => ERR_APP_INSTALLATION,
             Self::RepoRefused => ERR_APP_REPO,
             Self::Unavailable => ERR_UNAVAILABLE,
@@ -215,6 +233,7 @@ impl CredentialFailure {
             (Code::FailedPrecondition, PRECONDITION_EXPIRED) => Self::Expired,
             (Code::FailedPrecondition, PRECONDITION_NOT_CONFIGURED) => Self::NotConfigured,
             (Code::FailedPrecondition, PRECONDITION_APP_MINT_CAP) => Self::MintCap,
+            (Code::FailedPrecondition, PRECONDITION_APP_MINT_RATE) => Self::RateLimited,
             (Code::FailedPrecondition, PRECONDITION_APP_INSTALLATION) => Self::InstallationRefused,
             (Code::FailedPrecondition, PRECONDITION_APP_REPO) => Self::RepoRefused,
             _ => Self::Unavailable,
@@ -620,6 +639,8 @@ pub struct CredentialBook {
     clock: Arc<dyn Clock>,
     revoker: Option<Arc<Revoker>>,
     drain_limit: Duration,
+    rate_retries: u32,
+    rate_delay: Duration,
 }
 
 /// The longest a replaced token waits for the children that hold it before it is revoked.
@@ -714,6 +735,8 @@ impl CredentialBook {
             clock: Arc::new(SystemClock),
             revoker: None,
             drain_limit: DRAIN_LIMIT,
+            rate_retries: RATE_RETRIES,
+            rate_delay: RATE_RETRY_DELAY,
         }
     }
 
@@ -762,6 +785,15 @@ impl CredentialBook {
         self
     }
 
+    /// Replaces how a first fetch waits out the per-minute mint limit: `retries` more asks,
+    /// `delay` apart. [`RATE_RETRIES`] and [`RATE_RETRY_DELAY`] by default.
+    #[must_use]
+    pub const fn with_rate_retry(mut self, retries: u32, delay: Duration) -> Self {
+        self.rate_retries = retries;
+        self.rate_delay = delay;
+        self
+    }
+
     /// Replaces the clock the refresh decision reads, [`SystemClock`] by default.
     #[must_use]
     pub fn with_clock(mut self, clock: Arc<dyn Clock>) -> Self {
@@ -782,9 +814,12 @@ impl CredentialBook {
     /// [`CredentialFailure::LeaseMismatch`] (any `PERMISSION_DENIED`),
     /// [`CredentialFailure::NoGithub`], [`CredentialFailure::NoAgent`],
     /// [`CredentialFailure::Expired`], [`CredentialFailure::NotConfigured`],
-    /// [`CredentialFailure::MintCap`], [`CredentialFailure::InstallationRefused`] and
-    /// [`CredentialFailure::RepoRefused`]. Any other status, a timeout or a transport error is
-    /// [`CredentialFailure::Unavailable`]. A reply that breaks a rule is
+    /// [`CredentialFailure::MintCap`], [`CredentialFailure::RateLimited`],
+    /// [`CredentialFailure::InstallationRefused`] and
+    /// [`CredentialFailure::RepoRefused`]. A `RateLimited` answer is waited out
+    /// [`RATE_RETRIES`] times, [`RATE_RETRY_DELAY`] apart, before it is returned. Any other
+    /// status, a timeout or a transport error is [`CredentialFailure::Unavailable`]. A reply that
+    /// breaks a rule is
     /// [`CredentialFailure::Malformed`], [`CredentialFailure::AppIdentityMissing`] or
     /// [`CredentialFailure::AppIdentityInvalid`]; the well-formed installation token in such a
     /// reply is revoked, because the server already minted and committed it. A reply that holds no
@@ -797,7 +832,7 @@ impl CredentialBook {
         box_name: &str,
     ) -> Result<Arc<JobCredentials>, CredentialFailure> {
         self.end(job_id);
-        let credentials = Arc::new(self.fetch_checked(job_id, attempt, box_name).await?);
+        let credentials = Arc::new(self.fetch_waiting(job_id, attempt, box_name).await?);
         let fetched_at_ms = self.clock.now_ms();
         self.held
             .lock()
@@ -841,8 +876,8 @@ impl CredentialBook {
     ///
     /// # Errors
     ///
-    /// Returns [`CredentialFailure::MintCap`] when the server's per-Job mint cap or per-User
-    /// mint rate limit is reached, [`CredentialFailure::InstallationRefused`] or
+    /// Returns [`CredentialFailure::MintCap`] when the server's per-Job mint cap is reached,
+    /// [`CredentialFailure::InstallationRefused`] or
     /// [`CredentialFailure::RepoRefused`] when the allowlists now refuse the installation or
     /// the repository, and any other server refusal as the variant [`CredentialBook::fetch`]
     /// maps it to ([`CredentialFailure::LeaseMismatch`] for a lost lease or a capability that
@@ -851,10 +886,12 @@ impl CredentialBook {
     /// [`CredentialFailure::AppIdentityMissing`] or
     /// [`CredentialFailure::AppIdentityInvalid`], and the well-formed installation token in that reply is
     /// revoked, as is the token of a [`CredentialFailure::Malformed`] reply and the fresh token
-    /// of a reply whose swap `refreshed` refuses. None of these keeps the old token or falls back to a PAT; the caller fails the
-    /// step. A transient failure, [`CredentialFailure::Unavailable`] or the server's
-    /// [`CredentialFailure::Expired`], returns `Ok(None)` while the held token is usable and
-    /// keeps it. Once it is not usable, an entry that is not skewed returns
+    /// of a reply whose swap `refreshed` refuses. None of these keeps the old token or falls back
+    /// to a PAT; the caller fails the step. A transient failure,
+    /// [`CredentialFailure::Unavailable`], the server's
+    /// [`CredentialFailure::Expired`] or the per-User [`CredentialFailure::RateLimited`], returns
+    /// `Ok(None)` while the held token is usable and keeps it. Once it is not usable, an
+    /// entry that is not skewed returns
     /// [`CredentialFailure::Unavailable`] and a skewed entry returns
     /// [`CredentialFailure::Expired`], whichever transient failure it was. A skewed entry has
     /// no expiry the box clock can judge, so it counts as usable until [`REFRESH_SKEW_MS`]
@@ -970,7 +1007,9 @@ impl CredentialBook {
                 }
                 let transient = matches!(
                     failure,
-                    CredentialFailure::Unavailable | CredentialFailure::Expired
+                    CredentialFailure::Unavailable
+                        | CredentialFailure::Expired
+                        | CredentialFailure::RateLimited
                 );
                 if usable && transient {
                     tracing::warn!(
@@ -983,6 +1022,28 @@ impl CredentialBook {
                 } else {
                     Err(failure)
                 }
+            }
+        }
+    }
+
+    async fn fetch_waiting(
+        &self,
+        job_id: &str,
+        attempt: u32,
+        box_name: &str,
+    ) -> Result<JobCredentials, CredentialFailure> {
+        let mut retries = self.rate_retries;
+        loop {
+            match self.fetch_checked(job_id, attempt, box_name).await {
+                Err(CredentialFailure::RateLimited) if retries > 0 => {
+                    retries -= 1;
+                    tracing::warn!(
+                        reason = ERR_RATE_LIMITED,
+                        "first credential fetch rate limited, retrying"
+                    );
+                    tokio::time::sleep(self.rate_delay).await;
+                }
+                other => return other,
             }
         }
     }
@@ -1180,6 +1241,17 @@ mod tests {
     use std::time::Duration;
     use tokio::io::AsyncReadExt;
     use tokio::net::TcpListener;
+
+    #[tokio::test]
+    async fn a_new_book_waits_out_the_rate_limit_longer_than_its_window() {
+        let channel = tonic::transport::Endpoint::from_static("http://127.0.0.1:1").connect_lazy();
+        let book = CredentialBook::new(CredentialClient::new(channel, "tok").unwrap());
+        assert_eq!(book.rate_retries, super::RATE_RETRIES);
+        assert_eq!(book.rate_delay, super::RATE_RETRY_DELAY);
+        let waited = book.rate_delay * book.rate_retries;
+        assert!(waited > Duration::from_secs(60), "{waited:?}");
+        assert!(waited <= Duration::from_secs(120), "{waited:?}");
+    }
 
     #[tokio::test]
     async fn a_refresh_whose_swap_fails_revokes_the_token_it_got() {

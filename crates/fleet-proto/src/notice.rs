@@ -8,8 +8,8 @@ use tonic::{Code, Status};
 
 use crate::{
     ERR_CAPABILITY_NOT_GRANTED, ERR_GITHUB_REJECTED, ERR_NEEDS_USER_TOKEN,
-    PRECONDITION_APP_INSTALLATION, PRECONDITION_APP_REPO, PRECONDITION_CREDENTIAL_TOMBSTONED,
-    PRECONDITION_NO_VERIFY_REPO, PRECONDITION_NOT_CONFIGURED,
+    PRECONDITION_APP_INSTALLATION, PRECONDITION_APP_MINT_RATE, PRECONDITION_APP_REPO,
+    PRECONDITION_CREDENTIAL_TOMBSTONED, PRECONDITION_NO_VERIFY_REPO, PRECONDITION_NOT_CONFIGURED,
 };
 
 /// One outcome of a credential operation, as shown to a person.
@@ -49,6 +49,8 @@ pub enum CredentialNotice {
     InstallationRefused,
     /// The repository of the Job is not allowed for the GitHub App.
     RepoRefused,
+    /// The User reached the per-minute GitHub App mint limit. Retry later.
+    RateLimited,
     /// Any other failure.
     Failed,
 }
@@ -73,6 +75,7 @@ impl CredentialNotice {
         Self::Tombstoned,
         Self::InstallationRefused,
         Self::RepoRefused,
+        Self::RateLimited,
         Self::Failed,
     ];
 
@@ -97,6 +100,7 @@ impl CredentialNotice {
             Self::Tombstoned => "tombstoned",
             Self::InstallationRefused => "installation_refused",
             Self::RepoRefused => "repo_refused",
+            Self::RateLimited => "rate_limited",
             Self::Failed => "failed",
         }
     }
@@ -142,6 +146,7 @@ impl CredentialNotice {
             Self::RepoRefused => {
                 "The repository is not allowed for the GitHub App. Ask the operator."
             }
+            Self::RateLimited => "Too many GitHub App token requests. Try again in a minute.",
             Self::Failed => "The request failed.",
         }
     }
@@ -176,6 +181,7 @@ impl CredentialNotice {
                 Self::InstallationRefused
             }
             Code::FailedPrecondition if message == PRECONDITION_APP_REPO => Self::RepoRefused,
+            Code::FailedPrecondition if message == PRECONDITION_APP_MINT_RATE => Self::RateLimited,
             Code::FailedPrecondition => Self::NoVerifier,
             _ => Self::Failed,
         }

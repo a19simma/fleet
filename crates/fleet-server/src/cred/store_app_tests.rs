@@ -1478,8 +1478,8 @@ async fn the_user_limit_refuses_at_the_limit_with_a_denied_row_and_no_pat(pool: 
     let w = limited_world(pool, &fake).await;
     w.plant_attempts(w.alice, i64::from(LIMIT), 0).await;
     let err = w.release_outcome().await.unwrap_err();
-    assert!(matches!(err, StoreError::MintCapReached), "{err:?}");
-    assert_eq!(err.to_string(), fleet_proto::PRECONDITION_APP_MINT_CAP);
+    assert!(matches!(err, StoreError::MintRateLimited), "{err:?}");
+    assert_eq!(err.to_string(), fleet_proto::PRECONDITION_APP_MINT_RATE);
     assert_eq!(fake.mints(), 0);
     assert_eq!(w.uses().await, 0);
     let denied: Vec<Row> = w
@@ -1500,7 +1500,7 @@ async fn the_user_limit_refuses_above_the_limit(pool: PgPool) {
     let w = limited_world(pool, &fake).await;
     w.plant_attempts(w.alice, i64::from(LIMIT) + 1, 0).await;
     let err = w.release_outcome().await.unwrap_err();
-    assert!(matches!(err, StoreError::MintCapReached), "{err:?}");
+    assert!(matches!(err, StoreError::MintRateLimited), "{err:?}");
     assert_eq!(fake.mints(), 0);
 }
 
@@ -1512,7 +1512,7 @@ async fn real_releases_reach_the_user_limit_then_stop(pool: PgPool) {
         w.release_outcome().await.unwrap();
     }
     let err = w.release_outcome().await.unwrap_err();
-    assert!(matches!(err, StoreError::MintCapReached), "{err:?}");
+    assert!(matches!(err, StoreError::MintRateLimited), "{err:?}");
     assert_eq!(fake.mints(), usize::try_from(LIMIT).unwrap());
 }
 
@@ -1534,7 +1534,7 @@ async fn attempts_older_than_a_minute_do_not_count_and_younger_ones_do(pool: PgP
     w.release_outcome().await.unwrap();
     w.plant_attempts(w.alice, i64::from(LIMIT), 59).await;
     let err = w.release_outcome().await.unwrap_err();
-    assert!(matches!(err, StoreError::MintCapReached), "{err:?}");
+    assert!(matches!(err, StoreError::MintRateLimited), "{err:?}");
     assert_eq!(fake.mints(), 1);
 }
 
@@ -1686,7 +1686,7 @@ async fn verify_obeys_the_user_rate_limit_with_a_denied_row_and_no_mint(pool: Pg
     w.plant_attempts(w.alice, 2, 0).await;
     let status = verify_reply(&w).await.unwrap_err();
     assert_eq!(status.code(), tonic::Code::FailedPrecondition);
-    assert_eq!(status.message(), fleet_proto::PRECONDITION_APP_MINT_CAP);
+    assert_eq!(status.message(), fleet_proto::PRECONDITION_APP_MINT_RATE);
     assert_eq!(fake.mints(), 0);
     assert_eq!(
         w.rows().await.last().cloned(),
@@ -1732,9 +1732,9 @@ async fn verify_probes_count_toward_the_user_rate_for_probes_and_releases(pool: 
     assert!(verify_reply(&w).await.unwrap().valid);
     assert!(verify_reply(&w).await.unwrap().valid);
     let status = verify_reply(&w).await.unwrap_err();
-    assert_eq!(status.message(), fleet_proto::PRECONDITION_APP_MINT_CAP);
+    assert_eq!(status.message(), fleet_proto::PRECONDITION_APP_MINT_RATE);
     let err = w.release_outcome().await.unwrap_err();
-    assert!(matches!(err, StoreError::MintCapReached), "{err:?}");
+    assert!(matches!(err, StoreError::MintRateLimited), "{err:?}");
     assert_eq!(fake.mints(), 2);
     assert_eq!(
         w.rows().await.last().cloned(),
@@ -2342,4 +2342,19 @@ async fn the_service_put_refuses_an_off_list_installation_with_the_fixed_message
         .await
         .unwrap();
     assert_eq!(stored, 0);
+}
+
+#[sqlx::test]
+async fn the_service_maps_the_user_rate_limit_to_its_own_retryable_precondition(pool: PgPool) {
+    let fake = fake("201 Created", None).await;
+    let w = limited_world(pool, &fake).await;
+    w.plant_attempts(w.alice, i64::from(LIMIT), 0).await;
+    let service = super::CredentialService::new(w.creds.clone(), Arc::new(NoGithub));
+    let status = service.job_credentials(JOB, 1, "alpha").await.unwrap_err();
+    assert_eq!(status.code(), tonic::Code::FailedPrecondition);
+    assert_eq!(status.message(), fleet_proto::PRECONDITION_APP_MINT_RATE);
+    assert_ne!(
+        fleet_proto::PRECONDITION_APP_MINT_RATE,
+        fleet_proto::PRECONDITION_APP_MINT_CAP
+    );
 }

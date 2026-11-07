@@ -216,10 +216,16 @@ pub const GITHUB_INSTALLATION_TOKEN_KIND: &str = "github_installation_token";
 /// every cause.
 pub const PRECONDITION_APP_MINT: &str = "github app token unavailable";
 
-/// `FAILED_PRECONDITION` message: the Job reached its mint cap or its User reached the
-/// per-minute mint limit (ADR-0058, SEC-003, SEC-004, SEC-011). The Job or step fails and never
-/// falls back to a PAT.
+/// `FAILED_PRECONDITION` message: the Job reached its mint cap (ADR-0058, SEC-004, SEC-011).
+/// Terminal: the Job or step fails and never falls back to a PAT.
 pub const PRECONDITION_APP_MINT_CAP: &str = "github app token limit reached";
+
+/// `FAILED_PRECONDITION` message: the User reached the per-minute mint limit (ADR-0058,
+/// SEC-003).
+///
+/// The limit counts every scope. It is retryable: fleetd waits and asks again because the
+/// limit lifts within a minute. It never falls back to a PAT.
+pub const PRECONDITION_APP_MINT_RATE: &str = "github app token rate limited";
 
 /// `FAILED_PRECONDITION` message: the installation is refused.
 ///
