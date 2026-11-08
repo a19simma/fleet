@@ -11,6 +11,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use fleet_core::credential::Secret;
+use fleet_proto::v1::SubmitJobRequest;
 use fleet_server::auth::BearerAuth;
 use fleet_server::config::Token;
 use fleet_server::cred::github::{GithubApi, GithubError, GithubUser};
@@ -70,6 +71,7 @@ struct Reply {
 struct Harness {
     addr: SocketAddr,
     pool: PgPool,
+    store: Store,
     stop: Option<oneshot::Sender<()>>,
     task: tokio::task::JoinHandle<std::io::Result<()>>,
 }
@@ -91,6 +93,7 @@ impl Harness {
         );
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
+        let kept = store.clone();
         let (stop, rx) = oneshot::channel::<()>();
         let task = tokio::spawn(async move {
             serve_with_web(&store, &bearer, web, TcpIncoming::from(listener), async {
@@ -101,6 +104,7 @@ impl Harness {
         Self {
             addr,
             pool,
+            store: kept,
             stop: Some(stop),
             task,
         }
@@ -416,5 +420,74 @@ async fn the_account_page_carries_mode_and_csrf_on_main(pool: PgPool) {
     assert_eq!(attr(main[0], "data-mode"), Some("add"));
     assert_eq!(attr(main[0], "data-csrf"), Some(CSRF));
     assert!(!tags(&page.body, "body")[0].contains("data-"));
+    h.finish().await;
+}
+
+const TRANSCRIPT_HOOKS: [&str; 4] = ["tx-entry", "tx-note", "tx-result-total", "tx-list"];
+
+#[sqlx::test]
+async fn the_job_transcript_page_has_no_inline_style_and_known_classes(pool: PgPool) {
+    let h = Harness::start(pool).await;
+    let cookie = h.cookie().await;
+    let user_id: i64 = sqlx::query_scalar("SELECT id FROM users WHERE username = 'alice'")
+        .fetch_one(&h.pool)
+        .await
+        .unwrap();
+    let request = SubmitJobRequest {
+        idempotency_key: "k1".to_owned(),
+        prompt: "p".to_owned(),
+        repo: "https://example.com/org/repo.git".to_owned(),
+        base_ref: "main".to_owned(),
+        open_pr: false,
+        agent: String::new(),
+        profile: String::new(),
+    };
+    let id = h
+        .store
+        .submit_job_for(Some(user_id), &request)
+        .await
+        .unwrap()
+        .job_id;
+    let lines = [
+        serde_json::json!({"type": "assistant", "message": {"id": "m1", "role": "assistant",
+            "content": [{"type": "tool_use", "id": "t1", "name": "Bash", "input": {"command": "ls"}}],
+            "usage": {"input_tokens": 3, "output_tokens": 20}}, "parent_tool_use_id": null}),
+        serde_json::json!({"type": "user", "message": {"role": "user", "content": [
+            {"type": "tool_result", "tool_use_id": "t1", "content": "boom", "is_error": true}]},
+            "parent_tool_use_id": null}),
+        serde_json::json!({"type": "fleet_note", "text": "note"}),
+        serde_json::json!({"type": "result", "subtype": "success", "is_error": false,
+            "num_turns": 1, "duration_ms": 5, "total_cost_usd": 0.5,
+            "usage": {"input_tokens": 3, "output_tokens": 20}}),
+    ];
+    for (n, line) in lines.iter().enumerate() {
+        sqlx::query(
+            "INSERT INTO job_transcript (job_id, seq, ts_ms, chunk, truncated) \
+             VALUES ($1, $2, 1, $3, false)",
+        )
+        .bind(&id)
+        .bind(i64::try_from(n).unwrap() + 1)
+        .bind(line.to_string())
+        .execute(&h.pool)
+        .await
+        .unwrap();
+    }
+    let known = selectors(STYLE_CSS);
+    for path in [format!("/jobs/{id}"), format!("/jobs/{id}?raw=1")] {
+        let page = h.get(&path, Some(&cookie)).await;
+        assert_eq!(page.status, 200, "{path}");
+        assert_eq!(
+            inline_violations(&page.body),
+            Vec::<String>::new(),
+            "{path}"
+        );
+        let missing: Vec<String> = class_tokens(&page.body)
+            .into_iter()
+            .filter(|class| !known.contains(class) && !TRANSCRIPT_HOOKS.contains(&class.as_str()))
+            .collect();
+        assert!(missing.is_empty(), "{path}: {missing:?}");
+    }
+    let pretty = h.get(&format!("/jobs/{id}"), Some(&cookie)).await;
+    assert!(pretty.body.contains("data-kind=\"tool\""));
     h.finish().await;
 }

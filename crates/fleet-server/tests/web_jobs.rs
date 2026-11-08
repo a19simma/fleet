@@ -7,7 +7,7 @@
 
 use std::fmt::Write as _;
 use std::net::SocketAddr;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use fleet_proto::v1::SubmitJobRequest;
 use fleet_server::auth::BearerAuth;
@@ -16,6 +16,7 @@ use fleet_server::cred::Users;
 use fleet_server::service::serve_with_web;
 use fleet_server::store::Store;
 use fleet_server::web::{MAX_RENDER_BYTES, SESSION_COOKIE, Web, WebAuth};
+use serde_json::{Value, json};
 use sqlx::PgPool;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
@@ -156,6 +157,34 @@ impl Harness {
         .execute(&self.pool)
         .await
         .unwrap();
+    }
+
+    async fn lines(&self, job_id: &str, lines: &[Value]) {
+        for (n, line) in lines.iter().enumerate() {
+            self.chunk(job_id, i64::try_from(n).unwrap() + 1, &line.to_string())
+                .await;
+        }
+    }
+
+    async fn bulk(&self, job_id: &str, count: i64, text: &str) {
+        sqlx::query(
+            "INSERT INTO job_transcript (job_id, seq, ts_ms, chunk, truncated) \
+             SELECT $1, g, 1, $2, false FROM generate_series(1::bigint, $3::bigint) g",
+        )
+        .bind(job_id)
+        .bind(text)
+        .bind(count)
+        .execute(&self.pool)
+        .await
+        .unwrap();
+    }
+
+    async fn end(&self, job_id: &str) {
+        sqlx::query("UPDATE jobs SET state = 'SUCCEEDED', finished_at = now() WHERE job_id = $1")
+            .bind(job_id)
+            .execute(&self.pool)
+            .await
+            .unwrap();
     }
 
     async fn send(&self, method: &str, path: &str, extra: &[(&str, &str)], body: &[u8]) -> Reply {
@@ -457,19 +486,6 @@ async fn revoking_works_for_the_owner_and_not_for_another_user(pool: PgPool) {
 }
 
 #[sqlx::test]
-async fn more_chunks_than_one_page_shows_the_cut_marker(pool: PgPool) {
-    let h = Harness::start(pool).await;
-    let alice = h.session("alice", 'a').await;
-    let id = h.job(&alice, "a1", "p").await;
-    for seq in 1..=101 {
-        h.chunk(&id, seq, "x").await;
-    }
-    let detail = h.get(&alice, &format!("/jobs/{id}")).await;
-    assert!(detail.body.contains("transcript cut"));
-    h.finish().await;
-}
-
-#[sqlx::test]
 async fn only_an_https_pull_request_url_becomes_a_link(pool: PgPool) {
     let h = Harness::start(pool).await;
     let alice = h.session("alice", 'a').await;
@@ -503,5 +519,441 @@ async fn a_label_with_a_control_character_is_refused(pool: PgPool) {
     let body = format!("csrf={}&label=a%0Ab", alice.csrf);
     let made = h.post(&alice, "/tokens/create", &body).await;
     assert_eq!(made.location(), "/tokens?notice=invalid");
+    h.finish().await;
+}
+
+fn said(role: &str, id: &str, block: &Value, parent: Option<&str>) -> Value {
+    json!({"type": role, "message": {"id": id, "role": role, "content": [block],
+        "usage": {"input_tokens": 3, "output_tokens": 20}}, "parent_tool_use_id": parent})
+}
+
+fn text(role: &str, id: &str, body: &str) -> Value {
+    said(role, id, &json!({"type": "text", "text": body}), None)
+}
+
+fn call(msg: &str, tool: &str, name: &str, input: &Value, parent: Option<&str>) -> Value {
+    said(
+        "assistant",
+        msg,
+        &json!({"type": "tool_use", "id": tool, "name": name, "input": input}),
+        parent,
+    )
+}
+
+fn answer(tool: &str, body: &str, is_error: bool, parent: Option<&str>) -> Value {
+    json!({"type": "user", "message": {"role": "user", "content": [
+        {"type": "tool_result", "tool_use_id": tool, "content": body, "is_error": is_error}]},
+        "parent_tool_use_id": parent})
+}
+
+fn finale() -> Value {
+    json!({"type": "result", "subtype": "success", "is_error": false, "duration_ms": 12345,
+        "num_turns": 7, "result": "all done", "total_cost_usd": 0.4231,
+        "usage": {"input_tokens": 111, "output_tokens": 222,
+            "cache_read_input_tokens": 333, "cache_creation_input_tokens": 444},
+        "permission_denials": [{"tool_name": "Bash"}, {"tool_name": "Edit"}]})
+}
+
+fn entries(body: &str) -> Vec<&str> {
+    body.split("<li ")
+        .skip(1)
+        .filter(|part| part.contains("data-kind=\""))
+        .collect()
+}
+
+fn kind_of<'a>(body: &'a str, kind: &str) -> Vec<&'a str> {
+    let needle = format!("data-kind=\"{kind}\"");
+    entries(body)
+        .into_iter()
+        .filter(|part| part.contains(&needle))
+        .collect()
+}
+
+#[sqlx::test]
+async fn the_transcript_renders_turns_pairs_and_the_result_footer(pool: PgPool) {
+    let h = Harness::start(pool).await;
+    let alice = h.session("alice", 'a').await;
+    let id = h.job(&alice, "a1", "p").await;
+    h.lines(
+        &id,
+        &[
+            text("user", "u1", "please fix it"),
+            text("assistant", "m1", "on it"),
+            call("m2", "t1", "Bash", &json!({"command": "cargo test"}), None),
+            answer("t1", "all green", false, None),
+            finale(),
+        ],
+    )
+    .await;
+    h.end(&id).await;
+    let page = h.get(&alice, &format!("/jobs/{id}")).await;
+    assert_eq!(page.status, 200);
+    let body = &page.body;
+    assert!(body.contains("<ol id=\"transcript\""), "{body}");
+    assert!(body.contains("aria-label=\"Transcript entries\""));
+    assert_eq!(kind_of(body, "message").len(), 2);
+    let tool = kind_of(body, "tool");
+    assert_eq!(tool.len(), 1);
+    assert!(tool[0].contains("<details"));
+    assert!(tool[0].contains("Bash"));
+    assert!(tool[0].contains("cargo test"));
+    assert!(tool[0].contains("all green"));
+    assert!(tool[0].contains("data-status=\"ok\""));
+    let result = kind_of(body, "result");
+    assert_eq!(result.len(), 1);
+    for want in [
+        "$0.4231", "12.3 s", "111", "222", "333", "444", "Turns", "Denials",
+    ] {
+        assert!(result[0].contains(want), "{want}: {}", result[0]);
+    }
+    assert!(result[0].contains(">7<"));
+    assert!(result[0].contains(">2<"));
+    assert!(!body.contains("<pre id=\"transcript\""));
+    assert!(!body.contains("id=\"cut\""));
+    h.finish().await;
+}
+
+#[sqlx::test]
+async fn a_result_footer_needs_a_result_entry(pool: PgPool) {
+    let h = Harness::start(pool).await;
+    let alice = h.session("alice", 'a').await;
+    let id = h.job(&alice, "a1", "p").await;
+    h.lines(&id, &[text("assistant", "m1", "working")]).await;
+    let page = h.get(&alice, &format!("/jobs/{id}")).await;
+    assert_eq!(kind_of(&page.body, "result").len(), 0);
+    assert!(!page.body.contains("Cost"));
+    assert!(!page.body.contains("$0."));
+    h.finish().await;
+}
+
+#[sqlx::test]
+async fn an_error_pair_is_open_and_thinking_and_plain_pairs_are_closed(pool: PgPool) {
+    let h = Harness::start(pool).await;
+    let alice = h.session("alice", 'a').await;
+    let id = h.job(&alice, "a1", "p").await;
+    h.lines(
+        &id,
+        &[
+            said(
+                "assistant",
+                "m0",
+                &json!({"type": "thinking", "thinking": "hmm", "signature": "s"}),
+                None,
+            ),
+            call("m1", "t1", "Bash", &json!({"command": "ls"}), None),
+            answer("t1", "fine", false, None),
+            call("m2", "t2", "Bash", &json!({"command": "boom"}), None),
+            answer("t2", "it broke", true, None),
+        ],
+    )
+    .await;
+    h.end(&id).await;
+    let body = h.get(&alice, &format!("/jobs/{id}")).await.body;
+    let thinking = kind_of(&body, "thinking");
+    assert_eq!(thinking.len(), 1);
+    assert!(!thinking[0].contains("open=\"open\""));
+    let tools = kind_of(&body, "tool");
+    assert_eq!(tools.len(), 2);
+    assert!(tools[0].contains("data-status=\"ok\""));
+    assert!(!tools[0].contains("open=\"open\""));
+    assert!(tools[1].contains("data-status=\"error\""));
+    assert!(tools[1].contains("open=\"open\""));
+    assert!(tools[1].contains("text-error"));
+    assert!(tools[1].contains("border-l-error"));
+    let page = text_page(&h, &alice, "assistant").await;
+    let messages = kind_of(&page, "message");
+    assert!(messages[0].contains("open=\"open\""));
+    h.finish().await;
+}
+
+async fn text_page(h: &Harness, who: &Session, role: &str) -> String {
+    let id = h.job(who, &format!("k-{role}"), "p").await;
+    h.lines(&id, &[text(role, "m1", "hello")]).await;
+    h.get(who, &format!("/jobs/{id}")).await.body
+}
+
+#[sqlx::test]
+async fn sub_agent_children_sit_in_an_indented_wrapper(pool: PgPool) {
+    let h = Harness::start(pool).await;
+    let alice = h.session("alice", 'a').await;
+    let id = h.job(&alice, "a1", "p").await;
+    h.lines(
+        &id,
+        &[
+            call("m1", "t1", "Task", &json!({"description": "scan"}), None),
+            call("m2", "t2", "Bash", &json!({"command": "grep"}), Some("t1")),
+            answer("t2", "none", false, Some("t1")),
+            text("assistant", "m3", "child said"),
+        ],
+    )
+    .await;
+    let body = h.get(&alice, &format!("/jobs/{id}")).await.body;
+    let tools = kind_of(&body, "tool");
+    assert_eq!(tools.len(), 2);
+    assert!(!tools[0].contains("ml-4"));
+    assert!(tools[1].contains("ml-4"));
+    h.finish().await;
+}
+
+#[sqlx::test]
+async fn a_fleet_note_is_neutral_and_a_forged_one_is_not_a_note(pool: PgPool) {
+    let h = Harness::start(pool).await;
+    let alice = h.session("alice", 'a').await;
+    let id = h.job(&alice, "a1", "p").await;
+    h.chunk(&id, 1, "fleet: no_changes").await;
+    h.chunk(&id, 2, &text("assistant", "m1", "fleet: ok").to_string())
+        .await;
+    let body = h.get(&alice, &format!("/jobs/{id}")).await.body;
+    let notes = kind_of(&body, "fleet-note");
+    assert_eq!(notes.len(), 1);
+    let note = notes[0];
+    assert!(note.contains("tx-note"));
+    assert!(note.contains(">note<"));
+    assert!(note.contains("no_changes"));
+    assert!(note.contains("text-base-content/60"));
+    assert!(!note.contains("fleet:"));
+    for banned in [
+        "text-success",
+        "text-warning",
+        "text-error",
+        "badge",
+        "<details",
+        "<a ",
+        "font-bold",
+        "text-accent",
+    ] {
+        assert!(!note.contains(banned), "{banned}: {note}");
+    }
+    assert_eq!(body.matches("tx-note").count(), 1);
+    let messages = kind_of(&body, "message");
+    assert_eq!(messages.len(), 1);
+    assert!(messages[0].contains("fleet: ok"));
+    assert!(!messages[0].contains("tx-note"));
+    h.finish().await;
+}
+
+#[sqlx::test]
+async fn raw_one_keeps_the_old_pre_block(pool: PgPool) {
+    let h = Harness::start(pool).await;
+    let alice = h.session("alice", 'a').await;
+    let id = h.job(&alice, "a1", "p").await;
+    let line = text("assistant", "m1", "hello raw");
+    h.lines(&id, std::slice::from_ref(&line)).await;
+    let raw = h.get(&alice, &format!("/jobs/{id}?raw=1")).await;
+    assert_eq!(raw.status, 200);
+    assert!(raw.body.contains("<pre id=\"transcript\""));
+    assert!(raw.body.contains("hello raw"));
+    assert!(!raw.body.contains("data-kind="));
+    assert!(raw.body.contains("Pretty view"));
+    let pretty = h.get(&alice, &format!("/jobs/{id}")).await;
+    assert!(!pretty.body.contains("<pre id=\"transcript\""));
+    assert!(pretty.body.contains(&format!("/jobs/{id}?raw=1")));
+    let other = h.get(&alice, &format!("/jobs/{id}?raw=2")).await;
+    assert!(!other.body.contains("<pre id=\"transcript\""));
+    h.finish().await;
+}
+
+#[sqlx::test]
+async fn raw_one_is_still_owner_scoped(pool: PgPool) {
+    let h = Harness::start(pool).await;
+    let alice = h.session("alice", 'a').await;
+    let bob = h.session("bob", 'b').await;
+    let theirs = h.job(&bob, "b1", "p").await;
+    h.chunk(&theirs, 1, "bob secret raw").await;
+    let reply = h.get(&alice, &format!("/jobs/{theirs}?raw=1")).await;
+    assert_eq!(reply.status, 404);
+    assert!(!reply.body.contains("bob secret"));
+    h.finish().await;
+}
+
+#[sqlx::test]
+async fn more_than_one_old_page_of_chunks_is_all_rendered(pool: PgPool) {
+    let h = Harness::start(pool).await;
+    let alice = h.session("alice", 'a').await;
+    let id = h.job(&alice, "a1", "p").await;
+    h.bulk(&id, 1_200, &text("assistant", "m1", "x").to_string())
+        .await;
+    h.end(&id).await;
+    let body = h.get(&alice, &format!("/jobs/{id}")).await.body;
+    assert_eq!(kind_of(&body, "message").len(), 1_200);
+    assert!(!body.contains("transcript cut"));
+    assert!(!body.contains("id=\"cut\""));
+    h.finish().await;
+}
+
+#[sqlx::test]
+async fn the_row_ceiling_stops_paging_and_shows_the_cut(pool: PgPool) {
+    let h = Harness::start(pool).await;
+    let alice = h.session("alice", 'a').await;
+    let id = h.job(&alice, "a1", "p").await;
+    h.bulk(&id, 50_001, "").await;
+    h.end(&id).await;
+    let body = h.get(&alice, &format!("/jobs/{id}")).await.body;
+    assert!(body.contains("id=\"cut\""));
+    assert!(body.contains("transcript cut"));
+    assert!(body.contains("role=\"status\""));
+    assert!(body.contains(&format!("/jobs/{id}?raw=1")));
+    h.finish().await;
+}
+
+#[sqlx::test]
+async fn exactly_the_row_ceiling_is_not_a_cut(pool: PgPool) {
+    let h = Harness::start(pool).await;
+    let alice = h.session("alice", 'a').await;
+    let id = h.job(&alice, "a1", "p").await;
+    h.bulk(&id, 50_000, "").await;
+    h.end(&id).await;
+    let body = h.get(&alice, &format!("/jobs/{id}")).await.body;
+    assert!(!body.contains("transcript cut"));
+    h.finish().await;
+}
+
+#[sqlx::test]
+async fn a_chunk_over_the_render_cap_is_cut_and_one_that_fits_is_not(pool: PgPool) {
+    let h = Harness::start(pool).await;
+    let alice = h.session("alice", 'a').await;
+    let id = h.job(&alice, "a1", "p").await;
+    let line = text("assistant", "m1", &"y".repeat(15_000)).to_string();
+    let fit = MAX_RENDER_BYTES / line.len();
+    h.bulk(&id, i64::try_from(fit).unwrap(), &line).await;
+    h.end(&id).await;
+    let body = h.get(&alice, &format!("/jobs/{id}")).await.body;
+    assert!(!body.contains("transcript cut"), "{fit}");
+    assert_eq!(kind_of(&body, "message").len(), fit);
+    let id = h.job(&alice, "a2", "p").await;
+    h.bulk(&id, i64::try_from(fit).unwrap() + 1, &line).await;
+    h.end(&id).await;
+    let body = h.get(&alice, &format!("/jobs/{id}")).await.body;
+    assert!(body.contains("transcript cut"));
+    assert_eq!(kind_of(&body, "message").len(), fit);
+    h.finish().await;
+}
+
+#[sqlx::test]
+async fn a_large_transcript_stays_small_and_fast(pool: PgPool) {
+    let h = Harness::start(pool).await;
+    let alice = h.session("alice", 'a').await;
+    let id = h.job(&alice, "a1", "p").await;
+    let line = json!({"type": "assistant", "message": {"id": "m", "content": [{"type": "text", "text": "a"}]}}).to_string();
+    let count = i64::try_from(MAX_RENDER_BYTES / (line.len() + 1)).unwrap();
+    h.bulk(&id, count, &line).await;
+    h.end(&id).await;
+    let start = Instant::now();
+    let page = h.get(&alice, &format!("/jobs/{id}")).await;
+    let took = start.elapsed();
+    assert_eq!(page.status, 200);
+    assert_eq!(
+        kind_of(&page.body, "message").len(),
+        usize::try_from(count).unwrap()
+    );
+    assert!(page.body.len() < 8 * 1024 * 1024, "{}", page.body.len());
+    assert!(took < Duration::from_secs(15), "{took:?}");
+    h.finish().await;
+}
+
+#[sqlx::test]
+async fn the_empty_states_are_static_strings(pool: PgPool) {
+    let h = Harness::start(pool).await;
+    let alice = h.session("alice", 'a').await;
+    let queued = h.job(&alice, "a1", "p").await;
+    let body = h.get(&alice, &format!("/jobs/{queued}")).await.body;
+    assert!(body.contains("<p id=\"empty\""));
+    assert!(body.contains("No transcript yet."));
+    let finished = h.job(&alice, "a2", "p").await;
+    h.end(&finished).await;
+    let body = h.get(&alice, &format!("/jobs/{finished}")).await.body;
+    assert!(body.contains("This job wrote no transcript."));
+    assert!(!body.contains("No transcript yet."));
+    let blank = h.job(&alice, "a3", "p").await;
+    h.chunk(&blank, 1, "\n").await;
+    let body = h.get(&alice, &format!("/jobs/{blank}")).await.body;
+    assert!(body.contains("Transcript has no readable entries."));
+    h.finish().await;
+}
+
+#[sqlx::test]
+async fn hostile_values_are_escaped_on_every_field(pool: PgPool) {
+    let h = Harness::start(pool).await;
+    let alice = h.session("alice", 'a').await;
+    let id = h.job(&alice, "a1", "p").await;
+    let evil = |marker: &str| format!("<{marker}>\"'&<img src=x onerror=alert(1)>");
+    let tool_id = format!("tid-MARK{}", "<>\"&'");
+    h.lines(
+        &id,
+        &[
+            text("assistant", "m1", &evil("MSG")),
+            call(
+                "m2",
+                &tool_id,
+                &evil("NAME"),
+                &json!({"command": evil("SUMM"), "other": evil("INPUT")}),
+                None,
+            ),
+            answer(&tool_id, &evil("OUT"), true, None),
+            json!({"type": "zzz", "p": evil("UNK")}),
+            said(
+                "assistant",
+                "m3",
+                &json!({"type": "thinking", "thinking": evil("THINK"), "signature": "s"}),
+                None,
+            ),
+        ],
+    )
+    .await;
+    h.chunk(&id, 6, &format!("fleet: {}", evil("NOTE"))).await;
+    let body = h.get(&alice, &format!("/jobs/{id}")).await.body;
+    for marker in ["MSG", "SUMM", "INPUT", "OUT", "UNK", "THINK", "NOTE"] {
+        assert!(body.contains(&format!("&lt;{marker}&gt;")), "{marker}");
+        assert!(!body.contains(&format!("<{marker}>")), "{marker}");
+    }
+    assert!(!body.contains("<img src=x"));
+    assert!(!body.contains("onerror=alert(1)>"));
+    assert!(!body.contains("tid-MARK"));
+    assert!(!body.contains("<NAME>"));
+    h.finish().await;
+}
+
+#[sqlx::test]
+async fn line_breaks_escapes_and_length_are_neutralised(pool: PgPool) {
+    let h = Harness::start(pool).await;
+    let alice = h.session("alice", 'a').await;
+    let id = h.job(&alice, "a1", "p").await;
+    let hostile = "a\rb\r\nc\u{85}d\u{2028}e\u{2029}f\u{1b}[31mred\u{1b}[0m\u{202e}g";
+    let long = "L".repeat(100_000);
+    h.lines(
+        &id,
+        &[
+            text("assistant", "m1", hostile),
+            call("m2", "t1", "Bash", &json!({"command": hostile}), None),
+            answer("t1", hostile, false, None),
+            text("assistant", "m3", &long),
+        ],
+    )
+    .await;
+    h.chunk(&id, 5, &format!("fleet: {hostile}")).await;
+    let page = h.get(&alice, &format!("/jobs/{id}")).await;
+    assert_eq!(page.status, 200);
+    for bad in ['\u{85}', '\u{2028}', '\u{2029}', '\u{1b}', '\u{202e}', '\r'] {
+        assert!(!page.body.contains(bad), "{bad:?}");
+    }
+    assert!(page.body.contains("red"));
+    assert!(page.body.matches('L').count() < 20_000);
+    h.finish().await;
+}
+
+#[sqlx::test]
+async fn the_transcript_page_has_no_inline_style_or_script(pool: PgPool) {
+    let h = Harness::start(pool).await;
+    let alice = h.session("alice", 'a').await;
+    let id = h.job(&alice, "a1", "p").await;
+    h.lines(&id, &[text("assistant", "m1", "hi"), finale()])
+        .await;
+    let body = h.get(&alice, &format!("/jobs/{id}")).await.body;
+    assert!(!body.contains(" style="));
+    assert!(!body.contains("<style"));
+    assert!(!body.contains(" onclick="));
+    assert!(body.contains("id=\"tx-toolbar\""));
+    assert!(body.contains("href=\"#tx-end\""));
+    assert!(body.contains("id=\"tx-end\""));
     h.finish().await;
 }
