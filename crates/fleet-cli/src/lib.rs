@@ -6,6 +6,7 @@ pub mod config;
 pub mod credential;
 pub mod list;
 pub mod logs;
+mod pretty;
 pub mod profile;
 pub mod repo;
 pub mod stats;
@@ -131,6 +132,9 @@ pub enum Command {
         /// Keep polling until the job ends; exit nonzero unless it succeeded.
         #[arg(short, long)]
         follow: bool,
+        /// Print the stored stream-json lines unchanged instead of the readable view.
+        #[arg(long)]
+        raw: bool,
     },
     /// Request cancellation of a job.
     Cancel {
@@ -993,21 +997,59 @@ pub async fn run_with(
     stdin: &mut impl Read,
     out: &mut impl Write,
 ) -> Result<(), CliError> {
+    run_with_color(cli, lookup, timeouts, false, stdin, out).await
+}
+
+/// Whether output may carry color: `tty` says stdout is a terminal and `no_color` is the value
+/// of `NO_COLOR`. Only the binary reads the environment, the renderer takes the result.
+#[must_use]
+pub fn color_wanted(tty: bool, no_color: Option<&str>) -> bool {
+    tty && no_color.is_none_or(str::is_empty)
+}
+
+/// Like [`run_with`], with color in the readable `logs` view switched by `color`.
+///
+/// Test seam and the binary's entry point. Not part of the stable interface.
+///
+/// # Errors
+/// Returns [`CliError`] on the same conditions as [`run`].
+#[doc(hidden)]
+pub async fn run_with_color(
+    cli: Cli,
+    lookup: impl Fn(&str) -> Option<String>,
+    timeouts: bool,
+    color: bool,
+    stdin: &mut impl Read,
+    out: &mut impl Write,
+) -> Result<(), CliError> {
     let Cli {
         server,
         insecure,
         command,
     } = cli;
     let env = resolve(server, insecure, lookup);
-    Box::pin(dispatch(command, &env, timeouts, stdin, out))
+    Box::pin(dispatch(command, &env, timeouts, color, stdin, out))
         .await
         .map_err(|e| e.scrubbed(env.as_ref().ok().map(|resolved| &resolved.scrub)))
+}
+
+async fn run_logs(
+    env: &Resolution,
+    timeouts: bool,
+    color: bool,
+    (id, follow, raw): (String, bool, bool),
+    out: &mut impl Write,
+) -> Result<(), CliError> {
+    let session = session(env, timeouts).await?;
+    let view = logs::View::new(raw, color);
+    logs::logs(&session.jobs, &session.scrub, id, follow, view, out).await
 }
 
 async fn dispatch(
     command: Command,
     env: &Resolution,
     timeouts: bool,
+    color: bool,
     stdin: &mut impl Read,
     out: &mut impl Write,
 ) -> Result<(), CliError> {
@@ -1066,9 +1108,8 @@ async fn dispatch(
                 telemetry::write_tools(&mut client, &scrub, &id, out).await?;
             }
         }
-        Command::Logs { id, follow } => {
-            let session = session(env, timeouts).await?;
-            logs::logs(&session.jobs, &session.scrub, id, follow, out).await?;
+        Command::Logs { id, follow, raw } => {
+            run_logs(env, timeouts, color, (id, follow, raw), out).await?;
         }
         Command::Stats {
             since,
