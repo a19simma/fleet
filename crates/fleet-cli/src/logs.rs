@@ -8,6 +8,7 @@ use fleet_proto::v1::{GetJobRequest, ReadTranscriptRequest, TranscriptChunk};
 use tokio::time::sleep;
 use tonic::{Code, Response, Status};
 
+use crate::pretty::Pretty;
 use crate::{CliError, Client, Scrub, ScrubStream, require_success};
 
 /// Wait between polls when a follow read returns no chunks.
@@ -18,6 +19,28 @@ pub const RETRY_DELAY: Duration = Duration::from_secs(1);
 
 /// Attempts made for one call before a transient status is returned as the error.
 pub const MAX_ATTEMPTS: u32 = 5;
+
+/// How `fleet logs` shows the transcript.
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum View {
+    /// The stored lines unchanged.
+    Raw,
+    /// The readable view.
+    Pretty {
+        /// Whether to wrap marks in ANSI color.
+        color: bool,
+    },
+}
+
+impl View {
+    pub(crate) fn new(raw: bool, color: bool) -> Self {
+        if raw {
+            Self::Raw
+        } else {
+            Self::Pretty { color }
+        }
+    }
+}
 
 const TRUNCATED_MARKER: &str = "-- transcript truncated --";
 
@@ -58,6 +81,28 @@ fn write_text(out: &mut impl Write, text: &str) -> std::io::Result<()> {
     Ok(())
 }
 
+/// Where read chunks go: the raw lines or the readable view.
+enum Sink<'a> {
+    Raw(ScrubStream<'a>),
+    Pretty(Box<Pretty<'a>>),
+}
+
+impl Sink<'_> {
+    fn chunk(&mut self, out: &mut impl Write, chunk: &TranscriptChunk) -> std::io::Result<()> {
+        match self {
+            Self::Raw(stream) => write_chunk(out, stream, chunk),
+            Self::Pretty(pretty) => pretty.chunk(out, &chunk.text, chunk.truncated),
+        }
+    }
+
+    fn finish(&mut self, out: &mut impl Write, done: bool) -> std::io::Result<()> {
+        match self {
+            Self::Raw(stream) => write_text(out, &stream.finish()),
+            Self::Pretty(pretty) => pretty.finish(out, done),
+        }
+    }
+}
+
 /// Writes one chunk, adding a newline when its scrubbed text lacks one, then the truncation
 /// marker when the chunk is flagged truncated. A text suffix that could start the token is
 /// held for the next chunk, so a token split across chunks is redacted.
@@ -82,12 +127,18 @@ pub(crate) async fn logs(
     scrub: &Scrub,
     id: String,
     follow: bool,
+    view: View,
     out: &mut impl Write,
 ) -> Result<(), CliError> {
-    let mut stream = scrub.stream();
-    let read = pages(client, &mut stream, &id, follow, out).await;
-    let tail = stream.finish();
-    write_text(out, &tail)?;
+    let mut sink = match view {
+        View::Raw => Sink::Raw(scrub.stream()),
+        View::Pretty { color } => {
+            Sink::Pretty(Box::new(Pretty::new(scrub.redactor(), color, follow)))
+        }
+    };
+    let read = pages(client, &mut sink, &id, follow, out).await;
+    let done = *read.as_ref().unwrap_or(&false);
+    sink.finish(out, done)?;
     read?;
     if !follow {
         return Ok(());
@@ -103,11 +154,11 @@ pub(crate) async fn logs(
 
 async fn pages(
     client: &Client,
-    stream: &mut ScrubStream<'_>,
+    sink: &mut Sink<'_>,
     id: &str,
     follow: bool,
     out: &mut impl Write,
-) -> Result<(), CliError> {
+) -> Result<bool, CliError> {
     let mut after_seq = 0;
     loop {
         let mut reply = with_retry(|| {
@@ -124,20 +175,19 @@ async fn pages(
         let mut printed = false;
         let floor = after_seq;
         for chunk in reply.chunks.iter().filter(|c| c.seq > floor) {
-            write_chunk(out, stream, chunk)?;
+            sink.chunk(out, chunk)?;
             after_seq = chunk.seq;
             printed = true;
         }
         out.flush()?;
         if reply.done {
-            break;
+            return Ok(true);
         }
         if !printed {
             if !follow {
-                return Ok(());
+                return Ok(false);
             }
             sleep(POLL_INTERVAL).await;
         }
     }
-    Ok(())
 }
