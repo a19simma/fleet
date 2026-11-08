@@ -1,6 +1,6 @@
 # Fleet
 
-Fleet runs coding-agent Jobs on Boxes and records what each Job did. This file defines the terms of the ADRs on telemetry and metrics (0029, 0030), profiles (0034, 0035, 0052, 0053, 0057), capabilities and the model allowlist (0054), job timing (0055), the job socket, broker and registration (0036, 0037, 0039), fetch policy (0038), credentials and users (0040, 0042, 0043), the GitHub App lane (0058), agent runners and forges (0044, 0045), the mirror key (0046), the update trust root (0047, 0050), and the release feed (0060, 0061).
+Fleet runs coding-agent Jobs on Boxes and records what each Job did. This file defines the terms of the ADRs on telemetry and metrics (0029, 0030), profiles (0034, 0035, 0052, 0053, 0057), capabilities and the model allowlist (0054), job timing (0055), the job socket, broker and registration (0036, 0037, 0039), fetch policy (0038), credentials and users (0040, 0042, 0043), the GitHub App lane (0058), agent runners and forges (0044, 0045), the mirror key (0046), the update trust root (0047, 0050), the release feed (0060, 0061), and the transcript view (0062).
 
 ## Language
 
@@ -319,6 +319,18 @@ _Avoid_: bot user
 
 **Forge credential**:
 A **Credential** for a **Forge**: a `github_pat` today, or a **GitHub App credential** (ADR-0043, ADR-0058). The App kind can be saved, and fleetd uses its released token and identity (ADR-0058).
+
+**Transcript**:
+The redacted stream-json lines of one Job, stored as `job_transcript` chunks (ADR-0022, ADR-0062).
+
+**Transcript entry**:
+One typed unit that the view parser in `fleet_core::transcript` emits from a line of a **Transcript** (ADR-0062).
+
+**Tool pair**:
+A `tool_use` joined to its `tool_result` by id in one **Transcript entry** (ADR-0062).
+
+**Fleet note**:
+A non-JSON line that starts with `fleet: ` and that fleetd writes into a **Transcript**. Not authoritative: the Job row is (ADR-0062).
 
 ## Relationships
 
