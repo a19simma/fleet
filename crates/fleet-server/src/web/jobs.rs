@@ -194,6 +194,7 @@ enum Body {
     Tool(ToolBody),
     Orphan(Output),
     Meta { label: &'static str, text: String },
+    System { subtype: String },
     Note { text: String },
     Unknown { kind: String, raw: String },
     Cut,
@@ -434,9 +435,8 @@ impl Flatten {
             Entry::System { subtype, .. } => self.push(
                 depth,
                 &Shape::of("system", RULE_NEUTRAL),
-                Body::Meta {
-                    label: "system",
-                    text: subtype.clone(),
+                Body::System {
+                    subtype: subtype.clone(),
                 },
             ),
             Entry::RateLimit {
@@ -577,12 +577,18 @@ const EMPTY_QUEUED: &str = "No transcript yet.";
 const EMPTY_ENDED: &str = "This job wrote no transcript.";
 const EMPTY_UNREADABLE: &str = "Transcript has no readable entries. Open raw.";
 
+const UNKNOWN_CUT: &str = "transcript cut: the count of entries not shown is unknown.";
+
 /// Says whether the page shows a cut cue and what it says.
+///
+/// The count is a minimum: [`Assembler`] counts a line it skips after a cap as one item, and it
+/// also counts a repeated call id or a second result, each an entry the page does not show.
 fn cut_of(read_cut: bool, capped: bool, dropped: usize) -> (bool, String) {
-    let text = if capped {
-        format!("transcript cut: {dropped} entries not shown.")
+    let text = if capped && !read_cut {
+        let noun = if dropped == 1 { "entry" } else { "entries" };
+        format!("transcript cut: at least {dropped} {noun} not shown.")
     } else {
-        "transcript cut: later entries not shown.".to_owned()
+        UNKNOWN_CUT.to_owned()
     };
     (read_cut || capped, text)
 }
@@ -611,7 +617,7 @@ async fn load(
             rows: Vec::new(),
             raw: text,
             cut: read.cut,
-            cut_text: "transcript cut: the rest is not shown here.".to_owned(),
+            cut_text: UNKNOWN_CUT.to_owned(),
             empty: None,
         });
     }
@@ -663,7 +669,7 @@ async fn transcript_pane(transcript: Transcript, raw: bool, job_id: String) -> R
                     <a class="link link-hover ml-auto" href="#tx-end">"Jump to end"</a>
                 </div>
                 if raw {
-                    <pre id="transcript" class="overflow-auto border border-base-300 bg-base-300 p-2 text-xs">(transcript.raw.as_str())</pre>
+                    <pre id="transcript" class="overflow-auto border border-base-300 bg-base-300 p-2 text-xs" tabindex="0" role="region" aria-label="Raw transcript">(transcript.raw.as_str())</pre>
                     if transcript.cut {
                         <p id="cut" class="mt-1 text-xs text-warning">(transcript.cut_text.as_str())</p>
                     }
@@ -688,7 +694,7 @@ async fn transcript_pane(transcript: Transcript, raw: bool, job_id: String) -> R
                         <p id="cut" role="status" class="mt-2 text-xs text-warning">(transcript.cut_text.as_str())" "<a class="link link-hover" href=(raw_href.as_str())>"Open raw"</a>" for the full stream."</p>
                     }
                 }
-                <div id="tx-end"></div>
+                <div id="tx-end" tabindex="-1"></div>
             </section>
     })
 }
@@ -749,6 +755,15 @@ async fn entry_body(body: Body, open: Option<&'static str>) -> Result<impl View>
                         <span>(label)</span>
                     </summary>
                     <pre class="min-w-0 whitespace-pre-wrap break-words text-xs text-base-content/60">(text)</pre>
+                </details>
+            }
+            Body::System { subtype } => {
+                <details class="min-w-0">
+                    <summary class="flex min-h-8 cursor-pointer items-center gap-2 text-xs text-base-content/60">
+                        <span>"system"</span>
+                        <span class="text-xs text-base-content/60">(subtype.as_str())</span>
+                    </summary>
+                    <pre class="min-w-0 whitespace-pre-wrap break-words text-xs text-base-content/60">(subtype.as_str())</pre>
                 </details>
             }
             Body::Note { text } => {
@@ -904,16 +919,16 @@ async fn job_page(cx: &Cx) -> Result<impl View> {
                     <section class="flex min-w-0 flex-col gap-3">
                         <dl class="grid grid-cols-[6rem_1fr] gap-y-1 border border-base-300 p-2 text-xs">
                             <dt class="text-base-content/60">"State"</dt>
-                            <dd><span class=(badge_class(state))>(state)</span></dd>
-                            <dt class="text-base-content/60">"Repo"</dt><dd class="break-all">(job.repo.as_str())</dd>
-                            <dt class="text-base-content/60">"Base ref"</dt><dd class="break-all">(job.base_ref.as_str())</dd>
-                            <dt class="text-base-content/60">"Created"</dt><dd>(created)</dd>
-                            <dt class="text-base-content/60">"Phase"</dt><dd>(job.phase.as_str())</dd>
-                            <dt class="text-base-content/60">"Progress"</dt><dd>(job.progress.as_str())</dd>
-                            <dt class="text-base-content/60">"Branch"</dt><dd class="break-all">(branch)</dd>
-                            <dt class="text-base-content/60">"Error"</dt><dd class="text-error">(error)</dd>
+                            <dd class="min-w-0 break-all"><span class=(badge_class(state))>(state)</span></dd>
+                            <dt class="text-base-content/60">"Repo"</dt><dd class="min-w-0 break-all">(job.repo.as_str())</dd>
+                            <dt class="text-base-content/60">"Base ref"</dt><dd class="min-w-0 break-all">(job.base_ref.as_str())</dd>
+                            <dt class="text-base-content/60">"Created"</dt><dd class="min-w-0 break-all">(created)</dd>
+                            <dt class="text-base-content/60">"Phase"</dt><dd class="min-w-0 break-all">(job.phase.as_str())</dd>
+                            <dt class="text-base-content/60">"Progress"</dt><dd class="min-w-0 break-all">(job.progress.as_str())</dd>
+                            <dt class="text-base-content/60">"Branch"</dt><dd class="min-w-0 break-all">(branch)</dd>
+                            <dt class="text-base-content/60">"Error"</dt><dd class="min-w-0 break-all text-error">(error)</dd>
                             <dt class="text-base-content/60">"Pull request"</dt>
-                            <dd class="break-all">
+                            <dd class="min-w-0 break-all">
                                 if pr_link {
                                     <a class="link link-primary" href=(pr_url.as_str())>(pr_url.as_str())</a>
                                 } else {
@@ -933,7 +948,7 @@ async fn job_page(cx: &Cx) -> Result<impl View> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use fleet_core::transcript::{Assembler, Item};
+    use fleet_core::transcript::{Assembler, Item, ViewLimits};
 
     const SMALL: Ceilings = Ceilings {
         bytes: 10,
@@ -996,12 +1011,59 @@ mod tests {
         assert!(!cut_of(false, false, 0).0);
         assert_eq!(
             cut_of(false, true, 7),
-            (true, "transcript cut: 7 entries not shown.".to_owned())
+            (
+                true,
+                "transcript cut: at least 7 entries not shown.".to_owned()
+            )
+        );
+        assert_eq!(cut_of(true, false, 0), (true, UNKNOWN_CUT.to_owned()));
+    }
+
+    #[test]
+    fn one_hidden_entry_is_singular() {
+        assert_eq!(
+            cut_of(false, true, 1).1,
+            "transcript cut: at least 1 entry not shown."
         );
         assert_eq!(
-            cut_of(true, false, 0),
-            (true, "transcript cut: later entries not shown.".to_owned())
+            cut_of(false, true, 2).1,
+            "transcript cut: at least 2 entries not shown."
         );
+    }
+
+    #[test]
+    fn a_line_of_several_items_after_the_cap_counts_one_so_the_cue_is_a_minimum() {
+        let mut limits = ViewLimits::DEFAULT;
+        limits.entries = 1;
+        let mut asm = Assembler::with_limits(None, &limits);
+        let call = |ids: &[&str]| {
+            let blocks: Vec<_> = ids
+                .iter()
+                .map(|id| {
+                    serde_json::json!({"type": "tool_use", "id": id, "name": "Bash",
+                        "input": {"command": "x"}})
+                })
+                .collect();
+            serde_json::json!({"type": "assistant", "message": {"id": "m", "role": "assistant",
+                "content": blocks}, "parent_tool_use_id": null})
+            .to_string()
+        };
+        asm.push(&call(&["a"]), false);
+        asm.push(&call(&["b", "c", "d"]), false);
+        asm.push(&call(&["e", "f", "g"]), false);
+        let view = asm.snapshot();
+        assert!(view.capped());
+        assert_eq!(view.items().len(), 1);
+        assert_eq!(view.dropped(), 4);
+        assert_eq!(
+            cut_of(false, view.capped(), view.dropped()).1,
+            "transcript cut: at least 4 entries not shown."
+        );
+    }
+
+    #[test]
+    fn an_unfinished_read_never_states_a_count() {
+        assert_eq!(cut_of(true, true, 7), (true, UNKNOWN_CUT.to_owned()));
     }
 
     #[test]

@@ -957,3 +957,83 @@ async fn the_transcript_page_has_no_inline_style_or_script(pool: PgPool) {
     assert!(body.contains("id=\"tx-end\""));
     h.finish().await;
 }
+
+#[sqlx::test]
+async fn the_raw_block_is_a_labelled_focusable_region(pool: PgPool) {
+    let h = Harness::start(pool).await;
+    let alice = h.session("alice", 'a').await;
+    let id = h.job(&alice, "a1", "p").await;
+    h.lines(&id, &[text("assistant", "m1", "hello raw")]).await;
+    let raw = h.get(&alice, &format!("/jobs/{id}?raw=1")).await.body;
+    let tag = raw
+        .split("<pre id=\"transcript\"")
+        .nth(1)
+        .and_then(|rest| rest.split('>').next())
+        .unwrap_or_default();
+    for want in [
+        "tabindex=\"0\"",
+        "role=\"region\"",
+        "aria-label=\"Raw transcript\"",
+    ] {
+        assert!(tag.contains(want), "{want}: {tag}");
+    }
+    h.finish().await;
+}
+
+#[sqlx::test]
+async fn a_read_stopped_at_the_row_ceiling_says_the_count_is_unknown(pool: PgPool) {
+    let h = Harness::start(pool).await;
+    let alice = h.session("alice", 'a').await;
+    let id = h.job(&alice, "a1", "p").await;
+    h.bulk(&id, 50_001, "").await;
+    h.end(&id).await;
+    let page = h.get(&alice, &format!("/jobs/{id}")).await.body;
+    let toolbar = page.split("id=\"tx-toolbar\"").nth(1).unwrap_or_default();
+    let toolbar = toolbar.split("id=\"tx-end\"").next().unwrap_or_default();
+    let cue = "the count of entries not shown is unknown";
+    assert_eq!(toolbar.matches(cue).count(), 2, "{toolbar}");
+    let raw = h.get(&alice, &format!("/jobs/{id}?raw=1")).await.body;
+    assert!(raw.contains(cue));
+    assert!(!page.contains("later entries not shown"));
+    h.finish().await;
+}
+
+#[sqlx::test]
+async fn a_collapsed_system_row_shows_its_subtype_in_the_summary(pool: PgPool) {
+    let h = Harness::start(pool).await;
+    let alice = h.session("alice", 'a').await;
+    let id = h.job(&alice, "a1", "p").await;
+    h.lines(&id, &[json!({"type": "system", "subtype": "init"})])
+        .await;
+    let body = h.get(&alice, &format!("/jobs/{id}")).await.body;
+    let system = kind_of(&body, "system");
+    assert_eq!(system.len(), 1);
+    let summary = system[0].split("</summary>").next().unwrap_or_default();
+    assert!(
+        summary.contains("<span class=\"text-xs text-base-content/60\">init</span>"),
+        "{summary}"
+    );
+    h.finish().await;
+}
+
+#[sqlx::test]
+async fn the_end_anchor_takes_focus_and_meta_values_can_shrink_and_break(pool: PgPool) {
+    let h = Harness::start(pool).await;
+    let alice = h.session("alice", 'a').await;
+    let id = h.job(&alice, "a1", "p").await;
+    h.lines(&id, &[text("assistant", "m1", "hi")]).await;
+    let body = h.get(&alice, &format!("/jobs/{id}")).await.body;
+    assert!(
+        body.contains("<div id=\"tx-end\" tabindex=\"-1\">"),
+        "{body}"
+    );
+    let meta = body
+        .split("<dl class=\"grid grid-cols-[6rem_1fr]")
+        .nth(1)
+        .and_then(|rest| rest.split("</dl>").next())
+        .unwrap_or_default();
+    let cells = meta.matches("<dd").count();
+    assert_eq!(cells, 9);
+    assert_eq!(meta.matches("<dd class=\"min-w-0 break-all").count(), cells);
+    h.finish().await;
+}
