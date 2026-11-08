@@ -10,6 +10,7 @@ mod ct;
 mod envelope;
 mod error;
 pub mod forge;
+pub mod graph;
 mod id;
 pub mod model_allowlist;
 mod normalize;
