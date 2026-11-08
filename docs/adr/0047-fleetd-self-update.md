@@ -1,6 +1,6 @@
 # fleetd self-update
 
-Status: Proposed 2026-11-01. Built and wired in fleetd (`crates/fleetd/src/update/`, the release workflow signs the manifest, the server relays it in the heartbeat). No live run on a real Box yet. Amends ADR-0017. The trust root is amended by ADR-0050.
+Status: Proposed 2026-11-01. Built and wired in fleetd (`crates/fleetd/src/update/`, the release workflow signs the manifest, the server relays it in the heartbeat). Live run on box-1 on 2026-11-08: v0.3.8 was fetched, verified, staged, swapped and restarted. The rollback has not run. Amends ADR-0017. The trust root is amended by ADR-0050.
 
 ADR-0017 makes a fleetd upgrade a Template rebuild: the Template pins a version and boxes reach GitHub at build time only. This ADR adds an in-place update so a running Box can move to a new fleetd without a rebuild. The design fixes who signs, where the trust root lives, how the binary is laid out on disk, and how a bad update is undone.
 
@@ -53,7 +53,7 @@ The server rolls first. Protocol changes are additive only, so a new server serv
 
 ## Unverified
 
-- Whether the Box egress policy (ADR-0038) admits the GitHub release hosts at runtime.
+- Answered 2026-11-08: the Box downloaded the release archive from GitHub. The server's own egress needed a policy change before its manifest fetch worked.
 - The value of N for the guard, and where the health marker lives.
 - Whether `rename(2)` over a symlink behaves the same on the macOS target. The Box target is Linux.
 
