@@ -1,6 +1,6 @@
 # Baked default update trust root
 
-Status: Proposed 2026-11-01. Built in `crates/fleetd/src/update.rs`, verified on box-1 on 2026-11-08 against the signed v0.3.8 manifest. Amends ADR-0047.
+Status: Proposed 2026-11-01. Built in `crates/fleetd/src/update.rs`, verified on the dev box on 2026-11-08 against the signed v0.3.8 manifest. Amends ADR-0047.
 
 ADR-0047 fixed the update trust root as a file, `/etc/fleetd/update.pub`, that every Box had to hold. A Box without that file could not verify a manifest, so a fresh Template did nothing until an operator installed the file. This ADR gives fleetd a default key inside the binary and keeps the file as an override. Commit 27567fe edited the trust-root lines of ADR-0047 in place to match.
 
@@ -54,4 +54,4 @@ A compromised signing key has no safe in-band route. An attacker who holds the o
 
 ## Unverified
 
-- Answered 2026-11-08: box-1 verified the signed v0.3.8 manifest with the baked key. The key id to check against the published files is `B4880B1AF20089CF` with `minisign -V` against the published `manifest.json` and `manifest.json.minisig`.
+- Answered 2026-11-08: the dev box verified the signed v0.3.8 manifest with the baked key. The key id to check against the published files is `B4880B1AF20089CF` with `minisign -V` against the published `manifest.json` and `manifest.json.minisig`.
