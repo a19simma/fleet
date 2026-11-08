@@ -1,0 +1,16 @@
+cr	a\u000db
+crlf	a\u000d\u000ab
+nel	a\u0085b
+line_sep	a\u2028b
+para_sep	a\u2029b
+bidi_rlo	a\u202eb
+bidi_lri	a\u2066b
+ansi_sgr	\u001b[31mred\u001b[0m
+osc8	\u001b]8;;http://example.invalid/\u0007link\u001b]8;;\u0007
+nul	a\u0000b
+script	<script>alert(1)</script>
+md_link	[click](http://example.invalid/x)
+html_entity	&lt;b&gt;&amp;#x3c;
+overlong	<LONG:70000>
+empty	
+non_ascii	caf\u00e9 \u65e5\u672c\u8a9e \ud83d\ude80
