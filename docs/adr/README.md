@@ -37,10 +37,10 @@ ADRs for fleetd, the Fleet server and the `fleet` CLI. The plan is in `../plan.m
 | [0044](0044-agent-runners.md) | Agent runners | Proposed 2026-10-29, Codex and Kimi wired, not built: runner-owned command lines and the Codex and Kimi parsers, builds on 0033 and 0043, amends 0021, 0029, 0034 and 0038 |
 | [0045](0045-forge-trait.md) | Forge trait | Proposed 2026-10-29, built, builds on 0033 and 0043, amends 0024 and 0037, amended by 0058 and 0059 |
 | [0046](0046-mirror-key.md) | Mirror key | Proposed 2026-10-29, wired to the Job owner, amends 0024 and 0031 |
-| [0047](0047-fleetd-self-update.md) | fleetd self-update | Proposed 2026-11-01, built and wired, live on box-1 2026-11-08, amends 0017, trust root amended by 0050, amended by 0060 |
+| [0047](0047-fleetd-self-update.md) | fleetd self-update | Proposed 2026-11-01, built and wired, live on the dev box 2026-11-08, amends 0017, trust root amended by 0050, amended by 0060 |
 | [0048](0048-profile-tools-and-bundled-mise.md) | Profile tools and bundled mise | Proposed 2026-11-01, built, no live run, amends 0034 and 0035, builds on 0038 and 0031, amended by 0054 |
 | [0049](0049-job-docker-and-build-egress.md) | Job docker and build-chain egress | Proposed 2026-11-01, spike pending, amends 0031 and 0038 |
-| [0050](0050-baked-default-update-trust-root.md) | Baked default update trust root | Proposed 2026-11-01, built, live on box-1 2026-11-08, amends 0047 |
+| [0050](0050-baked-default-update-trust-root.md) | Baked default update trust root | Proposed 2026-11-01, built, live on the dev box 2026-11-08, amends 0047 |
 | [0051](0051-web-ui-styling-tailwind-daisyui.md) | Web UI styling: Tailwind and daisyUI, generated CSS committed | Accepted 2026-11-01, built, extends 0041 |
 | [0052](0052-profile-ownership-and-visibility.md) | Profile ownership and visibility | Proposed 2026-11-02, built, amends 0034, 0035 and 0048, builds on 0042 |
 | [0053](0053-global-catalog-and-profile-selection.md) | Global catalog and profile selection | Proposed 2026-11-02, save-time selection validation, a re-save equal to an older version moves latest, `fleet profile item` and `prompt`, Kimi dropped-subagent job notes, the web selection editor, the Catalog store and pages, `resolve` and the submit snapshot built, Profile preview and job note display not built, amends 0034 and 0035, builds on 0044, 0048 and 0054 |
