@@ -17,6 +17,8 @@ Every line parses as JSON except the documented exceptions: the last line of `tr
 | `interleaved_calls.jsonl` | two tool_use in flight, results arrive in reverse order |
 | `call_without_result.jsonl` | tool_use never answered, no final result |
 | `result_without_call.jsonl` | tool_result whose tool_use_id has no earlier tool_use |
+| `duplicate_ids.jsonl` | a repeated message id with different usage, a second tool_use and a second tool_result with the same id |
+| `late_call.jsonl` | a tool_result whose tool_use arrives later, then a second result for the same id |
 | `truncated_chunk.jsonl` | last line cut mid-JSON (invalid), as the runner's 256 KiB cut leaves |
 | `unknown_top_level.jsonl` | a `{"type":"future_thing",...}` line |
 | `unknown_subtype.jsonl` | a system line with an unseen subtype |

@@ -2,6 +2,9 @@
 //!
 //! [`parse_chunk`] turns one stored chunk into [`Entry`] values. It never fails and never
 //! panics: input it cannot read becomes [`Entry::Unknown`] or [`Entry::Truncated`].
+//!
+//! [`Transcript::build`] and [`Assembler`] join those entries into a view: each tool call with
+//! its result, sub-agent work nested under its Task call, and per-turn usage.
 
 use std::borrow::Cow;
 use std::cell::OnceCell;
@@ -12,6 +15,13 @@ use serde_json::Value;
 
 use crate::redact::Redactor;
 use crate::text::is_hostile;
+
+mod view;
+
+pub use view::{
+    Assembler, Item, MAX_NEST_DEPTH, MAX_VIEW_BYTES, MAX_VIEW_ENTRIES, Pair, PairStatus,
+    Transcript, TurnUsage, Update, ViewLimits,
+};
 
 /// A line over this many bytes is not parsed and becomes [`Entry::Truncated`].
 pub const MAX_CHUNK_BYTES: usize = 256 * 1024;
@@ -305,13 +315,7 @@ pub fn parse_chunk_with(
             out.push(Entry::Truncated);
             continue;
         }
-        let cx = Cx {
-            redactor,
-            limits,
-            fallback: OnceCell::new(),
-            #[cfg(test)]
-            fallback_builds: std::cell::Cell::new(0),
-        };
+        let cx = Cx::new(redactor, limits);
         parse_line(line, &cx, &mut out);
     }
     out
@@ -369,6 +373,18 @@ fn cut_chars(text: &str, cap: usize) -> &str {
     match text.char_indices().nth(cap) {
         Some((end, _)) => text.get(..end).unwrap_or_default(),
         None => text,
+    }
+}
+
+impl<'a> Cx<'a> {
+    fn new(redactor: Option<&'a Redactor>, limits: &'a Limits) -> Self {
+        Self {
+            redactor,
+            limits,
+            fallback: OnceCell::new(),
+            #[cfg(test)]
+            fallback_builds: std::cell::Cell::new(0),
+        }
     }
 }
 
@@ -514,7 +530,11 @@ impl Cx<'_> {
 }
 
 fn parse_line(line: &str, cx: &Cx<'_>, out: &mut Vec<Entry>) {
-    let Ok(value) = serde_json::from_str::<Value>(line) else {
+    parse_decoded(line, serde_json::from_str::<Value>(line).ok(), cx, out);
+}
+
+fn parse_decoded(line: &str, value: Option<Value>, cx: &Cx<'_>, out: &mut Vec<Entry>) {
+    let Some(value) = value else {
         match line.strip_prefix(FLEET_PREFIX) {
             Some(note) => out.push(Entry::FleetNote {
                 text: cx.undecodable_text(note, "note"),
@@ -566,9 +586,17 @@ fn count(value: &Value, key: &str) -> u64 {
     value.get(key).and_then(Value::as_u64).unwrap_or(0)
 }
 
-fn result(value: &Value, cx: &Cx<'_>) -> Entry {
-    let usage = value.get("usage");
+fn usage_of(usage: Option<&Value>) -> Usage {
     let tokens = |key: &str| usage.map_or(0, |u| count(u, key));
+    Usage {
+        input_tokens: tokens("input_tokens"),
+        output_tokens: tokens("output_tokens"),
+        cache_read_input_tokens: tokens("cache_read_input_tokens"),
+        cache_creation_input_tokens: tokens("cache_creation_input_tokens"),
+    }
+}
+
+fn result(value: &Value, cx: &Cx<'_>) -> Entry {
     Entry::Result {
         is_error: value
             .get("is_error")
@@ -577,12 +605,7 @@ fn result(value: &Value, cx: &Cx<'_>) -> Entry {
         turns: count(value, "num_turns"),
         duration_ms: count(value, "duration_ms"),
         cost_usd: value.get("total_cost_usd").and_then(Value::as_f64),
-        usage: Usage {
-            input_tokens: tokens("input_tokens"),
-            output_tokens: tokens("output_tokens"),
-            cache_read_input_tokens: tokens("cache_read_input_tokens"),
-            cache_creation_input_tokens: tokens("cache_creation_input_tokens"),
-        },
+        usage: usage_of(value.get("usage")),
         terminal_reason: value
             .get("terminal_reason")
             .and_then(Value::as_str)

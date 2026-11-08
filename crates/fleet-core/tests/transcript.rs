@@ -5,6 +5,10 @@ use std::error::Error;
 
 use fleet_core::Redactor;
 use fleet_core::transcript::{
+    Assembler, Item, MAX_VIEW_BYTES, MAX_VIEW_ENTRIES, Pair, PairStatus, Transcript, TurnUsage,
+    Update, ViewLimits,
+};
+use fleet_core::transcript::{
     Entry, Limits, MAX_CHUNK_BYTES, MAX_ENTRIES_PER_LINE, MAX_ID_BYTES, MAX_INPUT_BYTES,
     MAX_LABEL_BYTES, MAX_OBJECT_KEYS, MAX_OUTPUT_BYTES, MAX_SUMMARY_CHARS, MAX_TEXT_BYTES,
     MAX_TOOL_NAME_BYTES, Role, ToolId, ToolIdError, Usage, parse_chunk, parse_chunk_with,
@@ -2059,4 +2063,1315 @@ fn entry_cap_applies_with_a_shrunk_value_just_over_it() {
     let both = parse_with(&two, &limits);
     assert_eq!(both.len(), 4);
     assert!(!both.contains(&Entry::Truncated));
+}
+
+fn chunks_of(name: &str) -> Result<Vec<String>, std::io::Error> {
+    Ok(fixture(name)?.lines().map(str::to_owned).collect())
+}
+
+fn view_of(name: &str, done: bool) -> Result<Transcript, std::io::Error> {
+    let chunks = chunks_of(name)?;
+    Ok(Transcript::build(
+        chunks.iter().map(|c| (c.as_str(), false)),
+        done,
+        None,
+    ))
+}
+
+fn view_limits(f: impl FnOnce(&mut ViewLimits)) -> ViewLimits {
+    let mut limits = ViewLimits::DEFAULT;
+    f(&mut limits);
+    limits
+}
+
+fn build_lines(lines: &[String], done: bool, limits: &ViewLimits) -> Transcript {
+    Transcript::build_with(
+        lines.iter().map(|c| (c.as_str(), false)),
+        done,
+        None,
+        limits,
+    )
+}
+
+fn pair(item: &Item) -> Result<&Pair, String> {
+    match item {
+        Item::Pair(p) => Ok(p),
+        other => Err(format!("want a pair, got {other:?}")),
+    }
+}
+
+fn pairs(view: &Transcript) -> Vec<&Pair> {
+    view.items()
+        .iter()
+        .filter_map(|i| match i {
+            Item::Pair(p) => Some(p),
+            _ => None,
+        })
+        .collect()
+}
+
+fn done_status(is_error: bool, output: &str) -> PairStatus {
+    PairStatus::Done {
+        is_error,
+        output: output.to_owned(),
+    }
+}
+
+fn task_call(i: &str, parent: Option<&str>) -> String {
+    json!({
+        "type": "assistant",
+        "message": {"id": format!("m_{i}"), "content": [
+            {"type": "tool_use", "id": i, "name": "Task", "input": {"description": "d"}}
+        ]},
+        "parent_tool_use_id": parent,
+    })
+    .to_string()
+}
+
+fn text_line(text: &str, parent: Option<&str>) -> String {
+    json!({
+        "type": "assistant",
+        "message": {"content": [{"type": "text", "text": text}]},
+        "parent_tool_use_id": parent,
+    })
+    .to_string()
+}
+
+fn result_line(i: &str, output: &str, parent: Option<&str>) -> String {
+    json!({
+        "type": "user",
+        "message": {"content": [{"type": "tool_result", "tool_use_id": i, "content": output}]},
+        "parent_tool_use_id": parent,
+    })
+    .to_string()
+}
+
+fn total_items(items: &[Item]) -> usize {
+    let mut stack: Vec<&Item> = items.iter().collect();
+    let mut n = 0;
+    while let Some(item) = stack.pop() {
+        n += 1;
+        if let Item::Pair(p) = item {
+            stack.extend(p.children.iter());
+        }
+    }
+    n
+}
+
+fn max_depth(items: &[Item]) -> usize {
+    let mut stack: Vec<(&Item, usize)> = items.iter().map(|i| (i, 0)).collect();
+    let mut deepest = 0;
+    while let Some((item, d)) = stack.pop() {
+        deepest = deepest.max(d);
+        if let Item::Pair(p) = item {
+            stack.extend(p.children.iter().map(|c| (c, d + 1)));
+        }
+    }
+    deepest
+}
+
+#[test]
+fn interleaved_results_join_their_calls() -> Res {
+    let view = view_of("interleaved_calls.jsonl", false)?;
+    let found = pairs(&view);
+    assert_eq!(found.len(), 2);
+    let ids: Vec<&str> = found.iter().map(|p| p.id.as_str()).collect();
+    assert_eq!(ids, ["toolu_07A", "toolu_07B"]);
+    assert_eq!(found[0].status, done_status(false, "a"));
+    assert_eq!(found[1].status, done_status(false, "b"));
+    assert!(
+        view.items()
+            .iter()
+            .all(|i| !matches!(i, Item::Orphan { .. }))
+    );
+    Ok(())
+}
+
+#[test]
+fn a_call_without_result_is_pending_until_the_job_is_done() -> Res {
+    let live = view_of("call_without_result.jsonl", false)?;
+    let open = pairs(&live);
+    assert_eq!(open.len(), 1);
+    assert_eq!(open[0].status, PairStatus::Pending);
+    assert!(!live.done());
+    let ended = view_of("call_without_result.jsonl", true)?;
+    assert_eq!(pairs(&ended)[0].status, PairStatus::NoResult);
+    assert!(ended.done());
+    Ok(())
+}
+
+#[test]
+fn a_result_without_a_call_is_an_orphan() -> Res {
+    let view = view_of("result_without_call.jsonl", true)?;
+    let orphans: Vec<&Item> = view
+        .items()
+        .iter()
+        .filter(|i| matches!(i, Item::Orphan { .. }))
+        .collect();
+    assert_eq!(orphans.len(), 1);
+    assert!(matches!(
+        orphans[0],
+        Item::Orphan { id, output, .. } if id.as_str() == "toolu_09ORPHAN" && !output.is_empty()
+    ));
+    assert_eq!(pairs(&view).len(), 0);
+    Ok(())
+}
+
+#[test]
+fn subagent_work_nests_under_its_task_call() -> Res {
+    let view = view_of("subagent.jsonl", true)?;
+    let tasks = pairs(&view);
+    assert_eq!(tasks.len(), 1);
+    let task = tasks[0];
+    assert_eq!(task.id.as_str(), "toolu_02T1");
+    assert_eq!(task.status, done_status(false, "No TODOs found."));
+    assert_eq!(task.children.len(), 2);
+    let inner = pair(&task.children[0])?;
+    assert_eq!(inner.id.as_str(), "toolu_02C1");
+    assert_eq!(inner.status, done_status(false, "none"));
+    assert!(matches!(
+        &task.children[1],
+        Item::Entry(Entry::Message { subagent: Some(s), .. }) if s.as_str() == "toolu_02T1"
+    ));
+    Ok(())
+}
+
+#[test]
+fn duplicate_ids_keep_the_first_pair_and_the_first_usage() -> Res {
+    let view = view_of("duplicate_ids.jsonl", true)?;
+    let found = pairs(&view);
+    assert_eq!(found.len(), 1);
+    assert_eq!(found[0].name, "Bash");
+    assert_eq!(found[0].status, done_status(false, "first"));
+    assert_eq!(view.dropped(), 2);
+    let turns: Vec<(&str, u64)> = view
+        .turns()
+        .iter()
+        .map(|t| (t.message_id.as_str(), t.usage.output_tokens))
+        .collect();
+    assert_eq!(turns, [("msg_14A", 20), ("msg_14B", 20)]);
+    assert_eq!(view.totals().map(|u| u.output_tokens), Some(340));
+    Ok(())
+}
+
+#[test]
+fn totals_come_from_the_last_result_line() -> Res {
+    let view = view_of("sample_job.jsonl", true)?;
+    assert_eq!(
+        view.totals(),
+        Some(Usage {
+            input_tokens: 120,
+            output_tokens: 340,
+            ..Usage::default()
+        })
+    );
+    assert_eq!(view.turns().len(), 3);
+    let first = r#"{"type":"result","usage":{"input_tokens":1}}"#;
+    let second = r#"{"type":"result","usage":{"input_tokens":2}}"#;
+    let two = Transcript::build([(first, false), (second, false)], true, None);
+    assert_eq!(two.totals().map(|u| u.input_tokens), Some(2));
+    let none = Transcript::build([(&text_line("x", None)[..], false)], true, None);
+    assert_eq!(none.totals(), None);
+    Ok(())
+}
+
+#[test]
+fn hostile_parents_render_at_the_top_level() {
+    let lines = vec![
+        task_call("self", Some("self")),
+        task_call("a", Some("b")),
+        task_call("b", Some("a")),
+        task_call("lost", Some("nowhere")),
+        text_line("hi", Some("nowhere")),
+        result_line("self", "r", Some("a")),
+    ];
+    let view = build_lines(&lines, true, &ViewLimits::DEFAULT);
+    let ids: Vec<&str> = pairs(&view).iter().map(|p| p.id.as_str()).collect();
+    assert_eq!(ids, ["self", "a", "lost"]);
+    assert_eq!(view.items().len(), 4);
+    assert_eq!(total_items(view.items()), 5);
+    assert_eq!(pairs(&view)[1].children.len(), 1);
+    assert_eq!(pairs(&view)[0].children.len(), 0);
+    assert_eq!(pairs(&view)[0].status, done_status(false, "r"));
+}
+
+#[test]
+fn a_child_nests_only_under_a_call_that_came_first() {
+    let lines = vec![
+        text_line("early", Some("late")),
+        task_call("late", None),
+        text_line("after", Some("late")),
+    ];
+    let view = build_lines(&lines, true, &ViewLimits::DEFAULT);
+    assert_eq!(view.items().len(), 2);
+    assert_eq!(pairs(&view)[0].children.len(), 1);
+}
+
+fn chain(n: usize) -> Vec<String> {
+    (0..n)
+        .map(|k| {
+            let parent = (k > 0).then(|| format!("t{}", k - 1));
+            task_call(&format!("t{k}"), parent.as_deref())
+        })
+        .collect()
+}
+
+#[test]
+fn nesting_stops_at_depth_eight() {
+    let at = build_lines(&chain(9), true, &ViewLimits::DEFAULT);
+    assert_eq!(max_depth(at.items()), 8);
+    assert_eq!(total_items(at.items()), 9);
+    let over = build_lines(&chain(12), true, &ViewLimits::DEFAULT);
+    assert_eq!(max_depth(over.items()), 8);
+    assert_eq!(total_items(over.items()), 12);
+    assert_eq!(over.dropped(), 0);
+}
+
+#[test]
+fn nesting_depth_cap_applies_with_a_shrunk_value_just_over_it() {
+    let limits = view_limits(|l| l.depth = 2);
+    let at = build_lines(&chain(3), true, &limits);
+    assert_eq!(max_depth(at.items()), 2);
+    let over = build_lines(&chain(4), true, &limits);
+    assert_eq!(max_depth(over.items()), 2);
+    assert_eq!(total_items(over.items()), 4);
+    let huge = view_limits(|l| l.depth = 1000);
+    assert_eq!(max_depth(build_lines(&chain(20), true, &huge).items()), 8);
+}
+
+#[test]
+fn a_child_past_the_cap_sits_beside_its_parent() -> Res {
+    let limits = view_limits(|l| l.depth = 1);
+    let mut lines = chain(2);
+    lines.push(task_call("deep", Some("t1")));
+    let view = build_lines(&lines, true, &limits);
+    let top = pair(&view.items()[0])?;
+    let names: Vec<&str> = top
+        .children
+        .iter()
+        .map(|c| pair(c).map(|p| p.id.as_str()))
+        .collect::<Result<_, _>>()?;
+    assert_eq!(names, ["t1", "deep"]);
+    Ok(())
+}
+
+fn many_lines(n: usize) -> String {
+    (0..n)
+        .map(|k| text_line(&format!("m{k}"), None))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+#[test]
+fn view_entry_cap_applies_with_a_shrunk_value_just_over_it() {
+    let limits = view_limits(|l| l.entries = 3);
+    let at = Transcript::build_with([(many_lines(3).as_str(), false)], false, None, &limits);
+    assert_eq!(at.items().len(), 3);
+    assert!(!at.capped());
+    assert_eq!(at.dropped(), 0);
+    let over = Transcript::build_with([(many_lines(4).as_str(), false)], false, None, &limits);
+    assert_eq!(over.items().len(), 3);
+    assert!(over.capped());
+    assert_eq!(over.dropped(), 1);
+}
+
+#[test]
+fn nested_items_count_against_the_entry_cap() {
+    let limits = view_limits(|l| l.entries = 3);
+    let lines = vec![
+        task_call("t", None),
+        text_line("a", Some("t")),
+        text_line("b", Some("t")),
+        text_line("c", Some("t")),
+    ];
+    let view = build_lines(&lines, true, &limits);
+    assert_eq!(total_items(view.items()), 3);
+    assert!(view.capped());
+}
+
+#[test]
+fn the_view_holds_at_most_twenty_thousand_entries() {
+    assert_eq!(MAX_VIEW_ENTRIES, 20_000);
+    let at = Transcript::build(
+        [(many_lines(MAX_VIEW_ENTRIES).as_str(), false)],
+        false,
+        None,
+    );
+    assert_eq!(at.items().len(), MAX_VIEW_ENTRIES);
+    assert!(!at.capped());
+    let over = Transcript::build(
+        [(many_lines(MAX_VIEW_ENTRIES + 1).as_str(), false)],
+        false,
+        None,
+    );
+    assert_eq!(over.items().len(), MAX_VIEW_ENTRIES);
+    assert!(over.capped());
+    assert_eq!(over.dropped(), 1);
+}
+
+#[test]
+fn many_pending_calls_stay_inside_the_cap_and_close_on_finish() {
+    let lines: Vec<String> = (0..=MAX_VIEW_ENTRIES)
+        .map(|k| task_call(&format!("p{k}"), None))
+        .collect();
+    let mut asm = Assembler::new(None);
+    for line in &lines {
+        asm.push(line, false);
+    }
+    let closed = asm.finish();
+    assert_eq!(closed.len(), MAX_VIEW_ENTRIES);
+    let view = asm.snapshot();
+    assert!(view.capped());
+    assert!(
+        pairs(&view)
+            .iter()
+            .all(|p| p.status == PairStatus::NoResult)
+    );
+}
+
+#[test]
+fn huge_orphan_counts_stay_inside_the_cap() {
+    let lines: Vec<String> = (0..MAX_VIEW_ENTRIES + 5)
+        .map(|k| result_line(&format!("o{k}"), "x", None))
+        .collect();
+    let view = build_lines(&lines, true, &ViewLimits::DEFAULT);
+    assert_eq!(view.items().len(), MAX_VIEW_ENTRIES);
+    assert_eq!(view.dropped(), 5);
+}
+
+fn weight_of(items: &[Item]) -> usize {
+    let mut stack: Vec<&Item> = items.iter().collect();
+    let mut bytes = 0;
+    while let Some(item) = stack.pop() {
+        match item {
+            Item::Orphan { output, .. } => bytes += output.len(),
+            Item::Pair(p) => stack.extend(p.children.iter()),
+            _ => {}
+        }
+    }
+    bytes
+}
+
+#[test]
+fn byte_cap_applies_with_a_shrunk_value_just_over_it() {
+    let limits = view_limits(|l| l.bytes = 45);
+    let at = Transcript::build_with(
+        [(many_lines(2).as_str(), false)],
+        false,
+        None,
+        &view_limits(|l| l.bytes = 4),
+    );
+    assert_eq!(at.items().len(), 2);
+    assert!(!at.capped());
+    let over = Transcript::build_with(
+        [(many_lines(2).as_str(), false)],
+        false,
+        None,
+        &view_limits(|l| l.bytes = 3),
+    );
+    assert_eq!(over.items().len(), 1);
+    assert!(over.capped());
+    let lines = vec![
+        task_call("t", None),
+        result_line("t", &"y".repeat(21), None),
+    ];
+    let lost = build_lines(&lines, true, &limits);
+    assert_eq!(pairs(&lost)[0].status, done_status(false, ""));
+    assert!(lost.capped());
+    let fits = vec![
+        task_call("t", None),
+        result_line("t", &"y".repeat(20), None),
+    ];
+    let kept = build_lines(&fits, true, &limits);
+    assert_eq!(pairs(&kept)[0].status, done_status(false, &"y".repeat(20)));
+    assert!(!kept.capped());
+}
+
+#[test]
+fn one_line_of_257_large_entries_cannot_fill_memory() {
+    assert_eq!(MAX_VIEW_BYTES, 8 * 1024 * 1024);
+    let make = |n: usize| {
+        let blocks: Vec<_> = (0..=MAX_ENTRIES_PER_LINE)
+            .map(|k| json!({"type": "tool_result", "tool_use_id": format!("t{n}_{k}")}))
+            .collect();
+        json!({
+            "type": "user",
+            "message": {"content": blocks},
+            "tool_use_result": {"stdout": "z".repeat(20_000)},
+        })
+        .to_string()
+    };
+    let line = make(0);
+    assert!(line.len() <= MAX_CHUNK_BYTES);
+    let single = Transcript::build([(line.as_str(), false)], true, None);
+    assert_eq!(single.items().len(), MAX_ENTRIES_PER_LINE + 1);
+    assert!(weight_of(single.items()) <= MAX_VIEW_BYTES);
+    let lines: Vec<String> = (0..6).map(make).collect();
+    let view = build_lines(&lines, true, &ViewLimits::DEFAULT);
+    assert!(view.capped());
+    assert!(weight_of(view.items()) <= MAX_VIEW_BYTES);
+    assert!(weight_of(view.items()) > MAX_VIEW_BYTES - 2 * (MAX_OUTPUT_BYTES + 64));
+}
+
+#[test]
+fn a_cap_still_lets_the_result_line_set_the_totals() {
+    let limits = view_limits(|l| l.entries = 1);
+    let lines = vec![
+        text_line("a", None),
+        text_line("b", None),
+        r#"{"type":"result","usage":{"output_tokens":7}}"#.to_owned(),
+    ];
+    let view = build_lines(&lines, true, &limits);
+    assert_eq!(view.items().len(), 1);
+    assert_eq!(view.totals().map(|u| u.output_tokens), Some(7));
+}
+
+#[test]
+fn distinct_message_ids_are_capped() {
+    let limits = view_limits(|l| l.entries = 2);
+    let turn = |k: usize| {
+        json!({"type": "assistant", "message": {"id": format!("m{k}"),
+            "content": [], "usage": {"output_tokens": 1}}})
+        .to_string()
+    };
+    let at = build_lines(&[turn(1), turn(2)], true, &limits);
+    assert_eq!(at.turns().len(), 2);
+    let over = build_lines(&[turn(1), turn(2), turn(3), turn(1)], true, &limits);
+    assert_eq!(over.turns().len(), 2);
+    assert!(over.turns_capped());
+    assert!(!over.capped());
+    assert!(!at.turns_capped());
+}
+
+#[test]
+fn a_truncated_chunk_is_one_truncated_item_and_is_not_parsed() {
+    let view = Transcript::build(
+        [(r#"{"type":"result","usage":{"input_tokens":9}}"#, true)],
+        true,
+        None,
+    );
+    assert_eq!(view.items(), [Item::Entry(Entry::Truncated)]);
+    assert_eq!(view.totals(), None);
+}
+
+#[test]
+fn a_secret_in_a_call_id_never_pairs() {
+    const SECRET: &str = "sk-live-0123456789";
+    let redactor = Redactor::new([SECRET]);
+    let call_line = task_call(&format!("t_{SECRET}"), None);
+    let result = result_line(&format!("t_{SECRET}"), "out", None);
+    let view = Transcript::build(
+        [(call_line.as_str(), false), (result.as_str(), false)],
+        true,
+        Some(&redactor),
+    );
+    assert_eq!(pairs(&view).len(), 0);
+    assert!(
+        view.items()
+            .iter()
+            .all(|i| !matches!(i, Item::Orphan { .. }))
+    );
+    assert!(!format!("{view:?}").contains(SECRET));
+}
+
+#[test]
+fn push_after_finish_changes_nothing_and_finish_is_idempotent() {
+    let mut asm = Assembler::new(None);
+    asm.push(&task_call("t", None), false);
+    assert_eq!(asm.finish().len(), 1);
+    assert_eq!(asm.finish().len(), 0);
+    assert_eq!(asm.push(&result_line("t", "late", None), false).len(), 0);
+    assert_eq!(asm.push(&text_line("late", None), false).len(), 0);
+    assert_eq!(asm.snapshot().items().len(), 1);
+    let view = asm.snapshot();
+    assert_eq!(pairs(&view)[0].status, PairStatus::NoResult);
+}
+
+fn place_in(items: &mut Vec<Item>, under: Option<&ToolId>, item: Item) -> bool {
+    let Some(id) = under else {
+        items.push(item);
+        return true;
+    };
+    for existing in items.iter_mut() {
+        if let Item::Pair(p) = existing {
+            if &p.id == id {
+                p.children.push(item);
+                return true;
+            }
+            if place_in(&mut p.children, under, item.clone()) {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+fn pair_mut<'a>(items: &'a mut [Item], id: &ToolId) -> Option<&'a mut Pair> {
+    for item in items {
+        if let Item::Pair(p) = item {
+            if &p.id == id {
+                return Some(p);
+            }
+            if let Some(found) = pair_mut(&mut p.children, id) {
+                return Some(found);
+            }
+        }
+    }
+    None
+}
+
+fn adopt_in(item: &mut Item, adopted: &Pair) {
+    match item {
+        Item::Orphan { id, .. } if *id == adopted.id => *item = Item::Pair(adopted.clone()),
+        Item::Pair(p) => {
+            for child in &mut p.children {
+                adopt_in(child, adopted);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn replay(updates: &[Update]) -> (Vec<Item>, Vec<TurnUsage>, Option<Usage>, bool) {
+    let mut items = Vec::new();
+    let mut turns = Vec::new();
+    let mut totals = None;
+    let mut capped = false;
+    for update in updates {
+        match update {
+            Update::Appended { under, item } => {
+                place_in(&mut items, under.as_ref(), item.clone());
+            }
+            Update::Paired {
+                id,
+                is_error,
+                output,
+            } => {
+                if let Some(p) = pair_mut(&mut items, id) {
+                    p.status = done_status(*is_error, output);
+                }
+            }
+            Update::NoResult { id } => {
+                if let Some(p) = pair_mut(&mut items, id) {
+                    p.status = PairStatus::NoResult;
+                }
+            }
+            Update::Adopted { pair } => {
+                for item in &mut items {
+                    adopt_in(item, pair);
+                }
+            }
+            Update::Turn(t) => turns.push(t.clone()),
+            Update::Totals(u) => totals = Some(*u),
+            Update::Capped => capped = true,
+            _ => {}
+        }
+    }
+    (items, turns, totals, capped)
+}
+
+const ALL_FIXTURES: [&str; 15] = [
+    "sample_job.jsonl",
+    "subagent.jsonl",
+    "thinking.jsonl",
+    "result_block_array.jsonl",
+    "error_result.jsonl",
+    "denial.jsonl",
+    "interleaved_calls.jsonl",
+    "call_without_result.jsonl",
+    "result_without_call.jsonl",
+    "truncated_chunk.jsonl",
+    "unknown_top_level.jsonl",
+    "unknown_subtype.jsonl",
+    "unknown_block.jsonl",
+    "duplicate_ids.jsonl",
+    "late_call.jsonl",
+];
+
+#[test]
+fn every_fixture_pushed_chunk_by_chunk_equals_the_batch_and_its_replay() -> Res {
+    for name in ALL_FIXTURES {
+        let lines = chunks_of(name)?;
+        let mut asm = Assembler::new(None);
+        let mut updates = Vec::new();
+        for line in &lines {
+            updates.extend(asm.push(line, false));
+        }
+        updates.extend(asm.finish());
+        let batch = build_lines(&lines, true, &ViewLimits::DEFAULT);
+        assert_eq!(asm.snapshot(), batch, "{name}");
+        let whole = Transcript::build([(fixture(name)?.as_str(), false)], true, None);
+        assert_eq!(whole, batch, "{name}");
+        let (items, turns, totals, capped) = replay(&updates);
+        assert_eq!(items, batch.items(), "{name}");
+        assert_eq!(turns, batch.turns(), "{name}");
+        assert_eq!(totals, batch.totals(), "{name}");
+        assert_eq!(capped, batch.capped(), "{name}");
+    }
+    Ok(())
+}
+
+#[test]
+fn every_split_point_of_interleaved_calls_gives_the_same_view() -> Res {
+    let lines = chunks_of("interleaved_calls.jsonl")?;
+    let want = build_lines(&lines, false, &ViewLimits::DEFAULT);
+    for at in 0..=lines.len() {
+        let (head, tail) = lines.split_at(at);
+        let (a, b) = (head.join("\n"), tail.join("\n"));
+        let view = Transcript::build([(a.as_str(), false), (b.as_str(), false)], false, None);
+        assert_eq!(view, want, "split at {at}");
+    }
+    Ok(())
+}
+
+#[test]
+fn updates_arrive_in_input_order() -> Res {
+    let lines = chunks_of("interleaved_calls.jsonl")?;
+    let mut asm = Assembler::new(None);
+    let mut kinds = Vec::new();
+    for line in &lines {
+        for update in asm.push(line, false) {
+            kinds.push(match update {
+                Update::Appended {
+                    item: Item::Pair(p),
+                    ..
+                } => format!("call {}", p.id),
+                Update::Appended { .. } => "item".to_owned(),
+                Update::Paired { id, .. } => format!("result {id}"),
+                Update::Turn(t) => format!("turn {}", t.message_id),
+                Update::Totals(_) => "totals".to_owned(),
+                other => format!("{other:?}"),
+            });
+        }
+    }
+    let at = |s: &str| kinds.iter().position(|k| k == s);
+    assert!(at("call toolu_07A") < at("call toolu_07B"));
+    assert!(at("call toolu_07B") < at("result toolu_07B"));
+    assert!(at("result toolu_07B") < at("result toolu_07A"));
+    Ok(())
+}
+
+fn kept_with_bytes(entry_line: &str, bytes: usize) -> (usize, bool) {
+    let limits = view_limits(|l| l.bytes = bytes);
+    let view = Transcript::build_with([(entry_line, false)], false, None, &limits);
+    (view.items().len(), view.capped())
+}
+
+#[test]
+fn every_entry_kind_weighs_its_text_against_the_byte_cap() {
+    let msg = json!({"type": "user", "message": {"content": "abcd"}, "parent_tool_use_id": null});
+    let sub_msg =
+        json!({"type": "assistant", "message": {"content": "abcd"}, "parent_tool_use_id": "tt"});
+    let thinking = text_block_line("thinking", "thinking", "abcd");
+    let note = "fleet: abcd".to_owned();
+    let system = r#"{"type":"system","subtype":"init"}"#.to_owned();
+    let rate = r#"{"type":"rate_limit_event","rate_limit_info":{"status":"abcd"}}"#.to_owned();
+    let result = r#"{"type":"result","terminal_reason":"abcd"}"#.to_owned();
+    let unknown = r#"{"type":"zz"}"#.to_owned();
+    let table: [(&str, String, usize); 8] = [
+        ("message", msg.to_string(), 4),
+        ("thinking", thinking, 4),
+        ("fleet note", note, 4),
+        ("system", system, 4),
+        ("rate limit", rate, 4),
+        ("result", result, 4),
+        ("unknown", unknown, 2 + 13),
+        ("sub-agent message", sub_msg.to_string(), 4 + 2),
+    ];
+    for (label, line, weight) in table {
+        assert_eq!(kept_with_bytes(&line, weight), (1, false), "{label} fits");
+        assert_eq!(
+            kept_with_bytes(&line, weight - 1),
+            (0, true),
+            "{label} over"
+        );
+    }
+    let orphan = result_line("abc", "wxyz", None);
+    assert_eq!(kept_with_bytes(&orphan, 7), (1, false));
+    assert_eq!(kept_with_bytes(&orphan, 6), (0, true));
+}
+
+fn text_block_line(kind: &str, key: &str, text: &str) -> String {
+    json!({"type": "assistant", "message": {"content": [{"type": kind, key: text}]}}).to_string()
+}
+
+#[test]
+fn a_stored_result_counts_against_the_byte_cap() {
+    let limits = view_limits(|l| l.bytes = 45);
+    let lines = vec![
+        task_call("t", None),
+        result_line("t", &"y".repeat(20), None),
+        text_line("a", None),
+    ];
+    let view = build_lines(&lines, true, &limits);
+    assert_eq!(view.items().len(), 1);
+    assert!(view.capped());
+}
+
+#[test]
+fn the_line_cap_decides_whether_a_turn_is_read() {
+    let line = |pad: usize| {
+        json!({"type": "assistant", "message": {"id": "m1", "usage": {"output_tokens": 5},
+            "content": [{"type": "text", "text": "a".repeat(pad)}]}})
+        .to_string()
+    };
+    let base = line(0).len();
+    let limits = view_limits(|l| l.parse.chunk_bytes = base + 10);
+    let at = build_lines(&[line(10)], true, &limits);
+    assert_eq!(at.turns().len(), 1);
+    assert_eq!(at.items().len(), 1);
+    let over = build_lines(&[line(11)], true, &limits);
+    assert_eq!(over.turns().len(), 0);
+    assert_eq!(over.items(), [Item::Entry(Entry::Truncated)]);
+}
+
+#[test]
+fn the_result_line_stays_in_the_view() -> Res {
+    let view = view_of("sample_job.jsonl", true)?;
+    assert!(
+        view.items()
+            .iter()
+            .any(|i| matches!(i, Item::Entry(Entry::Result { .. })))
+    );
+    Ok(())
+}
+
+fn push_all(asm: &mut Assembler<'_>, lines: &[String]) -> Vec<Update> {
+    lines.iter().flat_map(|l| asm.push(l, false)).collect()
+}
+
+#[test]
+fn late_call_adopts_the_orphan_in_place() -> Res {
+    let lines = vec![
+        result_line("t", "out", None),
+        text_line("between", None),
+        task_call("t", None),
+        text_line("child", Some("t")),
+        result_line("t", "again", None),
+    ];
+    let view = build_lines(&lines, true, &ViewLimits::DEFAULT);
+    assert_eq!(view.items().len(), 2);
+    let first = pair(&view.items()[0])?;
+    assert_eq!(first.status, done_status(false, "out"));
+    assert_eq!(first.children.len(), 1);
+    assert_eq!(view.dropped(), 1);
+    assert!(!view.capped());
+    for at in 0..=lines.len() {
+        let (a, b) = lines.split_at(at);
+        let (a, b) = (a.join("\n"), b.join("\n"));
+        let split = Transcript::build([(a.as_str(), false), (b.as_str(), false)], true, None);
+        assert_eq!(split, view, "split at {at}");
+    }
+    Ok(())
+}
+
+#[test]
+fn nothing_lands_after_a_cap_except_a_result_for_a_call_in_view() {
+    let limits = view_limits(|l| l.bytes = 30);
+    let mut asm = Assembler::with_limits(None, &limits);
+    let lines = vec![
+        task_call("t", None),
+        text_line(&"x".repeat(10), None),
+        text_line("z", None),
+        task_call("late", None),
+        result_line("late", "r", None),
+        result_line("t", "ab", None),
+    ];
+    let updates = push_all(&mut asm, &lines);
+    let at = updates.iter().position(|u| *u == Update::Capped);
+    assert!(at.is_some());
+    let after = updates.iter().skip(at.unwrap_or(0) + 1);
+    assert_eq!(
+        after
+            .filter(|u| matches!(u, Update::Appended { .. }))
+            .count(),
+        0
+    );
+    let view = asm.snapshot();
+    assert_eq!(view.items().len(), 1);
+    assert_eq!(pairs(&view)[0].status, done_status(false, "ab"));
+    assert_eq!(view.dropped(), 4);
+}
+
+#[test]
+fn push_after_finish_counts_the_lines_as_dropped() {
+    let mut asm = Assembler::new(None);
+    asm.push(&task_call("t", None), false);
+    asm.finish();
+    assert_eq!(asm.push("a\n\nb\r\n", false).len(), 0);
+    assert_eq!(asm.snapshot().dropped(), 2);
+    assert_eq!(asm.push("ignored", true).len(), 0);
+    assert_eq!(asm.snapshot().dropped(), 3);
+}
+
+#[test]
+fn a_turn_cap_is_not_an_item_cap() {
+    let limits = view_limits(|l| l.entries = 1);
+    let turn = |k: usize| {
+        json!({"type": "assistant", "message": {"id": format!("m{k}"),
+            "content": [], "usage": {"output_tokens": 1}}})
+        .to_string()
+    };
+    let mut asm = Assembler::with_limits(None, &limits);
+    let updates = push_all(&mut asm, &[turn(1), turn(2)]);
+    assert!(!updates.contains(&Update::Capped));
+    let view = asm.snapshot();
+    assert!(!view.capped());
+    assert_eq!(view.dropped(), 0);
+}
+
+#[test]
+fn after_a_cap_only_result_bearing_lines_are_parsed() {
+    let limits = view_limits(|l| l.entries = 1);
+    let three = json!({"type": "assistant", "message": {"id": "mm", "usage": {"output_tokens": 4},
+        "content": [{"type": "text", "text": "a"}, {"type": "text", "text": "b"},
+                    {"type": "text", "text": "c"}]}})
+    .to_string();
+    let mut asm = Assembler::with_limits(None, &limits);
+    push_all(&mut asm, &[task_call("t", None), text_line("over", None)]);
+    assert_eq!(asm.snapshot().dropped(), 1);
+    let updates = asm.push(&three, false);
+    assert_eq!(updates.len(), 1);
+    assert!(matches!(&updates[0], Update::Turn(t) if t.message_id.as_str() == "mm"));
+    assert_eq!(asm.snapshot().dropped(), 2);
+    asm.push(&result_line("t", "ok", None), false);
+    asm.push(r#"{"type":"result","usage":{"input_tokens":5}}"#, false);
+    let view = asm.snapshot();
+    assert_eq!(pairs(&view)[0].status, done_status(false, "ok"));
+    assert_eq!(view.totals().map(|u| u.input_tokens), Some(5));
+    assert_eq!(view.dropped(), 3);
+}
+
+#[test]
+fn a_fixture_with_a_late_call_adopts_the_orphan() -> Res {
+    let view = view_of("late_call.jsonl", true)?;
+    assert_eq!(view.dropped(), 1);
+    let kinds: Vec<&str> = view
+        .items()
+        .iter()
+        .map(|i| match i {
+            Item::Pair(_) => "pair",
+            Item::Orphan { .. } => "orphan",
+            Item::Entry(_) => "entry",
+            _ => "other",
+        })
+        .collect();
+    assert_eq!(kinds, ["entry", "pair", "entry", "entry"]);
+    assert_eq!(pairs(&view)[0].status, done_status(false, "early output"));
+    Ok(())
+}
+
+fn kinds(updates: &[Update]) -> Vec<&'static str> {
+    updates
+        .iter()
+        .map(|u| match u {
+            Update::Appended {
+                item: Item::Pair(_),
+                ..
+            } => "append pair",
+            Update::Appended {
+                item: Item::Orphan { .. },
+                ..
+            } => "append orphan",
+            Update::Appended { .. } => "append",
+            Update::Paired { .. } => "paired",
+            Update::Adopted { .. } => "adopted",
+            Update::NoResult { .. } => "no result",
+            Update::Turn(_) => "turn",
+            Update::Totals(_) => "totals",
+            Update::Capped => "capped",
+            _ => "other",
+        })
+        .collect()
+}
+
+#[test]
+fn an_adopted_error_keeps_its_flag_and_its_bytes_count() {
+    let error = json!({"type": "user", "message": {"content": [
+        {"type": "tool_result", "tool_use_id": "t", "content": "bad", "is_error": true}]}})
+    .to_string();
+    let lines = vec![error, task_call("t", None), text_line("xx", None)];
+    let view = build_lines(&lines, true, &view_limits(|l| l.bytes = 29));
+    assert_eq!(pairs(&view)[0].status, done_status(true, "bad"));
+    assert_eq!(view.items().len(), 1);
+    assert!(view.capped());
+    let roomy = build_lines(&lines, true, &view_limits(|l| l.bytes = 30));
+    assert_eq!(roomy.items().len(), 2);
+    assert!(!roomy.capped());
+}
+
+#[test]
+fn after_a_cap_an_assistant_line_with_a_result_block_still_pairs() {
+    let limits = view_limits(|l| l.entries = 1);
+    let mut asm = Assembler::with_limits(None, &limits);
+    push_all(&mut asm, &[task_call("t", None), text_line("over", None)]);
+    let line = json!({"type": "assistant", "message": {"content": [
+        {"type": "tool_result", "tool_use_id": "t", "content": "odd"}]}})
+    .to_string();
+    assert_eq!(kinds(&asm.push(&line, false)), ["paired"]);
+    assert_eq!(pairs(&asm.snapshot())[0].status, done_status(false, "odd"));
+}
+
+#[test]
+fn a_carriage_return_ends_a_pushed_line() {
+    let mut asm = Assembler::new(None);
+    asm.push("fleet: hi\r\n", false);
+    assert_eq!(
+        asm.snapshot().items(),
+        [Item::Entry(Entry::FleetNote {
+            text: "hi".to_owned()
+        })]
+    );
+    asm.finish();
+    asm.push("\r\na\r\n\r", false);
+    assert_eq!(asm.snapshot().dropped(), 1);
+}
+
+#[test]
+fn a_call_in_a_parsed_line_after_a_cap_is_dropped_not_adopted() {
+    let mut asm = capped_assembler(false);
+    let line = json!({"type": "user", "message": {"content": [
+        {"type": "tool_result", "tool_use_id": "p", "content": "ab"},
+        {"type": "tool_use", "id": "o", "name": "Task", "input": {}}]}})
+    .to_string();
+    assert_eq!(step(&mut asm, &line), (vec!["paired"], 1));
+    assert!(matches!(asm.snapshot().items()[0], Item::Orphan { .. }));
+}
+
+const RESULT_LINE: &str = r#"{"type":"result","usage":{"input_tokens":5}}"#;
+
+fn step(asm: &mut Assembler<'_>, line: &str) -> (Vec<&'static str>, usize) {
+    let before = asm.snapshot().dropped();
+    let updates = asm.push(line, false);
+    (kinds(&updates), asm.snapshot().dropped() - before)
+}
+
+fn step_truncated(asm: &mut Assembler<'_>) -> (Vec<&'static str>, usize) {
+    let before = asm.snapshot().dropped();
+    let updates = asm.push("cut", true);
+    (kinds(&updates), asm.snapshot().dropped() - before)
+}
+
+#[test]
+fn table_open_cells() {
+    let mut asm = Assembler::new(None);
+    assert_eq!(
+        step(&mut asm, &task_call("a", None)),
+        (vec!["append pair"], 0),
+        "call"
+    );
+    assert_eq!(
+        step(&mut asm, &result_line("a", "r", None)),
+        (vec!["paired"], 0),
+        "result"
+    );
+    assert_eq!(
+        step(&mut asm, &result_line("a", "r2", None)),
+        (vec![], 1),
+        "duplicate result"
+    );
+    assert_eq!(
+        step(&mut asm, &task_call("a", None)),
+        (vec![], 1),
+        "duplicate call"
+    );
+    assert_eq!(
+        step(&mut asm, &result_line("o", "early", None)),
+        (vec!["append orphan"], 0),
+        "orphan"
+    );
+    assert_eq!(
+        step(&mut asm, &result_line("o", "again", None)),
+        (vec![], 1),
+        "duplicate orphan"
+    );
+    assert_eq!(
+        step(&mut asm, &task_call("o", None)),
+        (vec!["adopted"], 0),
+        "late call"
+    );
+    assert_eq!(
+        step(&mut asm, &result_line("o", "again", None)),
+        (vec![], 1),
+        "result after adopt"
+    );
+    assert_eq!(
+        step(&mut asm, &text_line("m", None)),
+        (vec!["append"], 0),
+        "message"
+    );
+    assert_eq!(
+        step(&mut asm, RESULT_LINE),
+        (vec!["totals", "append"], 0),
+        "result line"
+    );
+    assert_eq!(asm.push("cut", true).len(), 1, "truncated");
+    assert!(!asm.snapshot().capped());
+}
+
+#[test]
+fn table_open_cells_that_go_over() {
+    let full = |lines: &[String]| {
+        let mut asm = Assembler::with_limits(None, &view_limits(|l| l.entries = lines.len()));
+        push_all(&mut asm, lines);
+        asm
+    };
+    let filler = vec![text_line("f", None)];
+    let mut asm = full(&filler);
+    assert_eq!(
+        step(&mut asm, &task_call("n", None)),
+        (vec!["capped"], 1),
+        "call"
+    );
+    assert_eq!(
+        step(&mut asm, &task_call("m", None)),
+        (vec![], 1),
+        "second drop is silent"
+    );
+    let mut asm = full(&filler);
+    assert_eq!(
+        step(&mut asm, &result_line("o", "r", None)),
+        (vec!["capped"], 1),
+        "orphan"
+    );
+    let mut asm = full(&filler);
+    assert_eq!(
+        step(&mut asm, &text_line("m", None)),
+        (vec!["capped"], 1),
+        "message"
+    );
+    let mut asm = full(&filler);
+    assert_eq!(
+        step(&mut asm, RESULT_LINE),
+        (vec!["totals", "capped"], 1),
+        "result line"
+    );
+    let mut asm = full(&filler);
+    assert_eq!(step_truncated(&mut asm), (vec!["capped"], 1), "truncated");
+    let mut asm = Assembler::with_limits(None, &view_limits(|l| l.bytes = 26));
+    push_all(&mut asm, &[task_call("t", None)]);
+    assert_eq!(
+        step(&mut asm, &result_line("t", "ab", None)),
+        (vec!["paired", "capped"], 0),
+        "result over budget"
+    );
+    assert_eq!(pairs(&asm.snapshot())[0].status, done_status(false, ""));
+    let mut asm = Assembler::with_limits(None, &view_limits(|l| l.bytes = 10));
+    push_all(&mut asm, &[result_line("o", "r", None)]);
+    assert_eq!(
+        step(&mut asm, &task_call("o", None)),
+        (vec!["capped"], 1),
+        "late call body over"
+    );
+    assert!(matches!(asm.snapshot().items(), [Item::Orphan { .. }]));
+}
+
+fn capped_assembler(by_bytes: bool) -> Assembler<'static> {
+    let limits = if by_bytes {
+        view_limits(|l| l.bytes = 40)
+    } else {
+        view_limits(|l| l.entries = 2)
+    };
+    let mut asm = Assembler::with_limits(None, &limits);
+    push_all(
+        &mut asm,
+        &[
+            result_line("o", "r", None),
+            task_call("p", None),
+            text_line(&"x".repeat(20), None),
+        ],
+    );
+    assert!(asm.snapshot().capped());
+    assert_eq!(asm.snapshot().dropped(), 1);
+    asm
+}
+
+#[test]
+fn table_capped_cells() {
+    for by_bytes in [true, false] {
+        let mut asm = capped_assembler(by_bytes);
+        let at = |what: &str| format!("{what}, bytes {by_bytes}");
+        assert_eq!(
+            step(&mut asm, &task_call("n", None)),
+            (vec![], 1),
+            "{}",
+            at("call")
+        );
+        assert_eq!(
+            step(&mut asm, &result_line("n", "r", None)),
+            (vec![], 1),
+            "{}",
+            at("dropped call's result")
+        );
+        assert_eq!(
+            step(&mut asm, &result_line("q", "r", None)),
+            (vec![], 1),
+            "{}",
+            at("orphan")
+        );
+        assert_eq!(
+            step(&mut asm, &task_call("o", None)),
+            (vec![], 1),
+            "{}",
+            at("late call")
+        );
+        assert_eq!(
+            step(&mut asm, &task_call("p", None)),
+            (vec![], 1),
+            "{}",
+            at("duplicate call")
+        );
+        assert_eq!(
+            step(&mut asm, &result_line("o", "r", None)),
+            (vec![], 1),
+            "{}",
+            at("duplicate orphan")
+        );
+        assert_eq!(
+            step(&mut asm, &text_line("m", None)),
+            (vec![], 1),
+            "{}",
+            at("message")
+        );
+        assert_eq!(
+            step(&mut asm, RESULT_LINE),
+            (vec!["totals"], 1),
+            "{}",
+            at("result line")
+        );
+        assert_eq!(step_truncated(&mut asm), (vec![], 1), "{}", at("truncated"));
+        assert_eq!(
+            step(&mut asm, &result_line("p", "ab", None)),
+            (vec!["paired"], 0),
+            "{}",
+            at("result")
+        );
+        assert_eq!(
+            step(&mut asm, &result_line("p", "ab", None)),
+            (vec![], 1),
+            "{}",
+            at("duplicate result")
+        );
+        let view = asm.snapshot();
+        assert!(
+            matches!(view.items()[0], Item::Orphan { .. }),
+            "{}",
+            at("orphan stays")
+        );
+        assert_eq!(pairs(&view)[0].status, done_status(false, "ab"));
+        assert_eq!(view.items().len(), 2);
+    }
+    let mut asm = capped_assembler(true);
+    assert_eq!(
+        step(&mut asm, &result_line("p", &"y".repeat(14), None)),
+        (vec!["paired"], 0),
+        "result over the remaining bytes"
+    );
+    assert_eq!(pairs(&asm.snapshot())[0].status, done_status(false, ""));
+}
+
+#[test]
+fn table_turn_capped_cells_behave_like_open() {
+    let turn = |k: usize| {
+        json!({"type": "assistant", "message": {"id": format!("m{k}"),
+            "content": [], "usage": {"output_tokens": 1}}})
+        .to_string()
+    };
+    let mut asm = Assembler::with_limits(None, &view_limits(|l| l.entries = 3));
+    push_all(&mut asm, &[turn(1), turn(2), turn(3)]);
+    assert_eq!(step(&mut asm, &turn(4)), (vec![], 0), "dropped turn");
+    assert_eq!(step(&mut asm, &turn(1)), (vec![], 0), "repeated turn");
+    assert!(asm.snapshot().turns_capped());
+    assert_eq!(
+        step(&mut asm, &task_call("a", None)),
+        (vec!["append pair"], 0),
+        "call"
+    );
+    assert_eq!(
+        step(&mut asm, &result_line("a", "r", None)),
+        (vec!["paired"], 0),
+        "result"
+    );
+    assert_eq!(
+        step(&mut asm, &result_line("o", "r", None)),
+        (vec!["append orphan"], 0),
+        "orphan"
+    );
+    assert_eq!(
+        step(&mut asm, &task_call("o", None)),
+        (vec!["adopted"], 0),
+        "late call"
+    );
+    assert_eq!(
+        step(&mut asm, &task_call("a", None)),
+        (vec![], 1),
+        "duplicate call"
+    );
+    assert_eq!(
+        step(&mut asm, &text_line("m", None)),
+        (vec!["append"], 0),
+        "message"
+    );
+    assert_eq!(
+        step(&mut asm, &text_line("n", None)),
+        (vec!["capped"], 1),
+        "message past the item cap"
+    );
+}
+
+#[test]
+fn table_finished_cells() {
+    let mut asm = Assembler::new(None);
+    push_all(
+        &mut asm,
+        &[task_call("p", None), result_line("o", "r", None)],
+    );
+    assert_eq!(kinds(&asm.finish()), ["no result"]);
+    let lines = [
+        task_call("n", None),
+        result_line("p", "late", None),
+        result_line("q", "late", None),
+        task_call("o", None),
+        task_call("p", None),
+        result_line("o", "again", None),
+        text_line("m", None),
+        RESULT_LINE.to_owned(),
+    ];
+    for (k, line) in lines.iter().enumerate() {
+        assert_eq!(step(&mut asm, line), (vec![], 1), "event {k}");
+    }
+    assert_eq!(step_truncated(&mut asm), (vec![], 1), "truncated");
+    let view = asm.snapshot();
+    assert_eq!(view.dropped(), 9);
+    assert_eq!(view.totals(), None);
+    assert_eq!(pairs(&view)[0].status, PairStatus::NoResult);
+    assert!(matches!(view.items()[1], Item::Orphan { .. }));
+}
+
+#[test]
+fn an_adopted_pair_takes_children_and_replays() {
+    let lines = vec![
+        result_line("t", "out", None),
+        task_call("t", None),
+        text_line("child", Some("t")),
+    ];
+    let mut asm = Assembler::new(None);
+    let updates = push_all(&mut asm, &lines);
+    assert_eq!(kinds(&updates), ["append orphan", "adopted", "append"]);
+    let (items, ..) = replay(&updates);
+    assert_eq!(items, asm.snapshot().items());
+    assert!(matches!(&updates[2], Update::Appended { under: Some(u), .. } if u.as_str() == "t"));
+}
+
+#[test]
+fn a_late_call_over_the_byte_budget_leaves_the_orphan() {
+    let limits = view_limits(|l| l.bytes = 25);
+    let lines = vec![result_line("t", "r", None), task_call("t", None)];
+    let view = build_lines(&lines, true, &limits);
+    assert!(matches!(view.items(), [Item::Orphan { .. }]));
+    assert!(view.capped());
+    assert_eq!(view.dropped(), 1);
+    let fits = build_lines(&lines, true, &view_limits(|l| l.bytes = 26));
+    assert_eq!(pairs(&fits).len(), 1);
+    assert!(!fits.capped());
 }
