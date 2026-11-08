@@ -2,6 +2,8 @@
 
 Status: Accepted. Built: the server stores and serves job transcripts, and `fleet logs` reads them. Amends ADR-0013.
 
+Amended by ADR-0062: reading is parsed into a transcript view at read time. Storage is unchanged.
+
 ADR-0013 says the server stores prompts and last messages, never transcripts. The goal needs a laptop to read what a Job did, and a Box may be gone by then.
 
 ## Decision
