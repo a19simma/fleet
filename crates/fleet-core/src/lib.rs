@@ -20,6 +20,7 @@ pub mod stamp;
 pub mod text;
 pub mod timing;
 pub mod tools;
+pub mod transcript;
 mod validate;
 
 pub use box_name::BoxName;
