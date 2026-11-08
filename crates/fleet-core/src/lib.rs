@@ -17,6 +17,7 @@ mod profile;
 mod redact;
 pub mod repo;
 pub mod stamp;
+pub mod text;
 pub mod timing;
 pub mod tools;
 mod validate;

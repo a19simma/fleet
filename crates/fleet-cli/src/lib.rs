@@ -18,6 +18,7 @@ use std::io::{Read, Write};
 use std::time::Duration;
 
 use clap::{Parser, Subcommand};
+use fleet_core::text::{is_hostile, strip_keeping_lines};
 use fleet_proto::v1::fleet_batches_client::FleetBatchesClient;
 use fleet_proto::v1::fleet_credentials_client::FleetCredentialsClient;
 use fleet_proto::v1::fleet_jobs_client::FleetJobsClient;
@@ -362,58 +363,6 @@ impl CliError {
             | Self::Credential(_) => 1,
         }
     }
-}
-
-/// Inclusive code point ranges of the Unicode `Cf` (format) category, Unicode 16.0.0.
-const FORMAT_RANGES: [(u32, u32); 21] = [
-    (0xAD, 0xAD),
-    (0x600, 0x605),
-    (0x61C, 0x61C),
-    (0x6DD, 0x6DD),
-    (0x70F, 0x70F),
-    (0x890, 0x891),
-    (0x8E2, 0x8E2),
-    (0x180E, 0x180E),
-    (0x200B, 0x200F),
-    (0x202A, 0x202E),
-    (0x2060, 0x2064),
-    (0x2066, 0x206F),
-    (0xFEFF, 0xFEFF),
-    (0xFFF9, 0xFFFB),
-    (0x110BD, 0x110BD),
-    (0x110CD, 0x110CD),
-    (0x13430, 0x1343F),
-    (0x1BCA0, 0x1BCA3),
-    (0x1D173, 0x1D17A),
-    (0xE0001, 0xE0001),
-    (0xE0020, 0xE007F),
-];
-
-/// Whether `c` must not reach the terminal: a control character, a code point of the
-/// Unicode `Cf` category, or a line or paragraph separator.
-pub(crate) fn is_hostile(c: char) -> bool {
-    if c.is_control() || matches!(c, '\u{2028}' | '\u{2029}') {
-        return true;
-    }
-    let cp = c as u32;
-    FORMAT_RANGES
-        .binary_search_by(|&(lo, hi)| {
-            if hi < cp {
-                std::cmp::Ordering::Less
-            } else if lo > cp {
-                std::cmp::Ordering::Greater
-            } else {
-                std::cmp::Ordering::Equal
-            }
-        })
-        .is_ok()
-}
-
-/// Strips hostile characters except newline and tab.
-pub(crate) fn strip_keeping_lines(text: &str) -> String {
-    text.chars()
-        .filter(|c| matches!(c, '\n' | '\t') || !is_hostile(*c))
-        .collect()
 }
 
 /// Strips, redacts, then strips again, keeping newline and tab.
@@ -1164,57 +1113,21 @@ async fn dispatch(
 
 #[cfg(test)]
 mod tests {
-    const ALL_FORMAT: [(u32, u32); 21] = [
-        (0xAD, 0xAD),
-        (0x600, 0x605),
-        (0x61C, 0x61C),
-        (0x6DD, 0x6DD),
-        (0x70F, 0x70F),
-        (0x890, 0x891),
-        (0x8E2, 0x8E2),
-        (0x180E, 0x180E),
-        (0x200B, 0x200F),
-        (0x202A, 0x202E),
-        (0x2060, 0x2064),
-        (0x2066, 0x206F),
-        (0xFEFF, 0xFEFF),
-        (0xFFF9, 0xFFFB),
-        (0x110BD, 0x110BD),
-        (0x110CD, 0x110CD),
-        (0x13430, 0x1343F),
-        (0x1BCA0, 0x1BCA3),
-        (0x1D173, 0x1D17A),
-        (0xE0001, 0xE0001),
-        (0xE0020, 0xE007F),
-    ];
-
     #[test]
-    fn every_format_code_point_is_hostile() {
-        let mut count = 0;
-        for (lo, hi) in ALL_FORMAT {
-            for cp in lo..=hi {
-                let c = char::from_u32(cp).expect("scalar value");
-                assert!(is_hostile(c), "U+{cp:04X} not hostile");
-                count += 1;
+    fn sanitize_routes_through_the_core_predicate() {
+        for cp in 0..=0x0010_FFFF_u32 {
+            if let Some(c) = char::from_u32(cp) {
+                assert_eq!(
+                    sanitize(&c.to_string()).is_empty(),
+                    is_hostile(c),
+                    "U+{cp:04X}"
+                );
+                assert_eq!(
+                    Scrub::new(None).text(&c.to_string()).is_empty(),
+                    strip_keeping_lines(&c.to_string()).is_empty(),
+                    "U+{cp:04X}"
+                );
             }
-        }
-        assert_eq!(count, 170);
-    }
-
-    #[test]
-    fn ordinary_characters_are_not_hostile() {
-        for c in [
-            'a',
-            'Z',
-            '0',
-            ' ',
-            '~',
-            '\u{4E2D}',
-            '\u{1F600}',
-            '\u{E9}',
-            '\u{8F0}',
-        ] {
-            assert!(!is_hostile(c), "{c:?} hostile");
         }
     }
 
