@@ -10,8 +10,8 @@
 
 ## Runner loop
 
-- **List every exit arm of a loop with several, and test each one for the heartbeat and the group kill.** The arms are stdout EOF, child exit, deadline, shutdown and report error. A17 failed twice because each retry fixed the named arm and left a sibling: group disarmed after wait, report awaited inside `select`, no heartbeat arm after stdout EOF.
-- **A change to the spawn path, or to a default that changes what a job does after the agent exits, needs every test binary that spawns the fake agent.** `grep -l 'claude_bin\|fake_gh\|"gh"' crates/fleetd/tests/*.rs` lists them, and `daemon_jobs` and `e2e_jobs` are among them. TEL-A3 ran only `telemetry` and `runner::` tests, and TEL-J2 added a 900 s CI wait after the PR that a fake `gh` answering every call alike turned into four red integration tests; both went red only in the independent verify.
+- **List every exit arm of a loop with several, and test each one for the heartbeat and the group kill.** The arms are stdout EOF, child exit, deadline, shutdown and report error. A past task failed twice because each retry fixed the named arm and left a sibling: group disarmed after wait, report awaited inside `select`, no heartbeat arm after stdout EOF.
+- **A change to the spawn path, or to a default that changes what a job does after the agent exits, needs every test binary that spawns the fake agent.** `grep -l 'claude_bin\|fake_gh\|"gh"' crates/fleetd/tests/*.rs` lists them, and `daemon_jobs` and `e2e_jobs` are among them. One change ran only `telemetry` and `runner::` tests, and another added a 900 s CI wait after the PR that a fake `gh` answering every call alike turned into four red integration tests; both went red only in the independent verify.
 
 ## Profile jobs
 
@@ -75,7 +75,7 @@
 
 ## Named pipes and modes
 
-- **No `mknodat` on macOS, no `unsafe` allowed.** `jobenv::create_stdout_fifo` runs the `mkfifo` program. A nonblocking FIFO reader reads 0 until a writer opens, then `WouldBlock`, so a test opens the writer before it asserts idle. A read after the writer opened can still return `WouldBlock` under load: `the_fifo_is_0660_carries_the_group_and_streams_to_a_reader` failed with Os code 35 in two full verifies (PF-2, P3-2) and passed in 5 and 6 isolated reruns. Retry on `WouldBlock` with a bounded wait in the test helper.
+- **No `mknodat` on macOS, no `unsafe` allowed.** `jobenv::create_stdout_fifo` runs the `mkfifo` program. A nonblocking FIFO reader reads 0 until a writer opens, then `WouldBlock`, so a test opens the writer before it asserts idle. A read after the writer opened can still return `WouldBlock` under load: `the_fifo_is_0660_carries_the_group_and_streams_to_a_reader` failed with Os code 35 in two full verifies and passed in 5 and 6 isolated reruns. Retry on `WouldBlock` with a bounded wait in the test helper.
 - **Mode asserts need the umask in mind.** `create_dir_all` and git leave 0755 dirs, so assert group-write and setgid bits (`& 0o2020`), not group-read.
 
 ## Systemd launcher test

@@ -5,7 +5,7 @@
 //! `192.88.99.0/24` is listed because the registry deprecates it, not because it is
 //! non-globally-reachable. Some blocks are refused whole although part of them is global:
 //! `192.0.0.0/24` and `2001::/23` (both hold a few globally reachable entries, such as the
-//! AS112 ranges) and `2002::/16` (6to4, which can embed a global IPv4 address). The ORCHIDv2
+//! AS112 ranges) and `2002::/16` (6to4, which can embed a global IPv4 address). The `ORCHIDv2`
 //! block `2001:20::/28` is not listed.
 
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};

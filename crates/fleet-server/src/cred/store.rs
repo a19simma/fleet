@@ -937,8 +937,8 @@ impl CredentialStore {
     }
 
     /// Attaches the GitHub App mint lane. Without it a release for a User holding a
-    /// `github_app` credential fails with [`StoreError::MintFailed`], and a verify without it yields the same error, shown as
-    /// `valid: false`.
+    /// `github_app` credential fails with [`StoreError::MintFailed`], and a verify without it
+    /// yields the same error, shown as `valid: false`.
     #[must_use]
     pub fn with_github_app(mut self, lane: AppLane) -> Self {
         self.app = Some(Arc::new(lane));
@@ -1137,8 +1137,8 @@ impl CredentialStore {
     ///
     /// # Errors
     ///
-    /// Returns [`StoreError::NotFound`] when the id is unknown, owned by another user or tombstoned,
-    /// [`StoreError::Seal`] when the value cannot be opened or the stored kind is unknown, and
+    /// Returns [`StoreError::NotFound`] when the id is unknown, owned by another user or
+    /// tombstoned, [`StoreError::Seal`] when the value cannot be opened or the stored kind is unknown, and
     /// [`StoreError::Db`] for a database failure.
     pub async fn open_for_verify(
         &self,
@@ -1237,8 +1237,9 @@ impl CredentialStore {
     /// Returns [`StoreError::MintFailed`] when the App lane is absent, the installation id is
     /// malformed, the credential row is gone before the mint, or the App token cannot be
     /// minted, which covers a failed installation lookup, a signing failure and a lookup plus
-    /// mint that outlasts [`MINT_BUDGET`]. A future dropped before the mint returns closes its `attempt` row as
-    /// `failed` with reason `mint cancelled`; the row keeps its slot against the cap.
+    /// mint that outlasts [`MINT_BUDGET`]. A future dropped before the mint returns closes its
+    /// `attempt` row as `failed` with reason `mint cancelled`; the row keeps its slot against the
+    /// cap.
     /// Returns [`StoreError::MintCapReached`] when the Job already holds the cap of mint
     /// attempts, and [`StoreError::MintRateLimited`] when the User started the per-minute
     /// limit of them.
