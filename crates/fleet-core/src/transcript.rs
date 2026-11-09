@@ -174,7 +174,8 @@ pub enum Entry {
     System {
         /// An allowlisted subtype, or `?`.
         subtype: String,
-        /// Whether a renderer shows it collapsed.
+        /// Set for the `init`, `hook_started` and `hook_response` subtypes. No renderer reads it:
+        /// the CLI prints one line and the web view always renders a closed row.
         collapsed: bool,
     },
     /// A rate limit event.

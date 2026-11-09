@@ -1,7 +1,7 @@
 # Redirects for release downloads over the no-redirect transport
 
 Status: Proposed 2026-11-07, fully built (FEED-3 to FEED-7). The operator decided every point below. Amends the scope
-of the "follows no redirect" rule of ADR-0059. Builds on ADR-0060. The build is tasks FEED-2 to
+of the "follows no redirect" rule of ADR-0059. Builds on ADR-0060. The tasks were FEED-2 to
 FEED-7.
 
 Built (FEED-3): the three Request shape items below and the 2048-byte `Location` cap, which
@@ -49,8 +49,10 @@ once per hop and decides whether to follow. Only the release feed uses `ReleaseF
 - Every hop is resolved again and vetted again with `allow_private` false. No address carries
   over from an earlier hop.
 - The final status must be 200. Any other final status fails the fetch.
-- The body is capped at the proto cap of the asset (ADR-0060). The whole cycle fits the 30 second
-  cycle timeout of ADR-0060.
+- The body is capped at the proto cap of the asset (ADR-0060). `ReleaseFetcher` checks that cap
+  after the transport has read the body, so the transport limit, `MAX_BODY_BYTES` (256 KiB in
+  `crates/fleet-server/src/cred/pinned.rs`), bounds memory and a body over it fails in the
+  transport. The whole cycle fits the 30 second cycle timeout of ADR-0060.
 
 ### Host allowlist
 

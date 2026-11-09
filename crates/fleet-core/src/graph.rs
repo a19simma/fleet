@@ -586,7 +586,11 @@ fn conflicts(a: &Owns<'_>, b: &Owns<'_>) -> bool {
 /// A node is ready when it is not done, not in `running`, every dependency is done, and its
 /// slices do not conflict with those of a running node. A node without a slice list owns every
 /// slice and one with an empty list owns none, so it never conflicts. An invalid graph, a
-/// `running` list over [`MAX_NODES`] entries, or a running id no node has returns nothing.
+/// `running` list over [`MAX_NODES`] entries, or a running id no node has returns nothing. A graph
+/// with a duplicate id is invalid, so it returns nothing too.
+///
+/// The returned nodes are checked against `running` only, not against each other, so two of them
+/// can conflict. The caller must start one at a time, or call `ready` again after each start.
 pub fn ready<'g>(graph: &'g Graph, running: &[&str]) -> Vec<&'g str> {
     if running.len() > MAX_NODES || validate(graph).is_err() {
         return Vec::new();

@@ -25,7 +25,8 @@ The hosted Fleet service. It stores box state, jobs, transcripts, job timing and
 - `cred::capability`: per-user capability grants. `profile:tools` (ADR-0054) lets a user save a Profile with tools. `forge:github_app` (ADR-0058) gates the `github_app` credential kind at put, release and verify through `cred::store::required_capability`, which maps the `github_app` kind. Migration 0034 widens the table CHECK to both names, and the admin capability page lists, grants and revokes each one.
 - `cred::https`, `cred::pinned`: the shared https client plumbing and the SSRF-safe forge connector (ADR-0059). The connector:
   - resolves a host once and vets every address with `is_vetted`;
-  - admits global unicast only: metadata addresses, loopback, link-local, CGNAT `100.64/10`, documentation and 6to4 ranges are always refused, and `allow_private` admits only RFC 1918 and ULA;
+  - admits global unicast only: metadata addresses, loopback, link-local, CGNAT `100.64/10`, documentation and 6to4 ranges are always refused;
+  - `allow_private` admits only RFC 1918 and ULA;
   - dials the vetted IP with SNI and certificate checks by host name;
   - follows no redirect and caps the body at 256 KiB.
 - `cred::repo_api`, `cred::repo_store`, `cred::repo_limit`: the `FleetRepos` handlers, the per-User registry table and the per-User check limiter (ADR-0059). Until migration 0037 adds `credentials.host`, `add` binds an unhosted GitHub credential to `github.com`: another github-kind host answers `NO_CREDENTIAL`.

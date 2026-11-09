@@ -203,7 +203,8 @@ pub enum CredentialFailure {
     /// The reply held an unknown kind or shape, a value outside the length bounds, a duplicate
     /// kind, or an installation token with no expiry. A refresh reply with no installation
     /// token or no expiry is this variant too. It is also this variant when an installation
-    /// token does not start with `ghs_` followed by alphanumerics or underscores, when the
+    /// token does not start with [`GITHUB_INSTALLATION_TOKEN_PREFIX`] followed by alphanumerics
+    /// or underscores, when the
     /// reply holds two forge credentials, when a credential has the wire kind `github_app`, or
     /// when a git identity rides on a credential that is not an installation token.
     Malformed,
@@ -230,6 +231,9 @@ impl CredentialFailure {
         }
     }
 
+    /// Maps a failed call. Any `PERMISSION_DENIED` is [`Self::LeaseMismatch`] whatever its
+    /// message, so `classify` is not consulted for it. Every other pair goes through `classify`,
+    /// and a pair it does not list is [`Self::Unavailable`].
     fn from_status(status: &Status) -> Self {
         if status.code() == Code::PermissionDenied {
             return Self::LeaseMismatch;

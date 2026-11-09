@@ -4,7 +4,7 @@ Rust workspace: `fleetd` (box daemon), `fleet-server` (gRPC on Postgres), `fleet
 
 ## Verify
 
-Run the project verify before every commit: `cargo fmt --check`, `cargo clippy --workspace --all-targets -- -D warnings`, `cargo nextest run --workspace --no-fail-fast`, `cargo test --workspace --doc`, and the private-pattern scan below. Server tests need `DATABASE_URL` pointing at Postgres 17 (`#[sqlx::test]`).
+Run the project verify before every commit: `cargo fmt --check`, `cargo clippy --workspace --all-targets -- -D warnings`, `cargo nextest run --workspace --no-fail-fast`, `cargo test --workspace --doc`, `mise run css:check` and the private-pattern scan below. Server tests need `DATABASE_URL` pointing at Postgres 17 (`#[sqlx::test]`).
 
 ## Common review failures
 

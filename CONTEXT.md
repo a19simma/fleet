@@ -181,7 +181,7 @@ The agent CLI a Job runs, such as Claude Code, Codex or Kimi, which a **Credenti
 _Avoid_: agent, model
 
 **Forge**:
-The git host of a repository: GitHub, Gitea or Forgejo (ADR-0043, ADR-0045).
+The git host of a repository: GitHub, Gitea or Forgejo (ADR-0043, ADR-0045). The fleetd `Forge` trait has a Gitea slot that is not built. The server config enum and the core `ForgeKind` have `Github` and `Forgejo` only, and the config `Forgejo` variant covers Gitea.
 _Avoid_: git server, SCM
 
 **Repo host**:
@@ -195,6 +195,10 @@ _Avoid_: forge type, provider
 **Repo key**:
 The `(user, host, path)` triple that names a **Registered repository**. It differs from the Mirror key, which is the (user, repo) pair (ADR-0059).
 _Avoid_: repo id
+
+**Repo ref**:
+A parsed repository reference. Two types carry the name `RepoRef`: `fleet_core::repo::RepoRef` holds a lowercase host, a lowercase `owner/name` and the path as written, and the server's `cred/app_policy.rs` `RepoRef` holds an ASCII-lowercased `owner` and `name` inside the GitHub grammar (ADR-0058, ADR-0059).
+_Avoid_: repo url
 
 **Repo verifier**:
 The server-side `RepoVerifier` implementation of one **Forge kind**. The `AddRepo` handler runs it before the insert: it reads the repository with the User's own stored credential and records push as optional. `add` is refused when the host has no verifier or the User has no credential for it. Built: the trait, the GitHub verifier, the registry and the public `FakeVerifier`. Not built: the Forgejo verifier (ADR-0059).
@@ -245,7 +249,7 @@ The manifest bytes and signature bytes the **Update relay** last accepted, held 
 _Avoid_: cache entry, current manifest
 
 **Seq gate**:
-The server rule that replaces the **Last good pair** only for a higher `seq`, and rejects a lower `seq` or an equal `seq` with different bytes. A sanity check on storage, not a trust decision: fleetd still checks `seq` itself (ADR-0060).
+The server rule that replaces the **Last good pair** only for a higher `seq`, and rejects a lower `seq` or an equal `seq` with different bytes. A sanity check on storage: fleetd still checks `seq` itself (ADR-0060).
 _Avoid_: version check, replay guard
 
 **Console theme**:

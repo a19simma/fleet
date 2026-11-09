@@ -229,8 +229,8 @@ impl CredentialService {
     ///
     /// # Errors
     ///
-    /// `PERMISSION_DENIED` with `lease does not match` for any lease mismatch, and with
-    /// `ERR_CAPABILITY_NOT_GRANTED` when the owner lost the capability a stored kind needs.
+    /// `PERMISSION_DENIED` with [`fleet_proto::ERR_LEASE_MISMATCH`] for any lease mismatch, and
+    /// with `ERR_CAPABILITY_NOT_GRANTED` when the owner lost the capability a stored kind needs.
     ///
     /// `FAILED_PRECONDITION` with `PRECONDITION_APP_MINT` when the App token cannot be minted,
     /// with `PRECONDITION_APP_INSTALLATION` when the installation is off the allowlist or fails

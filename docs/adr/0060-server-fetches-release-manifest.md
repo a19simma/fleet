@@ -61,7 +61,7 @@ The relay holds the last good pair, the manifest bytes and the signature bytes, 
 ### The seq gate
 
 The server reads `seq` from the fetched manifest to decide whether to replace the pair. This is a
-sanity gate on what the server stores, not a trust decision.
+sanity gate on what the server stores.
 
 | Fetched `seq` against the cached pair | Action |
 | --- | --- |
@@ -80,6 +80,12 @@ The server never signs and never verifies. fleetd verifies the signature against
 and checks `seq` and the version policy, exactly as ADR-0047 and ADR-0050 say. A compromised
 server, or a compromised GitHub path, can withhold a manifest or replay an old one. It cannot
 forge one, and an old one fails fleetd's `seq` check.
+
+Because the server does not verify the signature, a manifest with a very high `seq` that nobody
+signed enters the cache, and the gate then rejects every lower `seq` until the server restarts. A
+pair with the cached `seq`, the same manifest bytes and a bad signature replaces the cached pair
+(`Resigned`), and the next poll that fetches the real pair replaces it again. fleetd rejects both,
+so no box is harmed, but real releases do not reach boxes meanwhile.
 
 ### Torn pairs
 
