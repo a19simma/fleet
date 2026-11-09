@@ -73,6 +73,30 @@ service FleetRepos {
   rpc RemoveRepo(RemoveRepoRequest) returns (RemoveRepoReply);
 }
 
+// Server-side work tracker (ADR-0064). Every mutating request carries a client `key`: a repeat with
+// the same `(project, key)` returns the first result. Items are addressed by their key within a
+// project and projects by name within the caller's account.
+service FleetWork {
+  rpc CreateWorkProject(CreateWorkProjectRequest) returns (WorkProject);
+  rpc ListWorkProjects(ListWorkProjectsRequest) returns (ListWorkProjectsReply);
+  rpc SetWorkSlices(SetWorkSlicesRequest) returns (WorkProject);
+  rpc AddWorkItem(AddWorkItemRequest) returns (WorkItem);
+  rpc ListWorkItems(ListWorkItemsRequest) returns (ListWorkItemsReply);
+  rpc GetWorkItem(GetWorkItemRequest) returns (GetWorkItemReply);
+  rpc AddWorkDep(AddWorkDepRequest) returns (WorkItem);
+  rpc RemoveWorkDep(RemoveWorkDepRequest) returns (WorkItem);
+  rpc CancelWork(CancelWorkRequest) returns (WorkItem);
+  rpc UnblockWork(UnblockWorkRequest) returns (WorkItem);
+  rpc NextWork(NextWorkRequest) returns (NextWorkReply);
+  rpc ClaimWork(ClaimWorkRequest) returns (WorkAttempt);
+  rpc RenewLease(RenewLeaseRequest) returns (WorkAttempt);
+  rpc ReportAttempt(ReportAttemptRequest) returns (WorkAttempt);
+  rpc AddWorkNote(AddWorkNoteRequest) returns (WorkEvent);
+  rpc RecordWorkDefer(RecordWorkDeferRequest) returns (WorkDefer);
+  rpc ResolveWorkDefer(ResolveWorkDeferRequest) returns (WorkDefer);
+  rpc ListWorkDefers(ListWorkDefersRequest) returns (ListWorkDefersReply);
+}
+
 service FleetWorker {
   rpc ClaimJob(ClaimJobRequest) returns (ClaimJobReply);
   rpc ReportJob(ReportJobRequest) returns (ReportJobReply);
@@ -963,4 +987,241 @@ message GetStatsReply {
   int64 since = 3;
   int64 until = 4;
   bool clamped = 5;
+}
+
+enum WorkItemState {
+  WORK_ITEM_STATE_UNSPECIFIED = 0;
+  WORK_ITEM_STATE_OPEN = 1;
+  WORK_ITEM_STATE_BLOCKED = 2;
+  WORK_ITEM_STATE_CANCELLED = 3;
+}
+
+enum WorkVerdict {
+  WORK_VERDICT_UNSPECIFIED = 0;
+  WORK_VERDICT_PASS = 1;
+  WORK_VERDICT_FAIL = 2;
+  WORK_VERDICT_LOST = 3;
+}
+
+enum WorkDeferState {
+  WORK_DEFER_STATE_UNSPECIFIED = 0;
+  WORK_DEFER_STATE_OPEN = 1;
+  WORK_DEFER_STATE_PROMOTED = 2;
+  WORK_DEFER_STATE_DROPPED = 3;
+}
+
+message WorkSlice {
+  string name = 1;
+  repeated string paths = 2;
+}
+
+message WorkProject {
+  string name = 1;
+  optional string repo = 2;
+  repeated WorkSlice slices = 3;
+  repeated string mergeable = 4;
+  uint64 created_at_ms = 5;
+}
+
+message CreateWorkProjectRequest {
+  string key = 1;
+  string name = 2;
+  optional string repo = 3;
+}
+
+message ListWorkProjectsRequest {}
+
+message ListWorkProjectsReply {
+  repeated WorkProject projects = 1;
+}
+
+// Replaces the slice set and the mergeable set of a project in one write.
+message SetWorkSlicesRequest {
+  string key = 1;
+  string project = 2;
+  repeated WorkSlice slices = 3;
+  repeated string mergeable = 4;
+}
+
+message WorkDep {
+  string depends_on = 1;
+  string why = 2;
+}
+
+// `passes` and `fails` count Attempts and are never stored. `ready` is computed per read.
+message WorkItem {
+  string key = 1;
+  string title = 2;
+  string body = 3;
+  WorkItemState state = 4;
+  repeated string slices = 5;
+  repeated WorkDep deps = 6;
+  uint32 passes = 7;
+  uint32 fails = 8;
+  bool ready = 9;
+  bool held = 10;
+  uint64 created_at_ms = 11;
+  uint64 updated_at_ms = 12;
+}
+
+message AddWorkItemRequest {
+  string key = 1;
+  string project = 2;
+  string item_key = 3;
+  string title = 4;
+  string body = 5;
+  repeated string slices = 6;
+  repeated WorkDep deps = 7;
+}
+
+message ListWorkItemsRequest {
+  string project = 1;
+  optional WorkItemState state = 2;
+  bool ready_only = 3;
+}
+
+message ListWorkItemsReply {
+  repeated WorkItem items = 1;
+}
+
+message GetWorkItemRequest {
+  string project = 1;
+  string item_key = 2;
+}
+
+message GetWorkItemReply {
+  WorkItem item = 1;
+  repeated WorkAttempt attempts = 2;
+  repeated WorkEvent events = 3;
+}
+
+message AddWorkDepRequest {
+  string key = 1;
+  string project = 2;
+  string item_key = 3;
+  WorkDep dep = 4;
+}
+
+message RemoveWorkDepRequest {
+  string key = 1;
+  string project = 2;
+  string item_key = 3;
+  string depends_on = 4;
+}
+
+message CancelWorkRequest {
+  string key = 1;
+  string project = 2;
+  string item_key = 3;
+  string reason = 4;
+}
+
+message UnblockWorkRequest {
+  string key = 1;
+  string project = 2;
+  string item_key = 3;
+  string reason = 4;
+}
+
+message NextWorkRequest {
+  string project = 1;
+}
+
+message NextWorkReply {
+  optional WorkItem item = 1;
+}
+
+message ClaimWorkRequest {
+  string key = 1;
+  string project = 2;
+  string item_key = 3;
+  string holder = 4;
+  uint32 ttl_secs = 5;
+}
+
+message RenewLeaseRequest {
+  string key = 1;
+  string project = 2;
+  uint64 attempt_id = 3;
+  uint32 ttl_secs = 4;
+}
+
+// `evidence_tail` is cut to 8 KiB by the server after redaction.
+message ReportAttemptRequest {
+  string key = 1;
+  string project = 2;
+  uint64 attempt_id = 3;
+  WorkVerdict verdict = 4;
+  string note = 5;
+  string evidence_tail = 6;
+}
+
+message WorkAttempt {
+  uint64 id = 1;
+  string item_key = 2;
+  string holder = 3;
+  uint64 claimed_at_ms = 4;
+  uint64 expires_at_ms = 5;
+  optional WorkVerdict verdict = 6;
+  string note = 7;
+  string evidence_tail = 8;
+  optional uint64 closed_at_ms = 9;
+}
+
+message WorkEvent {
+  uint64 id = 1;
+  optional string item_key = 2;
+  optional uint64 attempt_id = 3;
+  string kind = 4;
+  string actor = 5;
+  string note = 6;
+  uint64 at_ms = 7;
+}
+
+message AddWorkNoteRequest {
+  string key = 1;
+  string project = 2;
+  string item_key = 3;
+  string note = 4;
+}
+
+message WorkDefer {
+  uint64 id = 1;
+  optional string item_key = 2;
+  optional uint64 attempt_id = 3;
+  string title = 4;
+  string reason = 5;
+  string vertical = 6;
+  WorkDeferState state = 7;
+  optional string promoted_item_key = 8;
+  uint64 created_at_ms = 9;
+}
+
+message RecordWorkDeferRequest {
+  string key = 1;
+  string project = 2;
+  optional string item_key = 3;
+  optional uint64 attempt_id = 4;
+  string title = 5;
+  string reason = 6;
+  string vertical = 7;
+}
+
+// Promote needs `item_key` for the new Work item; drop leaves it empty.
+message ResolveWorkDeferRequest {
+  string key = 1;
+  string project = 2;
+  uint64 defer_id = 3;
+  bool promote = 4;
+  optional string item_key = 5;
+}
+
+message ListWorkDefersRequest {
+  string project = 1;
+  optional string vertical = 2;
+  optional WorkDeferState state = 3;
+}
+
+message ListWorkDefersReply {
+  repeated WorkDefer defers = 1;
 }
