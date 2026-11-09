@@ -1,6 +1,6 @@
 # Fleet
 
-Fleet runs coding-agent Jobs on Boxes and records what each Job did. This file defines the terms of the ADRs on telemetry and metrics (0029, 0030), profiles (0034, 0035, 0052, 0053, 0057), capabilities and the model allowlist (0054), job timing (0055), the job socket, broker and registration (0036, 0037, 0039), fetch policy (0038), credentials and users (0040, 0042, 0043), the GitHub App lane (0058), agent runners and forges (0044, 0045), the mirror key (0046), the update trust root (0047, 0050), the release feed (0060, 0061), and the transcript view (0062).
+Fleet runs coding-agent Jobs on Boxes and records what each Job did. This file defines the terms of the ADRs on telemetry and metrics (0029, 0030), profiles (0034, 0035, 0052, 0053, 0057), capabilities and the model allowlist (0054), job timing (0055), the job socket, broker and registration (0036, 0037, 0039), fetch policy (0038), credentials and users (0040, 0042, 0043), the GitHub App lane (0058), agent runners and forges (0044, 0045), the mirror key (0046), the update trust root (0047, 0050), the release feed (0060, 0061), the transcript view (0062), and the work tracker (0064, 0065, 0066).
 
 ## Language
 
@@ -335,11 +335,61 @@ A control character, format character, line or paragraph separator, or tag-block
 **Fleet note**:
 A non-JSON line that starts with `fleet: ` and that fleetd writes into a **Transcript**. Not authoritative: the Job row is (ADR-0062).
 
+**Work project**:
+The server record binding one registered repository to an **Owner** and holding its **Work items** and **Slices** (ADR-0064). Every graph write locks its row.
+_Avoid_: board, tracker
+
+**Work item**:
+One unit of change in a **Work project**, with a key, **Slice** membership and dependencies. It has many **Attempts** (ADR-0064).
+_Avoid_: task, issue, ticket
+
+**Slice**:
+A named set of repository paths that one **Attempt** at a time may change. Two Slices overlap when a path of one equals or contains a path of the other (ADR-0064).
+_Avoid_: lane, area
+
+**Slice lease**:
+The row that holds a **Slice** for one **Attempt**, keyed by the Slice. A claim inserts one per Slice of the **Work item**. It has a TTL and a reaper (ADR-0064).
+_Avoid_: lock
+
+**Attempt**:
+One claim of a **Work item**, ending in a **Verdict** or lost when its **Slice leases** expire (ADR-0064).
+_Avoid_: run, try
+
+**Verdict**:
+The `pass` or `fail` an **Attempt** reports, with a note and a redacted 8 KiB evidence tail (ADR-0064).
+_Avoid_: result, outcome
+
+**Ready**:
+A **Work item** whose dependencies all passed, which no **Attempt** holds and whose **Slices** have no **Slice lease**. Computed, never stored (ADR-0064).
+_Avoid_: unblocked, available
+
+**Defer**:
+Work found during an **Attempt** and left out of scope, with a reason and a vertical. Not a **Work item** until a person promotes it (ADR-0064).
+_Avoid_: backlog item, todo
+
+**Retro**:
+A review of a span of finished **Work items**. It cannot close while an **Improvement** lacks a disposition (ADR-0065).
+_Avoid_: postmortem, review
+
+**Improvement**:
+One proposed change to how the loop works, ranked by its count of occurrences, ending as accepted, rejected, deferred or applied (ADR-0065).
+_Avoid_: lesson, suggestion
+
+**Pitfall**:
+A known trap with a symptom, a cause and a fix, kept per **User** or per **Work project** and ranked into the brief a worker reads before an **Attempt** (ADR-0065).
+_Avoid_: gotcha, known issue
+
+**Suggested edit**:
+A stored proposal to change a **Slice**, a **Pitfall** or a repository file, applied only after an interactive **User** accepts it. It goes stale when its base hash changes (ADR-0066).
+_Avoid_: patch, auto-fix
+
 ## Relationships
 
 - A **Job** has many **Job Events** and at most one **Job Summary**.
 - A **Job Summary** records at most one **Stuck rule**, the first that fired.
 - An **Incomplete** **Job Summary** lists what it never observed in `missing`.
+- A **Work project** has many **Work items** and **Slices**. A **Work item** has many **Attempts**; a claim takes one **Slice lease** per **Slice** of the item.
+- A **Retro** has many **Improvements**. An accepted **Improvement** can create a **Pitfall**. A **Suggested edit** changes a **Slice** or a **Pitfall** only after a **User** accepts it.
 
 ## Flagged ambiguities
 
