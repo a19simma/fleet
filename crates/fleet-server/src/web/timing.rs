@@ -21,7 +21,7 @@
 use std::convert::Infallible;
 
 use fleet_core::Redactor;
-use fleet_core::text::{Cap, is_hostile, sanitise_text};
+use fleet_core::text::{Cap, is_hostile, sanitise_lines};
 use fleet_core::timing::{CommandInput, FIELDS, Summary, TimingView};
 use fleet_proto::v1::{
     GetJobTimingRequest, ShellCommand, StreamShellLogChunk, StreamShellLogRequest,
@@ -367,7 +367,7 @@ async fn tasks(store: &Store, job_id: &str) -> Result<Vec<Task>> {
             let command = command.unwrap_or_default();
             Ok(Task {
                 url: log_url(job_id, &id),
-                command: sanitise_text(
+                command: sanitise_lines(
                     &Redactor::default(),
                     &command,
                     Cap::Bytes(COMMAND_PREVIEW_BYTES),

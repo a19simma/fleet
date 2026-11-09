@@ -775,3 +775,61 @@ async fn the_tasks_list_holds_no_hostile_character_from_command_text(pool: PgPoo
     }
     h.finish().await;
 }
+
+const COMMAND_PREVIEW_BYTES: usize = 160;
+
+fn task_row(body: &str, task: &str) -> String {
+    body.split("<tr")
+        .find(|row| row.contains(&format!("data-task=\"{task}\"")))
+        .unwrap()
+        .to_owned()
+}
+
+#[sqlx::test]
+async fn the_tasks_list_keeps_newline_and_tab_in_a_command(pool: PgPool) {
+    let h = Harness::start(pool, true).await;
+    let alice = h.session("alice", 'a').await;
+    let job = h.job(&alice, "k1").await;
+    h.chunk(&job, "t1", 0, b"a", "running").await;
+    h.command_text(&job, "t1", "a\nb\tc").await;
+    let reply = h
+        .get(Some(&alice), &format!("/jobs/{job}/timing"), &[])
+        .await;
+    assert_eq!(reply.status, 200);
+    let row = task_row(&reply.body, "t1");
+    assert!(row.contains("a\nb\tc"), "{row}");
+    h.finish().await;
+}
+
+#[sqlx::test]
+async fn the_tasks_list_cuts_a_command_at_the_preview_cap_on_a_char_boundary(pool: PgPool) {
+    let h = Harness::start(pool, true).await;
+    let alice = h.session("alice", 'a').await;
+    let job = h.job(&alice, "k1").await;
+    let exact = "a".repeat(COMMAND_PREVIEW_BYTES);
+    let split = format!("{}\u{e9}", "b".repeat(COMMAND_PREVIEW_BYTES - 1));
+    let other = h.job(&alice, "k2").await;
+    h.chunk(&job, "t-exact", 0, b"a", "running").await;
+    h.chunk(&other, "t-split", 0, b"a", "running").await;
+    h.command_text(&job, "t-exact", &exact).await;
+    h.command_text(&other, "t-split", &split).await;
+    let reply = h
+        .get(Some(&alice), &format!("/jobs/{job}/timing"), &[])
+        .await;
+    assert_eq!(reply.status, 200);
+    let row = task_row(&reply.body, "t-exact");
+    assert!(row.contains(&exact), "{row}");
+    let reply = h
+        .get(Some(&alice), &format!("/jobs/{other}/timing"), &[])
+        .await;
+    assert_eq!(reply.status, 200);
+    let row = task_row(&reply.body, "t-split");
+    assert!(
+        row.contains(&"b".repeat(COMMAND_PREVIEW_BYTES - 1)),
+        "{row}"
+    );
+    assert!(!row.contains(&"b".repeat(COMMAND_PREVIEW_BYTES)), "{row}");
+    assert!(!row.contains('\u{e9}'), "{row}");
+    assert!(!row.contains('\u{fffd}'), "{row}");
+    h.finish().await;
+}
