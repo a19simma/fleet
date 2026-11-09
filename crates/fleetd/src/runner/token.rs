@@ -1230,7 +1230,12 @@ mod tests {
             let mut value = serde_json::json!({ text.clone(): [text.clone()] });
             redactor.redact_value(&mut value);
             assert!(!value.to_string().contains("ghs_"), "{name}: {value}");
-            let hidden = crate::shell_timing::strip_redact(&redactor, &text, true);
+            let hidden = fleet_core::text::sanitise_lines(
+                &redactor,
+                &text,
+                fleet_core::text::Cap::Bytes(usize::MAX),
+            )
+            .text;
             assert!(!hidden.contains("ghs_"), "{name}: {hidden}");
         }
         Ok(())

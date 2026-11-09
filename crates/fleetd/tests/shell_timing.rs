@@ -1,5 +1,6 @@
 //! Shell command records: redaction before truncation, NUL handling, caps.
 
+use fleet_core::text::is_hostile;
 use fleet_core::{PLACEHOLDER, Redactor};
 use fleet_proto::{MAX_COMMAND_BYTES, MAX_SHELL_COMMANDS, MAX_SHELL_LOG_BYTES};
 use fleetd::shell_timing::{ShellError, ShellInput, ShellRecorder};
@@ -248,45 +249,77 @@ fn a_command_of_only_hidden_chars_is_refused_as_empty() {
 }
 
 #[test]
-fn every_hidden_range_edge_is_stripped_and_its_neighbours_survive() {
-    let edges: [(u32, u32); 20] = [
-        (0xAD, 0xAD),
-        (0x600, 0x605),
-        (0x61C, 0x61C),
-        (0x6DD, 0x6DD),
-        (0x70F, 0x70F),
-        (0x890, 0x891),
-        (0x8E2, 0x8E2),
-        (0x180E, 0x180E),
-        (0x200B, 0x200F),
-        (0x2028, 0x202E),
-        (0x2060, 0x2064),
-        (0x2066, 0x206F),
-        (0xFEFF, 0xFEFF),
-        (0xFFF9, 0xFFFB),
-        (0x110BD, 0x110BD),
-        (0x110CD, 0x110CD),
-        (0x13430, 0x1343F),
-        (0x1BCA0, 0x1BCA3),
-        (0x1D173, 0x1D17A),
-        (0xE0000, 0xE007F),
-    ];
+fn every_scalar_is_stripped_exactly_when_the_core_calls_it_hostile() {
     let record = |text: &str| {
         let mut rec = ShellRecorder::new(redactor());
         rec.record(&input("x", text)).expect("record");
         rec.records()[0].output.clone()
     };
-    for (low, high) in edges {
-        for code in [low, high] {
-            let c = char::from_u32(code).expect("scalar");
-            assert_eq!(record(&format!("a{c}b")), "ab", "{code:#x}");
-        }
-        for code in [low - 1, high + 1] {
-            let c = char::from_u32(code).expect("scalar");
-            let hidden = edges.iter().any(|&(l, h)| (l..=h).contains(&code)) || c.is_control();
-            if !hidden {
-                assert_eq!(record(&format!("a{c}b")), format!("a{c}b"), "{code:#x}");
-            }
-        }
+    let all: Vec<char> = (0..=0x0010_FFFF_u32).filter_map(char::from_u32).collect();
+    for chunk in all.chunks(2048) {
+        let text: String = chunk.iter().collect();
+        let want: String = chunk
+            .iter()
+            .filter(|&&c| c == '\n' || c == '\t' || !is_hostile(c))
+            .collect();
+        assert_eq!(record(&text), want, "from {:#x}", u32::from(chunk[0]));
+    }
+}
+
+const HOSTILE_SAMPLES: [char; 8] = [
+    '\0',
+    '\r',
+    '\u{1b}',
+    '\u{85}',
+    '\u{200b}',
+    '\u{2028}',
+    '\u{feff}',
+    '\u{e0041}',
+];
+
+fn secret_holding(by: char) -> (Redactor, String) {
+    let secret = format!("{}{by}{}", &SECRET[..10], &SECRET[10..]);
+    (Redactor::new([secret.clone()]), secret)
+}
+
+#[test]
+fn a_secret_that_itself_holds_a_hostile_char_is_redacted_in_the_command() {
+    for by in HOSTILE_SAMPLES {
+        let (redactor, secret) = secret_holding(by);
+        let mut rec = ShellRecorder::new(redactor);
+        rec.record(&input(&format!("run {secret}"), "x"))
+            .expect("record");
+        assert_eq!(
+            rec.records()[0].command,
+            format!("run {PLACEHOLDER}"),
+            "{by:?}"
+        );
+    }
+}
+
+#[test]
+fn a_secret_that_itself_holds_a_hostile_char_is_redacted_in_the_output() {
+    for by in HOSTILE_SAMPLES {
+        let (redactor, secret) = secret_holding(by);
+        let mut rec = ShellRecorder::new(redactor);
+        rec.record(&input("x", &format!("got {secret}")))
+            .expect("record");
+        assert_eq!(
+            rec.records()[0].output,
+            format!("got {PLACEHOLDER}"),
+            "{by:?}"
+        );
+    }
+}
+
+#[test]
+fn every_hostile_sample_is_stripped_from_command_and_output() {
+    for by in HOSTILE_SAMPLES {
+        let mut rec = ShellRecorder::new(redactor());
+        rec.record(&input(&format!("a{by}b"), &format!("c{by}d")))
+            .expect("record");
+        let r = &rec.records()[0];
+        assert_eq!(r.command, "ab", "{by:?}");
+        assert_eq!(r.output, "cd", "{by:?}");
     }
 }
