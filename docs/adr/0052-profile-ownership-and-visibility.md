@@ -26,7 +26,7 @@ Visibility is `private` or `shared`. A new Profile is `private`.
 - Sharing exposes published versions only. A draft is visible to the owner alone, even when the Profile is `shared`.
 - A non-owner `GetProfile` without a version returns the latest published version. A non-owner naming a draft version gets the same answer as an unknown version.
 - A Profile with no published version has nothing to share. A non-owner sees no entry for it in `ListProfiles`.
-- `SubmitBatch` and Job submit by a non-owner accept only published versions of a shared Profile.
+- `SubmitBatch` and Job submit by a non-owner accept only published versions of a shared Profile. Not built: the publish step, so a non-owner currently sees every version of a shared Profile.
 
 ### Error shape
 
@@ -38,7 +38,7 @@ A non-owner `GetProfile` of a `private` Profile returns `NOT_FOUND` with the sam
 
 - The box token carries no user and reads every Profile blob for a leased Job (ADR-0035). That scope is unchanged. `GetProfileBlob` stays authorised against the lease.
 - Profiles that exist before this ADR have no owner. A migration assigns them to a system user, marks them `shared`, and marks every existing version published. Not built: the draft and publish step, and so the marking. Migration 0023 assigns legacy Profiles to the system user and marks them `shared`, and no code carries a published flag. A later task that builds publishing must mark each legacy version published in its own migration, or this ADR is amended to drop the draft state. The system user cannot log in and holds no token. Nobody can mutate a legacy Profile, which matches today's rule that versions are immutable. A user who wants to change one copies it under their own name.
-- The bootstrap user and the legacy client token (ADR-0042) are not owners of legacy Profiles. They read them as any other user does.
+- The bootstrap user and the legacy client token (ADR-0042) are not owners of legacy Profiles. They read them as any other user does. A batch submitted with the legacy client token has no user and sees shared Profiles only.
 
 ### ADR-0048 gate
 

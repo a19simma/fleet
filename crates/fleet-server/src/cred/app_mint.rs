@@ -102,11 +102,13 @@ pub enum RevokeOutcome {
 /// Which validation rule refused the response.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Invalid {
-    /// A field is missing, has the wrong type or is duplicated.
+    /// A field is missing, has the wrong type or is duplicated, or the token is empty, over 512
+    /// bytes or holds a non-graphic character.
     Shape,
     /// The permissions are not a subset of the accepted set.
     Permissions,
-    /// `repositories` is not exactly the one requested.
+    /// `repositories` is not exactly the one requested. The name comparison is ASCII
+    /// case-insensitive.
     Repositories,
     /// `expires_at` is malformed, in the past or over [`MAX_TOKEN_TTL_SECS`] ahead.
     Expiry,

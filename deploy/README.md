@@ -379,7 +379,7 @@ The template sets `PrivateNetwork=yes`, and no drop-in relaxes it. ADR-0031 P2 i
 
 Timing telemetry crosses the `PrivateNetwork=yes` boundary the same way (ADR-0055). fleetd runs one OTLP/HTTP receiver per job on the unix socket `/run/fleet/<job id>/otel.sock`, mode 0660 with the job group, so the job uid can connect. It accepts `POST /v1/logs` with `Content-Type: application/json` and a per-job bearer token. `fleetd agent-exec` binds a second forwarder on `127.0.0.1:<port>` inside the namespace, with a port fleetd chooses, and relays raw bytes to that socket. It serves at most 4 connections, closes a connection idle for 30 seconds and carries at most 16 MiB per connection. The forwarder starts only when `agent-exec` runs in a private network namespace. If it fails to start, the job runs and loses its timing. fleetd sets `OTEL_EXPORTER_OTLP_LOGS_ENDPOINT` to `http://127.0.0.1:<port>/v1/logs` on the Claude child, and a Profile or Job cannot override any `OTEL_*` name. The bind-mounted `/run/fleet/%i` already carries `otel.sock`, so the unit needs no extra path. Unverified: a full timing run through this path on a live box. The TIM-F11 probe covers transport only.
 
-TIM-F11 probe result: `deploy/probe-agent-loopback.sh` runs under `sudo` on a box and starts a unit from `fleet-agent@.service`. A live run reported `passed=9 failed=0`. Under `PrivateNetwork=yes` a TCP connect to the host loopback FAILED and a unix socket PASSED. That result is why the receiver listens on a unix socket and a forwarder bridges the namespace loopback. The probe's transport lines report reachability and do not change its exit code, only its control checks do.
+TIM-F11 probe result: `deploy/probe-agent-loopback.sh` runs under `sudo` on a box and starts a unit from `fleet-agent@.service`. It has not been run on a live host (ADR-0055). Under `PrivateNetwork=yes` a TCP connect to the host loopback is expected to fail and a unix socket to work, which is why the receiver listens on a unix socket and a forwarder bridges the namespace loopback. The probe's transport lines report reachability and do not change its exit code, only its control checks do.
 
 The unit needs the wiring: `PrivateNetwork=yes` leaves the job no route to the model API except through the egress proxy that fleetd serves on the job socket. A fleetd that runs `agent_launcher = "systemd"` with no services registered cuts the model API for every job, and logs `agent_launcher is systemd and no services are registered` at startup. Deploy the unit and a fleetd that registers the egress proxy together, never the unit alone.
 
@@ -480,7 +480,7 @@ Status: not run. Set `BOX` to the test box host name and `SERVER` to the fleet s
 
    Compare the `main` sha before and after the job. Expect no change. `git ls-remote` separates the sha and the ref with a tab, so a `grep -c " refs/heads/main$"` with a space always counts 0 and proves nothing.
 
-Record each outcome in `.ralph/progress.md`. Do not mark A28 passed until all six hold on the box.
+Record each outcome in the run log. Do not mark this check passed until all six hold on the box.
 
 ### Limits
 

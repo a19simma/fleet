@@ -12,7 +12,8 @@ use sqlx::PgPool;
 
 use crate::auth::ADMIN_REQUIRED;
 
-/// The capability that lets a user attach tools to a profile. Store and handlers share this name.
+/// The capability that lets a user attach tools to a profile. It is checked at profile save, Job
+/// submit, batch submit and blob serve (ADR-0054). Store and handlers share this name.
 pub const PROFILE_TOOLS: &str = "profile:tools";
 
 pub use fleet_proto::ERR_CAPABILITY_NOT_GRANTED;
