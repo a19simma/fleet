@@ -120,10 +120,10 @@ pub struct Usage {
     pub input_tokens: u64,
     /// Output tokens.
     pub output_tokens: u64,
-    /// Input tokens read from the cache.
-    pub cache_read_input_tokens: u64,
-    /// Input tokens written to the cache.
-    pub cache_creation_input_tokens: u64,
+    /// Input tokens read from the cache; `None` when the line did not report a count.
+    pub cache_read_input_tokens: Option<u64>,
+    /// Input tokens written to the cache; `None` when the line did not report a count.
+    pub cache_creation_input_tokens: Option<u64>,
 }
 
 /// One displayable unit of a transcript.
@@ -588,11 +588,12 @@ fn count(value: &Value, key: &str) -> u64 {
 
 fn usage_of(usage: Option<&Value>) -> Usage {
     let tokens = |key: &str| usage.map_or(0, |u| count(u, key));
+    let cache = |key: &str| usage.and_then(|u| u.get(key)).and_then(Value::as_u64);
     Usage {
         input_tokens: tokens("input_tokens"),
         output_tokens: tokens("output_tokens"),
-        cache_read_input_tokens: tokens("cache_read_input_tokens"),
-        cache_creation_input_tokens: tokens("cache_creation_input_tokens"),
+        cache_read_input_tokens: cache("cache_read_input_tokens"),
+        cache_creation_input_tokens: cache("cache_creation_input_tokens"),
     }
 }
 

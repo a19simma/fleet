@@ -474,8 +474,16 @@ fn present(fact: &str, rendered: &Rendered, surface: Surface) -> bool {
         ("run.duration", Surface::Web) => dd(web, "Duration", "12.3 s"),
         ("run.cost", Surface::Cli) => cli.contains(", $0.0421, "),
         ("run.cost", Surface::Web) => dd(web, "Cost", "$0.0421"),
-        ("run.tokens", Surface::Cli) => cli.contains("tokens in 120 out 340 "),
-        ("run.tokens", Surface::Web) => dd(web, "Input", "120") && dd(web, "Output", "340"),
+        ("run.tokens", Surface::Cli) => {
+            cli.contains("tokens in 120 out 340") && !cli.contains("cache read")
+        }
+        ("run.tokens", Surface::Web) => {
+            let block = web_block(web, "result", "Turns");
+            dd(web, "Input", "120")
+                && dd(web, "Output", "340")
+                && !block.contains("Cache read")
+                && !block.contains("Cache write")
+        }
         ("run.reason", Surface::Cli) => cli.contains(", reason completed"),
         ("run.reason", Surface::Web) => web_block(web, "result", "Turns").contains("completed"),
         ("run.denials", Surface::Cli) => cli.contains("denials"),

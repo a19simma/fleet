@@ -142,13 +142,17 @@ fn done_status(is_error: bool) -> &'static str {
 }
 
 fn usage_text(usage: Usage) -> String {
-    format!(
-        "tokens in {} out {} cache read {} write {}",
-        usage.input_tokens,
-        usage.output_tokens,
-        usage.cache_read_input_tokens,
-        usage.cache_creation_input_tokens
-    )
+    let mut parts = vec![format!(
+        "tokens in {} out {}",
+        usage.input_tokens, usage.output_tokens
+    )];
+    if let Some(read) = usage.cache_read_input_tokens {
+        parts.push(format!("cache read {read}"));
+    }
+    if let Some(write) = usage.cache_creation_input_tokens {
+        parts.push(format!("write {write}"));
+    }
+    parts.join(" ")
 }
 
 fn entry(out: &mut impl Write, style: Style, indent: usize, entry: &Entry) -> io::Result<()> {

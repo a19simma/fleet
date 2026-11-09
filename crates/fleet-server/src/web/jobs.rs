@@ -288,14 +288,18 @@ fn total_of(
             label: "Output",
             value: usage.output_tokens.to_string(),
         });
-        stats.push(Stat {
-            label: "Cache read",
-            value: usage.cache_read_input_tokens.to_string(),
-        });
-        stats.push(Stat {
-            label: "Cache write",
-            value: usage.cache_creation_input_tokens.to_string(),
-        });
+        if let Some(read) = usage.cache_read_input_tokens {
+            stats.push(Stat {
+                label: "Cache read",
+                value: read.to_string(),
+            });
+        }
+        if let Some(write) = usage.cache_creation_input_tokens {
+            stats.push(Stat {
+                label: "Cache write",
+                value: write.to_string(),
+            });
+        }
     }
     stats.push(Stat {
         label: "Denials",

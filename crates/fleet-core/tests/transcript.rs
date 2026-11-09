@@ -100,8 +100,8 @@ fn done(is_error: bool, turns: u64, denials: u64) -> Entry {
         usage: Usage {
             input_tokens: 120,
             output_tokens: 340,
-            cache_read_input_tokens: 0,
-            cache_creation_input_tokens: 0,
+            cache_read_input_tokens: None,
+            cache_creation_input_tokens: None,
         },
         terminal_reason: Some("completed".to_owned()),
         denials,
@@ -1450,8 +1450,8 @@ fn result_line_fields() -> Res {
         usage: Usage {
             input_tokens: 1,
             output_tokens: 2,
-            cache_read_input_tokens: 3,
-            cache_creation_input_tokens: 4,
+            cache_read_input_tokens: Some(3),
+            cache_creation_input_tokens: Some(4),
         },
         terminal_reason: Some("max_turns".to_owned()),
         denials: 3,
@@ -1467,6 +1467,92 @@ fn result_line_fields() -> Res {
         denials: 0,
     };
     assert_eq!(one(parse(r#"{"type":"result"}"#))?, bare);
+    Ok(())
+}
+
+fn cache_of(usage: &str) -> Result<(Option<u64>, Option<u64>), String> {
+    let line = format!(r#"{{"type":"result","usage":{usage}}}"#);
+    match one(parse(&line))? {
+        Entry::Result { usage, .. } => Ok((
+            usage.cache_read_input_tokens,
+            usage.cache_creation_input_tokens,
+        )),
+        other => Err(format!("want a result, got {other:?}")),
+    }
+}
+
+#[test]
+fn absent_cache_figures_are_none_and_a_real_zero_is_some() -> Res {
+    assert_eq!(cache_of("{}")?, (None, None));
+    assert_eq!(
+        cache_of(r#"{"input_tokens":1,"output_tokens":2}"#)?,
+        (None, None)
+    );
+    assert_eq!(cache_of("null")?, (None, None));
+    assert_eq!(
+        cache_of(r#"{"cache_read_input_tokens":0}"#)?,
+        (Some(0), None)
+    );
+    assert_eq!(
+        cache_of(r#"{"cache_creation_input_tokens":0}"#)?,
+        (None, Some(0))
+    );
+    assert_eq!(
+        cache_of(r#"{"cache_read_input_tokens":5,"cache_creation_input_tokens":6}"#)?,
+        (Some(5), Some(6))
+    );
+    let bare = parse(r#"{"type":"result"}"#);
+    assert!(matches!(
+        one(bare)?,
+        Entry::Result { usage, .. } if usage == Usage::default()
+    ));
+    Ok(())
+}
+
+#[test]
+fn a_hostile_cache_value_is_none_never_a_silent_zero() -> Res {
+    let hostile = [
+        r#""5""#,
+        "null",
+        "1.5",
+        "3.0",
+        "-1",
+        "-0",
+        "1e3",
+        "true",
+        "18446744073709551616",
+        r#"{"a":1}"#,
+        "[1]",
+        "[]",
+        r#""""#,
+    ];
+    for value in hostile {
+        for key in ["cache_read_input_tokens", "cache_creation_input_tokens"] {
+            let got = cache_of(&format!(r#"{{"{key}":{value}}}"#))?;
+            assert_eq!(got, (None, None), "{key}: {value}");
+        }
+    }
+    let max = u64::MAX;
+    assert_eq!(
+        cache_of(&format!(r#"{{"cache_read_input_tokens":{max}}}"#))?,
+        (Some(max), None)
+    );
+    assert_eq!(
+        cache_of(r#"{"cache_read_input_tokens":1,"cache_read_input_tokens":2}"#)?,
+        (Some(2), None)
+    );
+    assert_eq!(
+        cache_of(r#"{"cache_creation_input_tokens":9,"cache_creation_input_tokens":"x"}"#)?,
+        (None, None)
+    );
+    assert_eq!(
+        cache_of(r#"{"cache_read_input_tokens":1,"cache_creation_input_tokens":"x"}"#)?,
+        (Some(1), None)
+    );
+    assert_eq!(
+        cache_of(r#"{"cache_read_input_tokens":{"cache_read_input_tokens":4}}"#)?,
+        (None, None)
+    );
     Ok(())
 }
 

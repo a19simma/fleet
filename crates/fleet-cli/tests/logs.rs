@@ -491,8 +491,47 @@ async fn the_default_view_is_an_indented_plain_text_transcript() -> TestResult {
     res?;
     assert_eq!(
         out,
-        "assistant: hello\n> Bash ls -la\n  < ok\n    a\n    b\n-- 2 turns, 3.250s, $0.1234, tokens in 10 out 20 cache read 0 write 0 --\n"
+        "assistant: hello\n> Bash ls -la\n  < ok\n    a\n    b\n-- 2 turns, 3.250s, $0.1234, tokens in 10 out 20 --\n"
     );
+    Ok(())
+}
+
+async fn footer_for(usage: &str) -> Result<String, Box<dyn std::error::Error>> {
+    let line = format!(
+        r#"{{"type":"result","is_error":false,"num_turns":1,"duration_ms":5,"usage":{usage}}}"#
+    );
+    let chunks = vec![chunk(1, &format!("{line}\n"))];
+    let (url, _) = serve(vec![reply(chunks, true)], JobState::Succeeded).await?;
+    let (res, out) = logs(&url, &["job-1"]).await;
+    res?;
+    Ok(out)
+}
+
+#[tokio::test(start_paused = true)]
+async fn the_footer_prints_present_cache_figures_and_omits_absent_ones() -> TestResult {
+    let both = footer_for(
+        r#"{"input_tokens":1,"output_tokens":2,"cache_read_input_tokens":3,"cache_creation_input_tokens":4}"#,
+    )
+    .await?;
+    assert_eq!(
+        both,
+        "-- 1 turns, 0.005s, tokens in 1 out 2 cache read 3 write 4 --\n"
+    );
+    let zeros =
+        footer_for(r#"{"cache_read_input_tokens":0,"cache_creation_input_tokens":0}"#).await?;
+    assert_eq!(
+        zeros,
+        "-- 1 turns, 0.005s, tokens in 0 out 0 cache read 0 write 0 --\n"
+    );
+    let read = footer_for(r#"{"cache_read_input_tokens":7}"#).await?;
+    assert_eq!(
+        read,
+        "-- 1 turns, 0.005s, tokens in 0 out 0 cache read 7 --\n"
+    );
+    let write = footer_for(r#"{"cache_creation_input_tokens":8}"#).await?;
+    assert_eq!(write, "-- 1 turns, 0.005s, tokens in 0 out 0 write 8 --\n");
+    let neither = footer_for(r#"{"input_tokens":1,"output_tokens":2}"#).await?;
+    assert_eq!(neither, "-- 1 turns, 0.005s, tokens in 1 out 2 --\n");
     Ok(())
 }
 
@@ -900,7 +939,7 @@ async fn message_roles_thinking_system_rate_limit_and_denials_are_shown() -> Tes
     res?;
     assert_eq!(
         out,
-        "system: init\nrate limit: allowed, 83% used\nuser: question\nthinking: hmm\n  more\nassistant:\n-- 1 turns, 61.001s, tokens in 0 out 0 cache read 0 write 0, reason done, 2 denials --\n"
+        "system: init\nrate limit: allowed, 83% used\nuser: question\nthinking: hmm\n  more\nassistant:\n-- 1 turns, 61.001s, tokens in 0 out 0, reason done, 2 denials --\n"
     );
     Ok(())
 }

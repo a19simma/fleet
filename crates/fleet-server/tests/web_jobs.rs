@@ -613,6 +613,61 @@ async fn the_transcript_renders_turns_pairs_and_the_result_footer(pool: PgPool) 
     h.finish().await;
 }
 
+fn finale_with(usage: &Value) -> Value {
+    json!({"type": "result", "subtype": "success", "is_error": false, "duration_ms": 1000,
+        "num_turns": 1, "total_cost_usd": 0.5, "usage": usage, "permission_denials": []})
+}
+
+#[sqlx::test]
+async fn absent_cache_figures_get_no_rows_and_a_real_zero_stays(pool: PgPool) {
+    let h = Harness::start(pool).await;
+    let alice = h.session("alice", 'a').await;
+    let cases = [
+        (json!({"input_tokens": 5, "output_tokens": 6}), false, false),
+        (
+            json!({"input_tokens": 5, "output_tokens": 6, "cache_read_input_tokens": 0}),
+            true,
+            false,
+        ),
+        (
+            json!({"input_tokens": 5, "output_tokens": 6, "cache_creation_input_tokens": 0}),
+            false,
+            true,
+        ),
+        (
+            json!({"cache_read_input_tokens": 0, "cache_creation_input_tokens": 0}),
+            true,
+            true,
+        ),
+    ];
+    for (n, (usage, read, write)) in cases.iter().enumerate() {
+        let id = h.job(&alice, &format!("a{n}"), "p").await;
+        h.lines(&id, &[finale_with(usage)]).await;
+        h.end(&id).await;
+        let page = h.get(&alice, &format!("/jobs/{id}")).await;
+        let result = kind_of(&page.body, "result");
+        assert_eq!(result.len(), 1, "{usage}");
+        assert_eq!(
+            result[0].contains("Cache read"),
+            *read,
+            "{usage}: {}",
+            result[0]
+        );
+        assert_eq!(
+            result[0].contains("Cache write"),
+            *write,
+            "{usage}: {}",
+            result[0]
+        );
+        assert!(
+            result[0].contains(">Denials</dt><dd>0</dd>"),
+            "{usage}: {}",
+            result[0]
+        );
+    }
+    h.finish().await;
+}
+
 #[sqlx::test]
 async fn a_result_footer_needs_a_result_entry(pool: PgPool) {
     let h = Harness::start(pool).await;
