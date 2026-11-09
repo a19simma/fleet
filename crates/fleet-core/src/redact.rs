@@ -153,6 +153,8 @@ impl Redactor {
     }
 
     /// Returns the string with every secret replaced.
+    ///
+    /// Returns `Cow::Borrowed` exactly when nothing was replaced; callers may rely on that.
     pub fn redact_str<'a>(&self, input: &'a str) -> Cow<'a, str> {
         let mut ranges: Vec<(usize, usize)> = Vec::new();
         for secret in &self.secrets {

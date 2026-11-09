@@ -150,9 +150,11 @@ pub enum Entry {
         id: ToolId,
         /// The sanitised tool name.
         name: String,
-        /// A one-line summary, at most [`MAX_SUMMARY_CHARS`] characters.
+        /// A one-line summary, at most [`Limits::summary_chars`] characters ([`MAX_SUMMARY_CHARS`]
+        /// by default).
         summary: String,
-        /// The sanitised, capped compact JSON of the input.
+        /// The sanitised, capped compact JSON of the input. A cut can end mid-token, so the text
+        /// is not always valid JSON.
         input: String,
         /// The Task call that owns this call, for a sub-agent event.
         parent: Option<ToolId>,
@@ -293,8 +295,8 @@ pub fn parse_chunk(chunk: &str, truncated: bool, redactor: Option<&Redactor>) ->
 /// `[unparseable line, N bytes]` and [`Entry::FleetNote`] text is
 /// `[unparseable note, N bytes]`, because an escaped secret cannot be matched undecoded.
 ///
-/// A line yields at most [`Limits::line_entries`] entries. A line with more blocks ends in
-/// one [`Entry::Truncated`]. The stdout and stderr fallback of a tool result without
+/// A line yields at most [`Limits::line_entries`] entries plus one [`Entry::Truncated`], which
+/// ends a line with more blocks. The stdout and stderr fallback of a tool result without
 /// content is scrubbed and cut once per line.
 pub fn parse_chunk_with(
     chunk: &str,
