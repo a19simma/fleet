@@ -15,7 +15,7 @@ use fleet_server::config::Token;
 use fleet_server::cred::Users;
 use fleet_server::service::serve_with_web;
 use fleet_server::store::Store;
-use fleet_server::web::{MAX_RENDER_BYTES, SESSION_COOKIE, Web, WebAuth};
+use fleet_server::web::{MAX_RENDER_BYTES, SESSION_COOKIE, STYLE_CSS, Web, WebAuth};
 use serde_json::{Value, json};
 use sqlx::PgPool;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -291,6 +291,32 @@ async fn the_list_shows_only_the_signed_in_users_jobs(pool: PgPool) {
     assert!(page.body.contains(&theirs));
     assert!(!page.body.contains(&mine));
     assert!(page.head.to_ascii_lowercase().contains("no-store"));
+    h.finish().await;
+}
+
+#[test]
+fn table_cell_links_have_a_24px_minimum_target() {
+    assert!(
+        STYLE_CSS.contains(
+            ".table td a.link{align-items:center;min-block-size:24px;display:inline-flex}"
+        ),
+        "no 24px table link rule"
+    );
+}
+
+#[sqlx::test]
+async fn the_job_id_links_are_table_links_in_the_first_column(pool: PgPool) {
+    let h = Harness::start(pool).await;
+    let alice = h.session("alice", 'a').await;
+    let id = h.job(&alice, "a1", "alice prompt").await;
+    let page = h.get(&alice, "/jobs").await;
+    let row = page.body.split("<tr>").find(|r| r.contains(&id)).unwrap();
+    let first = row.split("</td>").next().unwrap();
+    assert!(
+        first.starts_with("<td><a class=\"link link-primary\""),
+        "{first}"
+    );
+    assert!(first.contains(&format!("href=\"/jobs/{id}\"")), "{first}");
     h.finish().await;
 }
 

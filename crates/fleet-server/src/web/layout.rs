@@ -91,6 +91,10 @@ pub(super) async fn shell(
                         </div>
                     </nav>
                     <nav class="flex lg:hidden overflow-x-auto gap-3 border-b border-base-300 bg-base-200 p-2 text-xs" aria-label="Main mobile">
+                        <form class="shrink-0" method="post" action="/logout">
+                            <input type="hidden" name="csrf" value=(csrf)>
+                            <button class="btn btn-outline btn-xs" type="submit">"Sign out"</button>
+                        </form>
                         <ul class="menu menu-sm menu-horizontal flex-nowrap items-center">
                             <li class="menu-title">"fleet"</li>
                             for item in NAV_ITEMS {
@@ -105,10 +109,6 @@ pub(super) async fn shell(
                                 }
                             }
                         </ul>
-                        <form class="ml-auto shrink-0" method="post" action="/logout">
-                            <input type="hidden" name="csrf" value=(csrf)>
-                            <button class="btn btn-outline btn-xs" type="submit">"Sign out"</button>
-                        </form>
                     </nav>
                     <main id="app" class="min-w-0 flex-1 p-3" data-mode=(mode) data-csrf=(csrf)>
                         (child)

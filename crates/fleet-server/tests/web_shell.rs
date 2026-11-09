@@ -430,6 +430,21 @@ async fn the_shell_is_a_sidebar_from_lg_and_a_top_bar_below(pool: PgPool) {
 }
 
 #[sqlx::test]
+async fn the_top_bar_puts_sign_out_before_the_scrolling_nav(pool: PgPool) {
+    let h = Harness::start(pool).await;
+    let cookie = h.cookie().await;
+    let page = h.get("/jobs", Some(&cookie)).await;
+    let from = page.body.find("aria-label=\"Main mobile\"").unwrap();
+    let bar = &page.body[from..from + page.body[from..].find("</nav>").unwrap()];
+    let sign_out = bar.find("Sign out").unwrap();
+    let list = bar.find("<ul").unwrap();
+    assert!(sign_out < list, "Sign out must precede the nav list: {bar}");
+    assert!(!bar.contains("ml-auto"), "{bar}");
+    assert_eq!(bar.matches("name=\"csrf\"").count(), 1, "{bar}");
+    h.finish().await;
+}
+
+#[sqlx::test]
 async fn page_headers_wrap_and_may_shrink(pool: PgPool) {
     let h = Harness::start(pool).await;
     let cookie = h.cookie().await;

@@ -51,3 +51,4 @@ pre, code, kbd { font-family: var(--font-mono); }
 :focus-visible { outline: 2px solid var(--color-accent); outline-offset: 1px; }
 .menu-title { color: #8b949e; }
 .menu :where(a) { min-block-size: 24px; }
+.table td a.link { display: inline-flex; align-items: center; min-block-size: 24px; }
