@@ -310,7 +310,7 @@ Requirements outside the box: `FLEET_UPDATE_REPO` set on the server, server egre
 
 ### fleetd settings
 
-Set these in `/etc/fleetd/config.toml`, which must be root-owned, mode 0644, not writable by `fleetd` or `fleet-job`, because the hook client trusts `hook_socket_uid` from this file. The hook client reads only the config file, so `hook_socket_uid` and `hook_socket` must be there. The daemon also accepts the environment variable in the second column, and the variable wins.
+Set these in `/etc/fleetd/config.toml`, which must be root-owned, mode 0644, not writable by `fleetd` or `fleet-job`, because the hook client trusts `hook_socket_uid` from this file. The hook client loads the same config as the daemon (`Config::load`), so it and the daemon both accept the environment variable in the second column, and the variable wins. Keep the file as the source of truth and do not pass these variables into the job environment.
 
 | Key | Variable | Value for this mode |
 | --- | --- | --- |
