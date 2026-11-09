@@ -132,3 +132,9 @@ The P2 CONNECT proxy serves the model API only. `egress_allow` is Box config. No
 ## Amendment (ADR-0033, ADR-0046)
 
 Job credentials reach fleetd only and stay in broker memory. They are never written into the agent's environment or files (ADR-0033). The Claude token is the exception: the agent still holds it (ADR-0037). The P3 mirror is keyed by `(user, repo)` (ADR-0046).
+
+## Amendment (ADR-0067)
+
+ADR-0067 adds a unit template `fleet-env@.service` for Environment setup scripts and a second run root `/run/fleet-env/<job id>`, apart from `/run/fleet/<job id>` because the agent unit mounts all of the latter.
+
+See ADR-0067.

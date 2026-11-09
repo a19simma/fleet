@@ -99,3 +99,9 @@ Checked against the code in the repository. Where a note differs from the Decisi
 - **Log tail residual (TIM-F8).** `LOG_TAIL_GUARD` in `bg_command.rs` holds back 4096 bytes of a cut or running log. A secret longer than `LOG_TAIL_GUARD + 1` bytes that the read cap splits can leak its leading bytes, because the redactor states no longest secret. Operators keep job secrets shorter than that.
 - **Retention.** The prune query joins `jobs` and deletes `job_timing`, `job_timing_spans` and `job_shell_commands` rows at the summary age, each with its own limit.
 - **Timing report client (TIM-F12).** `TimingReporter` in `crates/fleetd/src/poller.rs` sends `ReportTiming` once per job attempt under the key `timing:<job_id>:<attempt>`, also sent as the `idempotency-key` metadata, and it fails before any call on an empty job id (`EmptyJobId`) and on a job id over 128 bytes or holding a byte outside printable ASCII (`BadJobId`). `NotFound` ends it as pruned, `InvalidArgument` and `PermissionDenied` end it as refused, and any other failure retries on the full-jitter backoff, which resets only after a stored report. A `grpc-retry-pushback-ms` value raises the wait up to `MAX_SERVER_WAIT` of 60 s. It gives up after `MAX_TIMING_ATTEMPTS` calls or `TIMING_REPORT_DEADLINE` of 600 s on its injected clock. `crates/fleetd/src/jobs.rs` constructs it and `crates/fleetd/src/runner/timing.rs` reports through it. The server handler stores the report and refuses one whose parts or summary differ from the spans (`crates/fleet-server/src/timing.rs`). No live end-to-end run is verified.
+
+## Amendment (ADR-0067)
+
+ADR-0067 counts Environment setup time in Overhead. Setup ends before the agent window opens, so the five-part sum and the aggregate check are unchanged and no timing part or proto field is added.
+
+See ADR-0067.

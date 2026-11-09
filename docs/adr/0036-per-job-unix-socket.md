@@ -39,3 +39,9 @@ The socket exists only for `agent_launcher = "systemd"`. In `direct` mode the ag
 - **One global socket with a job id in the request.** The agent could name any Job.
 - **Peer uid per Job (a uid pool).** Needs a uid allocator and ownership across restarts (see the `DynamicUser=` rejection in ADR-0031).
 - **TCP on loopback with a token.** The token sits in the agent's environment, the thing the broker removes.
+
+## Amendment (ADR-0067)
+
+ADR-0067 makes the peer check admit the cgroup unit `fleet-env@<job id>` for the `egress proxy` service only. The `broker` and `fetch` services close a `fleet-env@` peer with no reply.
+
+See ADR-0067.

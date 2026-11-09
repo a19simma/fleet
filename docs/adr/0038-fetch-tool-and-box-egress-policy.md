@@ -103,3 +103,9 @@ Replaces the Floor bullet "WebFetch: fetches go through the egress proxy (ADR-00
 A non-claude runner calls its own model API. Inferred, not part of the design: those hosts must be in the Box `egress_allow` for the P2 proxy to pass them. No Profile can add them.
 
 The runner now narrows each job before its agent starts: `ConnectProxy::set_job_hosts` takes the runner's `model_hosts()` and keeps those inside the `egress_allow` ceiling, and the job end clears it. The narrowing is strict. `api.anthropic.com` is no longer always allowed, so a codex or kimi job reaches only its own model hosts and never the Anthropic host, even when the ceiling lists it. A job that was never narrowed keeps the whole ceiling plus `api.anthropic.com`.
+
+## Amendment (ADR-0067)
+
+ADR-0067 keeps the egress policy at Box level. The egress of an Environment Setup unit is a subset of `egress_allow`, and an Environment cannot widen it. The exfiltration note above covers agent-visible Environment secrets, and redaction of them stays exact-match.
+
+See ADR-0067.
