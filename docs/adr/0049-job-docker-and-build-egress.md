@@ -19,7 +19,7 @@ For integration tests, the candidate is a rootless `dockerd` per Job, in its own
 
 - Runs as `fleet-job`.
 - `PrivateNetwork=yes`: the namespace has loopback only, so containers have no route out.
-- Socket at `/run/fleet/<id>/docker.sock`, reachable by that Job only.
+- Socket at `/run/fleet/<id>/docker.sock`, reachable by that Job only. Every Job runs as the same `fleet-job` uid, so the file mode cannot keep one Job out of another Job's socket. The separation comes from the per-Job directory binding of `/run/fleet/<id>`, and the spike must show it holds.
 - Gated by a Box config key, and refused unless the Job is `disposable=true`.
 - Daemon pulls use `HTTPS_PROXY` pointed at the existing agent-exec loopback forwarder (ADR-0031). Every pull passes the CONNECT proxy and stays under the `egress_allow` ceiling (ADR-0038).
 
@@ -31,7 +31,7 @@ Nothing in this section is built until a live spike on the box passes. The spike
 
 ### Build-chain egress
 
-Build chains use exact hosts only. `config.rs` rejects wildcard TLDs, and no Profile can add hosts (ADR-0038). The candidate hosts below are unverified until the observe-mode task (BOX-3) captures real traffic:
+Build chains use exact hosts only. `config.rs` rejects wildcard TLDs, and no Profile can add hosts (ADR-0038). The candidate hosts below are unverified until the observe-mode task (BOX-3, the `egress_observe` key) captures real traffic:
 
 | Chain | Candidate hosts |
 | --- | --- |
@@ -48,11 +48,13 @@ The list stays under the Box `egress_allow` ceiling. The Box owner adds hosts to
 - `dockerd` honours `HTTPS_PROXY` for registry pulls.
 - `JoinsNamespaceOf=` between the docker unit and the agent unit gives the shared loopback forwarder.
 - `fleet-job` has a usable subuid and subgid range.
+- The forwarder limits of ADR-0031 (`MAX_FORWARDED` of 4 connections, `FORWARD_IDLE_TIMEOUT` of 120 s) leave room for the parallel layer pulls of one image. Unverified: a pull that opens more connections or stalls past the idle time can fail.
+- `JoinsNamespaceOf=` also shares the docker unit's loopback listeners with the agent unit. Inferred, not part of the design: the agent could then reach any port the daemon opens on loopback. Unverified.
 - `rootless-extras` is installed on the box.
 
 ### Accepted risk
 
-As in ADR-0031: domain fronting through an allowed host. A CONNECT proxy sees the hostname only.
+As in ADR-0031: domain fronting through an allowed host. A CONNECT proxy sees the hostname only. The Docker Hub and GitHub rows include shared CDN hosts (`production.cloudflare.docker.com`, `objects.githubusercontent.com`) that serve many tenants, so a fronted request to another tenant on the same host passes the ceiling.
 
 ## Options
 

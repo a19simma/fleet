@@ -21,7 +21,7 @@ ADR-0037 (credential broker), the fetch tool and the P2 egress proxy each need a
 
 ### Second layer
 
-The unit mounts only its own Run dir: `TemporaryFileSystem=/run/fleet:ro`, `BindPaths=/run/fleet/%i` and the hook dir. Other Jobs' sockets are then absent from the agent's mount namespace. Unverified: this needs a live probe on a Box, including that `BindPaths` after `TemporaryFileSystem` keeps the socket connectable.
+The unit mounts only its own Run dir: `TemporaryFileSystem=/run/fleet:ro`, `BindPaths=/run/fleet/%i` and the hook dir. Other Jobs' sockets are then absent from the agent's mount namespace. Unverified: this needs a live probe on a Box, including that `BindPaths` after `TemporaryFileSystem` keeps the socket connectable. Until the probe passes, the peer cgroup check is the only barrier between Jobs.
 
 ### Launcher scope
 

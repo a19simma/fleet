@@ -37,7 +37,7 @@ A non-owner `GetProfile` of a `private` Profile returns `NOT_FOUND` with the sam
 ### Box and legacy callers
 
 - The box token carries no user and reads every Profile blob for a leased Job (ADR-0035). That scope is unchanged. `GetProfileBlob` stays authorised against the lease.
-- Profiles that exist before this ADR have no owner. A migration assigns them to a system user, marks them `shared`, and marks every existing version published. The system user cannot log in and holds no token. Nobody can mutate a legacy Profile, which matches today's rule that versions are immutable. A user who wants to change one copies it under their own name.
+- Profiles that exist before this ADR have no owner. A migration assigns them to a system user, marks them `shared`, and marks every existing version published. Not built: the draft and publish step, and so the marking. Migration 0023 assigns legacy Profiles to the system user and marks them `shared`, and no code carries a published flag. A later task that builds publishing must mark each legacy version published in its own migration, or this ADR is amended to drop the draft state. The system user cannot log in and holds no token. Nobody can mutate a legacy Profile, which matches today's rule that versions are immutable. A user who wants to change one copies it under their own name.
 - The bootstrap user and the legacy client token (ADR-0042) are not owners of legacy Profiles. They read them as any other user does.
 
 ### ADR-0048 gate
