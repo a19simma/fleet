@@ -52,3 +52,5 @@ pre, code, kbd { font-family: var(--font-mono); }
 .menu-title { color: #8b949e; }
 .menu :where(a) { min-block-size: 24px; }
 .table td a.link { display: inline-flex; align-items: center; min-block-size: 24px; }
+nav .btn-xs { min-block-size: 24px; }
+.nav-fade { mask-image: linear-gradient(to right, #000 calc(100% - 2rem), transparent); }

@@ -44,6 +44,31 @@ pub const PASSKEY_JS: &str = include_str!("../../assets/passkey.js");
 /// URL path of the embedded script.
 pub const SCRIPT_PATH: &str = "/static/passkey.js";
 
+/// Script that scrolls a focused top bar link clear of the right-edge fade.
+pub const NAV_FOCUS_JS: &str = r#"(function () {
+  var nav = document.querySelector('nav[aria-label="Main mobile"]');
+  if (!nav) { return; }
+  var CLEAR = 48;
+  var EDGE = 16;
+  nav.addEventListener("focusin", function (event) {
+    var target = event.target;
+    if (!(target instanceof Element)) { return; }
+    var bar = nav.getBoundingClientRect();
+    var box = target.getBoundingClientRect();
+    var over = box.right - (bar.left + nav.clientWidth - CLEAR);
+    if (over > 0) {
+      nav.scrollLeft += over;
+      return;
+    }
+    var under = bar.left + EDGE - box.left;
+    if (under > 0) { nav.scrollLeft -= under; }
+  });
+})();
+"#;
+
+/// URL path of the top bar focus script.
+pub(super) const NAV_SCRIPT_PATH: &str = "/static/navfocus.js";
+
 /// Heading rendered by the home page.
 pub const HOME_MARKER: &str = "fleet";
 
@@ -373,6 +398,11 @@ async fn style() -> Result<([(header::HeaderName, &'static str); 1], &'static st
 #[route(GET "/static/passkey.js")]
 async fn script() -> Result<([(header::HeaderName, &'static str); 1], &'static str)> {
     Ok(([(header::CONTENT_TYPE, "text/javascript")], PASSKEY_JS))
+}
+
+#[route(GET "/static/navfocus.js")]
+async fn nav_script() -> Result<([(header::HeaderName, &'static str); 1], &'static str)> {
+    Ok(([(header::CONTENT_TYPE, "text/javascript")], NAV_FOCUS_JS))
 }
 
 #[route(POST "/passkey/setup/start")]
