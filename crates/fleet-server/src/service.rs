@@ -5,6 +5,7 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use fleet_core::Envelope;
+use fleet_core::graph;
 use fleet_proto::v1::fleet_batches_server::{FleetBatches, FleetBatchesServer};
 use fleet_proto::v1::fleet_capability_admin_server::{
     FleetCapabilityAdmin, FleetCapabilityAdminServer,
@@ -18,25 +19,32 @@ use fleet_proto::v1::fleet_judge_server::{FleetJudge, FleetJudgeServer};
 use fleet_proto::v1::fleet_profiles_server::{FleetProfiles, FleetProfilesServer};
 use fleet_proto::v1::fleet_query_server::{FleetQuery, FleetQueryServer};
 use fleet_proto::v1::fleet_repos_server::{FleetRepos, FleetReposServer};
+use fleet_proto::v1::fleet_work_server::{FleetWork, FleetWorkServer};
 use fleet_proto::v1::fleet_worker_server::{FleetWorker, FleetWorkerServer};
 use fleet_proto::v1::{
-    AddRepoRequest, CancelJobRequest, CatalogItem, ClaimJobReply, ClaimJobRequest,
-    CreateProfileRequest, CredentialInfo, DeleteCredentialReply, DeleteCredentialRequest,
-    GetBatchReply, GetBatchRequest, GetJobCredentialsReply, GetJobCredentialsRequest,
-    GetJobRequest, GetJobTimingReply, GetJobTimingRequest, GetJobTranscriptReply,
-    GetJobTranscriptRequest, GetProfileBlobReply, GetProfileBlobRequest, GetProfileRequest,
-    GetStatsReply, GetStatsRequest, GrantCapabilityRequest, HeartbeatReply, HeartbeatRequest, Job,
-    ListCapabilitiesReply, ListCapabilitiesRequest, ListCatalogReply, ListCatalogRequest,
-    ListCredentialsReply, ListCredentialsRequest, ListFleetReply, ListFleetRequest, ListJobsReply,
-    ListJobsRequest, ListProfilesReply, ListProfilesRequest, ListReposReply, ListReposRequest,
-    Profile, ProfileVersion, PushEventsReply, PushEventsRequest, PutCredentialRequest, QueuedEvent,
-    ReadJobEventsReply, ReadJobEventsRequest, ReadTranscriptReply, ReadTranscriptRequest,
-    Rejection, RemoveRepoReply, RemoveRepoRequest, RepoInfo, ReportJobReply, ReportJobRequest,
-    ReportShellLogReply, ReportShellLogRequest, ReportTimingReply, ReportTimingRequest,
+    AddRepoRequest, AddWorkDepRequest, AddWorkItemRequest, AddWorkNoteRequest, CancelJobRequest,
+    CancelWorkRequest, CatalogItem, ClaimJobReply, ClaimJobRequest, ClaimWorkRequest,
+    CreateProfileRequest, CreateWorkProjectRequest, CredentialInfo, DeleteCredentialReply,
+    DeleteCredentialRequest, GetBatchReply, GetBatchRequest, GetJobCredentialsReply,
+    GetJobCredentialsRequest, GetJobRequest, GetJobTimingReply, GetJobTimingRequest,
+    GetJobTranscriptReply, GetJobTranscriptRequest, GetProfileBlobReply, GetProfileBlobRequest,
+    GetProfileRequest, GetStatsReply, GetStatsRequest, GetWorkItemReply, GetWorkItemRequest,
+    GrantCapabilityRequest, HeartbeatReply, HeartbeatRequest, Job, ListCapabilitiesReply,
+    ListCapabilitiesRequest, ListCatalogReply, ListCatalogRequest, ListCredentialsReply,
+    ListCredentialsRequest, ListFleetReply, ListFleetRequest, ListJobsReply, ListJobsRequest,
+    ListProfilesReply, ListProfilesRequest, ListReposReply, ListReposRequest, ListWorkDefersReply,
+    ListWorkDefersRequest, ListWorkItemsReply, ListWorkItemsRequest, ListWorkProjectsReply,
+    ListWorkProjectsRequest, NextWorkReply, NextWorkRequest, Profile, ProfileVersion,
+    PushEventsReply, PushEventsRequest, PutCredentialRequest, QueuedEvent, ReadJobEventsReply,
+    ReadJobEventsRequest, ReadTranscriptReply, ReadTranscriptRequest, RecordWorkDeferRequest,
+    Rejection, RemoveRepoReply, RemoveRepoRequest, RemoveWorkDepRequest, RenewLeaseRequest,
+    RepoInfo, ReportAttemptRequest, ReportJobReply, ReportJobRequest, ReportShellLogReply,
+    ReportShellLogRequest, ReportTimingReply, ReportTimingRequest, ResolveWorkDeferRequest,
     RevokeCapabilityReply, RevokeCapabilityRequest, SetCatalogItemEnabledRequest,
-    ShareProfileRequest, StreamShellLogChunk, StreamShellLogRequest, SubmitBatchReply,
-    SubmitBatchRequest, SubmitJobRequest, SubmitJudgeRequest, UnshareProfileRequest,
-    UpsertCatalogItemRequest, UserCapability, VerifyCredentialReply, VerifyCredentialRequest,
+    SetWorkSlicesRequest, ShareProfileRequest, StreamShellLogChunk, StreamShellLogRequest,
+    SubmitBatchReply, SubmitBatchRequest, SubmitJobRequest, SubmitJudgeRequest, UnblockWorkRequest,
+    UnshareProfileRequest, UpsertCatalogItemRequest, UserCapability, VerifyCredentialReply,
+    VerifyCredentialRequest, WorkAttempt, WorkDefer, WorkEvent, WorkItem, WorkProject,
 };
 use fleet_proto::{ConvertError, validate_box};
 use tonic::codegen::BoxStream;
@@ -53,7 +61,7 @@ use crate::cred::capability::{self, Capabilities};
 use crate::cred::{CredentialService, RepoService};
 use crate::jobs::validate_job_id;
 use crate::profiles::{self, ProfileContent, ProfileFault, Viewer};
-use crate::store::{Store, StoreError};
+use crate::store::{Store, StoreError, WorkFault};
 use crate::timing;
 use crate::update_feed::FeedCache;
 use crate::web::{Dispatch, HEADER_READ_TIMEOUT, Web, serve};
@@ -635,6 +643,230 @@ impl FleetRepos for FleetService {
     }
 }
 
+fn work_user<T>(request: &Request<T>) -> Result<i64, Status> {
+    caller_of(request).ok_or_else(|| Status::permission_denied(fleet_proto::ERR_NEEDS_USER_TOKEN))
+}
+
+fn work_error(err: &StoreError) -> Status {
+    match err {
+        StoreError::KeyConflict => {
+            Status::already_exists("idempotency key already used with other parameters")
+        }
+        StoreError::Work(fault) => match fault {
+            WorkFault::ProjectNotFound | WorkFault::ItemNotFound | WorkFault::DepNotFound => {
+                Status::not_found(fault.to_string())
+            }
+            WorkFault::Invalid(reason) => Status::invalid_argument(*reason),
+            WorkFault::Graph(graph::GraphError::Cycle(_))
+            | WorkFault::RepoNotRegistered
+            | WorkFault::CrossProject => Status::failed_precondition(fault.to_string()),
+            WorkFault::Graph(_) => Status::invalid_argument(fault.to_string()),
+            WorkFault::Exists(reason) => Status::already_exists(*reason),
+            WorkFault::Precondition(reason) => Status::failed_precondition(*reason),
+        },
+        other => storage_unavailable(other),
+    }
+}
+
+const WORK_LATER: &str = "not available yet";
+
+#[tonic::async_trait]
+impl FleetWork for FleetService {
+    async fn create_work_project(
+        &self,
+        request: Request<CreateWorkProjectRequest>,
+    ) -> Result<Response<WorkProject>, Status> {
+        let user_id = work_user(&request)?;
+        let reply = self
+            .store
+            .create_work_project(user_id, request.get_ref())
+            .await
+            .map_err(|err| work_error(&err))?;
+        Ok(Response::new(reply))
+    }
+
+    async fn list_work_projects(
+        &self,
+        request: Request<ListWorkProjectsRequest>,
+    ) -> Result<Response<ListWorkProjectsReply>, Status> {
+        let user_id = work_user(&request)?;
+        let reply = self
+            .store
+            .list_work_projects(user_id)
+            .await
+            .map_err(|err| work_error(&err))?;
+        Ok(Response::new(reply))
+    }
+
+    async fn set_work_slices(
+        &self,
+        request: Request<SetWorkSlicesRequest>,
+    ) -> Result<Response<WorkProject>, Status> {
+        let user_id = work_user(&request)?;
+        let reply = self
+            .store
+            .set_work_slices(user_id, request.get_ref())
+            .await
+            .map_err(|err| work_error(&err))?;
+        Ok(Response::new(reply))
+    }
+
+    async fn add_work_item(
+        &self,
+        request: Request<AddWorkItemRequest>,
+    ) -> Result<Response<WorkItem>, Status> {
+        let user_id = work_user(&request)?;
+        let reply = self
+            .store
+            .add_work_item(user_id, request.get_ref())
+            .await
+            .map_err(|err| work_error(&err))?;
+        Ok(Response::new(reply))
+    }
+
+    async fn list_work_items(
+        &self,
+        request: Request<ListWorkItemsRequest>,
+    ) -> Result<Response<ListWorkItemsReply>, Status> {
+        let user_id = work_user(&request)?;
+        let reply = self
+            .store
+            .list_work_items(user_id, request.get_ref())
+            .await
+            .map_err(|err| work_error(&err))?;
+        Ok(Response::new(reply))
+    }
+
+    async fn get_work_item(
+        &self,
+        request: Request<GetWorkItemRequest>,
+    ) -> Result<Response<GetWorkItemReply>, Status> {
+        let user_id = work_user(&request)?;
+        let reply = self
+            .store
+            .get_work_item(user_id, request.get_ref())
+            .await
+            .map_err(|err| work_error(&err))?;
+        Ok(Response::new(reply))
+    }
+
+    async fn add_work_dep(
+        &self,
+        request: Request<AddWorkDepRequest>,
+    ) -> Result<Response<WorkItem>, Status> {
+        let user_id = work_user(&request)?;
+        let reply = self
+            .store
+            .add_work_dep(user_id, request.get_ref())
+            .await
+            .map_err(|err| work_error(&err))?;
+        Ok(Response::new(reply))
+    }
+
+    async fn remove_work_dep(
+        &self,
+        request: Request<RemoveWorkDepRequest>,
+    ) -> Result<Response<WorkItem>, Status> {
+        let user_id = work_user(&request)?;
+        let reply = self
+            .store
+            .remove_work_dep(user_id, request.get_ref())
+            .await
+            .map_err(|err| work_error(&err))?;
+        Ok(Response::new(reply))
+    }
+
+    async fn cancel_work(
+        &self,
+        request: Request<CancelWorkRequest>,
+    ) -> Result<Response<WorkItem>, Status> {
+        let user_id = work_user(&request)?;
+        let reply = self
+            .store
+            .cancel_work(user_id, request.get_ref())
+            .await
+            .map_err(|err| work_error(&err))?;
+        Ok(Response::new(reply))
+    }
+
+    async fn unblock_work(
+        &self,
+        request: Request<UnblockWorkRequest>,
+    ) -> Result<Response<WorkItem>, Status> {
+        let user_id = work_user(&request)?;
+        let reply = self
+            .store
+            .unblock_work(user_id, request.get_ref())
+            .await
+            .map_err(|err| work_error(&err))?;
+        Ok(Response::new(reply))
+    }
+
+    async fn next_work(
+        &self,
+        request: Request<NextWorkRequest>,
+    ) -> Result<Response<NextWorkReply>, Status> {
+        work_user(&request)?;
+        Err(Status::unimplemented(WORK_LATER))
+    }
+
+    async fn claim_work(
+        &self,
+        request: Request<ClaimWorkRequest>,
+    ) -> Result<Response<WorkAttempt>, Status> {
+        work_user(&request)?;
+        Err(Status::unimplemented(WORK_LATER))
+    }
+
+    async fn renew_lease(
+        &self,
+        request: Request<RenewLeaseRequest>,
+    ) -> Result<Response<WorkAttempt>, Status> {
+        work_user(&request)?;
+        Err(Status::unimplemented(WORK_LATER))
+    }
+
+    async fn report_attempt(
+        &self,
+        request: Request<ReportAttemptRequest>,
+    ) -> Result<Response<WorkAttempt>, Status> {
+        work_user(&request)?;
+        Err(Status::unimplemented(WORK_LATER))
+    }
+
+    async fn add_work_note(
+        &self,
+        request: Request<AddWorkNoteRequest>,
+    ) -> Result<Response<WorkEvent>, Status> {
+        work_user(&request)?;
+        Err(Status::unimplemented(WORK_LATER))
+    }
+
+    async fn record_work_defer(
+        &self,
+        request: Request<RecordWorkDeferRequest>,
+    ) -> Result<Response<WorkDefer>, Status> {
+        work_user(&request)?;
+        Err(Status::unimplemented(WORK_LATER))
+    }
+
+    async fn resolve_work_defer(
+        &self,
+        request: Request<ResolveWorkDeferRequest>,
+    ) -> Result<Response<WorkDefer>, Status> {
+        work_user(&request)?;
+        Err(Status::unimplemented(WORK_LATER))
+    }
+
+    async fn list_work_defers(
+        &self,
+        request: Request<ListWorkDefersRequest>,
+    ) -> Result<Response<ListWorkDefersReply>, Status> {
+        work_user(&request)?;
+        Err(Status::unimplemented(WORK_LATER))
+    }
+}
+
 fn caller_of<T>(request: &Request<T>) -> Option<i64> {
     request
         .extensions()
@@ -1161,6 +1393,7 @@ fn routes(store: &Store, credentials: Option<CredentialService>, update: UpdateR
     let credentials = FleetCredentialsServer::new(service.clone())
         .max_decoding_message_size(MAX_CREDENTIAL_MESSAGE_BYTES);
     let repos = FleetReposServer::new(service.clone());
+    let work = FleetWorkServer::new(service.clone());
     let catalog = FleetCatalogServer::new(service.clone());
     let catalog_admin = FleetCatalogAdminServer::new(service.clone())
         .max_decoding_message_size(MAX_PROFILE_MESSAGE_BYTES);
@@ -1176,6 +1409,7 @@ fn routes(store: &Store, credentials: Option<CredentialService>, update: UpdateR
         .add_service(batches)
         .add_service(credentials)
         .add_service(repos)
+        .add_service(work)
         .add_service(catalog)
         .add_service(catalog_admin)
         .add_service(capability_admin)

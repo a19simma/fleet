@@ -2,11 +2,11 @@
 //!
 //! Two static tokens plus per-user API tokens, scoped by gRPC path. The box token covers
 //! `FleetIngest` and `FleetWorker`. The client scope covers `FleetQuery`, `FleetJobs`,
-//! `FleetJudge`, `FleetProfiles`, `FleetBatches`, `FleetCredentials`, `FleetRepos` and
-//! `FleetCatalog`. Any other path is denied.
+//! `FleetJudge`, `FleetProfiles`, `FleetBatches`, `FleetCredentials`, `FleetRepos`,
+//! `FleetCatalog` and `FleetWork`. Any other path is denied.
 //! `FleetCatalog` passes the scope, then its handler requires an admin user.
 //! `FleetRepos` passes the scope, then its handler requires a user caller: the box token never
-//! reaches it.
+//! reaches it. `FleetWork` is the same: its handlers scope every read and write to the caller.
 //!
 //! The two admin services, `FleetCatalogAdmin` and `FleetCapabilityAdmin`, sit outside both
 //! static scopes. A request reaches one of their five RPCs only with a per-user API token whose
@@ -47,6 +47,7 @@ const BATCHES: &str = "/fleet.v1.FleetBatches/";
 const CREDENTIALS: &str = "/fleet.v1.FleetCredentials/";
 const REPOS: &str = "/fleet.v1.FleetRepos/";
 const CATALOG: &str = "/fleet.v1.FleetCatalog/";
+const WORK: &str = "/fleet.v1.FleetWork/";
 const CATALOG_ADMIN: &str = "/fleet.v1.FleetCatalogAdmin/";
 
 /// The fixed `PERMISSION_DENIED` reason for every refusal of an admin RPC.
@@ -146,7 +147,7 @@ impl BearerAuth {
 
     /// Allow-lists paths per scope: the box token takes `FleetIngest` and `FleetWorker`,
     /// the client token takes `FleetQuery`, `FleetJobs`, `FleetJudge`, `FleetProfiles`,
-    /// `FleetBatches`, `FleetCredentials`, `FleetRepos` and `FleetCatalog`.
+    /// `FleetBatches`, `FleetCredentials`, `FleetRepos`, `FleetCatalog` and `FleetWork`.
     /// Every other path is denied.
     fn allows(scope: Scope, path: &str) -> bool {
         match scope {
@@ -160,6 +161,7 @@ impl BearerAuth {
                     || path.starts_with(CREDENTIALS)
                     || path.starts_with(REPOS)
                     || path.starts_with(CATALOG)
+                    || path.starts_with(WORK)
             }
         }
     }
@@ -356,6 +358,25 @@ mod tests {
                 .ok_or_else(|| format!("{case:?} passed"))?;
             assert_eq!(status.code(), Code::Unauthenticated, "{case:?}");
         }
+        Ok(())
+    }
+
+    #[test]
+    fn work_path_is_client_scope_only() -> Result<(), String> {
+        const CLIENT: &str = "client-0123456789abcdef0123456789";
+        const WORK_PATH: &str = "/fleet.v1.FleetWork/AddWorkItem";
+        let box_token = Token::new(SECRET.into()).map_err(|err| err.to_string())?;
+        let client = Token::new(CLIENT.into()).map_err(|err| err.to_string())?;
+        let auth = BearerAuth::new(&box_token, Some(&client));
+        let client_header = format!("Bearer {CLIENT}");
+        auth.check(WORK_PATH, Some(client_header.as_bytes()))
+            .map_err(|status| status.to_string())?;
+        let box_header = format!("Bearer {SECRET}");
+        let status = auth
+            .check(WORK_PATH, Some(box_header.as_bytes()))
+            .err()
+            .ok_or("box token reached FleetWork")?;
+        assert_eq!(status.code(), Code::PermissionDenied);
         Ok(())
     }
 }

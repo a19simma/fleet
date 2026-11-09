@@ -31,6 +31,9 @@ use crate::stats;
 use crate::telemetry;
 
 mod ci_retry;
+mod work;
+
+pub use work::WorkFault;
 
 use ci_retry::{ROOT_ID, decide_ci_retry};
 
@@ -410,6 +413,8 @@ pub enum StoreError {
     /// A profile blob read did not match a live lease, or no such job exists. The handler
     /// maps this to gRPC `PERMISSION_DENIED`. The error carries no data.
     LeaseDenied,
+    /// A work tracker call refused. See [`WorkFault`].
+    Work(WorkFault),
 }
 
 impl fmt::Display for StoreError {
@@ -432,6 +437,7 @@ impl fmt::Display for StoreError {
             Self::ModelDenied(denied) => denied.fmt(f),
             Self::LeaseDenied => f.write_str(fleet_proto::ERR_LEASE_MISMATCH),
             Self::CatalogTooLarge => f.write_str(profiles::ERR_BLOB_CATALOG_TOO_LARGE),
+            Self::Work(fault) => fault.fmt(f),
         }
     }
 }
@@ -445,6 +451,7 @@ impl std::error::Error for StoreError {
             Self::InvalidProfile(err) => Some(err),
             Self::InvalidBatch(err) => Some(err),
             Self::ModelDenied(err) => Some(err),
+            Self::Work(err) => Some(err),
             Self::OutOfRange(_)
             | Self::KeyConflict
             | Self::StaleReport
