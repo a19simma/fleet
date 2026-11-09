@@ -8,6 +8,7 @@ pub mod catalog;
 pub mod credential;
 mod ct;
 mod envelope;
+pub mod environment;
 mod error;
 pub mod forge;
 pub mod graph;

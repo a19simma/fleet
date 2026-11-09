@@ -1,0 +1,104 @@
+{
+  "cases": [
+    {
+      "label": "empty",
+      "egress_hosts": [],
+      "secrets": [],
+      "scripts": [],
+      "digest": "244c3f41937d4eaf2c8072dd3d9789f75fd66f09e161bb4110742fbf6d8371da"
+    },
+    {
+      "label": "two secrets one script one host",
+      "egress_hosts": [
+        "pve.example.com"
+      ],
+      "secrets": [
+        {
+          "name": "KUBECONFIG",
+          "agent_visible": true,
+          "delivery": "file"
+        },
+        {
+          "name": "PM_TOKEN",
+          "agent_visible": false,
+          "delivery": "file"
+        }
+      ],
+      "scripts": [
+        {
+          "name": "kube_login",
+          "body": "#!/bin/sh\nset -eu\n",
+          "on_fail": "abort",
+          "timeout_s": 120
+        }
+      ],
+      "digest": "993f53f1b7142375b957cd987812fa5420325fd3ce5fb5e47a765734abbe2ba3"
+    },
+    {
+      "label": "same with KUBECONFIG not agent visible",
+      "egress_hosts": [
+        "pve.example.com"
+      ],
+      "secrets": [
+        {
+          "name": "KUBECONFIG",
+          "agent_visible": false,
+          "delivery": "file"
+        },
+        {
+          "name": "PM_TOKEN",
+          "agent_visible": false,
+          "delivery": "file"
+        }
+      ],
+      "scripts": [
+        {
+          "name": "kube_login",
+          "body": "#!/bin/sh\nset -eu\n",
+          "on_fail": "abort",
+          "timeout_s": 120
+        }
+      ],
+      "digest": "0a0830793595905816af7390fe0ee85da2ac63b2b257a76a1c5e0c852db5eef7"
+    },
+    {
+      "label": "mixed case secrets, unsorted hosts, two scripts",
+      "egress_hosts": [
+        "b.example.com",
+        "a.example.com"
+      ],
+      "secrets": [
+        {
+          "name": "C",
+          "agent_visible": true,
+          "delivery": "env"
+        },
+        {
+          "name": "A",
+          "agent_visible": false,
+          "delivery": "file"
+        },
+        {
+          "name": "b",
+          "agent_visible": true,
+          "delivery": "file"
+        }
+      ],
+      "scripts": [
+        {
+          "name": "zz",
+          "body": "#!/bin/bash\necho hi\n\tdone\n",
+          "on_fail": "continue",
+          "timeout_s": 600
+        },
+        {
+          "name": "aa",
+          "body": "#!/bin/sh\n",
+          "on_fail": "abort",
+          "timeout_s": 1
+        }
+      ],
+      "digest": "7bb017e5c6c3328d2257917d85ba5420becaa908684b48af7edc2b98ebab84f5"
+    }
+  ]
+}
