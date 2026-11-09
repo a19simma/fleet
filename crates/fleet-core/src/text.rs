@@ -13,7 +13,7 @@ use crate::Redactor;
 /// Blank or confusable characters that are not `Cf` are out of scope: `U+034F`, `U+115F`,
 /// `U+1160`, `U+3164`, `U+FFA0`, the variation selectors `U+FE00..=U+FE0F` and
 /// `U+E0100..=U+E01EF`, `U+17B4`, `U+17B5` and `U+2800`. Callers that need them keep their
-/// own extra list.
+/// own extra list, as `fleetd` does for fetched bodies.
 ///
 /// Sorted by start and non-overlapping. Control characters (`Cc`) are not listed: [`is_hostile`]
 /// tests them with [`char::is_control`].

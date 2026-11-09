@@ -1054,31 +1054,9 @@ mod tests {
         }
     }
 
-    const UNSAFE_RANGES: &[(u32, u32)] = &[
-        (0x0, 0x1F),
-        (0x7F, 0x9F),
-        (0xAD, 0xAD),
-        (0x600, 0x605),
-        (0x61C, 0x61C),
-        (0x6DD, 0x6DD),
-        (0x70F, 0x70F),
-        (0x890, 0x891),
-        (0x8E2, 0x8E2),
-        (0x180E, 0x180E),
-        (0x200B, 0x200F),
-        (0x2028, 0x2029),
-        (0x202A, 0x202E),
-        (0x2060, 0x2064),
-        (0x2066, 0x206F),
-        (0xFEFF, 0xFEFF),
-        (0xFFF9, 0xFFFB),
-        (0x110BD, 0x110BD),
-        (0x110CD, 0x110CD),
-        (0x13430, 0x1343F),
-        (0x1BCA0, 0x1BCA3),
-        (0x1D173, 0x1D17A),
-        (0xE0001, 0xE0001),
-        (0xE0020, 0xE007F),
+    /// Escaped code points the shared hostile set does not hold: private use (`Co`),
+    /// noncharacters and a few unassigned code points (`Cn`).
+    const EXTRA_UNSAFE_RANGES: &[(u32, u32)] = &[
         (0xE000, 0xF8FF),
         (0xF0000, 0xFFFFD),
         (0x0010_0000, 0x0010_FFFD),
@@ -1088,14 +1066,14 @@ mod tests {
     ];
 
     fn in_unsafe_table(cp: u32) -> bool {
-        UNSAFE_RANGES
-            .iter()
-            .any(|&(lo, hi)| (lo..=hi).contains(&cp))
+        char::from_u32(cp).is_some_and(crate::text::is_hostile)
+            || EXTRA_UNSAFE_RANGES
+                .iter()
+                .any(|&(lo, hi)| (lo..=hi).contains(&cp))
             || matches!(cp & 0xFFFF, 0xFFFE | 0xFFFF)
     }
 
-    /// The table is Cc, Cf, Zl, Zp and Co from `UnicodeData` 16.0.0, plus
-    /// noncharacters and a few unassigned code points (Cn).
+    /// The expected set is the shared hostile set plus `EXTRA_UNSAFE_RANGES`.
     #[test]
     fn every_code_point_in_a_unicode_unsafe_category_is_escaped() {
         let mut checked = 0_u32;

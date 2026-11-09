@@ -54,4 +54,5 @@ ADRs for fleetd, the Fleet server and the `fleet` CLI. The plan is in `../plan.m
 | [0061](0061-release-download-redirects.md) | Redirects for release downloads over the no-redirect transport | Proposed 2026-11-07, fully built (ForgeGet optional authorization, accept and ForgeReply location; ReleaseFetcher, hop rules, host allowlist and Location parsing; cache, seq gate and poller, FEED-5; relay wiring and startup, FEED-6; Deployment and runbooks, FEED-7), amends 0059 (redirect scope), builds on 0060 |
 
 Each ADR has a "Decisions (2026-10-24)" section with the choices made when the docs moved into this repo: Apache-2.0 licence, repo github.com/a19simma/fleet, `fleet watch` as a client poll in v1, job cost deferred, Tailscale not a hard dependency.
-| [0062](0062-transcript-view.md) | Transcript view | Proposed 2026-11-08, nothing built, amends 0022 (reading), builds on 0055 |
+| [0062](0062-transcript-view.md) | Transcript view | Proposed 2026-11-08, parser and views built, amends 0022 (reading), builds on 0055 |
+| [0063](0063-one-hostile-text-set.md) | One hostile-text set | Proposed 2026-11-09, built (SAN-1a to SAN-1k), amends 0062 (sanitiser scope), builds on 0022 |

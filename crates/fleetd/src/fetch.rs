@@ -361,48 +361,36 @@ fn is_valid_media_type(media: &str) -> bool {
             .is_some_and(|(kind, sub)| is_media_token(kind) && is_media_token(sub))
 }
 
-/// Code points a body may not carry besides controls, as sorted inclusive ranges: every
-/// `General_Category` `Cf`, `Zl` and `Zp` code point plus the variation selectors, U+034F and the
-/// Hangul fillers U+115F, U+1160, U+3164 and U+FFA0. Generated from `UnicodeData.txt` of Unicode
-/// 18.0.0 (<https://www.unicode.org/Public/UCD/latest/ucd/UnicodeData.txt>). A test checks it
-/// against the `unicode-general-category` crate.
-const HIDDEN_RANGES: &[(u32, u32)] = &[
-    (0xAD, 0xAD),
+/// Blank or confusable code points a body may not carry besides [`fleet_core::text::is_hostile`],
+/// as sorted inclusive ranges: U+034F, the Hangul fillers U+115F, U+1160, U+3164 and U+FFA0, the
+/// Khmer inherent vowels U+17B4 and U+17B5, and the variation selectors U+FE00..=U+FE0F and
+/// U+E0100..=U+E01EF.
+///
+/// The shared set stays out of this list's way by design: it holds `Cc`, `Cf`, `Zl`, `Zp` and the
+/// tag block, so it omits characters that render as nothing but are not format characters. A
+/// fetched body is refused whole when it holds one, since each can hide text from a reader or
+/// split a marker. U+2800 (braille blank) is not listed because braille text uses it legitimately.
+const EXTRA_BLANK_RANGES: &[(u32, u32)] = &[
     (0x34F, 0x34F),
-    (0x600, 0x605),
-    (0x61C, 0x61C),
-    (0x6DD, 0x6DD),
-    (0x70F, 0x70F),
-    (0x890, 0x891),
-    (0x8E2, 0x8E2),
     (0x115F, 0x1160),
-    (0x180E, 0x180E),
-    (0x200B, 0x200F),
-    (0x2028, 0x202E),
-    (0x2060, 0x2064),
-    (0x2066, 0x206F),
+    (0x17B4, 0x17B5),
     (0x3164, 0x3164),
     (0xFE00, 0xFE0F),
-    (0xFEFF, 0xFEFF),
     (0xFFA0, 0xFFA0),
-    (0xFFF9, 0xFFFB),
-    (0x110BD, 0x110BD),
-    (0x110CD, 0x110CD),
-    (0x13430, 0x1343F),
-    (0x1BCA0, 0x1BCA3),
-    (0x1D173, 0x1D17A),
-    (0xE0001, 0xE0001),
-    (0xE0020, 0xE007F),
     (0xE0100, 0xE01EF),
 ];
 
-/// Whether `c` is a control other than newline, tab and carriage return, or in [`HIDDEN_RANGES`].
-fn is_hidden_char(c: char) -> bool {
+/// Whether `c` is a control other than newline, tab and carriage return, a member of the shared
+/// hostile set, or in [`EXTRA_BLANK_RANGES`].
+fn refuses_body_char(c: char) -> bool {
     if c.is_control() {
         return !matches!(c, '\n' | '\t' | '\r');
     }
+    if fleet_core::text::is_hostile(c) {
+        return true;
+    }
     let code = u32::from(c);
-    HIDDEN_RANGES
+    EXTRA_BLANK_RANGES
         .binary_search_by(|&(low, high)| {
             if high < code {
                 std::cmp::Ordering::Less
@@ -679,7 +667,7 @@ impl<R: Resolver, D: Dialer> Fetcher<R, D> {
             }
         }
         let body = String::from_utf8(buf).map_err(|_| FetchError::NotText)?;
-        if body.chars().any(is_hidden_char) {
+        if body.chars().any(refuses_body_char) {
             return Err(FetchError::NotText);
         }
         Ok(Hop::Done(Landed::Text(Fetched {
@@ -1533,33 +1521,75 @@ mod tests {
     }
 
     #[test]
-    fn every_format_separator_and_filler_code_point_is_hidden() {
-        use unicode_general_category::{GeneralCategory, get_general_category};
-        let fillers = ['\u{34f}', '\u{115f}', '\u{1160}', '\u{3164}', '\u{ffa0}'];
+    fn every_shared_hostile_code_point_and_every_extra_is_refused_in_a_body() {
         let mut checked = 0_u32;
         for c in (0..=u32::from(char::MAX)).filter_map(char::from_u32) {
-            let hidden = matches!(
-                get_general_category(c),
-                GeneralCategory::Format
-                    | GeneralCategory::LineSeparator
-                    | GeneralCategory::ParagraphSeparator
-            ) || matches!(c, '\u{fe00}'..='\u{fe0f}' | '\u{e0100}'..='\u{e01ef}')
-                || fillers.contains(&c)
-                || (c.is_control() && !matches!(c, '\n' | '\t' | '\r'));
-            if hidden {
-                checked += 1;
-                assert!(is_hidden_char(c), "U+{:04X}", u32::from(c));
-            }
+            let want = if c.is_control() {
+                !matches!(c, '\n' | '\t' | '\r')
+            } else {
+                fleet_core::text::is_hostile(c)
+                    || EXTRA_BLANK_RANGES
+                        .iter()
+                        .any(|&(lo, hi)| (lo..=hi).contains(&u32::from(c)))
+            };
+            assert_eq!(refuses_body_char(c), want, "U+{:04X}", u32::from(c));
+            checked += u32::from(want);
         }
         assert!(checked > 400, "{checked}");
     }
 
     #[test]
-    fn ordinary_text_is_not_hidden() {
+    fn extra_blank_list_hostile_input_table() {
+        let table: &[(&str, u32, bool)] = &[
+            ("combining grapheme joiner", 0x34F, true),
+            ("below combining grapheme joiner", 0x34E, false),
+            ("above combining grapheme joiner", 0x350, false),
+            ("hangul choseong filler", 0x115F, true),
+            ("hangul jungseong filler", 0x1160, true),
+            ("below hangul fillers", 0x115E, false),
+            ("above hangul fillers", 0x1161, false),
+            ("khmer inherent aq", 0x17B4, true),
+            ("khmer inherent aa", 0x17B5, true),
+            ("khmer letter below", 0x17B3, false),
+            ("khmer vowel sign above", 0x17B6, false),
+            ("hangul filler", 0x3164, true),
+            ("below hangul filler", 0x3163, false),
+            ("above hangul filler", 0x3165, false),
+            ("halfwidth hangul filler", 0xFFA0, true),
+            ("below halfwidth filler", 0xFF9F, false),
+            ("above halfwidth filler", 0xFFA1, false),
+            ("first variation selector", 0xFE00, true),
+            ("last variation selector", 0xFE0F, true),
+            ("after variation selectors", 0xFE10, false),
+            ("first supplement selector", 0xE0100, true),
+            ("last supplement selector", 0xE01EF, true),
+            ("after supplement selectors", 0xE01F0, false),
+            ("braille blank is legitimate text", 0x2800, false),
+            ("zero width joiner", 0x200D, true),
+            ("carriage return", 0x0D, false),
+            ("newline", 0x0A, false),
+            ("tab", 0x09, false),
+            ("nul", 0x00, true),
+            ("nel", 0x85, true),
+            ("line separator", 0x2028, true),
+            ("bidi override", 0x202E, true),
+            ("tag block start", 0xE0000, true),
+            ("tag block end", 0xE007F, true),
+            ("ascii letter", 0x61, false),
+            ("cjk", 0x4E16, false),
+        ];
+        for &(label, code, refused) in table {
+            let c = char::from_u32(code).expect("scalar");
+            assert_eq!(refuses_body_char(c), refused, "{label} U+{code:04X}");
+        }
+    }
+
+    #[test]
+    fn ordinary_text_is_not_refused() {
         let ordinary = "Hello, world! 0123 \n\t\r caf\u{e9} na\u{ef}ve \u{4e16}\u{754c} \u{3053}\u{3093} \u{d55c}\u{ae00} \u{1f600} \u{2764} \u{627}\u{644}";
-        assert!(!ordinary.chars().any(is_hidden_char));
-        assert!((0x20_u8..0x7f).all(|b| !is_hidden_char(char::from(b))));
-        assert!(is_hidden_char('\u{200d}'));
+        assert!(!ordinary.chars().any(refuses_body_char));
+        assert!((0x20_u8..0x7f).all(|b| !refuses_body_char(char::from(b))));
+        assert!(refuses_body_char('\u{200d}'));
     }
 
     #[tokio::test]

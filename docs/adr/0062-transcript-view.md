@@ -1,6 +1,6 @@
 # Transcript view
 
-Status: Proposed 2026-11-08. Nothing is built: no `fleet_core::transcript` module, no pretty `fleet logs`, no web transcript view. Amends ADR-0022 (reading), builds on ADR-0055.
+Status: Proposed 2026-11-08. The `fleet_core::transcript` module, the pretty `fleet logs` and the web transcript view are built. Amends ADR-0022 (reading), builds on ADR-0055. Decision 2 is amended by ADR-0063.
 
 ADR-0022 stores the stream-json output of a Job and serves it as raw lines. `fleet logs` prints those lines and the job page shows them in one `pre` block. A reader sees JSON, not the conversation. The web page also makes one `ReadTranscript` call with a 100-chunk limit, so a long Job is cut short without a marker.
 
@@ -9,7 +9,7 @@ ADR-0022 stores the stream-json output of a Job and serves it as raw lines. `fle
 The server keeps storing raw stream-json. Both surfaces parse it at read time with one pure module in `fleet-core`.
 
 1. **Parse at read time in `fleet_core::transcript`.** The module does no IO. Storage (`job_transcript`) stays raw stream-json, and the proto and `ReadTranscript` do not change. Precedent: ADR-0055 put `fleet_core::timing` in `fleet-core` for the CLI and the web to share, with a parity test and a GAPS list. This module gets the same pair.
-2. **One sanitiser for every decoded string field.** `is_hostile`, the Unicode format ranges and `strip_keeping_lines` move from `fleet-cli` into `fleet-core`. For each field the order is: strip hostile characters, redact when a redactor is passed in, strip again, then cut at the field cap. Renderers never touch a raw string.
+2. **One sanitiser for every decoded string field.** `is_hostile`, the hostile ranges and `strip_keeping_lines` live in `fleet_core::text`, and ADR-0063 defines the set. For each field the order is: redact, strip hostile characters, redact again, strip again, then cut at the field cap. Renderers never touch a raw string.
 3. **The web job page stays server-rendered Topcoat HTML with no new JS.** The CSP is `script-src 'self'` (ADR-0041), and styling uses literal class names and the committed `assets/ui.css` (ADR-0051). Tool calls are `details` elements. `?raw=1` shows the old `pre` block. A copy button and auto-refresh are deferred: each needs a new decision.
 4. **Caps.** A line over 256 KiB (`MAX_CHUNK_BYTES`) is rejected before parsing. Text is cut at 16 KiB. Tool output is cut at 16 KiB with an "N bytes more" note. A command summary is 200 characters. A view holds at most 20,000 entries. Nesting depth is 8, and the `serde_json` recursion limit of 128 stays. A truncated chunk becomes a `Truncated` entry and is never parsed. A non-JSON line is a Fleet note only when it starts with the exact prefix `fleet: `.
 5. **`fleet logs` defaults to the pretty view.** `--raw` keeps the previous output byte for byte. Compatibility: a script that parses raw lines must add `--raw`. Color is on only for a TTY. `-f` streams line by line.
