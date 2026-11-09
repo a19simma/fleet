@@ -962,6 +962,7 @@ mod tests {
         let subscriber = tracing_subscriber::fmt()
             .with_writer(sink.clone())
             .with_ansi(false)
+            .without_time()
             .finish();
         (tracing::subscriber::set_default(subscriber), sink)
     }
@@ -1068,8 +1069,24 @@ mod tests {
         assert_eq!(sink.lines(), 1, "{}", sink.text());
         assert!(sink.text().contains("host=evil.example"), "{}", sink.text());
         assert!(!sink.text().contains("443"), "{}", sink.text());
+        assert!(!sink.text().contains(":443"), "{}", sink.text());
+        assert!(!sink.text().contains("port="), "{}", sink.text());
         assert_eq!(rig.dialer.dialed(), Vec::<SocketAddr>::new());
         assert_eq!(rig.proxy.stats("job1").refusals, 2);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn captured_log_lines_start_with_the_level_and_carry_no_time_field() -> TestResult {
+        let (_guard, sink) = capture();
+        let rig = observing_rig().await?;
+        assert!(!connect_status(&rig, "evil.example").await?);
+        let text = sink.text();
+        assert!(text.starts_with(" WARN "), "{text}");
+        assert!(
+            text.lines().all(|line| line.starts_with(" WARN ")),
+            "{text}"
+        );
         Ok(())
     }
 
