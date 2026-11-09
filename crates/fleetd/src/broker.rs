@@ -14,9 +14,10 @@
 //! at a time per Job. [`GhCli`] and [`MirrorGit`] are the real executors of these two reads.
 //!
 //! Per Job the broker allows [`MAX_PUSHES_PER_JOB`] pushes, no closer together than
-//! [`MIN_PUSH_INTERVAL`], and [`MAX_PRS_PER_JOB`] pull request creation, a title of at most
-//! [`MAX_TITLE_CHARS`] characters and a body of at most [`MAX_BODY_BYTES`] bytes, and refuses
-//! attribution lines, mentions, `#n` references, links and images ([`Denial::UnsafeText`]). Title and body are redacted before an executor sees them and every output
+//! [`MIN_PUSH_INTERVAL`], and [`MAX_PRS_PER_JOB`] pull request creation. A title holds at most
+//! [`MAX_TITLE_CHARS`] characters and a body at most [`MAX_BODY_BYTES`] bytes. The broker refuses
+//! attribution lines, mentions, `#n` references, links and images ([`Denial::UnsafeText`]).
+//! Title and body are redacted before an executor sees them and every output
 //! is redacted and cut to [`MAX_OUTPUT_BYTES`]. A capped operation counts when it is attempted,
 //! so a failed push or a failed pull request still spends its slot. A `pr_create` after one
 //! that returned a URL replies with that URL and calls no executor, so repeats are idempotent
@@ -161,6 +162,9 @@ pub enum PushTarget {
 
 impl PushTarget {
     /// Derives the target from the claimed Job.
+    ///
+    /// A `Some` but empty `parent_job_id` counts as a fix Job. That is safe: `base_ref` must
+    /// still name a valid `swarm/` branch.
     ///
     /// # Errors
     ///
@@ -929,6 +933,10 @@ fn valid_body(body: &str) -> bool {
 /// HTML tag (`<` followed by an ASCII letter, `/` or `!`), the markdown forms `![` and `](`, and
 /// the link schemes `http://`, `https://`, `ftp://`, `mailto:` and `www.`. Matching is
 /// case-insensitive and the input is never echoed.
+///
+/// The match is coarse. `gh-` needs no word boundary, so `high-1` is refused. `&#` is refused
+/// anywhere, `x[i](y)` trips the `](` rule, and a generic type such as `Vec<String>` is refused
+/// even inside backticks. Bare commit SHAs still autolink to a backlink and pass.
 fn has_live_markup(text: &str) -> bool {
     let lower = text.to_ascii_lowercase();
     let bytes = lower.as_bytes();
@@ -993,6 +1001,8 @@ fn is_trailer_line(line: &str) -> bool {
     ATTRIBUTION_TRAILERS.contains(&key)
 }
 
+/// Checks line by line, so a footer split across lines, such as `Generated with` then
+/// `Claude Code`, passes.
 fn has_attribution(text: &str) -> bool {
     text.split(is_line_separator).any(|line| {
         let skeleton = skeleton(line);

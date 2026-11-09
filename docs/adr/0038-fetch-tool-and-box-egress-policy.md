@@ -72,6 +72,7 @@ A later standalone service, radiant (spec only, own repo), takes over search and
 ## Consequences
 
 - Jobs can read the public web at once, with the exfiltration risk above accepted by decision.
+- The fetch cap and the tunnel budgets are counted per attempt, not per job: fleetd clears the counters when each attempt ends, so a retried job can spend the cap again on every attempt. A cumulative per-job cap would need a server-side count.
 - Every fetch leaves a local audit pair of events, and a Job that cannot record cannot fetch.
 - A skill and a daemon subcommand join the Template. The migration, the proto value and the Floor constant change together.
 - Moving to radiant changes the backend and leaves the command, the event and the Floor rule as they are.

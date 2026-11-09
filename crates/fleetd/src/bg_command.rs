@@ -43,6 +43,8 @@
 //!   bytes no longer matches, or the text is shorter than what was sent.
 //! - The same events before any byte went out leave no line-count or hash signal: a log
 //!   restarted below [`LOG_LINES`] lines is an undetectable residual.
+//! - A shifted window whose text still starts with the bytes already sent passes the hash
+//!   check, so identical repeated lines can hide the shift.
 //!
 //! The pusher fails the task closed on any of these: one empty `Failed` chunk, then no more
 //! pushes. The watcher withholds the log and reports [`HEAD_LOST_MARKER`] instead.

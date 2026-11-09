@@ -20,7 +20,7 @@ pub enum Finding {
     HttpHooks(usize),
     /// No file at the path.
     Missing,
-    /// The file exists and could not be read.
+    /// The file exists and could not be read, or it is larger than the read cap.
     Unreadable,
     /// The file is not valid JSON.
     Invalid,

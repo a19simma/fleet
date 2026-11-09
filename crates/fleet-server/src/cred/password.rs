@@ -3,7 +3,8 @@
 //! The server hashes the plaintext once at startup and drops it. Verification runs in
 //! `spawn_blocking` behind a semaphore so a flood of guesses cannot starve the runtime. A
 //! disarmed verifier, one with no hash or one whose caller says setup is closed, still
-//! verifies against a fixed decoy hash, so a refusal costs the same in every state.
+//! verifies against a fixed decoy hash, so those states cost the same hashing work. A candidate
+//! with a bad shape, or one that finds every permit busy, is refused without hashing.
 
 use std::fmt;
 use std::sync::atomic::{AtomicUsize, Ordering};

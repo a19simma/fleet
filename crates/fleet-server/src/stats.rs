@@ -22,9 +22,8 @@ pub const MAX_GROUPS: usize = 200;
 /// Error text a box reports for a job its agent timeout ended. Matches the text `fleetd`
 /// sends, and splits `FAILED` jobs into failed and timed out.
 ///
-/// A `FAILED` job with the finish
-/// step timeout text (`fleetd` `ERR_FINISH_TIMEOUT`) counts as failed, not timed out. The two
-/// copies of this text are kept equal by hand.
+/// A `FAILED` job with the finish step timeout text (`fleetd` `ERR_FINISH_TIMEOUT`) counts
+/// as failed, not timed out. The two copies of this text are kept equal by hand.
 pub const TIMED_OUT_ERROR: &str = "agent timed out";
 
 macro_rules! scoped {

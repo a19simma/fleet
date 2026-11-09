@@ -3,7 +3,8 @@
 //! Two static tokens plus per-user API tokens, scoped by gRPC path. The box token covers
 //! `FleetIngest` and `FleetWorker`. The client scope covers `FleetQuery`, `FleetJobs`,
 //! `FleetJudge`, `FleetProfiles`, `FleetBatches`, `FleetCredentials`, `FleetRepos` and
-//! `FleetCatalog`. Any other path is denied. `FleetCatalog` passes the scope, then its handler requires an admin user.
+//! `FleetCatalog`. Any other path is denied.
+//! `FleetCatalog` passes the scope, then its handler requires an admin user.
 //! `FleetRepos` passes the scope, then its handler requires a user caller: the box token never
 //! reaches it.
 //!
