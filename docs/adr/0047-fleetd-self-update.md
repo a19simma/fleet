@@ -18,7 +18,8 @@ ADR-0017 fixes the cargo-dist assets as `fleetd-<target>.tar.gz` plus a `.sha256
 
 ### On-disk layout
 
-- `/var/lib/fleet/bin` is a new 0755 directory owned by fleetd. It is not under `/var/lib/fleetd`: the unit sets `StateDirectory=fleetd` with `StateDirectoryMode=0700` (`deploy/fleetd-systemd.service:19-20`), so the job uid `fleet-job` could not read a binary placed there.
+- `/var/lib/fleet/bin` is a new 0755 directory owned by fleetd. It is not under `/var/lib/fleetd`: the unit sets `StateDirectory=fleetd` with `StateDirectoryMode=0700` (`deploy/fleetd-systemd.service:19-20`), so the job uid `fleet-job` could not read a binary placed there. The unit lists `-/var/lib/fleet/bin` in `ReadWritePaths=`, because `ProtectSystem=strict` otherwise keeps the swap read-only.
+- fleetd writes the staged binary with mode 0700 while it extracts the archive and sets 0755 on the file and its version directory only after the write completes.
 - fleetd downloads the archive, checks the sha256 and the minisign signature against the trust root, then stages the binary at `/var/lib/fleet/bin/<ver>/fleetd`.
 - A `current` symlink points at the active version. fleetd swaps it by creating a new link and `rename(2)` over `current`, so a reader sees the old target or the new one, never a gap.
 - A `previous` symlink keeps the last good version.
@@ -32,20 +33,21 @@ ADR-0017 fixes the cargo-dist assets as `fleetd-<target>.tar.gz` plus a `.sha256
 
 ### Rollback guard
 
-- An `ExecStartPre` runs the guard from the root-owned baked binary, not from the staged one, so a broken update cannot disable its own rollback.
+- An `ExecStartPre` runs the guard as the unit user `fleetd` from the root-owned baked binary, not from the staged one, so a broken update cannot disable its own rollback.
 - A health marker is written once the new fleetd registers with the server. When the marker is missing after N starts, the guard flips `current` back to `previous`.
 - The guard only ever moves `current` to `previous`. It never picks a version by any other rule.
 
 ### Never a downgrade
 
-fleetd accepts a manifest only when its version is strictly newer than the running version, `version` is at or above the configured minimum, and `seq` is strictly greater than the highest `seq` fleetd has accepted. The accepted `seq` is stored in fleetd state. A replayed older manifest fails the `seq` check. The rollback guard is the one exception, and it restores a version that already ran as `current`.
+fleetd accepts a manifest only when its version is strictly newer than the running version, and `seq` is strictly greater than the highest `seq` fleetd has accepted. The accepted `seq` is stored in fleetd state. A replayed older manifest fails the `seq` check. The rollback guard is the one exception, and it restores a version that already ran as `current`.
 
 ### Protocol skew
 
-The server rolls first. Protocol changes are additive only, so a new server serves an old fleetd. `min_protocol` in the manifest tells fleetd the protocol the server speaks, and fleetd refuses an update whose `min_protocol` exceeds what it can serve.
+The server rolls first. Protocol changes are additive only, so a new server serves an old fleetd. `min_protocol` in the manifest is the lowest protocol version the new binary needs. fleetd refuses a manifest whose `min_protocol` exceeds the protocol version it serves.
 
 ## Consequences
 
+- A compromised fleetd owns `/var/lib/fleet/bin` and can plant an unsigned binary there. The signature check runs inside fleetd, so it does not defend against fleetd itself. Residual risk: such a binary starts on the next restart.
 - A signing key compromise is the one failure that ships a bad binary to every Box. The key custody rule limits it to the CI environment or the offline holder.
 - ADR-0017 said Boxes need GitHub only at Template build time. With self-update a Box reaches the release hosts at runtime, or the server proxies the assets. This ADR does not choose between them.
 - Disk holds up to three binaries: `current`, `previous` and a staged one.

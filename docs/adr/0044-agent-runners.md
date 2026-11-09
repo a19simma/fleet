@@ -39,7 +39,7 @@ Unverified: how Codex uses the proxy variables while its sandbox network is off,
 - Adding a runner means one trait implementation and its kind list.
 - A Job whose owner holds no credential of an accepted kind fails with a fixed error before the agent starts.
 - Stuck detection and cost figures for Codex and Kimi stay absent until their parsers land.
-- The model API hosts of a new runner must be in the Box `egress_allow` (ADR-0038).
+- Inferred, not part of the design: the model API hosts of a new runner must be in the Box `egress_allow` (ADR-0038), except `api.anthropic.com`.
 - The runner calls `set_job_hosts(job_id, runner.model_hosts())` on the egress proxy just before the agent starts, and the job end hook forgets it on every exit path. A job gets its own runner's hosts and nothing else, so the Anthropic host is not reachable from a codex or kimi job. The narrowed hosts are the runner's declared hosts that the proxy's `in_ceiling` admits. `in_ceiling` admits a host that the Box `egress_allow` lists and also `api.anthropic.com` (`MODEL_API_HOST`), which needs no listing.
 
 ## Considered and rejected
