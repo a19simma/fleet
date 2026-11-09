@@ -470,7 +470,7 @@ async fn an_unknown_notice_renders_nothing(pool: PgPool) {
     let alice = h.session("alice", 'a').await;
     let page = h.page(&alice, "?notice=%3Cscript%3E").await;
     assert_eq!(page.status, 200);
-    assert!(!page.body.contains("script>"));
+    assert!(!page.body.contains("<script>"));
     h.finish().await;
 }
 

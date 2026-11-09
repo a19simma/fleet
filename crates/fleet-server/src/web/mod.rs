@@ -25,7 +25,9 @@ mod tokens;
 pub use clientip::{MAX_FORWARDED_BYTES, MAX_TRUSTED_HOPS, UNKNOWN, client_ip};
 pub use dispatch::{Dispatch, GRPC_PREFIX, harden};
 pub use jobs::MAX_RENDER_BYTES;
-pub use pages::{HOME_MARKER, MAX_BODY_BYTES, PASSKEY_JS, SCRIPT_PATH, STYLE_CSS, STYLE_PATH, Web};
+pub use pages::{
+    HOME_MARKER, MAX_BODY_BYTES, NAV_FOCUS_JS, PASSKEY_JS, SCRIPT_PATH, STYLE_CSS, STYLE_PATH, Web,
+};
 pub use panic::CatchPanic;
 pub use passkeys::{
     AuthError, NewSession, SESSION_COOKIE, SESSION_IDLE_SECS, SESSION_TTL_SECS, SessionInfo,

@@ -10,7 +10,7 @@ use topcoat::{
     view::{Child, View, component, view},
 };
 
-use super::pages::{STYLE_PATH, auth, current, fail};
+use super::pages::{NAV_SCRIPT_PATH, STYLE_PATH, auth, current, fail};
 
 /// The sidebar entry a page marks as current.
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -63,11 +63,12 @@ pub(super) async fn shell(
                 <meta name="viewport" content="width=device-width, initial-scale=1">
                 <title>(title)</title>
                 <link rel="stylesheet" href=(STYLE_PATH)>
+                <script src=(NAV_SCRIPT_PATH) defer=""></script>
             </head>
             <body class="bg-base-100 text-base-content">
                 <a class="sr-only focus:not-sr-only focus:absolute focus:z-10 focus:bg-base-300 focus:p-2" href="#app">"Skip to content"</a>
                 <div class="flex min-h-screen flex-col lg:flex-row">
-                    <nav class="hidden lg:flex lg:w-48 shrink-0 flex-col border-r border-base-300 bg-base-200" aria-label="Main">
+                    <nav class="hidden lg:flex lg:sticky lg:top-0 lg:h-screen lg:overflow-y-auto lg:w-48 shrink-0 flex-col border-r border-base-300 bg-base-200" aria-label="Main">
                         <ul class="menu menu-sm w-full">
                             <li class="menu-title">"fleet"</li>
                             for item in NAV_ITEMS {
@@ -90,12 +91,12 @@ pub(super) async fn shell(
                             </form>
                         </div>
                     </nav>
-                    <nav class="flex lg:hidden overflow-x-auto gap-3 border-b border-base-300 bg-base-200 p-2 text-xs" aria-label="Main mobile">
+                    <nav class="nav-fade flex lg:hidden overflow-x-auto scroll-px-8 gap-1 border-b border-base-300 bg-base-200 p-2 text-xs" aria-label="Main mobile">
                         <form class="shrink-0" method="post" action="/logout">
                             <input type="hidden" name="csrf" value=(csrf)>
                             <button class="btn btn-outline btn-xs" type="submit">"Sign out"</button>
                         </form>
-                        <ul class="menu menu-sm menu-horizontal flex-nowrap items-center">
+                        <ul class="menu menu-sm menu-horizontal flex-nowrap items-center p-0 pe-8">
                             <li class="menu-title">"fleet"</li>
                             for item in NAV_ITEMS {
                                 if admin || item.0 != Nav::Catalog {
