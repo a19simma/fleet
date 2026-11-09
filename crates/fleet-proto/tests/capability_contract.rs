@@ -11,7 +11,7 @@ use prost::Message;
 
 const MIGRATION: &str = include_str!("../../fleet-server/migrations/0026_user_capabilities.sql");
 const LATEST_CHECK: &str =
-    include_str!("../../fleet-server/migrations/0034_capability_forge_github_app.sql");
+    include_str!("../../fleet-server/migrations/0039_capability_env_scripts.sql");
 const PROTO: &str = include_str!("../proto/fleet/v1/fleet.proto");
 
 fn block<'a>(open: &str) -> &'a str {

@@ -53,3 +53,9 @@ ADR-0048 gates Profile `tools` with one server switch, `FLEET_ALLOW_PROFILE_TOOL
 ## Amendment (ADR-0058)
 
 ADR-0058 (proposed, partly built) adds the capability `forge:github_app`. Built: the name, the migration 0034 CHECK that allows it, the admin page that grants and revokes it, and the credential store gate at put and live at release. `PutCredential` and the web form save the kind for a user who holds the capability, and `VerifyCredential` checks it again. Holders can mint write tokens for any repository in the installation, clamped to the Job repository.
+
+## Amendment (ADR-0067)
+
+ADR-0067 adds the capability `env:scripts`: save, pin or run an Environment version that holds a script. The server checks it live under `FOR SHARE` at save, submit and release, and a CHECK migration widens the `user_capabilities` list.
+
+See ADR-0067.

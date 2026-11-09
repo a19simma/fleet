@@ -1,7 +1,7 @@
 # Fleet
 
 Fleet runs coding-agent Jobs on Boxes and records what each Job did. This file defines the terms of these ADRs:
-telemetry and metrics (0029, 0030); profiles (0034, 0035, 0052, 0053, 0057); capabilities and the model allowlist (0054); job timing (0055); the job socket, broker and registration (0036, 0037, 0039); fetch policy (0038); credentials and users (0040, 0042, 0043); the GitHub App lane (0058); agent runners and forges (0044, 0045); the mirror key (0046); the update trust root (0047, 0050); the release feed (0060, 0061); the transcript view (0062); the work tracker (0064, 0065, 0066).
+telemetry and metrics (0029, 0030); profiles (0034, 0035, 0052, 0053, 0057); capabilities and the model allowlist (0054); job timing (0055); the job socket, broker and registration (0036, 0037, 0039); fetch policy (0038); credentials and users (0040, 0042, 0043); the GitHub App lane (0058); agent runners and forges (0044, 0045); the mirror key (0046); the update trust root (0047, 0050); the release feed (0060, 0061); the transcript view (0062); the work tracker (0064, 0065, 0066); job environments (0067).
 
 ## Language
 
@@ -130,7 +130,7 @@ _Avoid_: token, secret, key
 
 **Credential kind**:
 Which service a **Credential** is for: `anthropic_api_key`, `claude_subscription_token`, `github_pat`, `github_app`, `kimi_membership_key`, `kimi_platform_key` or `codex_api_key` (ADR-0043, ADR-0058).
-_Avoid_: credential type, provider
+_Avoid_: credential type, service name
 
 **Credential shape**:
 How a **Credential** behaves over time: `static_secret` (accepted in v1) or `refreshing_file` (reserved, rejected in v1) (ADR-0043).
@@ -190,7 +190,7 @@ _Avoid_: git server, remote
 
 **Forge kind**:
 The family of a **Repo host**: `github` is built, `forgejo` is accepted in config, `gitlab` is planned. The config `Forge` enum and the core `ForgeKind` enum are separate types. It selects the **Repo verifier**. It is set per host in operator config, never by the User (ADR-0059).
-_Avoid_: forge type, provider
+_Avoid_: forge type, vendor
 
 **Repo key**:
 The `(user, host, path)` triple that names a **Registered repository**. It differs from the Mirror key, which is the (user, repo) pair (ADR-0059).
@@ -297,8 +297,8 @@ Part of the **Timing summary**: agent window time covered by no **Span** (ADR-00
 _Avoid_: wait time
 
 **Overhead**:
-Part of the **Timing summary**: wall time outside the agent window, spent on clone, setup, push, pull request and teardown (ADR-0055).
-_Avoid_: setup time
+Part of the **Timing summary**: wall time outside the agent window, spent on clone, Environment setup, push, pull request and teardown (ADR-0055).
+_Avoid_: setup time as a separate part
 
 **Background command**:
 A shell command with no completion event. fleetd measures it as a `BgShell` **Span**. `BgWatcher` polls `pueue status --json` for tasks created after the Job started, and a pueue task still open at Job exit ends with `ended_by=job_exit` (ADR-0055).
@@ -388,6 +388,38 @@ _Avoid_: gotcha, known issue
 A stored proposal to change a **Slice**, a **Pitfall** or a repository file, applied only after an interactive **User** accepts it. It goes stale when its base hash changes (ADR-0066).
 _Avoid_: patch, auto-fix
 
+**Environment**:
+A named bundle of **Environment secrets** and **Environment scripts** that one **User** owns and attaches to a Job. It is private to its owner, has a version stream and never rides in a **Profile** (ADR-0067).
+_Avoid_: env vars, secrets bundle
+
+**Environment version**:
+One immutable, hashed structure of an **Environment**: its entry specs and declared egress hosts, no secret value. A Job pins `(environment id, version)` (ADR-0067).
+_Avoid_: snapshot, revision
+
+**Environment secret**:
+A named secret value of an **Environment**, sealed with the **Sealer** of ADR-0040. Its spec is part of the **Environment version** and its value is mutable outside the hash. It is not a **Credential** (ADR-0067).
+_Avoid_: job secret, stored token
+
+**Environment script**:
+A named script body of an **Environment** with `on_fail` and `timeout_s`, run by the **Setup unit** in order before the agent starts. It needs the capability `env:scripts` (ADR-0067).
+_Avoid_: init script, bootstrap
+
+**Setup unit**:
+The systemd unit `fleet-env@<job id>.service` that runs the **Environment scripts** of a Job before its agent, in a sandbox with no network except the Egress proxy (ADR-0067, Proposed, not built).
+_Avoid_: init unit, preflight
+
+**Provider**:
+A reserved term for a named, operator-enabled network or identity helper that a **Setup unit** may use. v1 has none, and ADR-0067 reserves ADR number 0068 and reply field numbers 7 to 9 for it.
+_Avoid_: plugin, extension
+
+**Agent-visible**:
+The per-entry flag `agent_visible` of an **Environment secret**. It defaults to false. A secret that is not agent-visible reaches only the **Setup unit** (ADR-0067).
+_Avoid_: exposed, public
+
+**Delivery file**:
+The default way an agent-visible **Environment secret** reaches the agent: one file under `/run/fleet/<job id>/envd/`, directory 0700 and file 0400, removed when the Job ends (ADR-0067).
+_Avoid_: secret file, mounted secret
+
 ## Relationships
 
 - A **Job** has many **Job Events** and at most one **Job Summary**.
@@ -395,6 +427,8 @@ _Avoid_: patch, auto-fix
 - An **Incomplete** **Job Summary** lists what it never observed in `missing`.
 - A **Work project** has many **Work items** and **Slices**. A **Work item** has many **Attempts**; a claim takes one **Slice lease** per **Slice** of the item.
 - A **Retro** has many **Improvements**. An accepted **Improvement** can create a **Pitfall**. A **Suggested edit** changes a **Slice** or a **Pitfall** only after a **User** accepts it.
+- An **Environment** has many **Environment versions**. A Job pins one version. An **Environment version** lists **Environment secrets** and **Environment scripts**. An **Environment secret** value is read at release and is never part of the version hash.
+- A **Setup unit** runs the **Environment scripts** of the pinned version and ends before the agent starts. Its time is part of **Overhead**.
 
 ## Flagged ambiguities
 

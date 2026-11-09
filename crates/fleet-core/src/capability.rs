@@ -13,6 +13,8 @@ pub enum Capability {
     ProfileTools,
     /// Store a `github_app` Credential and have its installation token minted for a Job (ADR-0058). Holders can mint write tokens for every repository the installation covers.
     ForgeGithubApp,
+    /// Save, pin or run an Environment version that holds a script.
+    EnvScripts,
 }
 
 /// A string is not the canonical text of any capability.
@@ -31,13 +33,14 @@ impl std::error::Error for CapabilityError {}
 
 impl Capability {
     /// Every capability. Adding a variant means adding it here and in [`Capability::as_str`].
-    pub const ALL: &'static [Self] = &[Self::ProfileTools, Self::ForgeGithubApp];
+    pub const ALL: &'static [Self] = &[Self::ProfileTools, Self::ForgeGithubApp, Self::EnvScripts];
 
     /// The canonical text.
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::ProfileTools => "profile:tools",
             Self::ForgeGithubApp => "forge:github_app",
+            Self::EnvScripts => "env:scripts",
         }
     }
 
@@ -110,6 +113,25 @@ mod tests {
             "forge:github-app",
             "forge:github_pat",
             "forge:",
+        ] {
+            assert_eq!(Capability::parse(raw), Err(CapabilityError), "{raw:?}");
+        }
+    }
+
+    #[test]
+    fn canonical_text_is_env_scripts() {
+        assert_eq!(Capability::EnvScripts.as_str(), "env:scripts");
+        assert_eq!(Capability::EnvScripts.to_string(), "env:scripts");
+        assert_eq!(Capability::parse("env:scripts"), Ok(Capability::EnvScripts));
+        assert!(Capability::ALL.contains(&Capability::EnvScripts));
+        for raw in [
+            "ENV:SCRIPTS",
+            "env:scripts ",
+            " env:scripts",
+            "env:scripts\n",
+            "env:script",
+            "env:scriptss",
+            "env:",
         ] {
             assert_eq!(Capability::parse(raw), Err(CapabilityError), "{raw:?}");
         }

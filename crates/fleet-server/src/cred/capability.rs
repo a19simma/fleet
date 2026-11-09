@@ -19,6 +19,8 @@ pub const PROFILE_TOOLS: &str = "profile:tools";
 pub use fleet_proto::ERR_CAPABILITY_NOT_GRANTED;
 /// The capability that gates the `github_app` credential kind (ADR-0058).
 pub const FORGE_GITHUB_APP: &str = "forge:github_app";
+/// The capability that lets a user attach setup scripts to an Environment (ADR-0067).
+pub const ENV_SCRIPTS: &str = "env:scripts";
 /// Refusal text for a capability name outside the closed set.
 pub const REASON_UNKNOWN_CAPABILITY: &str = "unknown capability";
 /// Refusal text for a call whose target user does not exist.
@@ -29,7 +31,7 @@ pub const REASON_NO_SUCH_ACTOR: &str = "no such acting user";
 pub const REASON_ADMIN_REQUIRED: &str = ADMIN_REQUIRED;
 const REASON_DB: &str = "capability store database error";
 
-const KNOWN: [&str; 2] = [PROFILE_TOOLS, FORGE_GITHUB_APP];
+const KNOWN: [&str; 3] = [PROFILE_TOOLS, FORGE_GITHUB_APP, ENV_SCRIPTS];
 
 const LOCK_USER: &str = "SELECT id FROM users WHERE id = $1 FOR SHARE";
 const LOCK_ACTOR: &str = "SELECT is_admin FROM users WHERE id = $1 FOR SHARE";

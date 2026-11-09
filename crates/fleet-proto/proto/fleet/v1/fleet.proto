@@ -97,6 +97,18 @@ service FleetWork {
   rpc ListWorkDefers(ListWorkDefersRequest) returns (ListWorkDefersReply);
 }
 
+service FleetRetro {
+  rpc OpenRetro(OpenRetroRequest) returns (Retro);
+  rpc CloseRetro(CloseRetroRequest) returns (Retro);
+  rpc ListRetros(ListRetrosRequest) returns (ListRetrosReply);
+  rpc FileImprovement(FileImprovementRequest) returns (Improvement);
+  rpc ListImprovements(ListImprovementsRequest) returns (ListImprovementsReply);
+  rpc DispositionImprovement(DispositionImprovementRequest) returns (Improvement);
+  rpc RecordPitfall(RecordPitfallRequest) returns (Pitfall);
+  rpc ListPitfalls(ListPitfallsRequest) returns (ListPitfallsReply);
+  rpc GetWorkBrief(GetWorkBriefRequest) returns (GetWorkBriefReply);
+}
+
 service FleetWorker {
   rpc ClaimJob(ClaimJobRequest) returns (ClaimJobReply);
   rpc ReportJob(ReportJobRequest) returns (ReportJobReply);
@@ -1226,4 +1238,147 @@ message ListWorkDefersRequest {
 
 message ListWorkDefersReply {
   repeated WorkDefer defers = 1;
+}
+
+enum RetroState {
+  RETRO_STATE_UNSPECIFIED = 0;
+  RETRO_STATE_OPEN = 1;
+  RETRO_STATE_CLOSED = 2;
+}
+
+enum ImprovementKind {
+  IMPROVEMENT_KIND_UNSPECIFIED = 0;
+  IMPROVEMENT_KIND_PROCESS = 1;
+  IMPROVEMENT_KIND_TOOLING = 2;
+  IMPROVEMENT_KIND_DOCS = 3;
+  IMPROVEMENT_KIND_TEST = 4;
+  IMPROVEMENT_KIND_PITFALL = 5;
+  IMPROVEMENT_KIND_OTHER = 6;
+}
+
+enum ImprovementDisposition {
+  IMPROVEMENT_DISPOSITION_UNSPECIFIED = 0;
+  IMPROVEMENT_DISPOSITION_ACCEPTED = 1;
+  IMPROVEMENT_DISPOSITION_REJECTED = 2;
+  IMPROVEMENT_DISPOSITION_DEFERRED = 3;
+  IMPROVEMENT_DISPOSITION_APPLIED = 4;
+}
+
+message Retro {
+  uint64 id = 1;
+  string title = 2;
+  RetroState state = 3;
+  optional string span_from_item_key = 4;
+  optional string span_to_item_key = 5;
+  uint64 opened_at_ms = 6;
+  optional uint64 closed_at_ms = 7;
+}
+
+message OpenRetroRequest {
+  string key = 1;
+  string project = 2;
+  string title = 3;
+  optional string span_from_item_key = 4;
+  optional string span_to_item_key = 5;
+}
+
+// Refused while any Improvement of the Retro has no disposition.
+message CloseRetroRequest {
+  string key = 1;
+  string project = 2;
+  uint64 retro_id = 3;
+}
+
+message ListRetrosRequest {
+  string project = 1;
+  optional RetroState state = 2;
+}
+
+message ListRetrosReply {
+  repeated Retro retros = 1;
+}
+
+message Improvement {
+  uint64 id = 1;
+  optional uint64 retro_id = 2;
+  optional string item_key = 3;
+  string vertical = 4;
+  string title = 5;
+  string body = 6;
+  ImprovementKind kind = 7;
+  uint32 occurrences = 8;
+  optional ImprovementDisposition disposition = 9;
+  optional string disposition_reason = 10;
+  uint64 created_at_ms = 11;
+}
+
+// Filing an existing title adds an occurrence and raises the count.
+message FileImprovementRequest {
+  string key = 1;
+  string project = 2;
+  optional uint64 retro_id = 3;
+  optional string item_key = 4;
+  optional uint64 attempt_id = 5;
+  string vertical = 6;
+  string title = 7;
+  string body = 8;
+  ImprovementKind kind = 9;
+}
+
+message ListImprovementsRequest {
+  string project = 1;
+  optional string vertical = 2;
+  optional uint64 retro_id = 3;
+  optional bool undecided = 4;
+}
+
+message ListImprovementsReply {
+  repeated Improvement improvements = 1;
+}
+
+message DispositionImprovementRequest {
+  string key = 1;
+  string project = 2;
+  uint64 improvement_id = 3;
+  ImprovementDisposition disposition = 4;
+  string reason = 5;
+}
+
+message Pitfall {
+  uint64 id = 1;
+  optional string project = 2;
+  string symptom = 3;
+  string cause = 4;
+  string fix = 5;
+  uint32 hits = 6;
+  optional uint64 last_hit_at_ms = 7;
+  uint64 created_at_ms = 8;
+}
+
+// Without `project` the Pitfall is user-level.
+message RecordPitfallRequest {
+  string key = 1;
+  optional string project = 2;
+  string symptom = 3;
+  string cause = 4;
+  string fix = 5;
+}
+
+message ListPitfallsRequest {
+  optional string project = 1;
+}
+
+message ListPitfallsReply {
+  repeated Pitfall pitfalls = 1;
+}
+
+message GetWorkBriefRequest {
+  string project = 1;
+  string item_key = 2;
+}
+
+// `dropped` counts the lowest-ranked entries cut to fit the token budget.
+message GetWorkBriefReply {
+  string text = 1;
+  uint32 dropped = 2;
 }
