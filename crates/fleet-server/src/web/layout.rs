@@ -20,16 +20,18 @@ pub(super) enum Nav {
     Tokens,
     Credentials,
     Repos,
+    Work,
     Catalog,
     Account,
 }
 
-const NAV_ITEMS: [(Nav, &str, &str); 7] = [
+const NAV_ITEMS: [(Nav, &str, &str); 8] = [
     (Nav::Jobs, "/jobs", "Jobs"),
     (Nav::Profiles, "/profiles", "Profiles"),
     (Nav::Tokens, "/tokens", "Tokens"),
     (Nav::Credentials, "/credentials", "Credentials"),
     (Nav::Repos, "/repos", "Repositories"),
+    (Nav::Work, "/work", "Work"),
     (Nav::Catalog, "/catalog", "Catalog"),
     (Nav::Account, "/account", "Account"),
 ];
