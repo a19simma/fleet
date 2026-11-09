@@ -447,7 +447,8 @@ pub fn is_ci_log(text: &str) -> bool {
 /// It must be `https` with a non-empty authority and no userinfo or backslash, hold only ASCII
 /// graphic characters and be at most [`MAX_CI_URL_BYTES`] bytes. The host is not parsed, so an
 /// authority with no host such as `https://:443/` passes. fleetd and the server both call it,
-/// so a link one side keeps the other accepts.
+/// so a link one side keeps the other accepts. Any `https` host passes, so a consumer renders
+/// the link as text or with `rel=noopener`.
 #[must_use]
 pub fn is_ci_url(url: &str) -> bool {
     let Some(rest) = url.strip_prefix("https://") else {

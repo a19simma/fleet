@@ -1,6 +1,6 @@
 # Agent isolation
 
-Status: Accepted 2026-10-26. P1 is built behind `agent_launcher = "systemd"` and cut over live on the first Box; P2 is built: the unit sets `PrivateNetwork=yes` and the runner registers the connect and egress proxies under the systemd launcher. `PrivatePIDs` is not set. P3 clone and publish are built, the rest of P3 is not. Supersedes the Known limit paragraph of ADR-0024. Amends the credential and mirror-hardening sections of ADR-0024.
+Status: Accepted 2026-10-26. P1 is built behind `agent_launcher = "systemd"` and cut over live on the first Box; P2 is built: the unit sets `PrivateNetwork=yes` and the runner registers the connect and egress proxies under the systemd launcher. The per-job socket mount isolation is unverified on a box (ADR-0036). `PrivatePIDs` is not set. P3 clone and publish are built, the rest of P3 is not. Supersedes the Known limit paragraph of ADR-0024. Amends the credential and mirror-hardening sections of ADR-0024.
 
 Supersedes: the "Known limit" paragraph of ADR-0024.
 Amends: the "Credential", "Who sees it", "Mirror hardening" and "Fetch credential" sections of ADR-0024, and the unit and hook sections of ADR-0011.

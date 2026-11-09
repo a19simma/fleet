@@ -92,11 +92,11 @@ Adds `EventKind::Fetch` and migration `0016`, described above. The event kinds a
 
 ## Amendment (ADR-0031)
 
-The P2 CONNECT proxy serves the model API only. The allowlist `egress_allow` is Box config. No Profile or bundle can add hosts. This replaces the "per-bundle additions" wording in P2.
+Replaces the "per-bundle additions" wording in P2. See "Egress policy is Box-level only" above.
 
 ## Amendment (ADR-0034)
 
-The Floor bullet "WebFetch: fetches go through the egress proxy (ADR-0031), not the tool" is replaced: fetch goes through `fleetd fetch` on the per-job socket (ADR-0036). The Floor gains `FLOOR_ALLOW` as described above, so the Overlay rule that a Profile `allow` replaces the default allow list does not remove the fetch and broker rules.
+Replaces the Floor bullet "WebFetch: fetches go through the egress proxy (ADR-0031), not the tool": fetch goes through `fleetd fetch` on the per-job socket (ADR-0036). See "Floor allow-set" above for `FLOOR_ALLOW`.
 
 ## Amendment (ADR-0044)
 

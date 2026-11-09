@@ -162,7 +162,8 @@ pub struct Config {
     /// fails the load. When the key is unset, the first `gh` in `/usr/local/bin`, `/usr/bin`,
     /// `/opt/homebrew/bin` and `/bin` is used, else `/usr/bin/gh`. No job looks `gh` up in `PATH`.
     pub gh_bin: PathBuf,
-    /// True when the box is disposable, which lets jobs run with permission checks off.
+    /// True when the box is disposable. Only then a Job without a Profile runs with permission
+    /// checks off, and only then a Kimi job runs.
     pub disposable: bool,
     /// Operator attestation that fleetd runs in the host network namespace. Default `false`.
     ///

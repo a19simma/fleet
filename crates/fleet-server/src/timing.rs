@@ -178,8 +178,9 @@ fn kind_name(record: &TimingSpanRecord) -> Result<&'static str, Status> {
 
 /// Stores the timing a box reports for one job, replacing any earlier report.
 ///
-/// The `box` field of the request is ignored: `box_name` is the validated reporter. The
-/// report is accepted only while the job is `RUNNING` at the reported attempt with an
+/// The caller derives `box_name` from the authenticated request; this function does not read
+/// `request.box`.
+/// The report is accepted only while the job is `RUNNING` at the reported attempt with an
 /// unexpired lease held by `box_name`. That row is locked `FOR UPDATE` for the
 /// whole transaction, so two reports for one job run one after the other and the later one
 /// replaces the summary, every span and every shell command of the earlier one. The wire

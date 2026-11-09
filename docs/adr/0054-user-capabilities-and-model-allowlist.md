@@ -37,6 +37,7 @@ ADR-0048 gates Profile `tools` with one server switch, `FLEET_ALLOW_PROFILE_TOOL
 - The admin RPC and the admin UI gain grant and revoke for the capability. `fleet-server admin` gains `grant-admin` and `revoke-admin` instead (ADR-0056).
 - A fleetd with an allowlist and a server without one still enforces on the Box. A server with one and a fleetd without one enforces at submit only.
 - Model ids that vendors rename need an allowlist edit in both configs.
+- `user_capabilities.granted_by` references `users (id)` with no `ON DELETE` action, so deleting a granter fails while a grant names them. No user-deletion path exists. One added later must reassign or remove those grants first.
 
 ## Considered and rejected
 

@@ -72,6 +72,11 @@ const COMMAND_PREVIEW_BYTES: usize = 160;
 const FRAME_QUEUE: usize = 8;
 const CARRY_MAX: usize = 3;
 
+/// The embedded log script.
+///
+/// It closes the `EventSource` on `error`, `end` and `fail` and never reconnects: the browser
+/// would resend the request without a resume position and the replay would duplicate the pane
+/// text. The state line shows `disconnected` and the viewer reopens the log by hand.
 const LOG_JS: &str = r#"(function () {
   var pane = document.getElementById("task-log");
   var title = document.getElementById("task-log-title");

@@ -1,6 +1,7 @@
 # Fleet
 
-Fleet runs coding-agent Jobs on Boxes and records what each Job did. This file defines the terms of the ADRs on telemetry and metrics (0029, 0030), profiles (0034, 0035, 0052, 0053, 0057), capabilities and the model allowlist (0054), job timing (0055), the job socket, broker and registration (0036, 0037, 0039), fetch policy (0038), credentials and users (0040, 0042, 0043), the GitHub App lane (0058), agent runners and forges (0044, 0045), the mirror key (0046), the update trust root (0047, 0050), the release feed (0060, 0061), the transcript view (0062), and the work tracker (0064, 0065, 0066).
+Fleet runs coding-agent Jobs on Boxes and records what each Job did. This file defines the terms of these ADRs:
+telemetry and metrics (0029, 0030); profiles (0034, 0035, 0052, 0053, 0057); capabilities and the model allowlist (0054); job timing (0055); the job socket, broker and registration (0036, 0037, 0039); fetch policy (0038); credentials and users (0040, 0042, 0043); the GitHub App lane (0058); agent runners and forges (0044, 0045); the mirror key (0046); the update trust root (0047, 0050); the release feed (0060, 0061); the transcript view (0062); the work tracker (0064, 0065, 0066).
 
 ## Language
 

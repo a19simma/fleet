@@ -20,11 +20,12 @@ Migration 0023 added the `profile.id` surrogate key with `UNIQUE (owner_user_id,
 - `jobs.profile_name` stays as a display copy and is not a key.
 - The migration backfills `profile_version` and `jobs.profile_id` from the system-owned profile row of each name. It raises an exception when a name has no system-owned row, when the new row count differs from the old one, or when a pinned job is left without `profile_id`.
 - The per-profile advisory lock key is `profile_id`.
+- Migration notes: every pre-existing `profile_version` row and pinned job moves to a shared profile named after it and owned by the `system` user, so history that earlier releases kept per name belongs to that shared profile, whose owner is the `system` user. `system_user_id()` finds the `system` user by case-insensitive username, so a human who registered as `System` before migration 0023 owns those profiles. Registration does not reserve the name; check the `users` table before upgrading a deployment.
 
 ### Blobs
 
 - A blob stays keyed by hash and is shared by content across owners.
-- A create reply must not reveal whether a blob or a hash exists for another owner. A create that matches an existing blob returns the same reply shape and timing class as one that stores a new blob.
+- A create reply must not reveal whether a blob or a hash exists for another owner. Requirement: a create of a blob that already exists returns the same status and the same body fields as a create of a new blob. Test: create the same content twice from two owners and compare the two replies field by field. Timing parity is a goal that no test measures.
 
 ## Amends
 

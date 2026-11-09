@@ -31,7 +31,7 @@ Nothing in this section is built until a live spike on the box passes. The spike
 
 ### Build-chain egress
 
-Build chains use exact hosts only. `config.rs` rejects wildcard TLDs, and no Profile can add hosts (ADR-0038). The candidate hosts below are unverified until the observe-mode task (BOX-3, the `egress_observe` key) captures real traffic:
+Build chains use exact hosts only. `config.rs` rejects a wildcard over a bare TLD such as `*.org` and accepts `*.example.org`, and no Profile can add hosts (ADR-0038). The candidate hosts below are unverified until the observe-mode task (BOX-3, the `egress_observe` key) captures real traffic:
 
 | Chain | Candidate hosts |
 | --- | --- |
