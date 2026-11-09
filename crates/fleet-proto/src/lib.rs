@@ -412,57 +412,34 @@ pub const MAX_PHASE_MS: u64 = 7 * 24 * 60 * 60 * 1000;
 /// `NULL` in the database (ADR-0030).
 pub const UNKNOWN_STAMP: &str = "unknown";
 
-/// True when `text` is non-empty and holds no control or format character.
+/// True when `text` is non-empty and holds no hostile character.
 ///
-/// Format characters are the bidirectional override, embedding and isolate controls, the
-/// zero-width space, the word joiner and invisible operators, the soft hyphen, the byte order mark, the tag
-/// characters and the line and paragraph separators. They can reorder or hide text on a
-/// terminal.
-///
-/// The zero-width joiner and non-joiner (U+200D, U+200C) and the left-to-right and
-/// right-to-left marks (U+200E, U+200F) are allowed. Emoji sequences and Persian, Hindi and
-/// Hebrew text need them, and the marks only set the direction of neutral characters, so they
-/// cannot override or embed a run the way the rejected controls do.
+/// Hostile is [`fleet_core::text::is_hostile_allowing_joiners`]: control characters, every
+/// Unicode format character, the line and paragraph separators and the tag block, minus the
+/// zero-width non-joiner and joiner (U+200C, U+200D) and the left-to-right and right-to-left
+/// marks (U+200E, U+200F). Emoji sequences and Persian, Hindi and Hebrew text need those four,
+/// and the marks only set the direction of neutral characters, so they cannot override or
+/// embed a run the way the rejected controls do.
 ///
 /// Agent and tool output is untrusted, so a value that reaches storage or a terminal must
 /// pass this, on the sending side and again on the receiving side.
 #[must_use]
 pub fn is_plain_text(text: &str) -> bool {
-    !text.is_empty() && !text.chars().any(|c| c.is_control() || is_format(c))
-}
-
-fn is_format(c: char) -> bool {
-    matches!(
-        c,
-        '\u{ad}'
-            | '\u{600}'..='\u{605}'
-            | '\u{61c}'
-            | '\u{6dd}'
-            | '\u{70f}'
-            | '\u{8e2}'
-            | '\u{180e}'
-            | '\u{200b}'
-            | '\u{2028}'..='\u{202e}'
-            | '\u{2060}'..='\u{2064}'
-            | '\u{2066}'..='\u{206f}'
-            | '\u{feff}'
-            | '\u{110bd}'
-            | '\u{1d173}'..='\u{1d17a}'
-            | '\u{fff9}'..='\u{fffb}'
-            | '\u{e0001}'
-            | '\u{e0020}'..='\u{e007f}'
-    )
+    !text.is_empty()
+        && !text
+            .chars()
+            .any(fleet_core::text::is_hostile_allowing_joiners)
 }
 
 /// True when `text` is a CI failure log the server may store: within [`MAX_CI_LOG_BYTES`],
-/// non-empty and holding no control or format character except newline and tab.
+/// non-empty and holding no hostile character except newline and tab.
 #[must_use]
 pub fn is_ci_log(text: &str) -> bool {
     !text.is_empty()
         && text.len() <= MAX_CI_LOG_BYTES
         && text
             .chars()
-            .all(|c| matches!(c, '\n' | '\t') || is_plain_text(c.encode_utf8(&mut [0; 4])))
+            .all(|c| matches!(c, '\n' | '\t') || !fleet_core::text::is_hostile_allowing_joiners(c))
 }
 
 /// True when `url` is a CI check link the server may store.
