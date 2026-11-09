@@ -332,8 +332,8 @@ impl WebAuth {
     }
 
     /// Starts the first-admin registration with the bootstrap password. Wrong, revoked and
-    /// rate-limited attempts all answer [`AuthError::Refused`], and a refused attempt costs
-    /// the same hashing work as a wrong one.
+    /// rate-limited attempts all answer [`AuthError::Refused`]. A wrong password costs a full
+    /// hash; a rate-limited, malformed or busy refusal skips hashing.
     ///
     /// # Errors
     ///

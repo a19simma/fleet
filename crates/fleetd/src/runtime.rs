@@ -98,6 +98,10 @@ pub fn bind_hook_socket(path: &Path, gid: Option<u32>) -> Result<UnixListener, E
     bind_with(path, 0o660, gid)
 }
 
+/// Binds a Unix socket at `path`, then sets its group and mode.
+///
+/// When the chown or chmod fails after the bind, the socket file stays behind. The next start
+/// treats it as a stale socket and replaces it.
 fn bind_with(path: &Path, mode: u32, gid: Option<u32>) -> Result<UnixListener, Error> {
     let io = |source| Error::Io {
         path: path.to_owned(),

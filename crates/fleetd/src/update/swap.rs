@@ -318,7 +318,8 @@ impl Swapper {
         self.activate(version)
     }
 
-    /// Moves `previous` to the old `current` target, then `current` to `version`.
+    /// Moves `previous` to the old `current` target, then `current` to `version`. When the old
+    /// target holds no regular binary, `previous` is left as it was and keeps its older value.
     ///
     /// # Errors
     ///

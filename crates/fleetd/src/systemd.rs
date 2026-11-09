@@ -642,6 +642,10 @@ impl SystemdLauncher {
     }
 }
 
+/// Binds the job socket for `id` under `run_dir`, then sets its group to `gid` when one is given.
+///
+/// The group change follows the bind, so the socket briefly keeps the fleetd group. The run dir
+/// is mode-restricted, so no job uid can reach it in that window.
 fn bind_socket(
     setup: Option<&JobSocketSetup>,
     run_dir: &Path,

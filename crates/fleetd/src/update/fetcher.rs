@@ -123,6 +123,8 @@ impl Drop for ChunkReader {
     }
 }
 
+/// Moves chunks from `stream` into `tx`. A full queue blocks it with no timeout of its own, and
+/// dropping the reader aborts it.
 async fn pump(mut stream: FetchStream, tx: mpsc::Sender<Chunk>) {
     loop {
         match stream.next_chunk().await {
@@ -141,6 +143,8 @@ async fn pump(mut stream: FetchStream, tx: mpsc::Sender<Chunk>) {
 }
 
 impl<R: Resolver + 'static, D: Dialer + 'static> ArchiveFetcher for PolicyArchiveFetcher<R, D> {
+    /// The returned `final_url` is `https://<host>/` of the connected host. The path and query
+    /// of the request are not kept.
     fn get(&self, url: &str) -> io::Result<ArchiveResponse> {
         let stream = self
             .handle

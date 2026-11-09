@@ -32,8 +32,9 @@ pub const MAX_COMMAND_BYTES: usize = 16 * 1024;
 pub const MAX_DURATION_MS: u64 = 366 * 24 * 60 * 60 * 1000;
 /// Deepest JSON nesting accepted.
 pub const MAX_DEPTH: usize = 16;
-/// Longest string of any kind in bytes, checked while parsing.
+/// [`MAX_DURATION_MS`] as a float, the bound for a fractional `duration_ms`.
 const MAX_DURATION_F64: f64 = 31_622_400_000.0;
+/// Longest string of any kind in bytes, checked while parsing.
 const MAX_STRING_BYTES: usize = 64 * 1024;
 /// Most keys in one object.
 const MAX_OBJECT_KEYS: usize = 256;
@@ -514,7 +515,9 @@ fn read_record(rec: &Obj, out: &mut Parsed) -> Result<(), ParseError> {
 pub struct Observed {
     /// Event end time in milliseconds on the job clock.
     pub ts_ms: u64,
-    /// Event id for duplicate detection. An event with none is never deduplicated.
+    /// Event id for duplicate detection. An event with none is never deduplicated. The mapper
+    /// does not bound the length: the caller must cap it, for example by hashing or cutting at
+    /// [`MAX_NAME_BYTES`].
     pub id: Option<String>,
     /// Structured `run_in_background` flag of a Bash call. Command text is never consulted.
     pub run_in_background: Option<bool>,
@@ -574,12 +577,17 @@ struct Pending {
 ///
 /// A `tool_decision` yields no span. It is held until the result with the same `tool_use_id`. The
 /// result is dropped when the decision names another tool or is `reject`, a reading that
-/// stays strict when the events disagree. A result with no decision still yields its span.
+/// stays strict when the events disagree. A result with no decision still yields its span. The
+/// tool name comparison against the decision is case-sensitive, while `reject` matches without
+/// regard to case. Deduplication runs before the decision check, so a decision whose event id
+/// was already seen is dropped. A held decision never expires; it leaves the table only when
+/// its result arrives.
 ///
 /// Event ids and decisions live in tables capped at [`MAX_SEEN_IDS`] and [`MAX_DECISIONS`]. At the
 /// id cap an event with an unseen id is dropped, so the set never grows and dedup never fails
 /// open; ids already held still count as duplicates and events without an id still map. At the
-/// decision cap a new decision is dropped, and its result then maps as one with no decision.
+/// decision cap a new decision is dropped, and its result then maps as one with no decision, so
+/// a `reject` dropped at the cap lets its result map as a span.
 pub struct SpanMapper {
     job: Interval,
     seen: HashSet<String>,
@@ -619,6 +627,9 @@ impl SpanMapper {
     }
 
     /// Maps one event. Returns the span, or `None` when the event is held or dropped.
+    ///
+    /// No batch cap applies here; a caller feeding a batch must use [`push_all`](Self::push_all)
+    /// or bound the batch itself.
     pub fn push(&mut self, obs: Observed) -> Option<Span> {
         if let Some(id) = &obs.id {
             if self.seen.contains(id) {

@@ -315,7 +315,7 @@ impl<R: Reporter> AgentRunner<R> {
 
     /// Runs `gh pr checks` and reads it with [`read_checks`]. An answer cut by the capture
     /// limit, a failed start and a nonzero exit with an all-pass list read as [`Seen::Waiting`],
-    /// never as a pass.
+    /// never as a pass. So does a job whose repository target cannot be built, before `gh` runs.
     ///
     /// # Errors
     ///

@@ -66,7 +66,8 @@ A wider allow such as `Bash` or `Bash(*)` is not covered by any Floor deny, so i
 
 - `CLAUDE.md` is replaced by the Profile `claude_md` when set. Each context file is written at `.claude/ctx/<path>` inside the bundle root and imported by an `@.claude/ctx/<path>` line appended to `CLAUDE.md`, so the import resolves from the file that holds it. A context path with whitespace is refused, because an import line cannot carry it.
 - Skill files are written at `skills/<name>/<path>`.
-- `settings.json` is generated: permissions from the Floor, the Profile model and attribution. Rules in `settings.permissions` join `allow` and `deny` before the Floor. A Profile with no allow rules keeps the default allow list; any allow rule replaces that list.
+- `settings.json` is generated: permissions from the Floor, the Profile model and attribution. Rules in `settings.permissions` join `allow` and `deny` before the Floor. A Profile with no allow rules keeps the default allow list; any allow rule replaces that list. A Profile whose every allow rule the Floor drops also falls back to the default list, which includes bare `Bash`; that stays inside the Floor deny set.
+- The overlay output carries no permission mode. The runner adds `dontAsk` itself; a later change that builds the command from the effective settings must keep that mode.
 - Overlay paths that collide when compared without case are refused, because the box may hold a case-insensitive filesystem.
 - The argv pieces are `--model`, `--allowedTools`, `--disallowedTools`, `--max-turns` and `--max-budget-usd` (cents written as dollars with two decimals). The prompt is the prefix followed by the template with `{prompt}` replaced once.
 - Unverified: whether claude discovers `skills/<name>/` under `CLAUDE_CONFIG_DIR` and resolves the import. The probe on the dev box stopped at "Not logged in".
