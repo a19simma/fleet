@@ -514,3 +514,15 @@ pub const MAX_EDIT_PAYLOAD_BYTES: usize = 65_536;
 
 /// Most `pending` suggested edits one Work project holds. Filing past it is refused.
 pub const MAX_PENDING_EDITS_PER_PROJECT: usize = 100;
+
+/// Most bytes of `tasks.json` an import carries. The server and the CLI both refuse more.
+pub const MAX_IMPORT_TASKS_BYTES: usize = 1_048_576;
+
+/// Most bytes of `slices.json` an import carries.
+pub const MAX_IMPORT_SLICES_BYTES: usize = 131_072;
+
+/// Most bytes of `progress.md` or of `docs-backlog.md` an import carries.
+pub const MAX_IMPORT_TEXT_BYTES: usize = 524_288;
+
+/// Most bytes an export may hold in `tasks_json`. A larger project is refused.
+pub const MAX_EXPORT_TASKS_BYTES: usize = 3_145_728;

@@ -95,6 +95,8 @@ service FleetWork {
   rpc RecordWorkDefer(RecordWorkDeferRequest) returns (WorkDefer);
   rpc ResolveWorkDefer(ResolveWorkDeferRequest) returns (WorkDefer);
   rpc ListWorkDefers(ListWorkDefersRequest) returns (ListWorkDefersReply);
+  rpc ImportWork(ImportWorkRequest) returns (ImportWorkReply);
+  rpc ExportWork(ExportWorkRequest) returns (ExportWorkReply);
 }
 
 service FleetRetro {
@@ -1144,6 +1146,39 @@ message UnblockWorkRequest {
   string project = 2;
   string item_key = 3;
   string reason = 4;
+}
+
+// Imports a `.ralph` directory. Dry-run unless `apply` is set. Needs a per-user API token.
+message ImportWorkRequest {
+  string project = 1;
+  bool apply = 2;
+  string tasks_json = 3;
+  string slices_json = 4;
+  string progress_md = 5;
+  string backlog_md = 6;
+}
+
+message ImportWorkReply {
+  bool applied = 1;
+  uint32 items_created = 2;
+  uint32 items_unchanged = 3;
+  uint32 items_raised = 4;
+  uint32 items_differing = 5;
+  uint32 slices_created = 6;
+  uint32 mergeable_created = 7;
+  uint32 defers_created = 8;
+  repeated string notes = 9;
+  repeated string unparsed = 10;
+  uint32 unparsed_dropped = 11;
+}
+
+message ExportWorkRequest {
+  string project = 1;
+}
+
+message ExportWorkReply {
+  string tasks_json = 1;
+  string slices_json = 2;
 }
 
 message NextWorkRequest {

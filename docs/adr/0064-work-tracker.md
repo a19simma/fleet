@@ -1,6 +1,6 @@
 # Server-side work tracker
 
-Status: Proposed 2026-11-09, partly built (store, graph RPCs, claim with slice leases, lease TTL and renew, report with derived counts and a redacted 8 KiB evidence tail, notes, defers, lease reaper, CLI `fleet work`; not built: WRK-6, WRK-12, WRK-13). Builds on ADR-0042 (users, owner scope), ADR-0059 (repository registry) and ADR-0063 (hostile text). Extended by ADR-0065 and ADR-0066.
+Status: Proposed 2026-11-09, partly built (store, graph RPCs, claim with slice leases, lease TTL and renew, report with derived counts and a redacted 8 KiB evidence tail, notes, defers, lease reaper, CLI `fleet work`, import and export; not built: WRK-6, WRK-13). Builds on ADR-0042 (users, owner scope), ADR-0059 (repository registry) and ADR-0063 (hostile text). Extended by ADR-0065 and ADR-0066.
 
 A ralph loop keeps its work graph in `.ralph/tasks.json`, `.ralph/slices.json` and `.ralph/progress.md` on one machine. One conductor reads them, so a second operator, a second machine or the web UI cannot see the graph, and a crashed worker leaves a stale line nobody reaps. Fleet already stores Jobs, Users and a repository registry. This ADR moves the graph into the server so agents and people claim and report work through one API.
 
@@ -16,7 +16,7 @@ A ralph loop keeps its work graph in `.ralph/tasks.json`, `.ralph/slices.json` a
 8. **Defer.** A **Defer** records work found during an Attempt and left out of scope: a title, a reason and the vertical it belongs to. A Defer is not a Work item and is never Ready. A person promotes it to a Work item, or drops it.
 9. **Idempotency.** Every mutating RPC takes a client key. A repeat with the same `(project, key)` returns the first result. Hostile text in any title, note or reason is refused at the proto boundary with the reject set (ADR-0063) and escaped in the web UI.
 10. **Repo binding.** `Work project.repo` is a foreign key to a registry row of the same owner (WRK-13, ADR-0059). Setting it validates the row.
-11. **Import and export.** `ImportWork` reads a `.ralph` directory, dry-run by default, idempotent on `(project, key)`, and prints every line it could not parse. Export regenerates `tasks.json` and `slices.json` so a loop can still run from files (WRK-12).
+11. **Import and export.** `ImportWork` reads a `.ralph` directory, dry-run by default, idempotent on `(project, key)`, and prints every line it could not parse. Export regenerates `tasks.json` and `slices.json` so a loop can still run from files (WRK-12). `ImportWork`, dry-run included, needs a per-user API token, because it can rewrite a whole project from one request.
 12. **Surfaces.** CLI `fleet work` (WRK-5): `project`, `slices`, `add`, `list`, `show`, `dep`, `cancel`, `unblock`, `next`, `claim`, `pass`, `fail`, `note`, `defers`. Web pages (WRK-6): board, dependency graph, Slice-lock view, item timeline, Defers by vertical.
 
 ## Consequences

@@ -56,6 +56,12 @@ const EDIT: &str = "/fleet.v1.FleetEdit/";
 /// The one edit RPC that needs a signed-in user.
 pub const DECIDE_EDIT: &str = "/fleet.v1.FleetEdit/DecideEdit";
 
+/// The one Work RPC that writes a whole directory and needs a signed-in user, even as a dry-run.
+pub const IMPORT_WORK: &str = "/fleet.v1.FleetWork/ImportWork";
+
+/// The fixed `PERMISSION_DENIED` reason when a token that names no person asks to import work.
+pub const IMPORT_USER_TOKEN_REQUIRED: &str = "a per-user API token is required to import work";
+
 /// The fixed `PERMISSION_DENIED` reason when a token that names no person asks to decide an edit.
 pub const USER_TOKEN_REQUIRED: &str = "a per-user API token is required to decide an edit";
 const CATALOG_ADMIN: &str = "/fleet.v1.FleetCatalogAdmin/";
@@ -207,6 +213,8 @@ impl BearerAuth {
         }
         if path == DECIDE_EDIT && Self::allows(scope, path) {
             Err(Status::permission_denied(USER_TOKEN_REQUIRED))
+        } else if path == IMPORT_WORK && Self::allows(scope, path) {
+            Err(Status::permission_denied(IMPORT_USER_TOKEN_REQUIRED))
         } else if Self::allows(scope, path) {
             Ok(())
         } else {
@@ -267,6 +275,9 @@ impl BearerAuth {
         }
         if path == DECIDE_EDIT && caller.is_none() {
             return Err(Status::permission_denied(USER_TOKEN_REQUIRED));
+        }
+        if path == IMPORT_WORK && caller.is_none() {
+            return Err(Status::permission_denied(IMPORT_USER_TOKEN_REQUIRED));
         }
         if let (Scope::Client, None, Some(users)) = (scope, caller, self.users.as_ref()) {
             let user_id = users.bootstrap_user().await.map_err(unavailable)?;
@@ -407,6 +418,49 @@ mod tests {
             .err()
             .ok_or("box token reached FleetWork")?;
         assert_eq!(status.code(), Code::PermissionDenied);
+        Ok(())
+    }
+
+    #[test]
+    fn import_work_refuses_a_static_token_even_though_the_scope_allows_it() -> Result<(), String> {
+        const CLIENT: &str = "client-0123456789abcdef0123456789";
+        let box_token = Token::new(SECRET.into()).map_err(|err| err.to_string())?;
+        let client = Token::new(CLIENT.into()).map_err(|err| err.to_string())?;
+        let auth = BearerAuth::new(&box_token, Some(&client));
+        let header = format!("Bearer {CLIENT}");
+        let status = auth
+            .check(IMPORT_WORK, Some(header.as_bytes()))
+            .err()
+            .ok_or("static client token reached ImportWork")?;
+        assert_eq!(status.code(), Code::PermissionDenied);
+        assert_eq!(status.message(), IMPORT_USER_TOKEN_REQUIRED);
+        auth.check("/fleet.v1.FleetWork/ExportWork", Some(header.as_bytes()))
+            .map_err(|status| status.to_string())?;
+        let box_header = format!("Bearer {SECRET}");
+        let status = auth
+            .check(IMPORT_WORK, Some(box_header.as_bytes()))
+            .err()
+            .ok_or("box token reached ImportWork")?;
+        assert_ne!(status.message(), IMPORT_USER_TOKEN_REQUIRED);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn import_work_authenticate_refuses_a_static_token() -> Result<(), String> {
+        const CLIENT: &str = "client-0123456789abcdef0123456789";
+        let box_token = Token::new(SECRET.into()).map_err(|err| err.to_string())?;
+        let client = Token::new(CLIENT.into()).map_err(|err| err.to_string())?;
+        let auth = BearerAuth::new(&box_token, Some(&client));
+        let header = format!("Bearer {CLIENT}");
+        let status = auth
+            .authenticate(IMPORT_WORK, Some(header.as_bytes()))
+            .await
+            .err()
+            .ok_or("static client token reached ImportWork")?;
+        assert_eq!(status.message(), IMPORT_USER_TOKEN_REQUIRED);
+        auth.authenticate("/fleet.v1.FleetWork/ExportWork", Some(header.as_bytes()))
+            .await
+            .map_err(|status| status.to_string())?;
         Ok(())
     }
 }

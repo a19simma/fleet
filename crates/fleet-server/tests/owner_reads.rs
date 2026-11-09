@@ -584,6 +584,8 @@ const CLASSIFIED: &[(&str, &str)] = &[
     ("FleetWork", "RecordWorkDefer:scoped"),
     ("FleetWork", "ResolveWorkDefer:scoped"),
     ("FleetWork", "ListWorkDefers:scoped"),
+    ("FleetWork", "ImportWork:scoped"),
+    ("FleetWork", "ExportWork:scoped"),
     ("FleetRetro", "OpenRetro:scoped"),
     ("FleetRetro", "CloseRetro:scoped"),
     ("FleetRetro", "ListRetros:scoped"),

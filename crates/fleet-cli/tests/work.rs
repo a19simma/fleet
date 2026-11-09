@@ -11,7 +11,8 @@ use fleet_cli::{Cli, CliError, run};
 use fleet_proto::v1::fleet_work_server::{FleetWork, FleetWorkServer};
 use fleet_proto::v1::{
     AddWorkDepRequest, AddWorkItemRequest, AddWorkNoteRequest, CancelWorkRequest, ClaimWorkRequest,
-    CreateWorkProjectRequest, GetWorkItemReply, GetWorkItemRequest, ListWorkDefersReply,
+    CreateWorkProjectRequest, ExportWorkReply, ExportWorkRequest, GetWorkItemReply,
+    GetWorkItemRequest, ImportWorkReply, ImportWorkRequest, ListWorkDefersReply,
     ListWorkDefersRequest, ListWorkItemsReply, ListWorkItemsRequest, ListWorkProjectsReply,
     ListWorkProjectsRequest, NextWorkReply, NextWorkRequest, RecordWorkDeferRequest,
     RemoveWorkDepRequest, RenewLeaseRequest, ReportAttemptRequest, ResolveWorkDeferRequest,
@@ -35,6 +36,8 @@ struct Stub {
     events: Vec<WorkEvent>,
     defers: Vec<WorkDefer>,
     next: Option<WorkItem>,
+    import: ImportWorkReply,
+    export: ExportWorkReply,
 }
 
 impl Stub {
@@ -238,6 +241,25 @@ impl FleetWork for Stub {
     ) -> Result<Response<WorkDefer>, Status> {
         self.record("resolve_defer", r.get_ref())?;
         Ok(Response::new(WorkDefer::default()))
+    }
+
+    async fn import_work(
+        &self,
+        r: Request<ImportWorkRequest>,
+    ) -> Result<Response<ImportWorkReply>, Status> {
+        self.record("import", r.get_ref())?;
+        Ok(Response::new(ImportWorkReply {
+            applied: r.get_ref().apply,
+            ..self.import.clone()
+        }))
+    }
+
+    async fn export_work(
+        &self,
+        r: Request<ExportWorkRequest>,
+    ) -> Result<Response<ExportWorkReply>, Status> {
+        self.record("export", r.get_ref())?;
+        Ok(Response::new(self.export.clone()))
     }
 
     async fn list_work_defers(
@@ -804,5 +826,195 @@ async fn a_multiline_field_cannot_forge_a_row() -> TestResult {
 async fn a_server_refusal_prints_scrubbed_without_the_token() -> TestResult {
     let (result, _) = cli("http://127.0.0.1:1", &["-p", "p", "next"], b"").await;
     assert!(matches!(result, Err(CliError::Connect(_))), "{result:?}");
+    Ok(())
+}
+
+fn ralph_dir(tasks: &str) -> tempfile::TempDir {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("tasks.json"), tasks).unwrap();
+    dir
+}
+
+fn path_of(dir: &tempfile::TempDir) -> String {
+    dir.path().to_str().unwrap().to_owned()
+}
+
+#[tokio::test]
+async fn import_is_a_dry_run_unless_apply_is_given() -> TestResult {
+    let stub = Stub::default();
+    let url = serve(stub.clone()).await?;
+    let dir = ralph_dir("[]");
+    let path = path_of(&dir);
+    let (result, out) = cli(&url, &["-p", "p", "import", &path], &[]).await;
+    result?;
+    assert!(out.starts_with("dry-run\t"), "{out}");
+    assert!(out.contains("nothing written: pass --apply"), "{out}");
+    let (result, out) = cli(&url, &["-p", "p", "import", "--apply", &path], &[]).await;
+    result?;
+    assert!(out.starts_with("applied\t"), "{out}");
+    assert!(!out.contains("nothing written"), "{out}");
+    let sent = calls(&stub);
+    assert!(sent[0].1.contains("apply: false"), "{sent:?}");
+    assert!(sent[1].1.contains("apply: true"), "{sent:?}");
+    assert!(sent[0].1.contains("project: \"p\""), "{sent:?}");
+    Ok(())
+}
+
+#[tokio::test]
+async fn import_sends_every_file_and_treats_the_optional_ones_as_empty() -> TestResult {
+    let stub = Stub::default();
+    let url = serve(stub.clone()).await?;
+    let dir = ralph_dir("[1]");
+    std::fs::write(dir.path().join("progress.md"), "line one").unwrap();
+    let path = path_of(&dir);
+    cli(&url, &["-p", "p", "import", &path], &[]).await.0?;
+    let sent = calls(&stub);
+    assert!(sent[0].1.contains("tasks_json: \"[1]\""), "{sent:?}");
+    assert!(sent[0].1.contains("slices_json: \"\""), "{sent:?}");
+    assert!(sent[0].1.contains("progress_md: \"line one\""), "{sent:?}");
+    assert!(sent[0].1.contains("backlog_md: \"\""), "{sent:?}");
+    Ok(())
+}
+
+#[tokio::test]
+async fn import_prints_counts_notes_and_every_unparsed_line_scrubbed() -> TestResult {
+    let stub = Stub {
+        import: ImportWorkReply {
+            items_created: 3,
+            items_unchanged: 4,
+            items_raised: 5,
+            items_differing: 6,
+            slices_created: 7,
+            mergeable_created: 8,
+            defers_created: 9,
+            notes: vec![hostile()],
+            unparsed: vec!["progress.md:2: odd".into(), hostile()],
+            unparsed_dropped: 11,
+            ..ImportWorkReply::default()
+        },
+        ..Stub::default()
+    };
+    let url = serve(stub).await?;
+    let dir = ralph_dir("[]");
+    let (result, out) = cli(&url, &["-p", "p", "import", &path_of(&dir)], &[]).await;
+    result?;
+    assert!(
+        out.contains(
+            "created=3\tunchanged=4\traised=5\tdiffering=6\tslices=7\tmergeable=8\tdefers=9"
+        ),
+        "{out}"
+    );
+    assert!(out.contains("unparsed: progress.md:2: odd\n"), "{out}");
+    assert_eq!(out.matches("unparsed: ").count(), 2, "{out}");
+    assert!(out.contains("note: "), "{out}");
+    assert!(out.contains("unparsed dropped: 11"), "{out}");
+    assert!(clean(&out), "{out:?}");
+    Ok(())
+}
+
+#[tokio::test]
+async fn import_refuses_bad_input_before_connecting() -> TestResult {
+    let dead = "http://127.0.0.1:1";
+    let empty = tempfile::tempdir().unwrap();
+    let (result, _) = cli(dead, &["-p", "p", "import", &path_of(&empty)], &[]).await;
+    assert!(matches!(result, Err(CliError::Io(_))), "{result:?}");
+    let (result, _) = cli(dead, &["import", &path_of(&empty)], &[]).await;
+    assert!(matches!(result, Err(CliError::Usage(_))), "{result:?}");
+    let big = ralph_dir(&" ".repeat(1_048_577));
+    let (result, _) = cli(dead, &["-p", "p", "import", &path_of(&big)], &[]).await;
+    assert!(matches!(result, Err(CliError::Usage(_))), "{result:?}");
+    let bad = ralph_dir("[]");
+    std::fs::write(bad.path().join("progress.md"), [0xff, 0xfe]).unwrap();
+    let (result, _) = cli(dead, &["-p", "p", "import", &path_of(&bad)], &[]).await;
+    assert!(matches!(result, Err(CliError::Usage(_))), "{result:?}");
+    Ok(())
+}
+
+#[tokio::test]
+async fn import_reads_a_file_at_the_cap_and_refuses_a_symlink() -> TestResult {
+    let stub = Stub::default();
+    let url = serve(stub.clone()).await?;
+    let edge = ralph_dir(&" ".repeat(1_048_576));
+    cli(&url, &["-p", "p", "import", &path_of(&edge)], &[])
+        .await
+        .0?;
+    assert_eq!(calls(&stub).len(), 1);
+    let linked = tempfile::tempdir().unwrap();
+    let real = ralph_dir("[]");
+    std::os::unix::fs::symlink(
+        real.path().join("tasks.json"),
+        linked.path().join("tasks.json"),
+    )
+    .unwrap();
+    let (result, _) = cli(&url, &["-p", "p", "import", &path_of(&linked)], &[]).await;
+    assert!(matches!(result, Err(CliError::Usage(_))), "{result:?}");
+    assert_eq!(calls(&stub).len(), 1);
+    Ok(())
+}
+
+#[tokio::test]
+async fn export_writes_both_files_and_leaves_no_temp_file() -> TestResult {
+    let stub = Stub {
+        export: ExportWorkReply {
+            tasks_json: "[]\n".into(),
+            slices_json: "{}\n".into(),
+        },
+        ..Stub::default()
+    };
+    let url = serve(stub.clone()).await?;
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("tasks.json"), "old").unwrap();
+    let (result, out) = cli(&url, &["-p", "p", "export", &path_of(&dir)], &[]).await;
+    result?;
+    assert_eq!(
+        std::fs::read_to_string(dir.path().join("tasks.json"))?,
+        "[]\n"
+    );
+    assert_eq!(
+        std::fs::read_to_string(dir.path().join("slices.json"))?,
+        "{}\n"
+    );
+    let mut names: Vec<_> = std::fs::read_dir(dir.path())?
+        .map(|e| e.unwrap().file_name().into_string().unwrap())
+        .collect();
+    names.sort();
+    assert_eq!(names, ["slices.json", "tasks.json"]);
+    assert_eq!(out.matches("wrote ").count(), 2, "{out}");
+    assert!(calls(&stub)[0].1.contains("project: \"p\""));
+    Ok(())
+}
+
+#[tokio::test]
+async fn export_refuses_a_symlink_target_and_writes_nothing_through_it() -> TestResult {
+    let stub = Stub {
+        export: ExportWorkReply {
+            tasks_json: "[]\n".into(),
+            slices_json: "{}\n".into(),
+        },
+        ..Stub::default()
+    };
+    let url = serve(stub).await?;
+    let dir = tempfile::tempdir().unwrap();
+    let elsewhere = tempfile::tempdir().unwrap();
+    let victim = elsewhere.path().join("victim");
+    std::fs::write(&victim, "keep").unwrap();
+    std::os::unix::fs::symlink(&victim, dir.path().join("tasks.json")).unwrap();
+    let (result, _) = cli(&url, &["-p", "p", "export", &path_of(&dir)], &[]).await;
+    assert!(matches!(result, Err(CliError::Usage(_))), "{result:?}");
+    assert_eq!(std::fs::read_to_string(&victim)?, "keep");
+    Ok(())
+}
+
+#[tokio::test]
+async fn export_needs_a_project_and_an_existing_directory() -> TestResult {
+    let dead = "http://127.0.0.1:1";
+    let dir = tempfile::tempdir().unwrap();
+    let (result, _) = cli(dead, &["export", &path_of(&dir)], &[]).await;
+    assert!(matches!(result, Err(CliError::Usage(_))), "{result:?}");
+    let stub = Stub::default();
+    let url = serve(stub).await?;
+    let missing = dir.path().join("nope");
+    let (result, _) = cli(&url, &["-p", "p", "export", missing.to_str().unwrap()], &[]).await;
+    assert!(matches!(result, Err(CliError::Io(_))), "{result:?}");
     Ok(())
 }

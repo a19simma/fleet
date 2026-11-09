@@ -49,11 +49,12 @@ use fleet_proto::v1::{
     VerifyCredentialRequest, WorkAttempt, WorkDefer, WorkEvent, WorkItem, WorkProject,
 };
 use fleet_proto::v1::{
-    CloseRetroRequest, DecideEditRequest, DispositionImprovementRequest, FileEditRequest,
-    FileImprovementRequest, GetEditRequest, GetWorkBriefReply, GetWorkBriefRequest, Improvement,
-    ListEditsReply, ListEditsRequest, ListImprovementsReply, ListImprovementsRequest,
-    ListPitfallsReply, ListPitfallsRequest, ListRetrosReply, ListRetrosRequest, OpenRetroRequest,
-    Pitfall, RecordPitfallRequest, Retro, SuggestedEdit,
+    CloseRetroRequest, DecideEditRequest, DispositionImprovementRequest, ExportWorkReply,
+    ExportWorkRequest, FileEditRequest, FileImprovementRequest, GetEditRequest, GetWorkBriefReply,
+    GetWorkBriefRequest, ImportWorkReply, ImportWorkRequest, Improvement, ListEditsReply,
+    ListEditsRequest, ListImprovementsReply, ListImprovementsRequest, ListPitfallsReply,
+    ListPitfallsRequest, ListRetrosReply, ListRetrosRequest, OpenRetroRequest, Pitfall,
+    RecordPitfallRequest, Retro, SuggestedEdit,
 };
 use fleet_proto::{ConvertError, validate_box};
 use tonic::codegen::BoxStream;
@@ -860,6 +861,32 @@ impl FleetWork for FleetService {
         let reply = self
             .store
             .renew_lease(user_id, request.get_ref())
+            .await
+            .map_err(|err| work_error(&err))?;
+        Ok(Response::new(reply))
+    }
+
+    async fn import_work(
+        &self,
+        request: Request<ImportWorkRequest>,
+    ) -> Result<Response<ImportWorkReply>, Status> {
+        let user_id = work_user(&request)?;
+        let reply = self
+            .store
+            .import_work(user_id, request.get_ref(), &self.work_redactor)
+            .await
+            .map_err(|err| work_error(&err))?;
+        Ok(Response::new(reply))
+    }
+
+    async fn export_work(
+        &self,
+        request: Request<ExportWorkRequest>,
+    ) -> Result<Response<ExportWorkReply>, Status> {
+        let user_id = work_user(&request)?;
+        let reply = self
+            .store
+            .export_work(user_id, request.get_ref())
             .await
             .map_err(|err| work_error(&err))?;
         Ok(Response::new(reply))

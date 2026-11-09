@@ -59,6 +59,8 @@ fn every_rpc_path_is_served() {
         "RecordWorkDefer",
         "ResolveWorkDefer",
         "ListWorkDefers",
+        "ImportWork",
+        "ExportWork",
     ];
     let proto = include_str!("../proto/fleet/v1/fleet.proto");
     let block = proto

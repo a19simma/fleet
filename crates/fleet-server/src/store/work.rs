@@ -23,13 +23,18 @@
 //! attempt and one `work_slice_lease` row per slice of the item in one transaction. A lease runs
 //! to a database clock expiry, and [`Store::reap_work_leases`] closes an attempt past it as lost.
 //! `passes` and `fails` stay counts over attempts.
+//!
+//! `import_work` and `export_work` (`import.rs`, with the file format in `ralph.rs`) move a `.ralph`
+//! directory in and out of a project. An import locks the project row before it reads.
 
 mod brief;
 mod claim;
 mod defer;
 mod edit;
+mod import;
 mod load;
 mod pitfall;
+mod ralph;
 mod retro;
 mod write;
 

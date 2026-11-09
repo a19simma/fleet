@@ -7,16 +7,21 @@
 //! it can start a row either. Evidence read from a file or stdin is bounded before it is sent.
 
 use std::io::{Read, Write};
+use std::path::{Path, PathBuf};
 
 use clap::{Args, Subcommand, ValueEnum};
 use fleet_core::stamp::utc_stamp;
 use fleet_proto::v1::fleet_work_client::FleetWorkClient;
 use fleet_proto::v1::{
     AddWorkDepRequest, AddWorkItemRequest, AddWorkNoteRequest, CancelWorkRequest, ClaimWorkRequest,
-    CreateWorkProjectRequest, GetWorkItemRequest, ListWorkDefersRequest, ListWorkItemsRequest,
-    ListWorkProjectsRequest, NextWorkRequest, RemoveWorkDepRequest, ReportAttemptRequest,
-    SetWorkSlicesRequest, UnblockWorkRequest, WorkAttempt, WorkDefer, WorkDeferState, WorkDep,
-    WorkItem, WorkItemState, WorkProject, WorkSlice, WorkVerdict,
+    CreateWorkProjectRequest, ExportWorkRequest, GetWorkItemRequest, ImportWorkReply,
+    ImportWorkRequest, ListWorkDefersRequest, ListWorkItemsRequest, ListWorkProjectsRequest,
+    NextWorkRequest, RemoveWorkDepRequest, ReportAttemptRequest, SetWorkSlicesRequest,
+    UnblockWorkRequest, WorkAttempt, WorkDefer, WorkDeferState, WorkDep, WorkItem, WorkItemState,
+    WorkProject, WorkSlice, WorkVerdict,
+};
+use fleet_proto::{
+    MAX_EXPORT_TASKS_BYTES, MAX_IMPORT_SLICES_BYTES, MAX_IMPORT_TASKS_BYTES, MAX_IMPORT_TEXT_BYTES,
 };
 use tonic::service::interceptor::InterceptedService;
 use tonic::transport::Channel;
@@ -32,6 +37,8 @@ const NO_PROJECT: &str = "this action needs --project";
 const EMPTY_KEY: &str = "the idempotency key is empty";
 const BAD_SLICE: &str = "invalid --slice: use NAME=PATH[,PATH...]";
 const BAD_EVIDENCE: &str = "evidence is larger than 262144 bytes or not valid UTF-8";
+const BAD_IMPORT_FILE: &str = "an import file is a symlink, too large or not valid UTF-8";
+const BAD_EXPORT_TARGET: &str = "an export target is a symlink or not a regular file";
 
 /// The arguments of `fleet work`.
 #[derive(Debug, Args)]
@@ -218,6 +225,19 @@ pub enum WorkAction {
         /// The note.
         note: String,
     },
+    /// Import a `.ralph` directory. Dry-run unless `--apply` is given.
+    Import {
+        /// Directory holding `tasks.json`, `slices.json`, `progress.md` and `docs-backlog.md`.
+        dir: PathBuf,
+        /// Write the import. Without it the server reports what it would do and writes nothing.
+        #[arg(long)]
+        apply: bool,
+    },
+    /// Write `tasks.json` and `slices.json` of the project into a directory.
+    Export {
+        /// Directory to write into. It must exist.
+        dir: PathBuf,
+    },
     /// List Defers: work found and left out of scope.
     Defers {
         /// Only Defers of this vertical.
@@ -281,6 +301,100 @@ fn read_evidence(source: Option<&str>, stdin: &mut impl Read) -> Result<String, 
         return Err(CliError::Usage(BAD_EVIDENCE.into()));
     }
     String::from_utf8(bytes).map_err(|_| CliError::Usage(BAD_EVIDENCE.into()))
+}
+
+fn read_import_file(
+    dir: &Path,
+    name: &str,
+    cap: usize,
+    required: bool,
+) -> Result<String, CliError> {
+    let path = dir.join(name);
+    let bad = || CliError::Usage(BAD_IMPORT_FILE.into());
+    match std::fs::symlink_metadata(&path) {
+        Ok(meta) if meta.file_type().is_file() => {}
+        Ok(_) => return Err(bad()),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound && !required => {
+            return Ok(String::new());
+        }
+        Err(err) => return Err(err.into()),
+    }
+    let mut bytes = Vec::new();
+    std::fs::File::open(&path)?
+        .take(cap as u64 + 1)
+        .read_to_end(&mut bytes)?;
+    if bytes.len() > cap {
+        return Err(bad());
+    }
+    String::from_utf8(bytes).map_err(|_| bad())
+}
+
+fn import_request(project: String, dir: &Path, apply: bool) -> Result<ImportWorkRequest, CliError> {
+    Ok(ImportWorkRequest {
+        project,
+        apply,
+        tasks_json: read_import_file(dir, "tasks.json", MAX_IMPORT_TASKS_BYTES, true)?,
+        slices_json: read_import_file(dir, "slices.json", MAX_IMPORT_SLICES_BYTES, false)?,
+        progress_md: read_import_file(dir, "progress.md", MAX_IMPORT_TEXT_BYTES, false)?,
+        backlog_md: read_import_file(dir, "docs-backlog.md", MAX_IMPORT_TEXT_BYTES, false)?,
+    })
+}
+
+fn write_export(dir: &Path, name: &str, text: &str) -> Result<PathBuf, CliError> {
+    let target = dir.join(name);
+    match std::fs::symlink_metadata(&target) {
+        Ok(meta) if meta.file_type().is_file() => {}
+        Ok(_) => return Err(CliError::Usage(BAD_EXPORT_TARGET.into())),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+        Err(err) => return Err(err.into()),
+    }
+    let temp = dir.join(format!(".{name}.fleet-export"));
+    let written = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&temp)
+        .and_then(|mut file| {
+            file.write_all(text.as_bytes())
+                .and_then(|()| file.sync_all())
+        })
+        .and_then(|()| std::fs::rename(&temp, &target));
+    if let Err(err) = written {
+        let _ = std::fs::remove_file(&temp);
+        return Err(err.into());
+    }
+    Ok(target)
+}
+
+fn print_import(
+    out: &mut impl Write,
+    scrub: &Scrub,
+    reply: &ImportWorkReply,
+) -> std::io::Result<()> {
+    let mode = if reply.applied { "applied" } else { "dry-run" };
+    writeln!(
+        out,
+        "{mode}\tcreated={}\tunchanged={}\traised={}\tdiffering={}\tslices={}\tmergeable={}\tdefers={}",
+        reply.items_created,
+        reply.items_unchanged,
+        reply.items_raised,
+        reply.items_differing,
+        reply.slices_created,
+        reply.mergeable_created,
+        reply.defers_created,
+    )?;
+    for note in &reply.notes {
+        writeln!(out, "note: {}", scrub.ident(note))?;
+    }
+    for line in &reply.unparsed {
+        writeln!(out, "unparsed: {}", scrub.ident(line))?;
+    }
+    if reply.unparsed_dropped > 0 {
+        writeln!(out, "unparsed dropped: {}", reply.unparsed_dropped)?;
+    }
+    if !reply.applied {
+        writeln!(out, "nothing written: pass --apply to import")?;
+    }
+    Ok(())
 }
 
 const fn item_state(state: ItemState) -> WorkItemState {
@@ -464,6 +578,8 @@ pub(crate) enum Call {
     Report(ReportAttemptRequest),
     Note(AddWorkNoteRequest),
     Defers(ListWorkDefersRequest),
+    Import(ImportWorkRequest),
+    Export(ExportWorkRequest, PathBuf),
 }
 
 impl WorkArgs {
@@ -612,6 +728,15 @@ impl WorkArgs {
                 vertical,
                 state: state.map(|s| defer_state(s) as i32),
             }),
+            WorkAction::Import { dir, apply } => {
+                Call::Import(import_request(project()?, &dir, apply)?)
+            }
+            WorkAction::Export { dir } => Call::Export(
+                ExportWorkRequest {
+                    project: project()?,
+                },
+                dir,
+            ),
             WorkAction::Project { .. }
             | WorkAction::Slices { .. }
             | WorkAction::Add { .. }
@@ -709,6 +834,28 @@ pub(crate) async fn execute(
             let reply = client.list_work_defers(r).await?.into_inner();
             for defer in &reply.defers {
                 writeln!(out, "{}", defer_row(scrub, defer))?;
+            }
+        }
+        Call::Import(r) => {
+            let reply = client.import_work(r).await?.into_inner();
+            print_import(out, scrub, &reply)?;
+        }
+        Call::Export(r, dir) => {
+            let reply = client.export_work(r).await?.into_inner();
+            if reply.tasks_json.len() > MAX_EXPORT_TASKS_BYTES {
+                return Err(CliError::Usage(BAD_EXPORT_TARGET.into()));
+            }
+            for (name, text) in [
+                ("tasks.json", &reply.tasks_json),
+                ("slices.json", &reply.slices_json),
+            ] {
+                let path = write_export(&dir, name, text)?;
+                writeln!(
+                    out,
+                    "wrote {}\t{} bytes",
+                    scrub.ident(&path.display().to_string()),
+                    text.len()
+                )?;
             }
         }
     }
