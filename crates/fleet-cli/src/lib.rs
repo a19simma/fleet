@@ -13,6 +13,7 @@ pub mod stats;
 pub mod telemetry;
 pub mod timing;
 pub mod watch;
+pub mod work;
 
 use std::fmt;
 use std::io::{Read, Write};
@@ -26,6 +27,7 @@ use fleet_proto::v1::fleet_jobs_client::FleetJobsClient;
 use fleet_proto::v1::fleet_profiles_client::FleetProfilesClient;
 use fleet_proto::v1::fleet_query_client::FleetQueryClient;
 use fleet_proto::v1::fleet_repos_client::FleetReposClient;
+use fleet_proto::v1::fleet_work_client::FleetWorkClient;
 use fleet_proto::v1::{
     CancelJobRequest, GetJobRequest, Job, JobState, ListJobsRequest, SubmitJobRequest,
 };
@@ -207,6 +209,8 @@ pub enum Command {
         #[command(subcommand)]
         action: repo::RepoAction,
     },
+    /// Manage Work projects, items, claims and Defers on the server.
+    Work(work::WorkArgs),
 }
 
 /// A `fleet batch` action.
@@ -572,6 +576,7 @@ struct Session {
     batches: batch::BatchesClient,
     credentials: credential::CredentialsClient,
     repos: repo::ReposClient,
+    work: work::WorkClient,
     scrub: Scrub,
 }
 
@@ -730,7 +735,9 @@ async fn session(env: &Resolution, timeouts: bool) -> Result<Session, CliError> 
             .max_decoding_message_size(MAX_DECODE_BYTES),
         credentials: FleetCredentialsClient::with_interceptor(channel.clone(), token.clone())
             .max_decoding_message_size(MAX_DECODE_BYTES),
-        repos: FleetReposClient::with_interceptor(channel, token)
+        repos: FleetReposClient::with_interceptor(channel.clone(), token.clone())
+            .max_decoding_message_size(MAX_DECODE_BYTES),
+        work: FleetWorkClient::with_interceptor(channel, token)
             .max_decoding_message_size(MAX_DECODE_BYTES),
     })
 }
@@ -881,6 +888,18 @@ async fn run_repo(
             repo::remove(&mut session.repos, host, path, out).await
         }
     }
+}
+
+async fn run_work(
+    args: work::WorkArgs,
+    env: &Resolution,
+    timeouts: bool,
+    stdin: &mut impl Read,
+    out: &mut impl Write,
+) -> Result<(), CliError> {
+    let call = args.prepare(stdin)?;
+    let mut session = session(env, timeouts).await?;
+    work::execute(call, &mut session.work, &session.scrub, out).await
 }
 
 async fn run_profile(
@@ -1154,6 +1173,7 @@ async fn dispatch(
         }
         Command::Credential { action } => run_credential(action, env, timeouts, stdin, out).await?,
         Command::Repo { action } => run_repo(action, env, timeouts, out).await?,
+        Command::Work(args) => run_work(args, env, timeouts, stdin, out).await?,
         Command::Cancel { id } => {
             let session = session(env, timeouts).await?;
             cancel(session.jobs, &session.scrub, id, out).await?;

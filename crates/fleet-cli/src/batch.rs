@@ -306,7 +306,7 @@ fn parse_profiles(list: &str) -> Result<Vec<String>, CliError> {
     Ok(names)
 }
 
-fn fresh_key() -> String {
+pub(crate) fn fresh_key() -> String {
     use std::hash::{BuildHasher, Hasher};
     use std::time::{SystemTime, UNIX_EPOCH};
 
