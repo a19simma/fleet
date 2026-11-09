@@ -3,10 +3,10 @@
 //! Two static tokens plus per-user API tokens, scoped by gRPC path. The box token covers
 //! `FleetIngest` and `FleetWorker`. The client scope covers `FleetQuery`, `FleetJobs`,
 //! `FleetJudge`, `FleetProfiles`, `FleetBatches`, `FleetCredentials`, `FleetRepos`,
-//! `FleetCatalog` and `FleetWork`. Any other path is denied.
+//! `FleetCatalog`, `FleetWork` and `FleetRetro`. Any other path is denied.
 //! `FleetCatalog` passes the scope, then its handler requires an admin user.
 //! `FleetRepos` passes the scope, then its handler requires a user caller: the box token never
-//! reaches it. `FleetWork` is the same: its handlers scope every read and write to the caller.
+//! reaches it. `FleetWork` and `FleetRetro` are the same: its handlers scope every read and write to the caller.
 //!
 //! The two admin services, `FleetCatalogAdmin` and `FleetCapabilityAdmin`, sit outside both
 //! static scopes. A request reaches one of their five RPCs only with a per-user API token whose
@@ -48,6 +48,7 @@ const CREDENTIALS: &str = "/fleet.v1.FleetCredentials/";
 const REPOS: &str = "/fleet.v1.FleetRepos/";
 const CATALOG: &str = "/fleet.v1.FleetCatalog/";
 const WORK: &str = "/fleet.v1.FleetWork/";
+const RETRO: &str = "/fleet.v1.FleetRetro/";
 const CATALOG_ADMIN: &str = "/fleet.v1.FleetCatalogAdmin/";
 
 /// The fixed `PERMISSION_DENIED` reason for every refusal of an admin RPC.
@@ -160,8 +161,8 @@ impl BearerAuth {
 
     /// Allow-lists paths per scope: the box token takes `FleetIngest` and `FleetWorker`,
     /// the client token takes `FleetQuery`, `FleetJobs`, `FleetJudge`, `FleetProfiles`,
-    /// `FleetBatches`, `FleetCredentials`, `FleetRepos`, `FleetCatalog` and `FleetWork`.
-    /// Every other path is denied.
+    /// `FleetBatches`, `FleetCredentials`, `FleetRepos`, `FleetCatalog`, `FleetWork` and
+    /// `FleetRetro`. Every other path is denied.
     fn allows(scope: Scope, path: &str) -> bool {
         match scope {
             Scope::Box => path.starts_with(INGEST) || path.starts_with(WORKER),
@@ -175,6 +176,7 @@ impl BearerAuth {
                     || path.starts_with(REPOS)
                     || path.starts_with(CATALOG)
                     || path.starts_with(WORK)
+                    || path.starts_with(RETRO)
             }
         }
     }

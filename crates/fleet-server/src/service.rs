@@ -19,6 +19,7 @@ use fleet_proto::v1::fleet_judge_server::{FleetJudge, FleetJudgeServer};
 use fleet_proto::v1::fleet_profiles_server::{FleetProfiles, FleetProfilesServer};
 use fleet_proto::v1::fleet_query_server::{FleetQuery, FleetQueryServer};
 use fleet_proto::v1::fleet_repos_server::{FleetRepos, FleetReposServer};
+use fleet_proto::v1::fleet_retro_server::{FleetRetro, FleetRetroServer};
 use fleet_proto::v1::fleet_work_server::{FleetWork, FleetWorkServer};
 use fleet_proto::v1::fleet_worker_server::{FleetWorker, FleetWorkerServer};
 use fleet_proto::v1::{
@@ -45,6 +46,12 @@ use fleet_proto::v1::{
     SubmitBatchReply, SubmitBatchRequest, SubmitJobRequest, SubmitJudgeRequest, UnblockWorkRequest,
     UnshareProfileRequest, UpsertCatalogItemRequest, UserCapability, VerifyCredentialReply,
     VerifyCredentialRequest, WorkAttempt, WorkDefer, WorkEvent, WorkItem, WorkProject,
+};
+use fleet_proto::v1::{
+    CloseRetroRequest, DispositionImprovementRequest, FileImprovementRequest, GetWorkBriefReply,
+    GetWorkBriefRequest, Improvement, ListImprovementsReply, ListImprovementsRequest,
+    ListPitfallsReply, ListPitfallsRequest, ListRetrosReply, ListRetrosRequest, OpenRetroRequest,
+    Pitfall, RecordPitfallRequest, Retro,
 };
 use fleet_proto::{ConvertError, validate_box};
 use tonic::codegen::BoxStream;
@@ -667,11 +674,14 @@ fn work_error(err: &StoreError) -> Status {
             | WorkFault::ItemNotFound
             | WorkFault::DepNotFound
             | WorkFault::AttemptNotFound
-            | WorkFault::DeferNotFound => Status::not_found(fault.to_string()),
+            | WorkFault::DeferNotFound
+            | WorkFault::RetroNotFound
+            | WorkFault::ImprovementNotFound => Status::not_found(fault.to_string()),
             WorkFault::Invalid(reason) => Status::invalid_argument(*reason),
             WorkFault::Graph(graph::GraphError::Cycle(_))
             | WorkFault::RepoNotRegistered
-            | WorkFault::CrossProject => Status::failed_precondition(fault.to_string()),
+            | WorkFault::CrossProject
+            | WorkFault::Undecided(_) => Status::failed_precondition(fault.to_string()),
             WorkFault::Graph(_) => Status::invalid_argument(fault.to_string()),
             WorkFault::Exists(reason) => Status::already_exists(*reason),
             WorkFault::Precondition(reason) => Status::failed_precondition(*reason),
@@ -911,6 +921,126 @@ impl FleetWork for FleetService {
         let reply = self
             .store
             .list_work_defers(user_id, request.get_ref())
+            .await
+            .map_err(|err| work_error(&err))?;
+        Ok(Response::new(reply))
+    }
+}
+
+#[tonic::async_trait]
+impl FleetRetro for FleetService {
+    async fn open_retro(
+        &self,
+        request: Request<OpenRetroRequest>,
+    ) -> Result<Response<Retro>, Status> {
+        let user_id = work_user(&request)?;
+        let reply = self
+            .store
+            .open_retro(user_id, request.get_ref(), &self.work_redactor)
+            .await
+            .map_err(|err| work_error(&err))?;
+        Ok(Response::new(reply))
+    }
+
+    async fn close_retro(
+        &self,
+        request: Request<CloseRetroRequest>,
+    ) -> Result<Response<Retro>, Status> {
+        let user_id = work_user(&request)?;
+        let reply = self
+            .store
+            .close_retro(user_id, request.get_ref())
+            .await
+            .map_err(|err| work_error(&err))?;
+        Ok(Response::new(reply))
+    }
+
+    async fn list_retros(
+        &self,
+        request: Request<ListRetrosRequest>,
+    ) -> Result<Response<ListRetrosReply>, Status> {
+        let user_id = work_user(&request)?;
+        let reply = self
+            .store
+            .list_retros(user_id, request.get_ref())
+            .await
+            .map_err(|err| work_error(&err))?;
+        Ok(Response::new(reply))
+    }
+
+    async fn file_improvement(
+        &self,
+        request: Request<FileImprovementRequest>,
+    ) -> Result<Response<Improvement>, Status> {
+        let user_id = work_user(&request)?;
+        let reply = self
+            .store
+            .file_improvement(user_id, request.get_ref(), &self.work_redactor)
+            .await
+            .map_err(|err| work_error(&err))?;
+        Ok(Response::new(reply))
+    }
+
+    async fn list_improvements(
+        &self,
+        request: Request<ListImprovementsRequest>,
+    ) -> Result<Response<ListImprovementsReply>, Status> {
+        let user_id = work_user(&request)?;
+        let reply = self
+            .store
+            .list_improvements(user_id, request.get_ref())
+            .await
+            .map_err(|err| work_error(&err))?;
+        Ok(Response::new(reply))
+    }
+
+    async fn disposition_improvement(
+        &self,
+        request: Request<DispositionImprovementRequest>,
+    ) -> Result<Response<Improvement>, Status> {
+        let user_id = work_user(&request)?;
+        let reply = self
+            .store
+            .disposition_improvement(user_id, request.get_ref(), &self.work_redactor)
+            .await
+            .map_err(|err| work_error(&err))?;
+        Ok(Response::new(reply))
+    }
+
+    async fn record_pitfall(
+        &self,
+        request: Request<RecordPitfallRequest>,
+    ) -> Result<Response<Pitfall>, Status> {
+        let user_id = work_user(&request)?;
+        let reply = self
+            .store
+            .record_pitfall(user_id, request.get_ref(), &self.work_redactor)
+            .await
+            .map_err(|err| work_error(&err))?;
+        Ok(Response::new(reply))
+    }
+
+    async fn list_pitfalls(
+        &self,
+        request: Request<ListPitfallsRequest>,
+    ) -> Result<Response<ListPitfallsReply>, Status> {
+        let user_id = work_user(&request)?;
+        let reply = self
+            .store
+            .list_pitfalls(user_id, request.get_ref())
+            .await
+            .map_err(|err| work_error(&err))?;
+        Ok(Response::new(reply))
+    }
+
+    async fn get_work_brief(
+        &self,
+        request: Request<GetWorkBriefRequest>,
+    ) -> Result<Response<GetWorkBriefReply>, Status> {
+        let user_id = work_user(&request)?;
+        let reply = self
+            .store
+            .get_work_brief(user_id, request.get_ref())
             .await
             .map_err(|err| work_error(&err))?;
         Ok(Response::new(reply))
@@ -1453,6 +1583,7 @@ fn routes(
         .max_decoding_message_size(MAX_CREDENTIAL_MESSAGE_BYTES);
     let repos = FleetReposServer::new(service.clone());
     let work = FleetWorkServer::new(service.clone());
+    let retro = FleetRetroServer::new(service.clone());
     let catalog = FleetCatalogServer::new(service.clone());
     let catalog_admin = FleetCatalogAdminServer::new(service.clone())
         .max_decoding_message_size(MAX_PROFILE_MESSAGE_BYTES);
@@ -1469,6 +1600,7 @@ fn routes(
         .add_service(credentials)
         .add_service(repos)
         .add_service(work)
+        .add_service(retro)
         .add_service(catalog)
         .add_service(catalog_admin)
         .add_service(capability_admin)

@@ -24,9 +24,12 @@
 //! to a database clock expiry, and [`Store::reap_work_leases`] closes an attempt past it as lost.
 //! `passes` and `fails` stay counts over attempts.
 
+mod brief;
 mod claim;
 mod defer;
 mod load;
+mod pitfall;
+mod retro;
 mod write;
 
 use std::fmt;
@@ -51,6 +54,17 @@ const MAX_LIST_PROJECTS: i64 = 1000;
 const MAX_DETAIL_ROWS: i64 = 200;
 const MAX_LIST_DEFERS: i64 = 1000;
 const MAX_NOTE_BYTES: usize = 4096;
+const MAX_REASON_CHARS: usize = 2000;
+const MAX_VERTICAL_CHARS: usize = 128;
+const MAX_SYMPTOM_CHARS: usize = 500;
+const MAX_CAUSE_CHARS: usize = 1000;
+const MAX_TEXT_INPUT_BYTES: usize = 262_144;
+const MAX_LIST_RETROS: i64 = 1000;
+const MAX_LIST_IMPROVEMENTS: i64 = 1000;
+const MAX_LIST_PITFALLS: i64 = 1000;
+/// Most occurrences one improvement counts. A filing past it is refused.
+pub const MAX_OCCURRENCES: i32 = 1_000_000;
+pub use brief::{BRIEF_TOKEN_BUDGET, BYTES_PER_TOKEN, MAX_BRIEF_CANDIDATES};
 
 /// Shortest lease a claim or renewal may ask for, in seconds.
 pub const MIN_LEASE_TTL_SECS: u32 = 10;
@@ -103,6 +117,12 @@ pub enum WorkFault {
     DeferNotFound,
     /// The dependency edge does not exist.
     DepNotFound,
+    /// The retro is unknown in that project.
+    RetroNotFound,
+    /// The improvement is unknown in that project.
+    ImprovementNotFound,
+    /// A retro cannot close while this many improvements of it have no disposition.
+    Undecided(i64),
     /// An input broke a rule. The text is fixed.
     Invalid(&'static str),
     /// The resulting graph is not valid.
@@ -125,6 +145,11 @@ impl fmt::Display for WorkFault {
             Self::DepNotFound => f.write_str("work dependency not found"),
             Self::AttemptNotFound => f.write_str("work attempt not found"),
             Self::DeferNotFound => f.write_str("work defer not found"),
+            Self::RetroNotFound => f.write_str("retro not found"),
+            Self::ImprovementNotFound => f.write_str("improvement not found"),
+            Self::Undecided(count) => {
+                write!(f, "retro has {count} improvements without a disposition")
+            }
             Self::Invalid(reason) | Self::Exists(reason) | Self::Precondition(reason) => {
                 f.write_str(reason)
             }
