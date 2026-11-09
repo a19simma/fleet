@@ -330,7 +330,7 @@ One typed unit that the view parser in `fleet_core::transcript` emits from a lin
 A `tool_use` joined to its `tool_result` by id in one **Transcript entry** (ADR-0062).
 
 **Hostile text**:
-A control character, format character, line or paragraph separator, or tag-block character. One set in `fleet_core::text` (ADR-0063). Strip paths remove it. Reject paths refuse it but allow ZWNJ and ZWJ.
+A control character, format character, line or paragraph separator, or tag-block character. One set in `fleet_core::text` (ADR-0063). Strip paths remove it. Reject paths refuse it but allow ZWNJ and ZWJ. It does not cover unassigned (`Cn`) or private-use (`Co`) code points.
 
 **Fleet note**:
 A non-JSON line that starts with `fleet: ` and that fleetd writes into a **Transcript**. Not authoritative: the Job row is (ADR-0062).

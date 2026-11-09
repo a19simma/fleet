@@ -17,6 +17,10 @@ Before this change six places kept their own hand-cut list of characters to stri
 - A character added to the set takes effect on every strip and reject path at once. A path cannot forget it.
 - A reject path accepts ZWNJ and ZWJ. A stored value can hold one, and any later strip path removes it. A secret split by ZWJ in a stored value is caught only when the value passes a strip path before redaction, which the sanitiser order guarantees for transcripts and shell commands.
 - The broker, proto and profile reject paths accept `U+200C` and `U+200D`. A broker Low finding stays open: a ZWJ inside a secret can split it past exact-match redaction when the value is rejected or stored rather than stripped.
+- Tag characters are refused as a block, so emoji tag flag sequences such as the England, Scotland and Wales flags are refused on reject paths and stripped on strip paths.
+- The broker check name redactor holds the static token, the leased token and every installation token by shape, so a check name never shows a GitHub token.
+- The CLI stream scrubber strips each piece before it redacts, so a secret that itself holds a hostile character is not matched in a stream. A bearer token cannot hold one.
+- A fetched body accepts unassigned and private-use code points (`Cn`, `Co`). Only the shared set and the fetch extra list refuse a body.
 - Profile prompts refuse the direction marks that proto plain text accepts. The two differ on purpose and the tests pin both.
 - A fetched body with a variation selector, which emoji presentation uses, is refused. The refusal is the existing behaviour.
 

@@ -2,7 +2,7 @@
 
 Status: Proposed 2026-11-08. The `fleet_core::transcript` module, the pretty `fleet logs` and the web transcript view are built. Amends ADR-0022 (reading), builds on ADR-0055. Decision 2 is amended by ADR-0063.
 
-ADR-0022 stores the stream-json output of a Job and serves it as raw lines. `fleet logs` prints those lines and the job page shows them in one `pre` block. A reader sees JSON, not the conversation. The web page also makes one `ReadTranscript` call with a 100-chunk limit, so a long Job is cut short without a marker.
+ADR-0022 stores the stream-json output of a Job and serves it as raw lines. `fleet logs` prints those lines and the job page shows them in one `pre` block. A reader sees JSON, not the conversation. The web page also makes one `ReadTranscript` call with a 100-chunk limit, so a long Job showed only its first 100 chunks, and the page said so only with a cut cue.
 
 ## Decision
 
@@ -10,18 +10,18 @@ The server keeps storing raw stream-json. Both surfaces parse it at read time wi
 
 1. **Parse at read time in `fleet_core::transcript`.** The module does no IO. Storage (`job_transcript`) stays raw stream-json, and the proto and `ReadTranscript` do not change. Precedent: ADR-0055 put `fleet_core::timing` in `fleet-core` for the CLI and the web to share, with a parity test and a GAPS list. This module gets the same pair.
 2. **One sanitiser for every decoded string field.** `is_hostile`, the hostile ranges and `strip_keeping_lines` live in `fleet_core::text`, and ADR-0063 defines the set. For each field the order is: redact, strip hostile characters, redact again, strip again, then cut at the field cap. Renderers never touch a raw string.
-3. **The web job page stays server-rendered Topcoat HTML with no new JS.** The CSP is `script-src 'self'` (ADR-0041), and styling uses literal class names and the committed `assets/ui.css` (ADR-0051). Tool calls are `details` elements. `?raw=1` shows the old `pre` block. A copy button and auto-refresh are deferred: each needs a new decision.
-4. **Caps.** A line over 256 KiB (`MAX_CHUNK_BYTES`) is rejected before parsing. Text is cut at 16 KiB. Tool output is cut at 16 KiB with an "N bytes more" note. A command summary is 200 characters. A view holds at most 20,000 entries. Nesting depth is 8, and the `serde_json` recursion limit of 128 stays. A truncated chunk becomes a `Truncated` entry and is never parsed. A non-JSON line is a Fleet note only when it starts with the exact prefix `fleet: `.
+3. **The web job page stays server-rendered Topcoat HTML with no new JS.** The CSP is `script-src 'self'`, set in `web/dispatch.rs` on every web response, and styling uses literal class names and the committed `assets/ui.css` (ADR-0051). Tool calls are `details` elements. `?raw=1` shows the old `pre` block. A copy button and auto-refresh are deferred: each needs a new decision.
+4. **Caps.** A line over 256 KiB (`MAX_CHUNK_BYTES`) is rejected before parsing. Text is cut at 16 KiB. Tool output is cut at 16 KiB with an "N bytes more" note. A command summary is 200 characters. A view holds at most 20,000 entries. Nesting depth is 8, and the `serde_json` recursion limit of 128 stays. A truncated chunk becomes a `Truncated` entry and is never parsed. A non-JSON line is a Fleet note only when it starts with the exact prefix `fleet: `. A line yields at most 256 entries (`MAX_ENTRIES_PER_LINE`) plus one `Truncated`. The view assembler holds at most 8 MiB of text, and `ViewLimits` carries every cap so tests can shrink them. An item nests under the call named by its parent id only when that call arrived earlier, otherwise it sits at the top level. A result with no earlier call is an orphan, shown alone until a later call with that id adopts it into a pair at the orphan's place.
 5. **`fleet logs` defaults to the pretty view.** `--raw` keeps the previous output byte for byte. Compatibility: a script that parses raw lines must add `--raw`. Color is on only for a TTY. `-f` streams line by line.
 6. **Unknown input degrades.** An unknown event type or shape becomes an `Unknown` entry. ADR-0044 names Codex and Kimi runners whose parsers do not exist yet, and their output must not break the view. The view parser is separate from the fleetd telemetry parser (ADR-0029) and, like it, never fails a read.
-7. **The web page pages `ReadTranscript`.** It follows `after_seq` until `done`, the 4 MiB and 50,000-row ceiling of ADR-0022, or the render cap, whichever comes first. Today it makes one read with a 100-chunk limit.
+7. **The web page pages `ReadTranscript`.** It follows `after_seq` until `done`, the 4 MiB and 50,000-row ceiling of ADR-0022, or the render cap, whichever comes first. The render cap is 256 KiB of stored bytes read, so it ends paging before the 4 MiB ceiling is reachable, and the 8 MiB byte cap of the view assembler is not reached on the web page. Before this ADR the page made one read with a 100-chunk limit.
 8. **Chunk shape.** ADR-0022 says a chunk is a batch of lines up to 64 KiB, while the runner sends one line per chunk. The parser splits each chunk on newline and never joins lines across chunks.
 
 ### Entries
 
 Terms are in `CONTEXT.md`. The parser turns each line into one **Transcript entry**: text, a **Tool pair** (a `tool_use` joined to its `tool_result` by id, shown as one unit, or alone when the other half is missing), a result with totals, a **Fleet note**, `Truncated` or `Unknown`.
 
-Per-turn `usage` can repeat across assistant events that share a message id. The parser dedupes by message id and takes totals from `result.usage`.
+Per-turn `usage` can repeat across assistant events that share a message id. The parser dedupes by message id and takes totals from `result.usage`. This is a design choice of this ADR with no earlier precedent.
 
 ## Consequences
 

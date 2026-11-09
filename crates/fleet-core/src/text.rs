@@ -66,7 +66,8 @@ pub fn is_hostile_allowing_joiners(c: char) -> bool {
     is_hostile(c) && !matches!(c, '\u{200C}'..='\u{200F}')
 }
 
-/// Strips hostile characters except newline and tab.
+/// Strips hostile characters except newline and tab. The keep set is exactly those two, so
+/// carriage return and U+0085 are removed.
 pub fn strip_keeping_lines(text: &str) -> String {
     strip(text, true)
 }

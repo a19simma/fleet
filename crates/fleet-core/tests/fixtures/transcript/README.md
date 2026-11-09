@@ -30,7 +30,7 @@ Every line parses as JSON except the documented exceptions: the last line of `tr
 One case per line: `label`, a TAB, then the value. The value is ASCII only and is decoded by the test:
 
 - `\uXXXX` (four hex digits) is one UTF-16 code unit. A high surrogate followed by a low surrogate forms one code point.
-- `<LONG:N>` as the whole value means a string of N `a` characters (an over-long line marker).
+- `<LONG:N>` as the whole value means a string of N `a` characters (an over-long line marker). `<LONG:70000>` is over the 16 KiB text cut and under the 256 KiB `MAX_CHUNK_BYTES` line cap.
 - An empty value (nothing after the TAB) is the empty string.
 - There is no other escape syntax. The values contain no literal backslash.
 
