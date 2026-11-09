@@ -4,11 +4,14 @@ pub mod batch;
 pub mod catalog;
 pub mod config;
 pub mod credential;
+pub mod edit;
 pub mod list;
 pub mod logs;
+pub mod patch;
 mod pretty;
 pub mod profile;
 pub mod repo;
+pub mod retro;
 pub mod stats;
 pub mod telemetry;
 pub mod timing;
@@ -23,10 +26,12 @@ use clap::{Parser, Subcommand};
 use fleet_core::text::{Cap, sanitise_lines, sanitise_text};
 use fleet_proto::v1::fleet_batches_client::FleetBatchesClient;
 use fleet_proto::v1::fleet_credentials_client::FleetCredentialsClient;
+use fleet_proto::v1::fleet_edit_client::FleetEditClient;
 use fleet_proto::v1::fleet_jobs_client::FleetJobsClient;
 use fleet_proto::v1::fleet_profiles_client::FleetProfilesClient;
 use fleet_proto::v1::fleet_query_client::FleetQueryClient;
 use fleet_proto::v1::fleet_repos_client::FleetReposClient;
+use fleet_proto::v1::fleet_retro_client::FleetRetroClient;
 use fleet_proto::v1::fleet_work_client::FleetWorkClient;
 use fleet_proto::v1::{
     CancelJobRequest, GetJobRequest, Job, JobState, ListJobsRequest, SubmitJobRequest,
@@ -211,6 +216,14 @@ pub enum Command {
     },
     /// Manage Work projects, items, claims and Defers on the server.
     Work(work::WorkArgs),
+    /// Open and close Retros and read the brief for a Work item.
+    Retro(retro::RetroArgs),
+    /// File, list and decide Improvements.
+    Improvement(retro::ImprovementArgs),
+    /// Record and list Pitfalls.
+    Pitfall(retro::PitfallArgs),
+    /// File, decide and apply suggested edits.
+    Edit(edit::EditArgs),
 }
 
 /// A `fleet batch` action.
@@ -344,6 +357,8 @@ pub enum CliError {
     NoTimingReport,
     /// A credential command ended in a fixed notice. It holds no server text or input.
     Credential(CredentialNotice),
+    /// `edit apply` refused or failed. The message is fixed text and scrubbed git output.
+    Apply(String),
 }
 
 impl CliError {
@@ -368,6 +383,7 @@ impl CliError {
             | Self::Rpc(_)
             | Self::Io(_)
             | Self::JobEnded(_)
+            | Self::Apply(_)
             | Self::Credential(_) => 1,
         }
     }
@@ -530,7 +546,7 @@ impl fmt::Display for CliError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Config(e) => write!(f, "{e}"),
-            Self::Usage(m) => write!(f, "{m}"),
+            Self::Usage(m) | Self::Apply(m) => write!(f, "{m}"),
             Self::Connect(m) => write!(f, "cannot connect: {m}"),
             Self::Rpc(s) => write!(
                 f,
@@ -577,6 +593,8 @@ struct Session {
     credentials: credential::CredentialsClient,
     repos: repo::ReposClient,
     work: work::WorkClient,
+    retro: retro::RetroClient,
+    edit: edit::EditClient,
     scrub: Scrub,
 }
 
@@ -737,7 +755,11 @@ async fn session(env: &Resolution, timeouts: bool) -> Result<Session, CliError> 
             .max_decoding_message_size(MAX_DECODE_BYTES),
         repos: FleetReposClient::with_interceptor(channel.clone(), token.clone())
             .max_decoding_message_size(MAX_DECODE_BYTES),
-        work: FleetWorkClient::with_interceptor(channel, token)
+        work: FleetWorkClient::with_interceptor(channel.clone(), token.clone())
+            .max_decoding_message_size(MAX_DECODE_BYTES),
+        retro: FleetRetroClient::with_interceptor(channel.clone(), token.clone())
+            .max_decoding_message_size(MAX_DECODE_BYTES),
+        edit: FleetEditClient::with_interceptor(channel, token)
             .max_decoding_message_size(MAX_DECODE_BYTES),
     })
 }
@@ -900,6 +922,28 @@ async fn run_work(
     let call = args.prepare(stdin)?;
     let mut session = session(env, timeouts).await?;
     work::execute(call, &mut session.work, &session.scrub, out).await
+}
+
+async fn run_family(
+    command: Command,
+    env: &Resolution,
+    timeouts: bool,
+    stdin: &mut impl Read,
+    out: &mut impl Write,
+) -> Result<(), CliError> {
+    let call = match command {
+        Command::Retro(args) => args.prepare()?,
+        Command::Improvement(args) => args.prepare()?,
+        Command::Pitfall(args) => args.prepare()?,
+        Command::Edit(args) => {
+            let call = args.prepare(stdin)?;
+            let mut session = session(env, timeouts).await?;
+            return edit::execute(call, &mut session.edit, &session.scrub, out).await;
+        }
+        _ => return Ok(()),
+    };
+    let mut session = session(env, timeouts).await?;
+    retro::execute(call, &mut session.retro, &session.scrub, out).await
 }
 
 async fn run_profile(
@@ -1074,6 +1118,10 @@ async fn run_logs(
     logs::logs(&session.jobs, &session.scrub, id, follow, view, out).await
 }
 
+#[expect(
+    clippy::too_many_lines,
+    reason = "one arm per command; each arm only routes to its module"
+)]
 async fn dispatch(
     command: Command,
     env: &Resolution,
@@ -1174,6 +1222,10 @@ async fn dispatch(
         Command::Credential { action } => run_credential(action, env, timeouts, stdin, out).await?,
         Command::Repo { action } => run_repo(action, env, timeouts, out).await?,
         Command::Work(args) => run_work(args, env, timeouts, stdin, out).await?,
+        family @ (Command::Retro(_)
+        | Command::Improvement(_)
+        | Command::Pitfall(_)
+        | Command::Edit(_)) => run_family(family, env, timeouts, stdin, out).await?,
         Command::Cancel { id } => {
             let session = session(env, timeouts).await?;
             cancel(session.jobs, &session.scrub, id, out).await?;

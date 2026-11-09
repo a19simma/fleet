@@ -1,6 +1,6 @@
 # Retros, improvements and pitfalls
 
-Status: Proposed 2026-11-09, not built (WRK-7, WRK-8, WRK-10, WRK-11). Builds on ADR-0064 and ADR-0063. Extended by ADR-0066.
+Status: Proposed 2026-11-09, CLI built in WRK-10, Web not built (WRK-11). Builds on ADR-0064 and ADR-0063. Extended by ADR-0066.
 
 A ralph loop learns from `progress.md` lines and `CLAUDE.md` notes that a person copies by hand. A lesson found in one Attempt is lost to the next worker unless someone files it. This ADR gives the server a place for what a loop learns and a way to hand it back to the next Attempt.
 
