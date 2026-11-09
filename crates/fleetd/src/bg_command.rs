@@ -110,7 +110,7 @@ pub enum PueueError {
     NoStdout,
     /// Reading the command's stdout failed before the cap was crossed.
     Read,
-    /// The command exited with a failure.
+    /// The command exited with a failure or its exit status could not be read.
     Status,
     /// The reply exceeded its byte cap.
     TooLarge,

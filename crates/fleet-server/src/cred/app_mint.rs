@@ -3,7 +3,9 @@
 //! The client talks to the fixed `https://api.github.com` (SEC-020). Redirects are never
 //! followed: hyper does not follow them and any status other than the expected one is an error.
 //! The request body is built with `serde_json` from server constants and the Job repository
-//! name (SEC-019). The URL is built from the `u64` installation id.
+//! name (SEC-019). The URL is built from the `u64` installation id. The client dials the host
+//! name `api.github.com` through ordinary name resolution and does not vet the resolved address
+//! the way `cred::pinned` does.
 //!
 //! Every response is validated before the token is returned (SEC-016): the permissions must be
 //! a subset of [`ACCEPTED_PERMISSIONS`], `repositories` must be exactly the one requested and

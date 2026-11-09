@@ -410,7 +410,7 @@ impl Scrub {
         &self.redactor
     }
 
-    /// Redacts, strips, redacts, strips and cuts `text`, keeping newline and tab.
+    /// Redacts, strips, redacts and strips `text` with no length cap, keeping newline and tab.
     #[must_use]
     pub fn text(&self, text: &str) -> String {
         scrub(&self.redactor, text)

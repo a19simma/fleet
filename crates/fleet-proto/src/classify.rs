@@ -1,4 +1,4 @@
-//! One classifier for the fixed `(Code, message)` credential refusals.
+//! Classifies the fixed `(Code, message)` credential refusals.
 
 use tonic::Code;
 
@@ -17,7 +17,7 @@ use crate::{
 pub enum Reason {
     /// `FAILED_PRECONDITION`: no GitHub credential stored.
     NoGithub,
-    /// `FAILED_PRECONDITION`: no credential for the job's agent.
+    /// `FAILED_PRECONDITION`: no credential for the Job's agent.
     NoAgent,
     /// `FAILED_PRECONDITION`: a credential has expired.
     Expired,
@@ -33,9 +33,10 @@ pub enum Reason {
     AppInstallation,
     /// `FAILED_PRECONDITION`: the Job repository is refused.
     AppRepo,
-    /// `FAILED_PRECONDITION`: a verify has no Job repository.
+    /// `FAILED_PRECONDITION`: a `github_app` verify has no Job repository to scope its mint to.
     NoVerifyRepo,
-    /// `FAILED_PRECONDITION`: the credential is a tombstone.
+    /// `FAILED_PRECONDITION`: a `PutCredential` hit a credential that was deleted and kept as a
+    /// tombstone because it has mint history.
     Tombstoned,
     /// `FAILED_PRECONDITION`: the repository host is not allowed or has no verifier.
     RepoNotAllowedHost,
@@ -51,7 +52,7 @@ pub enum Reason {
     CapabilityNotGranted,
     /// `PERMISSION_DENIED`: a per-user token is needed.
     NeedsUserToken,
-    /// `PERMISSION_DENIED`: no running job holds the lease.
+    /// `PERMISSION_DENIED`: no running Job holds the lease.
     LeaseMismatch,
     /// `INVALID_ARGUMENT`: GitHub rejected the token.
     GithubRejected,

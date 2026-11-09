@@ -130,7 +130,7 @@ lands with the verifier, ahead of any registry code.
 ### Runnable
 
 `fleet repo list` prints a `runnable` field per row. It is false for every non-GitHub host until
-fleetd delivers a token per host (REPO-9). Today `RepoPolicy` in `crates/fleetd/src/workspace.rs`
+fleetd delivers a token per host. Today `RepoPolicy` in `crates/fleetd/src/workspace.rs`
 carries a single `token_host`, and the Gitea slot in `crates/fleetd/src/forge/gitea.rs` returns
 `ForgeError::Unsupported`. A row on a host that is not runnable still lists and still verifies.
 
@@ -164,7 +164,7 @@ host's. Until migration 0037 adds `credentials.host`, an unhosted GitHub credent
 `github.com` only. TLS SNI and certificate verification use the hostname, not the IP. TLS 1.2 is the minimum
 and no option skips verification. Test seams are injected parameters. The `Authorization` header
 is never sent on a redirect: a 3xx is an error and its body is not parsed. The forge response body
-is read with `take(cap + 1)` and a truncated JSON body fails. The token is opaque, with no format
+is read through a length limit, `MAX_BODY_BYTES` (256 KiB in `cred/pinned.rs`), and a body over it fails. The token is opaque, with no format
 validation. It is redacted in `Debug` and tracing and never logged. Storing a credential for a
 host also checks the operator host list.
 
