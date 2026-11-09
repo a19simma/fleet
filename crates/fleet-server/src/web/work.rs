@@ -1,5 +1,5 @@
 //! The work tracker pages: projects, board, dependency graph, slice locks, item timeline and
-//! defers by vertical (ADR-0064).
+//! defers by vertical (ADR-0064). The retro, pitfall and edit pages live in `review`.
 //!
 //! Every route needs a session and reads through the owner-scoped store calls with the
 //! session's user id, so a project of another user, an unknown project and a name that fails
@@ -70,15 +70,18 @@ const MERGEABLE_PATHS: &str =
 path_param!(project_name);
 path_param!(item_name);
 
-const TABS: [(&str, &str, &str); 4] = [
+const TABS: [(&str, &str, &str); 7] = [
     ("board", "", "Board"),
     ("graph", "/graph", "Graph"),
     ("locks", "/locks", "Locks"),
     ("defers", "/defers", "Defers"),
+    ("retros", "/retros", "Retros"),
+    ("pitfalls", "/pitfalls", "Pitfalls"),
+    ("edits", "/edits", "Edits"),
 ];
 
 /// A stored string as one clean line of at most [`LINE_CHARS`] characters.
-fn line(text: &str) -> String {
+pub(super) fn line(text: &str) -> String {
     let clean = sanitise_text(&Redactor::default(), text, Cap::Chars(LINE_CHARS));
     if clean.cut {
         format!("{}...", clean.text)
@@ -88,13 +91,13 @@ fn line(text: &str) -> String {
 }
 
 /// A stored string as clean text that keeps newline and tab, cut at [`BLOCK_BYTES`].
-fn block(text: &str) -> (String, bool) {
+pub(super) fn block(text: &str) -> (String, bool) {
     let clean = sanitise_lines(&Redactor::default(), text, Cap::Bytes(BLOCK_BYTES));
     (clean.text, clean.cut)
 }
 
 /// Percent-encodes every byte outside the unreserved set of RFC 3986.
-fn slug(text: &str) -> String {
+pub(super) fn slug(text: &str) -> String {
     let mut out = String::with_capacity(text.len());
     for byte in text.bytes() {
         if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'.' | b'_' | b'~') {
@@ -106,15 +109,15 @@ fn slug(text: &str) -> String {
     out
 }
 
-fn project_url(project: &str) -> String {
+pub(super) fn project_url(project: &str) -> String {
     format!("/work/{}", slug(project))
 }
 
-fn item_url(project: &str, item: &str) -> String {
+pub(super) fn item_url(project: &str, item: &str) -> String {
     format!("/work/{}/items/{}", slug(project), slug(item))
 }
 
-fn checked(name: &str) -> Result<&str> {
+pub(super) fn checked(name: &str) -> Result<&str> {
     if name.is_empty() || name.chars().count() > MAX_NAME_CHARS || name.chars().any(is_hostile) {
         Err(not_found().into())
     } else {
@@ -122,7 +125,7 @@ fn checked(name: &str) -> Result<&str> {
     }
 }
 
-fn internal(err: &dyn std::fmt::Display) -> topcoat::Error {
+pub(super) fn internal(err: &dyn std::fmt::Display) -> topcoat::Error {
     tracing::error!(error = %err, "work page read failed");
     fail(AuthError::Internal)
 }
@@ -136,14 +139,14 @@ fn read_error(err: StoreError) -> topcoat::Error {
     }
 }
 
-struct Viewer<'a> {
-    store: &'a Store,
-    user_id: i64,
-    username: String,
-    csrf: String,
+pub(super) struct Viewer<'a> {
+    pub(super) store: &'a Store,
+    pub(super) user_id: i64,
+    pub(super) username: String,
+    pub(super) csrf: String,
 }
 
-async fn viewer(cx: &Cx) -> Result<Viewer<'_>> {
+pub(super) async fn viewer(cx: &Cx) -> Result<Viewer<'_>> {
     let store = app_context::<ConsoleSlot>(cx)
         .0
         .as_deref()
@@ -208,7 +211,7 @@ fn defer_state(defer: &WorkDefer) -> &'static str {
     }
 }
 
-fn state_badge(state: &str) -> &'static str {
+pub(super) fn state_badge(state: &str) -> &'static str {
     match state {
         "open" | "pass" => "badge badge-sm badge-success",
         "blocked" | "fail" | "lost" => "badge badge-sm badge-error",
@@ -218,7 +221,11 @@ fn state_badge(state: &str) -> &'static str {
 }
 
 #[component]
-async fn project_head(name: String, slug: String, active: &'static str) -> Result<impl View> {
+pub(super) async fn project_head(
+    name: String,
+    slug: String,
+    active: &'static str,
+) -> Result<impl View> {
     let tabs: Vec<(String, &'static str, (), bool)> = TABS
         .iter()
         .map(|(id, suffix, label)| (format!("/work/{slug}{suffix}"), *label, (), *id == active))
@@ -634,12 +641,12 @@ async fn locks_page(cx: &Cx) -> Result<impl View> {
     })
 }
 
-struct Text {
+pub(super) struct Text {
     text: String,
     cut: bool,
 }
 
-fn text_of(raw: &str) -> Text {
+pub(super) fn text_of(raw: &str) -> Text {
     let (text, cut) = block(raw);
     Text { text, cut }
 }
@@ -729,7 +736,7 @@ fn item_view(project: &str, reply: &GetWorkItemReply) -> Result<ItemView> {
 }
 
 #[component]
-async fn cell_text(text: Text) -> Result<impl View> {
+pub(super) async fn cell_text(text: Text) -> Result<impl View> {
     Ok(view! {
         <pre class="max-h-48 overflow-auto whitespace-pre-wrap text-xs">(text.text.as_str())</pre>
         if text.cut {

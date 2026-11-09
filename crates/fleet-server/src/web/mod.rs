@@ -4,7 +4,8 @@
 //! loop so HTTP/1 clients get a header-read timeout. [`Dispatch`] sends gRPC calls to the
 //! authenticated tonic routes and every other request to the Topcoat router, behind
 //! [`CatchPanic`], then stamps the security headers. [`WebAuth`] holds passkey login and
-//! sessions (ADR 0042). The work tracker pages live in `work` (ADR 0064).
+//! sessions (ADR 0042). The work tracker pages live in `work` (ADR 0064) and the retro, pitfall
+//! and suggested-edit pages in `review` (ADR 0065, ADR 0066).
 
 mod capabilities;
 mod catalog;
@@ -18,6 +19,7 @@ mod panic;
 mod passkeys;
 mod profiles;
 mod repos;
+mod review;
 mod serve;
 mod timing;
 mod tokens;
