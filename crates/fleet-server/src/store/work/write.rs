@@ -30,7 +30,10 @@ WHERE p.user_id = $1 AND k.key = $2 AND k.rpc = 'CreateWorkProject'";
 
 const NAME_TAKEN: &str = "SELECT 1 FROM work_project WHERE user_id = $1 AND name = $2";
 
-const FIND_REPO: &str = "SELECT id FROM user_repos WHERE user_id = $1 AND host = $2 AND path = $3";
+const LOCK_REPO: &str = "\
+SELECT id FROM user_repos WHERE user_id = $1 AND host = $2 AND path = $3 FOR SHARE";
+
+const UPDATE_REPO: &str = "UPDATE work_project SET repo_id = $2 WHERE id = $1";
 
 const INSERT_PROJECT: &str = "\
 INSERT INTO work_project (user_id, name, repo_id) VALUES ($1, $2, $3) \
@@ -201,7 +204,7 @@ impl Store {
         let repo_id: Option<i64> = match &located {
             None => None,
             Some((host, path)) => Some(
-                sqlx::query_scalar(FIND_REPO)
+                sqlx::query_scalar(LOCK_REPO)
                     .bind(user_id)
                     .bind(host)
                     .bind(path)
@@ -237,6 +240,73 @@ impl Store {
         )
         .await?;
         Self::finish_graph_write(tx, project_id, key, RPC, &request_digest, &reply).await?;
+        Ok(reply)
+    }
+
+    /// Binds the repository `repo` (`host/path`) to a project, or clears the binding with `None`.
+    ///
+    /// The transaction takes `FOR UPDATE` on the project row before it reads anything, then
+    /// `FOR SHARE` on the registry row of the same owner, so a registry delete in flight finishes
+    /// first and the lookup then finds nothing. A repository that is unknown and one that belongs
+    /// to another user give the same [`WorkFault::RepoNotRegistered`]. Removing a registry row
+    /// later clears the binding (`ON DELETE SET NULL`, migration 0041).
+    ///
+    /// # Errors
+    ///
+    /// [`WorkFault::ProjectNotFound`] for an unknown or foreign project, [`WorkFault::Invalid`]
+    /// for repository text that does not parse and [`WorkFault::RepoNotRegistered`] when the
+    /// caller has no such registry row.
+    pub async fn set_work_project_repo(
+        &self,
+        user_id: i64,
+        project: &str,
+        repo: Option<&str>,
+    ) -> Result<WorkProject, StoreError> {
+        let located = repo
+            .map(|raw| RepoRef::locate(raw).map_err(|_| WorkFault::Invalid("invalid repository")))
+            .transpose()?;
+        let mut tx = self.pool.begin().await?;
+        let project_id = lock_project(&mut tx, user_id, project).await?;
+        let repo_id: Option<i64> = match &located {
+            None => None,
+            Some((host, path)) => Some(
+                sqlx::query_scalar(LOCK_REPO)
+                    .bind(user_id)
+                    .bind(host)
+                    .bind(path)
+                    .fetch_optional(&mut *tx)
+                    .await?
+                    .ok_or(WorkFault::RepoNotRegistered)?,
+            ),
+        };
+        sqlx::query(UPDATE_REPO)
+            .bind(project_id)
+            .bind(repo_id)
+            .execute(&mut *tx)
+            .await?;
+        insert_event(
+            &mut tx,
+            project_id,
+            None,
+            None,
+            "updated",
+            &actor(user_id),
+            "repository set",
+        )
+        .await?;
+        let row = sqlx::query(PROJECT_ROW)
+            .bind(project_id)
+            .fetch_one(&mut *tx)
+            .await?;
+        let reply = project_view(
+            &mut tx,
+            project_id,
+            row.try_get("name")?,
+            row.try_get("repo")?,
+            row.try_get("created_ms")?,
+        )
+        .await?;
+        tx.commit().await?;
         Ok(reply)
     }
 
