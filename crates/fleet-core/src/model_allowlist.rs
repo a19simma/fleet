@@ -63,6 +63,9 @@ pub struct ModelDenied {
 
 impl ModelDenied {
     /// The denied model name, escaped and capped.
+    ///
+    /// Unsafe characters are escaped as `\u{..}`, but `<`, `>`, `"`, `'`, `&` and the backtick
+    /// are kept. A caller that renders the name as HTML or markdown must escape it.
     #[must_use]
     pub fn model(&self) -> &str {
         &self.model

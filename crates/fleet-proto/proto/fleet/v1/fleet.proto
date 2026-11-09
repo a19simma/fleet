@@ -502,6 +502,7 @@ message ReportJobRequest {
   optional JobCi ci = 15;
 }
 
+// Kind of one job telemetry event.
 enum JobEventKind {
   JOB_EVENT_KIND_UNSPECIFIED = 0;
   JOB_EVENT_KIND_TOOL = 1;
@@ -512,6 +513,7 @@ enum JobEventKind {
   JOB_EVENT_KIND_FETCH = 6;
 }
 
+// One telemetry event of a job, ordered by seq. Which optional fields are set depends on kind.
 message JobEvent {
   uint32 seq = 1;
   uint64 ts_ms = 2;
@@ -527,6 +529,7 @@ message JobEvent {
   optional string detail = 12;
 }
 
+// Aggregate telemetry of a job. complete is false while any field named in missing is unknown.
 message JobSummary {
   optional uint64 turns = 1;
   optional uint64 duration_ms = 2;
