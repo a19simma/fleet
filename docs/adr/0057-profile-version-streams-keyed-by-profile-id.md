@@ -25,7 +25,7 @@ Migration 0023 added the `profile.id` surrogate key with `UNIQUE (owner_user_id,
 ### Blobs
 
 - A blob stays keyed by hash and is shared by content across owners.
-- A create reply must not reveal whether a blob or a hash exists for another owner. Requirement: a create of a blob that already exists returns the same status and the same body fields as a create of a new blob. Test: create the same content twice from two owners and compare the two replies field by field. Timing parity is a goal that no test measures.
+- A create reply must not reveal whether a blob or a hash exists for another owner. Requirement: a create of a blob that already exists returns the same status and the same body fields as a create of a new blob. Test (no such test found in the tree, unverified): create the same content twice from two owners and compare the two replies field by field. Timing parity is a goal that no test measures.
 
 ## Amends
 

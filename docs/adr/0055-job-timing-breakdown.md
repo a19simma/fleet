@@ -1,6 +1,6 @@
 # Job timing breakdown and loopback OTLP receiver
 
-Status: Proposed 2026-11-02. Built in fleetd and the server: timing capture, aggregation, `ReportTiming`, `BgWatcher` and the shell log RPCs. Not built: fleetd pushing pueue task logs to the server. A live end-to-end run is unverified, and loopback reachability has a probe written but not run on a live host. Supersedes the "Not built" bullet of ADR-0029 (no OTLP receiver, no pueue). Amends ADR-0029 and ADR-0031.
+Status: Proposed 2026-11-02. Built in fleetd and the server: timing capture, aggregation, `ReportTiming`, `BgWatcher` and the shell log RPCs. Not built: fleetd pushing pueue task logs to the server. A live end-to-end run is unverified, and loopback reachability has a probe written but not run on a live host. Supersedes the "Not built" bullet of ADR-0029 (no OTLP receiver, no pueue). Amends ADR-0029 and ADR-0031. Amended by ADR-0067.
 
 Supersedes: the "No OTLP receiver, no pueue, no wrapper around Bash" bullet of ADR-0029, in part. The no-wrapper rule stays.
 

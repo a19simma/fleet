@@ -22,7 +22,7 @@ The hosted Fleet service. It stores box state, jobs, transcripts, job timing and
 ## Modules
 
 - `catalog`: the global Catalog of skill, subagent, tool and context items (ADR-0053). An admin creates and enables items through `FleetCatalogAdmin` or the `/catalog` pages. A Profile switches items off and the effective set is resolved at submit.
-- `cred::capability`: per-user capability grants. `profile:tools` (ADR-0054) lets a user save a Profile with tools. `forge:github_app` (ADR-0058) gates the `github_app` credential kind at put, release and verify through `cred::store::required_capability`, which maps the `github_app` kind. Migration 0034 widens the table CHECK to both names, and the admin capability page lists, grants and revokes each one.
+- `cred::capability`: per-user capability grants. `profile:tools` (ADR-0054) lets a user save a Profile with tools. `forge:github_app` (ADR-0058) gates the `github_app` credential kind at put, release and verify through `cred::store::required_capability`, which maps the `github_app` kind. Migrations 0034 and 0039 widen the table CHECK to three names, adding `env:scripts` (ADR-0067), and the admin capability page lists, grants and revokes each one.
 - `cred::https`, `cred::pinned`: the shared https client plumbing and the SSRF-safe forge connector (ADR-0059). The connector:
   - resolves a host once and vets every address with `is_vetted`;
   - admits global unicast only: metadata addresses, loopback, link-local, CGNAT `100.64/10`, documentation and 6to4 ranges are always refused;

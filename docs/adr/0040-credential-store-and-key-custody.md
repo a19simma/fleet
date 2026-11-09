@@ -1,6 +1,6 @@
 # Credential store and key custody
 
-Status: Proposed 2026-10-29. Built in fleet-server: the sealed store, `FileSealer`, the key ring loaded from the master key file at startup, and the insert-only `credential_use` audit (migrations 0017 and 0019). Not built: the re-seal pass (`Sealer::rewrap` exists and no code calls it) and a key ring reload without a restart. Amends ADR-0013 (storage). Refers to ADR-0043 for the credential kinds and shapes this store holds. Amended by ADR-0058.
+Status: Proposed 2026-10-29. Built in fleet-server: the sealed store, `FileSealer`, the key ring loaded from the master key file at startup, and the insert-only `credential_use` audit (migrations 0017 and 0019). Not built: the re-seal pass (`Sealer::rewrap` exists and no code calls it) and a key ring reload without a restart. Amends ADR-0013 (storage). Refers to ADR-0043 for the credential kinds and shapes this store holds. Amended by ADR-0058 and ADR-0067.
 
 Fleet will run Jobs with the user's own agent and forge credentials. The server must keep them between Jobs and hand them to a Box only for the Job that needs them. This ADR fixes where they live, how they are sealed and who holds the key.
 
