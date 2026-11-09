@@ -19,7 +19,7 @@ use fleet_server::cred::store::CredentialStore;
 use fleet_server::cred::{CredentialService, FileSealer, Users};
 use fleet_server::service::serve_with_web;
 use fleet_server::store::Store;
-use fleet_server::web::{SESSION_COOKIE, STYLE_CSS, Web, WebAuth};
+use fleet_server::web::{NAV_FOCUS_JS, SESSION_COOKIE, STYLE_CSS, Web, WebAuth};
 use sqlx::PgPool;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
@@ -65,6 +65,7 @@ fn sealers_built_in_parallel_do_not_share_a_key_file() {
 
 struct Reply {
     status: u16,
+    content_type: String,
     body: String,
 }
 
@@ -139,8 +140,15 @@ impl Harness {
             .unwrap();
         let raw = String::from_utf8_lossy(&raw).into_owned();
         let (head, body) = raw.split_once("\r\n\r\n").unwrap();
+        let content_type = head
+            .lines()
+            .filter_map(|line| line.split_once(':'))
+            .find(|(name, _)| name.eq_ignore_ascii_case("content-type"))
+            .map(|(_, value)| value.trim().to_owned())
+            .unwrap_or_default();
         Reply {
             status: head.split(' ').nth(1).unwrap().parse().unwrap(),
+            content_type,
             body: body.to_owned(),
         }
     }
@@ -389,6 +397,97 @@ fn nav_links_have_a_24px_minimum_target() {
     );
 }
 
+#[test]
+fn the_top_bar_fade_rule_masks_the_clipped_edge() {
+    assert!(
+        STYLE_CSS.contains(".nav-fade{") && STYLE_CSS.contains("mask-image:linear-gradient("),
+        "no nav-fade mask rule"
+    );
+}
+
+#[test]
+fn shell_buttons_have_a_24px_minimum_target() {
+    assert!(
+        STYLE_CSS.contains("nav .btn-xs{min-block-size:24px}"),
+        "no 24px nav button rule"
+    );
+}
+
+#[sqlx::test]
+async fn the_top_bar_scrolls_with_a_fade_cue_and_focus_padding(pool: PgPool) {
+    let h = Harness::start(pool).await;
+    let cookie = h.cookie().await;
+    let page = h.get("/jobs", Some(&cookie)).await;
+    let navs = tags(&page.body, "nav");
+    let bar = navs.iter().find(|t| t.contains("lg:hidden")).unwrap();
+    let bar_class = attr(bar, "class").unwrap();
+    for want in ["nav-fade", "scroll-px-8", "overflow-x-auto", "gap-1"] {
+        assert!(bar_class.split(' ').any(|c| c == want), "{bar} {want}");
+    }
+    assert!(!bar_class.split(' ').any(|c| c == "gap-3"), "{bar}");
+    let lists = tags(&page.body, "ul");
+    let list = lists
+        .iter()
+        .find(|t| t.contains("menu-horizontal"))
+        .unwrap();
+    let list_class = attr(list, "class").unwrap();
+    for want in ["p-0", "pe-8"] {
+        assert!(list_class.split(' ').any(|c| c == want), "{list} {want}");
+    }
+    h.finish().await;
+}
+
+#[sqlx::test]
+async fn the_signed_in_shell_links_the_nav_focus_script(pool: PgPool) {
+    let h = Harness::start(pool).await;
+    let cookie = h.cookie().await;
+    let page = h.get("/jobs", Some(&cookie)).await;
+    let scripts = tags(&page.body, "script");
+    assert!(
+        scripts
+            .iter()
+            .any(|t| attr(t, "src") == Some("/static/navfocus.js")),
+        "{scripts:?}"
+    );
+    let login = h.get("/login", None).await;
+    assert!(!login.body.contains("/static/navfocus.js"));
+    h.finish().await;
+}
+
+#[sqlx::test]
+async fn the_nav_focus_script_is_served_and_clears_the_fade_zone(pool: PgPool) {
+    let h = Harness::start(pool).await;
+    let reply = h.get("/static/navfocus.js", None).await;
+    assert_eq!(reply.status, 200);
+    assert!(reply.content_type.starts_with("text/javascript"));
+    assert_eq!(reply.body, NAV_FOCUS_JS);
+    for want in [
+        "focusin",
+        "getBoundingClientRect",
+        "scrollLeft",
+        "Main mobile",
+    ] {
+        assert!(reply.body.contains(want), "{want}");
+    }
+    assert!(!reply.body.contains("innerHTML"));
+    assert!(!reply.body.contains("smooth"));
+    h.finish().await;
+}
+
+#[sqlx::test]
+async fn the_desktop_sidebar_is_sticky_and_scrolls_on_its_own(pool: PgPool) {
+    let h = Harness::start(pool).await;
+    let cookie = h.cookie().await;
+    let page = h.get("/jobs", Some(&cookie)).await;
+    let navs = tags(&page.body, "nav");
+    let side = navs.iter().find(|t| t.contains("lg:w-48")).unwrap();
+    let class = attr(side, "class").unwrap();
+    for want in ["lg:sticky", "lg:top-0", "lg:h-screen", "lg:overflow-y-auto"] {
+        assert!(class.split(' ').any(|c| c == want), "{side} {want}");
+    }
+    h.finish().await;
+}
+
 #[sqlx::test]
 async fn the_shell_is_a_sidebar_from_lg_and_a_top_bar_below(pool: PgPool) {
     let h = Harness::start(pool).await;
@@ -414,7 +513,7 @@ async fn the_shell_is_a_sidebar_from_lg_and_a_top_bar_below(pool: PgPool) {
     for want in [
         "flex",
         "overflow-x-auto",
-        "gap-3",
+        "gap-1",
         "border-b",
         "border-base-300",
     ] {
