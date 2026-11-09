@@ -23,9 +23,10 @@ use fleet_server::cred::repo_store::RepoStore;
 use fleet_server::cred::repo_verify::{GithubVerifier, RepoVerifiers};
 use fleet_server::cred::store::{AppIdCheck, AppLane, CredentialStore};
 use fleet_server::cred::{CredentialService, RepoService, Users};
+use fleet_server::environments::{EnvironmentService, EnvironmentStore};
 use fleet_server::reaper::{DEFAULT_REAP_PERIOD, run_reaper};
 use fleet_server::retention::run_retention;
-use fleet_server::service::{UpdateRelay, serve_with_credentials};
+use fleet_server::service::{UpdateRelay, serve_with_environments};
 use fleet_server::store::Store;
 use fleet_server::supervise::{BoxError, supervise};
 use fleet_server::update_feed::{FeedCache, FeedPoller, FeedSource, ReleaseFeed, SystemJitter};
@@ -112,16 +113,17 @@ async fn credential_service(
     config: &Config,
     pool: &sqlx::PgPool,
     github_app: Option<AppLane>,
-) -> Result<Option<CredentialService>, BoxError> {
+) -> Result<(Option<CredentialService>, Option<EnvironmentService>), BoxError> {
     let rows_exist: bool = sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM credentials)")
         .fetch_one(pool)
         .await?;
     let state = CredentialsState::resolve(config.master_key_file.as_deref(), rows_exist)?;
     let CredentialsState::Enabled(sealer) = state else {
         tracing::info!("{}", CredentialsState::DISABLED_NOTICE);
-        return Ok(None);
+        return Ok((None, None));
     };
     tracing::info!("credential master key loaded");
+    let environments = EnvironmentService::new(EnvironmentStore::new(pool.clone(), sealer.clone()));
     let github = HttpsGithub::new()?;
     let mut store = CredentialStore::new(pool.clone(), sealer);
     if let Some(lane) = github_app {
@@ -135,8 +137,9 @@ async fn credential_service(
         RepoStore::new(pool.clone(), store.clone()),
         Arc::new(verifiers),
     );
-    Ok(Some(
-        CredentialService::new(store, Arc::new(github)).with_repos(repos),
+    Ok((
+        Some(CredentialService::new(store, Arc::new(github)).with_repos(repos)),
+        Some(environments),
     ))
 }
 
@@ -236,20 +239,25 @@ async fn load_github_app(config: &Config) -> Result<Option<AppLane>, BoxError> {
     }
 }
 
-async fn run() -> Result<(), BoxError> {
-    let config = Config::from_env()?;
-    let github_app = load_github_app(&config).await?;
+async fn connect_pool(config: &Config) -> Result<sqlx::PgPool, BoxError> {
     let options = PgConnectOptions::from_str(config.database_url.expose())?
         .options([("statement_timeout", STATEMENT_TIMEOUT_MS)]);
-    let pool = PgPoolOptions::new()
+    Ok(PgPoolOptions::new()
         .max_connections(MAX_CONNECTIONS)
         .acquire_timeout(ACQUIRE_TIMEOUT)
         .connect_with(options)
-        .await?;
+        .await?)
+}
+
+async fn run() -> Result<(), BoxError> {
+    let config = Config::from_env()?;
+    let github_app = load_github_app(&config).await?;
+    let pool = connect_pool(&config).await?;
     let store = configured_store(pool.clone(), &config);
     store.migrate().await?;
 
-    let credential_service = credential_service(&config, &pool, github_app).await?;
+    let (credential_service, environment_service) =
+        credential_service(&config, &pool, github_app).await?;
 
     let users = Users::new(pool.clone());
     log_setup_path(&users).await?;
@@ -313,11 +321,12 @@ async fn run() -> Result<(), BoxError> {
     let (update, feed_task) = update_relay(&config, stop_rx.clone())?;
     let auth = BearerAuth::new(&config.token, config.client_token.as_ref()).with_users(users);
     let grpc_server = async {
-        serve_with_credentials(
+        serve_with_environments(
             &store,
             &auth,
             web,
             credential_service,
+            environment_service,
             update,
             grpc,
             stopped(stop_rx.clone()),

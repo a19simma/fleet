@@ -10,8 +10,9 @@ use std::sync::Arc;
 
 use fleet_core::credential::{Secret, fingerprint};
 use fleet_core::environment::{
-    Delivery, Entry, EntryName, EnvironmentName, EnvironmentSpec, MAX_ENTRIES, MAX_TOTAL_BYTES,
-    OnFail, SecretValue,
+    DEFAULT_TIMEOUT_S, Delivery, EgressHost, Entry, EntryName, EnvironmentError, EnvironmentName,
+    EnvironmentSpec, MAX_ENTRIES, MAX_TOTAL_BYTES, OnFail, ScriptBody, ScriptSpec, SecretSpec,
+    SecretValue,
 };
 use sqlx::{PgConnection, PgPool};
 use zeroize::Zeroizing;
@@ -20,6 +21,40 @@ use crate::cred::seal::{Aad, SealError, Sealer};
 
 /// Environments one user may own. ADR-0067 states no number, so this is the chosen cap.
 pub const MAX_ENVIRONMENTS_PER_USER: usize = 64;
+
+/// The `INVALID_ARGUMENT` message for an entry that names neither a secret nor a script.
+pub const REASON_ENTRY_KIND: &str = "entry names no kind";
+
+/// The `INVALID_ARGUMENT` message for a version number of zero.
+pub const REASON_VERSION_REQUIRED: &str = "version is required";
+
+/// The `INVALID_ARGUMENT` message for an enum field holding a number the schema does not name.
+pub const REASON_ENUM: &str = "enum value is unknown";
+
+const SHARE_CAPABILITY: &str =
+    "SELECT user_id FROM user_capabilities WHERE user_id = $1 AND capability = $2 FOR SHARE";
+
+const RESOLVE_ENVIRONMENT: &str =
+    "SELECT id FROM environment WHERE user_id = $1 AND lower(name) = lower($2)";
+
+const LIST_SECRETS: &str = "\
+SELECT s.name, s.fingerprint FROM environment_secret s \
+JOIN environment e ON e.id = s.environment_id \
+WHERE s.environment_id = $1 AND e.user_id = $2 ORDER BY lower(s.name)";
+
+const VERSION_HEAD: &str = "\
+SELECT v.hash, v.egress_hosts FROM environment_version v \
+JOIN environment e ON e.id = v.environment_id \
+WHERE v.environment_id = $1 AND v.version = $2 AND e.user_id = $3";
+
+const VERSION_ENTRIES: &str = "\
+SELECT name, kind, agent_visible, delivery, body, on_fail, timeout_s FROM environment_entry \
+WHERE environment_id = $1 AND version = $2 ORDER BY position";
+
+const LIST_VERSIONS: &str = "\
+SELECT v.version, v.hash FROM environment_version v \
+JOIN environment e ON e.id = v.environment_id \
+WHERE v.environment_id = $1 AND e.user_id = $2 ORDER BY v.version";
 
 const LOCK_USER: &str = "SELECT id FROM users WHERE id = $1 FOR UPDATE";
 
@@ -110,6 +145,8 @@ pub enum EnvError {
     TooManyEntries,
     /// Script bodies plus secret values would pass the size cap.
     TooLarge,
+    /// The version holds a script and the user does not hold the `env:scripts` capability.
+    ScriptsNotAllowed,
 }
 
 impl fmt::Display for EnvError {
@@ -124,6 +161,7 @@ impl fmt::Display for EnvError {
             Self::TooManyEnvironments => "too many environments",
             Self::TooManyEntries => "too many environment entries",
             Self::TooLarge => "environment is too large",
+            Self::ScriptsNotAllowed => "environment scripts are not granted",
         })
     }
 }
@@ -176,6 +214,42 @@ pub struct SavedVersion {
     pub version: i32,
     /// False when the structure equalled the latest version and nothing was written.
     pub created: bool,
+}
+
+/// One entry of a stored version, as written.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum StoredEntry {
+    /// A secret slot. The value lives outside the version.
+    Secret {
+        /// The secret name.
+        name: String,
+        /// Whether the agent may see the value.
+        agent_visible: bool,
+        /// `file` or `env`.
+        delivery: String,
+    },
+    /// A setup script.
+    Script {
+        /// The script name.
+        name: String,
+        /// The script text.
+        body: String,
+        /// `abort` or `continue`.
+        on_fail: String,
+        /// The timeout in seconds.
+        timeout_s: i32,
+    },
+}
+
+/// One stored version: its hash, egress hosts and entries in order.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StoredVersion {
+    /// The SHA-256 structure hash.
+    pub hash: Vec<u8>,
+    /// The egress hosts.
+    pub egress_hosts: Vec<String>,
+    /// The entries in position order.
+    pub entries: Vec<StoredEntry>,
 }
 
 /// One secret a release handed to a Job, as recorded in `environment_use`.
@@ -302,6 +376,96 @@ impl EnvironmentStore {
         Ok((rows.len(), bytes))
     }
 
+    /// Resolves `name` to the id of the user's Environment after case fold. A name another user
+    /// owns resolves exactly as an unknown name.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`EnvError::NotFound`] when the user owns no such Environment and
+    /// [`EnvError::Database`] on a database failure.
+    pub async fn resolve_environment(
+        &self,
+        user_id: i64,
+        name: &EnvironmentName,
+    ) -> Result<i64, EnvError> {
+        sqlx::query_scalar(RESOLVE_ENVIRONMENT)
+            .bind(user_id)
+            .bind(name.as_str())
+            .fetch_optional(&self.pool)
+            .await?
+            .ok_or(EnvError::NotFound)
+    }
+
+    /// Lists the secret names of the user's Environment with the fingerprint of each value.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`EnvError::Database`] on a database failure.
+    pub async fn list_secrets(
+        &self,
+        user_id: i64,
+        environment_id: i64,
+    ) -> Result<Vec<(String, String)>, EnvError> {
+        Ok(sqlx::query_as(LIST_SECRETS)
+            .bind(environment_id)
+            .bind(user_id)
+            .fetch_all(&self.pool)
+            .await?)
+    }
+
+    /// Reads version `version` of the user's Environment, or `None` when it does not exist.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`EnvError::Database`] on a database failure.
+    pub async fn get_version(
+        &self,
+        user_id: i64,
+        environment_id: i64,
+        version: i32,
+    ) -> Result<Option<StoredVersion>, EnvError> {
+        let head: Option<(Vec<u8>, Vec<String>)> = sqlx::query_as(VERSION_HEAD)
+            .bind(environment_id)
+            .bind(version)
+            .bind(user_id)
+            .fetch_optional(&self.pool)
+            .await?;
+        let Some((hash, egress_hosts)) = head else {
+            return Ok(None);
+        };
+        let rows: Vec<StoredEntryRow> = sqlx::query_as(VERSION_ENTRIES)
+            .bind(environment_id)
+            .bind(version)
+            .fetch_all(&self.pool)
+            .await?;
+        let entries = rows
+            .into_iter()
+            .map(StoredEntry::try_from)
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(Some(StoredVersion {
+            hash,
+            egress_hosts,
+            entries,
+        }))
+    }
+
+    /// Lists the version numbers and hashes of the user's Environment, oldest first.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`EnvError::Database`] on a database failure.
+    pub async fn list_versions(
+        &self,
+        user_id: i64,
+        environment_id: i64,
+    ) -> Result<Vec<(i32, Vec<u8>)>, EnvError> {
+        Ok(sqlx::query_as(LIST_VERSIONS)
+            .bind(environment_id)
+            .bind(user_id)
+            .fetch_all(&self.pool)
+            .await?)
+    }
+
     /// Lists the user's Environments by name.
     ///
     /// # Errors
@@ -401,9 +565,15 @@ impl EnvironmentStore {
     /// lock, so two equal concurrent writes make one version. The hash covers no secret value,
     /// so a value-only secret update never reaches this call.
     ///
+    /// A spec with a script entry also needs the `env:scripts` grant. The grant row is read
+    /// `FOR SHARE` after the Environment lock and in the same transaction as the version write,
+    /// so a revoke in flight either lands first and refuses the save or waits for it. A dedupe
+    /// hit is refused too.
+    ///
     /// # Errors
     ///
-    /// Returns [`EnvError::NotFound`] for an unknown or foreign Environment,
+    /// Returns [`EnvError::ScriptsNotAllowed`] when the spec holds a script and the grant is
+    /// missing, [`EnvError::NotFound`] for an unknown or foreign Environment,
     /// [`EnvError::TooManyEntries`] and [`EnvError::TooLarge`] past the caps and
     /// [`EnvError::Database`] on a database failure.
     pub async fn save_version(
@@ -414,6 +584,18 @@ impl EnvironmentStore {
     ) -> Result<SavedVersion, EnvError> {
         let mut tx = self.pool.begin().await?;
         Self::lock_owned(&mut tx, user_id, environment_id).await?;
+        if spec
+            .entries()
+            .iter()
+            .any(|entry| matches!(entry, Entry::Script(_)))
+        {
+            sqlx::query_scalar::<_, i64>(SHARE_CAPABILITY)
+                .bind(user_id)
+                .bind(crate::cred::capability::ENV_SCRIPTS)
+                .fetch_optional(&mut *tx)
+                .await?
+                .ok_or(EnvError::ScriptsNotAllowed)?;
+        }
         if spec.entries().len() > self.limits.max_entries {
             return Err(EnvError::TooManyEntries);
         }
@@ -437,11 +619,7 @@ impl EnvironmentStore {
             });
         }
         let version = latest.map_or(1, |(v, _)| v.saturating_add(1));
-        let hosts: Vec<&str> = spec
-            .egress_hosts()
-            .iter()
-            .map(fleet_core::environment::EgressHost::as_str)
-            .collect();
+        let hosts: Vec<&str> = spec.egress_hosts().iter().map(EgressHost::as_str).collect();
         sqlx::query(INSERT_VERSION)
             .bind(environment_id)
             .bind(user_id)
@@ -618,5 +796,470 @@ impl EnvironmentStore {
                 SealError::UnknownKey => EnvError::UnknownKey,
                 SealError::Open | SealError::Seal => EnvError::Open,
             })
+    }
+}
+
+type StoredEntryRow = (
+    String,
+    String,
+    Option<bool>,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+    Option<i32>,
+);
+
+impl TryFrom<StoredEntryRow> for StoredEntry {
+    type Error = EnvError;
+
+    fn try_from(row: StoredEntryRow) -> Result<Self, EnvError> {
+        match row {
+            (name, kind, Some(agent_visible), Some(delivery), None, None, None)
+                if kind == "secret" =>
+            {
+                Ok(Self::Secret {
+                    name,
+                    agent_visible,
+                    delivery,
+                })
+            }
+            (name, kind, None, None, Some(body), Some(on_fail), Some(timeout_s))
+                if kind == "script" =>
+            {
+                Ok(Self::Script {
+                    name,
+                    body,
+                    on_fail,
+                    timeout_s,
+                })
+            }
+            _ => Err(EnvError::Database),
+        }
+    }
+}
+
+use fleet_proto::v1::environment_entry_spec::Kind;
+use fleet_proto::v1::{
+    CreateEnvironmentRequest, DeleteEnvironmentReply, DeleteEnvironmentRequest,
+    DeleteEnvironmentSecretReply, DeleteEnvironmentSecretRequest, EnvironmentDelivery,
+    EnvironmentDetail, EnvironmentEntrySpec, EnvironmentInfo as ProtoInfo, EnvironmentOnFail,
+    EnvironmentScriptSpec, EnvironmentSecretInfo, EnvironmentSecretSpec, EnvironmentVersion,
+    EnvironmentVersionInfo, GetEnvironmentRequest, GetEnvironmentVersionRequest,
+    ListEnvironmentVersionsReply, ListEnvironmentVersionsRequest, ListEnvironmentsReply,
+    PutEnvironmentSecretReply, PutEnvironmentSecretRequest, SaveEnvironmentVersionReply,
+    SaveEnvironmentVersionRequest,
+};
+use tonic::Status;
+
+fn invalid(err: EnvironmentError) -> Status {
+    Status::invalid_argument(err.to_string())
+}
+
+fn hex(bytes: &[u8]) -> String {
+    use std::fmt::Write as _;
+    bytes.iter().fold(String::new(), |mut out, b| {
+        let _ = write!(out, "{b:02x}");
+        out
+    })
+}
+
+fn number(value: i32) -> Result<u32, Status> {
+    u32::try_from(value).map_err(|_| Status::internal(fleet_proto::ERR_ENV_INTERNAL))
+}
+
+fn store_status(err: EnvError) -> Status {
+    match err {
+        EnvError::NotFound => Status::not_found(fleet_proto::ERR_ENV_NOT_FOUND),
+        EnvError::Exists => Status::already_exists(fleet_proto::ERR_ENV_EXISTS),
+        EnvError::TooManyEnvironments | EnvError::TooManyEntries | EnvError::TooLarge => {
+            Status::resource_exhausted(fleet_proto::ERR_ENV_LIMIT)
+        }
+        EnvError::ScriptsNotAllowed => {
+            Status::permission_denied(fleet_proto::ERR_ENV_SCRIPTS_NOT_GRANTED)
+        }
+        EnvError::Seal | EnvError::Open | EnvError::UnknownKey | EnvError::Database => {
+            tracing::warn!(reason = %err, "environment store call failed");
+            Status::internal(fleet_proto::ERR_ENV_INTERNAL)
+        }
+    }
+}
+
+fn delivery_of(raw: i32) -> Result<Delivery, Status> {
+    match EnvironmentDelivery::try_from(raw) {
+        Ok(EnvironmentDelivery::Unspecified | EnvironmentDelivery::File) => Ok(Delivery::File),
+        Ok(EnvironmentDelivery::Env) => Ok(Delivery::Env),
+        Err(_) => Err(Status::invalid_argument(REASON_ENUM)),
+    }
+}
+
+fn on_fail_of(raw: i32) -> Result<OnFail, Status> {
+    match EnvironmentOnFail::try_from(raw) {
+        Ok(EnvironmentOnFail::Unspecified | EnvironmentOnFail::Abort) => Ok(OnFail::Abort),
+        Ok(EnvironmentOnFail::Continue) => Ok(OnFail::Continue),
+        Err(_) => Err(Status::invalid_argument(REASON_ENUM)),
+    }
+}
+
+fn entry_of(item: &EnvironmentEntrySpec) -> Result<Entry, Status> {
+    match &item.kind {
+        None => Err(Status::invalid_argument(REASON_ENTRY_KIND)),
+        Some(Kind::Secret(s)) => {
+            let name = EntryName::new(&s.name).map_err(invalid)?;
+            SecretSpec::new(name, s.agent_visible, delivery_of(s.delivery)?)
+                .map(Entry::Secret)
+                .map_err(invalid)
+        }
+        Some(Kind::Script(s)) => {
+            let name = EntryName::new(&s.name).map_err(invalid)?;
+            let body = ScriptBody::new(&s.body).map_err(invalid)?;
+            ScriptSpec::new(
+                name,
+                body,
+                on_fail_of(s.on_fail)?,
+                s.timeout_s.unwrap_or(DEFAULT_TIMEOUT_S),
+            )
+            .map(Entry::Script)
+            .map_err(invalid)
+        }
+    }
+}
+
+fn spec_of(
+    entries: &[EnvironmentEntrySpec],
+    egress_hosts: &[String],
+) -> Result<EnvironmentSpec, Status> {
+    let entries = entries
+        .iter()
+        .map(entry_of)
+        .collect::<Result<Vec<_>, _>>()?;
+    let hosts = egress_hosts
+        .iter()
+        .map(|h| EgressHost::new(h))
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(invalid)?;
+    EnvironmentSpec::new(entries, hosts).map_err(invalid)
+}
+
+fn env_name_of(raw: &str) -> Result<EnvironmentName, Status> {
+    EnvironmentName::new(raw).map_err(invalid)
+}
+
+fn entry_name_of(raw: &str) -> Result<EntryName, Status> {
+    EntryName::new(raw).map_err(invalid)
+}
+
+fn detail_of(stored: StoredVersion, version: u32) -> EnvironmentVersion {
+    let entries = stored
+        .entries
+        .into_iter()
+        .map(|entry| EnvironmentEntrySpec {
+            kind: Some(match entry {
+                StoredEntry::Secret {
+                    name,
+                    agent_visible,
+                    delivery,
+                } => Kind::Secret(EnvironmentSecretSpec {
+                    name,
+                    agent_visible,
+                    delivery: if delivery == "env" {
+                        EnvironmentDelivery::Env
+                    } else {
+                        EnvironmentDelivery::File
+                    }
+                    .into(),
+                }),
+                StoredEntry::Script {
+                    name,
+                    body,
+                    on_fail,
+                    timeout_s,
+                } => Kind::Script(EnvironmentScriptSpec {
+                    name,
+                    body,
+                    on_fail: if on_fail == "continue" {
+                        EnvironmentOnFail::Continue
+                    } else {
+                        EnvironmentOnFail::Abort
+                    }
+                    .into(),
+                    timeout_s: u32::try_from(timeout_s).ok(),
+                }),
+            }),
+        })
+        .collect();
+    EnvironmentVersion {
+        version,
+        hash: hex(&stored.hash),
+        entries,
+        egress_hosts: stored.egress_hosts,
+    }
+}
+
+/// The `FleetEnvironments` handlers.
+///
+/// Every method takes the caller's user id. Inputs are parsed into the core types before any
+/// lookup, so a malformed request answers the same for a foreign and an unknown name, and a
+/// name that does not resolve to one of the caller's Environments answers
+/// [`fleet_proto::ERR_ENV_NOT_FOUND`] whoever owns it.
+#[derive(Clone)]
+pub struct EnvironmentService {
+    store: Arc<EnvironmentStore>,
+}
+
+impl fmt::Debug for EnvironmentService {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("EnvironmentService(..)")
+    }
+}
+
+impl EnvironmentService {
+    /// Builds the handlers over `store`.
+    pub fn new(store: EnvironmentStore) -> Self {
+        Self {
+            store: Arc::new(store),
+        }
+    }
+
+    async fn resolve(&self, user_id: i64, name: &EnvironmentName) -> Result<i64, Status> {
+        self.store
+            .resolve_environment(user_id, name)
+            .await
+            .map_err(store_status)
+    }
+
+    /// Creates an Environment.
+    ///
+    /// # Errors
+    ///
+    /// Returns `INVALID_ARGUMENT` for a bad name, `ALREADY_EXISTS`, `RESOURCE_EXHAUSTED` at the
+    /// cap and `INTERNAL` for a store failure.
+    pub async fn create(
+        &self,
+        user_id: i64,
+        request: &CreateEnvironmentRequest,
+    ) -> Result<ProtoInfo, Status> {
+        let name = env_name_of(&request.name)?;
+        self.store
+            .create_environment(user_id, &name)
+            .await
+            .map_err(store_status)?;
+        Ok(ProtoInfo {
+            name: name.as_str().to_owned(),
+            latest_version: None,
+        })
+    }
+
+    /// Lists the caller's Environments.
+    ///
+    /// # Errors
+    ///
+    /// Returns `INTERNAL` for a store failure.
+    pub async fn list(&self, user_id: i64) -> Result<ListEnvironmentsReply, Status> {
+        let rows = self
+            .store
+            .list_environments(user_id)
+            .await
+            .map_err(store_status)?;
+        let environments = rows
+            .into_iter()
+            .map(|row| {
+                Ok(ProtoInfo {
+                    name: row.name,
+                    latest_version: row.latest_version.map(number).transpose()?,
+                })
+            })
+            .collect::<Result<Vec<_>, Status>>()?;
+        Ok(ListEnvironmentsReply { environments })
+    }
+
+    /// Reads one Environment: secret names with fingerprints and the latest version.
+    ///
+    /// # Errors
+    ///
+    /// Returns `INVALID_ARGUMENT` for a bad name, `NOT_FOUND` and `INTERNAL`.
+    pub async fn get(
+        &self,
+        user_id: i64,
+        request: &GetEnvironmentRequest,
+    ) -> Result<EnvironmentDetail, Status> {
+        let name = env_name_of(&request.name)?;
+        let id = self.resolve(user_id, &name).await?;
+        let info = self
+            .store
+            .get_environment(user_id, id)
+            .await
+            .map_err(store_status)?;
+        let secrets = self
+            .store
+            .list_secrets(user_id, id)
+            .await
+            .map_err(store_status)?
+            .into_iter()
+            .map(|(name, fingerprint)| EnvironmentSecretInfo { name, fingerprint })
+            .collect();
+        let latest = match info.latest_version {
+            Some(version) => self
+                .store
+                .get_version(user_id, id, version)
+                .await
+                .map_err(store_status)?
+                .map(|stored| number(version).map(|n| detail_of(stored, n)))
+                .transpose()?,
+            None => None,
+        };
+        Ok(EnvironmentDetail {
+            environment: Some(ProtoInfo {
+                name: info.name,
+                latest_version: info.latest_version.map(number).transpose()?,
+            }),
+            secrets,
+            latest,
+        })
+    }
+
+    /// Deletes one Environment.
+    ///
+    /// # Errors
+    ///
+    /// Returns `INVALID_ARGUMENT` for a bad name, `NOT_FOUND` and `INTERNAL`.
+    pub async fn delete(
+        &self,
+        user_id: i64,
+        request: &DeleteEnvironmentRequest,
+    ) -> Result<DeleteEnvironmentReply, Status> {
+        let name = env_name_of(&request.name)?;
+        let id = self.resolve(user_id, &name).await?;
+        self.store
+            .delete_environment(user_id, id)
+            .await
+            .map_err(store_status)?;
+        Ok(DeleteEnvironmentReply {})
+    }
+
+    /// Stores a secret value and returns its fingerprint.
+    ///
+    /// # Errors
+    ///
+    /// Returns `INVALID_ARGUMENT` for a bad name or value, `NOT_FOUND`, `RESOURCE_EXHAUSTED` past
+    /// a cap and `INTERNAL`. No error text carries the value.
+    pub async fn put_secret(
+        &self,
+        user_id: i64,
+        request: &PutEnvironmentSecretRequest,
+    ) -> Result<PutEnvironmentSecretReply, Status> {
+        let environment = env_name_of(&request.environment)?;
+        let name = entry_name_of(&request.name)?;
+        let value = SecretValue::new(request.value.clone()).map_err(invalid)?;
+        let id = self.resolve(user_id, &environment).await?;
+        let fingerprint = self
+            .store
+            .put_secret(user_id, id, &name, &value)
+            .await
+            .map_err(store_status)?;
+        tracing::debug!(environment_id = id, "environment secret stored");
+        Ok(PutEnvironmentSecretReply { fingerprint })
+    }
+
+    /// Deletes a secret value.
+    ///
+    /// # Errors
+    ///
+    /// Returns `INVALID_ARGUMENT` for a bad name, `NOT_FOUND` for an unknown Environment or
+    /// secret and `INTERNAL`.
+    pub async fn delete_secret(
+        &self,
+        user_id: i64,
+        request: &DeleteEnvironmentSecretRequest,
+    ) -> Result<DeleteEnvironmentSecretReply, Status> {
+        let environment = env_name_of(&request.environment)?;
+        let name = entry_name_of(&request.name)?;
+        let id = self.resolve(user_id, &environment).await?;
+        self.store
+            .delete_secret(user_id, id, &name)
+            .await
+            .map_err(|e| match e {
+                EnvError::NotFound => Status::not_found(fleet_proto::ERR_ENV_SECRET_NOT_FOUND),
+                other => store_status(other),
+            })?;
+        Ok(DeleteEnvironmentSecretReply {})
+    }
+
+    /// Saves a version of the whole structure.
+    ///
+    /// # Errors
+    ///
+    /// Returns `INVALID_ARGUMENT` for a bad spec, `NOT_FOUND`, `PERMISSION_DENIED` for a script
+    /// without the `env:scripts` grant, `RESOURCE_EXHAUSTED` past a cap and `INTERNAL`.
+    pub async fn save_version(
+        &self,
+        user_id: i64,
+        request: &SaveEnvironmentVersionRequest,
+    ) -> Result<SaveEnvironmentVersionReply, Status> {
+        let environment = env_name_of(&request.environment)?;
+        let spec = spec_of(&request.entries, &request.egress_hosts)?;
+        let id = self.resolve(user_id, &environment).await?;
+        let saved = self
+            .store
+            .save_version(user_id, id, &spec)
+            .await
+            .map_err(store_status)?;
+        Ok(SaveEnvironmentVersionReply {
+            version: number(saved.version)?,
+            created: saved.created,
+        })
+    }
+
+    /// Reads a version.
+    ///
+    /// # Errors
+    ///
+    /// Returns `INVALID_ARGUMENT` for a bad name or version zero, `NOT_FOUND` and `INTERNAL`.
+    pub async fn get_version(
+        &self,
+        user_id: i64,
+        request: &GetEnvironmentVersionRequest,
+    ) -> Result<EnvironmentVersion, Status> {
+        let environment = env_name_of(&request.environment)?;
+        if request.version == 0 {
+            return Err(Status::invalid_argument(REASON_VERSION_REQUIRED));
+        }
+        let id = self.resolve(user_id, &environment).await?;
+        let version = i32::try_from(request.version)
+            .map_err(|_| Status::not_found(fleet_proto::ERR_ENV_VERSION_NOT_FOUND))?;
+        let stored = self
+            .store
+            .get_version(user_id, id, version)
+            .await
+            .map_err(store_status)?
+            .ok_or_else(|| Status::not_found(fleet_proto::ERR_ENV_VERSION_NOT_FOUND))?;
+        Ok(detail_of(stored, request.version))
+    }
+
+    /// Lists versions, oldest first.
+    ///
+    /// # Errors
+    ///
+    /// Returns `INVALID_ARGUMENT` for a bad name, `NOT_FOUND` and `INTERNAL`.
+    pub async fn list_versions(
+        &self,
+        user_id: i64,
+        request: &ListEnvironmentVersionsRequest,
+    ) -> Result<ListEnvironmentVersionsReply, Status> {
+        let environment = env_name_of(&request.environment)?;
+        let id = self.resolve(user_id, &environment).await?;
+        let versions = self
+            .store
+            .list_versions(user_id, id)
+            .await
+            .map_err(store_status)?
+            .into_iter()
+            .map(|(version, hash)| {
+                Ok(EnvironmentVersionInfo {
+                    version: number(version)?,
+                    hash: hex(&hash),
+                })
+            })
+            .collect::<Result<Vec<_>, Status>>()?;
+        Ok(ListEnvironmentVersionsReply { versions })
     }
 }

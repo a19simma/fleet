@@ -13,7 +13,7 @@ use fleet_core::environment::{
 use fleet_server::cred::seal::{Aad, FileSealer, SealError, Sealed, Sealer};
 use fleet_server::cred::store::CredentialStore;
 use fleet_server::environments::{
-    EnvError, EnvironmentStore, Limits, ReleasedSecret, record_environment_use,
+    EnvError, EnvironmentStore, Limits, ReleasedSecret, SavedVersion, record_environment_use,
 };
 use sqlx::PgPool;
 use zeroize::Zeroizing;
@@ -40,12 +40,24 @@ fn store(pool: &PgPool, tag: &str) -> EnvironmentStore {
     EnvironmentStore::new(pool.clone(), Arc::new(sealer(tag, &[("k1", "ab")])))
 }
 
-async fn user(pool: &PgPool, name: &str) -> i64 {
+async fn bare_user(pool: &PgPool, name: &str) -> i64 {
     sqlx::query_scalar("INSERT INTO users (username) VALUES ($1) RETURNING id")
         .bind(name)
         .fetch_one(pool)
         .await
         .unwrap()
+}
+
+async fn user(pool: &PgPool, name: &str) -> i64 {
+    let id = bare_user(pool, name).await;
+    sqlx::query(
+        "INSERT INTO user_capabilities (user_id, capability, granted_by) VALUES ($1, 'env:scripts', $1)",
+    )
+    .bind(id)
+    .execute(pool)
+    .await
+    .unwrap();
+    id
 }
 
 fn env_name(raw: &str) -> EnvironmentName {
@@ -370,6 +382,10 @@ const TABLES: [&str; 5] = [
     "environment_secret",
     "environment_use",
 ];
+
+async fn version_rows(pool: &PgPool) -> i64 {
+    counts(pool).await.get(1).copied().unwrap()
+}
 
 async fn counts(pool: &PgPool) -> Vec<i64> {
     let mut out = Vec::new();
@@ -1072,4 +1088,117 @@ async fn marker_too_large_carries_no_value(pool: PgPool) {
         .await
         .unwrap_err();
     assert_clean(&buffer, err, MARK, EnvError::TooLarge);
+}
+
+#[sqlx::test]
+async fn a_script_save_needs_the_live_env_scripts_grant(pool: PgPool) {
+    let store = store(&pool, "scriptgrant");
+    let alice = bare_user(&pool, "alice").await;
+    let env = store
+        .create_environment(alice, &env_name("prod"))
+        .await
+        .unwrap();
+    let with_script = spec(vec![script("setup", "#!/bin/sh\necho a\n")]);
+    assert_eq!(
+        store.save_version(alice, env, &with_script).await,
+        Err(EnvError::ScriptsNotAllowed)
+    );
+    assert_eq!(counts(&pool).await[1], 0);
+    let secrets_only = spec(vec![secret_entry("TOKEN")]);
+    assert!(store.save_version(alice, env, &secrets_only).await.is_ok());
+    sqlx::query(
+        "INSERT INTO user_capabilities (user_id, capability, granted_by) VALUES ($1, 'env:scripts', $1)",
+    )
+    .bind(alice)
+    .execute(&pool)
+    .await
+    .unwrap();
+    assert!(
+        store
+            .save_version(alice, env, &with_script)
+            .await
+            .unwrap()
+            .created
+    );
+    sqlx::query("DELETE FROM user_capabilities WHERE user_id = $1")
+        .bind(alice)
+        .execute(&pool)
+        .await
+        .unwrap();
+    assert_eq!(
+        store.save_version(alice, env, &with_script).await,
+        Err(EnvError::ScriptsNotAllowed)
+    );
+    assert_eq!(counts(&pool).await[1], 2);
+}
+
+async fn script_save_behind_a_held_grant(
+    pool: &PgPool,
+    tag: &str,
+) -> (Result<SavedVersion, EnvError>, i64) {
+    let store = Arc::new(store(pool, tag));
+    let alice = user(pool, "alice").await;
+    let env = store
+        .create_environment(alice, &env_name("prod"))
+        .await
+        .unwrap();
+    let mut holder = pool.begin().await.unwrap();
+    sqlx::query("DELETE FROM user_capabilities WHERE user_id = $1 AND capability = 'env:scripts'")
+        .bind(alice)
+        .execute(&mut *holder)
+        .await
+        .unwrap();
+    let saver = store.clone();
+    let task = tokio::spawn(async move {
+        saver
+            .save_version(
+                alice,
+                env,
+                &spec(vec![script("setup", "#!/bin/sh\necho a\n")]),
+            )
+            .await
+    });
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+    loop {
+        let waiting: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM pg_stat_activity \
+             WHERE wait_event_type = 'Lock' AND query LIKE '%FROM user_capabilities%'",
+        )
+        .fetch_one(pool)
+        .await
+        .unwrap();
+        if waiting >= 1 {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the saver never waited on the grant row"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    assert_eq!(version_rows(pool).await, 0);
+    if tag.ends_with("commit") {
+        holder.commit().await.unwrap();
+    } else {
+        holder.rollback().await.unwrap();
+    }
+    let got = tokio::time::timeout(std::time::Duration::from_secs(20), task)
+        .await
+        .unwrap()
+        .unwrap();
+    (got, version_rows(pool).await)
+}
+
+#[sqlx::test]
+async fn a_save_waits_for_a_grant_revoke_in_flight_and_then_refuses(pool: PgPool) {
+    let (got, versions) = script_save_behind_a_held_grant(&pool, "barrier-commit").await;
+    assert_eq!(got, Err(EnvError::ScriptsNotAllowed));
+    assert_eq!(versions, 0);
+}
+
+#[sqlx::test]
+async fn a_save_waits_for_a_rolled_back_revoke_and_then_saves(pool: PgPool) {
+    let (got, versions) = script_save_behind_a_held_grant(&pool, "barrier-rollback").await;
+    assert_eq!(got.unwrap().version, 1);
+    assert_eq!(versions, 1);
 }

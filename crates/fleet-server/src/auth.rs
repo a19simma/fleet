@@ -3,12 +3,15 @@
 //! Two static tokens plus per-user API tokens, scoped by gRPC path. The box token covers
 //! `FleetIngest` and `FleetWorker`. The client scope covers `FleetQuery`, `FleetJobs`,
 //! `FleetJudge`, `FleetProfiles`, `FleetBatches`, `FleetCredentials`, `FleetRepos`,
-//! `FleetCatalog`, `FleetWork`, `FleetRetro` and `FleetEdit`. Any other path is denied.
+//! `FleetCatalog`, `FleetWork`, `FleetRetro`, `FleetEdit` and `FleetEnvironments`. Any other path
+//! is denied.
 //! `FleetEdit.DecideEdit` is the one client-scope path the shared client token cannot reach: it
 //! passes only for a per-user API token, because the client token acts as the bootstrap user and
 //! names no person (ADR-0066). `FleetCatalog` passes the scope, then its handler requires an admin user.
 //! `FleetRepos` passes the scope, then its handler requires a user caller: the box token never
-//! reaches it. `FleetWork` and `FleetRetro` are the same: its handlers scope every read and write to the caller.
+//! reaches it. `FleetEnvironments` is stricter: the shared client token is refused on every method
+//! with [`fleet_proto::ERR_ENV_NEEDS_USER_TOKEN`], because Environments belong to a person (ADR-0067).
+//! `FleetWork` and `FleetRetro` are the same: its handlers scope every read and write to the caller.
 //!
 //! The two admin services, `FleetCatalogAdmin` and `FleetCapabilityAdmin`, sit outside both
 //! static scopes. A request reaches one of their five RPCs only with a per-user API token whose
@@ -52,6 +55,7 @@ const CATALOG: &str = "/fleet.v1.FleetCatalog/";
 const WORK: &str = "/fleet.v1.FleetWork/";
 const RETRO: &str = "/fleet.v1.FleetRetro/";
 const EDIT: &str = "/fleet.v1.FleetEdit/";
+const ENVIRONMENTS: &str = "/fleet.v1.FleetEnvironments/";
 
 /// The one edit RPC that needs a signed-in user.
 pub const DECIDE_EDIT: &str = "/fleet.v1.FleetEdit/DecideEdit";
@@ -177,7 +181,7 @@ impl BearerAuth {
     /// Allow-lists paths per scope: the box token takes `FleetIngest` and `FleetWorker`,
     /// the client token takes `FleetQuery`, `FleetJobs`, `FleetJudge`, `FleetProfiles`,
     /// `FleetBatches`, `FleetCredentials`, `FleetRepos`, `FleetCatalog`, `FleetWork`,
-    /// `FleetRetro` and `FleetEdit`. Every other path is denied.
+    /// `FleetRetro`, `FleetEdit` and `FleetEnvironments`. Every other path is denied.
     fn allows(scope: Scope, path: &str) -> bool {
         match scope {
             Scope::Box => path.starts_with(INGEST) || path.starts_with(WORKER),
@@ -193,6 +197,7 @@ impl BearerAuth {
                     || path.starts_with(WORK)
                     || path.starts_with(RETRO)
                     || path.starts_with(EDIT)
+                    || path.starts_with(ENVIRONMENTS)
             }
         }
     }
@@ -215,6 +220,10 @@ impl BearerAuth {
             Err(Status::permission_denied(USER_TOKEN_REQUIRED))
         } else if path == IMPORT_WORK && Self::allows(scope, path) {
             Err(Status::permission_denied(IMPORT_USER_TOKEN_REQUIRED))
+        } else if path.starts_with(ENVIRONMENTS) && Self::allows(scope, path) {
+            Err(Status::permission_denied(
+                fleet_proto::ERR_ENV_NEEDS_USER_TOKEN,
+            ))
         } else if Self::allows(scope, path) {
             Ok(())
         } else {
@@ -278,6 +287,11 @@ impl BearerAuth {
         }
         if path == IMPORT_WORK && caller.is_none() {
             return Err(Status::permission_denied(IMPORT_USER_TOKEN_REQUIRED));
+        }
+        if path.starts_with(ENVIRONMENTS) && caller.is_none() {
+            return Err(Status::permission_denied(
+                fleet_proto::ERR_ENV_NEEDS_USER_TOKEN,
+            ));
         }
         if let (Scope::Client, None, Some(users)) = (scope, caller, self.users.as_ref()) {
             let user_id = users.bootstrap_user().await.map_err(unavailable)?;

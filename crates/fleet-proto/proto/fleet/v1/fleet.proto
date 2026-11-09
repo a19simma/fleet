@@ -120,6 +120,21 @@ service FleetEdit {
   rpc DecideEdit(DecideEditRequest) returns (SuggestedEdit);
 }
 
+// Job environments (ADR-0067). The caller must be a User: the shared client token and the box
+// token are refused. A foreign name answers exactly as an unknown name. No reply carries a secret
+// value, and PutEnvironmentSecretRequest hides its value under Debug.
+service FleetEnvironments {
+  rpc CreateEnvironment(CreateEnvironmentRequest) returns (EnvironmentInfo);
+  rpc ListEnvironments(ListEnvironmentsRequest) returns (ListEnvironmentsReply);
+  rpc GetEnvironment(GetEnvironmentRequest) returns (EnvironmentDetail);
+  rpc DeleteEnvironment(DeleteEnvironmentRequest) returns (DeleteEnvironmentReply);
+  rpc PutEnvironmentSecret(PutEnvironmentSecretRequest) returns (PutEnvironmentSecretReply);
+  rpc DeleteEnvironmentSecret(DeleteEnvironmentSecretRequest) returns (DeleteEnvironmentSecretReply);
+  rpc SaveEnvironmentVersion(SaveEnvironmentVersionRequest) returns (SaveEnvironmentVersionReply);
+  rpc GetEnvironmentVersion(GetEnvironmentVersionRequest) returns (EnvironmentVersion);
+  rpc ListEnvironmentVersions(ListEnvironmentVersionsRequest) returns (ListEnvironmentVersionsReply);
+}
+
 service FleetWorker {
   rpc ClaimJob(ClaimJobRequest) returns (ClaimJobReply);
   rpc ReportJob(ReportJobRequest) returns (ReportJobReply);
@@ -1493,4 +1508,127 @@ message DecideEditRequest {
   string project = 2;
   uint64 id = 3;
   EditDecision decision = 4;
+}
+
+enum EnvironmentDelivery {
+  ENVIRONMENT_DELIVERY_UNSPECIFIED = 0;
+  ENVIRONMENT_DELIVERY_FILE = 1;
+  ENVIRONMENT_DELIVERY_ENV = 2;
+}
+
+enum EnvironmentOnFail {
+  ENVIRONMENT_ON_FAIL_UNSPECIFIED = 0;
+  ENVIRONMENT_ON_FAIL_ABORT = 1;
+  ENVIRONMENT_ON_FAIL_CONTINUE = 2;
+}
+
+message EnvironmentInfo {
+  string name = 1;
+  optional uint32 latest_version = 2;
+}
+
+message CreateEnvironmentRequest {
+  string name = 1;
+}
+
+message ListEnvironmentsRequest {}
+
+message ListEnvironmentsReply {
+  repeated EnvironmentInfo environments = 1;
+}
+
+message GetEnvironmentRequest {
+  string name = 1;
+}
+
+message DeleteEnvironmentRequest {
+  string name = 1;
+}
+
+message DeleteEnvironmentReply {}
+
+// The structure of one secret. Unspecified delivery means a delivery file.
+message EnvironmentSecretSpec {
+  string name = 1;
+  bool agent_visible = 2;
+  EnvironmentDelivery delivery = 3;
+}
+
+// Unspecified on_fail means abort and an unset timeout means the default.
+message EnvironmentScriptSpec {
+  string name = 1;
+  string body = 2;
+  EnvironmentOnFail on_fail = 3;
+  optional uint32 timeout_s = 4;
+}
+
+message EnvironmentEntrySpec {
+  oneof kind {
+    EnvironmentSecretSpec secret = 1;
+    EnvironmentScriptSpec script = 2;
+  }
+}
+
+message EnvironmentVersion {
+  uint32 version = 1;
+  string hash = 2;
+  repeated EnvironmentEntrySpec entries = 3;
+  repeated string egress_hosts = 4;
+}
+
+message EnvironmentVersionInfo {
+  uint32 version = 1;
+  string hash = 2;
+}
+
+message EnvironmentSecretInfo {
+  string name = 1;
+  string fingerprint = 2;
+}
+
+message EnvironmentDetail {
+  EnvironmentInfo environment = 1;
+  repeated EnvironmentSecretInfo secrets = 2;
+  optional EnvironmentVersion latest = 3;
+}
+
+message PutEnvironmentSecretRequest {
+  string environment = 1;
+  string name = 2;
+  string value = 3;
+}
+
+message PutEnvironmentSecretReply {
+  string fingerprint = 1;
+}
+
+message DeleteEnvironmentSecretRequest {
+  string environment = 1;
+  string name = 2;
+}
+
+message DeleteEnvironmentSecretReply {}
+
+message SaveEnvironmentVersionRequest {
+  string environment = 1;
+  repeated EnvironmentEntrySpec entries = 2;
+  repeated string egress_hosts = 3;
+}
+
+message SaveEnvironmentVersionReply {
+  uint32 version = 1;
+  bool created = 2;
+}
+
+message GetEnvironmentVersionRequest {
+  string environment = 1;
+  uint32 version = 2;
+}
+
+message ListEnvironmentVersionsRequest {
+  string environment = 1;
+}
+
+message ListEnvironmentVersionsReply {
+  repeated EnvironmentVersionInfo versions = 1;
 }

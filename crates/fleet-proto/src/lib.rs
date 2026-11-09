@@ -310,6 +310,34 @@ pub const ERR_LEASE_MISMATCH: &str = "lease does not match";
 /// `PERMISSION_DENIED` message: credentials need a per-user token.
 pub const ERR_NEEDS_USER_TOKEN: &str = "credentials need a user token";
 
+/// `PERMISSION_DENIED` message: an Environment RPC needs a per-user token. The shared client
+/// token acts as the bootstrap user and names no person.
+pub const ERR_ENV_NEEDS_USER_TOKEN: &str = "environments need a user token";
+
+/// `NOT_FOUND` message of every Environment RPC that names an Environment. An unknown name and
+/// another User's name give this one text.
+pub const ERR_ENV_NOT_FOUND: &str = "environment not found";
+
+/// `NOT_FOUND` message of `DeleteEnvironmentSecret` for an Environment the caller owns that holds
+/// no secret of that name.
+pub const ERR_ENV_SECRET_NOT_FOUND: &str = "environment secret not found";
+
+/// `NOT_FOUND` message of `GetEnvironmentVersion` for a version the Environment does not have.
+pub const ERR_ENV_VERSION_NOT_FOUND: &str = "environment version not found";
+
+/// `ALREADY_EXISTS` message of `CreateEnvironment`.
+pub const ERR_ENV_EXISTS: &str = "environment already exists";
+
+/// `RESOURCE_EXHAUSTED` message: an Environment count, entry count or size cap is reached.
+pub const ERR_ENV_LIMIT: &str = "environment limit reached";
+
+/// `PERMISSION_DENIED` message: a version with a script needs the `env:scripts` capability.
+pub const ERR_ENV_SCRIPTS_NOT_GRANTED: &str =
+    "environment scripts need a capability the user lacks";
+
+/// `INTERNAL` message of an Environment store failure.
+pub const ERR_ENV_INTERNAL: &str = "environment store error";
+
 /// `INVALID_ARGUMENT` message: GitHub refused the token on save.
 pub const ERR_GITHUB_REJECTED: &str = "github rejected the token";
 
@@ -478,6 +506,16 @@ impl std::fmt::Debug for v1::PutCredentialRequest {
             .field("shape", &self.shape)
             .field("value", &"<redacted>")
             .field("expires_at_ms", &self.expires_at_ms)
+            .finish()
+    }
+}
+
+impl std::fmt::Debug for v1::PutEnvironmentSecretRequest {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PutEnvironmentSecretRequest")
+            .field("environment", &self.environment)
+            .field("name", &self.name)
+            .field("value", &"<redacted>")
             .finish()
     }
 }

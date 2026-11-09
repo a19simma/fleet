@@ -14,6 +14,7 @@ use fleet_proto::v1::fleet_catalog_admin_server::{FleetCatalogAdmin, FleetCatalo
 use fleet_proto::v1::fleet_catalog_server::{FleetCatalog, FleetCatalogServer};
 use fleet_proto::v1::fleet_credentials_server::{FleetCredentials, FleetCredentialsServer};
 use fleet_proto::v1::fleet_edit_server::{FleetEdit, FleetEditServer};
+use fleet_proto::v1::fleet_environments_server::{FleetEnvironments, FleetEnvironmentsServer};
 use fleet_proto::v1::fleet_ingest_server::{FleetIngest, FleetIngestServer};
 use fleet_proto::v1::fleet_jobs_server::{FleetJobs, FleetJobsServer};
 use fleet_proto::v1::fleet_judge_server::{FleetJudge, FleetJudgeServer};
@@ -56,6 +57,14 @@ use fleet_proto::v1::{
     ListPitfallsRequest, ListRetrosReply, ListRetrosRequest, OpenRetroRequest, Pitfall,
     RecordPitfallRequest, Retro, SuggestedEdit,
 };
+use fleet_proto::v1::{
+    CreateEnvironmentRequest, DeleteEnvironmentReply, DeleteEnvironmentRequest,
+    DeleteEnvironmentSecretReply, DeleteEnvironmentSecretRequest, EnvironmentDetail,
+    EnvironmentInfo, EnvironmentVersion, GetEnvironmentRequest, GetEnvironmentVersionRequest,
+    ListEnvironmentVersionsReply, ListEnvironmentVersionsRequest, ListEnvironmentsReply,
+    ListEnvironmentsRequest, PutEnvironmentSecretReply, PutEnvironmentSecretRequest,
+    SaveEnvironmentVersionReply, SaveEnvironmentVersionRequest,
+};
 use fleet_proto::{ConvertError, validate_box};
 use tonic::codegen::BoxStream;
 use tonic::service::Routes;
@@ -69,6 +78,7 @@ use crate::auth::{ADMIN_REQUIRED, BearerAuth, Caller};
 use crate::catalog;
 use crate::cred::capability::{self, Capabilities};
 use crate::cred::{CredentialService, RepoService};
+use crate::environments::EnvironmentService;
 use crate::jobs::validate_job_id;
 use crate::profiles::{self, ProfileContent, ProfileFault, Viewer};
 use crate::store::{Store, StoreError, WorkFault};
@@ -261,6 +271,7 @@ fn no_nul(field: &str, value: &str) -> Result<(), Status> {
 pub struct FleetService {
     store: Store,
     credentials: Option<CredentialService>,
+    environments: Option<EnvironmentService>,
     capabilities: Capabilities,
     update: UpdateRelay,
     timing_reply_cap: usize,
@@ -274,6 +285,7 @@ impl FleetService {
             capabilities: Capabilities::new(store.pool().clone()),
             store,
             credentials: None,
+            environments: None,
             update: UpdateRelay::default(),
             timing_reply_cap: MAX_JOB_TIMING_REPLY_BYTES,
             work_redactor: Redactor::default().with_installation_tokens(),
@@ -307,6 +319,26 @@ impl FleetService {
     pub fn with_credentials(mut self, credentials: Option<CredentialService>) -> Self {
         self.credentials = credentials;
         self
+    }
+
+    /// Enables the Environment RPCs.
+    #[must_use]
+    pub fn with_environments(mut self, environments: Option<EnvironmentService>) -> Self {
+        self.environments = environments;
+        self
+    }
+
+    fn environment_owner<T>(
+        &self,
+        request: &Request<T>,
+    ) -> Result<(&EnvironmentService, i64), Status> {
+        let user_id = caller_of(request)
+            .ok_or_else(|| Status::permission_denied(fleet_proto::ERR_ENV_NEEDS_USER_TOKEN))?;
+        let service = self
+            .environments
+            .as_ref()
+            .ok_or_else(|| Status::failed_precondition(fleet_proto::PRECONDITION_NOT_CONFIGURED))?;
+        Ok((service, user_id))
     }
 
     fn credential_owner<T>(
@@ -959,6 +991,97 @@ impl FleetWork for FleetService {
 }
 
 #[tonic::async_trait]
+impl FleetEnvironments for FleetService {
+    async fn create_environment(
+        &self,
+        request: Request<CreateEnvironmentRequest>,
+    ) -> Result<Response<EnvironmentInfo>, Status> {
+        let (service, user_id) = self.environment_owner(&request)?;
+        Ok(Response::new(
+            service.create(user_id, request.get_ref()).await?,
+        ))
+    }
+
+    async fn list_environments(
+        &self,
+        request: Request<ListEnvironmentsRequest>,
+    ) -> Result<Response<ListEnvironmentsReply>, Status> {
+        let (service, user_id) = self.environment_owner(&request)?;
+        Ok(Response::new(service.list(user_id).await?))
+    }
+
+    async fn get_environment(
+        &self,
+        request: Request<GetEnvironmentRequest>,
+    ) -> Result<Response<EnvironmentDetail>, Status> {
+        let (service, user_id) = self.environment_owner(&request)?;
+        Ok(Response::new(
+            service.get(user_id, request.get_ref()).await?,
+        ))
+    }
+
+    async fn delete_environment(
+        &self,
+        request: Request<DeleteEnvironmentRequest>,
+    ) -> Result<Response<DeleteEnvironmentReply>, Status> {
+        let (service, user_id) = self.environment_owner(&request)?;
+        Ok(Response::new(
+            service.delete(user_id, request.get_ref()).await?,
+        ))
+    }
+
+    async fn put_environment_secret(
+        &self,
+        request: Request<PutEnvironmentSecretRequest>,
+    ) -> Result<Response<PutEnvironmentSecretReply>, Status> {
+        let (service, user_id) = self.environment_owner(&request)?;
+        Ok(Response::new(
+            service.put_secret(user_id, request.get_ref()).await?,
+        ))
+    }
+
+    async fn delete_environment_secret(
+        &self,
+        request: Request<DeleteEnvironmentSecretRequest>,
+    ) -> Result<Response<DeleteEnvironmentSecretReply>, Status> {
+        let (service, user_id) = self.environment_owner(&request)?;
+        Ok(Response::new(
+            service.delete_secret(user_id, request.get_ref()).await?,
+        ))
+    }
+
+    async fn save_environment_version(
+        &self,
+        request: Request<SaveEnvironmentVersionRequest>,
+    ) -> Result<Response<SaveEnvironmentVersionReply>, Status> {
+        let (service, user_id) = self.environment_owner(&request)?;
+        Ok(Response::new(
+            service.save_version(user_id, request.get_ref()).await?,
+        ))
+    }
+
+    async fn get_environment_version(
+        &self,
+        request: Request<GetEnvironmentVersionRequest>,
+    ) -> Result<Response<EnvironmentVersion>, Status> {
+        let (service, user_id) = self.environment_owner(&request)?;
+        Ok(Response::new(
+            service.get_version(user_id, request.get_ref()).await?,
+        ))
+    }
+
+    async fn list_environment_versions(
+        &self,
+        request: Request<ListEnvironmentVersionsRequest>,
+    ) -> Result<Response<ListEnvironmentVersionsReply>, Status> {
+        let (service, user_id) = self.environment_owner(&request)?;
+        Ok(Response::new(
+            service.list_versions(user_id, request.get_ref()).await?,
+        ))
+    }
+}
+
+#[tonic::async_trait]
 impl FleetEdit for FleetService {
     async fn file_edit(
         &self,
@@ -1538,10 +1661,21 @@ pub fn router_with(
     auth: &BearerAuth,
     credentials: Option<CredentialService>,
 ) -> Router<Stack<BearerAuth, Identity>> {
+    router_with_environments(store, auth, credentials, None)
+}
+
+/// Same as [`router_with`] with the Environment RPCs backed by `environments`.
+pub fn router_with_environments(
+    store: &Store,
+    auth: &BearerAuth,
+    credentials: Option<CredentialService>,
+    environments: Option<EnvironmentService>,
+) -> Router<Stack<BearerAuth, Identity>> {
     server().layer(auth.clone()).add_routes(routes(
         store,
         auth,
         credentials,
+        environments,
         UpdateRelay::default(),
     ))
 }
@@ -1597,8 +1731,40 @@ pub async fn serve_with_credentials(
     incoming: TcpIncoming,
     shutdown: impl Future<Output = ()>,
 ) -> std::io::Result<()> {
+    serve_with_environments(
+        store,
+        auth,
+        web,
+        credentials,
+        None,
+        update,
+        incoming,
+        shutdown,
+    )
+    .await
+}
+
+/// Same as [`serve_with_credentials`] with the Environment RPCs backed by `environments`.
+///
+/// # Errors
+///
+/// Returns the I/O error that stopped the server.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "one wiring entry point for the server main"
+)]
+pub async fn serve_with_environments(
+    store: &Store,
+    auth: &BearerAuth,
+    web: Web,
+    credentials: Option<CredentialService>,
+    environments: Option<EnvironmentService>,
+    update: UpdateRelay,
+    incoming: TcpIncoming,
+    shutdown: impl Future<Output = ()>,
+) -> std::io::Result<()> {
     serve_routes(
-        routes(store, auth, credentials, update),
+        routes(store, auth, credentials, environments, update),
         auth,
         web,
         incoming,
@@ -1622,7 +1788,7 @@ pub async fn serve_with_web_timeout(
     header_read_timeout: Duration,
 ) -> std::io::Result<()> {
     serve_routes(
-        routes(store, auth, None, UpdateRelay::default()),
+        routes(store, auth, None, None, UpdateRelay::default()),
         auth,
         web,
         incoming,
@@ -1654,11 +1820,13 @@ fn routes(
     store: &Store,
     auth: &BearerAuth,
     credentials: Option<CredentialService>,
+    environments: Option<EnvironmentService>,
     update: UpdateRelay,
 ) -> Routes {
     let service = FleetService::new(store.clone())
         .with_work_redactor(auth.redactor())
         .with_credentials(credentials)
+        .with_environments(environments)
         .with_update(update);
     let ingest =
         FleetIngestServer::new(service.clone()).max_decoding_message_size(MAX_MESSAGE_BYTES);
@@ -1676,6 +1844,8 @@ fn routes(
     let work = FleetWorkServer::new(service.clone());
     let retro = FleetRetroServer::new(service.clone());
     let edit = FleetEditServer::new(service.clone());
+    let environments =
+        FleetEnvironmentsServer::new(service.clone()).max_decoding_message_size(MAX_MESSAGE_BYTES);
     let catalog = FleetCatalogServer::new(service.clone());
     let catalog_admin = FleetCatalogAdminServer::new(service.clone())
         .max_decoding_message_size(MAX_PROFILE_MESSAGE_BYTES);
@@ -1694,6 +1864,7 @@ fn routes(
         .add_service(work)
         .add_service(retro)
         .add_service(edit)
+        .add_service(environments)
         .add_service(catalog)
         .add_service(catalog_admin)
         .add_service(capability_admin)

@@ -80,3 +80,5 @@ Postgres also holds users, passkeys, sessions and API tokens. Auth on `FleetQuer
 ## Amendment for ADR-0066 (deciding suggested edits)
 
 `FleetEdit` joins the Client scope and stays out of the Box scope. `FileEdit`, `ListEdits` and `GetEdit` accept any Client-scope credential, owner scoped. `DecideEdit` accepts only a per-user API token: the auth layer refuses the static Client token, which maps to the Bootstrap user, and the store refuses the Bootstrap user again. A Web session decides through the store in WRK-11, never over gRPC.
+
+`FleetEnvironments` (ADR-0067) joins the Client scope and stays out of the Box scope. All nine methods accept only a per-user API token: the auth layer refuses the static Client token, which maps to the Bootstrap user, with a fixed reason.
