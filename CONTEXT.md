@@ -277,7 +277,7 @@ The `private` or `shared` setting of a **Profile**. A new Profile is `private`, 
 _Avoid_: access level, sharing mode
 
 **Capability**:
-A grant an **Admin** gives a **User**. `profile:tools` is needed to save or submit a **Profile** that lists `tools` or selects a `tool` **Catalog item**. `forge:github_app` gates the `github_app` credential kind (ADR-0058). A request under the **Client token** acts as the **Bootstrap user**, which holds the Capability only if an Admin grants it (ADR-0054).
+A grant an **Admin** gives a **User**. `profile:tools` is needed to save or submit a **Profile** that lists `tools` or selects a `tool` **Catalog item**. `forge:github_app` gates the `github_app` credential kind (ADR-0058). `env:scripts` is needed to save an **Environment** script (ADR-0067). A request under the **Client token** acts as the **Bootstrap user**, which holds the Capability only if an Admin grants it (ADR-0054).
 _Avoid_: role, permission
 
 **Model allowlist**:
@@ -365,7 +365,7 @@ The `pass` or `fail` an **Attempt** reports, with a note and a redacted 8 KiB ev
 _Avoid_: result, outcome
 
 **Ready**:
-A **Work item** whose dependencies all passed, which no **Attempt** holds and whose **Slices** have no **Slice lease**. Computed, never stored (ADR-0064).
+A **Work item** that is not cancelled or blocked, whose dependencies all passed, which no **Attempt** holds and whose **Slices** have no **Slice lease**. Computed, never stored (ADR-0064).
 _Avoid_: unblocked, available
 
 **Defer**:

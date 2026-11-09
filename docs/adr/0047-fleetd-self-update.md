@@ -19,7 +19,7 @@ ADR-0017 fixes the cargo-dist assets as `fleetd-<target>.tar.gz` plus a `.sha256
 ### On-disk layout
 
 - `/var/lib/fleet/bin` is a new 0755 directory owned by fleetd. It is not under `/var/lib/fleetd`: the unit sets `StateDirectory=fleetd` with `StateDirectoryMode=0700` (`deploy/fleetd-systemd.service:19-20`), so the job uid `fleet-job` could not read a binary placed there. The unit lists `-/var/lib/fleet/bin` in `ReadWritePaths=`, because `ProtectSystem=strict` otherwise keeps the swap read-only.
-- fleetd writes the staged binary with mode 0700 while it extracts the archive and sets 0755 on the file and its version directory only after the write completes.
+- fleetd writes the staged binary with mode 0700 while it extracts the archive (`crates/fleetd/src/update.rs`) and sets 0755 on the file and its version directory only after the write completes (`crates/fleetd/src/update/swap.rs`).
 - fleetd downloads the archive, checks the sha256 and the minisign signature against the trust root, then stages the binary at `/var/lib/fleet/bin/<ver>/fleetd`.
 - A `current` symlink points at the active version. fleetd swaps it by creating a new link and `rename(2)` over `current`, so a reader sees the old target or the new one, never a gap.
 - A `previous` symlink keeps the last good version.
