@@ -20,8 +20,10 @@ use zeroize::{Zeroize, Zeroizing};
 
 const KEY_LEN: usize = 32;
 const NONCE_LEN: usize = 24;
+const ENV_SECRET_LABEL: &str = "env-secret";
 
-/// Associated data for one sealed credential: `user_id|credential_id|kind`.
+/// Associated data for one sealed credential: `user_id|credential_id|kind`, or for one
+/// Environment secret (see [`Aad::for_environment_secret`]).
 ///
 /// The parts are joined with a raw `|` and not escaped, so ids that contain `|` can collide.
 /// Callers pass generated ids that never do.
@@ -38,6 +40,15 @@ impl Aad {
         bytes.push(b'|');
         bytes.extend_from_slice(kind.wire_name().as_bytes());
         Self(bytes)
+    }
+
+    /// Builds the associated data of one Environment secret: `env-secret|user|environment|name`.
+    ///
+    /// The fixed prefix cannot start a credential AAD, whose first part is a numeric user id, so
+    /// a credential ciphertext never opens as an Environment secret and the reverse. The name
+    /// follows the entry grammar and holds no `|`.
+    pub fn for_environment_secret(user_id: i64, environment_id: i64, name: &str) -> Self {
+        Self(format!("{ENV_SECRET_LABEL}|{user_id}|{environment_id}|{name}").into_bytes())
     }
 
     /// The raw bytes.
@@ -357,6 +368,43 @@ mod tests {
         assert_eq!(sealed.key_id, "k1");
         let open = s.open(&aad(), "k1", &sealed.ciphertext).unwrap();
         assert_eq!(open.as_slice(), b"hunter2-secret");
+    }
+
+    #[test]
+    fn environment_and_credential_aad_never_open_each_others_ciphertext() {
+        let s = ring(&[("k1", 1)]);
+        let env_aad = Aad::for_environment_secret(1, 2, "TOKEN");
+        let env_sealed = s.seal(&env_aad, b"value").unwrap();
+        assert_eq!(
+            s.open(&aad(), "k1", &env_sealed.ciphertext).unwrap_err(),
+            SealError::Open
+        );
+        let cred_sealed = s.seal(&aad(), b"value").unwrap();
+        assert_eq!(
+            s.open(&env_aad, "k1", &cred_sealed.ciphertext).unwrap_err(),
+            SealError::Open
+        );
+        let numeric = Aad::new("1", "2", CredentialKind::GithubPat);
+        assert_ne!(numeric.as_bytes(), env_aad.as_bytes());
+    }
+
+    #[test]
+    fn environment_aad_binds_user_environment_and_name() {
+        let s = ring(&[("k1", 1)]);
+        let sealed = s
+            .seal(&Aad::for_environment_secret(1, 2, "TOKEN"), b"value")
+            .unwrap();
+        for other in [
+            Aad::for_environment_secret(9, 2, "TOKEN"),
+            Aad::for_environment_secret(1, 9, "TOKEN"),
+            Aad::for_environment_secret(1, 2, "TOKEn"),
+            Aad::for_environment_secret(12, 2, "TOKEN"),
+        ] {
+            assert_eq!(
+                s.open(&other, "k1", &sealed.ciphertext).unwrap_err(),
+                SealError::Open
+            );
+        }
     }
 
     #[test]
