@@ -571,6 +571,50 @@ fn every_control_format_and_separator_code_point_is_stripped() {
 }
 
 #[test]
+fn a_multi_line_secret_is_redacted_before_the_strip() {
+    let secret = "-----BEGIN KEY-----\nabcdefghij\n-----END KEY-----";
+    let redactor = Redactor::new([secret]);
+    let out = sanitise_note(&format!("dropped {secret} end"), &redactor);
+    assert!(!out.contains("abcdefghij"), "{out}");
+    assert!(!out.contains("BEGIN KEY"), "{out}");
+    assert!(out.starts_with("dropped "), "{out}");
+}
+
+#[test]
+fn each_note_field_strips_every_hostile_class() {
+    let redactor = Redactor::new(Vec::<String>::new());
+    let hostile = [
+        "\r",
+        "\r\n",
+        "\n",
+        "\t",
+        "\u{85}",
+        "\u{2028}",
+        "\u{2029}",
+        "\u{202e}",
+        "\u{2066}",
+        "\u{200b}",
+        "\u{200d}",
+        "\u{feff}",
+        "\u{ad}",
+        "\u{e0041}",
+        "\u{1b}",
+        "\u{0}",
+    ];
+    for h in hostile {
+        let note = sanitise_note(
+            &format!("kimi has no subagents: dropped ag{h}ent-1"),
+            &redactor,
+        );
+        assert_eq!(note, "kimi has no subagents: dropped agent-1", "note {h:?}");
+        let item = sanitise_note(&format!("kimi has no subagents: dropped {h}"), &redactor);
+        assert_eq!(item, "kimi has no subagents: dropped ", "item {h:?}");
+        let summary = sanitise_note(&format!("and {h}3 more dropped"), &redactor);
+        assert_eq!(summary, "and 3 more dropped", "summary {h:?}");
+    }
+}
+
+#[test]
 fn ordinary_text_survives_note_sanitising() {
     let redactor = Redactor::new(Vec::<String>::new());
     let text = "kimi caf\u{e9} \u{4e16}\u{754c} \u{1f600} \u{627}\u{644} x-y_z";
