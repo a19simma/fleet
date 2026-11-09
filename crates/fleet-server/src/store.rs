@@ -378,19 +378,19 @@ pub enum StoreError {
     /// another attempt. The handler maps this to gRPC `FAILED_PRECONDITION`. No input is
     /// kept.
     StaleReport,
-    /// A transcript chunk has a sequence number or text the store cannot keep. No input is
-    /// kept.
+    /// A transcript chunk has a sequence number or text the store cannot keep. Nothing is
+    /// stored.
     InvalidChunk,
-    /// A telemetry event or summary has a value the store cannot keep. No input is kept.
+    /// A telemetry event or summary has a value the store cannot keep. Nothing is stored.
     InvalidTelemetry,
     /// A report carries more telemetry events than [`fleet_proto::MAX_EVENTS_PER_REPORT`].
     TelemetryTooLarge,
     /// A get, cancel or transcript read named a job that does not exist. The handler maps
-    /// this to gRPC `NOT_FOUND`. No input is kept.
+    /// this to gRPC `NOT_FOUND`.
     NotFound,
-    /// A profile request failed validation. No input is kept.
+    /// A profile request failed validation. Nothing is stored.
     InvalidProfile(ProfileFault),
-    /// A batch request failed validation. No input is kept.
+    /// A batch request failed validation. Nothing is stored.
     InvalidBatch(BatchInvalid),
     /// A batch named a profile that has no version. The handler maps this to gRPC
     /// `NOT_FOUND`. The error carries no data.

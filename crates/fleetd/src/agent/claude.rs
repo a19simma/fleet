@@ -69,8 +69,10 @@ impl TelemetryEnv {
     ///
     /// # Errors
     ///
-    /// [`TelemetryEnvError::BadToken`] when the receiver would refuse `token`, so a value that
-    /// could break the header or the env file never reaches either.
+    /// [`TelemetryEnvError::BadToken`] when the receiver would refuse `token`. The receiver
+    /// accepts any visible ASCII, including `,`, `=`, `"`, `\`, `$` and `'`, which can split the
+    /// header or break env-file quoting. The systemd launcher therefore admits only
+    /// `[A-Za-z0-9_-]` before it calls this.
     pub fn new(port: std::num::NonZeroU16, token: &str) -> Result<Self, TelemetryEnvError> {
         crate::otel::BearerToken::new(token).map_err(|_| TelemetryEnvError::BadToken)?;
         Ok(Self {

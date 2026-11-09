@@ -185,7 +185,9 @@ impl FetchPolicy {
     /// `host` must be the post-parse ASCII (punycode) host from the URL parser. Callers must
     /// call this again on every redirect hop, must not route the fetch through an HTTP proxy
     /// (the proxy would resolve and dial the host, bypassing the address check), and must pair
-    /// it with [`FetchPolicy::permits_address`] on the connected socket address.
+    /// it with [`FetchPolicy::permits_address`] on the connected socket address. A host with a
+    /// trailing dot never matches an exact pattern, so a caller must strip the dot or refuse the
+    /// host before the check; the policy fails closed on it.
     #[must_use]
     pub fn permits_host(&self, host: &str) -> bool {
         match self {

@@ -5,6 +5,10 @@
 //! disk, to a log or to an error. A value lives in a [`Secret`], which zeroes its buffer on
 //! drop and prints as `[REDACTED]`.
 //!
+//! Zeroing is partial. The bearer token header value and the `prost` decode buffers of a reply
+//! are plain allocations that are not zeroed when dropped, and the [`Redactor`] keeps plain
+//! copies. A process that can read fleetd memory can still recover a value.
+//!
 //! The call is authorised by the job lease (ADR-0033), so the caller fetches only after the
 //! claim is held and before the agent starts. The server's fixed refusals map to one
 //! [`CredentialFailure`] each, and each failure has a fixed reason the job report carries.
