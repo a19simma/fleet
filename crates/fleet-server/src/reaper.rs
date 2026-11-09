@@ -1,4 +1,5 @@
-//! Background task that marks jobs with an expired lease `LOST`.
+//! Background task that marks jobs with an expired lease `LOST` and closes work attempts past
+//! their lease as lost.
 
 use std::time::Duration;
 
@@ -35,9 +36,20 @@ pub fn error_kind(err: &StoreError) -> &'static str {
     }
 }
 
-/// Runs [`Store::reap_expired`] every `period` until `stop` turns true.
+/// One pass: [`Store::reap_expired`] then [`Store::reap_work_leases`]. Returns both counts summed.
 ///
-/// A pass that reaps at least one job logs only the count and wakes `reaped`, which lets a
+/// # Errors
+///
+/// The first failing statement. The work sweep then waits for the next pass.
+pub async fn reap_pass(store: &Store) -> Result<u64, StoreError> {
+    let jobs = store.reap_expired().await?;
+    let attempts = store.reap_work_leases().await?;
+    Ok(jobs.saturating_add(attempts))
+}
+
+/// Runs [`reap_pass`] every `period` until `stop` turns true.
+///
+/// A pass that reaps at least one job or attempt logs only the count and wakes `reaped`, which lets a
 /// test wait on a signal instead of sleeping. A failed pass logs a fixed message with an
 /// [`error_kind`] and sleeps [`backoff_after`]. The ticker uses delay mode and is already
 /// due when the sleep ends, so the gap after a failure is the larger of that wait and
@@ -58,11 +70,11 @@ pub async fn run_reaper(
             _ = stop.wait_for(|halt| *halt) => return,
             _ = ticker.tick() => {}
         }
-        match store.reap_expired().await {
+        match reap_pass(&store).await {
             Ok(0) => backoff = None,
             Ok(count) => {
                 backoff = None;
-                tracing::warn!(count, "marked expired jobs lost");
+                tracing::warn!(count, "marked expired leases lost");
                 if let Some(signal) = reaped {
                     signal.notify_one();
                 }

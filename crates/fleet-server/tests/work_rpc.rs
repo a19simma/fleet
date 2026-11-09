@@ -9,10 +9,10 @@ use std::time::Duration;
 
 use fleet_proto::v1::fleet_work_server::FleetWork;
 use fleet_proto::v1::{
-    AddWorkDepRequest, AddWorkItemRequest, CancelWorkRequest, ClaimWorkRequest,
-    CreateWorkProjectRequest, GetWorkItemRequest, ListWorkItemsRequest, ListWorkProjectsRequest,
-    NextWorkRequest, RemoveWorkDepRequest, SetWorkSlicesRequest, UnblockWorkRequest, WorkDep,
-    WorkItem, WorkItemState, WorkProject, WorkSlice,
+    AddWorkDepRequest, AddWorkItemRequest, CancelWorkRequest, CreateWorkProjectRequest,
+    GetWorkItemRequest, ListWorkItemsRequest, ListWorkProjectsRequest, RemoveWorkDepRequest,
+    SetWorkSlicesRequest, UnblockWorkRequest, WorkDep, WorkItem, WorkItemState, WorkProject,
+    WorkSlice,
 };
 use fleet_server::auth::Caller;
 use fleet_server::service::FleetService;
@@ -845,24 +845,4 @@ async fn concurrent_deps_cannot_form_a_cycle(pool: PgPool) {
     let (x, y) = tokio::join!(w.dep("d1", "a", "b"), w.dep("d2", "b", "a"));
     assert_eq!(usize::from(x.is_ok()) + usize::from(y.is_ok()), 1);
     assert_eq!(w.count("work_dep").await, 1);
-}
-
-#[sqlx::test(migrations = false)]
-async fn later_rpcs_are_not_available_yet(pool: PgPool) {
-    let w = world(pool).await;
-    let next = w
-        .svc
-        .next_work(as_user(w.alice, NextWorkRequest::default()))
-        .await;
-    assert_eq!(code(next).0, Code::Unimplemented);
-    let claim = w
-        .svc
-        .claim_work(as_user(w.alice, ClaimWorkRequest::default()))
-        .await;
-    assert_eq!(code(claim).0, Code::Unimplemented);
-    let anonymous = w
-        .svc
-        .list_work_projects(Request::new(ListWorkProjectsRequest {}))
-        .await;
-    assert_eq!(code(anonymous).0, Code::PermissionDenied);
 }

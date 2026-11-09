@@ -26,7 +26,7 @@ use std::future::Future;
 use std::pin::Pin;
 use std::task::{Context, Poll};
 
-use fleet_core::constant_time_eq;
+use fleet_core::{Redactor, constant_time_eq};
 use tonic::Status;
 use tonic::body::Body;
 use tonic::codegen::http::{HeaderValue, Request, Response};
@@ -120,6 +120,19 @@ impl BearerAuth {
             client_token: client_token.map(header),
             users: None,
         }
+    }
+
+    /// Builds the redactor for stored work evidence: the box token, the client token and the
+    /// GitHub installation-token shape.
+    pub fn redactor(&self) -> Redactor {
+        let raw = |secret: &Secret| {
+            let header = secret.expose();
+            header.strip_prefix("Bearer ").unwrap_or(header).to_owned()
+        };
+        let tokens = std::iter::once(&self.box_token)
+            .chain(self.client_token.as_ref())
+            .map(raw);
+        Redactor::new(tokens).with_installation_tokens()
     }
 
     /// Adds user resolution: API tokens authenticate as their user and the client token as

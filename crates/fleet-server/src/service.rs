@@ -4,8 +4,8 @@
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use fleet_core::Envelope;
 use fleet_core::graph;
+use fleet_core::{Envelope, Redactor};
 use fleet_proto::v1::fleet_batches_server::{FleetBatches, FleetBatchesServer};
 use fleet_proto::v1::fleet_capability_admin_server::{
     FleetCapabilityAdmin, FleetCapabilityAdminServer,
@@ -254,6 +254,7 @@ pub struct FleetService {
     capabilities: Capabilities,
     update: UpdateRelay,
     timing_reply_cap: usize,
+    work_redactor: Redactor,
 }
 
 impl FleetService {
@@ -265,7 +266,16 @@ impl FleetService {
             credentials: None,
             update: UpdateRelay::default(),
             timing_reply_cap: MAX_JOB_TIMING_REPLY_BYTES,
+            work_redactor: Redactor::default().with_installation_tokens(),
         }
+    }
+
+    /// Sets the redactor that masks secrets in the evidence of a reported work attempt. The
+    /// default masks GitHub App installation tokens by shape.
+    #[must_use]
+    pub fn with_work_redactor(mut self, redactor: Redactor) -> Self {
+        self.work_redactor = redactor;
+        self
     }
 
     /// Sets the largest `GetJobTimingReply` the handler returns, in encoded bytes.
@@ -653,9 +663,11 @@ fn work_error(err: &StoreError) -> Status {
             Status::already_exists("idempotency key already used with other parameters")
         }
         StoreError::Work(fault) => match fault {
-            WorkFault::ProjectNotFound | WorkFault::ItemNotFound | WorkFault::DepNotFound => {
-                Status::not_found(fault.to_string())
-            }
+            WorkFault::ProjectNotFound
+            | WorkFault::ItemNotFound
+            | WorkFault::DepNotFound
+            | WorkFault::AttemptNotFound
+            | WorkFault::DeferNotFound => Status::not_found(fault.to_string()),
             WorkFault::Invalid(reason) => Status::invalid_argument(*reason),
             WorkFault::Graph(graph::GraphError::Cycle(_))
             | WorkFault::RepoNotRegistered
@@ -667,8 +679,6 @@ fn work_error(err: &StoreError) -> Status {
         other => storage_unavailable(other),
     }
 }
-
-const WORK_LATER: &str = "not available yet";
 
 #[tonic::async_trait]
 impl FleetWork for FleetService {
@@ -806,64 +816,104 @@ impl FleetWork for FleetService {
         &self,
         request: Request<NextWorkRequest>,
     ) -> Result<Response<NextWorkReply>, Status> {
-        work_user(&request)?;
-        Err(Status::unimplemented(WORK_LATER))
+        let user_id = work_user(&request)?;
+        let reply = self
+            .store
+            .next_work(user_id, request.get_ref())
+            .await
+            .map_err(|err| work_error(&err))?;
+        Ok(Response::new(reply))
     }
 
     async fn claim_work(
         &self,
         request: Request<ClaimWorkRequest>,
     ) -> Result<Response<WorkAttempt>, Status> {
-        work_user(&request)?;
-        Err(Status::unimplemented(WORK_LATER))
+        let user_id = work_user(&request)?;
+        let reply = self
+            .store
+            .claim_work(user_id, request.get_ref())
+            .await
+            .map_err(|err| work_error(&err))?;
+        Ok(Response::new(reply))
     }
 
     async fn renew_lease(
         &self,
         request: Request<RenewLeaseRequest>,
     ) -> Result<Response<WorkAttempt>, Status> {
-        work_user(&request)?;
-        Err(Status::unimplemented(WORK_LATER))
+        let user_id = work_user(&request)?;
+        let reply = self
+            .store
+            .renew_lease(user_id, request.get_ref())
+            .await
+            .map_err(|err| work_error(&err))?;
+        Ok(Response::new(reply))
     }
 
     async fn report_attempt(
         &self,
         request: Request<ReportAttemptRequest>,
     ) -> Result<Response<WorkAttempt>, Status> {
-        work_user(&request)?;
-        Err(Status::unimplemented(WORK_LATER))
+        let user_id = work_user(&request)?;
+        let reply = self
+            .store
+            .report_attempt(user_id, request.get_ref(), &self.work_redactor)
+            .await
+            .map_err(|err| work_error(&err))?;
+        Ok(Response::new(reply))
     }
 
     async fn add_work_note(
         &self,
         request: Request<AddWorkNoteRequest>,
     ) -> Result<Response<WorkEvent>, Status> {
-        work_user(&request)?;
-        Err(Status::unimplemented(WORK_LATER))
+        let user_id = work_user(&request)?;
+        let reply = self
+            .store
+            .add_work_note(user_id, request.get_ref())
+            .await
+            .map_err(|err| work_error(&err))?;
+        Ok(Response::new(reply))
     }
 
     async fn record_work_defer(
         &self,
         request: Request<RecordWorkDeferRequest>,
     ) -> Result<Response<WorkDefer>, Status> {
-        work_user(&request)?;
-        Err(Status::unimplemented(WORK_LATER))
+        let user_id = work_user(&request)?;
+        let reply = self
+            .store
+            .record_work_defer(user_id, request.get_ref())
+            .await
+            .map_err(|err| work_error(&err))?;
+        Ok(Response::new(reply))
     }
 
     async fn resolve_work_defer(
         &self,
         request: Request<ResolveWorkDeferRequest>,
     ) -> Result<Response<WorkDefer>, Status> {
-        work_user(&request)?;
-        Err(Status::unimplemented(WORK_LATER))
+        let user_id = work_user(&request)?;
+        let reply = self
+            .store
+            .resolve_work_defer(user_id, request.get_ref())
+            .await
+            .map_err(|err| work_error(&err))?;
+        Ok(Response::new(reply))
     }
 
     async fn list_work_defers(
         &self,
         request: Request<ListWorkDefersRequest>,
     ) -> Result<Response<ListWorkDefersReply>, Status> {
-        work_user(&request)?;
-        Err(Status::unimplemented(WORK_LATER))
+        let user_id = work_user(&request)?;
+        let reply = self
+            .store
+            .list_work_defers(user_id, request.get_ref())
+            .await
+            .map_err(|err| work_error(&err))?;
+        Ok(Response::new(reply))
     }
 }
 
@@ -1267,9 +1317,12 @@ pub fn router_with(
     auth: &BearerAuth,
     credentials: Option<CredentialService>,
 ) -> Router<Stack<BearerAuth, Identity>> {
-    server()
-        .layer(auth.clone())
-        .add_routes(routes(store, credentials, UpdateRelay::default()))
+    server().layer(auth.clone()).add_routes(routes(
+        store,
+        auth,
+        credentials,
+        UpdateRelay::default(),
+    ))
 }
 
 fn server() -> Server {
@@ -1324,7 +1377,7 @@ pub async fn serve_with_credentials(
     shutdown: impl Future<Output = ()>,
 ) -> std::io::Result<()> {
     serve_routes(
-        routes(store, credentials, update),
+        routes(store, auth, credentials, update),
         auth,
         web,
         incoming,
@@ -1348,7 +1401,7 @@ pub async fn serve_with_web_timeout(
     header_read_timeout: Duration,
 ) -> std::io::Result<()> {
     serve_routes(
-        routes(store, None, UpdateRelay::default()),
+        routes(store, auth, None, UpdateRelay::default()),
         auth,
         web,
         incoming,
@@ -1376,8 +1429,14 @@ async fn serve_routes(
     .await
 }
 
-fn routes(store: &Store, credentials: Option<CredentialService>, update: UpdateRelay) -> Routes {
+fn routes(
+    store: &Store,
+    auth: &BearerAuth,
+    credentials: Option<CredentialService>,
+    update: UpdateRelay,
+) -> Routes {
     let service = FleetService::new(store.clone())
+        .with_work_redactor(auth.redactor())
         .with_credentials(credentials)
         .with_update(update);
     let ingest =

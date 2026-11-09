@@ -17,8 +17,15 @@
 //!
 //! `work_event` and `work_defer` reference items and attempts with single column foreign keys,
 //! so the schema alone does not stop a row that points into another project. [`insert_event`]
-//! checks the project of every reference inside its own statement.
+//! and [`defer::insert_defer`] check the project of every reference inside their own statement.
+//!
+//! A claim, a renewal, a report and a note take the same project row lock. A claim inserts the
+//! attempt and one `work_slice_lease` row per slice of the item in one transaction. A lease runs
+//! to a database clock expiry, and [`Store::reap_work_leases`] closes an attempt past it as lost.
+//! `passes` and `fails` stay counts over attempts.
 
+mod claim;
+mod defer;
 mod load;
 mod write;
 
@@ -42,6 +49,21 @@ const MAX_BODY_BYTES: usize = 16384;
 const MAX_REASON_BYTES: usize = 2000;
 const MAX_LIST_PROJECTS: i64 = 1000;
 const MAX_DETAIL_ROWS: i64 = 200;
+const MAX_LIST_DEFERS: i64 = 1000;
+const MAX_NOTE_BYTES: usize = 4096;
+
+/// Shortest lease a claim or renewal may ask for, in seconds.
+pub const MIN_LEASE_TTL_SECS: u32 = 10;
+/// Lease length used when a claim or renewal sends `ttl_secs` 0, in seconds.
+pub const DEFAULT_LEASE_TTL_SECS: u32 = 1800;
+/// Longest lease a claim or renewal may ask for, in seconds.
+pub const MAX_LEASE_TTL_SECS: u32 = 86_400;
+/// Bytes of evidence kept on an attempt, cut after redaction.
+pub const MAX_EVIDENCE_BYTES: usize = 8192;
+/// Most evidence bytes a report may send. A longer text is refused before it is scanned.
+pub const MAX_EVIDENCE_INPUT_BYTES: usize = 262_144;
+/// Most attempts one reaper pass closes.
+pub const MAX_REAP_BATCH: i64 = 1000;
 
 const SELECT_KEY: &str = "\
 SELECT rpc, request_digest, response FROM work_request_key WHERE project_id = $1 AND key = $2";
@@ -56,7 +78,8 @@ SELECT $1, $2, $3, $4, $5, $6 \
 WHERE ($2::bigint IS NULL OR EXISTS (\
 SELECT 1 FROM work_item WHERE id = $2 AND project_id = $1)) \
 AND ($3::bigint IS NULL OR EXISTS (\
-SELECT 1 FROM work_attempt WHERE id = $3 AND project_id = $1))";
+SELECT 1 FROM work_attempt WHERE id = $3 AND project_id = $1)) \
+RETURNING id, (extract(epoch FROM at) * 1000)::bigint AS at_ms";
 
 const LOCK_PROJECT: &str =
     "SELECT id FROM work_project WHERE user_id = $1 AND name = $2 FOR UPDATE";
@@ -74,6 +97,10 @@ pub enum WorkFault {
     ProjectNotFound,
     /// The item is unknown in that project.
     ItemNotFound,
+    /// The attempt is unknown in that project.
+    AttemptNotFound,
+    /// The defer is unknown in that project.
+    DeferNotFound,
     /// The dependency edge does not exist.
     DepNotFound,
     /// An input broke a rule. The text is fixed.
@@ -96,6 +123,8 @@ impl fmt::Display for WorkFault {
             Self::ProjectNotFound => f.write_str("work project not found"),
             Self::ItemNotFound => f.write_str("work item not found"),
             Self::DepNotFound => f.write_str("work dependency not found"),
+            Self::AttemptNotFound => f.write_str("work attempt not found"),
+            Self::DeferNotFound => f.write_str("work defer not found"),
             Self::Invalid(reason) | Self::Exists(reason) | Self::Precondition(reason) => {
                 f.write_str(reason)
             }
@@ -211,8 +240,8 @@ pub(super) async fn remember<R: Message>(
     Ok(())
 }
 
-/// Records an event of `project_id`. A reference to an item or attempt of another project
-/// writes nothing and returns [`WorkFault::CrossProject`].
+/// Records an event of `project_id` and returns its id and time in milliseconds. A reference to
+/// an item or attempt of another project writes nothing and returns [`WorkFault::CrossProject`].
 pub(super) async fn insert_event(
     conn: &mut PgConnection,
     project_id: i64,
@@ -221,20 +250,17 @@ pub(super) async fn insert_event(
     kind: &str,
     actor: &str,
     note: &str,
-) -> Result<(), StoreError> {
-    let done = sqlx::query(INSERT_EVENT)
+) -> Result<(i64, i64), StoreError> {
+    sqlx::query_as(INSERT_EVENT)
         .bind(project_id)
         .bind(item_id)
         .bind(attempt_id)
         .bind(kind)
         .bind(actor)
         .bind(note)
-        .execute(&mut *conn)
-        .await?;
-    if done.rows_affected() == 0 {
-        return Err(WorkFault::CrossProject.into());
-    }
-    Ok(())
+        .fetch_optional(&mut *conn)
+        .await?
+        .ok_or_else(|| WorkFault::CrossProject.into())
 }
 
 pub(super) async fn lock_project(

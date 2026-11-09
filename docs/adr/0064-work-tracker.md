@@ -1,6 +1,6 @@
 # Server-side work tracker
 
-Status: Proposed 2026-11-09, not built (WRK-2 to WRK-6, WRK-12, WRK-13). Builds on ADR-0042 (users, owner scope), ADR-0059 (repository registry) and ADR-0063 (hostile text). Extended by ADR-0065 and ADR-0066.
+Status: Proposed 2026-11-09, partly built (store, graph RPCs, claim with slice leases, lease TTL and renew, report with derived counts and a redacted 8 KiB evidence tail, notes, defers, lease reaper; not built: WRK-5, WRK-6, WRK-12, WRK-13). Builds on ADR-0042 (users, owner scope), ADR-0059 (repository registry) and ADR-0063 (hostile text). Extended by ADR-0065 and ADR-0066.
 
 A ralph loop keeps its work graph in `.ralph/tasks.json`, `.ralph/slices.json` and `.ralph/progress.md` on one machine. One conductor reads them, so a second operator, a second machine or the web UI cannot see the graph, and a crashed worker leaves a stale line nobody reaps. Fleet already stores Jobs, Users and a repository registry. This ADR moves the graph into the server so agents and people claim and report work through one API.
 

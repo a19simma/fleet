@@ -33,7 +33,10 @@ use crate::telemetry;
 mod ci_retry;
 mod work;
 
-pub use work::WorkFault;
+pub use work::{
+    DEFAULT_LEASE_TTL_SECS, MAX_EVIDENCE_BYTES, MAX_EVIDENCE_INPUT_BYTES, MAX_LEASE_TTL_SECS,
+    MAX_REAP_BATCH, MIN_LEASE_TTL_SECS, WorkFault,
+};
 
 use ci_retry::{ROOT_ID, decide_ci_retry};
 

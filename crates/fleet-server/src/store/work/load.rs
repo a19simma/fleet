@@ -167,7 +167,7 @@ impl Snapshot {
             .map(|item| item.key.as_str())
     }
 
-    fn counts_of(&self, id: i64) -> (i64, i64, bool) {
+    pub(super) fn counts_of(&self, id: i64) -> (i64, i64, bool) {
         self.counts.get(&id).copied().unwrap_or((0, 0, false))
     }
 
@@ -194,6 +194,10 @@ impl Snapshot {
             slices: self.slices.clone(),
             mergeable: self.mergeable.clone(),
         }
+    }
+
+    pub(super) fn is_ready(&self, key: &str) -> bool {
+        self.ready_keys().contains(key)
     }
 
     fn ready_keys(&self) -> HashSet<String> {
@@ -269,7 +273,7 @@ fn state_of(text: &str) -> Result<WorkItemState, StoreError> {
     }
 }
 
-fn verdict_of(text: &str) -> Result<WorkVerdict, StoreError> {
+pub(super) fn verdict_of(text: &str) -> Result<WorkVerdict, StoreError> {
     match text {
         "pass" => Ok(WorkVerdict::Pass),
         "fail" => Ok(WorkVerdict::Fail),

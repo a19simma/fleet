@@ -78,18 +78,18 @@ const CLOSE_ATTEMPTS: &str = "\
 UPDATE work_attempt SET verdict = 'lost', closed_at = now(), note = $3 \
 WHERE project_id = $1 AND item_id = $2 AND verdict IS NULL RETURNING id";
 
-enum Started<R> {
+pub(super) enum Started<R> {
     Replayed(R),
     Fresh(Transaction<'static, Postgres>, i64),
 }
 
-fn keyless<M: Clone>(request: &M, clear: impl FnOnce(&mut M)) -> M {
+pub(super) fn keyless<M: Clone>(request: &M, clear: impl FnOnce(&mut M)) -> M {
     let mut copy = request.clone();
     clear(&mut copy);
     copy
 }
 
-fn check(graph: &fleet_core::graph::Graph) -> Result<(), StoreError> {
+pub(super) fn check(graph: &fleet_core::graph::Graph) -> Result<(), StoreError> {
     validate(graph).map_err(|errors| {
         let first = errors.into_iter().next().unwrap_or(GraphError::Truncated);
         StoreError::from(WorkFault::Graph(first))
@@ -117,7 +117,7 @@ fn normalised(raw: &[String]) -> Result<BTreeSet<String>, WorkFault> {
 }
 
 impl Store {
-    async fn begin_graph_write<R: Message + Default>(
+    pub(super) async fn begin_graph_write<R: Message + Default>(
         &self,
         user_id: i64,
         project: &str,
@@ -131,7 +131,7 @@ impl Store {
         Ok(replayed.map_or_else(|| Started::Fresh(tx, project_id), Started::Replayed))
     }
 
-    async fn finish_graph_write<R: Message>(
+    pub(super) async fn finish_graph_write<R: Message>(
         mut tx: Transaction<'static, Postgres>,
         project_id: i64,
         key: &str,
@@ -728,7 +728,7 @@ async fn store_slices(
     Ok(())
 }
 
-fn reason(text: &str) -> Result<&str, WorkFault> {
+pub(super) fn reason(text: &str) -> Result<&str, WorkFault> {
     if text.trim().is_empty() || !lines(text, MAX_REASON_BYTES) {
         return Err(WorkFault::Invalid("invalid reason"));
     }
