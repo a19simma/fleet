@@ -335,6 +335,123 @@ fn the_stylesheet_is_the_generated_console_build() {
     assert!(STYLE_CSS.contains(":focus-visible"));
 }
 
+fn hex_channel(hex: &str, at: usize) -> f64 {
+    let v = u8::from_str_radix(&hex[at..at + 2], 16).unwrap();
+    let c = f64::from(v) / 255.0;
+    if c <= 0.03928 {
+        c / 12.92
+    } else {
+        ((c + 0.055) / 1.055).powf(2.4)
+    }
+}
+
+fn luminance(hex: &str) -> f64 {
+    0.0722f64.mul_add(
+        hex_channel(hex, 5),
+        0.7152f64.mul_add(hex_channel(hex, 3), 0.2126 * hex_channel(hex, 1)),
+    )
+}
+
+fn contrast(a: &str, b: &str) -> f64 {
+    let (la, lb) = (luminance(a), luminance(b));
+    (la.max(lb) + 0.05) / (la.min(lb) + 0.05)
+}
+
+fn token(css: &str, name: &str) -> String {
+    let start = css.find(&format!("{name}:#")).unwrap() + name.len() + 1;
+    css[start..start + 7].to_owned()
+}
+
+#[test]
+fn the_contrast_helper_matches_known_ratios() {
+    assert!((contrast("#000000", "#ffffff") - 21.0).abs() < 0.01);
+    assert!((contrast("#777777", "#ffffff") - 4.48).abs() < 0.02);
+}
+
+#[test]
+fn menu_title_text_meets_aa_contrast_on_the_sidebar() {
+    let rule = "menu-title{color:#";
+    let at = STYLE_CSS
+        .rfind(rule)
+        .expect("no solid menu-title colour rule");
+    let fg = &STYLE_CSS[at + rule.len() - 1..at + rule.len() + 6];
+    let bg = token(STYLE_CSS, "--color-base-200");
+    let ratio = contrast(fg, &bg);
+    assert!(ratio >= 4.5, "{fg} on {bg} is {ratio:.2}");
+}
+
+#[test]
+fn nav_links_have_a_24px_minimum_target() {
+    assert!(
+        STYLE_CSS.contains(".menu a{min-block-size:24px}")
+            || STYLE_CSS.contains(".menu :where(a){min-block-size:24px}"),
+        "no 24px nav link rule"
+    );
+}
+
+#[sqlx::test]
+async fn the_shell_is_a_sidebar_from_lg_and_a_top_bar_below(pool: PgPool) {
+    let h = Harness::start(pool).await;
+    let cookie = h.cookie().await;
+    let page = h.get("/jobs", Some(&cookie)).await;
+    assert_eq!(page.status, 200);
+    let classes = class_tokens(&page.body);
+    for want in [
+        "lg:flex",
+        "lg:w-48",
+        "lg:hidden",
+        "lg:flex-row",
+        "flex-col",
+        "overflow-x-auto",
+    ] {
+        assert!(classes.contains(want), "missing {want}");
+    }
+    let navs = tags(&page.body, "nav");
+    assert_eq!(navs.len(), 2, "{navs:?}");
+    let side = navs.iter().find(|t| t.contains("lg:w-48")).unwrap();
+    let bar = navs.iter().find(|t| t.contains("lg:hidden")).unwrap();
+    let bar_class = attr(bar, "class").unwrap();
+    for want in [
+        "flex",
+        "overflow-x-auto",
+        "gap-3",
+        "border-b",
+        "border-base-300",
+    ] {
+        assert!(bar_class.split(' ').any(|c| c == want), "{bar} {want}");
+    }
+    let side_class = attr(side, "class").unwrap();
+    assert!(side_class.split(' ').any(|c| c == "hidden"), "{side}");
+    assert_ne!(attr(side, "aria-label"), attr(bar, "aria-label"));
+    for t in &navs {
+        assert!(attr(t, "aria-label").is_some(), "{t}");
+    }
+    h.finish().await;
+}
+
+#[sqlx::test]
+async fn page_headers_wrap_and_may_shrink(pool: PgPool) {
+    let h = Harness::start(pool).await;
+    let cookie = h.cookie().await;
+    for path in NAV {
+        let page = h.get(path, Some(&cookie)).await;
+        let headers = tags(&page.body, "header");
+        if path == "/account" {
+            continue;
+        }
+        assert!(!headers.is_empty(), "{path}");
+        for header in headers {
+            let class = attr(header, "class").unwrap();
+            assert!(
+                class.split(' ').any(|c| c == "flex-wrap"),
+                "{path} {header}"
+            );
+            assert!(class.split(' ').any(|c| c == "min-w-0"), "{path} {header}");
+        }
+    }
+    h.finish().await;
+}
+
 #[sqlx::test]
 async fn the_shell_marks_exactly_the_active_nav_item(pool: PgPool) {
     let h = Harness::start(pool).await;
@@ -344,15 +461,17 @@ async fn the_shell_marks_exactly_the_active_nav_item(pool: PgPool) {
         assert_eq!(page.status, 200, "{path}");
         assert_eq!(
             page.body.matches("aria-current=\"page\"").count(),
-            1,
+            2,
             "{path}"
         );
         let marked: Vec<&str> = tags(&page.body, "a")
             .into_iter()
             .filter(|tag| tag.contains("aria-current=\"page\""))
             .collect();
-        assert_eq!(marked.len(), 1, "{path}");
-        assert_eq!(attr(marked[0], "href"), Some(path), "{path}");
+        assert_eq!(marked.len(), 2, "{path}");
+        for tag in marked {
+            assert_eq!(attr(tag, "href"), Some(path), "{path}");
+        }
         assert!(page.body.contains("<nav"), "{path}");
         for other in NAV {
             assert!(

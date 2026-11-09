@@ -428,7 +428,7 @@ async fn admin_adds_an_item_and_the_list_shows_it(pool: PgPool) {
     assert_eq!(status, 200);
     assert!(page.contains("greet") && page.contains("disabled") && page.contains("Enable"));
     assert!(page.contains("/catalog/greet/enable"));
-    assert_eq!(page.matches("name=\"csrf\"").count(), 3);
+    assert_eq!(page.matches("name=\"csrf\"").count(), 4);
     assert!(page.contains(&format!("value=\"{}\"", root.csrf)));
     h.finish().await;
 }
@@ -461,7 +461,7 @@ async fn admin_edits_content_only(pool: PgPool) {
         .await;
     assert_eq!(status, 200);
     assert!(page.contains("say goodbye"));
-    assert_eq!(page.matches("name=\"csrf\"").count(), 2);
+    assert_eq!(page.matches("name=\"csrf\"").count(), 3);
     h.finish().await;
 }
 
@@ -761,7 +761,8 @@ async fn the_catalog_pages_mark_the_link_current(pool: PgPool) {
         assert_eq!(status, 200, "{path}");
         assert!(page.contains(LINK_CURRENT), "{path}");
         assert!(!page.contains(LINK_PLAIN), "{path}");
-        assert_eq!(page.matches("aria-current=\"page\"").count(), 1, "{path}");
+        assert_eq!(page.matches("aria-current=\"page\"").count(), 2, "{path}");
+        assert_eq!(page.matches(LINK_CURRENT).count(), 2, "{path}");
     }
     h.finish().await;
 }

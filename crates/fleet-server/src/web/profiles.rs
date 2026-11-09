@@ -211,7 +211,7 @@ async fn profiles_page(cx: &Cx) -> Result<impl View> {
     let csrf = String::from_utf8_lossy(session.csrf.expose()).into_owned();
     Ok(view! {
         shell(title: "fleet profiles", active: Nav::Profiles, user: session.username.as_str(), csrf: csrf.as_str(), mode: "",
-                <header class="mb-3 flex items-center gap-3 border-b border-base-300 pb-2 text-xs">
+                <header class="mb-3 flex min-w-0 flex-wrap items-center gap-3 border-b border-base-300 pb-2 text-xs">
                     <span class="text-primary">"$"</span>
                     <h1 class="text-sm font-bold">"Profiles"</h1>
                 </header>
@@ -274,7 +274,7 @@ async fn profile_page(cx: &Cx) -> Result<impl View> {
     let unshare_action = format!("/profiles/{}/unshare", found.id);
     Ok(view! {
         shell(title: "fleet profile", active: Nav::Profiles, user: session.username.as_str(), csrf: csrf.as_str(), mode: "",
-                <header class="mb-3 flex items-center gap-3 border-b border-base-300 pb-2 text-xs">
+                <header class="mb-3 flex min-w-0 flex-wrap items-center gap-3 border-b border-base-300 pb-2 text-xs">
                     <span class="text-primary">"$"</span>
                     <h1 class="text-sm font-bold">(found.name.as_str())</h1>
                     <a class="link link-hover ml-auto" href="/profiles">"Profiles"</a>

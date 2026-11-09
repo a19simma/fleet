@@ -66,8 +66,8 @@ pub(super) async fn shell(
             </head>
             <body class="bg-base-100 text-base-content">
                 <a class="sr-only focus:not-sr-only focus:absolute focus:z-10 focus:bg-base-300 focus:p-2" href="#app">"Skip to content"</a>
-                <div class="flex min-h-screen">
-                    <nav class="flex w-48 shrink-0 flex-col border-r border-base-300 bg-base-200" aria-label="Main">
+                <div class="flex min-h-screen flex-col lg:flex-row">
+                    <nav class="hidden lg:flex lg:w-48 shrink-0 flex-col border-r border-base-300 bg-base-200" aria-label="Main">
                         <ul class="menu menu-sm w-full">
                             <li class="menu-title">"fleet"</li>
                             for item in NAV_ITEMS {
@@ -89,6 +89,26 @@ pub(super) async fn shell(
                                 <button class="btn btn-outline btn-xs w-full" type="submit">"Sign out"</button>
                             </form>
                         </div>
+                    </nav>
+                    <nav class="flex lg:hidden overflow-x-auto gap-3 border-b border-base-300 bg-base-200 p-2 text-xs" aria-label="Main mobile">
+                        <ul class="menu menu-sm menu-horizontal flex-nowrap items-center">
+                            <li class="menu-title">"fleet"</li>
+                            for item in NAV_ITEMS {
+                                if admin || item.0 != Nav::Catalog {
+                                    <li>
+                                        if item.0 == active {
+                                            <a class="menu-active" href=(item.1) aria-current="page">(item.2)</a>
+                                        } else {
+                                            <a href=(item.1)>(item.2)</a>
+                                        }
+                                    </li>
+                                }
+                            }
+                        </ul>
+                        <form class="ml-auto shrink-0" method="post" action="/logout">
+                            <input type="hidden" name="csrf" value=(csrf)>
+                            <button class="btn btn-outline btn-xs" type="submit">"Sign out"</button>
+                        </form>
                     </nav>
                     <main id="app" class="min-w-0 flex-1 p-3" data-mode=(mode) data-csrf=(csrf)>
                         (child)

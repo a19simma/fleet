@@ -49,3 +49,5 @@ body { font-family: var(--font-body); background: var(--color-base-100); color: 
 pre, code, kbd { font-family: var(--font-mono); }
 .table :where(th, td) { padding-block: var(--space-cell); }
 :focus-visible { outline: 2px solid var(--color-accent); outline-offset: 1px; }
+.menu-title { color: #8b949e; }
+.menu :where(a) { min-block-size: 24px; }

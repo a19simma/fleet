@@ -113,7 +113,7 @@ async fn tokens_page(cx: &Cx) -> Result<impl View> {
     let csrf = String::from_utf8_lossy(session.csrf.expose()).into_owned();
     Ok(view! {
         shell(title: "fleet API tokens", active: Nav::Tokens, user: session.username.as_str(), csrf: csrf.as_str(), mode: "",
-                <header class="mb-3 flex items-center gap-3 border-b border-base-300 pb-2 text-xs">
+                <header class="mb-3 flex min-w-0 flex-wrap items-center gap-3 border-b border-base-300 pb-2 text-xs">
                     <span class="text-primary">"$"</span>
                     <h1 class="text-sm font-bold">"API tokens"</h1>
                     <a class="link link-hover ml-auto" href="/account">"Account"</a>
@@ -183,7 +183,7 @@ async fn create(cx: &Cx, Form(form): Form<HashMap<String, String>>) -> Result<im
     let csrf = String::from_utf8_lossy(session.csrf.expose()).into_owned();
     Ok(view! {
         shell(title: "fleet API token", active: Nav::Tokens, user: session.username.as_str(), csrf: csrf.as_str(), mode: "",
-                <header class="mb-3 flex items-center gap-3 border-b border-base-300 pb-2 text-xs">
+                <header class="mb-3 flex min-w-0 flex-wrap items-center gap-3 border-b border-base-300 pb-2 text-xs">
                     <span class="text-primary">"$"</span>
                     <h1 class="text-sm font-bold">"API token created"</h1>
                     <a class="link link-hover ml-auto" href="/tokens">"API tokens"</a>
