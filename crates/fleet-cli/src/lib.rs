@@ -19,7 +19,7 @@ use std::io::{Read, Write};
 use std::time::Duration;
 
 use clap::{Parser, Subcommand};
-use fleet_core::text::{is_hostile, strip_keeping_lines};
+use fleet_core::text::{Cap, sanitise_lines, sanitise_text};
 use fleet_proto::v1::fleet_batches_client::FleetBatchesClient;
 use fleet_proto::v1::fleet_credentials_client::FleetCredentialsClient;
 use fleet_proto::v1::fleet_jobs_client::FleetJobsClient;
@@ -369,13 +369,15 @@ impl CliError {
     }
 }
 
-/// Strips, redacts, then strips again, keeping newline and tab.
+/// Redacts, strips, redacts, strips, keeping newline and tab: [`sanitise_lines`] without a cap.
 ///
-/// The first strip removes characters an attacker slipped into a secret to dodge the match.
-/// The second removes any a replacement could have joined into view.
+/// The redact before the first strip matches a secret that itself holds a stripped character.
 pub(crate) fn scrub(redactor: &fleet_core::Redactor, text: &str) -> String {
-    let stripped = strip_keeping_lines(text);
-    strip_keeping_lines(&redactor.redact_str(&stripped))
+    sanitise_lines(redactor, text, Cap::Bytes(usize::MAX)).text
+}
+
+fn strip_lines(text: &str) -> String {
+    scrub(&fleet_core::Redactor::new(None::<String>), text)
 }
 
 /// Scrubs server text of the client token. Every path that prints server-supplied job text
@@ -458,7 +460,7 @@ impl ScrubStream<'_> {
     /// Adds `text` and returns the part that is safe to print.
     pub fn push(&mut self, text: &str) -> String {
         let mut whole = std::mem::take(&mut self.tail);
-        whole.push_str(&strip_keeping_lines(text));
+        whole.push_str(&strip_lines(text));
         let hold = self.scrub.held_len(&whole);
         let split = whole.len() - hold;
         let (ready, kept) = whole.split_at(split);
@@ -467,14 +469,14 @@ impl ScrubStream<'_> {
         let all = redactor.redact_str(&whole);
         if format!("{ready_clean}{kept}") == all {
             kept.clone_into(&mut self.tail);
-            return strip_keeping_lines(&ready_clean);
+            return strip_lines(&ready_clean);
         }
         let all = all.into_owned();
         let end = all
             .rfind(fleet_core::PLACEHOLDER)
             .map_or(0, |at| at + fleet_core::PLACEHOLDER.len());
         all[end..].clone_into(&mut self.tail);
-        strip_keeping_lines(&all[..end])
+        strip_lines(&all[..end])
     }
 
     /// Ends a stream the caller cut short. A held suffix that could start the token is dropped,
@@ -494,22 +496,27 @@ impl ScrubStream<'_> {
 
 /// Strips hostile characters from server text. The text is not shortened.
 pub fn sanitize(text: &str) -> String {
-    text.chars().filter(|c| !is_hostile(*c)).collect()
+    sanitise_text(
+        &fleet_core::Redactor::new(None::<String>),
+        text,
+        Cap::Bytes(usize::MAX),
+    )
+    .text
 }
 
 /// Strips hostile characters from free-form server text and cuts it to 200 characters,
 /// ending with an ellipsis when it was cut.
 pub fn sanitize_free(text: &str) -> String {
-    let mut clean: String = text
-        .chars()
-        .filter(|c| !is_hostile(*c))
-        .take(MAX_SERVER_TEXT + 1)
-        .collect();
-    if clean.chars().count() > MAX_SERVER_TEXT {
-        clean = clean.chars().take(MAX_SERVER_TEXT).collect();
-        clean.push(ELLIPSIS);
+    let clean = sanitise_text(
+        &fleet_core::Redactor::new(None::<String>),
+        text,
+        Cap::Chars(MAX_SERVER_TEXT),
+    );
+    let mut text = clean.text;
+    if clean.cut {
+        text.push(ELLIPSIS);
     }
-    clean
+    text
 }
 
 impl fmt::Display for CliError {
@@ -1154,6 +1161,8 @@ async fn dispatch(
 
 #[cfg(test)]
 mod tests {
+    use fleet_core::text::is_hostile;
+
     #[test]
     fn sanitize_routes_through_the_core_predicate() {
         for cp in 0..=0x0010_FFFF_u32 {
@@ -1165,11 +1174,70 @@ mod tests {
                 );
                 assert_eq!(
                     Scrub::new(None).text(&c.to_string()).is_empty(),
-                    strip_keeping_lines(&c.to_string()).is_empty(),
+                    is_hostile(c) && c != '\n' && c != '\t',
                     "U+{cp:04X}"
                 );
             }
         }
+    }
+
+    #[test]
+    fn every_printing_path_strips_the_whole_tag_block() {
+        let scrub = Scrub::new(None);
+        for cp in 0xE0000..=0xE007F_u32 {
+            let c = char::from_u32(cp).expect("tag block is valid");
+            let input = format!("a{c}b");
+            assert_eq!(sanitize(&input), "ab", "U+{cp:04X}");
+            assert_eq!(sanitize_free(&input), "ab", "U+{cp:04X}");
+            assert_eq!(scrub.text(&input), "ab", "U+{cp:04X}");
+            assert_eq!(scrub.ident(&input), "ab", "U+{cp:04X}");
+            assert_eq!(scrub.free(&input), "ab", "U+{cp:04X}");
+            let mut stream = scrub.stream();
+            let shown = stream.push(&input) + &stream.finish();
+            assert_eq!(shown, "ab", "U+{cp:04X}");
+        }
+        assert_eq!(sanitize("a\u{E0080}b"), "a\u{E0080}b");
+    }
+
+    #[test]
+    fn scrub_redacts_a_secret_that_holds_a_stripped_character() {
+        for secret in [
+            "line-one-aaaa\r\nline-two-bbbb",
+            "zero-\u{200B}width-secret-1",
+        ] {
+            let redactor = fleet_core::Redactor::new([secret]);
+            assert_eq!(scrub(&redactor, &format!("x {secret} y")), "x [REDACTED] y");
+        }
+    }
+
+    #[test]
+    fn each_printed_field_has_an_exact_hostile_output() {
+        const HOSTILE: &str = "a\u{E0041}\u{202E}\u{85}\u{2028}\r\n\tb\u{1b}[31m";
+        let scrub = Scrub::new(Some(TOKEN));
+        let input = format!("{HOSTILE}{TOKEN}z");
+        let lines = "a\n\tb[31m[REDACTED]z";
+        let flat = "ab[31m[REDACTED]z";
+        assert_eq!(scrub.ident(&input), flat, "box name");
+        assert_eq!(scrub.ident(&input), flat, "job id, repo, phase");
+        assert_eq!(scrub.free(&input), flat, "job text and error text");
+        assert_eq!(scrub.text(&input), lines, "log text");
+        let mut stream = scrub.stream();
+        let streamed = stream.push(&input) + &stream.finish();
+        assert_eq!(streamed, lines, "streamed log text");
+        assert_eq!(sanitize(&input), format!("ab[31m{TOKEN}z"), "usage name");
+        let rpc = CliError::Rpc(Status::new(tonic::Code::Internal, input.clone()));
+        assert_eq!(
+            rpc.to_string(),
+            format!("server error Internal: ab[31m{TOKEN}z"),
+            "unscrubbed rpc error"
+        );
+        let scrubbed =
+            CliError::Rpc(Status::new(tonic::Code::Internal, input)).scrubbed(Some(&scrub));
+        assert_eq!(
+            scrubbed.to_string(),
+            "server error Internal: a\n\tb[31m[REDACTED]z".replace("a\n\tb", "ab"),
+            "scrubbed rpc error"
+        );
     }
 
     use super::*;
