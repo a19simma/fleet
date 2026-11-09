@@ -2,7 +2,7 @@
 
 Status: Accepted 2026-10-27. Migration 0011, migration 0012 and the `FleetProfiles` and `FleetBatches.SubmitBatch` client RPCs and the server side of `FleetWorker.GetProfileBlob` are built, and fleetd materialises the Profile of each Job before the clone. Amends ADR-0021 and ADR-0023. Implements the storage and delivery of ADR-0034.
 
-Amended by ADR-0057: version streams and the Job pin key on the profile id, not the name.
+Amended by ADR-0057: version streams and the Job pin key on the profile id.
 
 ADR-0034 defines the Profile. The server holds Profiles and fleetd applies them, so a Box needs the Profile content for a leased Job without holding a client credential.
 

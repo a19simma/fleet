@@ -1,6 +1,6 @@
 # Admin is a user flag
 
-Status: Proposed 2026-11-04. Built: migration 0028 adds `users.is_admin`, `auth.rs` gates the two admin services on it, and the catalog, capability and `fleet-server admin` paths read it. Amends ADR-0023, ADR-0042 and ADR-0054. Builds on ADR-0042.
+Status: Proposed 2026-11-04. Built: migration 0028 adds `users.is_admin`, `auth.rs` gates the two admin services on it, and the catalog, capability and `fleet-server admin` paths read it. Amends ADR-0023, ADR-0042 and ADR-0054.
 
 ADR-0042 creates "the admin" at setup but stores no admin concept: the first user is a user like any other, and recovery runs as a database operator. ADR-0054 needs admin grants and the catalog and capability RPC services need a caller they can trust. The static client token carries no identity, and the capability table cannot hold an admin role. This ADR stores admin as one flag on the user and fixes who can set it.
 
@@ -52,7 +52,7 @@ ADR-0042 creates "the admin" at setup but stores no admin concept: the first use
 - ADR-0042, `admin_audit` actions: the list gains `admin_grant` and `admin_revoke`.
 - ADR-0023, "two bearer token scopes": identity gates the admin services. Scope alone no longer opens them.
 
-ADR-0042 and ADR-0054 are Proposed, so their lines are edited in place in this commit. ADR-0023 is Accepted and keeps its text. Its README row records the amendment.
+ADR-0042 and ADR-0054 are Proposed, so their lines are edited in place. ADR-0023 is Accepted and keeps its text. Its README row records the amendment.
 
 ## Consequences
 
@@ -65,5 +65,5 @@ ADR-0042 and ADR-0054 are Proposed, so their lines are edited in place in this c
 
 - **A static `FLEET_ADMIN_TOKEN`.** It has no identity for `granted_by` and the audit, adds a second shared secret, needs a redeploy after a leak and has no web use.
 - **Making `bootstrap` admin.** The shared client token would become admin.
-- **An admin capability in `user_capabilities`.** The grant RPC could mint admins, it depends on the unbuilt CAP-S1, and the table CHECK lists a closed set of resource capabilities.
+- **An admin capability in `user_capabilities`.** The grant RPC could mint admins, the table CHECK lists a closed set of resource capabilities.
 - **Promotion by RPC or web route.** It is escalation over the network.

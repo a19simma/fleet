@@ -26,7 +26,7 @@ ADR-0048 gates Profile `tools` with one server switch, `FLEET_ALLOW_PROFILE_TOOL
 - Match is exact and case-sensitive. No prefix, glob, alias or trimming beyond the list separator. An empty entry is a config error.
 - The server checks the model of a Job at submit, whether it comes from the request or from the pinned Profile, and refuses a model outside the list.
 - When `FLEET_MODEL_ALLOWLIST` is unset the server applies no model restriction.
-- fleetd re-checks the model before spawn against its own config key `model_allowlist`, same exact match. A mismatch fails the Job with a fixed error before any process starts. The server is not trusted alone, because fleetd holds the Box and the credentials.
+- fleetd re-checks the model before spawn against its own config key `model_allowlist`, same exact match. A mismatch fails the Job with a fixed error before any process starts. A Profile with no model is not re-checked, because no model is requested. The server is not trusted alone, because fleetd holds the Box and the credentials.
 - When fleetd has no `model_allowlist`, fleetd trusts the server and does not check. The deploy docs must recommend setting it on every Box, since an unset list leaves the server as the only gate.
 
 ## Consequences

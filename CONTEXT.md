@@ -224,7 +224,7 @@ The bearer token the CLI uses with the server, `FLEET_CLIENT_TOKEN`, in client s
 _Avoid_: token, API token
 
 **Trust root**:
-The key source fleetd verifies update manifests against: the file `/etc/fleetd/update.pub` when it exists, else the **Baked key**. A present but invalid file disables updating and never falls back (ADR-0047, ADR-0050).
+The key source fleetd verifies update manifests against: the file named by the `update_trust_root` config key, `/etc/fleetd/update.pub` by default, when it exists, else the **Baked key**. A config file that sets `update_trust_root` makes the file required. A present but invalid file disables updating and never falls back (ADR-0047, ADR-0050).
 _Avoid_: trust anchor, signing key
 
 **Baked key**:

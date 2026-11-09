@@ -8,7 +8,7 @@ A dense, dark terminal console. References: GitHub dark dimmed (Primer) for colo
 
 ## Tokens
 
-All tokens live in `crates/fleet-server/ui/input.css` as daisyUI theme variables, named by role.
+All tokens live in `crates/fleet-server/ui/input.css`. The colour, radius, size, border, depth and noise tokens are daisyUI theme variables named by role. The font, spacing and type-size tokens (`--font-*`, `--space-*`, `--type-body`) are `:root` custom properties.
 
 | Role | Value |
 | --- | --- |
@@ -26,7 +26,7 @@ Each role has a `-content` colour for text on top of it, set in `input.css`.
 
 - Radii: 2px for selectors, fields and boxes.
 - Border: 1px. No depth, no noise, no shadows.
-- Body: 13px monospace (`ui-monospace`, SF Mono, JetBrains Mono, Menlo, Consolas).
+- Body: 13px monospace (`ui-monospace`, SF Mono, JetBrains Mono, Menlo, Consolas). No font is served, so hosts without these faces fall back to the generic `monospace`.
 - Table rows: 0.15rem vertical cell padding. Gutter: 0.75rem.
 - Focus: a 2px accent outline with 1px offset on `:focus-visible`.
 

@@ -182,7 +182,7 @@ pub enum Command {
         #[command(subcommand)]
         action: catalog::CatalogAction,
     },
-    /// Manage users.
+    /// Manage the capabilities of users.
     #[command(name = "user")]
     UserCap {
         /// The user area.

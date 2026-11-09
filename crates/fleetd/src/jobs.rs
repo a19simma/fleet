@@ -676,7 +676,10 @@ pub(crate) fn tool_preflight(
     ))
 }
 
+/// Fixed directories searched for `pueue`, in order. fleetd runs the first regular file it finds
+/// there without checking owner or mode, so these directories must be writable by root only.
 const PUEUE_SEARCH_DIRS: [&str; 4] = ["/usr/local/bin", "/usr/bin", "/opt/homebrew/bin", "/bin"];
+/// Environment variables passed to `pueue`.
 const PUEUE_ENV_KEYS: [&str; 2] = ["HOME", "XDG_RUNTIME_DIR"];
 
 fn find_pueue(dirs: &[&str]) -> Option<PathBuf> {

@@ -1,7 +1,9 @@
 //! The job timing page and its live log stream.
 //!
-//! `/jobs/{id}/timing` shows the five-part timing breakdown of a job as a stacked bar and a
-//! table, then lists the pueue tasks the job reported with a status badge. The breakdown
+//! `/jobs/{id}/timing` shows the timing breakdown of a job as a stacked bar of its five parts
+//! and a table of those parts with the total and the command count. A second table lists each
+//! pueue command the job reported with its start, end, duration, exit code, background flag and
+//! end reason, and a log block under each row. The breakdown
 //! comes from [`read_job_timing`] scoped to the session user and is built into a
 //! [`TimingView`], the same view the CLI prints. Every duration is job-relative
 //! milliseconds. A job without a report shows one plain absent line, never zeros. The bar is

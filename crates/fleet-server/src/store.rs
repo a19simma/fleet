@@ -975,8 +975,9 @@ impl Store {
     /// effective catalog set is resolved for the job's runner, and the set, its notes and
     /// its hash are stored on the job in the insert transaction under `FOR SHARE` locks on the
     /// profile and catalog rows. The same transaction re-reads the owner's `profile:tools`
-    /// grant under `FOR SHARE` on the owner and grant rows and stamps the result on the job. Later catalog edits never change a stored job. A repeat under
-    /// the same key skips the resolution and returns the stored job.
+    /// grant under `FOR SHARE` on the owner row and on the grant row when one exists, and
+    /// stamps the result on the job. Later catalog edits never change a stored job. A repeat
+    /// under the same key skips the resolution and returns the stored job.
     ///
     /// The request is validated once, by [`validate_submit`]. The job id is a fresh
     /// ULID-shaped [`EventId`]. The insert uses `ON CONFLICT (idempotency_key) DO NOTHING`,
@@ -1533,7 +1534,8 @@ impl Store {
     /// Queues one job per named profile as one batch, or returns the stored batch.
     ///
     /// The request is validated once, by [`batches::validate_batch`]. One transaction inserts
-    /// the batch row, takes the advisory lock of each profile name in sorted order, pins the
+    /// the batch row, takes `FOR SHARE` on each visible profile row and then the advisory lock of
+    /// each profile id in sorted order, pins the
     /// latest version and hash of each profile, and inserts one job per profile in list
     /// order. Any failure rolls back the batch and every job. A repeat of the same key with
     /// identical parameters returns the stored batch with `created` false.

@@ -311,7 +311,8 @@ where
 
 /// `fleet profile show`: canonical content, version and hash of one profile version.
 ///
-/// No job references a profile yet, so `used-by` prints `-`: the count is unknown, never zero.
+/// The server has no per-version job count, so `used-by` prints `-`: the count is unknown,
+/// never zero.
 pub(crate) async fn show(
     client: &mut ProfilesClient,
     scrub: &Scrub,
