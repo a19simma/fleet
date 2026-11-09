@@ -57,6 +57,7 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use fleet_core::Redactor;
+use fleet_core::text::{Cap, sanitise_lines};
 use fleet_proto::{
     MAX_SHELL_COMMANDS, MAX_SHELL_LOG_BYTES, MAX_SHELL_LOG_CHUNK_BYTES, MAX_SHELL_LOG_CHUNKS, v1,
 };
@@ -66,7 +67,7 @@ use tokio::io::{AsyncRead, AsyncReadExt};
 use tokio::process::{Child, Command};
 use tokio::time::Instant;
 
-use crate::shell_timing::{ShellInput, ShellRecord, ShellRecorder, strip_redact};
+use crate::shell_timing::{ShellInput, ShellRecord, ShellRecorder};
 
 /// Default pause between status polls.
 pub const POLL_INTERVAL: Duration = Duration::from_secs(1);
@@ -917,15 +918,12 @@ impl<C: PueueClient> BgWatcher<C> {
         let raw = fetch.bytes;
         let cut = raw.len() > LOG_READ_CAP;
         let text = String::from_utf8_lossy(&raw);
-        let mut text = strip_redact(&self.redactor, &text, true);
+        let mut clean = sanitise_lines(&self.redactor, &text, Cap::Bytes(LOG_READ_CAP));
         if cut {
-            let mut end = text.len().saturating_sub(LOG_TAIL_GUARD);
-            while !text.is_char_boundary(end) {
-                end -= 1;
-            }
-            text.truncate(end);
+            let keep = clean.text.len().saturating_sub(LOG_TAIL_GUARD);
+            clean = sanitise_lines(&self.redactor, &clean.text, Cap::Bytes(keep));
         }
-        (text, cut, false)
+        (clean.text, cut || clean.cut, false)
     }
 
     async fn close(&mut self, id: u64, ended_by: EndedBy, now: Instant) {
@@ -1198,7 +1196,12 @@ fn is_terminal(status: v1::ShellStatus) -> bool {
 }
 
 fn clean_log(redactor: &Redactor, raw: &[u8]) -> String {
-    strip_redact(redactor, &String::from_utf8_lossy(raw), true)
+    sanitise_lines(
+        redactor,
+        &String::from_utf8_lossy(raw),
+        Cap::Bytes(LIVE_LOG_READ_CAP + 1),
+    )
+    .text
 }
 
 fn floor_boundary(text: &str, max: usize) -> usize {
