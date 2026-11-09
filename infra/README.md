@@ -28,7 +28,7 @@ The operator owns everything this directory leaves out.
 - Optional CI retry: `FLEET_MAX_CI_RETRIES` (0 to 5, default 0, which turns it off). When a job's pull request CI fails, the server submits up to that many fix jobs on the same branch (ADR-0028). An invalid value stops startup.
 - The external-secrets operator runs in the cluster and the Argo CD project allows `ExternalSecret` (`external-secrets.io`) and `Password` (`generators.external-secrets.io`) in the namespace.
 - A Postgres 17 database and a role for the server exist, and `FLEET_DATABASE_URL` points at them.
-- A Gateway named `fleet` in namespace `fleet-server` with an HTTPS listener named `https` and its certificate exist. The Gateway, the host and TLS belong to the operator.
+- A Gateway named `fleet` in namespace `fleet-server` with an HTTPS listener named `https` and its certificate exist.
 - This repo ships no routes. The operator owns the HTTPRoute and the GRPCRoute, in its own repo under the Argo project `routes`, along with the Gateway, the host and TLS.
 - The operator patches `FLEET_WEB_RP_ID` (the bare host) and `FLEET_WEB_ORIGIN` (`https://` plus the host) on the Deployment so both match the route host. The Deployment keeps the placeholders `fleet.example.com` and `https://fleet.example.com`. The web UI needs both set.
 - Both routes share one host and one listener. The Gateway API spec says an implementation MAY reject one of them (the oldest wins). Cilium behaviour is unverified here. The operator checks the `Accepted` status of each route.
