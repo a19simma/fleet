@@ -121,8 +121,26 @@ ON CONFLICT (environment_id, lower(name)) DO UPDATE SET name = EXCLUDED.name, \
 ciphertext = EXCLUDED.ciphertext, key_id = EXCLUDED.key_id, \
 fingerprint = EXCLUDED.fingerprint, updated_at = now()";
 
+const LOCK_JOB_LEASE: &str = "\
+SELECT user_id, environment_id, environment_version FROM jobs \
+WHERE job_id = $1 AND attempt = $2 AND box = $3 AND state = 'RUNNING' \
+AND lease_expires_at > now() FOR SHARE";
+
+const SHARE_OWNED_ENVIRONMENT: &str =
+    "SELECT name FROM environment WHERE id = $1 AND user_id = $2 FOR SHARE";
+
+const SHARE_RELEASE_SECRETS: &str =
+    "SELECT name, ciphertext, key_id FROM environment_secret WHERE environment_id = $1 FOR SHARE";
+
 const SELECT_SECRET: &str =
     "SELECT ciphertext, key_id FROM environment_secret WHERE environment_id = $1 AND name = $2";
+
+/// Secrets, scripts and audit entries of one release.
+type ReleaseParts = (
+    Vec<JobEnvironmentSecret>,
+    Vec<EnvironmentScriptSpec>,
+    Vec<ReleasedSecret>,
+);
 
 /// Why an Environment store call failed. Messages are fixed text.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -147,6 +165,10 @@ pub enum EnvError {
     TooLarge,
     /// The version holds a script and the user does not hold the `env:scripts` capability.
     ScriptsNotAllowed,
+    /// A release was refused: no running job holds the lease the caller named, the pin does not
+    /// resolve for the job owner, or `env:scripts` is no longer granted. One variant for every
+    /// cause, so no caller can tell them apart.
+    Denied,
 }
 
 impl fmt::Display for EnvError {
@@ -162,6 +184,7 @@ impl fmt::Display for EnvError {
             Self::TooManyEntries => "too many environment entries",
             Self::TooLarge => "environment is too large",
             Self::ScriptsNotAllowed => "environment scripts are not granted",
+            Self::Denied => fleet_proto::ERR_ENV_RELEASE_DENIED,
         })
     }
 }
@@ -310,6 +333,7 @@ pub struct EnvironmentStore {
     pool: PgPool,
     sealer: Arc<dyn Sealer>,
     limits: Limits,
+    reply_cap: usize,
 }
 
 impl fmt::Debug for EnvironmentStore {
@@ -325,7 +349,16 @@ impl EnvironmentStore {
             pool,
             sealer,
             limits: Limits::default(),
+            reply_cap: fleet_proto::MAX_JOB_ENVIRONMENT_REPLY_BYTES,
         }
+    }
+
+    /// Replaces the largest release reply, [`fleet_proto::MAX_JOB_ENVIRONMENT_REPLY_BYTES`]
+    /// otherwise. A test seam.
+    #[must_use]
+    pub fn with_reply_cap(mut self, cap: usize) -> Self {
+        self.reply_cap = cap;
+        self
     }
 
     /// Replaces the caps.
@@ -762,6 +795,159 @@ impl EnvironmentStore {
         Ok(fp)
     }
 
+    /// Releases the Environment pinned by the job to the box that holds its lease.
+    ///
+    /// One transaction takes the job row `FOR SHARE` first, so the lease guards (box, attempt,
+    /// `RUNNING`, unexpired) are evaluated against the locked row and a reaper or cancel cannot
+    /// slip between check and release. The Environment and its secret rows are then taken
+    /// `FOR SHARE`, `env:scripts` is read `FOR SHARE` when the pinned version holds a script,
+    /// every value is opened, and the `environment_use` rows are written before commit. A job
+    /// with no pin gets an empty reply and writes nothing.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`EnvError::Denied`] for a wrong box, wrong attempt, a job that is not running,
+    /// an expired lease, an unknown job, a pin that does not resolve for the job owner, a secret
+    /// the pinned version names that no longer exists and a revoked `env:scripts`.
+    /// Returns [`EnvError::TooLarge`] when the reply would pass the reply cap,
+    /// [`EnvError::Open`] and [`EnvError::UnknownKey`] when a value cannot be opened and
+    /// [`EnvError::Database`] on a database failure, which includes a failed audit insert. No use
+    /// row is written on any error.
+    pub async fn release_for_job(
+        &self,
+        job_id: &str,
+        attempt: u32,
+        box_name: &str,
+    ) -> Result<GetJobEnvironmentReply, EnvError> {
+        let attempt = i32::try_from(attempt).map_err(|_| EnvError::Denied)?;
+        let mut tx = self.pool.begin().await?;
+        let lease: Option<(i64, Option<i64>, Option<i32>)> = sqlx::query_as(LOCK_JOB_LEASE)
+            .bind(job_id)
+            .bind(attempt)
+            .bind(box_name)
+            .fetch_optional(&mut *tx)
+            .await?;
+        let (user_id, Some(environment_id), Some(version)) = lease.ok_or(EnvError::Denied)? else {
+            return Ok(GetJobEnvironmentReply::default());
+        };
+        let (name,): (String,) = sqlx::query_as(SHARE_OWNED_ENVIRONMENT)
+            .bind(environment_id)
+            .bind(user_id)
+            .fetch_optional(&mut *tx)
+            .await?
+            .ok_or(EnvError::Denied)?;
+        let head: (Vec<u8>, Vec<String>) = sqlx::query_as(VERSION_HEAD)
+            .bind(environment_id)
+            .bind(version)
+            .bind(user_id)
+            .fetch_optional(&mut *tx)
+            .await?
+            .ok_or(EnvError::Denied)?;
+        let rows: Vec<StoredEntryRow> = sqlx::query_as(VERSION_ENTRIES)
+            .bind(environment_id)
+            .bind(version)
+            .fetch_all(&mut *tx)
+            .await?;
+        let entries = rows
+            .into_iter()
+            .map(StoredEntry::try_from)
+            .collect::<Result<Vec<_>, _>>()?;
+        if entries
+            .iter()
+            .any(|entry| matches!(entry, StoredEntry::Script { .. }))
+        {
+            sqlx::query_scalar::<_, i64>(SHARE_CAPABILITY)
+                .bind(user_id)
+                .bind(crate::cred::capability::ENV_SCRIPTS)
+                .fetch_optional(&mut *tx)
+                .await?
+                .ok_or(EnvError::Denied)?;
+        }
+        let sealed: Vec<(String, Vec<u8>, String)> = sqlx::query_as(SHARE_RELEASE_SECRETS)
+            .bind(environment_id)
+            .fetch_all(&mut *tx)
+            .await?;
+        let (secrets, scripts, released) =
+            self.open_entries(user_id, environment_id, entries, &sealed)?;
+        let reply = GetJobEnvironmentReply {
+            environment: name,
+            version: u32::try_from(version).map_err(|_| EnvError::Database)?,
+            hash: hex(&head.0),
+            secrets,
+            scripts,
+            egress_hosts: head.1,
+        };
+        if reply.encoded_len() > self.reply_cap {
+            return Err(EnvError::TooLarge);
+        }
+        record_environment_use(&mut tx, environment_id, version, job_id, &released).await?;
+        tx.commit().await?;
+        Ok(reply)
+    }
+
+    /// Opens every secret the pinned version names and maps its scripts, in stored order.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`EnvError::Denied`] when a named secret has no stored row, and
+    /// [`EnvError::Open`] or [`EnvError::UnknownKey`] when a value cannot be opened.
+    fn open_entries(
+        &self,
+        user_id: i64,
+        environment_id: i64,
+        entries: Vec<StoredEntry>,
+        sealed: &[(String, Vec<u8>, String)],
+    ) -> Result<ReleaseParts, EnvError> {
+        let mut secrets = Vec::new();
+        let mut scripts = Vec::new();
+        let mut released = Vec::new();
+        for entry in entries {
+            match entry {
+                StoredEntry::Secret {
+                    name,
+                    agent_visible,
+                    delivery,
+                } => {
+                    let (row_name, ciphertext, key_id) = sealed
+                        .iter()
+                        .find(|(stored, _, _)| stored.eq_ignore_ascii_case(&name))
+                        .ok_or(EnvError::Denied)?;
+                    let aad = Aad::for_environment_secret(user_id, environment_id, row_name);
+                    let opened =
+                        self.sealer
+                            .open(&aad, key_id, ciphertext)
+                            .map_err(|e| match e {
+                                SealError::UnknownKey => EnvError::UnknownKey,
+                                SealError::Open | SealError::Seal => EnvError::Open,
+                            })?;
+                    let value = String::from_utf8(opened.to_vec()).map_err(|_| EnvError::Open)?;
+                    released.push(ReleasedSecret {
+                        name: name.clone(),
+                        fingerprint: fingerprint(&Secret::new(value.clone())),
+                    });
+                    secrets.push(JobEnvironmentSecret {
+                        name,
+                        value,
+                        agent_visible,
+                        delivery: delivery_wire(&delivery).into(),
+                    });
+                }
+                StoredEntry::Script {
+                    name,
+                    body,
+                    on_fail,
+                    timeout_s,
+                } => scripts.push(EnvironmentScriptSpec {
+                    name,
+                    body,
+                    on_fail: on_fail_wire(&on_fail).into(),
+                    timeout_s: u32::try_from(timeout_s).ok(),
+                }),
+            }
+        }
+        Ok((secrets, scripts, released))
+    }
+
     /// Opens secret `name` of the Environment for its owner.
     ///
     /// # Errors
@@ -845,11 +1031,12 @@ use fleet_proto::v1::{
     EnvironmentDetail, EnvironmentEntrySpec, EnvironmentInfo as ProtoInfo, EnvironmentOnFail,
     EnvironmentScriptSpec, EnvironmentSecretInfo, EnvironmentSecretSpec, EnvironmentVersion,
     EnvironmentVersionInfo, GetEnvironmentRequest, GetEnvironmentVersionRequest,
-    ListEnvironmentVersionsReply, ListEnvironmentVersionsRequest, ListEnvironmentsReply,
-    PutEnvironmentSecretReply, PutEnvironmentSecretRequest, SaveEnvironmentVersionReply,
-    SaveEnvironmentVersionRequest,
+    GetJobEnvironmentReply, JobEnvironmentSecret, ListEnvironmentVersionsReply,
+    ListEnvironmentVersionsRequest, ListEnvironmentsReply, PutEnvironmentSecretReply,
+    PutEnvironmentSecretRequest, SaveEnvironmentVersionReply, SaveEnvironmentVersionRequest,
 };
 use tonic::Status;
+use tonic_prost::prost::Message;
 
 fn invalid(err: EnvironmentError) -> Status {
     Status::invalid_argument(err.to_string())
@@ -877,6 +1064,7 @@ fn store_status(err: EnvError) -> Status {
         EnvError::ScriptsNotAllowed => {
             Status::permission_denied(fleet_proto::ERR_ENV_SCRIPTS_NOT_GRANTED)
         }
+        EnvError::Denied => Status::permission_denied(fleet_proto::ERR_ENV_RELEASE_DENIED),
         EnvError::Seal | EnvError::Open | EnvError::UnknownKey | EnvError::Database => {
             tracing::warn!(reason = %err, "environment store call failed");
             Status::internal(fleet_proto::ERR_ENV_INTERNAL)
@@ -948,6 +1136,22 @@ fn entry_name_of(raw: &str) -> Result<EntryName, Status> {
     EntryName::new(raw).map_err(invalid)
 }
 
+fn delivery_wire(raw: &str) -> EnvironmentDelivery {
+    if raw == "env" {
+        EnvironmentDelivery::Env
+    } else {
+        EnvironmentDelivery::File
+    }
+}
+
+fn on_fail_wire(raw: &str) -> EnvironmentOnFail {
+    if raw == "continue" {
+        EnvironmentOnFail::Continue
+    } else {
+        EnvironmentOnFail::Abort
+    }
+}
+
 fn detail_of(stored: StoredVersion, version: u32) -> EnvironmentVersion {
     let entries = stored
         .entries
@@ -961,12 +1165,7 @@ fn detail_of(stored: StoredVersion, version: u32) -> EnvironmentVersion {
                 } => Kind::Secret(EnvironmentSecretSpec {
                     name,
                     agent_visible,
-                    delivery: if delivery == "env" {
-                        EnvironmentDelivery::Env
-                    } else {
-                        EnvironmentDelivery::File
-                    }
-                    .into(),
+                    delivery: delivery_wire(&delivery).into(),
                 }),
                 StoredEntry::Script {
                     name,
@@ -976,12 +1175,7 @@ fn detail_of(stored: StoredVersion, version: u32) -> EnvironmentVersion {
                 } => Kind::Script(EnvironmentScriptSpec {
                     name,
                     body,
-                    on_fail: if on_fail == "continue" {
-                        EnvironmentOnFail::Continue
-                    } else {
-                        EnvironmentOnFail::Abort
-                    }
-                    .into(),
+                    on_fail: on_fail_wire(&on_fail).into(),
                     timeout_s: u32::try_from(timeout_s).ok(),
                 }),
             }),
@@ -1023,6 +1217,24 @@ impl EnvironmentService {
     async fn resolve(&self, user_id: i64, name: &EnvironmentName) -> Result<i64, Status> {
         self.store
             .resolve_environment(user_id, name)
+            .await
+            .map_err(store_status)
+    }
+
+    /// Releases the Environment pinned by a running job to the box that holds its lease.
+    ///
+    /// # Errors
+    ///
+    /// Returns `PERMISSION_DENIED` with one fixed message for every lease or capability refusal,
+    /// `RESOURCE_EXHAUSTED` when the reply passes the cap and `INTERNAL` otherwise.
+    pub async fn job_environment(
+        &self,
+        job_id: &str,
+        attempt: u32,
+        box_name: &str,
+    ) -> Result<GetJobEnvironmentReply, Status> {
+        self.store
+            .release_for_job(job_id, attempt, box_name)
             .await
             .map_err(store_status)
     }

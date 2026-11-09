@@ -613,6 +613,7 @@ const CLASSIFIED: &[(&str, &str)] = &[
     ("FleetWorker", "GetProfileBlob:box-only"),
     ("FleetWorker", "GetJobTranscript:box-only"),
     ("FleetWorker", "GetJobCredentials:box-only"),
+    ("FleetWorker", "GetJobEnvironment:box-only"),
     ("FleetWorker", "ReportTiming:box-only"),
     ("FleetWorker", "ReportShellLog:box-only"),
 ];

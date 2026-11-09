@@ -9,6 +9,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         "fleet.v1.PutCredentialRequest",
         "fleet.v1.JobCredential",
         "fleet.v1.PutEnvironmentSecretRequest",
+        "fleet.v1.JobEnvironmentSecret",
     ]);
     tonic_prost_build::configure().compile_with_config(
         config,

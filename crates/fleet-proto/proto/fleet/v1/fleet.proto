@@ -141,6 +141,7 @@ service FleetWorker {
   rpc GetProfileBlob(GetProfileBlobRequest) returns (GetProfileBlobReply);
   rpc GetJobTranscript(GetJobTranscriptRequest) returns (GetJobTranscriptReply);
   rpc GetJobCredentials(GetJobCredentialsRequest) returns (GetJobCredentialsReply);
+  rpc GetJobEnvironment(GetJobEnvironmentRequest) returns (GetJobEnvironmentReply);
   rpc ReportTiming(ReportTimingRequest) returns (ReportTimingReply);
   rpc ReportShellLog(ReportShellLogRequest) returns (ReportShellLogReply);
 }
@@ -392,6 +393,9 @@ message Job {
   // Set by the server alone: whether the owner held profile:tools when the job was submitted.
   // No request message carries it and the server ignores it on input.
   bool profile_tools_granted = 34;
+  // Set by the server alone: whether the job pins an Environment version. The server ignores it
+  // on input.
+  bool has_environment = 35;
 }
 
 enum CiRetry {
@@ -1608,6 +1612,32 @@ message DeleteEnvironmentSecretRequest {
 }
 
 message DeleteEnvironmentSecretReply {}
+
+message GetJobEnvironmentRequest {
+  string job_id = 1;
+  uint32 attempt = 2;
+  string box = 3;
+}
+
+// One released secret. The value is hidden under Debug.
+message JobEnvironmentSecret {
+  string name = 1;
+  string value = 2;
+  bool agent_visible = 3;
+  EnvironmentDelivery delivery = 4;
+}
+
+// An empty reply (version 0) means the job pins no Environment. Field numbers 7 to 9 are reserved
+// for providers (ADR-0067).
+message GetJobEnvironmentReply {
+  reserved 7 to 9;
+  string environment = 1;
+  uint32 version = 2;
+  string hash = 3;
+  repeated JobEnvironmentSecret secrets = 4;
+  repeated EnvironmentScriptSpec scripts = 5;
+  repeated string egress_hosts = 6;
+}
 
 message SaveEnvironmentVersionRequest {
   string environment = 1;

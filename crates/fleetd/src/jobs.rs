@@ -3040,6 +3040,13 @@ mod token_wiring_tests {
             Err(Status::unimplemented("unused"))
         }
 
+        async fn get_job_environment(
+            &self,
+            _: Request<fleet_proto::v1::GetJobEnvironmentRequest>,
+        ) -> Result<Response<fleet_proto::v1::GetJobEnvironmentReply>, Status> {
+            Err(Status::unimplemented("get_job_environment"))
+        }
+
         async fn get_job_credentials(
             &self,
             _: Request<GetJobCredentialsRequest>,

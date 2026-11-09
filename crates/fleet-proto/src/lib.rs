@@ -307,6 +307,21 @@ pub const ERR_CAPABILITY_NOT_GRANTED: &str = "credential kind needs a capability
 /// mismatch.
 pub const ERR_LEASE_MISMATCH: &str = "lease does not match";
 
+/// `PERMISSION_DENIED` message of `GetJobEnvironment`.
+///
+/// A wrong box, a wrong attempt, a job that is not running, an expired lease, an unknown job, a
+/// job of another user and a revoked `env:scripts` all give this one text with no details.
+pub const ERR_ENV_RELEASE_DENIED: &str = "environment release denied";
+
+/// Largest encoded `GetJobEnvironmentReply`, in bytes.
+///
+/// The value and script caps of one Environment plus 64 KiB for names, flags and framing. It sits
+/// below the 1 MiB decode limit of ADR-0018, so no limit is raised.
+pub const MAX_JOB_ENVIRONMENT_REPLY_BYTES: usize =
+    fleet_core::environment::MAX_TOTAL_BYTES + 64 * 1024;
+
+const _: () = assert!(MAX_JOB_ENVIRONMENT_REPLY_BYTES < 1024 * 1024);
+
 /// `PERMISSION_DENIED` message: credentials need a per-user token.
 pub const ERR_NEEDS_USER_TOKEN: &str = "credentials need a user token";
 
@@ -516,6 +531,17 @@ impl std::fmt::Debug for v1::PutEnvironmentSecretRequest {
             .field("environment", &self.environment)
             .field("name", &self.name)
             .field("value", &"<redacted>")
+            .finish()
+    }
+}
+
+impl std::fmt::Debug for v1::JobEnvironmentSecret {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("JobEnvironmentSecret")
+            .field("name", &self.name)
+            .field("value", &"<redacted>")
+            .field("agent_visible", &self.agent_visible)
+            .field("delivery", &self.delivery)
             .finish()
     }
 }

@@ -29,25 +29,26 @@ use fleet_proto::v1::{
     CancelWorkRequest, CatalogItem, ClaimJobReply, ClaimJobRequest, ClaimWorkRequest,
     CreateProfileRequest, CreateWorkProjectRequest, CredentialInfo, DeleteCredentialReply,
     DeleteCredentialRequest, GetBatchReply, GetBatchRequest, GetJobCredentialsReply,
-    GetJobCredentialsRequest, GetJobRequest, GetJobTimingReply, GetJobTimingRequest,
-    GetJobTranscriptReply, GetJobTranscriptRequest, GetProfileBlobReply, GetProfileBlobRequest,
-    GetProfileRequest, GetStatsReply, GetStatsRequest, GetWorkItemReply, GetWorkItemRequest,
-    GrantCapabilityRequest, HeartbeatReply, HeartbeatRequest, Job, ListCapabilitiesReply,
-    ListCapabilitiesRequest, ListCatalogReply, ListCatalogRequest, ListCredentialsReply,
-    ListCredentialsRequest, ListFleetReply, ListFleetRequest, ListJobsReply, ListJobsRequest,
-    ListProfilesReply, ListProfilesRequest, ListReposReply, ListReposRequest, ListWorkDefersReply,
-    ListWorkDefersRequest, ListWorkItemsReply, ListWorkItemsRequest, ListWorkProjectsReply,
-    ListWorkProjectsRequest, NextWorkReply, NextWorkRequest, Profile, ProfileVersion,
-    PushEventsReply, PushEventsRequest, PutCredentialRequest, QueuedEvent, ReadJobEventsReply,
-    ReadJobEventsRequest, ReadTranscriptReply, ReadTranscriptRequest, RecordWorkDeferRequest,
-    Rejection, RemoveRepoReply, RemoveRepoRequest, RemoveWorkDepRequest, RenewLeaseRequest,
-    RepoInfo, ReportAttemptRequest, ReportJobReply, ReportJobRequest, ReportShellLogReply,
-    ReportShellLogRequest, ReportTimingReply, ReportTimingRequest, ResolveWorkDeferRequest,
-    RevokeCapabilityReply, RevokeCapabilityRequest, SetCatalogItemEnabledRequest,
-    SetWorkSlicesRequest, ShareProfileRequest, StreamShellLogChunk, StreamShellLogRequest,
-    SubmitBatchReply, SubmitBatchRequest, SubmitJobRequest, SubmitJudgeRequest, UnblockWorkRequest,
-    UnshareProfileRequest, UpsertCatalogItemRequest, UserCapability, VerifyCredentialReply,
-    VerifyCredentialRequest, WorkAttempt, WorkDefer, WorkEvent, WorkItem, WorkProject,
+    GetJobCredentialsRequest, GetJobEnvironmentReply, GetJobEnvironmentRequest, GetJobRequest,
+    GetJobTimingReply, GetJobTimingRequest, GetJobTranscriptReply, GetJobTranscriptRequest,
+    GetProfileBlobReply, GetProfileBlobRequest, GetProfileRequest, GetStatsReply, GetStatsRequest,
+    GetWorkItemReply, GetWorkItemRequest, GrantCapabilityRequest, HeartbeatReply, HeartbeatRequest,
+    Job, ListCapabilitiesReply, ListCapabilitiesRequest, ListCatalogReply, ListCatalogRequest,
+    ListCredentialsReply, ListCredentialsRequest, ListFleetReply, ListFleetRequest, ListJobsReply,
+    ListJobsRequest, ListProfilesReply, ListProfilesRequest, ListReposReply, ListReposRequest,
+    ListWorkDefersReply, ListWorkDefersRequest, ListWorkItemsReply, ListWorkItemsRequest,
+    ListWorkProjectsReply, ListWorkProjectsRequest, NextWorkReply, NextWorkRequest, Profile,
+    ProfileVersion, PushEventsReply, PushEventsRequest, PutCredentialRequest, QueuedEvent,
+    ReadJobEventsReply, ReadJobEventsRequest, ReadTranscriptReply, ReadTranscriptRequest,
+    RecordWorkDeferRequest, Rejection, RemoveRepoReply, RemoveRepoRequest, RemoveWorkDepRequest,
+    RenewLeaseRequest, RepoInfo, ReportAttemptRequest, ReportJobReply, ReportJobRequest,
+    ReportShellLogReply, ReportShellLogRequest, ReportTimingReply, ReportTimingRequest,
+    ResolveWorkDeferRequest, RevokeCapabilityReply, RevokeCapabilityRequest,
+    SetCatalogItemEnabledRequest, SetWorkSlicesRequest, ShareProfileRequest, StreamShellLogChunk,
+    StreamShellLogRequest, SubmitBatchReply, SubmitBatchRequest, SubmitJobRequest,
+    SubmitJudgeRequest, UnblockWorkRequest, UnshareProfileRequest, UpsertCatalogItemRequest,
+    UserCapability, VerifyCredentialReply, VerifyCredentialRequest, WorkAttempt, WorkDefer,
+    WorkEvent, WorkItem, WorkProject,
 };
 use fleet_proto::v1::{
     CloseRetroRequest, DecideEditRequest, DispositionImprovementRequest, ExportWorkReply,
@@ -585,6 +586,23 @@ impl FleetWorker for FleetService {
             .map_err(|err| Status::invalid_argument(err.to_string()))?;
         let reply = service
             .job_credentials(&request.job_id, request.attempt, name.as_str())
+            .await?;
+        Ok(Response::new(reply))
+    }
+
+    async fn get_job_environment(
+        &self,
+        request: Request<GetJobEnvironmentRequest>,
+    ) -> Result<Response<GetJobEnvironmentReply>, Status> {
+        let service = self
+            .environments
+            .as_ref()
+            .ok_or_else(|| Status::failed_precondition(fleet_proto::PRECONDITION_NOT_CONFIGURED))?;
+        let request = request.into_inner();
+        let name = validate_box(&request.r#box)
+            .map_err(|err| Status::invalid_argument(err.to_string()))?;
+        let reply = service
+            .job_environment(&request.job_id, request.attempt, name.as_str())
             .await?;
         Ok(Response::new(reply))
     }

@@ -50,7 +50,7 @@ macro_rules! job_columns {
     () => {
         "job_id, idempotency_key, prompt, repo, base_ref, open_pr, state, box, attempt, \
 progress, phase, branch, pr_url, error, exit_code, cancel_requested, batch_id, \
-kind, user_id, agent, profile_tools_granted, target_job_id, parent_job_id, ci_retry_attempt, ci_retry, ci_state, ci_url, profile_name, profile_version, encode(profile_hash, 'hex') AS profile_hash, \
+kind, user_id, agent, profile_tools_granted, (environment_id IS NOT NULL) AS has_environment, target_job_id, parent_job_id, ci_retry_attempt, ci_retry, ci_state, ci_url, profile_name, profile_version, encode(profile_hash, 'hex') AS profile_hash, \
 (EXTRACT(EPOCH FROM lease_expires_at) * 1000)::bigint AS lease_ms, \
 (EXTRACT(EPOCH FROM created_at) * 1000)::bigint AS created_ms, \
 (EXTRACT(EPOCH FROM claimed_at) * 1000)::bigint AS claimed_ms, \
@@ -643,6 +643,7 @@ fn job_from_row(row: &PgRow) -> Result<Job, StoreError> {
             .map_err(|_| StoreError::OutOfRange("user id"))?,
         agent: row.try_get("agent")?,
         profile_tools_granted: row.try_get("profile_tools_granted")?,
+        has_environment: row.try_get("has_environment")?,
         ci_retry_attempt: u32::try_from(row.try_get::<i32, _>("ci_retry_attempt")?)
             .map_err(|_| StoreError::OutOfRange("ci retry attempt"))?,
         ci_retry: row

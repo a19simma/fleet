@@ -18,12 +18,20 @@ const SNAPSHOT_VERSION: i64 = 29;
 /// select, so the pre-snapshot schema keeps it.
 const TOOLS_GRANTED_VERSION: i64 = 31;
 
+/// Migration 0042 adds `jobs.environment_id`, which the store reads on every job select as
+/// `has_environment`, so the pre-snapshot schema keeps it.
+const ENVIRONMENTS_VERSION: i64 = 42;
+
 async fn migrate_before(pool: &PgPool) {
     let all = sqlx::migrate!("./migrations");
     let older: Vec<_> = all
         .migrations
         .iter()
-        .filter(|m| m.version < SNAPSHOT_VERSION || m.version == TOOLS_GRANTED_VERSION)
+        .filter(|m| {
+            m.version < SNAPSHOT_VERSION
+                || m.version == TOOLS_GRANTED_VERSION
+                || m.version == ENVIRONMENTS_VERSION
+        })
         .cloned()
         .collect();
     let partial = Migrator {
