@@ -27,6 +27,7 @@
 mod brief;
 mod claim;
 mod defer;
+mod edit;
 mod load;
 mod pitfall;
 mod retro;
@@ -65,6 +66,7 @@ const MAX_LIST_PITFALLS: i64 = 1000;
 /// Most occurrences one improvement counts. A filing past it is refused.
 pub const MAX_OCCURRENCES: i32 = 1_000_000;
 pub use brief::{BRIEF_TOKEN_BUDGET, BYTES_PER_TOKEN, MAX_BRIEF_CANDIDATES};
+pub use edit::{REASON_DECIDED, REASON_DOES_NOT_APPLY, REASON_STALE, REASON_TOO_MANY_PENDING};
 
 /// Shortest lease a claim or renewal may ask for, in seconds.
 pub const MIN_LEASE_TTL_SECS: u32 = 10;
@@ -121,6 +123,10 @@ pub enum WorkFault {
     RetroNotFound,
     /// The improvement is unknown in that project.
     ImprovementNotFound,
+    /// The suggested edit is unknown in that project.
+    EditNotFound,
+    /// The caller is the shared bootstrap user, which names no person and cannot decide an edit.
+    NotInteractive,
     /// A retro cannot close while this many improvements of it have no disposition.
     Undecided(i64),
     /// An input broke a rule. The text is fixed.
@@ -147,6 +153,8 @@ impl fmt::Display for WorkFault {
             Self::DeferNotFound => f.write_str("work defer not found"),
             Self::RetroNotFound => f.write_str("retro not found"),
             Self::ImprovementNotFound => f.write_str("improvement not found"),
+            Self::EditNotFound => f.write_str("edit not found"),
+            Self::NotInteractive => f.write_str("a signed-in user is required to decide an edit"),
             Self::Undecided(count) => {
                 write!(f, "retro has {count} improvements without a disposition")
             }

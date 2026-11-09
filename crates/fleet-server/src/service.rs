@@ -13,6 +13,7 @@ use fleet_proto::v1::fleet_capability_admin_server::{
 use fleet_proto::v1::fleet_catalog_admin_server::{FleetCatalogAdmin, FleetCatalogAdminServer};
 use fleet_proto::v1::fleet_catalog_server::{FleetCatalog, FleetCatalogServer};
 use fleet_proto::v1::fleet_credentials_server::{FleetCredentials, FleetCredentialsServer};
+use fleet_proto::v1::fleet_edit_server::{FleetEdit, FleetEditServer};
 use fleet_proto::v1::fleet_ingest_server::{FleetIngest, FleetIngestServer};
 use fleet_proto::v1::fleet_jobs_server::{FleetJobs, FleetJobsServer};
 use fleet_proto::v1::fleet_judge_server::{FleetJudge, FleetJudgeServer};
@@ -48,10 +49,11 @@ use fleet_proto::v1::{
     VerifyCredentialRequest, WorkAttempt, WorkDefer, WorkEvent, WorkItem, WorkProject,
 };
 use fleet_proto::v1::{
-    CloseRetroRequest, DispositionImprovementRequest, FileImprovementRequest, GetWorkBriefReply,
-    GetWorkBriefRequest, Improvement, ListImprovementsReply, ListImprovementsRequest,
+    CloseRetroRequest, DecideEditRequest, DispositionImprovementRequest, FileEditRequest,
+    FileImprovementRequest, GetEditRequest, GetWorkBriefReply, GetWorkBriefRequest, Improvement,
+    ListEditsReply, ListEditsRequest, ListImprovementsReply, ListImprovementsRequest,
     ListPitfallsReply, ListPitfallsRequest, ListRetrosReply, ListRetrosRequest, OpenRetroRequest,
-    Pitfall, RecordPitfallRequest, Retro,
+    Pitfall, RecordPitfallRequest, Retro, SuggestedEdit,
 };
 use fleet_proto::{ConvertError, validate_box};
 use tonic::codegen::BoxStream;
@@ -676,7 +678,9 @@ fn work_error(err: &StoreError) -> Status {
             | WorkFault::AttemptNotFound
             | WorkFault::DeferNotFound
             | WorkFault::RetroNotFound
+            | WorkFault::EditNotFound
             | WorkFault::ImprovementNotFound => Status::not_found(fault.to_string()),
+            WorkFault::NotInteractive => Status::permission_denied(fault.to_string()),
             WorkFault::Invalid(reason) => Status::invalid_argument(*reason),
             WorkFault::Graph(graph::GraphError::Cycle(_))
             | WorkFault::RepoNotRegistered
@@ -921,6 +925,66 @@ impl FleetWork for FleetService {
         let reply = self
             .store
             .list_work_defers(user_id, request.get_ref())
+            .await
+            .map_err(|err| work_error(&err))?;
+        Ok(Response::new(reply))
+    }
+}
+
+#[tonic::async_trait]
+impl FleetEdit for FleetService {
+    async fn file_edit(
+        &self,
+        request: Request<FileEditRequest>,
+    ) -> Result<Response<SuggestedEdit>, Status> {
+        let user_id = work_user(&request)?;
+        let reply = self
+            .store
+            .file_edit(
+                user_id,
+                request.get_ref(),
+                &self.work_redactor,
+                fleet_proto::MAX_PENDING_EDITS_PER_PROJECT,
+            )
+            .await
+            .map_err(|err| work_error(&err))?;
+        Ok(Response::new(reply))
+    }
+
+    async fn list_edits(
+        &self,
+        request: Request<ListEditsRequest>,
+    ) -> Result<Response<ListEditsReply>, Status> {
+        let user_id = work_user(&request)?;
+        let reply = self
+            .store
+            .list_edits(user_id, request.get_ref())
+            .await
+            .map_err(|err| work_error(&err))?;
+        Ok(Response::new(reply))
+    }
+
+    async fn get_edit(
+        &self,
+        request: Request<GetEditRequest>,
+    ) -> Result<Response<SuggestedEdit>, Status> {
+        let user_id = work_user(&request)?;
+        let reply = self
+            .store
+            .get_edit(user_id, request.get_ref())
+            .await
+            .map_err(|err| work_error(&err))?;
+        Ok(Response::new(reply))
+    }
+
+    async fn decide_edit(
+        &self,
+        request: Request<DecideEditRequest>,
+    ) -> Result<Response<SuggestedEdit>, Status> {
+        let user_id = work_user(&request)?;
+        let reply = self
+            .store
+            .decide_edit(user_id, request.get_ref())
             .await
             .map_err(|err| work_error(&err))?;
         Ok(Response::new(reply))
@@ -1584,6 +1648,7 @@ fn routes(
     let repos = FleetReposServer::new(service.clone());
     let work = FleetWorkServer::new(service.clone());
     let retro = FleetRetroServer::new(service.clone());
+    let edit = FleetEditServer::new(service.clone());
     let catalog = FleetCatalogServer::new(service.clone());
     let catalog_admin = FleetCatalogAdminServer::new(service.clone())
         .max_decoding_message_size(MAX_PROFILE_MESSAGE_BYTES);
@@ -1601,6 +1666,7 @@ fn routes(
         .add_service(repos)
         .add_service(work)
         .add_service(retro)
+        .add_service(edit)
         .add_service(catalog)
         .add_service(catalog_admin)
         .add_service(capability_admin)

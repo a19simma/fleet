@@ -37,6 +37,10 @@
 - **Timing pages scope by owner.** `web/timing.rs` serves `/jobs/{job_id}/timing` and `/jobs/{job_id}/shell/{command_id}/log`, and answers 404 for a job that is unknown or not the session user's.
 - **Work claim.** `claim_work` locks `work_project` FOR UPDATE, checks ready, inserts every slice lease in one transaction and refuses a held slice with `slice is leased`. Evidence is redacted before it is cut to `MAX_EVIDENCE_BYTES`. `routes` wires `BearerAuth::redactor`, so the box token, the client token and the installation-token shape are masked in stored evidence.
 
+## Edit rpcs
+
+`FleetEdit` lives in `store/work/edit.rs`. Every call locks the `work_project` row before any read, so `base_hash` is recomputed against the committed graph. `DecideEdit` takes only a per-user API token: keep the `FleetEdit` prefix out of the plain Client scope check for that path (`auth::DECIDE_EDIT`), and the store refuses the Bootstrap user too. Accept applies a `slice_op` or `pitfall` in the decide transaction through `replace_slices` and the graph `check`, and a failure answers `REASON_DOES_NOT_APPLY` and leaves the edit pending. `base_hash` is server computed for `slice_op` and `pitfall` and supplied by the filer for `file_patch`, which never goes stale and is never applied. The pending cap and payload bound are `fleet_proto::MAX_PENDING_EDITS_PER_PROJECT` and `MAX_EDIT_PAYLOAD_BYTES`.
+
 ## Retro rpcs
 
 `FleetRetro` lives in `store/work/{retro,pitfall,brief}.rs`. Filing an improvement locks the `work_project` row, then bumps `occurrences` and inserts the occurrence row in one transaction. `CloseRetro` is refused while an improvement of the retro has no disposition. A pitfall with no project is user-level and scoped to its owner. `GetWorkBrief` ranks pitfalls before improvements and caps the text at `BRIEF_TOKEN_BUDGET` tokens of `BYTES_PER_TOKEN` bytes.

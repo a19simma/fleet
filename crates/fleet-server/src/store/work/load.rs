@@ -282,7 +282,7 @@ pub(super) fn verdict_of(text: &str) -> Result<WorkVerdict, StoreError> {
     }
 }
 
-async fn load_slices(
+pub(super) async fn load_slices(
     conn: &mut PgConnection,
     project_id: i64,
 ) -> Result<(BTreeMap<String, Vec<String>>, Vec<String>), StoreError> {

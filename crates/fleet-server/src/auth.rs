@@ -3,8 +3,10 @@
 //! Two static tokens plus per-user API tokens, scoped by gRPC path. The box token covers
 //! `FleetIngest` and `FleetWorker`. The client scope covers `FleetQuery`, `FleetJobs`,
 //! `FleetJudge`, `FleetProfiles`, `FleetBatches`, `FleetCredentials`, `FleetRepos`,
-//! `FleetCatalog`, `FleetWork` and `FleetRetro`. Any other path is denied.
-//! `FleetCatalog` passes the scope, then its handler requires an admin user.
+//! `FleetCatalog`, `FleetWork`, `FleetRetro` and `FleetEdit`. Any other path is denied.
+//! `FleetEdit.DecideEdit` is the one client-scope path the shared client token cannot reach: it
+//! passes only for a per-user API token, because the client token acts as the bootstrap user and
+//! names no person (ADR-0066). `FleetCatalog` passes the scope, then its handler requires an admin user.
 //! `FleetRepos` passes the scope, then its handler requires a user caller: the box token never
 //! reaches it. `FleetWork` and `FleetRetro` are the same: its handlers scope every read and write to the caller.
 //!
@@ -49,6 +51,13 @@ const REPOS: &str = "/fleet.v1.FleetRepos/";
 const CATALOG: &str = "/fleet.v1.FleetCatalog/";
 const WORK: &str = "/fleet.v1.FleetWork/";
 const RETRO: &str = "/fleet.v1.FleetRetro/";
+const EDIT: &str = "/fleet.v1.FleetEdit/";
+
+/// The one edit RPC that needs a signed-in user.
+pub const DECIDE_EDIT: &str = "/fleet.v1.FleetEdit/DecideEdit";
+
+/// The fixed `PERMISSION_DENIED` reason when a token that names no person asks to decide an edit.
+pub const USER_TOKEN_REQUIRED: &str = "a per-user API token is required to decide an edit";
 const CATALOG_ADMIN: &str = "/fleet.v1.FleetCatalogAdmin/";
 
 /// The fixed `PERMISSION_DENIED` reason for every refusal of an admin RPC.
@@ -161,8 +170,8 @@ impl BearerAuth {
 
     /// Allow-lists paths per scope: the box token takes `FleetIngest` and `FleetWorker`,
     /// the client token takes `FleetQuery`, `FleetJobs`, `FleetJudge`, `FleetProfiles`,
-    /// `FleetBatches`, `FleetCredentials`, `FleetRepos`, `FleetCatalog`, `FleetWork` and
-    /// `FleetRetro`. Every other path is denied.
+    /// `FleetBatches`, `FleetCredentials`, `FleetRepos`, `FleetCatalog`, `FleetWork`,
+    /// `FleetRetro` and `FleetEdit`. Every other path is denied.
     fn allows(scope: Scope, path: &str) -> bool {
         match scope {
             Scope::Box => path.starts_with(INGEST) || path.starts_with(WORKER),
@@ -177,6 +186,7 @@ impl BearerAuth {
                     || path.starts_with(CATALOG)
                     || path.starts_with(WORK)
                     || path.starts_with(RETRO)
+                    || path.starts_with(EDIT)
             }
         }
     }
@@ -195,7 +205,9 @@ impl BearerAuth {
         if is_admin_path(path) {
             return Err(Status::permission_denied(ADMIN_REQUIRED));
         }
-        if Self::allows(scope, path) {
+        if path == DECIDE_EDIT && Self::allows(scope, path) {
+            Err(Status::permission_denied(USER_TOKEN_REQUIRED))
+        } else if Self::allows(scope, path) {
             Ok(())
         } else {
             Err(Status::permission_denied(
@@ -252,6 +264,9 @@ impl BearerAuth {
             return Err(Status::permission_denied(
                 "bearer token not valid for this service",
             ));
+        }
+        if path == DECIDE_EDIT && caller.is_none() {
+            return Err(Status::permission_denied(USER_TOKEN_REQUIRED));
         }
         if let (Scope::Client, None, Some(users)) = (scope, caller, self.users.as_ref()) {
             let user_id = users.bootstrap_user().await.map_err(unavailable)?;

@@ -1,6 +1,6 @@
 # Suggested edits
 
-Status: Proposed 2026-11-09, not built (WRK-9 to WRK-11). Builds on ADR-0064 and ADR-0065. May amend ADR-0042 (which credential kinds may decide).
+Status: Proposed 2026-11-09, decide and apply path built in WRK-9 (Web session in WRK-11). Builds on ADR-0064 and ADR-0065. Amends ADR-0042 (which credential kinds may decide).
 
 An Attempt or a Retro often ends with a proposed change: split a Slice, add a path to a Slice, record a Pitfall, patch a file in the repository. A worker agent must not apply these on its own authority, because an edit to the graph or to repository instructions steers every later worker. This ADR makes each proposal a record a person decides.
 

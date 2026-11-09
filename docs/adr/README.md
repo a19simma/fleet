@@ -58,5 +58,5 @@ Each ADR has a "Decisions (2026-10-24)" section with the choices made when the d
 | [0063](0063-one-hostile-text-set.md) | One hostile-text set | Proposed 2026-11-09, built (SAN-1a to SAN-1k), amends 0062 (sanitiser scope), builds on 0022 |
 | [0064](0064-work-tracker.md) | Server-side work tracker | Proposed 2026-11-09, partly built (store, graph RPCs, claim, lease TTL and renew, report, notes, defers, lease reaper, CLI `fleet work`; not built: WRK-6, WRK-12, WRK-13), builds on 0042, 0059 and 0063 |
 | [0065](0065-retros-improvements-pitfalls.md) | Retros, improvements and pitfalls | Proposed 2026-11-09, schema (WRK-7) and server rpcs (WRK-8) built; CLI and web not built (WRK-10, WRK-11), builds on 0063 and 0064 |
-| [0066](0066-suggested-edits.md) | Suggested edits | Proposed 2026-11-09, not built (WRK-9 to WRK-11), may amend 0042, builds on 0064 and 0065 |
+| [0066](0066-suggested-edits.md) | Suggested edits | Proposed 2026-11-09, decide path built (WRK-9), Web session pending (WRK-11), amends 0042, builds on 0064 and 0065 |
 | [0067](0067-job-environments.md) | Job environments | Proposed 2026-11-09, not built (ENV-1 to ENV-9), amends 0033, 0038, 0055, 0031, 0036, 0054 and 0040, builds on 0035, 0036, 0040, 0043 and 0054, reserves 0068 for providers |

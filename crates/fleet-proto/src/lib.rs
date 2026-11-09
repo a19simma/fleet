@@ -507,3 +507,10 @@ impl std::fmt::Debug for v1::JobCredential {
 pub mod v1 {
     tonic::include_proto!("fleet.v1");
 }
+
+/// Longest suggested edit payload, in bytes. The server refuses more, and the `suggested_edit`
+/// table CHECK (migration 0038) holds the same number.
+pub const MAX_EDIT_PAYLOAD_BYTES: usize = 65_536;
+
+/// Most `pending` suggested edits one Work project holds. Filing past it is refused.
+pub const MAX_PENDING_EDITS_PER_PROJECT: usize = 100;

@@ -76,3 +76,7 @@ Boxes and sessions have no user owner. `ListFleet` therefore returns every box t
 ## Amendment to ADR-0013 and ADR-0014 (auth)
 
 Postgres also holds users, passkeys, sessions and API tokens. Auth on `FleetQuery` and `FleetJobs` gains per-user API tokens beside `FLEET_CLIENT_TOKEN`, as set above.
+
+## Amendment for ADR-0066 (deciding suggested edits)
+
+`FleetEdit` joins the Client scope and stays out of the Box scope. `FileEdit`, `ListEdits` and `GetEdit` accept any Client-scope credential, owner scoped. `DecideEdit` accepts only a per-user API token: the auth layer refuses the static Client token, which maps to the Bootstrap user, and the store refuses the Bootstrap user again. A Web session decides through the store in WRK-11, never over gRPC.

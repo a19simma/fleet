@@ -284,34 +284,11 @@ impl Store {
             .collect();
         proposed.mergeable.clone_from(&request.mergeable);
         check(&proposed)?;
-        let leased: Vec<String> = sqlx::query_scalar(LEASED_SLICES)
-            .bind(project_id)
-            .fetch_all(&mut *tx)
-            .await?;
         let mut wanted = Vec::new();
         for slice in &request.slices {
             wanted.push((slice.name.clone(), normalised(&slice.paths)?));
         }
-        for name in &leased {
-            let before: BTreeSet<String> = snapshot
-                .slices
-                .get(name)
-                .map(|paths| paths.iter().cloned().collect())
-                .unwrap_or_default();
-            let kept = wanted
-                .iter()
-                .any(|(n, paths)| n == name && *paths == before);
-            if !kept {
-                return Err(WorkFault::Precondition("slice is leased").into());
-            }
-        }
-        let names: Vec<String> = wanted.iter().map(|(name, _)| name.clone()).collect();
-        sqlx::query(DELETE_SLICES)
-            .bind(project_id)
-            .bind(&names)
-            .execute(&mut *tx)
-            .await?;
-        store_slices(&mut tx, project_id, &snapshot, &wanted).await?;
+        replace_slices(&mut tx, project_id, &snapshot, &wanted).await?;
         let mergeable: Vec<String> = normalised(&request.mergeable)?.into_iter().collect();
         sqlx::query(DELETE_MERGEABLE)
             .bind(project_id)
@@ -680,6 +657,39 @@ impl Store {
         Self::finish_graph_write(tx, project_id, key, RPC, &request_digest, &reply).await?;
         Ok(reply)
     }
+}
+
+/// Makes the stored slices equal `wanted`. A leased slice must keep its paths.
+pub(super) async fn replace_slices(
+    tx: &mut Transaction<'static, Postgres>,
+    project_id: i64,
+    snapshot: &Snapshot,
+    wanted: &[(String, BTreeSet<String>)],
+) -> Result<(), StoreError> {
+    let leased: Vec<String> = sqlx::query_scalar(LEASED_SLICES)
+        .bind(project_id)
+        .fetch_all(&mut **tx)
+        .await?;
+    for name in &leased {
+        let before: BTreeSet<String> = snapshot
+            .slices
+            .get(name)
+            .map(|paths| paths.iter().cloned().collect())
+            .unwrap_or_default();
+        let kept = wanted
+            .iter()
+            .any(|(n, paths)| n == name && *paths == before);
+        if !kept {
+            return Err(WorkFault::Precondition("slice is leased").into());
+        }
+    }
+    let names: Vec<String> = wanted.iter().map(|(name, _)| name.clone()).collect();
+    sqlx::query(DELETE_SLICES)
+        .bind(project_id)
+        .bind(&names)
+        .execute(&mut **tx)
+        .await?;
+    store_slices(tx, project_id, snapshot, wanted).await
 }
 
 async fn store_slices(

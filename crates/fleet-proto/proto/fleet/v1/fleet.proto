@@ -109,6 +109,15 @@ service FleetRetro {
   rpc GetWorkBrief(GetWorkBriefRequest) returns (GetWorkBriefReply);
 }
 
+// Suggested edits (ADR-0066). The client scope files, lists and reads. DecideEdit passes only
+// for a per-user API token: the shared client token and the box token are refused.
+service FleetEdit {
+  rpc FileEdit(FileEditRequest) returns (SuggestedEdit);
+  rpc ListEdits(ListEditsRequest) returns (ListEditsReply);
+  rpc GetEdit(GetEditRequest) returns (SuggestedEdit);
+  rpc DecideEdit(DecideEditRequest) returns (SuggestedEdit);
+}
+
 service FleetWorker {
   rpc ClaimJob(ClaimJobRequest) returns (ClaimJobReply);
   rpc ReportJob(ReportJobRequest) returns (ReportJobReply);
@@ -1381,4 +1390,72 @@ message GetWorkBriefRequest {
 message GetWorkBriefReply {
   string text = 1;
   uint32 dropped = 2;
+}
+
+enum EditKind {
+  EDIT_KIND_UNSPECIFIED = 0;
+  EDIT_KIND_SLICE_OP = 1;
+  EDIT_KIND_PITFALL = 2;
+  EDIT_KIND_FILE_PATCH = 3;
+}
+
+enum EditState {
+  EDIT_STATE_UNSPECIFIED = 0;
+  EDIT_STATE_PENDING = 1;
+  EDIT_STATE_ACCEPTED = 2;
+  EDIT_STATE_REJECTED = 3;
+  EDIT_STATE_STALE = 4;
+}
+
+enum EditDecision {
+  EDIT_DECISION_UNSPECIFIED = 0;
+  EDIT_DECISION_ACCEPT = 1;
+  EDIT_DECISION_REJECT = 2;
+}
+
+// `target` is a Slice name, a Pitfall symptom or a repository path by kind. `payload` is a tab
+// separated slice op line, `cause` newline `fix`, or a unified diff.
+message SuggestedEdit {
+  uint64 id = 1;
+  EditKind kind = 2;
+  EditState state = 3;
+  string target = 4;
+  string base_hash = 5;
+  string payload = 6;
+  string filed_by = 7;
+  optional uint64 decided_by = 8;
+  optional uint64 decided_at_ms = 9;
+  uint64 created_at_ms = 10;
+}
+
+// `base_hash` is the file blob id for a file patch and must be empty for the other kinds: the
+// server hashes the target at filing time.
+message FileEditRequest {
+  string key = 1;
+  string project = 2;
+  EditKind kind = 3;
+  string target = 4;
+  string base_hash = 5;
+  string payload = 6;
+}
+
+message ListEditsRequest {
+  string project = 1;
+  optional EditState state = 2;
+}
+
+message ListEditsReply {
+  repeated SuggestedEdit edits = 1;
+}
+
+message GetEditRequest {
+  string project = 1;
+  uint64 id = 2;
+}
+
+message DecideEditRequest {
+  string key = 1;
+  string project = 2;
+  uint64 id = 3;
+  EditDecision decision = 4;
 }
