@@ -1,7 +1,7 @@
 //! The version stamp fields of a job summary on the wire, and the shared text check.
 
-use fleet_proto::is_plain_text;
 use fleet_proto::v1::JobSummary;
+use fleet_proto::{MAX_CI_LOG_BYTES, is_ci_log, is_plain_text};
 use prost::Message;
 
 type TestResult = Result<(), Box<dyn std::error::Error>>;
@@ -70,7 +70,6 @@ fn plain_text_rejects_format_characters() {
     for good in [
         "a\u{2010}b",
         "a\u{2065}b",
-        "a\u{e0000}b",
         "a\u{e0080}b",
         "\u{4e2d}\u{6587}",
         "\u{1f468}\u{200d}\u{1f469}\u{200d}\u{1f467}",
@@ -84,5 +83,68 @@ fn plain_text_rejects_format_characters() {
         "a\u{1d17b}b",
     ] {
         assert!(is_plain_text(good), "{good:?}");
+    }
+}
+
+#[test]
+fn plain_text_and_ci_log_refuse_the_ranges_the_old_list_missed() {
+    for bad in [
+        "a\u{890}b",
+        "a\u{891}b",
+        "a\u{110cd}b",
+        "a\u{13430}b",
+        "a\u{1343f}b",
+        "a\u{1bca0}b",
+        "a\u{1bca3}b",
+        "a\u{e0000}b",
+        "a\u{e0002}b",
+        "a\u{e001f}b",
+    ] {
+        assert!(!is_plain_text(bad), "plain {bad:?}");
+        assert!(!is_ci_log(bad), "log {bad:?}");
+    }
+}
+
+#[test]
+fn ci_log_table_has_one_row_per_class() {
+    let rows: [(&str, bool); 16] = [
+        ("a\rb", false),
+        ("a\u{85}b", false),
+        ("a\u{2028}b", false),
+        ("a\u{202e}b", false),
+        ("a\u{200b}b", false),
+        ("a\u{feff}b", false),
+        ("a\0b", false),
+        ("a\u{1b}[31mb", false),
+        ("a\u{e0041}b", false),
+        ("line1\nline2\tcol", true),
+        ("\n\t", true),
+        ("\u{1f468}\u{200d}\u{1f469}\u{200d}\u{1f467}", true),
+        ("\u{645}\u{200c}\u{6cc}", true),
+        ("shalom \u{200f}\u{5e9}\u{5dc}\u{5d5}\u{5dd}\u{200e}", true),
+        ("", false),
+        ("caf\u{e9}", true),
+    ];
+    for (log, want) in rows {
+        assert_eq!(is_ci_log(log), want, "{log:?}");
+    }
+    assert!(is_ci_log(&"x".repeat(MAX_CI_LOG_BYTES)));
+    assert!(!is_ci_log(&"x".repeat(MAX_CI_LOG_BYTES + 1)));
+}
+
+#[test]
+fn plain_text_table_accepts_joiners_and_marks_and_rejects_newline_and_tab() {
+    let rows: [(&str, bool); 8] = [
+        ("\u{1f468}\u{200d}\u{1f469}", true),
+        ("\u{645}\u{200c}\u{6cc}", true),
+        ("\u{5e9}\u{200f}\u{5dc}", true),
+        ("a\u{200e}b", true),
+        ("a\nb", false),
+        ("a\tb", false),
+        ("a\u{2029}b", false),
+        ("\u{200c}", true),
+    ];
+    for (text, want) in rows {
+        assert_eq!(is_plain_text(text), want, "{text:?}");
     }
 }
