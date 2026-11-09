@@ -34,6 +34,7 @@ use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
 use fleet_core::Redactor;
+use fleet_core::text::{Cap, sanitise_text};
 use fleet_core::timing::{Interval, Span, SpanKind, aggregate, clamp};
 use fleet_proto::v1::{ReportTimingRequest, ShellCommand, TimingSpan, TimingSummary};
 use fleet_proto::{
@@ -50,7 +51,7 @@ use crate::otel::{MAX_FLUSH_DEADLINE, QUIET_PERIOD};
 use crate::otel_parse::{ClaudeEvent, MAX_DECISIONS, MAX_DURATION_MS, Observed, SpanMapper};
 use crate::poller::{TimingOutcome, TimingReportError, TimingReporter, TimingTransport};
 use crate::runner::TelemetryCapture;
-use crate::shell_timing::{ShellInput, ShellRecord, ShellRecorder, strip_redact};
+use crate::shell_timing::{ShellInput, ShellRecord, ShellRecorder};
 use crate::wire_timing::parse_wire;
 
 /// Longest `Observed.id` the wiring passes to the mapper, in bytes. A longer id is dropped, so
@@ -148,14 +149,7 @@ pub struct NamedSpan {
 }
 
 fn one_line(redactor: &Redactor, text: &str, fallback: &str) -> String {
-    let redacted = strip_redact(redactor, text, false);
-    let mut out = String::new();
-    for c in redacted.chars() {
-        if out.len() + c.len_utf8() > MAX_TIMING_NAME_BYTES {
-            break;
-        }
-        out.push(c);
-    }
+    let out = sanitise_text(redactor, text, Cap::Bytes(MAX_TIMING_NAME_BYTES)).text;
     if out.trim().is_empty() {
         fallback.to_owned()
     } else {
@@ -951,6 +945,7 @@ mod tests {
     };
     use crate::otel_parse::{ApiRequest, ClaudeEvent, MAX_DECISIONS, ToolDecision, ToolResult};
     use crate::runner::TelemetryCapture;
+    use crate::shell_timing::ShellInput;
     use fleet_proto::{MAX_SHELL_COMMANDS, MAX_SPANS, MAX_TIMING_NAME_BYTES};
 
     fn result(id: &str, tool: &str, ms: u64, command: Option<&str>) -> ClaudeEvent {
@@ -1145,6 +1140,93 @@ mod tests {
             assert!(!out.contains("hunter"), "{by:?}: {out}");
             assert!(out.len() <= MAX_TIMING_NAME_BYTES);
         }
+    }
+
+    const HOSTILE: [(&str, char); 7] = [
+        ("cr", '\r'),
+        ("nel", '\u{85}'),
+        ("line separator", '\u{2028}'),
+        ("bidi", '\u{202e}'),
+        ("tag", '\u{e0041}'),
+        ("zwsp", '\u{200b}'),
+        ("bom", '\u{feff}'),
+    ];
+
+    fn assert_clean(field: &str, name: &str, out: &str) {
+        assert!(
+            !out.chars().any(fleet_core::text::is_hostile),
+            "{field} {name}: {out:?}"
+        );
+        assert!(!out.contains("hunter"), "{field} {name}: {out:?}");
+    }
+
+    #[test]
+    fn span_name_and_tool_use_id_drop_every_hostile_char_and_the_secret() {
+        for (name, h) in HOSTILE {
+            let text = format!("a{h}{}{h}b", split_secret(h));
+            let mut c = Collector::new(Redactor::new([SPLIT_SECRET]));
+            c.ingest(1000, vec![result(&text, &text, 10, None)]);
+            let (spans, _, _) = c.finish();
+            let span = spans.first().expect("span");
+            assert_clean("span name", name, &span.name);
+            assert_clean(
+                "tool use id",
+                name,
+                span.tool_use_id.as_deref().expect("id"),
+            );
+        }
+    }
+
+    #[test]
+    fn shell_command_drops_every_hostile_char_and_the_secret() {
+        for (name, h) in HOSTILE {
+            let text = format!("echo a{h}{}{h}b", split_secret(h));
+            let mut c = Collector::new(Redactor::new([SPLIT_SECRET]));
+            c.ingest(1000, vec![result("t1", "Bash", 10, Some(&text))]);
+            let (_, shells, _) = c.finish();
+            let rec = shells.first().expect("record");
+            assert_clean("shell command", name, &rec.command);
+        }
+    }
+
+    #[test]
+    fn shell_output_drops_every_hostile_char_and_the_secret() {
+        for (name, h) in HOSTILE {
+            let mut rec = crate::shell_timing::ShellRecorder::new(Redactor::new([SPLIT_SECRET]));
+            let out = format!("a{h}{}{h}b", split_secret(h));
+            let _ = rec.record(&ShellInput {
+                command: "echo".to_owned(),
+                output: out,
+                started: 1,
+                ended: Some(2),
+                exit_code: Some(0),
+                background: false,
+            });
+            let got = rec.records().first().expect("record");
+            assert_clean("shell output", name, &got.output);
+        }
+    }
+
+    #[test]
+    fn a_secret_holding_a_hostile_char_is_redacted_before_the_strip() {
+        let secret = "key\u{2028}body-body";
+        let redactor = Redactor::new([secret]);
+        let out = one_line(&redactor, &format!("x {secret} y"), "fallback");
+        assert!(!out.contains("body"), "{out:?}");
+        assert!(!out.contains("key"), "{out:?}");
+    }
+
+    #[test]
+    fn a_name_at_the_cap_is_kept_and_one_over_on_a_multibyte_boundary_is_cut() {
+        let redactor = Redactor::default();
+        let at = format!("{}\u{e9}", "a".repeat(MAX_TIMING_NAME_BYTES - 2));
+        assert_eq!(at.len(), MAX_TIMING_NAME_BYTES);
+        assert_eq!(one_line(&redactor, &at, "f"), at);
+        let over = format!("{}\u{e9}", "a".repeat(MAX_TIMING_NAME_BYTES - 1));
+        assert_eq!(
+            one_line(&redactor, &over, "f"),
+            "a".repeat(MAX_TIMING_NAME_BYTES - 1)
+        );
     }
 
     #[test]

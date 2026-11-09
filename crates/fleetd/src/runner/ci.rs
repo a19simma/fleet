@@ -5,6 +5,7 @@ use std::path::Path;
 use std::time::Duration;
 
 use fleet_core::Redactor;
+use fleet_core::text::{Cap, sanitise_lines};
 use fleet_proto::v1::{CiState, Job, JobCi};
 use fleet_proto::{MAX_CI_LOG_BYTES, is_ci_log, is_ci_url};
 use serde_json::{Value, json};
@@ -162,15 +163,11 @@ fn actions_job_id(url: &str) -> Option<&str> {
     (!digits.is_empty() && digits.bytes().all(|b| b.is_ascii_digit())).then_some(digits)
 }
 
-/// Drops every character the server refuses, redacts the whole result and keeps the last
-/// [`MAX_CI_LOG_BYTES`] bytes, since the end of a failed run holds the error. Filtering comes
-/// first so a secret with a zero-width character inside still matches the redactor.
+/// Redacts, strips hostile characters, redacts and strips again, then keeps the last
+/// [`MAX_CI_LOG_BYTES`] bytes, since the end of a failed run holds the error. The first strip
+/// lets a secret with a zero-width character inside match the redactor.
 pub(super) fn clean_log(text: &str, redactor: &Redactor) -> Option<String> {
-    let kept: String = text
-        .chars()
-        .filter(|c| matches!(c, '\n' | '\t') || is_ci_log(c.encode_utf8(&mut [0; 4])))
-        .collect();
-    let redacted = redactor.redact_str(&kept);
+    let redacted = sanitise_lines(redactor, text, Cap::Bytes(usize::MAX)).text;
     let mut start = redacted.len().saturating_sub(MAX_CI_LOG_BYTES);
     while !redacted.is_char_boundary(start) {
         start += 1;
@@ -486,6 +483,13 @@ mod tests {
         assert_eq!(cut.as_deref(), Some("token [REDACTED] end"));
         let bidi = clean_log("hunter\u{202e}2-hunter2", &redactor);
         assert_eq!(bidi.as_deref(), Some("[REDACTED]"));
+    }
+
+    #[test]
+    fn a_secret_split_by_a_zero_width_joiner_is_redacted() {
+        let redactor = Redactor::new(["hunter2-hunter2"]);
+        let out = clean_log("token hunter2-\u{200d}hunter2 end", &redactor);
+        assert_eq!(out.as_deref(), Some("token [REDACTED] end"));
     }
 
     #[test]
