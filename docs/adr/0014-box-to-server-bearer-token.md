@@ -32,6 +32,7 @@ Notes that refine it:
 ## Downsides
 
 - A leaked box token lets an attacker inject events and claim and report Jobs as any `box-<n>`. Every Box holds it, so one compromised Box leaks it. It cannot read the fleet or submit Jobs.
+- Accepted risk: the box token is shared by every Box, so the server has no per-Box identity and cannot revoke one Box. The box name is a claim until per-Box tokens exist.
 - A leaked client token lets an attacker read every Box's prompts and transcript summaries and submit or cancel Jobs. It cannot ingest or claim. It lives on the laptop and the server, not on Boxes.
 - Rotation of the box token means a Template rebuild with re-created Boxes, or a secrets push to each Box. The client token rotates on the laptop and the server only.
 - No per-Box revocation. A box name is a claim.

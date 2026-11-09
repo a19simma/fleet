@@ -28,6 +28,8 @@ A Profile does not list the items it wants. It inherits every item that is enabl
 
 The other ADR-0034 fields stay as they are. The `skills`, `context_files` and `tools` content fields move out of the Profile into the Catalog, and the Profile hash covers `disabled` and the authored text. The hash prefix for this shape is `fleet-profile-v3\0`, so existing v1 and v2 hashes stay valid.
 
+On the wire a Profile carries `SelectionEntry` messages of `{item_id, enabled}`. Only entries with `enabled = false` are valid: each one maps to one id in the stored `disabled` list, and an entry with `enabled = true` is refused (`SelectionError::EnabledEntry`). A missing `enabled` reads as false. Duplicate ids, a malformed id and more than `MAX_SELECTION` entries are refused too.
+
 The owner said: "there's a global list of available ones but the user can turn them off selectively". Opt-out follows that statement.
 
 ### Resolve
