@@ -44,7 +44,8 @@ pub const MAX_FLUSH_DEADLINE: Duration = Duration::from_secs(10);
 ///
 /// `flush` returns once no connection is in flight and no body has been queued for the quiet
 /// period, counted from the call at the earliest. The caller's deadline is capped at
-/// [`MAX_FLUSH_DEADLINE`]. Dropping the future mutates nothing.
+/// [`MAX_FLUSH_DEADLINE`]. Dropping the future mutates nothing. A connection still in the
+/// accept backlog is not yet counted as in flight, so a flush can return before its body.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Flush {
     /// The deadline fired before the stream went quiet.
@@ -201,6 +202,11 @@ impl OtelReceiver {
     /// 0660, because a peer under another uid needs write permission to connect. A dead
     /// socket at `path` is replaced. A live one, a symlink or any other file is refused
     /// untouched. Needs a Tokio runtime.
+    ///
+    /// The check for an existing socket and the rename onto `path`, and the removal in `Drop`,
+    /// are separate steps and leave small races. The directory holding `path` must not be
+    /// writable by any other user. A crash can leave a `.ot<pid>-<n>` staging dir behind; no
+    /// sweep removes it.
     ///
     /// # Errors
     ///

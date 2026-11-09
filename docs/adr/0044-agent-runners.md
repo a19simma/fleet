@@ -30,9 +30,9 @@ The output parsers for Codex and Kimi do not exist yet: no Kimi stream-json pars
 
 v1 takes static secrets only. `refreshing_file` credentials, the Codex `auth.json` and Kimi OAuth, are out of v1 (ADR-0043). fleetd receives the credential through ADR-0033 and passes it to the runner as that CLI expects.
 
-Residual risk: `CODEX_API_KEY` sits in the child environment, so the agent shell can read it from `/proc`, and it could be written into the worktree. `CLAUDE_CODE_OAUTH_TOKEN` has the same exposure. The Codex config sets `features.hooks=false` and no live Codex run has confirmed that CLI honours the key. Tests check the config and argv structure only.
+Residual risk: `CODEX_API_KEY` sits in the child environment, so the agent shell can read it from `/proc`, and it could be written into the worktree. `CLAUDE_CODE_OAUTH_TOKEN` has the same exposure. `HTTP_PROXY` and `HTTPS_PROXY` pass the allowlist, so credentials embedded in a proxy URL would be visible to the agent, as for claude. The Codex config sets `features.hooks=false` and no live Codex run has confirmed that CLI honours the key. Tests check the config and argv structure only.
 
-Unverified: the real Codex flags, env names, hosts and key prefixes, and the Kimi key prefixes and hosts beyond `api.kimi.ai`. The probe in `crates/fleetd/tests/agent_probe.rs` runs mock Codex and Kimi shell scripts, shaped from this contract, through the live egress proxy with a stored per-user credential. The key reaches each mock only through its env variable and appears in no feed, report, event or log. Live proof against the real CLIs is deferred to CRED-65L.
+Unverified: how Codex uses the proxy variables while its sandbox network is off, the real Codex flags, env names, hosts and key prefixes, and the Kimi key prefixes and hosts beyond `api.kimi.ai`. The probe in `crates/fleetd/tests/agent_probe.rs` runs mock Codex and Kimi shell scripts, shaped from this contract, through the live egress proxy with a stored per-user credential. The key reaches each mock only through its env variable and appears in no feed, report, event or log. Live proof against the real CLIs is deferred to CRED-65L.
 
 ## Consequences
 

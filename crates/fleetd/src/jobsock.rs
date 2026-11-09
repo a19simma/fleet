@@ -6,12 +6,16 @@
 //! peer: its whole path must equal `<agent slice>/fleet-agent@<job id>.service` for the
 //! listener's own id, or `<install slice>/fleet-tool-install@<job id>.service` for the tool
 //! install unit of that id. The install unit may select only [`ServiceName::EgressProxy`]. A
-//! mismatch or an unreadable cgroup closes the connection with no reply and bumps [`JobSocket::rejected`]. After the handshake line the listener reads the
-//! peer pid and cgroup again and requires both to equal the first reading.
+//! mismatch or an unreadable cgroup closes the connection with no reply and bumps
+//! [`JobSocket::rejected`]. After the handshake line the listener reads the peer pid and
+//! cgroup again and requires both to equal the first reading. The cgroup check reads the
+//! unified (v2) `0::` line of `/proc/<pid>/cgroup`, so a cgroup v1 host is not supported.
 //!
 //! The peer pid comes from `SO_PEERCRED`. `SO_PEERPIDFD` is not reachable here: neither tokio
 //! nor rustix exposes it and the workspace forbids `unsafe`, so a pid recycled between accept
-//! and a cgroup read is not detected. The second reading only shrinks that window. The
+//! and a cgroup read is not detected. `SO_PEERCRED` fixes the pid at connect, so in production the
+//! second pid reading always equals the first and only the cgroup comparison can differ.
+//! The second reading only shrinks the cgroup window. The
 //! per-Job mount namespace of ADR-0036 would cover the residual gap, but its mount shape
 //! (`BindPaths` after `TemporaryFileSystem`) is UNVERIFIED on a Box, so no claim rests on it.
 
@@ -390,7 +394,9 @@ impl JobSocket {
     ///
     /// The socket is bound inside a private 0700 staging dir beside `path`, set to 0660 and
     /// renamed onto `path`, so it is never reachable under a wider mode. A stale socket at
-    /// `path` is replaced. Anything else there, a symlink included, is refused untouched.
+    /// `path` is replaced. Anything else there, a symlink included, is refused untouched. The
+    /// check of `path` and the rename are separate steps, so the directory that holds `path`
+    /// must be writable by fleetd only (the shipped run dir is 0750 `fleetd:fleet-work`).
     ///
     /// # Errors
     ///

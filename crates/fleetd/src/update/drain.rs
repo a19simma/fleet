@@ -26,7 +26,8 @@ pub enum DrainState {
     Idle,
     /// Claiming is paused and the drain is waiting for the last lease.
     Draining,
-    /// The last drain hit the cap. Claiming has resumed.
+    /// The last drain hit the cap. Claiming has resumed. The state stays until the next
+    /// [`DrainController::begin_drain`].
     Aborted,
 }
 
@@ -129,6 +130,8 @@ impl Draining {
     /// claimed but not yet visible to `idle` still blocks [`DrainOutcome::Drained`]. `idle`
     /// itself must cover leases that outlive a poller task. On the cap this resumes claiming
     /// and returns [`DrainOutcome::Aborted`]. No running job is touched.
+    ///
+    /// After [`DrainOutcome::Drained`] a second call polls again and can return `Drained` again.
     ///
     /// A handle that already aborted returns [`DrainOutcome::Aborted`] at once and touches
     /// neither the state nor the gate, so a newer drain stays paused.

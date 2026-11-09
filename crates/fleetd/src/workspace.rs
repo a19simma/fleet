@@ -253,7 +253,9 @@ pub struct Workspace {
 }
 
 impl Workspace {
-    /// A workspace rooted at `root`. Mirrors live in `<root>/.cache`.
+    /// A workspace rooted at `root`. Mirrors live in `<root>/.cache`. The root is used as
+    /// given: a relative `root` stays relative, because only `Config::resolve` makes the
+    /// jobs dir absolute.
     #[must_use]
     pub fn new(root: impl Into<PathBuf>) -> Self {
         Self {
@@ -274,7 +276,8 @@ impl Workspace {
 
     /// Gives the cache dir to `gid` search-only (2710), the mirror a clone borrows read-only
     /// (dirs 2750), and makes each job clone group-writable (2770), so the job group can read
-    /// that mirror but never write it. `None`, the default,
+    /// that mirror but never write it. The clone is owned by the job group (2770), not by the
+    /// job uid, because fleetd is not root and can only chown to a group it belongs to. `None`, the default,
     /// leaves the modes git and `create_dir_all` set. `.finish-<id>` is 0700 either way.
     /// `.git-home` comes from `create_dir_all`, so its mode follows the process umask
     /// (0755 under the usual 022).
@@ -422,7 +425,9 @@ impl Workspace {
     /// job group lost write access needs no manual delete. Stale `*.lock` files in the mirror
     /// are deleted before each fetch.
     /// The jobs directory must belong to one daemon. The call holds the mirror lock that
-    /// [`Workspace::fetch_mirror`] also takes, from the mirror sync to the end of the clone.
+    /// [`Workspace::fetch_mirror`] also takes, from the mirror sync to the end of the clone,
+    /// so a clone never reads the mirror while another fetch writes it. A second daemon on
+    /// the same directory does not share that lock.
     ///
     /// # Errors
     ///
@@ -652,16 +657,17 @@ impl Workspace {
 
     /// Makes the mirror safe to fetch into, then fetches `repo` into it.
     ///
-    /// fleetd runs one job at a time against the jobs directory, so nothing else holds the
-    /// mirror while this runs. That lets the call delete every `*.lock` file outside
+    /// The caller holds the shared mirror lock and one daemon owns the jobs directory, so
+    /// nothing else holds the mirror while this runs. That lets the call delete every `*.lock` file outside
     /// `objects/` before the fetch: a lock left by a fetch that fleetd killed, cancelled or
     /// timed out would otherwise fail every later fetch.
     ///
     /// An existing mirror is trusted only when it passes [`mirror_is_trusted`]. Otherwise it is
     /// renamed to a sibling `.old`, deleted and created again, which costs one full fetch. A
-    /// crash mid-delete leaves only `.old` debris, which the next call removes. A new mirror is
-    /// built in a sibling directory and renamed into place, so a mirror path never holds a repo without
-    /// its gc settings.
+    /// crash mid-delete leaves only `.old` debris. A later call removes it only when it
+    /// finds the mirror untrusted again, so one stale entry can stay on disk. A new mirror is
+    /// built in a sibling directory and renamed into place, so a mirror path never holds a
+    /// repo without its gc settings.
     async fn sync_mirror(&self, mirror: &Path, repo: &str) -> Result<(), WorkspaceError> {
         self.ensure_mirror(mirror).await?;
         let swept = mirror.to_path_buf();

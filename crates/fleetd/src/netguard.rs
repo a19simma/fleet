@@ -1,8 +1,12 @@
 //! Address checks for fetch: which IP addresses a fetch may dial.
 //!
 //! The tables list the IANA special-purpose address registries (IPv4 and IPv6) where the
-//! registry marks a block as not globally reachable, plus blocks that ADR-0038 names. Where a
-//! block holds a few global entries (`192.0.0.0/24`, `2001::/23`), the whole block is refused.
+//! registry marks a block as not globally reachable, plus blocks that ADR-0038 names.
+//! `192.88.99.0/24` is listed because the registry deprecates it, not because it is
+//! non-globally-reachable. Some blocks are refused whole although part of them is global:
+//! `192.0.0.0/24` and `2001::/23` (both hold a few globally reachable entries, such as the
+//! AS112 ranges) and `2002::/16` (6to4, which can embed a global IPv4 address). The ORCHIDv2
+//! block `2001:20::/28` is not listed.
 
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
@@ -100,7 +104,10 @@ pub enum UrlRefusal {
     BadPort,
     /// The host is empty.
     EmptyHost,
-    /// The host is not a valid ASCII DNS name or IPv6 literal.
+    /// The host is not a valid ASCII DNS name or IPv6 literal. Covers a host over 253 bytes, a
+    /// bad label (empty, over 63 bytes, edge hyphen, non-alphanumeric), a single-label host, a
+    /// last label that does not start with a letter, a bracketed host that does not close or
+    /// does not parse as IPv6, and a percent sign in the host.
     InvalidHost,
     /// The host ends in a dot.
     TrailingDot,
@@ -214,10 +221,10 @@ fn parse_host(authority_host: &str) -> Result<String, UrlRefusal> {
 /// [`UrlRefusal`] that holds no part of the input: a length over [`MAX_URL_BYTES`], any byte
 /// outside printable ASCII (whitespace, controls and non-ASCII, so an internationalised host
 /// must arrive as punycode), a backslash, a fragment, userinfo, an empty host, a percent sign in
-/// the host, a trailing-dot host (refused, never stripped, so one host has one spelling), a
-/// single-label host, a host whose last label does not start with a letter (which refuses the
-/// numeric and hex forms resolvers read as IPv4), and an IP literal that fails
-/// [`is_public_address`]. The returned host is lowercase ASCII; an IPv6 literal comes back
+/// the host (refused as [`UrlRefusal::InvalidHost`]), a trailing-dot host (refused, never
+/// stripped, so one host has one spelling), a single-label host, a host whose last label does
+/// not start with a letter (which refuses the numeric and hex forms resolvers read as IPv4),
+/// and an IP literal that fails [`is_public_address`]. The returned host is lowercase ASCII; an IPv6 literal comes back
 /// without brackets. The path keeps its query and is `/` when the URL has none.
 ///
 /// This is the pre-check only. The resolved address is checked again at dial time.

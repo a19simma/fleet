@@ -5,11 +5,11 @@
 //! provider comes from the `KIMI_MODEL_*` variables, so no config file is written: the per-job
 //! `KIMI_CODE_HOME` directory is empty at start and is removed when the job ends. The only
 //! secret in the child environment is [`API_KEY_ENV`]. fleetd sets no `User-Agent`: traffic
-//! reaches the model host through the `HTTPS_PROXY` CONNECT tunnel only.
+//! reached the model host through the `HTTPS_PROXY` CONNECT tunnel only in the observed run.
 //!
-//! `-p` mode asks for no approval and always runs under the auto policy, so a Kimi job runs
-//! only on a disposable box ([`ERR_NOT_DISPOSABLE`]). No hook runs in the Kimi CLI, so a deny
-//! cannot depend on one.
+//! Observed on that version only: `-p` mode asks for no approval and runs under the auto
+//! policy, which approves tool calls without a prompt, so a Kimi job runs only on a disposable
+//! box ([`ERR_NOT_DISPOSABLE`]). No hook ran in the Kimi CLI, so a deny cannot depend on one.
 //!
 //! Unverified: the `sk-kimi-` key prefix (ADR-0043), whether `-p` accepts a prompt that
 //! starts with a dash, whether the static deny rules hold under the auto policy, and which
@@ -140,7 +140,8 @@ pub fn argv(program: &Path, job: &KimiJob<'_>) -> Vec<OsString> {
 /// `base` is filtered to the allow list and `LC_*`, minus any forbidden name, so no host
 /// secret passes. `api_key` becomes [`API_KEY_ENV`], the one secret, and `model` the model
 /// name; pass one that [`resolve_model`] accepted. `home` is the per-job `HOME` and
-/// `kimi_home` the per-job [`HOME_ENV`].
+/// `kimi_home` the per-job [`HOME_ENV`]. [`KimiHome`] creates only `kimi_home`; the caller
+/// creates `home` with mode 0700.
 #[must_use]
 pub fn env(
     base: &[(OsString, OsString)],
@@ -198,7 +199,10 @@ impl KimiHome {
 
     /// Like [`KimiHome::create`]. With a `group`, `.kimi` and the job directory become
     /// group-writable for it (2770), as the Claude job directory does, so a job uid in that
-    /// group can write config and cache there. `None` leaves mode 0700.
+    /// group can write config and cache there. `None` leaves mode 0700. The modes carry no
+    /// sticky bit, so jobs that share the group can rename or delete a sibling's directory, as
+    /// with `.agent`. The directory is made in place, not staged and renamed as `JobDir`
+    /// does; a failed share removes it on drop.
     ///
     /// # Errors
     ///

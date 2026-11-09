@@ -1,7 +1,8 @@
 //! The agent CLI a Job runs under (ADR-0044).
 //!
 //! [`AgentRunner`] owns what differs between agent CLIs. `claude`, `codex` and `kimi` exist; the
-//! [`resolve`] table maps a `Job.agent` name to its runner.
+//! [`resolve`] table maps a `Job.agent` name to its runner. The command line of a `claude` job is
+//! still built in `runner.rs` from `claude_bin`, not through [`AgentRunner::program`].
 
 pub mod codex;
 pub mod kimi;
@@ -41,8 +42,8 @@ pub trait AgentRunner: Send + Sync {
 /// The runner for the `agent` field of a Job.
 ///
 /// An empty name comes from servers that predate the field and means `claude`. Any other
-/// name that no runner claims returns `None`; the caller fails the Job with
-/// [`ERR_UNKNOWN_AGENT`].
+/// name that no runner claims returns `None`. The job start fails the Job with
+/// [`ERR_UNKNOWN_AGENT`]; the other callers skip their runner-specific step.
 #[must_use]
 pub fn resolve(agent: &str) -> Option<&'static dyn AgentRunner> {
     match agent {

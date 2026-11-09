@@ -323,8 +323,8 @@ impl Config {
     /// Fails on invalid TOML, an unparsable `FLEETD_PORT`, a zero
     /// `queue_max_bytes` or `queue_max_age_secs`, a `max_turns` outside 1 to 1000, a
     /// `max_budget_usd` that is not finite, not above 0 or above 1000, a `repo_hosts` entry that
-    /// is not a bare host name, a `token_host` that is not in `repo_hosts`, a `hook_socket` that is relative
-    /// or equals `socket_path`, an unparsable `hook_socket_uid`, or a `hook_socket_group` that
+    /// is not a bare host name, a `token_host` that is not in `repo_hosts`, a `hook_socket`
+    /// that is relative or equals `socket_path`, an unparsable `hook_socket_uid`, or a `hook_socket_group` that
     /// is not a plain name or has no `hook_socket`. An empty environment value
     /// counts as unset.
     #[expect(

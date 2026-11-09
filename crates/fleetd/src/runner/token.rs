@@ -3,7 +3,7 @@
 //! With a [`crate::cred::CredentialBook`] attached, the push and `gh` children take the token the job's
 //! owner stored and never a value from the box environment: a job with no held credential gets
 //! no token. Without a book the children keep the base environment token, which is the library
-//! default for callers that have no credential channel. The agent shares fleetd's uid under the
+//! default for callers that have no credential channel. Production always attaches a book. The agent shares fleetd's uid under the
 //! direct launcher, so the token is hidden from other uids only (ADR-0024 Known limit).
 
 use std::ffi::OsString;

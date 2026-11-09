@@ -124,6 +124,10 @@ pub const STRIPPED_ENV: [&str; 11] = [
     "FLEETD_ASKPASS_HOST",
 ];
 
+/// Names the agent environment keeps from [`RunConfig::base_env`].
+///
+/// `CLAUDE_CODE_OAUTH_TOKEN` is on the list, so every run that starts from a base env holding
+/// it passes it on, whatever the run kind.
 const AGENT_ENV: [&str; 13] = [
     "PATH",
     "LANG",
@@ -214,7 +218,8 @@ pub const STDOUT_DRAIN: Duration = Duration::from_secs(1);
 /// Pending chunk bytes that trigger an immediate report.
 pub const FLUSH_BYTES: usize = 64 * 1024;
 
-/// Most chunk bytes held while the server is unreachable. The oldest chunks go first.
+/// Most chunk bytes held while the server is unreachable. The oldest chunks go first and keep
+/// their `seq`, so the numbers the server receives have a gap where they were dropped.
 pub const MAX_BUFFER_BYTES: usize = 8 * 1024 * 1024;
 
 /// Most chunk bytes in one report, kept under the 1 MiB server decode limit.
@@ -353,7 +358,8 @@ pub struct RunConfig {
     pub ci_poll_initial: Duration,
     /// Longest wait between check polls.
     pub ci_poll_cap: Duration,
-    /// True when the box is disposable. Only then a Job without a Profile runs with permission checks off.
+    /// True when the box is disposable. Only then a Job without a Profile runs with permission
+    /// checks off.
     pub disposable: bool,
     /// Hard limit on the run. The process group is killed when it passes.
     pub timeout: Duration,
@@ -370,7 +376,10 @@ pub struct RunConfig {
     /// Longest time for preparing the workspace, lease renewals included.
     pub prepare_timeout: Duration,
     /// Longest wait for the terminal report. Past it the report is dropped, so a hung
-    /// server cannot hold the runner after the process group is dead.
+    /// server cannot hold the runner after the process group is dead. The server then gets no
+    /// terminal report and shows the job `LOST`. The report is sent once, resent only without
+    /// the CI status after an `InvalidArgument` reply; any other failed send is logged and the
+    /// summary is lost.
     pub terminal_report_timeout: Duration,
     /// Environment the agent inherits from, filtered by the allowlist and
     /// [`RunConfig::env_passthrough`].
@@ -570,8 +579,8 @@ pub trait AgentProc: Send {
     }
 
     /// Fires the cancel signal of the services behind the job socket, so each stops
-    /// mid-request. The runner calls it before it ends a run that the server cancelled or
-    /// whose lease is lost. A launcher with no job socket keeps the default, which does nothing.
+    /// mid-request. The runner calls it before it ends a run early for any reason: a cancel,
+    /// a lost lease, shutdown, the run deadline or a failed wait on the child. A launcher with no job socket keeps the default, which does nothing.
     fn cancel_services(&self) {}
 }
 
@@ -1345,8 +1354,8 @@ impl<R: Reporter> AgentRunner<R> {
     ///
     /// The child gets no stdin, its own process group, `FLEET_JOB_ID` and `SWARM_BOX=1`.
     /// It gets `--dangerously-skip-permissions` only when the config marks the box
-    /// disposable and the Job has no Profile. Exit 0 is [`AgentOutcome::Succeeded`]. A nonzero exit, a signal, a
-    /// start failure or the timeout sends a terminal `FAILED` report and returns
+    /// disposable and the Job has no Profile. Exit 0 is [`AgentOutcome::Succeeded`]. A nonzero
+    /// exit, a signal, a start failure or the timeout sends a terminal `FAILED` report and returns
     /// [`AgentOutcome::Failed`]. A report reply with `cancel_requested` gives
     /// [`AgentOutcome::Cancelled`] after `SIGTERM`, the cancel grace and `SIGKILL`. A
     /// `FAILED_PRECONDITION` reply gives [`AgentOutcome::Lost`]. The whole process group is
