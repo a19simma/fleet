@@ -1785,3 +1785,72 @@ async fn a_split_secret_straddling_the_bg_read_cap_leaves_no_fragment() {
         }
     }
 }
+
+const HOSTILE_CHARS: [char; 10] = [
+    '\r',
+    '\u{85}',
+    '\u{2028}',
+    '\u{2029}',
+    '\u{202E}',
+    '\u{E0041}',
+    '\u{200B}',
+    '\u{FEFF}',
+    '\u{AD}',
+    '\u{2066}',
+];
+
+#[tokio::test(start_paused = true)]
+async fn each_hostile_char_is_stripped_from_the_log_command_and_label() {
+    for bad in HOSTILE_CHARS {
+        let log = format!("a{bad}b\nc");
+        let (out, _, _) = output_of(&hostile_log(log.into_bytes())).await;
+        assert_eq!(out, "ab\nc", "log {bad:?}");
+
+        let cmd = serde_json::to_string(&format!("c{bad}m{bad}d")).expect("json");
+        let label = serde_json::to_string(&format!("l{bad}b")).expect("json");
+        let hostile = format!(
+            r#""1":{{"id":1,"created_at":"{START}","original_command":{cmd},"command":"x","path":"/w","envs":{{}},"group":"default","dependencies":[],"priority":0,"label":{label},"status":{}}}"#,
+            done(r#""Success""#)
+        );
+        let fake = Fake::with(vec![
+            status(&[]),
+            format!(r#"{{"tasks":{{{hostile}}},"groups":{{}}}}"#),
+        ])
+        .log(1, b"o".to_vec());
+        let mut w = watcher(&fake).await;
+        w.poll(Instant::now()).await.expect("poll");
+        let r = w
+            .finish(EndedBy::JobExit, Instant::now())
+            .await
+            .records
+            .remove(0);
+        assert_eq!(r.record.command, "cmd", "command {bad:?}");
+        assert!(!format!("{r:?}").contains("lb"), "label {bad:?}");
+    }
+}
+
+#[tokio::test]
+async fn a_hostile_char_at_a_chunk_boundary_is_stripped_before_the_cut() {
+    for bad in HOSTILE_CHARS {
+        let mut raw = pad(MAX_SHELL_LOG_CHUNK_BYTES - 1);
+        raw.push(bad);
+        raw.push_str("tail");
+        let fake = Fake::with(vec![]);
+        let rec = Rec::default();
+        let t0 = Instant::now();
+        let mut p = pusher(&fake, &rec, Redactor::new([SECRET]), t0).await;
+        fake.logs
+            .lock()
+            .expect("lock")
+            .insert(1, Ok(raw.into_bytes()));
+        set_tasks(&fake, &[finished_task(1)]);
+        drain(&mut p, t0).await;
+        for chunk in rec.all() {
+            let text = std::str::from_utf8(&chunk.bytes).expect("utf-8");
+            assert!(!text.contains(bad), "{bad:?}");
+        }
+        let text = rec.text();
+        assert_eq!(text.len(), MAX_SHELL_LOG_CHUNK_BYTES - 1 + 4, "{bad:?}");
+        assert!(text.ends_with("tail"), "{bad:?}");
+    }
+}
