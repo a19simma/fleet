@@ -112,7 +112,7 @@ Built (ADR-0058):
 
 Not built: the per-credential repository list, the audit of revokes inside the mint client, a fleetd revoke that survives a daemon exit, and a revoke of a token GitHub created while the mint call was cut off (its value was never read, so it lives until its expiry, at most one hour).
 
-When the Job cap is hit, the step fails with the Job reason `github app token limit reached`. A plain mint failure reports `credentials could not be fetched` instead. A refresh whose mint fails keeps the last good token until it expires. A box whose clock runs ahead of the server's refreshes every 45 minutes, keeps the token for 50 minutes after the fetch and then fails the step with `credential expired` if the refresh still fails. A box clock that runs behind cannot be detected: its steps fail at GitHub once the token has expired. To see the cause, list the denied rows. The table has no user column, so join through the credential:
+When the Job cap is hit at the first fetch, the Job fails with the reason; on a later refresh the step fails with the reason `github app token limit reached`. A plain mint failure reports `credentials could not be fetched` instead. A refresh whose mint fails keeps the last good token until it expires. A box whose clock runs ahead of the server's refreshes every 45 minutes, keeps the token for 50 minutes after the fetch and then fails the step with `credential expired` if the refresh still fails. A box clock that runs behind cannot be detected: its steps fail at GitHub once the token has expired. To see the cause, list the denied rows. The table has no user column, so join through the credential:
 
 ```
 SELECT m.at, m.job_id, m.reason

@@ -67,7 +67,7 @@ sanity gate on what the server stores, not a trust decision.
 | --- | --- |
 | first success, nothing cached | store |
 | higher | replace |
-| equal, same bytes | no-op |
+| equal, same manifest and signature bytes | no-op |
 | equal, same manifest bytes, different signature | replace the pair (`Resigned`), counts as accepted, heals a torn pair |
 | equal, different bytes | reject, keep the cached pair |
 | lower | reject, keep the cached pair |

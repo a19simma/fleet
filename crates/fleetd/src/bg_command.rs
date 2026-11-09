@@ -919,6 +919,11 @@ impl<C: PueueClient> BgWatcher<C> {
         Ok(())
     }
 
+    /// Reads, sanitises and cuts one task log. When the read hit the cap, a second pass cuts the
+    /// already-clean text by its own sanitised length, which is shorter than the raw length, so
+    /// the last `LOG_TAIL_GUARD` bytes drop and a secret split by the cap leaves no prefix. The
+    /// second pass redacts text that is already redacted and relies on the redactor being
+    /// idempotent.
     async fn read_log(&self, id: u64) -> (String, bool, bool) {
         let Some(fetch) =
             fetch_checked(&self.client, id, LOG_READ_CAP + 1, self.config.call_timeout).await

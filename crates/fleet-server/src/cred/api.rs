@@ -293,8 +293,8 @@ impl CredentialService {
     /// with `PRECONDITION_APP_INSTALLATION` or `PRECONDITION_APP_REPO` when the installation or
     /// the repository of the user's latest Job is refused, and with
     /// `PRECONDITION_APP_MINT_RATE` when the per-User mint rate limit is reached (a probe
-    /// never counts toward a Job's cap), `PERMISSION_DENIED` with `ERR_CAPABILITY_NOT_GRANTED` when a
-    /// `github_app` owner lacks the capability, `INTERNAL` when a sealed value cannot be opened
+    /// never counts toward a Job's cap), `PERMISSION_DENIED` with `ERR_CAPABILITY_NOT_GRANTED` when
+    /// a `github_app` owner lacks the capability, `INTERNAL` when a sealed value cannot be opened
     /// or a stored kind is unknown, `UNAVAILABLE` when GitHub or storage cannot answer.
     ///
     /// A `github_app` mint failure, including a failed installation lookup and a signing

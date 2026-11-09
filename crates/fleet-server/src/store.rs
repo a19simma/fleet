@@ -396,7 +396,8 @@ pub enum StoreError {
     /// `NOT_FOUND`. The error carries no data.
     UnknownProfile,
     /// A save, a submit or a blob serve involved a profile with `tools`, or a save named a `tool`
-    /// catalog item, and the responsible user does not hold `profile:tools`. The handler maps this to gRPC `PERMISSION_DENIED`. The error carries no data.
+    /// catalog item, and the responsible user does not hold `profile:tools`. The handler maps
+    /// this to gRPC `PERMISSION_DENIED`. The error carries no data.
     ToolsNotGranted,
     /// A profile save, a submit, a batch submit or a profile blob read named a model outside
     /// the allowlist. The blob read refuses a job queued before the list was set or narrowed. The
@@ -847,8 +848,8 @@ impl Store {
     /// Sets the model allowlist, none otherwise.
     ///
     /// With a list, a profile save, a job or batch submit and a profile blob read refuse a profile
-    /// model outside it with [`StoreError::ModelDenied`]. With `None` the store applies no model restriction. The
-    /// list is process configuration and never changes after this call.
+    /// model outside it with [`StoreError::ModelDenied`]. With `None` the store applies no model
+    /// restriction. The list is process configuration and never changes after this call.
     #[must_use]
     pub fn with_model_allowlist(mut self, allowlist: Option<ModelAllowlist>) -> Self {
         self.model_allowlist = allowlist;
@@ -990,8 +991,8 @@ impl Store {
     /// Returns [`StoreError::InvalidJob`] when the request fails validation or its profile
     /// set cannot be frozen, [`ProfileFault::Unowned`] for a profile with no user,
     /// [`StoreError::UnknownProfile`] when the user cannot read the profile,
-    /// [`StoreError::ToolsNotGranted`] when the profile has `tools` and the submitting user no longer
-    /// holds `profile:tools`,
+    /// [`StoreError::ToolsNotGranted`] when the profile has `tools` and the submitting user no
+    /// longer holds `profile:tools`,
     /// [`StoreError::ModelDenied`] when the pinned model is outside the allowlist,
     /// [`StoreError::KeyConflict`] when the key exists with different parameters, and
     /// [`StoreError::Database`] when a query fails.
@@ -1439,7 +1440,8 @@ impl Store {
     /// `profile:tools` (checked first, by `require_tools_grant`) or when the selection names a
     /// `tool` item and `caller` lacks it (the selection faults come in the order `UnknownItem`,
     /// `ItemDisabled`, `ToolsNotGranted`), [`StoreError::ModelDenied`] when the store has an
-    /// allowlist and the profile model is outside it, and [`StoreError::Database`] when a query fails.
+    /// allowlist and the profile model is outside it, and [`StoreError::Database`] when a query
+    /// fails.
     pub async fn create_profile(
         &self,
         caller: Option<i64>,
@@ -1761,8 +1763,8 @@ impl Store {
     ///
     /// With `terminal_state` set to `SUCCEEDED`, `FAILED` or `CANCELLED`, the same
     /// statement also ends the job: it stores the state, `finished_at`, `exit_code`,
-    /// `error` (cut to [`crate::jobs::MAX_ERROR_CHARS`] characters), `pr_url` and `branch`. The row is
-    /// then no longer `RUNNING`, so a second final report is stale. Result fields on a
+    /// `error` (cut to [`crate::jobs::MAX_ERROR_CHARS`] characters), `pr_url` and `branch`. The row
+    /// is then no longer `RUNNING`, so a second final report is stale. Result fields on a
     /// report without `terminal_state` are ignored.
     ///
     /// A chunk whose `seq` is already stored is skipped and counts as acked. A report

@@ -2,7 +2,7 @@
 //!
 //! Both routes start with [`admin_gate`] or [`admin_post_gate`], which read `users.is_admin`
 //! on that request, and the POST checks the session's CSRF token. The user id in the path must
-//! be plain ASCII digits that parse as an `i64` before any SQL runs; anything else is the same
+//! be plain ASCII digits that parse as an `i64` before the id reaches any query; anything else is the same
 //! 404 as a missing user. The form names one capability and an action. The name must parse as
 //! a [`Capability`] exactly, else the POST is a 400 and nothing is written. A write goes
 //! through [`Capabilities`], which re-reads the acting admin under a row lock. Every stored

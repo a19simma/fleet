@@ -1,10 +1,11 @@
 //! The per-job GitHub token and redactor of the runner.
 //!
-//! With a [`crate::cred::CredentialBook`] attached, the push and `gh` children take the token the job's
-//! owner stored and never a value from the box environment: a job with no held credential gets
-//! no token. Without a book the children keep the base environment token, which is the library
-//! default for callers that have no credential channel. Production always attaches a book. The agent shares fleetd's uid under the
-//! direct launcher, so the token is hidden from other uids only (ADR-0024 Known limit).
+//! With a [`crate::cred::CredentialBook`] attached, the push and `gh` children take the token
+//! the job's owner stored and never a value from the box environment: a job with no held
+//! credential gets no token. Without a book the children keep the base environment token, which
+//! is the library default for callers that have no credential channel. Production always
+//! attaches a book. The agent shares fleetd's uid under the direct launcher, so the token is
+//! hidden from other uids only (ADR-0024 Known limit).
 
 use std::ffi::OsString;
 use std::sync::{Arc, PoisonError};
@@ -178,10 +179,10 @@ impl<R: Reporter> AgentRunner<R> {
         }
     }
 
-    /// Renews the installation token of `job_id` when fewer than ten minutes of it remain, and
-    /// keeps both the old and the new value in the job redactor. The redactor is updated before
-    /// the book hands out the new token. A runner with no book, a PAT
-    /// job and a job with a fresh token do nothing.
+    /// Renews the installation token of `job_id` when fewer than
+    /// [`REFRESH_WINDOW_MS`](crate::cred::REFRESH_WINDOW_MS) of it remain, and keeps both the old
+    /// and the new value in the job redactor. The redactor is updated before the book hands out
+    /// the new token. A runner with no book, a PAT job and a job with a fresh token do nothing.
     ///
     /// # Errors
     ///

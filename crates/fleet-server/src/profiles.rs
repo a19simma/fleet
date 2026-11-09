@@ -41,6 +41,7 @@ pub enum Viewer {
 }
 
 impl Viewer {
+    /// The user id, or `None` for the shared-only view.
     pub(crate) fn id(self) -> Option<i64> {
         match self {
             Self::Shared => None,

@@ -192,8 +192,8 @@ fn fence_candidate(body: &str) -> bool {
 /// Whether a subagent body stays inside the Floor. The claude runner parses the frontmatter as
 /// YAML, so only a strict subset is accepted and everything else is refused. The body must start
 /// with `---\n`, then hold one line per key, each `key: value` with the key one of
-/// [`SUBAGENT_KEYS`] at most once and the value a [`plain_scalar`], then a `---\n` line that no further `---` line follows. No CR,
-/// tab, NUL, indentation, blank line or second document start can occur in that region, so no
+/// [`SUBAGENT_KEYS`] at most once and the value a [`plain_scalar`], then a `---\n` line that no
+/// further `---` line follows. No CR, tab, NUL, indentation, blank line or second document start can occur in that region, so no
 /// line break YAML knows (CR, NEL, U+2028, U+2029) hides a key. `tools` is a comma-separated
 /// list of tool names, none in the Floor deny set. A body with no frontmatter is accepted only
 /// when it has no BOM and its first non-whitespace line does not start with `---`.
@@ -450,8 +450,9 @@ pub enum LoadError {
     RefHash,
     /// The catalog snapshot holds an item the core rules refuse, other than a name or body.
     Catalog,
-    /// The catalog snapshot holds more than `MAX_BLOB_CATALOG_ITEMS` items or more than
-    /// `MAX_BLOB_CATALOG_BYTES` content bytes.
+    /// The catalog snapshot holds more than
+    /// [`MAX_BLOB_CATALOG_ITEMS`](fleet_proto::MAX_BLOB_CATALOG_ITEMS) items or more than
+    /// [`MAX_BLOB_CATALOG_BYTES`](fleet_proto::MAX_BLOB_CATALOG_BYTES) content bytes.
     CatalogTooLarge,
     /// The catalog snapshot names one item id twice.
     CatalogDuplicate,

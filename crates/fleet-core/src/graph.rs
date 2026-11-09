@@ -84,7 +84,8 @@ impl std::error::Error for PathError {}
 /// A relative, normalised path of printable ASCII segments.
 ///
 /// One trailing `/` is dropped. A path names a file or a directory and covers everything
-/// below it.
+/// below it. Comparison is case-sensitive and nothing is percent-decoded, so a consumer must
+/// not case-fold or decode a path before it compares.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RepoPath {
     text: String,
