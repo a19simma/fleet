@@ -396,7 +396,8 @@ pub enum StoreError {
     /// `NOT_FOUND`. The error carries no data.
     UnknownProfile,
     /// A save, a submit or a blob serve involved a profile with `tools`, or a save named a `tool`
-    /// catalog item, and the responsible user does not hold `profile:tools`. The handler maps this to gRPC `PERMISSION_DENIED`. The error carries no data.
+    /// catalog item, and the responsible user does not hold `profile:tools`. The handler maps
+    /// this to gRPC `PERMISSION_DENIED`. The error carries no data.
     ToolsNotGranted,
     /// A profile save, a submit, a batch submit or a profile blob read named a model outside
     /// the allowlist. The blob read refuses a job queued before the list was set or narrowed. The
@@ -847,8 +848,8 @@ impl Store {
     /// Sets the model allowlist, none otherwise.
     ///
     /// With a list, a profile save, a job or batch submit and a profile blob read refuse a profile
-    /// model outside it with [`StoreError::ModelDenied`]. With `None` the store applies no model restriction. The
-    /// list is process configuration and never changes after this call.
+    /// model outside it with [`StoreError::ModelDenied`]. With `None` the store applies no model
+    /// restriction. The list is process configuration and never changes after this call.
     #[must_use]
     pub fn with_model_allowlist(mut self, allowlist: Option<ModelAllowlist>) -> Self {
         self.model_allowlist = allowlist;
@@ -975,8 +976,9 @@ impl Store {
     /// effective catalog set is resolved for the job's runner, and the set, its notes and
     /// its hash are stored on the job in the insert transaction under `FOR SHARE` locks on the
     /// profile and catalog rows. The same transaction re-reads the owner's `profile:tools`
-    /// grant under `FOR SHARE` on the owner and grant rows and stamps the result on the job. Later catalog edits never change a stored job. A repeat under
-    /// the same key skips the resolution and returns the stored job.
+    /// grant under `FOR SHARE` on the owner row and on the grant row when one exists, and
+    /// stamps the result on the job. Later catalog edits never change a stored job. A repeat
+    /// under the same key skips the resolution and returns the stored job.
     ///
     /// The request is validated once, by [`validate_submit`]. The job id is a fresh
     /// ULID-shaped [`EventId`]. The insert uses `ON CONFLICT (idempotency_key) DO NOTHING`,
@@ -989,8 +991,8 @@ impl Store {
     /// Returns [`StoreError::InvalidJob`] when the request fails validation or its profile
     /// set cannot be frozen, [`ProfileFault::Unowned`] for a profile with no user,
     /// [`StoreError::UnknownProfile`] when the user cannot read the profile,
-    /// [`StoreError::ToolsNotGranted`] when the profile has `tools` and the submitting user no longer
-    /// holds `profile:tools`,
+    /// [`StoreError::ToolsNotGranted`] when the profile has `tools` and the submitting user no
+    /// longer holds `profile:tools`,
     /// [`StoreError::ModelDenied`] when the pinned model is outside the allowlist,
     /// [`StoreError::KeyConflict`] when the key exists with different parameters, and
     /// [`StoreError::Database`] when a query fails.
@@ -1438,7 +1440,8 @@ impl Store {
     /// `profile:tools` (checked first, by `require_tools_grant`) or when the selection names a
     /// `tool` item and `caller` lacks it (the selection faults come in the order `UnknownItem`,
     /// `ItemDisabled`, `ToolsNotGranted`), [`StoreError::ModelDenied`] when the store has an
-    /// allowlist and the profile model is outside it, and [`StoreError::Database`] when a query fails.
+    /// allowlist and the profile model is outside it, and [`StoreError::Database`] when a query
+    /// fails.
     pub async fn create_profile(
         &self,
         caller: Option<i64>,
@@ -1533,7 +1536,8 @@ impl Store {
     /// Queues one job per named profile as one batch, or returns the stored batch.
     ///
     /// The request is validated once, by [`batches::validate_batch`]. One transaction inserts
-    /// the batch row, takes the advisory lock of each profile name in sorted order, pins the
+    /// the batch row, takes `FOR SHARE` on each visible profile row and then the advisory lock of
+    /// each profile id in sorted order, pins the
     /// latest version and hash of each profile, and inserts one job per profile in list
     /// order. Any failure rolls back the batch and every job. A repeat of the same key with
     /// identical parameters returns the stored batch with `created` false.
@@ -1759,8 +1763,8 @@ impl Store {
     ///
     /// With `terminal_state` set to `SUCCEEDED`, `FAILED` or `CANCELLED`, the same
     /// statement also ends the job: it stores the state, `finished_at`, `exit_code`,
-    /// `error` (cut to [`crate::jobs::MAX_ERROR_CHARS`] characters), `pr_url` and `branch`. The row is
-    /// then no longer `RUNNING`, so a second final report is stale. Result fields on a
+    /// `error` (cut to [`crate::jobs::MAX_ERROR_CHARS`] characters), `pr_url` and `branch`. The row
+    /// is then no longer `RUNNING`, so a second final report is stale. Result fields on a
     /// report without `terminal_state` are ignored.
     ///
     /// A chunk whose `seq` is already stored is skipped and counts as acked. A report

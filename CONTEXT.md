@@ -1,6 +1,7 @@
 # Fleet
 
-Fleet runs coding-agent Jobs on Boxes and records what each Job did. This file defines the terms of the ADRs on telemetry and metrics (0029, 0030), profiles (0034, 0035, 0052, 0053, 0057), capabilities and the model allowlist (0054), job timing (0055), the job socket, broker and registration (0036, 0037, 0039), fetch policy (0038), credentials and users (0040, 0042, 0043), the GitHub App lane (0058), agent runners and forges (0044, 0045), the mirror key (0046), the update trust root (0047, 0050), the release feed (0060, 0061), the transcript view (0062), and the work tracker (0064, 0065, 0066).
+Fleet runs coding-agent Jobs on Boxes and records what each Job did. This file defines the terms of these ADRs:
+telemetry and metrics (0029, 0030); profiles (0034, 0035, 0052, 0053, 0057); capabilities and the model allowlist (0054); job timing (0055); the job socket, broker and registration (0036, 0037, 0039); fetch policy (0038); credentials and users (0040, 0042, 0043); the GitHub App lane (0058); agent runners and forges (0044, 0045); the mirror key (0046); the update trust root (0047, 0050); the release feed (0060, 0061); the transcript view (0062); the work tracker (0064, 0065, 0066).
 
 ## Language
 
@@ -224,7 +225,7 @@ The bearer token the CLI uses with the server, `FLEET_CLIENT_TOKEN`, in client s
 _Avoid_: token, API token
 
 **Trust root**:
-The key source fleetd verifies update manifests against: the file `/etc/fleetd/update.pub` when it exists, else the **Baked key**. A present but invalid file disables updating and never falls back (ADR-0047, ADR-0050).
+The key source fleetd verifies update manifests against: the file named by the `update_trust_root` config key, `/etc/fleetd/update.pub` by default, when it exists, else the **Baked key**. A config file that sets `update_trust_root` makes the file required. A present but invalid file disables updating and never falls back (ADR-0047, ADR-0050).
 _Avoid_: trust anchor, signing key
 
 **Baked key**:
@@ -330,7 +331,7 @@ One typed unit that the view parser in `fleet_core::transcript` emits from a lin
 A `tool_use` joined to its `tool_result` by id in one **Transcript entry** (ADR-0062).
 
 **Hostile text**:
-A control character, format character, line or paragraph separator, or tag-block character. One set in `fleet_core::text` (ADR-0063). Strip paths remove it. Reject paths refuse it but allow ZWNJ and ZWJ.
+A control character, format character, line or paragraph separator, or tag-block character. One set in `fleet_core::text` (ADR-0063). Strip paths remove it. Reject paths refuse it but allow ZWNJ and ZWJ. It does not cover unassigned (`Cn`) or private-use (`Co`) code points.
 
 **Fleet note**:
 A non-JSON line that starts with `fleet: ` and that fleetd writes into a **Transcript**. Not authoritative: the Job row is (ADR-0062).

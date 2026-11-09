@@ -135,6 +135,9 @@ impl std::fmt::Display for UrlRefusal {
 impl std::error::Error for UrlRefusal {}
 
 /// A URL that passed [`precheck_url`].
+///
+/// Consumers use these fields as they are and never rebuild a URL by formatting
+/// `https://{host}{path}`: an IPv6 literal is stored without brackets, so the rebuilt URL is wrong.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ParsedTarget {
     /// Lowercase ASCII host; an IPv6 literal has no brackets.

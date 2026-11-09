@@ -47,7 +47,8 @@
 //!   check, so identical repeated lines can hide the shift.
 //!
 //! The pusher fails the task closed on any of these: one empty `Failed` chunk, then no more
-//! pushes. The watcher withholds the log and reports [`HEAD_LOST_MARKER`] instead.
+//! pushes. The watcher withholds the log and reports [`HEAD_LOST_MARKER`] instead. A task that
+//! prints [`LOG_LINES`] or more lines therefore always ends `Failed`; this is accepted.
 //!
 //! Limit: pueue reuses ids after `pueue reset`, so a task created after a reset with an id at or
 //! below the baseline is not seen. The watcher polls as the uid of its [`PueueClient`]; the
@@ -195,6 +196,9 @@ pub struct PueueCli {
 
 impl PueueCli {
     /// Builds a client for `bin`. The child gets only `env`.
+    ///
+    /// A bare name is searched on the PATH of the fleetd process unless `env` sets `PATH`, so
+    /// pass an absolute path.
     #[must_use]
     pub fn new(bin: impl Into<PathBuf>, env: Vec<(String, String)>) -> Self {
         Self {
@@ -203,6 +207,10 @@ impl PueueCli {
         }
     }
 
+    /// Runs `pueue` with `args` and returns at most `cap` bytes of stdout.
+    ///
+    /// The call has no timeout of its own. A hung child stalls the caller until the watcher
+    /// wrapper that polls it gives up.
     async fn run(&self, args: &[String], cap: usize) -> Result<Vec<u8>, PueueError> {
         let mut child = Command::new(&self.bin)
             .args(args)
@@ -799,6 +807,9 @@ pub struct BgReport {
 impl<C: PueueClient> BgWatcher<C> {
     /// Reads the status once and sets the baseline to its highest task id.
     ///
+    /// The baseline is set when this runs, not at job start: the caller must call it before the
+    /// job runs.
+    ///
     /// # Errors
     ///
     /// Returns [`BgError`] when that read fails or times out. Without a baseline every old task
@@ -908,6 +919,11 @@ impl<C: PueueClient> BgWatcher<C> {
         Ok(())
     }
 
+    /// Reads, sanitises and cuts one task log. When the read hit the cap, a second pass cuts the
+    /// already-clean text by its own sanitised length, which is shorter than the raw length, so
+    /// the last `LOG_TAIL_GUARD` bytes drop and a secret split by the cap leaves no prefix. The
+    /// second pass redacts text that is already redacted and relies on the redactor being
+    /// idempotent.
     async fn read_log(&self, id: u64) -> (String, bool, bool) {
         let Some(fetch) =
             fetch_checked(&self.client, id, LOG_READ_CAP + 1, self.config.call_timeout).await

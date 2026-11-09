@@ -311,7 +311,10 @@ where
 
 /// `fleet profile show`: canonical content, version and hash of one profile version.
 ///
-/// No job references a profile yet, so `used-by` prints `-`: the count is unknown, never zero.
+/// Prints the version, hash and `used-by`, then the owner, visibility, selection (the disabled
+/// item ids joined by `,`, or `-`) and authored prompt (or `-`), then the canonical content. The
+/// server has no per-version job count, so `used-by` prints `-`: the count is unknown, never
+/// zero.
 pub(crate) async fn show(
     client: &mut ProfilesClient,
     scrub: &Scrub,
@@ -331,6 +334,8 @@ pub(crate) async fn show(
 }
 
 /// `fleet profile share` and `unshare`: sets the visibility and prints the result.
+///
+/// An unknown or not-owned profile is an error and nothing is printed.
 pub(crate) async fn set_shared(
     client: &mut ProfilesClient,
     scrub: &Scrub,

@@ -182,7 +182,7 @@ pub enum Command {
         #[command(subcommand)]
         action: catalog::CatalogAction,
     },
-    /// Manage users.
+    /// Manage the capabilities of users.
     #[command(name = "user")]
     UserCap {
         /// The user area.
@@ -410,7 +410,7 @@ impl Scrub {
         &self.redactor
     }
 
-    /// Strips, redacts and strips `text`, keeping newline and tab.
+    /// Redacts, strips, redacts, strips and cuts `text`, keeping newline and tab.
     #[must_use]
     pub fn text(&self, text: &str) -> String {
         scrub(&self.redactor, text)
@@ -458,6 +458,9 @@ pub struct ScrubStream<'a> {
 
 impl ScrubStream<'_> {
     /// Adds `text` and returns the part that is safe to print.
+    ///
+    /// Strips `text` before it redacts, so a secret that holds a hostile character is not
+    /// matched here. A bearer token cannot hold one.
     pub fn push(&mut self, text: &str) -> String {
         let mut whole = std::mem::take(&mut self.tail);
         whole.push_str(&strip_lines(text));

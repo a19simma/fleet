@@ -25,7 +25,7 @@ Not exposed: arbitrary `git` or `gh`, `gh api`, merge, other repos, branch names
 
 ### Push target
 
-fleetd derives a `PushTarget` from the claimed Job on the server side: `Own(job id)` or `Chain(root job id)`. The agent never supplies it. Fix Jobs (ADR-0028) push to the chain root's branch `swarm/<root id>`. The server validates the target at `INSERT_FIX` and in `validate_terminal` against `^swarm/[A-Za-z0-9]{1,64}$`. This closes a finding from the review of the CI retry (TEL-J3 SEC-001). The pattern is a lint over the branch text, and the server also requires the branch to equal `swarm/` plus the chain root job id.
+fleetd derives a `PushTarget` from the claimed Job on the server side: `Own(job id)` or `Chain(root job id)`. The agent never supplies it. Fix Jobs (ADR-0028) push to the chain root's branch `swarm/<root id>`. The server validates the target at `INSERT_FIX` and in `validate_terminal` against `^swarm/[A-Za-z0-9]{1,64}$`. The pattern is a lint over the branch text, shared as `fleet_proto::is_swarm_branch`, and the server also requires the branch to equal `swarm/` plus the chain root job id.
 
 ### Ordering
 
@@ -51,7 +51,10 @@ Pushes per Job (10, at least 5 s apart), one `pr_create` call per Job that reach
 
 - The agent can push and open a PR without any credential in its reach.
 - The broker does not shrink the P2 `CONNECT` proxy. The Claude token stays visible to the agent and `api.anthropic.com` stays reachable.
+- Redaction of broker output is an exact-substring match on held credential values. An encoded or split secret in executor output passes. The control for that is the argv and environment the executor gets, not the redactor.
+- The attribution check reduces text to lowercase ASCII letters and digits, so it folds case only and does not map homoglyphs such as a Cyrillic `o`.
 - Unverified: the per-op cap values beyond those stated, and the `pr_checks` output format.
+- Residual, accepted: the title and body check allows the characters in U+200C..=U+200F (ZWNJ, ZWJ, LRM, RLM) and refuses every other hostile character, U+2028 and U+2029 included. A joiner can split an `@mention` or an auto-close keyword for GitHub. The attribution check folds case and drops every non-ASCII character per line, so these do not hide an attribution line. The check does not apply NFKC, so a fullwidth letter does not fold to ASCII.
 
 ## Considered and rejected
 

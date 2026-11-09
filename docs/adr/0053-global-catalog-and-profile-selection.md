@@ -13,7 +13,7 @@ The **Catalog** is one global list of items, curated by an admin. An item has a 
 - `skill`: a name and files, as in ADR-0034.
 - `subagent`: a name, a prompt and a tool list.
 - `tool`: a `{name, version}` entry from the registry of ADR-0048.
-- `context`: a path and text, laid out as in ADR-0034.
+- `context`: a path and text, laid out as in ADR-0034. The body is written verbatim and imported by an `@` line in `CLAUDE.md`, so an `@` import inside the body is read by the agent like any other import; neither the Catalog nor fleetd checks or strips it.
 
 Items are insert-only and versioned like Profile blobs (ADR-0035). Changing an item adds a version. An admin disables an item by clearing `enabled`, never by deleting it.
 
@@ -27,6 +27,8 @@ A Profile does not list the items it wants. It inherits every item that is enabl
 - The user-authored prompt text: `claude_md`, `prompt_prefix` and `prompt_template`.
 
 The other ADR-0034 fields stay as they are. The `skills`, `context_files` and `tools` content fields move out of the Profile into the Catalog, and the Profile hash covers `disabled` and the authored text. The hash prefix for this shape is `fleet-profile-v3\0`, so existing v1 and v2 hashes stay valid.
+
+On the wire a Profile carries `SelectionEntry` messages of `{item_id, enabled}`. Only entries with `enabled = false` are valid: each one maps to one id in the stored `disabled` list, and an entry with `enabled = true` is refused (`SelectionError::EnabledEntry`). A missing `enabled` reads as false. Duplicate ids, a malformed id and more than `MAX_SELECTION` entries are refused too.
 
 The owner said: "there's a global list of available ones but the user can turn them off selectively". Opt-out follows that statement.
 

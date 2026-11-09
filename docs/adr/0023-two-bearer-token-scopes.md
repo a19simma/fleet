@@ -9,7 +9,7 @@ ADR-0014 uses one shared token for ingest, claim, query and Job control, and say
 The server holds two static bearer tokens, each with a scope.
 
 - **Box token.** `FLEET_TOKEN`, in `/etc/swarm/secrets.env` as before. Scope: `FleetIngest` and `FleetWorker`.
-- **Client token.** `FLEET_CLIENT_TOKEN`, in server config. Scope: `FleetQuery` and `FleetJobs`. The CLI reads it from the environment or `~/.config/fleet/token`, beside `FLEET_SERVER_URL`.
+- **Client token.** `FLEET_CLIENT_TOKEN`, in server config. Scope: `FleetQuery` and `FleetJobs` when this ADR was written; later services joined it and per-user API tokens share it, so `crates/fleet-server/src/auth.rs` holds the current list. The key is optional. The CLI reads it from the environment or `~/.config/fleet/token`, beside `FLEET_SERVER_URL`.
 - **Interceptor.** It maps the token to a scope and checks the gRPC path. A bad or missing token gets `UNAUTHENTICATED`. A valid token on a path outside its scope gets `PERMISSION_DENIED`. The compare stays constant time.
 - **Box names.** `ClaimJob` and `ReportJob` keep the `box-<n>` check. A box name is still a claim.
 - **TLS.** The CLI client needs the tonic rustls feature for https through a gateway.

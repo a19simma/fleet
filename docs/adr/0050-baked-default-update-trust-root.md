@@ -17,7 +17,8 @@ ADR-0047 fixed the update trust root as a file, `/etc/fleetd/update.pub`, that e
 ### Consistency check in CI
 
 - The `update-key` job in `ci.yml` compares line 2 of `crates/fleetd/trust/update.pub` with the repository variable `FLEET_UPDATE_PUBLIC_KEY`.
-- The release workflow runs the same comparison and fails a tag build when the variable is empty. On other runs an empty variable logs a notice and skips the check.
+- The `update-key` job skips its comparison step when the variable is empty.
+- The release workflow runs the same comparison and fails a tag build when the variable is empty. On other runs an empty variable logs a notice and skips the check. The Verify step of the manifest-signing job also logs a notice and passes when the variable is empty, so the signature is then unverified in CI.
 
 ### Rotation
 

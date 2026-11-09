@@ -172,10 +172,16 @@ pub const CLAIM_INTERVAL_S: u32 = 5;
 /// Largest request message the server decodes, in bytes.
 pub const MAX_MESSAGE_BYTES: usize = 1024 * 1024;
 
+/// Bytes one span adds to a `GetJobTimingReply` beyond its two names: field tags, length
+/// prefixes and the numeric fields.
 const TIMING_SPAN_WIRE_OVERHEAD: usize = 64;
 
+/// Bytes one shell command adds to a `GetJobTimingReply` beyond its id, command, log and
+/// `ended_by` text: field tags, length prefixes and the numeric and flag fields.
 const TIMING_COMMAND_WIRE_OVERHEAD: usize = 128;
 
+/// Bytes the summary and reply envelope add to a `GetJobTimingReply`: field tags and the five
+/// duration fields.
 const TIMING_SUMMARY_WIRE_OVERHEAD: usize = 128;
 
 /// Largest `GetJobTimingReply` the server encodes, in bytes.

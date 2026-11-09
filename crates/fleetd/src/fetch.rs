@@ -46,6 +46,10 @@ pub enum FetchError {
     /// The host is not permitted by the [`FetchPolicy`].
     HostNotPermitted,
     /// Name resolution failed or returned no address.
+    ///
+    /// [`FetchError::Resolve`], [`FetchError::NonPublicAddress`], [`FetchError::Connect`] and
+    /// [`FetchError::Tls`] are distinct on purpose. They tell the agent a little about the
+    /// network, which an attacker who controls the DNS for a host learns anyway.
     Resolve,
     /// An address for the host is not public. One bad answer refuses the whole hop.
     NonPublicAddress,
@@ -191,6 +195,10 @@ pub trait Dialer: Send + Sync {
 }
 
 /// The system resolver.
+///
+/// `lookup_host` runs on the blocking pool, so a lookup that outlives [`FetchCaps::total_timeout`]
+/// keeps its thread until the OS call returns. Callers bound the work with
+/// [`FetchCaps::max_fetches_per_job`] and the concurrent fetch cap.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct SystemResolver;
 

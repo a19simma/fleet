@@ -27,8 +27,8 @@
 //!
 //! `jobs::build` registers one instance under [`crate::jobsock::ServiceName::Fetch`] with a
 //! [`FeedBook`] recorder. The runner registers each job's feed with the book when its stream
-//! starts and forgets it when the stream ends. Calling [`FetchService::forget`] when a job ends
-//! is still to wire.
+//! starts and forgets it when the stream ends. The job end hook in `jobs::job_services` calls
+//! [`FetchService::forget`].
 
 use std::collections::HashMap;
 use std::fmt;

@@ -1002,7 +1002,8 @@ fn is_trailer_line(line: &str) -> bool {
 }
 
 /// Checks line by line, so a footer split across lines, such as `Generated with` then
-/// `Claude Code`, passes.
+/// `Claude Code`, passes. [`skeleton`] keeps ASCII only and folds case only, so a
+/// Cyrillic `o` in a trailer key passes.
 fn has_attribution(text: &str) -> bool {
     text.split(is_line_separator).any(|line| {
         let skeleton = skeleton(line);

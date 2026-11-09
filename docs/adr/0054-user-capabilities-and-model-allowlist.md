@@ -1,6 +1,6 @@
 # User capabilities and model allowlist
 
-Status: Proposed 2026-11-02. Built: the `profile:tools` capability (save, Job submit, batch submit, blob serve), the startup refusal of `FLEET_ALLOW_PROFILE_TOOLS`, the server `FLEET_MODEL_ALLOWLIST` check at profile save, Job submit, batch submit and blob serve, and the fleetd `model_allowlist`. Amends ADR-0048 (the server gate for `tools`). Builds on ADR-0035, ADR-0042 and ADR-0044. Amended by ADR-0056 and ADR-0058.
+Status: Proposed 2026-11-02. Built: the admin page `/users/{id}/capabilities`, the `profile:tools` capability (save, Job submit, batch submit, blob serve), the startup refusal of `FLEET_ALLOW_PROFILE_TOOLS`, the server `FLEET_MODEL_ALLOWLIST` check at profile save, Job submit, batch submit and blob serve, and the fleetd `model_allowlist`. Amends ADR-0048 (the server gate for `tools`). Builds on ADR-0035, ADR-0042 and ADR-0044. Amended by ADR-0056 and ADR-0058.
 
 ADR-0048 gates Profile `tools` with one server switch, `FLEET_ALLOW_PROFILE_TOOLS`, because the server then had only box and client scopes. The server now has Users and an admin, a user with `users.is_admin` (ADR-0042, ADR-0056), so a grant can attach to a principal. A global switch lets every client install toolchains once an operator flips it. This ADR replaces it with a per-user capability and adds a model allowlist so a Job cannot select a model the operator never approved.
 
@@ -24,9 +24,9 @@ ADR-0048 gates Profile `tools` with one server switch, `FLEET_ALLOW_PROFILE_TOOL
 
 - `FLEET_MODEL_ALLOWLIST` in the server config is a comma-separated list of model ids.
 - Match is exact and case-sensitive. No prefix, glob, alias or trimming beyond the list separator. An empty entry is a config error.
-- The server checks the model of a Job at submit, whether it comes from the request or from the pinned Profile, and refuses a model outside the list.
+- The server checks the pinned Profile model at profile save, Job submit and batch submit, and refuses a model outside the list. A Job request carries no model of its own, so there is no request-model path.
 - When `FLEET_MODEL_ALLOWLIST` is unset the server applies no model restriction.
-- fleetd re-checks the model before spawn against its own config key `model_allowlist`, same exact match. A mismatch fails the Job with a fixed error before any process starts. The server is not trusted alone, because fleetd holds the Box and the credentials.
+- fleetd re-checks the model before spawn against its own config key `model_allowlist`, same exact match. A mismatch fails the Job with a fixed error before any process starts. A Profile with no model is not re-checked, because no model is requested. The server is not trusted alone, because fleetd holds the Box and the credentials.
 - When fleetd has no `model_allowlist`, fleetd trusts the server and does not check. The deploy docs must recommend setting it on every Box, since an unset list leaves the server as the only gate.
 
 ## Consequences
@@ -37,6 +37,7 @@ ADR-0048 gates Profile `tools` with one server switch, `FLEET_ALLOW_PROFILE_TOOL
 - The admin RPC and the admin UI gain grant and revoke for the capability. `fleet-server admin` gains `grant-admin` and `revoke-admin` instead (ADR-0056).
 - A fleetd with an allowlist and a server without one still enforces on the Box. A server with one and a fleetd without one enforces at submit only.
 - Model ids that vendors rename need an allowlist edit in both configs.
+- `user_capabilities.granted_by` references `users (id)` with no `ON DELETE` action, so deleting a granter fails while a grant names them. No user-deletion path exists. One added later must reassign or remove those grants first.
 
 ## Considered and rejected
 

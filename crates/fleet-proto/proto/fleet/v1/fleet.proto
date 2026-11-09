@@ -919,6 +919,8 @@ message Profile {
   string authored_prompt = 5;
 }
 
+// ShareProfile and UnshareProfile reply with a Profile that carries name, owner_user_id and
+// visibility only; selection and authored_prompt are empty. Read the content with GetProfile.
 message ShareProfileRequest {
   string name = 1;
 }

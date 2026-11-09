@@ -1,7 +1,9 @@
 //! The job timing page and its live log stream.
 //!
-//! `/jobs/{id}/timing` shows the five-part timing breakdown of a job as a stacked bar and a
-//! table, then lists the pueue tasks the job reported with a status badge. The breakdown
+//! `/jobs/{id}/timing` shows the timing breakdown of a job as a stacked bar of its five parts
+//! and a table of those parts with the total and the command count. A second table lists each
+//! pueue command the job reported with its start, end, duration, exit code, background flag and
+//! end reason, and a log block under each row. The breakdown
 //! comes from [`read_job_timing`] scoped to the session user and is built into a
 //! [`TimingView`], the same view the CLI prints. Every duration is job-relative
 //! milliseconds. A job without a report shows one plain absent line, never zeros. The bar is
@@ -70,6 +72,11 @@ const COMMAND_PREVIEW_BYTES: usize = 160;
 const FRAME_QUEUE: usize = 8;
 const CARRY_MAX: usize = 3;
 
+/// The embedded log script.
+///
+/// It closes the `EventSource` on `error`, `end` and `fail` and never reconnects: the browser
+/// would resend the request without a resume position and the replay would duplicate the pane
+/// text. The state line shows `disconnected` and the viewer reopens the log by hand.
 const LOG_JS: &str = r#"(function () {
   var pane = document.getElementById("task-log");
   var title = document.getElementById("task-log-title");
