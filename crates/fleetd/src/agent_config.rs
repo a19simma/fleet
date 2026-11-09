@@ -88,6 +88,9 @@ const EMBEDDED: [(&str, &str); 4] = [
         include_str!("../agent-config/skills/broker/SKILL.md"),
     ),
 ];
+/// The job `.gitconfig`. It sits in the agent-writable job home, so `push.default = nothing`
+/// is advisory: the agent can change it. The controls are the argv deny floor and the absence of
+/// push credentials in the agent environment.
 const GITCONFIG: &str = "[user]\n\tname = Fleet Job\n\temail = fleet-job@fleet.invalid\n[commit]\n\tgpgsign = false\n[push]\n\tdefault = nothing\n";
 
 /// Why an operator bundle directory was rejected.
@@ -182,7 +185,8 @@ impl Bundle {
     ///
     /// Applies the same entry and byte caps, the same `settings.json` checks and the same
     /// error variants as [`Bundle::from_dir`], and yields an equal [`Bundle`] for the same
-    /// files. Each distinct parent directory counts as an entry, as on disk. A path must be
+    /// files. Each distinct parent directory counts as an entry, as on disk, but an empty directory cannot be
+    /// expressed, so a bundle with one differs from its `from_dir` twin. A path must be
     /// relative, hold only plain components and no backslash or NUL byte, and appear once; a
     /// bad or repeated path is [`BundleError::Path`], and a path that is both a file and a
     /// directory is [`BundleError::Entry`].

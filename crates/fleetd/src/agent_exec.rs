@@ -227,7 +227,9 @@ const ACCEPT_RETRY: Duration = Duration::from_millis(10);
 ///
 /// It dials only the socket path it was given at start, never one read from the environment,
 /// and selects only [`ServiceName::EgressProxy`]. It runs on its own thread, so it dies with
-/// the process. Dropping it stops the accept loop and closes every open connection.
+/// the process. Dropping it stops the accept loop and closes every open connection. The proxy
+/// URL it serves is plain `http` with no authentication, as designed: the unit's network
+/// namespace is the boundary.
 #[derive(Debug)]
 pub struct Forwarder {
     port: u16,
@@ -259,7 +261,9 @@ impl Forwarder {
 
     /// Binds `addr` and relays raw bytes to the plain unix socket at `socket`, with no Job
     /// socket handshake. The telemetry receiver speaks HTTP on that socket itself. `addr` must
-    /// be a loopback address.
+    /// be a loopback address. The socket path is dialled afresh for every connection, so the
+    /// directory holding it must not be writable by the agent: a peer that can swap the socket
+    /// redirects later connections.
     ///
     /// # Errors
     ///

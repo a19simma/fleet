@@ -554,7 +554,8 @@ pub struct JobServices<R = SystemResolver, D = TcpDialer> {
 /// `Fetch` is a [`FetchService`] over the config's policy and caps, system DNS and plain TCP,
 /// recording through `feeds`. `EgressProxy` is a [`ConnectProxy`] over the config's
 /// `egress_allow` list (the model API host is allowed to a job never narrowed) with the system
-/// resolver and dialer, so every dial is pinned to an address that passed `netguard::is_public_address`.
+/// resolver and dialer, so every dial is pinned to an address that passed
+/// `netguard::is_public_address`.
 /// Both key their per-job state by the job id of the socket, never by the client. The `end`
 /// hook of the result calls [`ConnectProxy::set_job_hosts`] before the agent starts and
 /// [`FetchService::forget`] and [`ConnectProxy::forget`] when the job ends, so the

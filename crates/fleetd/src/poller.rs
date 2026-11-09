@@ -10,11 +10,11 @@
 //!
 //! The server URL must use `http` or `https`. An `https` URL gets TLS with the webpki roots,
 //! the same provider and roots as the laptop CLI, and the bearer token travels inside it.
-//! [`TimingReporter`] sends one job's timing summary over `ReportTiming` with retry. It is
-//! built and tested, and no runtime path calls it yet.
-//!
 //! A certificate the roots do not vouch for fails the call. A handshake that never completes is
 //! cut off by [`CALL_BACKSTOP`], because the channel timeout does not cover it.
+//!
+//! [`TimingReporter`] sends one job's timing summary over `ReportTiming` with retry. The job
+//! wiring builds it when the host network namespace is available.
 
 use std::fmt;
 use std::future::Future;
@@ -553,6 +553,10 @@ impl<T: TimingTransport, C: RetryClock, R: Random> TimingReporter<T, C, R> {
     /// # Errors
     ///
     /// Fails before any call when the request has no job id.
+    ///
+    /// The request is sent as given: this method puts no bound on the span count, the shell
+    /// commands or the summary size, so the caller must keep the request within what the server
+    /// accepts.
     pub async fn report(
         &mut self,
         request: ReportTimingRequest,
@@ -741,11 +745,11 @@ impl<R: JobRunner, G: Random> Poller<R, G> {
     ///
     /// An idle reply waits `next_in_s`, capped at [`MAX_IDLE_WAIT`], or the jittered
     /// interval when it is zero. A claim error is logged with its status code only and
-    /// delays the next claim by the backoff schedule. A claimed job runs in its own task to completion before the
-    /// next claim. When `stop` completes mid-job, the runner is signalled and given
-    /// [`SHUTDOWN_GRACE`] to return. A runner `Ok` resets the schedule. A runner error or
-    /// panic is logged with a fixed message and grows it, so a crash-looping runner cannot
-    /// claim faster than the schedule allows.
+    /// delays the next claim by the backoff schedule. A claimed job runs in its own task to
+    /// completion before the next claim. When `stop` completes mid-job, the runner is
+    /// signalled and given [`SHUTDOWN_GRACE`] to return. A runner `Ok` resets the schedule. A
+    /// runner error or panic is logged with a fixed message and grows it, so a crash-looping
+    /// runner cannot claim faster than the schedule allows.
     pub async fn run(mut self, stop: impl Future<Output = ()> + Send) {
         tokio::pin!(stop);
         let mut stop = Stop {

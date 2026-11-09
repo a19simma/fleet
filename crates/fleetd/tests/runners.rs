@@ -207,6 +207,8 @@ fn a_codex_home_rejects_a_bad_job_id() -> TestResult {
     Ok(())
 }
 
+/// Checks the config and argv structure only. It does not run Codex, so live Codex behaviour
+/// is unverified.
 #[test]
 fn a_deny_holds_with_hooks_disabled() -> TestResult {
     let argv = strings(&codex::argv(

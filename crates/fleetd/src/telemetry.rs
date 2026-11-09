@@ -269,6 +269,9 @@ struct Pending {
 }
 
 /// Incremental parser. Feed lines, read [`Telemetry::events`], call [`Telemetry::finish`].
+///
+/// The maps of pending tool calls and per-message usage have no cap of their own. The caller
+/// bounds the line length and the stream size.
 #[derive(Debug)]
 pub struct Telemetry {
     limits: Limits,

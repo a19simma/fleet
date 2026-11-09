@@ -1,8 +1,8 @@
 //! Verification of a signed update manifest.
 //!
 //! The server relays `{version, min_protocol, seq, targets}` plus a minisign signature. This
-//! module checks the signature against the trust root, an override key file or the embedded key, bounds and validates every
-//! field, and refuses a manifest that is not strictly newer than the running version and the
+//! module checks the signature against the trust root (an override key file or the embedded
+//! key), bounds and validates every field, and refuses a manifest that is not strictly newer than the running version and the
 //! last accepted `seq` (ADR-0047). The `swap` submodule unpacks a staged archive and flips the
 //! `current` and `previous` links. Nothing here restarts fleetd.
 
@@ -706,7 +706,8 @@ pub enum StageError {
     HashMismatch,
     /// A staging directory is a symlink, not a directory, or has loose mode or owner.
     UnsafeDir(PathBuf),
-    /// The version is already staged.
+    /// The version appeared between the leftover cleanup and the publish, so another stage won
+    /// the race.
     AlreadyStaged,
     /// The fetcher failed.
     Fetch(io::Error),
