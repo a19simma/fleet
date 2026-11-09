@@ -699,3 +699,79 @@ async fn hostile_fields_of_one_command_render_inert_and_show_truncation(pool: Pg
     assert!(block.contains('\u{2026}'));
     h.finish().await;
 }
+
+const HOSTILE_STRIPPED: [char; 12] = [
+    '\u{200b}',
+    '\u{200c}',
+    '\u{200d}',
+    '\u{200e}',
+    '\u{feff}',
+    '\u{ad}',
+    '\u{2060}',
+    '\u{61c}',
+    '\u{e0041}',
+    '\u{e007f}',
+    '\u{85}',
+    '\u{2028}',
+];
+
+fn hostile_all() -> String {
+    HOSTILE_STRIPPED.iter().collect()
+}
+
+#[sqlx::test]
+async fn the_stream_holds_no_hostile_character_from_log_text(pool: PgPool) {
+    let h = Harness::start(pool, true).await;
+    let alice = h.session("alice", 'a').await;
+    let job = h.job(&alice, "k1").await;
+    for (index, bad) in HOSTILE_STRIPPED.iter().enumerate() {
+        let text = format!("pre{bad}post{index}\n");
+        let command = format!("t{index}");
+        h.chunk(&job, &command, 0, text.as_bytes(), "done").await;
+        let reply = h.get(Some(&alice), &log_path(&job, &command), &[]).await;
+        assert_eq!(reply.status, 200);
+        assert!(reply.body.contains(&format!("prepost{index}")), "{bad:?}");
+        assert!(!reply.body.contains(*bad), "raw {bad:?} reached the wire");
+    }
+    h.finish().await;
+}
+
+#[sqlx::test]
+async fn a_hostile_character_split_across_stream_chunks_is_dropped(pool: PgPool) {
+    let h = Harness::start(pool, true).await;
+    let alice = h.session("alice", 'a').await;
+    let job = h.job(&alice, "k1").await;
+    let tag = '\u{e0041}'.to_string();
+    let bytes = tag.as_bytes();
+    let mut first = b"pre".to_vec();
+    first.extend_from_slice(bytes.get(..2).unwrap());
+    let mut second = bytes.get(2..).unwrap().to_vec();
+    second.extend_from_slice(b"post\n");
+    h.chunk(&job, "t1", 0, &first, "running").await;
+    h.chunk(&job, "t1", 1, &second, "done").await;
+    let reply = h.get(Some(&alice), &log_path(&job, "t1"), &[]).await;
+    assert!(reply.body.contains("pre") && reply.body.contains("post"));
+    assert!(!reply.body.contains('\u{e0041}'));
+    assert!(!reply.body.contains('\u{fffd}'));
+    h.finish().await;
+}
+
+#[sqlx::test]
+async fn the_tasks_list_holds_no_hostile_character_from_command_text(pool: PgPool) {
+    let h = Harness::start(pool, true).await;
+    let alice = h.session("alice", 'a').await;
+    let job = h.job(&alice, "k1").await;
+    let hostile = hostile_all();
+    h.chunk(&job, "t1", 0, b"a", "running").await;
+    h.command_text(&job, "t1", &format!("echo{hostile}hi"))
+        .await;
+    let reply = h
+        .get(Some(&alice), &format!("/jobs/{job}/timing"), &[])
+        .await;
+    assert_eq!(reply.status, 200);
+    assert!(reply.body.contains("echohi"));
+    for bad in HOSTILE_STRIPPED {
+        assert!(!reply.body.contains(bad), "raw {bad:?} in the tasks page");
+    }
+    h.finish().await;
+}

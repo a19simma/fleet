@@ -20,6 +20,8 @@
 
 use std::convert::Infallible;
 
+use fleet_core::Redactor;
+use fleet_core::text::{Cap, is_hostile, sanitise_text};
 use fleet_core::timing::{CommandInput, FIELDS, Summary, TimingView};
 use fleet_proto::v1::{
     GetJobTimingRequest, ShellCommand, StreamShellLogChunk, StreamShellLogRequest,
@@ -328,14 +330,6 @@ fn internal(err: &dyn std::fmt::Display) -> topcoat::Error {
     fail(AuthError::Internal)
 }
 
-fn cut_at(text: &str, max: usize) -> &str {
-    let mut end = max.min(text.len());
-    while !text.is_char_boundary(end) {
-        end -= 1;
-    }
-    text.get(..end).unwrap_or_default()
-}
-
 fn badge_class(status: &str) -> &'static str {
     match status {
         "running" => "badge badge-sm badge-warning",
@@ -373,7 +367,12 @@ async fn tasks(store: &Store, job_id: &str) -> Result<Vec<Task>> {
             let command = command.unwrap_or_default();
             Ok(Task {
                 url: log_url(job_id, &id),
-                command: cut_at(&command, COMMAND_PREVIEW_BYTES).to_owned(),
+                command: sanitise_text(
+                    &Redactor::default(),
+                    &command,
+                    Cap::Bytes(COMMAND_PREVIEW_BYTES),
+                )
+                .text,
                 id,
                 status,
             })
@@ -530,20 +529,6 @@ struct Pane {
     sent: usize,
 }
 
-fn is_dropped(ch: char) -> bool {
-    (ch.is_control() && ch != '\t')
-        || matches!(
-            ch,
-            '\u{2028}'
-                | '\u{2029}'
-                | '\u{061c}'
-                | '\u{200e}'
-                | '\u{200f}'
-                | '\u{202a}'..='\u{202e}'
-                | '\u{2066}'..='\u{2069}'
-        )
-}
-
 impl Pane {
     fn new() -> Self {
         Self {
@@ -603,7 +588,7 @@ impl Pane {
                 self.sent += 1;
                 self.column = 0;
                 self.skipping = false;
-            } else if is_dropped(ch) || self.skipping {
+            } else if ch != '\t' && is_hostile(ch) || self.skipping {
             } else if self.column >= MAX_LINE_CHARS {
                 out.push('\u{2026}');
                 self.sent += '\u{2026}'.len_utf8();
@@ -797,5 +782,42 @@ mod tests {
     #[test]
     fn invalid_bytes_become_the_replacement_character() {
         assert_eq!(Pane::new().push(b"a\xffb\xc3("), "a\u{fffd}b\u{fffd}(");
+    }
+
+    const HOSTILE_TABLE: [(&str, char); 10] = [
+        ("zero width space", '\u{200b}'),
+        ("zero width non-joiner", '\u{200c}'),
+        ("zero width joiner", '\u{200d}'),
+        ("left-to-right mark", '\u{200e}'),
+        ("byte order mark", '\u{feff}'),
+        ("soft hyphen", '\u{ad}'),
+        ("word joiner", '\u{2060}'),
+        ("arabic letter mark", '\u{61c}'),
+        ("tag latin a", '\u{e0041}'),
+        ("tag cancel", '\u{e007f}'),
+    ];
+
+    #[test]
+    fn every_hostile_character_is_dropped_from_the_pane() {
+        for (name, ch) in HOSTILE_TABLE {
+            assert_eq!(clean(&format!("a{ch}b\tc\n")), "ab\tc\n", "{name}");
+        }
+    }
+
+    #[test]
+    fn a_hostile_character_split_across_chunks_is_dropped() {
+        for (name, ch) in HOSTILE_TABLE {
+            let mut bytes = [0_u8; 4];
+            let encoded = ch.encode_utf8(&mut bytes).as_bytes();
+            for cut in 1..encoded.len() {
+                let mut pane = Pane::new();
+                let mut head = b"a".to_vec();
+                head.extend_from_slice(encoded.get(..cut).unwrap());
+                let mut tail = encoded.get(cut..).unwrap().to_vec();
+                tail.extend_from_slice(b"b");
+                let joined = pane.push(&head) + &pane.push(&tail);
+                assert_eq!(joined, "ab", "{name} cut at {cut}");
+            }
+        }
     }
 }
