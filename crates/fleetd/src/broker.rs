@@ -46,6 +46,7 @@ use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
 use fleet_core::Redactor;
+use fleet_core::text::{Cap, is_hostile_allowing_joiners, sanitise_text};
 use fleet_proto::v1::Job;
 use fleet_proto::{is_ci_url, is_swarm_branch};
 use serde::{Deserialize, Serialize};
@@ -744,7 +745,7 @@ impl GhCli {
         command
     }
 
-    async fn run(&self, pr_url: &str) -> Result<Vec<u8>, ExecError> {
+    async fn run(&self, pr_url: &str) -> Result<(Vec<u8>, Redactor), ExecError> {
         if !scratch_is_private(&self.scratch) {
             return Err(ExecError);
         }
@@ -772,11 +773,15 @@ impl GhCli {
             return Err(ExecError);
         }
         let _ = child.wait().await;
+        let redactor = check_redactor(
+            &self.token,
+            leased.as_ref().map(crate::cred::LeasedToken::token),
+        );
         drop(leased);
-        Ok(raw)
+        Ok((raw, redactor))
     }
 
-    fn subset(&self, raw: &[u8]) -> Result<String, ExecError> {
+    fn subset(&self, raw: &[u8], redactor: &Redactor) -> Result<String, ExecError> {
         let items: Vec<RawCheck> = serde_json::from_slice(raw).map_err(|_| ExecError)?;
         let mut shown = Checks {
             checks: Vec::new(),
@@ -785,7 +790,7 @@ impl GhCli {
         for item in items.into_iter().take(MAX_CHECKS) {
             shown.checks.push(Check {
                 bucket: bucket_name(item.bucket.as_deref()),
-                name: check_name(item.name.as_deref()),
+                name: check_name(redactor, item.name.as_deref()),
                 link: item.link.filter(|link| link_on_host(link, &self.host)),
             });
             if serde_json::to_string(&shown).map_err(|_| ExecError)?.len() > MAX_OUTPUT_BYTES {
@@ -812,8 +817,8 @@ impl GhExecutor for GhCli {
         if !is_pull_url(pr_url, &self.host) {
             return Err(ExecError);
         }
-        let raw = self.run(pr_url).await?;
-        self.subset(&raw)
+        let (raw, redactor) = self.run(pr_url).await?;
+        self.subset(&raw, &redactor)
     }
 }
 
@@ -828,14 +833,21 @@ fn bucket_name(bucket: Option<&str>) -> &'static str {
     }
 }
 
-fn check_name(name: Option<&str>) -> String {
-    name.unwrap_or_default()
-        .chars()
-        .filter(|c| !c.is_control() && !is_hidden_text(*c) && !is_line_separator(*c))
-        .take(MAX_CHECK_NAME_CHARS)
-        .collect::<String>()
-        .trim()
-        .to_owned()
+/// A redactor for check names: the static token, the leased token when one is in use, and every
+/// installation token by shape.
+fn check_redactor(token: &str, leased: Option<&str>) -> Redactor {
+    Redactor::new([token, leased.unwrap_or_default()]).with_installation_tokens()
+}
+
+fn check_name(redactor: &Redactor, name: Option<&str>) -> String {
+    sanitise_text(
+        redactor,
+        name.unwrap_or_default(),
+        Cap::Chars(MAX_CHECK_NAME_CHARS),
+    )
+    .text
+    .trim()
+    .to_owned()
 }
 
 fn host_of(url: &str) -> Option<&str> {
@@ -897,7 +909,7 @@ fn spend(count: &mut u32, cap: u32) -> bool {
 fn valid_title(title: &str) -> bool {
     !title.trim().is_empty()
         && title.chars().count() <= MAX_TITLE_CHARS
-        && !title.chars().any(|c| c.is_control() || is_hidden_text(c))
+        && !title.chars().any(is_hostile_allowing_joiners)
         && !has_attribution(title)
 }
 
@@ -905,7 +917,7 @@ fn valid_body(body: &str) -> bool {
     body.len() <= MAX_BODY_BYTES
         && !body
             .chars()
-            .any(|c| is_hidden_text(c) || (c.is_control() && !matches!(c, '\n' | '\r' | '\t')))
+            .any(|c| is_hostile_allowing_joiners(c) && !matches!(c, '\n' | '\r' | '\t'))
         && !has_attribution(body)
 }
 
@@ -962,11 +974,6 @@ const ATTRIBUTION_FRAGMENTS: [&str; 2] = ["claudeaicode", "generatedbyclaude"];
 
 fn is_line_separator(c: char) -> bool {
     matches!(c, '\n' | '\r' | '\u{85}' | '\u{2028}' | '\u{2029}')
-}
-
-/// Bidi overrides and isolates plus Unicode tag characters hide or smuggle text.
-fn is_hidden_text(c: char) -> bool {
-    matches!(c, '\u{202a}'..='\u{202e}' | '\u{2066}'..='\u{2069}' | '\u{e0000}'..='\u{e007f}')
 }
 
 /// Lowercased ASCII alphanumerics only, so invisible and decorative characters vanish.
@@ -1731,6 +1738,113 @@ mod tests {
         Ok(())
     }
 
+    const HOSTILE: [(&str, char); 10] = [
+        ("nel", '\u{85}'),
+        ("line separator", '\u{2028}'),
+        ("paragraph separator", '\u{2029}'),
+        ("bidi override", '\u{202e}'),
+        ("bidi isolate", '\u{2066}'),
+        ("tag character", '\u{e0041}'),
+        ("tag block start", '\u{e0000}'),
+        ("zero width space", '\u{200b}'),
+        ("byte order mark", '\u{feff}'),
+        ("soft hyphen", '\u{ad}'),
+    ];
+
+    fn name(raw: &str) -> String {
+        check_name(&Redactor::new([SECRET]), Some(raw))
+    }
+
+    #[test]
+    fn a_check_name_loses_every_hostile_character() {
+        for (label, c) in HOSTILE {
+            assert_eq!(name(&format!("a{c}b")), "ab", "{label}");
+        }
+        assert_eq!(name("a\rb"), "ab", "cr");
+        assert_eq!(name("a\r\nb"), "ab", "crlf");
+        assert_eq!(name("a\nb\tc"), "abc", "newline and tab");
+    }
+
+    #[test]
+    fn an_installation_token_is_redacted_when_the_static_token_is_empty() {
+        const INSTALLATION: &str = "ghs_AbCdEfGhIjKlMnOpQrStUvWxYz0123456789";
+        let redactor = check_redactor("", None);
+        let shown = check_name(&redactor, Some(&format!("build {INSTALLATION}")));
+        assert!(!shown.contains(INSTALLATION), "{shown}");
+        let leased = check_redactor("", Some("leased-token-value-123456"));
+        let shown = check_name(&leased, Some("x leased-token-value-123456"));
+        assert!(!shown.contains("leased-token-value"), "{shown}");
+    }
+
+    #[test]
+    fn a_check_name_cap_counts_chars_after_the_strip() {
+        let exact = "\u{e9}".repeat(MAX_CHECK_NAME_CHARS);
+        assert_eq!(name(&exact), exact);
+        let over = "\u{e9}".repeat(MAX_CHECK_NAME_CHARS + 1);
+        assert_eq!(name(&over), exact);
+        let hidden = "a\u{200b}".repeat(MAX_CHECK_NAME_CHARS + 1);
+        assert_eq!(name(&hidden), "a".repeat(MAX_CHECK_NAME_CHARS));
+        assert_eq!(name("  padded \u{feff} "), "padded");
+        assert_eq!(check_name(&Redactor::default(), None), "");
+    }
+
+    #[test]
+    fn a_check_name_secret_hidden_by_a_character_or_cut_by_the_cap_leaves_no_trace() {
+        let split = format!("run {}\u{200b}{}", &SECRET[..8], &SECRET[8..]);
+        assert!(!name(&split).contains(&SECRET[..8]));
+        let edge = format!("{}{SECRET}", "a".repeat(MAX_CHECK_NAME_CHARS - 6));
+        let shown = name(&edge);
+        assert!(!shown.contains("ghp_se"), "{shown}");
+    }
+
+    #[test]
+    fn a_title_refuses_every_hostile_character_and_both_ends_of_the_cap() {
+        for (label, c) in HOSTILE {
+            assert!(!valid_title(&format!("a{c}b")), "{label}");
+        }
+        assert!(!valid_title("a\rb"), "cr");
+        assert!(!valid_title("a\r\nb"), "crlf");
+        assert!(!valid_title("a\nb"), "lf");
+        assert!(!valid_title("a\tb"), "tab");
+        assert!(valid_title("plain title"));
+        assert!(valid_title(&"a".repeat(MAX_TITLE_CHARS)));
+        assert!(!valid_title(&"a".repeat(MAX_TITLE_CHARS + 1)));
+    }
+
+    #[test]
+    fn a_body_refuses_every_hostile_character_but_keeps_line_breaks_and_tab() {
+        for (label, c) in HOSTILE {
+            assert!(!valid_body(&format!("a{c}b")), "{label}");
+        }
+        assert!(valid_body("a\rb"), "cr");
+        assert!(valid_body("a\r\nb"), "crlf");
+        assert!(valid_body("a\nb\tc"), "lf and tab");
+        assert!(!valid_body("a\u{7}b"), "bell");
+        assert!(valid_body(&"a".repeat(MAX_BODY_BYTES)));
+        assert!(!valid_body(&"a".repeat(MAX_BODY_BYTES + 1)));
+    }
+
+    #[tokio::test]
+    async fn a_hostile_title_or_body_is_denied_and_spends_no_cap() -> TestResult {
+        let fake = Fake::default();
+        let b = broker(&fake)?;
+        for (label, c) in HOSTILE {
+            for request in [pr(&format!("t{c}"), "b"), pr("t", &format!("b{c}"))] {
+                assert_eq!(
+                    b.handle(request).await,
+                    denied(Denial::InvalidRequest),
+                    "{label}"
+                );
+            }
+        }
+        assert_eq!(fake.calls(), Vec::<String>::new());
+        assert!(matches!(
+            b.handle(pr("t", "a\r\nb")).await,
+            Response::Done { .. }
+        ));
+        Ok(())
+    }
+
     #[test]
     fn attribution_detection_covers_separators_and_decorations() {
         let attributed = [
@@ -1847,11 +1961,30 @@ mod tests {
             "family \u{1f468}\u{200d}\u{1f469}\u{200d}\u{1f467} emoji",
             "\u{645}\u{6cc}\u{200c}\u{62e}\u{648}\u{627}\u{647}\u{645} persian",
             "left\u{200e}right\u{200f}mark",
-            "arabic\u{61c}letter",
         ];
         for text in texts {
             assert!(valid_title(text), "{text:?}");
             assert!(valid_body(text), "{text:?}");
+        }
+    }
+
+    #[test]
+    fn invisible_and_directional_controls_stay_refused() {
+        for c in [
+            '\u{200b}',
+            '\u{feff}',
+            '\u{ad}',
+            '\u{2028}',
+            '\u{2029}',
+            '\u{202a}',
+            '\u{202e}',
+            '\u{2066}',
+            '\u{2069}',
+            '\u{e0001}',
+            '\u{e0041}',
+        ] {
+            assert!(!valid_title(&format!("a{c}b")), "{c:?}");
+            assert!(!valid_body(&format!("a{c}b")), "{c:?}");
         }
     }
 

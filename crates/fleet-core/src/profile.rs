@@ -8,6 +8,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 
+use crate::text::is_hostile_allowing_joiners;
 use crate::tools::ToolSpec;
 
 /// Domain-separation prefix hashed before the canonical bytes of a [`Profile`].
@@ -972,6 +973,34 @@ mod tests {
         }
     }
 
+    fn stored_with_prompt(raw: &str) -> Value {
+        serde_json::json!({ "authored_prompt": raw })
+    }
+
+    #[test]
+    fn stored_profiles_refuse_hostile_authored_prompts() {
+        for raw in ["a\u{200B}b", "a\u{FEFF}b", "a\u{AD}b", "a\u{E0041}b"] {
+            let value = stored_with_prompt(raw);
+            assert_eq!(
+                Profile::from_stored_json(value.to_string().as_bytes()),
+                Err(ProfileError::Malformed),
+                "{raw:?}"
+            );
+            assert!(serde_json::from_value::<Profile>(value).is_err(), "{raw:?}");
+        }
+    }
+
+    #[test]
+    fn stored_profiles_accept_joiners_in_authored_prompts() {
+        for raw in ["a\u{200D}b", "\u{1F468}\u{200D}\u{1F469}\u{200D}\u{1F467}"] {
+            let value = stored_with_prompt(raw);
+            let stored = Profile::from_stored_json(value.to_string().as_bytes()).unwrap();
+            assert_eq!(stored.authored_prompt.unwrap().as_str(), raw);
+            let serde: Profile = serde_json::from_value(value).unwrap();
+            assert_eq!(serde.authored_prompt.unwrap().as_str(), raw);
+        }
+    }
+
     #[test]
     fn json_input_with_tools_is_rejected() {
         let text = br#"{"tools":[{"name":"node","version":"20.11.1"}]}"#;
@@ -1172,8 +1201,9 @@ pub const MAX_PROMPT_TEXT_BYTES: usize = 64 * 1024;
 pub enum PromptTextError {
     /// The text is longer than [`MAX_PROMPT_TEXT_BYTES`].
     TooLong,
-    /// The text holds a refused character: NUL, a control character other than newline and tab
-    /// (CR and NEL included), U+2028, U+2029 or a bidirectional control.
+    /// The text holds a refused character: a control character other than newline and tab (NUL,
+    /// CR and NEL included), a format, separator or tag character, or a bidirectional control.
+    /// U+200C and U+200D are accepted.
     ForbiddenChar,
 }
 
@@ -1188,17 +1218,20 @@ impl fmt::Display for PromptTextError {
 
 impl std::error::Error for PromptTextError {}
 
-fn is_refused_char(c: char) -> bool {
-    (c.is_control() && !matches!(c, '\n' | '\t'))
-        || matches!(
-            c,
-            '\u{061C}' | '\u{200E}' | '\u{200F}' | '\u{2028}' | '\u{2029}'
-                | '\u{202A}'..='\u{202E}' | '\u{2066}'..='\u{2069}'
-        )
+/// Whether the prompt validator refuses `c`: [`is_hostile_allowing_joiners`] plus U+200E and
+/// U+200F, which the shared joiner exemption exempts but which are bidirectional controls.
+/// Newline and tab are allowed. Stored profiles are validated by the same rule.
+fn is_refused(c: char) -> bool {
+    !matches!(c, '\n' | '\t')
+        && (is_hostile_allowing_joiners(c) || matches!(c, '\u{200E}' | '\u{200F}'))
 }
 
-/// User-authored prompt text: 1 to [`MAX_PROMPT_TEXT_BYTES`] bytes, no NUL, no control
-/// character other than newline and tab, no CR, no U+2028, U+2029 or bidirectional control.
+/// User-authored prompt text: 1 to [`MAX_PROMPT_TEXT_BYTES`] bytes, no character in the shared
+/// hostile set other than newline, tab, U+200C and U+200D.
+///
+/// The refused set covers control, format, line and paragraph separator and tag characters,
+/// so NUL, CR, NEL, ZWSP, BOM, soft hyphen and tag characters are refused, and so are U+200E
+/// and U+200F.
 ///
 /// Inferred, not part of the design: CR is refused so a text has one line ending, and
 /// backslash and non-ASCII text are allowed.
@@ -1239,7 +1272,7 @@ impl PromptText {
         if raw.len() > Self::MAX_BYTES {
             return Err(PromptTextError::TooLong);
         }
-        if raw.chars().any(is_refused_char) {
+        if raw.chars().any(is_refused) {
             return Err(PromptTextError::ForbiddenChar);
         }
         Ok(Some(Self(raw.to_owned())))
@@ -1547,6 +1580,40 @@ mod prompt_text_tests {
         ];
         for raw in hostile {
             assert_eq!(text(raw), Err(PromptTextError::ForbiddenChar), "{raw:?}");
+        }
+    }
+
+    #[test]
+    fn format_and_tag_characters_are_refused() {
+        let hostile = [
+            "a\u{200B}b",
+            "a\u{FEFF}b",
+            "a\u{AD}b",
+            "a\u{E0041}b",
+            "a\u{E0001}b",
+            "a\u{E007F}b",
+            "a\u{2060}b",
+            "a\u{180E}b",
+            "a\u{600}b",
+            "a\u{FFF9}b",
+            "a\u{206A}b",
+            "a\u{1D173}b",
+        ];
+        for raw in hostile {
+            assert_eq!(text(raw), Err(PromptTextError::ForbiddenChar), "{raw:?}");
+        }
+    }
+
+    #[test]
+    fn joiners_and_emoji_sequences_are_accepted() {
+        let ok = [
+            "a\u{200C}b",
+            "a\u{200D}b",
+            "\u{1F468}\u{200D}\u{1F469}\u{200D}\u{1F467}",
+            "\u{1F3F3}\u{FE0F}\u{200D}\u{1F308}",
+        ];
+        for raw in ok {
+            assert_eq!(text(raw), Ok(Some(raw.to_owned())), "{raw:?}");
         }
     }
 
