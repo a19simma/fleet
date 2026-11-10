@@ -5,13 +5,15 @@
 //! authenticated tonic routes and every other request to the Topcoat router, behind
 //! [`CatchPanic`], then stamps the security headers. [`WebAuth`] holds passkey login and
 //! sessions (ADR 0042). The work tracker pages live in `work` (ADR 0064) and the retro, pitfall
-//! and suggested-edit pages in `review` (ADR 0065, ADR 0066).
+//! and suggested-edit pages in `review` (ADR 0065, ADR 0066). The environment pages live in `env`
+//! and the job submit form in `submit` (ADR 0067).
 
 mod capabilities;
 mod catalog;
 mod clientip;
 mod credentials;
 mod dispatch;
+mod env;
 mod jobs;
 mod layout;
 mod pages;
@@ -21,6 +23,7 @@ mod profiles;
 mod repos;
 mod review;
 mod serve;
+mod submit;
 mod timing;
 mod tokens;
 mod work;
