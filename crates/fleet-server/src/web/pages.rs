@@ -5,6 +5,7 @@ use std::net::IpAddr;
 use std::sync::Arc;
 
 use crate::cred::{CredentialService, Users};
+use crate::environments::EnvironmentService;
 use crate::store::Store;
 use fleet_core::constant_time_eq;
 use serde_json::{Value, json};
@@ -27,6 +28,7 @@ use webauthn_rs::prelude::{PublicKeyCredential, RegisterPublicKeyCredential};
 
 use super::clientip::client_ip;
 use super::credentials::{Backend, CredentialSlot};
+use super::env::EnvSlot;
 use super::jobs::ConsoleSlot;
 use super::layout::{Nav, bare, shell};
 use super::passkeys::{AuthError, SESSION_COOKIE, SESSION_TTL_SECS, SessionInfo, WebAuth};
@@ -553,6 +555,7 @@ fn builder(
     auth: Option<Arc<WebAuth>>,
     credentials: Option<Arc<Backend>>,
     console: Option<(Arc<Store>, Arc<Tokens>)>,
+    environments: Option<EnvironmentService>,
     origins: &[String],
 ) -> Router {
     let (store, tokens) = console.unzip();
@@ -564,6 +567,7 @@ fn builder(
         .app_context(CredentialSlot(credentials))
         .app_context(ConsoleSlot(store))
         .app_context(TokenSlot(tokens))
+        .app_context(EnvSlot(environments))
         .build()
 }
 
@@ -572,7 +576,7 @@ impl Web {
     #[must_use]
     pub fn new() -> Self {
         Self {
-            router: Arc::new(builder(None, None, None, &[])),
+            router: Arc::new(builder(None, None, None, None, &[])),
         }
     }
 
@@ -581,7 +585,7 @@ impl Web {
     pub fn with_auth(auth: WebAuth) -> Self {
         let origins = [auth.origin().to_owned()];
         Self {
-            router: Arc::new(builder(Some(Arc::new(auth)), None, None, &origins)),
+            router: Arc::new(builder(Some(Arc::new(auth)), None, None, None, &origins)),
         }
     }
 
@@ -591,6 +595,18 @@ impl Web {
     pub fn with_console(
         auth: WebAuth,
         credentials: Option<CredentialService>,
+        store: Store,
+    ) -> Self {
+        Self::with_environments(auth, credentials, None, store)
+    }
+
+    /// Builds the router like [`Web::with_console`] and serves the environment pages from
+    /// `environments` (ADR 0067). Without it those routes answer 404.
+    #[must_use]
+    pub fn with_environments(
+        auth: WebAuth,
+        credentials: Option<CredentialService>,
+        environments: Option<EnvironmentService>,
         store: Store,
     ) -> Self {
         let origins = [auth.origin().to_owned()];
@@ -610,6 +626,7 @@ impl Web {
                 Some(Arc::new(auth)),
                 backend,
                 Some((Arc::new(store), Arc::new(tokens))),
+                environments,
                 &origins,
             )),
         }
