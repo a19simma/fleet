@@ -32,6 +32,9 @@ pub enum ProfileError {
     InvalidHash,
     /// The input is JSON and sets a non-empty `tools` field; only TOML input accepts it.
     ToolsNotAllowed,
+    /// The input carries a top-level `environment` key in any ASCII case. A Profile never names
+    /// an Environment (ADR-0067 decision 10).
+    EnvironmentNotAllowed,
 }
 
 impl fmt::Display for ProfileError {
@@ -40,6 +43,7 @@ impl fmt::Display for ProfileError {
             Self::Malformed => f.write_str("profile is not valid profile JSON"),
             Self::InvalidHash => f.write_str("profile hash is not 64 lowercase hex characters"),
             Self::ToolsNotAllowed => f.write_str("profile tools are accepted only from TOML input"),
+            Self::EnvironmentNotAllowed => f.write_str("a profile cannot name an environment"),
         }
     }
 }
@@ -309,19 +313,40 @@ fn write_canonical(value: &Value, out: &mut String) {
     }
 }
 
+const ENVIRONMENT_KEY: &str = "environment";
+
+fn names_environment<'a>(mut keys: impl Iterator<Item = &'a String>) -> bool {
+    keys.any(|key| key.eq_ignore_ascii_case(ENVIRONMENT_KEY))
+}
+
+fn json_refusal(bytes: &[u8]) -> ProfileError {
+    match serde_json::from_slice::<serde_json::Map<String, Value>>(bytes) {
+        Ok(keys) if names_environment(keys.keys()) => ProfileError::EnvironmentNotAllowed,
+        _ => ProfileError::Malformed,
+    }
+}
+
+fn toml_refusal(text: &str) -> ProfileError {
+    match toml::from_str::<toml::Table>(text) {
+        Ok(keys) if names_environment(keys.keys()) => ProfileError::EnvironmentNotAllowed,
+        _ => ProfileError::Malformed,
+    }
+}
+
 impl Profile {
     /// Parses a Profile from JSON bytes.
     ///
     /// # Errors
     ///
-    /// Returns [`ProfileError::Malformed`] for bad JSON, a top level that is not an object,
+    /// Returns [`ProfileError::EnvironmentNotAllowed`] for an `environment` key,
+    /// [`ProfileError::Malformed`] for bad JSON, a top level that is not an object,
     /// unknown fields, wrong types or an env flag other than `"0"` or `"1"`, and
     /// [`ProfileError::ToolsNotAllowed`] for a non-empty `tools`.
     pub fn from_json(bytes: &[u8]) -> Result<Self, ProfileError> {
         if bytes.trim_ascii_start().first() != Some(&b'{') {
             return Err(ProfileError::Malformed);
         }
-        let profile: Self = serde_json::from_slice(bytes).map_err(|_| ProfileError::Malformed)?;
+        let profile: Self = serde_json::from_slice(bytes).map_err(|_| json_refusal(bytes))?;
         if profile.tools.is_empty() {
             Ok(profile)
         } else {
@@ -342,7 +367,7 @@ impl Profile {
         if bytes.trim_ascii_start().first() != Some(&b'{') {
             return Err(ProfileError::Malformed);
         }
-        serde_json::from_slice(bytes).map_err(|_| ProfileError::Malformed)
+        serde_json::from_slice(bytes).map_err(|_| json_refusal(bytes))
     }
 
     /// Parses a Profile from TOML text, the only input that accepts `tools`.
@@ -352,7 +377,7 @@ impl Profile {
     /// Returns [`ProfileError::Malformed`] for bad TOML, unknown fields, wrong types, an unknown
     /// tool or a version that is not an exact pin.
     pub fn from_toml(text: &str) -> Result<Self, ProfileError> {
-        toml::from_str(text).map_err(|_| ProfileError::Malformed)
+        toml::from_str(text).map_err(|_| toml_refusal(text))
     }
 
     /// The canonical JSON: keys sorted by byte at every depth, no whitespace, absent fields omitted.
@@ -999,6 +1024,59 @@ mod tests {
             let serde: Profile = serde_json::from_value(value).unwrap();
             assert_eq!(serde.authored_prompt.unwrap().as_str(), raw);
         }
+    }
+
+    #[test]
+    fn an_environment_key_gets_its_own_refusal_on_every_parse_path() {
+        let json: [&[u8]; 5] = [
+            br#"{"claude_md":"x","environment":"prod"}"#,
+            br#"{"claude_md":"x","Environment":"prod"}"#,
+            br#"{"claude_md":"x","ENVIRONMENT":null}"#,
+            br#"{"environment":{"a":1}}"#,
+            br#"{"environment":""}"#,
+        ];
+        for raw in json {
+            assert_eq!(
+                Profile::from_json(raw),
+                Err(ProfileError::EnvironmentNotAllowed)
+            );
+            assert_eq!(
+                Profile::from_stored_json(raw),
+                Err(ProfileError::EnvironmentNotAllowed)
+            );
+        }
+        let toml = [
+            "environment = \"prod\"\n",
+            "Environment = 1\n",
+            "[environment]\nname = \"x\"\n",
+            "environment.name = \"x\"\n",
+        ];
+        for raw in toml {
+            assert_eq!(
+                Profile::from_toml(raw),
+                Err(ProfileError::EnvironmentNotAllowed)
+            );
+        }
+        assert_eq!(
+            ProfileError::EnvironmentNotAllowed.to_string(),
+            "a profile cannot name an environment"
+        );
+        assert_eq!(
+            Profile::from_json(br#"{"bogus":1}"#),
+            Err(ProfileError::Malformed)
+        );
+        assert_eq!(
+            Profile::from_toml("bogus = 1\n"),
+            Err(ProfileError::Malformed)
+        );
+        assert_eq!(
+            Profile::from_stored_json(br#"{"bogus":1}"#),
+            Err(ProfileError::Malformed)
+        );
+        assert_eq!(
+            Profile::from_json(br#"{"environment":"#),
+            Err(ProfileError::Malformed)
+        );
     }
 
     #[test]

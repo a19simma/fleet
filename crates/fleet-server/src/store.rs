@@ -166,7 +166,7 @@ ON CONFLICT (idempotency_key) DO NOTHING \
 RETURNING job_id";
 
 const STORED_PIN: &str =
-    "SELECT environment_id, environment_version FROM jobs WHERE idempotency_key = $1";
+    "SELECT environment_id, environment_version, profile_id FROM jobs WHERE idempotency_key = $1";
 
 const KEY_EXISTS: &str = "SELECT EXISTS (SELECT 1 FROM jobs WHERE idempotency_key = $1)";
 
@@ -837,6 +837,53 @@ fn parse_count(value: Option<String>, bad: &mut u32) -> u64 {
     })
 }
 
+const REGISTERED_REPO: &str =
+    "SELECT id FROM user_repos WHERE user_id = $1 AND host = $2 AND path = $3";
+
+/// The id of the user's registered repository row for a job repository URL, or `None` when the
+/// URL does not parse or the user registered no such repository.
+pub(crate) async fn registered_repo(
+    conn: &mut sqlx::PgConnection,
+    user_id: i64,
+    repo: &str,
+) -> Result<Option<i64>, sqlx::Error> {
+    let Ok((host, path)) = fleet_core::repo::RepoRef::locate(repo) else {
+        return Ok(None);
+    };
+    sqlx::query_scalar(REGISTERED_REPO)
+        .bind(user_id)
+        .bind(host)
+        .bind(path)
+        .fetch_optional(conn)
+        .await
+}
+
+/// Whether the pin a job holds equals what its default bindings resolve to now.
+///
+/// A refused resolution equals no pin, so a replay of a key whose binding now needs a revoked
+/// capability is a conflict, like a named request.
+pub(crate) async fn default_pin_matches(
+    conn: &mut sqlx::PgConnection,
+    user_id: i64,
+    repo: &str,
+    profile_id: Option<i64>,
+    held: Option<EnvPin>,
+) -> Result<bool, sqlx::Error> {
+    let keys = environments::DefaultKeys {
+        repo_id: registered_repo(conn, user_id, repo).await?,
+        profile_id,
+    };
+    Ok(
+        match environments::resolve_pin_with_defaults(conn, user_id, &EnvRequest::Default, keys)
+            .await?
+        {
+            environments::PinResult::None => held.is_none(),
+            environments::PinResult::Pinned(pin) => held == Some(pin),
+            environments::PinResult::Refused(_) => false,
+        },
+    )
+}
+
 /// Postgres-backed storage for events, box state and the session projection.
 #[derive(Debug, Clone)]
 pub struct Store {
@@ -1131,9 +1178,14 @@ impl Store {
                 }
                 None => None,
             };
-            let pin = environments::resolve_pin(&mut tx, caller, &job.environment)
-                .await?
-                .into_pin()?;
+            let keys = environments::DefaultKeys {
+                repo_id: registered_repo(&mut tx, caller, &job.repo).await?,
+                profile_id: profile.as_ref().map(|(_, pinned)| pinned.profile_id),
+            };
+            let pin =
+                environments::resolve_pin_with_defaults(&mut tx, caller, &job.environment, keys)
+                    .await?
+                    .into_pin()?;
             let (environment_id, version) = pin.map_or((None, None), |pin| {
                 (Some(pin.environment_id), Some(pin.version))
             });
@@ -1180,10 +1232,11 @@ impl Store {
     }
 
     async fn check_stored_pin(&self, owner: i64, job: &NewJob) -> Result<(), StoreError> {
-        let (environment_id, version): (Option<i64>, Option<i32>) = sqlx::query_as(STORED_PIN)
-            .bind(&job.key)
-            .fetch_one(&self.pool)
-            .await?;
+        let (environment_id, version, profile_id): (Option<i64>, Option<i32>, Option<i64>) =
+            sqlx::query_as(STORED_PIN)
+                .bind(&job.key)
+                .fetch_one(&self.pool)
+                .await?;
         let held = environment_id
             .zip(version)
             .map(|(environment_id, version)| EnvPin {
@@ -1191,7 +1244,12 @@ impl Store {
                 version,
             });
         let mut conn = self.pool.acquire().await?;
-        if environments::pin_matches(&mut conn, owner, &job.environment, held).await? {
+        let matches = if matches!(job.environment, EnvRequest::Default) {
+            default_pin_matches(&mut conn, owner, &job.repo, profile_id, held).await?
+        } else {
+            environments::pin_matches(&mut conn, owner, &job.environment, held).await?
+        };
+        if matches {
             Ok(())
         } else {
             Err(StoreError::KeyConflict)
@@ -1233,9 +1291,7 @@ impl Store {
                 .fetch_optional(&mut *tx)
                 .await?;
             tx.commit().await?;
-        } else if let Some(caller) = scoped
-            && (job.profile.is_some() || matches!(job.environment, EnvRequest::Named(_)))
-        {
+        } else if let Some(caller) = scoped {
             self.insert_pinned(caller, owner, id, &job).await?;
         } else {
             if job.profile.is_some() {
