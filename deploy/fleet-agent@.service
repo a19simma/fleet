@@ -40,6 +40,7 @@ InaccessiblePaths=/etc/swarm
 InaccessiblePaths=-/run/docker.sock
 InaccessiblePaths=-/var/run/docker.sock
 TemporaryFileSystem=/run/fleet:ro
+TemporaryFileSystem=/run/fleet-env:ro
 BindPaths=/run/fleet/%i
 BindReadOnlyPaths=/run/fleet/hook
 ExecStopPost=-/bin/chmod -R g+rwX /var/lib/fleet/jobs/.agent/%i

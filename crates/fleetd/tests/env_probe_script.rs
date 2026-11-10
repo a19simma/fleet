@@ -175,3 +175,32 @@ fn list_touches_no_host_state() -> TestResult {
     assert!(out.status.success(), "--list needs a tool outside bash");
     Ok(())
 }
+
+/// The `[Service]` values of `key` in `text`, in file order.
+fn service_values(text: &str, key: &str) -> Vec<String> {
+    let mut values = Vec::new();
+    let mut inside = false;
+    for line in text.lines() {
+        let line = line.trim();
+        if line.starts_with('[') {
+            inside = line == "[Service]";
+        } else if inside
+            && let Some((name, value)) = line.split_once('=')
+            && name == key
+        {
+            values.push(value.to_owned());
+        }
+    }
+    values
+}
+
+#[test]
+fn agent_unit_hides_the_setup_run_root() -> TestResult {
+    let text = fs::read_to_string(deploy().join("fleet-agent@.service"))?;
+    let hidden = service_values(&text, "TemporaryFileSystem");
+    assert!(
+        hidden.iter().any(|v| v == "/run/fleet-env:ro"),
+        "fleet-agent@.service must set TemporaryFileSystem=/run/fleet-env:ro, has {hidden:?}"
+    );
+    Ok(())
+}

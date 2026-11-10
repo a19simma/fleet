@@ -443,7 +443,7 @@ Limits of the probes, from reading the script:
 
 - `proxy-path` proves `lo` and the unix socket path. It does not run the forwarder of `env-setup-exec`, so the TCP to unix relay stays untested.
 - `env-out-writable-visible` copies the marker to `/run/fleet/<id>/envd/out` itself, because the launcher does not carry `out/` to the agent yet. It proves the agent unit sees that path, not the carry.
-- Inferred, not part of the design: `env-dir-unreadable-from-agent` can report `FAIL`. The agent unit runs as `fleet-job`, the owner of `/run/fleet-env/<id>`, and does not hide `/run/fleet-env`. A `FAIL` there is a finding about the units, not a script fault.
+- Inferred, not part of the design: `env-dir-unreadable-from-agent` can report `FAIL`. `fleet-agent@.service` now sets `TemporaryFileSystem=/run/fleet-env:ro` (the agent reads its env from `/run/fleet/<id>/envd`, never `/run/fleet-env`), so a `FAIL` there is a regression in the unit, not a script fault.
 
 ### Credential isolation probe
 
