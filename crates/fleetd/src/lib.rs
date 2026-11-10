@@ -21,6 +21,7 @@ mod config;
 pub mod connect_proxy;
 pub mod cred;
 mod dump;
+pub mod envd;
 mod error;
 pub mod events;
 mod feed;

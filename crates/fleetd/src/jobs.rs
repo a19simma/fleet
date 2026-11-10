@@ -24,6 +24,7 @@ use crate::broker::{Broker, BrokerError, GhCli, MirrorGit};
 use crate::config::Config;
 use crate::connect_proxy::{ConnectProxy, ProxyLimits};
 use crate::cred::{CredentialBook, CredentialClient, ERR_NO_AGENT};
+use crate::envd::{ERR_ENV_DENIED, EnvironmentClient, ReleasedEnvironment};
 use crate::fetch::{Dialer, Fetcher, Resolver, SystemResolver, TcpDialer, webpki_tls_config};
 use crate::fetch_service::{FeedBook, FetchRecorder, FetchService, MAX_CONCURRENT_FETCHES};
 use crate::jobenv::group_id;
@@ -59,6 +60,7 @@ pub struct DaemonRunner<R> {
     box_name: String,
     broker: Option<BrokerWiring>,
     credentials: Option<Arc<CredentialBook>>,
+    environment: Option<Arc<EnvironmentClient>>,
 }
 
 /// A [`Broker`] with its executor types erased, so one [`PerJob`] registry holds them all.
@@ -120,6 +122,7 @@ impl<R: Reporter + Send + Sync + 'static> DaemonRunner<R> {
             box_name: box_name.to_owned(),
             broker: None,
             credentials: None,
+            environment: None,
         }
     }
 
@@ -133,6 +136,16 @@ impl<R: Reporter + Send + Sync + 'static> DaemonRunner<R> {
             agent.credentials = Some(Arc::clone(&book));
         }
         self.credentials = Some(book);
+        self
+    }
+
+    /// Fetches the Environment secrets of each pinned job through `client` once its credentials
+    /// are held and before its workspace is prepared, and fails the job with
+    /// [`ERR_ENV_DENIED`] when the fetch fails. A job with no pin makes no call. A pinned job on
+    /// a runner without a client fails the same way.
+    #[must_use]
+    pub fn with_environment(mut self, client: Arc<EnvironmentClient>) -> Self {
+        self.environment = Some(client);
         self
     }
 
@@ -178,6 +191,45 @@ impl<R: Reporter + Send + Sync + 'static> DaemonRunner<R> {
             Ok(Err(failure)) => {
                 tracing::warn!(reason = failure.reason(), "job credentials refused");
                 self.agent.fail_job(job, failure.reason()).await;
+                Err(RunError)
+            }
+            Err(Interrupt::Cancelled) => {
+                self.agent.cancel_job(job).await;
+                Err(RunError)
+            }
+            Err(_) => Err(RunError),
+        }
+    }
+
+    async fn fetch_environment(
+        &self,
+        job: &Job,
+        mut shutdown: Shutdown,
+    ) -> Result<Option<ReleasedEnvironment>, RunError> {
+        if !job.has_environment {
+            return Ok(None);
+        }
+        let Some(client) = &self.environment else {
+            tracing::warn!(reason = ERR_ENV_DENIED, "job environment refused");
+            self.agent.fail_job(job, ERR_ENV_DENIED).await;
+            return Err(RunError);
+        };
+        let work = client.fetch(&job.job_id, job.attempt, &self.box_name);
+        let guarded = tokio::select! {
+            guarded = self.agent.keep_alive(job, work) => guarded,
+            () = shutdown.requested() => {
+                self.agent.fail_job(job, ERR_SHUTDOWN).await;
+                return Err(RunError);
+            }
+        };
+        match guarded {
+            Ok(Ok(held)) => {
+                self.agent.adopt_environment(job, &held);
+                Ok(Some(held))
+            }
+            Ok(Err(denied)) => {
+                tracing::warn!(reason = denied.reason(), "job environment refused");
+                self.agent.fail_job(job, denied.reason()).await;
                 Err(RunError)
             }
             Err(Interrupt::Cancelled) => {
@@ -448,6 +500,13 @@ impl<R: Reporter + Send + Sync + 'static> JobRunner for DaemonRunner<R> {
             self.agent.clear_profile(&job);
             return Err(stop);
         }
+        let _environment = match self.fetch_environment(&job, shutdown.clone()).await {
+            Ok(held) => held,
+            Err(stop) => {
+                self.agent.clear_profile(&job);
+                return Err(stop);
+            }
+        };
         let result = match self.prepare(&job, shutdown.clone()).await {
             Ok(path) => match self.register_broker(&job, &path).await {
                 Ok(()) => self.execute(&job, &path, shutdown).await,
@@ -774,6 +833,7 @@ pub(crate) fn build(
         CredentialBook::new(CredentialClient::new(channel.clone(), &raw_token)?)
             .with_revoker(Arc::new(crate::revoke::Revoker::github())),
     );
+    let environment = Arc::new(EnvironmentClient::new(channel.clone(), &raw_token)?);
     let mut run = agent_binaries(config);
     run.jobs_dir = Some(config.jobs_dir.clone());
     run.job_gid = job_gid(config)?;
@@ -826,6 +886,7 @@ pub(crate) fn build(
         box_name,
     )
     .with_credentials(book)
+    .with_environment(environment)
     .with_broker(wiring);
     Poller::with_channel(
         channel,
@@ -3044,7 +3105,14 @@ mod token_wiring_tests {
             &self,
             _: Request<fleet_proto::v1::GetJobEnvironmentRequest>,
         ) -> Result<Response<fleet_proto::v1::GetJobEnvironmentReply>, Status> {
-            Err(Status::unimplemented("get_job_environment"))
+            Ok(Response::new(fleet_proto::v1::GetJobEnvironmentReply {
+                secrets: vec![fleet_proto::v1::JobEnvironmentSecret {
+                    name: "KEY".into(),
+                    value: ENV_VALUE.into(),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }))
         }
 
         async fn get_job_credentials(
@@ -3141,6 +3209,43 @@ mod token_wiring_tests {
             repo: "https://github.com/o/r.git".into(),
             ..Job::default()
         }
+    }
+
+    const ENV_VALUE: &str = "env-value-0123456789abcdef";
+
+    #[tokio::test]
+    async fn a_fetched_environment_is_held_and_masked_for_the_rest_of_the_job() -> TestResult {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).await?;
+        let url = format!("http://{}", listener.local_addr()?);
+        tokio::spawn(
+            tonic::transport::Server::builder()
+                .add_service(FleetWorkerServer::new(Minting(AtomicUsize::new(0))))
+                .serve_with_incoming(TcpListenerStream::new(listener)),
+        );
+        let dir = tempfile::TempDir::new()?;
+        let agent = AgentRunner::new(RunConfig::new("claude", false), Quiet, Redactor::default());
+        let client = EnvironmentClient::new(channel(&url)?, "tok-0123456789")?;
+        let runner = DaemonRunner::new(Workspace::new(dir.path().join("jobs")), agent, "box")
+            .with_environment(Arc::new(client));
+        let job = Job {
+            has_environment: true,
+            ..job()
+        };
+        let (_trigger, shutdown) = Shutdown::channel();
+        let held = runner
+            .fetch_environment(&job, shutdown)
+            .await
+            .map_err(|_| "fetch refused")?
+            .ok_or("nothing held")?;
+        assert_eq!(held.get("KEY"), Some(ENV_VALUE));
+        assert_eq!(
+            runner
+                .agent
+                .job_redactor("job1")
+                .redact_str(&format!("x {ENV_VALUE} y")),
+            "x [REDACTED] y"
+        );
+        Ok(())
     }
 
     #[tokio::test]
