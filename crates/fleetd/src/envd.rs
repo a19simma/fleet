@@ -30,11 +30,13 @@ use rustix::fs::{
 };
 use rustix::io::Errno;
 
-use fleet_core::environment::Delivery;
+use fleet_core::environment::{DEFAULT_TIMEOUT_S, Delivery};
 use fleet_core::{MIN_SECRET_LEN, Redactor};
 use fleet_proto::ERR_ENV_RELEASE_DENIED;
 use fleet_proto::v1::fleet_worker_client::FleetWorkerClient;
-use fleet_proto::v1::{EnvironmentDelivery, GetJobEnvironmentReply, GetJobEnvironmentRequest};
+use fleet_proto::v1::{
+    EnvironmentDelivery, EnvironmentOnFail, GetJobEnvironmentReply, GetJobEnvironmentRequest,
+};
 use tonic::metadata::MetadataValue;
 use tonic::service::Interceptor;
 use tonic::service::interceptor::InterceptedService;
@@ -93,6 +95,20 @@ pub struct Redaction {
 #[derive(Default)]
 pub struct ReleasedEnvironment {
     secrets: BTreeMap<String, Held>,
+    scripts: Vec<SetupScript>,
+}
+
+/// One Environment script step, in execution order.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SetupScript {
+    /// The step name.
+    pub name: String,
+    /// The script text, which starts with a `#!/` line.
+    pub body: String,
+    /// Whether a failure fails the Job. Only `Abort` is acted on; `Continue` is read as `Abort`.
+    pub abort: bool,
+    /// The step timeout.
+    pub timeout: Duration,
 }
 
 struct Held {
@@ -137,7 +153,24 @@ impl ReleasedEnvironment {
                 },
             );
         }
-        Self { secrets }
+        let scripts = std::mem::take(&mut reply.scripts)
+            .into_iter()
+            .map(|script| SetupScript {
+                name: script.name,
+                body: script.body,
+                abort: script.on_fail != i32::from(EnvironmentOnFail::Continue),
+                timeout: Duration::from_secs(u64::from(
+                    script.timeout_s.unwrap_or(DEFAULT_TIMEOUT_S),
+                )),
+            })
+            .collect();
+        Self { secrets, scripts }
+    }
+
+    /// The scripts of this environment, in execution order.
+    #[must_use]
+    pub fn scripts(&self) -> &[SetupScript] {
+        &self.scripts
     }
 
     /// The value held under `name`.
@@ -176,6 +209,7 @@ impl ReleasedEnvironment {
             zeroize::Zeroize::zeroize(&mut held.value);
         }
         self.secrets.clear();
+        self.scripts.clear();
     }
 
     /// The redactor of these values under [`MAX_REDACT_LINES`].
@@ -571,6 +605,15 @@ impl EnvDelivery {
     /// Holds `env` for `job_id` until [`EnvDelivery::end`].
     pub fn hold(&self, job_id: &str, env: ReleasedEnvironment) {
         lock(&self.held).insert(job_id.to_owned(), env);
+    }
+
+    /// The scripts held for `job_id`, empty when none.
+    #[must_use]
+    pub fn scripts(&self, job_id: &str) -> Vec<SetupScript> {
+        lock(&self.held)
+            .get(job_id)
+            .map(|env| env.scripts().to_vec())
+            .unwrap_or_default()
     }
 
     /// Whether `job_id` has a held environment.

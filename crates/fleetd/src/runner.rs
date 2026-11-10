@@ -72,6 +72,7 @@ use tonic::{Code, Status};
 use crate::agent_config::{Bundle, JUDGE_PROTOCOL, JobDir, protocol_for};
 use crate::askpass;
 use crate::cred::CredentialBook;
+use crate::env_setup::{ERR_SETUP, EnvSetup, PHASE_SETUP};
 use crate::feed::Feed;
 use crate::fetch_service::FeedBook;
 use crate::floor::{BoxCeilings, PERMISSION_MODE};
@@ -803,6 +804,7 @@ pub struct AgentRunner<R> {
     notes: Mutex<HashMap<String, Vec<pb::JobEvent>>>,
     tool_paths: Mutex<HashMap<String, String>>,
     tool_preflight: Option<ToolPreflight>,
+    setup: Option<Arc<EnvSetup>>,
     pub(crate) clock: Arc<dyn Clock>,
     hub: Option<Arc<HookHub>>,
     feeds: Option<Arc<FeedBook>>,
@@ -842,6 +844,7 @@ impl<R: Reporter> AgentRunner<R> {
             notes: Mutex::new(HashMap::new()),
             tool_paths: Mutex::new(HashMap::new()),
             tool_preflight: None,
+            setup: None,
             clock: Arc::new(SystemClock::new()),
             hub: None,
             feeds: None,
@@ -873,6 +876,27 @@ impl<R: Reporter> AgentRunner<R> {
     pub fn with_tool_preflight(mut self, preflight: ToolPreflight) -> Self {
         self.tool_preflight = Some(preflight);
         self
+    }
+
+    /// Runs the Environment scripts of a job through `setup` after its workspace exists and
+    /// before its agent starts. The time they take lands in Overhead, since the job clock starts
+    /// before them and the agent window opens after.
+    #[must_use]
+    pub fn with_setup(self, setup: Arc<EnvSetup>) -> Self {
+        self.with_setup_opt(Some(setup))
+    }
+
+    /// [`AgentRunner::with_setup`] where the runner may be absent.
+    #[must_use]
+    pub fn with_setup_opt(mut self, setup: Option<Arc<EnvSetup>>) -> Self {
+        self.setup = setup;
+        self
+    }
+
+    /// Whether [`AgentRunner::with_setup`] was applied.
+    #[must_use]
+    pub const fn has_setup(&self) -> bool {
+        self.setup.is_some()
     }
 
     /// Starts agents through `launcher` instead of [`DirectLauncher`].
@@ -1454,18 +1478,17 @@ impl<R: Reporter> AgentRunner<R> {
             return Ok(stream.fail(None, ERR_START).await);
         }
         let mut spec = self.agent_spec(job, cwd, &job_dir.home());
-        if !Self::is_codex(job)
-            && !Self::is_kimi(job)
-            && let Some(version) = self.claude_version(cwd, &job_dir.home()).await
-        {
-            spec.stamp.claude_version = version;
-        }
+        self.stamp_claude_version(job, cwd, &job_dir.home(), &mut spec)
+            .await;
         stream.feed().set_stamp(spec.stamp.clone());
         if let Some(runner) = crate::agent::resolve(&job.agent) {
             self.end.set_hosts(&job.job_id, runner.model_hosts());
         }
         let program = spec.argv.first().cloned().unwrap_or_default();
         let t0 = Instant::now();
+        if let Some(stop) = self.run_setup(job, shutdown.clone(), stream).await {
+            return stop;
+        }
         let Launched {
             stdout,
             mut proc,
@@ -1525,6 +1548,58 @@ impl<R: Reporter> AgentRunner<R> {
                 Err(RunError)
             }
         }
+    }
+
+    async fn stamp_claude_version(&self, job: &Job, cwd: &Path, home: &Path, spec: &mut AgentSpec) {
+        if !Self::is_codex(job)
+            && !Self::is_kimi(job)
+            && let Some(version) = self.claude_version(cwd, home).await
+        {
+            spec.stamp.claude_version = version;
+        }
+    }
+
+    async fn run_setup(
+        &self,
+        job: &Job,
+        mut shutdown: Shutdown,
+        stream: &mut Stream<'_, R>,
+    ) -> Option<Result<AgentOutcome, RunError>> {
+        let setup = self.setup.as_ref()?;
+        let redactor = self.job_redactor(&job.job_id);
+        let work = setup.run(&job.job_id, &redactor);
+        let guarded = tokio::select! {
+            guarded = self.keep_alive(job, work) => guarded,
+            () = shutdown.requested() => {
+                stream.fail(None, ERR_SHUTDOWN).await;
+                return Some(Err(RunError));
+            }
+        };
+        let report = match guarded {
+            Ok(report) => report,
+            Err(Interrupt::Lost) => return Some(Ok(AgentOutcome::Lost)),
+            Err(Interrupt::Cancelled) => {
+                stream.cancelled().await;
+                return Some(Ok(AgentOutcome::Cancelled));
+            }
+        };
+        let notes = report
+            .notes
+            .into_iter()
+            .map(|detail| pb::JobEvent {
+                kind: pb::JobEventKind::Phase.into(),
+                detail: Some(detail),
+                ..pb::JobEvent::default()
+            })
+            .collect::<Vec<_>>();
+        if !notes.is_empty() {
+            stream.feed().queue_notes(&redactor, notes);
+        }
+        if report.failed.is_some() {
+            stream.set_phase(PHASE_SETUP);
+            return Some(Ok(stream.fail(None, ERR_SETUP).await));
+        }
+        None
     }
 
     /// Publishes the agent's work and sends the terminal report.
@@ -1732,6 +1807,13 @@ impl<R: Reporter> AgentRunner<R> {
     /// the agent started. The report waits at most [`RunConfig::terminal_report_timeout`].
     pub async fn fail_job(&self, job: &Job, error: &'static str) {
         let mut stream = self.resume(job);
+        stream.fail(None, error).await;
+    }
+
+    /// [`AgentRunner::fail_job`] reported under `phase`.
+    pub async fn fail_job_in(&self, job: &Job, phase: &'static str, error: &'static str) {
+        let mut stream = self.resume(job);
+        stream.set_phase(phase);
         stream.fail(None, error).await;
     }
 
@@ -2340,6 +2422,7 @@ struct Stream<'a, R> {
     progress: String,
     last_report: Instant,
     terminal_timeout: Duration,
+    phase: &'static str,
     cancel: bool,
     lost: bool,
     failing: bool,
@@ -2403,6 +2486,7 @@ impl<'a, R: Reporter> Stream<'a, R> {
             progress: carry.progress,
             last_report: Instant::now(),
             terminal_timeout,
+            phase: PHASE,
             cancel: false,
             lost: false,
             failing: false,
@@ -2410,6 +2494,10 @@ impl<'a, R: Reporter> Stream<'a, R> {
             result_text: carry.result_text,
             model: carry.model,
         }
+    }
+
+    fn set_phase(&mut self, phase: &'static str) {
+        self.phase = phase;
     }
 
     fn feed(&self) -> MutexGuard<'_, Feed> {
@@ -2613,7 +2701,9 @@ impl<'a, R: Reporter> Stream<'a, R> {
     }
 
     fn request(&self, chunks: Vec<TranscriptChunk>) -> ReportJobRequest {
-        report_request(self.job, &self.progress, chunks)
+        let mut request = report_request(self.job, &self.progress, chunks);
+        self.phase.clone_into(&mut request.phase);
+        request
     }
 
     async fn fail(&mut self, exit_code: Option<i32>, error: &'static str) -> AgentOutcome {

@@ -3270,8 +3270,13 @@ mod timing_e2e {
     use std::time::Duration;
 
     use fleet_core::{PLACEHOLDER, Redactor};
-    use fleet_proto::v1::{ReportJobRequest, ReportTimingRequest};
+    use fleet_proto::v1::{
+        EnvironmentOnFail, EnvironmentScriptSpec, GetJobEnvironmentReply, ReportJobRequest,
+        ReportTimingRequest,
+    };
     use fleetd::bg_command::{BgConfig, LogFetch, PueueClient, PueueError};
+    use fleetd::env_setup::{ERR_SETUP, EnvSetup, SetupLauncher, StepProc, StepRun};
+    use fleetd::envd::{EnvDelivery, MountCheck, Owner, ReleasedEnvironment};
     use fleetd::now_ms;
     use fleetd::otel::{BearerToken, Limits, OtelReceiver, SOCKET_NAME};
     use fleetd::poller::{Shutdown, TimingOutcome, TimingReportError};
@@ -3586,6 +3591,144 @@ mod timing_e2e {
             assert!(bg.duration_ms > 100, "{}", bg.duration_ms);
             assert_eq!(bg.ended_by.as_deref(), Some("job_exit"));
             assert!(!transcript(&mut rx).contains("timing note"));
+            Ok(())
+        }))
+        .await
+    }
+
+    #[derive(Debug)]
+    struct SleepLauncher {
+        run_for: Duration,
+        pass: bool,
+    }
+
+    impl SetupLauncher for SleepLauncher {
+        fn start(&self, _: &StepRun<'_>) -> io::Result<StepProc> {
+            let run_for = self.run_for;
+            let pass = self.pass;
+            Ok(StepProc {
+                output: Box::pin(tokio::io::empty()),
+                exit: Box::pin(async move {
+                    tokio::time::sleep(run_for).await;
+                    Ok(pass)
+                }),
+                kill: Box::new(|| {}),
+            })
+        }
+    }
+
+    #[derive(Debug)]
+    struct Tmpfs;
+
+    impl MountCheck for Tmpfs {
+        fn is_tmpfs(&self, _: std::os::fd::BorrowedFd<'_>) -> io::Result<bool> {
+            Ok(true)
+        }
+    }
+
+    fn with_setup_step(
+        rig: &Rig,
+        runner: AgentRunner<Fake>,
+        launcher: SleepLauncher,
+    ) -> Result<AgentRunner<Fake>, Box<dyn std::error::Error>> {
+        let root = rig.dir.path().join("setup-run");
+        std::fs::create_dir(&root)?;
+        let delivery = Arc::new(EnvDelivery::new(
+            &root,
+            Owner {
+                uid: None,
+                gid: None,
+            },
+            Arc::new(Tmpfs),
+        )?);
+        delivery.hold(
+            "job1",
+            ReleasedEnvironment::from_reply(GetJobEnvironmentReply {
+                scripts: vec![EnvironmentScriptSpec {
+                    name: "install-deps".to_owned(),
+                    body: "#!/bin/sh\ntrue\n".to_owned(),
+                    on_fail: EnvironmentOnFail::Abort.into(),
+                    timeout_s: Some(30),
+                }],
+                ..GetJobEnvironmentReply::default()
+            }),
+        );
+        let setup = EnvSetup::new(
+            Arc::new(launcher),
+            delivery,
+            rig.dir.path().join("setup-work"),
+        );
+        Ok(runner.with_setup(Arc::new(setup)))
+    }
+
+    #[tokio::test]
+    async fn environment_setup_time_lands_in_overhead_and_the_parts_still_sum_to_wall() -> TestResult
+    {
+        common::bounded(Box::pin(async {
+            let rig = rig("ok").await?;
+            let (runner, _rx, sink) = runner(&rig, Mode::Store);
+            let runner = with_setup_step(
+                &rig,
+                runner,
+                SleepLauncher {
+                    run_for: Duration::from_millis(700),
+                    pass: true,
+                },
+            )?;
+            let outcome = run_job(&rig, &runner).await?;
+            assert!(matches!(outcome, FinishOutcome::Succeeded { .. }));
+            let request = {
+                let seen = sink.seen.lock().unwrap_or_else(PoisonError::into_inner);
+                assert_eq!(seen.len(), 1);
+                seen[0].clone()
+            };
+            let summary = request.summary.ok_or("summary")?;
+            assert!(summary.overhead_ms >= 700, "{summary:?}");
+            assert_eq!(
+                summary.api_wait_ms
+                    + summary.tool_ms
+                    + summary.shell_ms
+                    + summary.idle_ms
+                    + summary.overhead_ms,
+                summary.wall_ms
+            );
+            Ok(())
+        }))
+        .await
+    }
+
+    #[tokio::test]
+    async fn a_failed_setup_step_fails_the_job_in_the_setup_phase_naming_the_step() -> TestResult {
+        common::bounded(Box::pin(async {
+            let rig = rig("ok").await?;
+            let (runner, mut rx, _sink) = runner(&rig, Mode::Store);
+            let runner = with_setup_step(
+                &rig,
+                runner,
+                SleepLauncher {
+                    run_for: Duration::from_millis(10),
+                    pass: false,
+                },
+            )?;
+            let (_trigger, shutdown) = Shutdown::channel();
+            let mut job = job(&rig, false);
+            "x:slow".clone_into(&mut job.prompt);
+            let ran = runner.run(&job, &rig.worktree, shutdown).await?;
+            assert!(matches!(ran, AgentOutcome::Failed { .. }), "{ran:?}");
+            let mut terminal = None;
+            let mut text = String::new();
+            while let Ok(request) = rx.try_recv() {
+                for event in &request.events {
+                    text.push_str(event.detail.as_deref().unwrap_or_default());
+                }
+                if request.terminal_state.is_some() {
+                    terminal = Some(request);
+                }
+            }
+            let terminal = terminal.ok_or("terminal report")?;
+            assert_eq!(terminal.phase, "SETUP");
+            assert_eq!(terminal.error.as_deref(), Some(ERR_SETUP));
+            assert!(text.contains("install-deps"), "{text}");
             Ok(())
         }))
         .await

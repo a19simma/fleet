@@ -2130,3 +2130,101 @@ async fn a_launcher_without_delivery_writes_no_tree_for_a_held_environment() -> 
     drop(launched);
     Ok(())
 }
+
+const ENV_UNIT: &str = "fleet-env@.service";
+
+fn active_lines(name: &str) -> Vec<String> {
+    let mut lines: Vec<String> = unit_directives(name)
+        .into_iter()
+        .filter(|l| !l.trim().is_empty() && !l.trim_start().starts_with('#'))
+        .collect();
+    lines.sort();
+    lines
+}
+
+fn only_in(left: &[String], right: &[String]) -> Vec<String> {
+    left.iter()
+        .filter(|l| !right.contains(l))
+        .cloned()
+        .collect()
+}
+
+#[test]
+fn env_unit_is_a_sandboxed_no_network_unprivileged_setup_unit() {
+    let lines = unit_directives(ENV_UNIT);
+    assert_ne!(lines.len(), 0);
+    for want in [
+        "User=fleet-job",
+        "PrivateNetwork=yes",
+        "CapabilityBoundingSet=",
+        "RuntimeMaxSec=20min",
+        "NoNewPrivileges=yes",
+        "ProtectSystem=strict",
+        "ProtectProc=invisible",
+        "InaccessiblePaths=/etc/swarm",
+        "TemporaryFileSystem=/run/fleet:ro",
+        "BindReadOnlyPaths=/run/fleet-env/%i",
+    ] {
+        assert!(has_line(&lines, want), "missing {want}");
+    }
+    for l in &lines {
+        let bound = l.starts_with("BindPaths=")
+            || l.starts_with("BindReadOnlyPaths=")
+            || l.starts_with("ReadWritePaths=");
+        assert!(
+            !(bound && l.contains("/run/fleet/")),
+            "binds /run/fleet: {l}"
+        );
+        assert!(!l.starts_with("EnvironmentFile="), "env file: {l}");
+        assert!(!l.starts_with("ReadWritePaths="), "writable path: {l}");
+    }
+}
+
+#[test]
+fn env_unit_differs_from_the_tool_install_unit_only_where_allowed() {
+    let install = active_lines(INSTALL_UNIT);
+    let env = active_lines(ENV_UNIT);
+    let mut only_env = only_in(&env, &install);
+    let mut only_install = only_in(&install, &env);
+    only_env.sort();
+    only_install.sort();
+    let want_env = [
+        "BindReadOnlyPaths=/run/fleet-env/%i",
+        "ConditionPathExists=/run/fleet-env/%i",
+        "Description=Fleet environment setup for job %i",
+        "Environment=HOME=/run/fleet-env/%i",
+        "ExecStart=/usr/local/bin/fleetd env-setup-exec %i",
+        "RuntimeMaxSec=20min",
+        "TemporaryFileSystem=/run/fleet-env:ro",
+        "UMask=0077",
+    ];
+    let want_install = [
+        "BindReadOnlyPaths=/run/fleet/%i",
+        "ConditionPathExists=/run/fleet/%i/mise.toml",
+        "Description=Fleet tool install for job %i",
+        "Environment=HOME=/var/lib/fleet/tools",
+        "Environment=MISE_CACHE_DIR=/var/lib/fleet/tools/cache",
+        "Environment=MISE_CONFIG_FILE=/run/fleet/%i/mise.toml",
+        "Environment=MISE_DATA_DIR=/var/lib/fleet/tools",
+        "Environment=MISE_SAFE=1",
+        "Environment=MISE_STATE_DIR=/var/lib/fleet/tools/state",
+        "EnvironmentFile=-/run/fleet/%i/tool-env",
+        "ExecStart=/usr/local/bin/fleetd tool-install-exec %i",
+        "ReadWritePaths=/var/lib/fleet/tools",
+        "RuntimeMaxSec=15min",
+        "UMask=0007",
+    ];
+    assert_eq!(only_env, want_env);
+    assert_eq!(only_install, want_install);
+}
+
+#[test]
+fn tmpfiles_creates_the_setup_input_root() {
+    let text = deploy_file("tmpfiles.d/fleet.conf");
+    assert!(
+        text.lines()
+            .any(|l| l.split_whitespace().collect::<Vec<_>>()
+                == ["d", "/run/fleet-env", "0750", "fleetd", "fleet-work", "-"]),
+        "no /run/fleet-env line"
+    );
+}

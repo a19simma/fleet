@@ -24,6 +24,7 @@ use crate::broker::{Broker, BrokerError, GhCli, MirrorGit};
 use crate::config::Config;
 use crate::connect_proxy::{ConnectProxy, ProxyLimits};
 use crate::cred::{CredentialBook, CredentialClient, ERR_NO_AGENT};
+use crate::env_setup::{ERR_SETUP_UNAVAILABLE, EnvSetup, PHASE_SETUP, UnavailableLauncher};
 use crate::envd::{
     ERR_ENV_DENIED, EnvDelivery, EnvironmentClient, Owner, ReleasedEnvironment, StatfsCheck,
 };
@@ -52,6 +53,8 @@ use crate::workspace::{RepoPolicy, Workspace, broker_scratch_path, job_owner};
 const ERR_WORKSPACE: &str = "workspace could not be prepared";
 const ERR_PREPARE_TIMEOUT: &str = "workspace preparation timed out";
 const ERR_SHUTDOWN: &str = "agent stopped by daemon shutdown";
+/// Run root of the Setup unit input directories.
+const SETUP_RUN_DIR: &str = "/run/fleet-env";
 const ERR_BROKER: &str = "job broker could not be set up";
 
 /// The poller the daemon runs.
@@ -215,6 +218,21 @@ impl<R: Reporter + Send + Sync + 'static> DaemonRunner<R> {
             }
             Err(_) => Err(RunError),
         }
+    }
+
+    async fn require_setup(
+        &self,
+        job: &Job,
+        environment: Option<&ReleasedEnvironment>,
+    ) -> Result<(), RunError> {
+        if environment.is_some_and(|held| !held.scripts().is_empty()) && !self.agent.has_setup() {
+            tracing::warn!(reason = ERR_SETUP_UNAVAILABLE, "job environment refused");
+            self.agent
+                .fail_job_in(job, PHASE_SETUP, ERR_SETUP_UNAVAILABLE)
+                .await;
+            return Err(RunError);
+        }
+        Ok(())
     }
 
     async fn fetch_environment(
@@ -523,6 +541,10 @@ impl<R: Reporter + Send + Sync + 'static> JobRunner for DaemonRunner<R> {
                 return Err(stop);
             }
         };
+        if let Err(stop) = self.require_setup(&job, environment.as_ref()).await {
+            self.agent.clear_profile(&job);
+            return Err(stop);
+        }
         let _environment = match (&self.delivery, environment) {
             (Some(delivery), Some(held)) => {
                 delivery.hold(&job.job_id, held);
@@ -831,6 +853,28 @@ fn pueue_cli(env: &dyn Fn(&str) -> Option<String>, dirs: &[&str]) -> Option<Pueu
     Some(PueueCli::new(bin, vars))
 }
 
+fn setup_wiring(
+    mut end: JobEnd,
+    delivery: Option<&Arc<EnvDelivery>>,
+    job_gid: Option<u32>,
+) -> (JobEnd, Option<Arc<EnvSetup>>) {
+    let Some(delivery) = delivery else {
+        return (end, None);
+    };
+    let setup = Arc::new(
+        EnvSetup::new(
+            Arc::new(UnavailableLauncher),
+            Arc::clone(delivery),
+            SETUP_RUN_DIR,
+        )
+        .with_job_gid(job_gid),
+    );
+    end = end.on_end(delivery.end_hook());
+    let ended = Arc::clone(&setup);
+    end = end.on_end(move |job_id| ended.end(job_id));
+    (end, Some(setup))
+}
+
 /// Builds the poller when `FLEET_SERVER_URL` is set and non-empty, else `None`.
 ///
 /// # Errors
@@ -908,16 +952,18 @@ pub(crate) fn build(
         token: String::new(),
         redactor: redactor.clone(),
     };
-    let mut end = wired.end.on_end(book.end_hook());
-    if let Some(delivery) = &delivery {
-        end = end.on_end(delivery.end_hook());
-    }
+    let (end, setup) = setup_wiring(
+        wired.end.on_end(book.end_hook()),
+        delivery.as_ref(),
+        run.job_gid,
+    );
     let mut agent = AgentRunner::new(run, reporter, redactor)
         .with_hook_hub(hub)
         .with_launcher(launcher);
     if let Some(preflight) = preflight {
         agent = agent.with_tool_preflight(preflight);
     }
+    agent = agent.with_setup_opt(setup);
     let transport = GrpcTimingTransport::new(channel.clone(), &token)?;
     agent = wire_agent(agent, config, transport, env, &PUEUE_SEARCH_DIRS);
     let mut runner = DaemonRunner::new(
@@ -3291,6 +3337,69 @@ mod token_wiring_tests {
                 .redact_str(&format!("x {ENV_VALUE} y")),
             "x [REDACTED] y"
         );
+        Ok(())
+    }
+
+    struct Capturing(Arc<std::sync::Mutex<Vec<ReportJobRequest>>>);
+
+    impl Reporter for Capturing {
+        fn report(
+            &self,
+            request: ReportJobRequest,
+        ) -> impl Future<Output = Result<ReportJobReply, Status>> + Send {
+            self.0
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .push(request);
+            std::future::ready(Ok(ReportJobReply::default()))
+        }
+    }
+
+    fn scripted() -> ReleasedEnvironment {
+        ReleasedEnvironment::from_reply(fleet_proto::v1::GetJobEnvironmentReply {
+            scripts: vec![fleet_proto::v1::EnvironmentScriptSpec {
+                name: "deps".into(),
+                body: "#!/bin/sh\ntrue\n".into(),
+                ..Default::default()
+            }],
+            ..Default::default()
+        })
+    }
+
+    #[tokio::test]
+    async fn scripts_without_a_configured_setup_runner_fail_the_job_in_the_setup_phase()
+    -> TestResult {
+        let dir = tempfile::TempDir::new()?;
+        let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let agent = AgentRunner::new(
+            RunConfig::new("claude", false),
+            Capturing(Arc::clone(&seen)),
+            Redactor::default(),
+        );
+        let runner = DaemonRunner::new(Workspace::new(dir.path().join("jobs")), agent, "box");
+        let job = job();
+        let held = scripted();
+        assert!(runner.require_setup(&job, Some(&held)).await.is_err());
+        let last = seen
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .last()
+            .cloned()
+            .ok_or("no report")?;
+        assert_eq!(last.phase, "SETUP");
+        assert_eq!(last.error.as_deref(), Some(ERR_SETUP_UNAVAILABLE));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn no_scripts_need_no_setup_runner() -> TestResult {
+        let dir = tempfile::TempDir::new()?;
+        let agent = AgentRunner::new(RunConfig::new("claude", false), Quiet, Redactor::default());
+        let runner = DaemonRunner::new(Workspace::new(dir.path().join("jobs")), agent, "box");
+        let empty =
+            ReleasedEnvironment::from_reply(fleet_proto::v1::GetJobEnvironmentReply::default());
+        assert!(runner.require_setup(&job(), Some(&empty)).await.is_ok());
+        assert!(runner.require_setup(&job(), None).await.is_ok());
         Ok(())
     }
 

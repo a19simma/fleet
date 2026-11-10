@@ -1,0 +1,37 @@
+[Unit]
+Description=Fleet environment setup for job %i
+BindsTo=fleetd.service
+After=fleetd.service
+ConditionPathExists=/run/fleet-env/%i
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+User=fleet-job
+Group=fleet-work
+UMask=0077
+Environment=HOME=/run/fleet-env/%i
+ExecStart=/usr/local/bin/fleetd env-setup-exec %i
+Restart=no
+RuntimeMaxSec=20min
+TimeoutStopSec=10
+KillMode=control-group
+MemoryMax=1G
+TasksMax=256
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+ProtectProc=invisible
+ProcSubset=pid
+PrivateNetwork=yes
+PrivateTmp=yes
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+RestrictSUIDSGID=yes
+LockPersonality=yes
+CapabilityBoundingSet=
+InaccessiblePaths=/etc/swarm
+InaccessiblePaths=-/run/docker.sock
+InaccessiblePaths=-/var/run/docker.sock
+TemporaryFileSystem=/run/fleet:ro
+TemporaryFileSystem=/run/fleet-env:ro
+BindReadOnlyPaths=/run/fleet-env/%i
