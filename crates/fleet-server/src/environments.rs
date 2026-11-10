@@ -403,8 +403,10 @@ pub async fn pin_inheritable(
 
 /// Whether the pin stored on a Job equals what `request` asks for now.
 ///
-/// [`EnvRequest::Default`] and [`EnvRequest::Bare`] equal a Job with no pin. A named request
-/// equals a Job pinned to the same Environment at the version that is latest now, so an
+/// [`EnvRequest::Bare`] equals a Job with no pin. [`EnvRequest::Default`] also takes that arm
+/// here, but callers must not use it for a default request: they call
+/// `store::default_pin_matches`, which re-resolves the default bindings and compares the full
+/// pin. A named request equals a Job pinned to the same Environment at the version that is latest now, so an
 /// Environment edited between two submits under one key is a conflict (ADR-0067 decision 11
 /// compares the name and the resolved version). An Environment that no longer exists equals
 /// no pin.

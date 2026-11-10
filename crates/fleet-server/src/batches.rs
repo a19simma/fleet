@@ -338,8 +338,9 @@ async fn replay_pins_equal(
 /// Environment in the request each child resolves its own default through
 /// [`environments::resolve_pin_with_defaults`]: the repository binding for all, else the
 /// binding of the child's profile. A replay of a named or `-` request compares the stored pin
-/// with the request like single submit, and a replay of a default request accepts the stored
-/// pins.
+/// with the request like single submit. A replay of a default request re-resolves the default
+/// bindings of every child and compares each stored pin with the resolved one (see
+/// `replay_pins_equal`), so a binding edited or revoked since the first submit is a conflict.
 ///
 /// # Errors
 ///
