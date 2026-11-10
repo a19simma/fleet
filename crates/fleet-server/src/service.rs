@@ -5,6 +5,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
+use fleet_core::ProfileError;
 use fleet_core::graph;
 use fleet_core::{Envelope, Redactor};
 use fleet_proto::v1::fleet_batches_server::{FleetBatches, FleetBatchesServer};
@@ -518,6 +519,9 @@ fn worker_error(err: &StoreError) -> Status {
         StoreError::NotFound => Status::not_found("job not found"),
         StoreError::LeaseDenied => Status::permission_denied(fleet_proto::ERR_LEASE_MISMATCH),
         StoreError::UnknownProfile => Status::not_found("profile not found"),
+        StoreError::InvalidProfile(
+            fault @ ProfileFault::Malformed(ProfileError::EnvironmentNotAllowed),
+        ) => Status::invalid_argument(fault.to_string()),
         StoreError::ToolsNotGranted => {
             Status::permission_denied(profiles::ERR_PROFILE_TOOLS_NOT_GRANTED)
         }
@@ -1355,6 +1359,9 @@ fn jobs_error(err: &StoreError) -> Status {
         StoreError::InvalidProfile(ProfileFault::Unowned) => {
             Status::permission_denied(profiles::ERR_PROFILE_SUBMIT_UNOWNED)
         }
+        StoreError::InvalidProfile(
+            fault @ ProfileFault::Malformed(ProfileError::EnvironmentNotAllowed),
+        ) => Status::invalid_argument(fault.to_string()),
         StoreError::InvalidJob(_) | StoreError::InvalidChunk => {
             Status::invalid_argument("invalid job request")
         }
@@ -1388,6 +1395,9 @@ fn batches_error(err: &StoreError) -> Status {
         StoreError::UnknownProfile => Status::not_found("profile not found"),
         StoreError::NotFound => Status::not_found("batch not found"),
         StoreError::InvalidBatch(reason) => Status::invalid_argument(reason.to_string()),
+        StoreError::InvalidProfile(
+            fault @ ProfileFault::Malformed(ProfileError::EnvironmentNotAllowed),
+        ) => Status::invalid_argument(fault.to_string()),
         StoreError::InvalidProfile(_) => Status::invalid_argument("invalid profile name"),
         StoreError::InvalidJob(_) => Status::invalid_argument("invalid job request"),
         StoreError::ToolsNotGranted => {
@@ -2191,6 +2201,21 @@ mod tests {
         ] {
             assert_eq!(status.code(), Code::PermissionDenied);
             assert_eq!(status.message(), "model gpt-5 is not in the allowlist");
+        }
+    }
+
+    #[test]
+    fn an_environment_key_maps_to_invalid_argument_with_the_distinct_message() {
+        let err = || {
+            StoreError::InvalidProfile(ProfileFault::Malformed(ProfileError::EnvironmentNotAllowed))
+        };
+        for status in [
+            jobs_error(&err()),
+            batches_error(&err()),
+            worker_error(&err()),
+        ] {
+            assert_eq!(status.code(), Code::InvalidArgument);
+            assert_eq!(status.message(), "a profile cannot name an environment");
         }
     }
 

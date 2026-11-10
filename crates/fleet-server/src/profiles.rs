@@ -399,6 +399,17 @@ pub(crate) fn require_model(
     }
 }
 
+/// The refusal for a stored blob that does not parse: the distinct environment refusal when
+/// the blob carries an `environment` key, else [`StoreError::OutOfRange`] naming `what`.
+pub(crate) fn blob_refusal(content: &[u8], what: &'static str) -> StoreError {
+    match Profile::from_stored_json(content) {
+        Err(ProfileError::EnvironmentNotAllowed) => {
+            ProfileFault::Malformed(ProfileError::EnvironmentNotAllowed).into()
+        }
+        _ => StoreError::OutOfRange(what),
+    }
+}
+
 fn hex(bytes: &[u8]) -> String {
     let mut out = String::with_capacity(bytes.len() * 2);
     for byte in bytes {
@@ -740,7 +751,7 @@ pub async fn get_for(
         .ok_or(StoreError::NotFound)?;
     let content = row.try_get::<Vec<u8>, _>("content")?;
     let stored = Profile::from_stored_json(&content)
-        .map_err(|_| StoreError::OutOfRange("profile content"))?;
+        .map_err(|_| blob_refusal(&content, "profile content"))?;
     Ok(ProfileVersion {
         name: name.to_owned(),
         version: version_of(row.try_get("version")?)?,
@@ -821,7 +832,8 @@ pub(crate) async fn blob_for_lease(
     if version_hash != pinned {
         return Err(corrupt());
     }
-    let profile = serde_json::from_slice::<Profile>(&content).map_err(|_| corrupt())?;
+    let profile = serde_json::from_slice::<Profile>(&content)
+        .map_err(|_| blob_refusal(&content, "profile blob"))?;
     if profile.hash().as_bytes().as_slice() != pinned.as_slice()
         || profile.canonical_json() != content
     {
@@ -1017,7 +1029,8 @@ pub(crate) async fn pin_for_submit(
     let corrupt = || StoreError::OutOfRange("profile blob");
     let hash: Vec<u8> = row.try_get("hash")?;
     let content: Vec<u8> = row.try_get("content")?;
-    let profile = Profile::from_stored_json(&content).map_err(|_| corrupt())?;
+    let profile =
+        Profile::from_stored_json(&content).map_err(|_| blob_refusal(&content, "profile blob"))?;
     if profile.hash().as_bytes().as_slice() != hash.as_slice() {
         return Err(corrupt());
     }
