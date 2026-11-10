@@ -439,7 +439,27 @@ async fn submit_forwards_the_idempotency_key() -> TestResult {
     res?;
     let sent = submitted(&stub)?;
     assert_eq!(sent[0].idempotency_key, "key-42");
-    assert_eq!(sent[1].idempotency_key, "");
+    assert_ne!(sent[1].idempotency_key, "");
+    Ok(())
+}
+
+#[tokio::test]
+async fn submit_without_a_key_generates_a_distinct_key_each_time() -> TestResult {
+    let (url, stub) = serve().await?;
+    for prompt in ["a", "b"] {
+        let (res, _) = cli(
+            &url,
+            Some(TOKEN),
+            &["submit", "--repo", "o/r", "--base", "main", prompt],
+        )
+        .await;
+        res?;
+    }
+    let sent = submitted(&stub)?;
+    assert_eq!(sent.len(), 2);
+    assert_ne!(sent[0].idempotency_key, "");
+    assert_ne!(sent[1].idempotency_key, "");
+    assert_ne!(sent[0].idempotency_key, sent[1].idempotency_key);
     Ok(())
 }
 

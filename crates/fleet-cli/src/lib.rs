@@ -1224,7 +1224,7 @@ async fn dispatch(
             let mut client = session.jobs;
             let job = client
                 .submit_job(SubmitJobRequest {
-                    idempotency_key: idempotency_key.unwrap_or_default(),
+                    idempotency_key: idempotency_key.unwrap_or_else(batch::fresh_key),
                     prompt,
                     repo,
                     base_ref: base,
