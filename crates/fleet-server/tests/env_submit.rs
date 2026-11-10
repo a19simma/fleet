@@ -414,11 +414,39 @@ fn same_status(left: &Status, right: &Status, cause: &str) {
     assert_eq!(left.code(), right.code(), "{cause}");
     assert_eq!(left.message(), right.message(), "{cause}");
     assert_eq!(left.details(), right.details(), "{cause}");
-    assert_eq!(
-        left.metadata().clone().into_headers(),
-        right.metadata().clone().into_headers(),
-        "{cause}"
-    );
+    assert_eq!(undated_headers(left), undated_headers(right), "{cause}");
+}
+
+fn undated_headers(status: &Status) -> tonic::codegen::http::HeaderMap {
+    let mut headers = status.metadata().clone().into_headers();
+    headers.remove("date");
+    headers
+}
+
+fn status_with(date: &str, other: &str) -> Status {
+    let mut status = Status::permission_denied("denied");
+    status
+        .metadata_mut()
+        .insert("date", MetadataValue::try_from(date).unwrap());
+    status
+        .metadata_mut()
+        .insert("x-probe", MetadataValue::try_from(other).unwrap());
+    status
+}
+
+#[test]
+fn same_status_ignores_a_differing_date_header() {
+    let early = status_with("Tue, 10 Nov 2026 11:42:08 GMT", "same");
+    let late = status_with("Tue, 10 Nov 2026 11:42:09 GMT", "same");
+    same_status(&early, &late, "date only");
+}
+
+#[test]
+#[should_panic(expected = "non-date")]
+fn same_status_still_fails_on_a_differing_non_date_header() {
+    let left = status_with("Tue, 10 Nov 2026 11:42:08 GMT", "one");
+    let right = status_with("Tue, 10 Nov 2026 11:42:08 GMT", "two");
+    same_status(&left, &right, "non-date");
 }
 
 #[sqlx::test]
