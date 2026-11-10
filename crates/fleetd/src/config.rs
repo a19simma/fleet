@@ -91,6 +91,7 @@ struct FileConfig {
     hook_socket_group: Option<String>,
     job_group: Option<String>,
     tool_cache_uid: Option<u32>,
+    job_uid: Option<u32>,
     agent_launcher: Option<String>,
     systemctl_path: Option<PathBuf>,
     fetch_policy: Option<String>,
@@ -265,6 +266,12 @@ pub struct Config {
     /// reads the cache as. Env `FLEETD_TOOL_CACHE_UID` wins over the file key. Required when
     /// `[mise]` is set, see [`Config::tool_cache_owner`]. Root and `u32::MAX` are refused.
     pub tool_cache_uid: Option<u32>,
+    /// Uid the Environment delivery tree is handed to, normally `fleet-job`. Env
+    /// `FLEETD_JOB_UID` wins over the file key. Unset keeps the tree with the fleetd uid and
+    /// shares it with `job_group` (directory 0750, files 0440). Set, the tree is directory
+    /// 0700 and files 0400 owned by that uid, which needs `CAP_CHOWN` and `CAP_DAC_OVERRIDE`
+    /// in fleetd. Root and `u32::MAX` are refused.
+    pub job_uid: Option<u32>,
 }
 
 impl Config {
@@ -428,7 +435,8 @@ impl Config {
             hook_socket_uid,
             hook_socket_group,
             job_group: resolve_job_group(&env, file.job_group)?,
-            tool_cache_uid: resolve_tool_cache_uid(&env, file.tool_cache_uid)?,
+            tool_cache_uid: resolve_uid(&env, file.tool_cache_uid, TOOL_CACHE_UID_KEY)?,
+            job_uid: resolve_uid(&env, file.job_uid, JOB_UID_KEY)?,
             agent_launcher,
             systemctl_path,
             fetch_policy,
@@ -622,15 +630,17 @@ fn resolve_gh_bin_in(file: Option<PathBuf>, dirs: &[&str]) -> Result<PathBuf, Er
     }
 }
 
-fn resolve_tool_cache_uid(
+const TOOL_CACHE_UID_KEY: (&str, &str) = ("tool_cache_uid", "FLEETD_TOOL_CACHE_UID");
+
+const JOB_UID_KEY: (&str, &str) = ("job_uid", "FLEETD_JOB_UID");
+
+fn resolve_uid(
     env: &dyn Fn(&str) -> Option<String>,
     file: Option<u32>,
+    (name, env_name): (&'static str, &str),
 ) -> Result<Option<u32>, Error> {
-    let bad = |value: String| Error::InvalidValue {
-        name: "tool_cache_uid",
-        value,
-    };
-    let uid = match env("FLEETD_TOOL_CACHE_UID") {
+    let bad = |value: String| Error::InvalidValue { name, value };
+    let uid = match env(env_name) {
         Some(raw) => {
             let plain = !raw.is_empty() && raw.bytes().all(|b| b.is_ascii_digit());
             let parsed = plain.then(|| raw.parse::<u32>().ok()).flatten();
@@ -1634,6 +1644,31 @@ mod tests {
             .filter(|line| !line.starts_with(key))
             .collect::<Vec<_>>()
             .join("\n")
+    }
+
+    #[test]
+    fn job_uid_reads_file_then_env_defaults_to_unset_and_refuses_root_and_junk() {
+        assert_eq!(Config::resolve(None, &env_of(&[])).unwrap().job_uid, None);
+        let file = "job_uid = 990\n";
+        let cfg = Config::resolve(Some(file), &env_of(&[])).unwrap();
+        assert_eq!((cfg.job_uid, cfg.tool_cache_uid), (Some(990), None));
+        let env = env_of(&[("FLEETD_JOB_UID", "991")]);
+        let cfg = Config::resolve(Some(file), &env).unwrap();
+        assert_eq!(cfg.job_uid, Some(991));
+        for raw in ["0", "-1", "+5", "4294967295", "x", "99999999999"] {
+            let pairs = [("FLEETD_JOB_UID", raw)];
+            let env = env_of(&pairs);
+            match Config::resolve(None, &env) {
+                Err(Error::InvalidValue { name, .. }) => assert_eq!(name, "job_uid", "{raw:?}"),
+                other => panic!("{raw:?} accepted: {other:?}"),
+            }
+        }
+        for file in ["job_uid = 0\n", "job_uid = 4294967295\n", "job_uid = -1\n"] {
+            assert!(
+                Config::resolve(Some(file), &env_of(&[])).is_err(),
+                "{file:?}"
+            );
+        }
     }
 
     #[test]

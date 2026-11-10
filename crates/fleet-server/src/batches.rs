@@ -8,6 +8,7 @@ use fleet_core::{EventId, Profile};
 use fleet_proto::v1::{GetBatchReply, SubmitBatchReply, SubmitBatchRequest, SubmitJobRequest};
 use sqlx::{PgPool, Row};
 
+use crate::environments::{self, EnvPin, EnvRequest};
 use crate::jobs::{validate_job_id, validate_submit};
 use crate::profiles::{
     Viewer, check_profile_tools, read_tools_grant, require_model, validate_name,
@@ -21,7 +22,7 @@ const INSERT_BATCH: &str = "INSERT INTO batch (batch_id, idempotency_key, prompt
      VALUES ($1, $2, $3, $4, $5, 1) ON CONFLICT (idempotency_key) DO NOTHING RETURNING batch_id";
 const SELECT_BATCH_BY_KEY: &str =
     "SELECT batch_id, prompt, repo, base_sha FROM batch WHERE idempotency_key = $1";
-const SELECT_BATCH_JOBS: &str = "SELECT job_id, profile_name, user_id, agent FROM jobs WHERE batch_id = $1 ORDER BY batch_pos LIMIT $2";
+const SELECT_BATCH_JOBS: &str = "SELECT job_id, profile_name, user_id, agent, environment_id, environment_version FROM jobs WHERE batch_id = $1 ORDER BY batch_pos LIMIT $2";
 const SELECT_BATCH_BY_ID: &str = "SELECT prompt, repo, base_sha, repeats, \
      (EXTRACT(EPOCH FROM created_at) * 1000)::bigint AS created_at_ms FROM batch WHERE batch_id = $1";
 const SELECT_BATCH_JOB_IDS: &str = "SELECT job_id FROM jobs WHERE batch_id = $1 \
@@ -36,8 +37,8 @@ const SELECT_LATEST: &str = "SELECT v.version, v.hash, b.content FROM profile p 
      JOIN profile_blob b ON b.hash = v.hash WHERE p.id = $1";
 const INSERT_BATCH_JOB: &str = "INSERT INTO jobs (job_id, prompt, repo, base_ref, branch, open_pr, \
      batch_id, repeat_idx, batch_pos, profile_name, profile_id, profile_version, profile_hash, \
-     user_id, agent, profile_tools_granted) \
-     VALUES ($1, $2, $3, $4, 'swarm/' || $1, false, $5, 0, $6, $7, $8, $9, $10, $11, $12, $13)";
+     user_id, agent, profile_tools_granted, environment_id, environment_version) \
+     VALUES ($1, $2, $3, $4, 'swarm/' || $1, false, $5, 0, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)";
 const SELECT_BOOTSTRAP_USER: &str = "SELECT bootstrap_user_id()";
 
 /// Why a batch request was refused. The variants carry no client input.
@@ -82,6 +83,7 @@ pub struct NewBatch {
     base_sha: String,
     profiles: Vec<String>,
     agent: &'static str,
+    environment: EnvRequest,
 }
 
 fn is_sha(text: &str) -> bool {
@@ -120,7 +122,7 @@ pub fn validate_batch(request: &SubmitBatchRequest) -> Result<NewBatch, StoreErr
         open_pr: false,
         agent: request.agent.clone(),
         profile: String::new(),
-        environment: String::new(),
+        environment: request.environment.clone(),
     })?;
     Ok(NewBatch {
         key: job.key,
@@ -129,6 +131,7 @@ pub fn validate_batch(request: &SubmitBatchRequest) -> Result<NewBatch, StoreErr
         base_sha: job.base_ref,
         profiles: request.profiles.clone(),
         agent: job.agent,
+        environment: job.environment,
     })
 }
 
@@ -258,18 +261,43 @@ async fn pin_profiles(
     Ok(pins)
 }
 
+fn stored_pin(row: &sqlx::postgres::PgRow) -> Result<Option<EnvPin>, StoreError> {
+    let id: Option<i64> = row.try_get("environment_id")?;
+    let version: Option<i32> = row.try_get("environment_version")?;
+    Ok(id.zip(version).map(|(environment_id, version)| EnvPin {
+        environment_id,
+        version,
+    }))
+}
+
+async fn resolve_batch_pin(
+    tx: &mut sqlx::PgConnection,
+    viewer: Viewer,
+    request: &EnvRequest,
+) -> Result<Option<EnvPin>, StoreError> {
+    let Viewer::User(user) = viewer else {
+        return Ok(None);
+    };
+    Ok(environments::resolve_pin(tx, user, request)
+        .await?
+        .into_pin()?)
+}
+
 /// Creates a batch and one job per profile for `owner`, or returns the stored batch of the key.
 ///
 /// The `profile:tools` rule of single submit applies: a profile with tools needs the grant of
 /// `owner`, a legacy `None` owner has none, and every job stamps `profile_tools_granted` with
-/// the grant read in the batch transaction.
+/// the grant read in the batch transaction. A named Environment resolves once through
+/// [`environments::resolve_pin`] after the profiles, and every child stores that pin. A replay
+/// of the key compares the stored pin with the request like single submit.
 ///
 /// # Errors
 ///
 /// [`StoreError::InvalidBatch`], [`StoreError::InvalidProfile`] or [`StoreError::InvalidJob`] for
 /// a bad request, [`StoreError::KeyConflict`] when the key exists with other parameters, owner, agent
-/// or profile list, every error of `pin_profiles` including [`StoreError::ToolsNotGranted`], and a
-/// database error.
+/// profile list or Environment, every error of `pin_profiles` including
+/// [`StoreError::ToolsNotGranted`], the Environment refusals of single submit, and a database
+/// error.
 pub(crate) async fn submit(
     pool: &PgPool,
     owner: Option<i64>,
@@ -278,6 +306,9 @@ pub(crate) async fn submit(
 ) -> Result<SubmitBatchReply, StoreError> {
     let batch = validate_batch(request)?;
     let viewer = Viewer::from(owner);
+    if owner.is_none() && matches!(batch.environment, EnvRequest::Named(_)) {
+        return Err(StoreError::UnknownEnvironment);
+    }
     let owner = match owner {
         Some(owner) => owner,
         None => {
@@ -313,13 +344,22 @@ pub(crate) async fn submit(
         let mut names = Vec::with_capacity(rows.len());
         let mut job_ids = Vec::with_capacity(rows.len());
         let mut same_owner = true;
+        let mut held = Vec::with_capacity(rows.len());
         for row in &rows {
+            held.push(stored_pin(row)?);
             names.push(row.try_get::<String, _>("profile_name")?);
             job_ids.push(row.try_get::<String, _>("job_id")?);
             same_owner &= row.try_get::<i64, _>("user_id")? == owner
                 && row.try_get::<String, _>("agent")? == batch.agent;
         }
-        if !same || !same_owner || names != batch.profiles {
+        let pin_equal = match held.split_first() {
+            Some((first, rest)) => {
+                rest.iter().all(|pin| pin == first)
+                    && environments::pin_matches(&mut tx, owner, &batch.environment, *first).await?
+            }
+            None => true,
+        };
+        if !same || !same_owner || names != batch.profiles || !pin_equal {
             return Err(StoreError::KeyConflict);
         }
         return Ok(SubmitBatchReply {
@@ -329,6 +369,10 @@ pub(crate) async fn submit(
         });
     }
     let pins = pin_profiles(&mut tx, viewer, allowlist, &batch.profiles).await?;
+    let env_pin = resolve_batch_pin(&mut tx, viewer, &batch.environment).await?;
+    let (environment_id, environment_version) = env_pin.map_or((None, None), |pin| {
+        (Some(pin.environment_id), Some(pin.version))
+    });
     let mut job_ids = Vec::with_capacity(pins.len());
     for (pos, (name, pin)) in batch.profiles.iter().zip(pins).enumerate() {
         let job_id = EventId::generate().to_string();
@@ -346,6 +390,8 @@ pub(crate) async fn submit(
             .bind(owner)
             .bind(batch.agent)
             .bind(pin.tools_granted)
+            .bind(environment_id)
+            .bind(environment_version)
             .execute(&mut *tx)
             .await?;
         job_ids.push(job_id);
@@ -374,6 +420,7 @@ mod tests {
             repeats: 0,
             profiles: vec!["a".to_owned(), "b".to_owned()],
             agent: String::new(),
+            environment: String::new(),
         }
     }
 

@@ -89,6 +89,7 @@ fn request(key: &str, profiles: &[&str]) -> SubmitBatchRequest {
         repeats: 0,
         profiles: profiles.iter().map(|p| (*p).to_owned()).collect(),
         agent: String::new(),
+        environment: String::new(),
     }
 }
 

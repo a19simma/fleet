@@ -20,7 +20,7 @@ use sqlx::postgres::PgRow;
 use sqlx::{PgPool, Postgres, Row, Transaction};
 
 use crate::batches::{self, BatchInvalid};
-use crate::environments::{self, EnvPin, EnvRequest, PinRefusal, PinResult};
+use crate::environments::{self, EnvPin, EnvRequest, PinRefusal};
 use crate::jobs::{
     JobInvalid, MAX_CHUNKS_PER_REPORT, MAX_PHASE_CHARS, MAX_PROGRESS_CHARS, MAX_TRANSCRIPT_BYTES,
     MAX_TRANSCRIPT_ROWS, MIN_CHUNK_COST_BYTES, NewJob, runner_kind, validate_ci, validate_job_id,
@@ -696,6 +696,7 @@ fn ci_retry_state(text: &str) -> Result<CiRetry, StoreError> {
         "disabled" => Ok(CiRetry::Disabled),
         "no_log" => Ok(CiRetry::NoLog),
         "ineligible" => Ok(CiRetry::Ineligible),
+        "env_unavailable" => Ok(CiRetry::EnvUnavailable),
         _ => Err(StoreError::OutOfRange("ci retry")),
     }
 }
@@ -706,6 +707,7 @@ const fn ci_retry_name(outcome: CiRetry) -> &'static str {
         CiRetry::Exhausted => "exhausted",
         CiRetry::Disabled => "disabled",
         CiRetry::NoLog => "no_log",
+        CiRetry::EnvUnavailable => "env_unavailable",
         CiRetry::Ineligible | CiRetry::Unspecified => "ineligible",
     }
 }
@@ -1129,11 +1131,9 @@ impl Store {
                 }
                 None => None,
             };
-            let pin = match environments::resolve_pin(&mut tx, caller, &job.environment).await? {
-                PinResult::None => None,
-                PinResult::Pinned(pin) => Some(pin),
-                PinResult::Refused(refusal) => return Err(refusal.into()),
-            };
+            let pin = environments::resolve_pin(&mut tx, caller, &job.environment)
+                .await?
+                .into_pin()?;
             let (environment_id, version) = pin.map_or((None, None), |pin| {
                 (Some(pin.environment_id), Some(pin.version))
             });

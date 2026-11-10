@@ -405,6 +405,7 @@ enum CiRetry {
   CI_RETRY_DISABLED = 3;
   CI_RETRY_NO_LOG = 4;
   CI_RETRY_INELIGIBLE = 5;
+  CI_RETRY_ENV_UNAVAILABLE = 6;
 }
 
 enum CiState {
@@ -486,6 +487,9 @@ message SubmitBatchRequest {
   uint32 repeats = 5;
   repeated string profiles = 6;
   string agent = 7;
+  // Environment name (ADR-0067), pinned once for every child. Empty means the default
+  // behaviour, "-" means none.
+  string environment = 8;
 }
 
 message SubmitBatchReply {

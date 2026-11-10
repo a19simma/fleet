@@ -1468,6 +1468,7 @@ async fn unshare_leaves_a_queued_jobs_snapshot_intact(pool: PgPool) {
                 repeats: 0,
                 profiles: vec!["cherry".to_owned()],
                 agent: String::new(),
+                environment: String::new(),
             },
         )
         .await

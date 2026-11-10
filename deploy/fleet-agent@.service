@@ -11,6 +11,7 @@ User=fleet-job
 Group=fleet-work
 UMask=0007
 EnvironmentFile=/run/fleet/%i/env
+EnvironmentFile=-/run/fleet/%i/envd/envd.env
 ExecStart=/usr/local/bin/fleetd agent-exec %i
 StandardOutput=file:/run/fleet/%i/stdout
 Restart=no

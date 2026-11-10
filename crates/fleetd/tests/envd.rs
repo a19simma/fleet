@@ -21,7 +21,7 @@ use fleetd::envd::{
     ERR_ENV_DENIED, EnvDenied, EnvironmentClient, MAX_REDACT_LINES, ReleasedEnvironment,
 };
 use fleetd::poller::{JobRunner, Shutdown, channel};
-use fleetd::runner::{AgentRunner, Reporter, RunConfig};
+use fleetd::runner::{AgentRunner, JobEnd, Reporter, RunConfig};
 use fleetd::workspace::Workspace;
 use tokio::net::TcpListener;
 use tokio::sync::mpsc;
@@ -553,5 +553,72 @@ async fn no_value_reaches_tracing_on_either_path_and_the_capture_sees_the_denial
     let text = logs.text();
     assert!(text.contains(ERR_ENV_DENIED), "positive control: {text}");
     assert!(!text.contains(MARKER), "{text}");
+    Ok(())
+}
+
+#[derive(Debug)]
+struct OnTmpfs;
+
+impl fleetd::envd::MountCheck for OnTmpfs {
+    fn is_tmpfs(&self, _dir: std::os::fd::BorrowedFd<'_>) -> std::io::Result<bool> {
+        Ok(true)
+    }
+}
+
+#[tokio::test]
+async fn a_delivering_runner_holds_the_fetched_values_until_the_end_hook_shreds_them() -> TestResult
+{
+    use fleetd::envd::{EnvDelivery, Owner};
+    let (url, fake) = spawn_fake(Ok(reply_of(vec![secret("PVE_TOKEN", MARKER)]))).await?;
+    let client = EnvironmentClient::new(channel(&url)?, TOKEN)?;
+    let dir = tempfile::tempdir()?;
+    let seen = Arc::new(Mutex::new(Vec::<bool>::new()));
+    let slot: Arc<Mutex<Option<Arc<EnvDelivery>>>> = Arc::default();
+    let probe = {
+        let seen = Arc::clone(&seen);
+        let slot = Arc::clone(&slot);
+        Arc::new(move |id: &str| {
+            let held = slot
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .as_ref()
+                .is_some_and(|delivery| delivery.is_held(id));
+            seen.lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .push(held);
+        })
+    };
+    let delivery = Arc::new(
+        EnvDelivery::new(
+            dir.path(),
+            Owner {
+                uid: None,
+                gid: None,
+            },
+            Arc::new(OnTmpfs),
+        )?
+        .with_shred_probe(probe),
+    );
+    *slot.lock().unwrap_or_else(PoisonError::into_inner) = Some(Arc::clone(&delivery));
+    let (tx, mut reports) = mpsc::unbounded_channel();
+    let mut config = RunConfig::new("claude-fake", false);
+    config.report_interval = Duration::from_millis(50);
+    let agent = AgentRunner::new(config, Scripted { reports: tx }, Redactor::default())
+        .with_job_end(JobEnd::new().on_end(delivery.end_hook()));
+    let runner = DaemonRunner::new(Workspace::new(dir.path().join("jobs")), agent, BOX)
+        .with_environment(Arc::new(client))
+        .with_delivery(Arc::clone(&delivery));
+    let (_trigger, shutdown) = Shutdown::channel();
+    let result = tokio::time::timeout(
+        Duration::from_secs(10),
+        Box::pin(runner.run(pinned_job(), shutdown)),
+    )
+    .await?;
+    assert!(result.is_err());
+    assert_eq!(fake.calls.load(Ordering::SeqCst), 1);
+    assert_eq!(*seen.lock().unwrap_or_else(PoisonError::into_inner), [true]);
+    assert!(!delivery.is_held("job1"));
+    let last = terminal(&mut reports).ok_or("no terminal report")?;
+    assert_ne!(last.error.as_deref(), Some(ERR_ENV_DENIED));
     Ok(())
 }

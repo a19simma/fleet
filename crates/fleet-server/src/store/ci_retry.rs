@@ -6,6 +6,7 @@ use fleet_proto::v1::CiRetry;
 use sqlx::{Postgres, Transaction};
 
 use super::{StoreError, ci_retry_name};
+use crate::environments::{self, EnvPin};
 use crate::jobs::{expected_branch, fix_prompt};
 
 const SELECT_RETRY_ATTEMPT: &str = "SELECT ci_retry_attempt FROM jobs WHERE job_id = $1";
@@ -28,15 +29,18 @@ SELECT prompt FROM up WHERE parent_job_id IS NULL";
 
 const INSERT_FIX: &str = "\
 INSERT INTO jobs (job_id, idempotency_key, prompt, repo, base_ref, branch, open_pr, pr_url, \
-parent_job_id, ci_retry_attempt, user_id, agent) \
+parent_job_id, ci_retry_attempt, user_id, agent, environment_id, environment_version) \
 SELECT $1, $2, $3, p.repo, p.branch, p.branch, true, p.pr_url, p.job_id, p.ci_retry_attempt + 1, \
-p.user_id, p.agent \
+p.user_id, p.agent, p.environment_id, p.environment_version \
 FROM jobs p \
 WHERE p.job_id = $4 AND p.kind = 'agent' AND p.state = 'SUCCEEDED' AND p.open_pr \
 AND p.pr_url IS NOT NULL AND p.ci_state = 'failure' AND p.batch_id IS NULL \
 AND p.profile_name IS NULL AND p.branch = $5 AND p.branch ~ '^swarm/[A-Za-z0-9]{1,64}$' \
 ON CONFLICT DO NOTHING \
 RETURNING job_id";
+
+const PARENT_PIN: &str =
+    "SELECT user_id, environment_id, environment_version FROM jobs WHERE job_id = $1";
 
 const SELECT_FIX_CHILD: &str = "SELECT 1 FROM jobs WHERE parent_job_id = $1";
 
@@ -68,6 +72,24 @@ pub(super) async fn decide_ci_retry(
     Ok(())
 }
 
+async fn pin_inheritable(
+    tx: &mut Transaction<'_, Postgres>,
+    parent: &str,
+) -> Result<bool, StoreError> {
+    let (owner, id, version): (i64, Option<i64>, Option<i32>) = sqlx::query_as(PARENT_PIN)
+        .bind(parent)
+        .fetch_one(&mut **tx)
+        .await?;
+    let Some((environment_id, version)) = id.zip(version) else {
+        return Ok(true);
+    };
+    let pin = EnvPin {
+        environment_id,
+        version,
+    };
+    Ok(environments::pin_inheritable(tx, owner, pin).await?)
+}
+
 async fn submit_fix(
     tx: &mut Transaction<'_, Postgres>,
     parent: &str,
@@ -89,6 +111,9 @@ async fn submit_fix(
     let Some(root_id) = root_id else {
         return Ok(CiRetry::Ineligible);
     };
+    if !pin_inheritable(tx, parent).await? {
+        return Ok(CiRetry::EnvUnavailable);
+    }
     let inserted = sqlx::query(INSERT_FIX)
         .bind(id)
         .bind(ci_retry_key(parent, attempt))

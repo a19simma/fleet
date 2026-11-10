@@ -344,6 +344,7 @@ pub(crate) fn prepare(args: Submit, stdin: &mut impl Read) -> Result<SubmitBatch
         repeats: 0,
         profiles,
         agent: args.agent,
+        environment: String::new(),
     })
 }
 
