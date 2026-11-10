@@ -204,3 +204,43 @@ fn agent_unit_hides_the_setup_run_root() -> TestResult {
     );
     Ok(())
 }
+
+/// The body of the single-quoted `PY_ONLYLO` snippet in the probe script.
+fn onlylo_snippet(text: &str) -> Option<&str> {
+    let rest = text.split_once("PY_ONLYLO='")?.1;
+    Some(rest.split_once('\'')?.0)
+}
+
+#[test]
+fn net_lo_snippet_lists_interfaces_without_netlink() -> TestResult {
+    let text = fs::read_to_string(deploy().join("probe-env-setup.sh"))?;
+    let snippet = onlylo_snippet(&text).ok_or("PY_ONLYLO snippet not found")?;
+    assert!(
+        snippet.contains("interfaces="),
+        "snippet no longer prints the interface list: {snippet}"
+    );
+    let lowered = snippet.to_lowercase();
+    for banned in ["if_nameindex", "af_netlink", "netlink"] {
+        assert!(
+            !lowered.contains(banned),
+            "PY_ONLYLO uses {banned}, refused under RestrictAddressFamilies: {snippet}"
+        );
+    }
+    Ok(())
+}
+
+#[test]
+fn net_lo_probe_keeps_its_positive_control() -> TestResult {
+    let text = fs::read_to_string(deploy().join("probe-env-setup.sh"))?;
+    let (_, after) = text
+        .split_once("probe_net_lo() {")
+        .ok_or("probe_net_lo not found")?;
+    let body = after
+        .split_once("\n}\n")
+        .ok_or("probe_net_lo unterminated")?
+        .0;
+    assert!(body.contains("CTRL_OV=(PrivateNetwork=)"), "{body}");
+    assert!(body.contains("TEST_OV=()"), "{body}");
+    assert!(body.contains("net-lo-only yes"), "{body}");
+    Ok(())
+}

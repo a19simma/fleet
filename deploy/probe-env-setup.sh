@@ -272,8 +272,15 @@ except OSError:
     pass
 print("uid=%d gid=%d umask-mode=%s" % (os.getuid(), os.getgid(), oct(mode) if mode is not None else "none"))
 sys.exit(10 if uid_ok and gid_ok and mode == 0o600 else 11)'
-PY_ONLYLO='import socket,sys
-names = [n for _, n in socket.if_nameindex()]
+PY_ONLYLO='import array,fcntl,socket,struct,sys
+s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+buf = array.array("B", bytes(4096))
+addr, _ = buf.buffer_info()
+out = fcntl.ioctl(s.fileno(), 0x8912, struct.pack("iL", len(buf), addr))
+used = struct.unpack("iL", out)[0]
+raw = buf.tobytes()[:used]
+step = 40 if struct.calcsize("P") == 8 else 32
+names = sorted({raw[i:i + 16].split(b"\0")[0].decode() for i in range(0, used, step)})
 print("interfaces=" + ",".join(names))
 sys.exit(10 if names == ["lo"] else 11)'
 PY_CONNECT='import socket,sys
