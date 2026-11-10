@@ -2,6 +2,7 @@
 //! `FleetBatches` and `FleetCredentials` gRPC handlers.
 
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::Duration;
 
 use fleet_core::graph;
@@ -81,15 +82,19 @@ use tower::layer::util::{Identity, Stack};
 
 use crate::auth::{ADMIN_REQUIRED, BearerAuth, Caller};
 use crate::catalog;
+use crate::config::Config;
 use crate::cred::capability::{self, Capabilities};
-use crate::cred::{CredentialService, RepoService};
+use crate::cred::limiter::Limiter;
+use crate::cred::password::BootstrapPassword;
+use crate::cred::{CredentialService, RepoService, Users};
 use crate::environments::EnvironmentService;
 use crate::jobs::validate_job_id;
 use crate::profiles::{self, ProfileContent, ProfileFault, Viewer};
 use crate::store::{Store, StoreError, WorkFault};
+use crate::supervise::BoxError;
 use crate::timing;
 use crate::update_feed::FeedCache;
-use crate::web::{Dispatch, HEADER_READ_TIMEOUT, Web, serve};
+use crate::web::{Dispatch, HEADER_READ_TIMEOUT, Web, WebAuth, serve};
 use fleet_proto::MAX_PROFILE_MESSAGE_BYTES;
 
 /// Where an [`UpdateRelay`] gets the pair it passes on.
@@ -1801,6 +1806,44 @@ pub async fn serve_with_credentials(
         shutdown,
     )
     .await
+}
+
+/// Builds the web router from `config`: login off without `FLEET_WEB_ORIGIN`, otherwise the
+/// console pages and, when `environments` is set, the environment pages (ADR-0067).
+///
+/// # Errors
+///
+/// Returns the error from [`WebAuth::new`] when the origin or relying party id is invalid.
+pub fn build_web(
+    config: &Config,
+    pool: &sqlx::PgPool,
+    users: &Users,
+    credentials: Option<CredentialService>,
+    environments: Option<EnvironmentService>,
+    store: Store,
+    password: BootstrapPassword,
+) -> Result<Web, BoxError> {
+    let Some(origin) = config.web_origin.as_deref() else {
+        tracing::warn!("FLEET_WEB_ORIGIN is unset: web login is off");
+        return Ok(Web::new());
+    };
+    let auth = WebAuth::new(
+        pool.clone(),
+        users.clone(),
+        origin,
+        config.web_rp_id.as_deref(),
+    )?
+    .with_bootstrap(
+        password,
+        Arc::new(Limiter::system()),
+        config.trusted_proxy_hops,
+    );
+    Ok(Web::with_environments(
+        auth,
+        credentials,
+        environments,
+        store,
+    ))
 }
 
 /// Same as [`serve_with_credentials`] with the Environment RPCs backed by `environments`.
