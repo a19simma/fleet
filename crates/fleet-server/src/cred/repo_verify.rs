@@ -244,6 +244,7 @@ impl GithubVerifier {
                 host: api_host,
                 path: &path,
                 allow_private: host.allow_private,
+                approved_ips: &[],
                 authorization: Some(&authorization),
                 accept: "application/json",
             })
@@ -918,6 +919,7 @@ mod tests {
                     host: "h",
                     path: "/",
                     allow_private: false,
+                    approved_ips: &[],
                     authorization: Some(&header),
                     accept: "application/json",
                 }
