@@ -11,10 +11,13 @@ use std::ffi::OsString;
 use std::sync::{Arc, PoisonError};
 
 use fleet_core::Redactor;
+use fleet_proto::v1 as pb;
+use fleet_proto::v1::Job;
 use tokio::process::Command;
 
 use crate::agent_config::{JOB_EMAIL, JOB_NAME};
 use crate::cred::{CredentialFailure, JobCredentials, LeaseFuture, LeasedToken, TokenSource};
+use crate::envd::{NOTE_COVERAGE_REDUCED, ReleasedEnvironment};
 use crate::runner::{AgentRunner, Reporter};
 
 /// The [`TokenSource`] of one job.
@@ -146,7 +149,7 @@ impl<R: Reporter> AgentRunner<R> {
     pub(crate) fn apply_model_env(
         &self,
         env: &mut std::collections::BTreeMap<OsString, OsString>,
-        job: &fleet_proto::v1::Job,
+        job: &Job,
     ) {
         let Some(book) = &self.credentials else {
             return;
@@ -206,6 +209,30 @@ impl<R: Reporter> AgentRunner<R> {
             .insert(job_id.to_owned(), merged);
     }
 
+    /// Merges the redactor of `environment` into the job's redactor until
+    /// [`AgentRunner::end_job`], and queues the [`NOTE_COVERAGE_REDUCED`] job note when the line
+    /// limit cut its coverage.
+    pub(crate) fn adopt_environment(&self, job: &Job, environment: &ReleasedEnvironment) {
+        let redaction = environment.redaction();
+        let merged = Arc::new(self.job_redactor(&job.job_id).merged(&redaction.redactor));
+        self.job_redactors
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .insert(job.job_id.clone(), merged);
+        if redaction.reduced {
+            self.notes
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .entry(Self::carry_key(job))
+                .or_default()
+                .push(pb::JobEvent {
+                    kind: pb::JobEventKind::Phase.into(),
+                    detail: Some(NOTE_COVERAGE_REDUCED.to_owned()),
+                    ..pb::JobEvent::default()
+                });
+        }
+    }
+
     /// The redactor for output of `job_id`: the runner's merged with the job's credentials.
     pub(crate) fn job_redactor(&self, job_id: &str) -> Arc<Redactor> {
         let held = self
@@ -244,6 +271,7 @@ mod tests {
 
     use crate::agent_config::{JOB_EMAIL, JOB_NAME};
     use crate::cred::{CredentialBook, CredentialClient, CredentialFailure};
+    use crate::envd::{NOTE_COVERAGE_REDUCED, ReleasedEnvironment};
     use crate::poller::channel;
     use crate::runner::Ctl;
     use crate::runner::ci::{PollStop, Watched};
@@ -547,6 +575,45 @@ mod tests {
                 "[REDACTED] [REDACTED]"
             );
         }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn adopting_an_environment_masks_its_lines_and_notes_a_cut_once_per_job()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (runner, book, _dir) = fixture(true).await?;
+        let held = book.get("job1").ok_or("held")?;
+        runner.adopt_credentials("job1", &held);
+        let job = Job {
+            job_id: "job1".into(),
+            attempt: 1,
+            ..Job::default()
+        };
+        let secret = |value: &str| fleet_proto::v1::JobEnvironmentSecret {
+            name: "KEY".into(),
+            value: value.into(),
+            ..Default::default()
+        };
+        let env = |value: &str| {
+            ReleasedEnvironment::from_reply(fleet_proto::v1::GetJobEnvironmentReply {
+                secrets: vec![secret(value)],
+                ..Default::default()
+            })
+        };
+        runner.adopt_environment(&job, &env("first-line-xx\nsecond-line-yy"));
+        let redactor = runner.job_redactor("job1");
+        assert_eq!(redactor.redact_str("a first-line-xx b"), "a [REDACTED] b");
+        let gh = held.github_str().ok_or("github")?;
+        assert_eq!(redactor.redact_str(gh), "[REDACTED]");
+        assert_eq!(runner.take_notes(&job), Vec::new());
+        let many = (0..=crate::envd::MAX_REDACT_LINES)
+            .map(|i| format!("line-number-{i:06}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        runner.adopt_environment(&job, &env(&many));
+        let notes = runner.take_notes(&job);
+        assert_eq!(notes.len(), 1);
+        assert_eq!(notes[0].detail.as_deref(), Some(NOTE_COVERAGE_REDUCED));
         Ok(())
     }
 
