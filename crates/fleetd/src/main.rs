@@ -12,6 +12,7 @@ use std::time::Duration;
 use clap::{Parser, Subcommand};
 use fleetd::agent_exec::{MISE_BINARY, MISE_OWNER_UID, exec_job, exec_tool_install};
 use fleetd::broker::Denial;
+use fleetd::env_launcher::{DEFAULT_RUN_ROOT, exec_env_setup};
 use fleetd::fetch_policy::MAX_URL_BYTES;
 use fleetd::jobsock::{ServiceName, connect, read_frame, socket_path, write_frame};
 use fleetd::systemd::DEFAULT_RUN_DIR;
@@ -89,6 +90,16 @@ enum Command {
         id: String,
         /// Parent of the per-job run directories.
         #[arg(long, default_value = DEFAULT_RUN_DIR)]
+        run_dir: PathBuf,
+    },
+    /// Run one Environment setup step for a job inside the Setup unit, with its output sent to
+    /// the daemon over the step socket. Exits with the step's exit code, or 2 when the step
+    /// cannot start.
+    EnvSetupExec {
+        /// Job id.
+        id: String,
+        /// Parent of the per-job setup directories.
+        #[arg(long, default_value = DEFAULT_RUN_ROOT)]
         run_dir: PathBuf,
     },
     /// Count this start of the current version and roll back to the previous one when it never
@@ -200,6 +211,10 @@ async fn execute(cli: Cli) -> Result<ExitCode, Error> {
                 Err(message) => message,
             };
             eprintln!("fleetd tool-install-exec: {message}");
+            Ok(ExitCode::from(2))
+        }
+        Command::EnvSetupExec { id, run_dir } => {
+            eprintln!("fleetd env-setup-exec: {}", exec_env_setup(&run_dir, &id));
             Ok(ExitCode::from(2))
         }
         Command::PueueCallback { id, group } => {

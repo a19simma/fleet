@@ -622,3 +622,28 @@ async fn a_delivering_runner_holds_the_fetched_values_until_the_end_hook_shreds_
     assert_ne!(last.error.as_deref(), Some(ERR_ENV_DENIED));
     Ok(())
 }
+
+#[test]
+fn a_script_timeout_is_clamped_to_one_through_the_adr_maximum() {
+    use fleet_proto::v1::{EnvironmentScriptSpec, GetJobEnvironmentReply};
+    let reply = |timeout_s| GetJobEnvironmentReply {
+        scripts: vec![EnvironmentScriptSpec {
+            name: "s".to_owned(),
+            body: "#!/bin/sh\n".to_owned(),
+            timeout_s,
+            ..EnvironmentScriptSpec::default()
+        }],
+        ..GetJobEnvironmentReply::default()
+    };
+    let got = |timeout_s| {
+        ReleasedEnvironment::from_reply(reply(timeout_s)).scripts()[0]
+            .timeout
+            .as_secs()
+    };
+    assert_eq!(got(Some(0)), 1);
+    assert_eq!(got(Some(1)), 1);
+    assert_eq!(got(Some(600)), 600);
+    assert_eq!(got(Some(601)), 600);
+    assert_eq!(got(Some(u32::MAX)), 600);
+    assert_eq!(got(None), 120);
+}

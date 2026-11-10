@@ -5,6 +5,7 @@
     reason = "unreachable_pub forbids plain pub in a private module"
 )]
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -24,7 +25,11 @@ use crate::broker::{Broker, BrokerError, GhCli, MirrorGit};
 use crate::config::Config;
 use crate::connect_proxy::{ConnectProxy, ProxyLimits};
 use crate::cred::{CredentialBook, CredentialClient, ERR_NO_AGENT};
-use crate::env_setup::{ERR_SETUP_UNAVAILABLE, EnvSetup, PHASE_SETUP, UnavailableLauncher};
+use crate::env_launcher::{DEFAULT_RUN_ROOT, SystemdSetupLauncher};
+use crate::env_setup::{
+    DEFAULT_BUDGET, ERR_SETUP_UNAVAILABLE, EgressHook, EnvSetup, PHASE_SETUP, SetupLauncher,
+    UnavailableLauncher,
+};
 use crate::envd::{
     ERR_ENV_DENIED, EnvDelivery, EnvironmentClient, Owner, ReleasedEnvironment, StatfsCheck,
 };
@@ -42,7 +47,7 @@ use crate::runner::{
     TimingWiring, ToolPreflight,
 };
 use crate::systemd::{
-    DEFAULT_RUN_DIR, HostsHook, select_launcher_delivering, select_tool_installer,
+    DEFAULT_RUN_DIR, HostsHook, JobSocketSetup, select_launcher_delivering, select_tool_installer,
 };
 use crate::telemetry::{FetchPhase, FetchRecordError};
 use crate::toolhook::HookHub;
@@ -53,8 +58,6 @@ use crate::workspace::{RepoPolicy, Workspace, broker_scratch_path, job_owner};
 const ERR_WORKSPACE: &str = "workspace could not be prepared";
 const ERR_PREPARE_TIMEOUT: &str = "workspace preparation timed out";
 const ERR_SHUTDOWN: &str = "agent stopped by daemon shutdown";
-/// Run root of the Setup unit input directories.
-const SETUP_RUN_DIR: &str = "/run/fleet-env";
 const ERR_BROKER: &str = "job broker could not be set up";
 
 /// The poller the daemon runs.
@@ -853,21 +856,71 @@ fn pueue_cli(env: &dyn Fn(&str) -> Option<String>, dirs: &[&str]) -> Option<Pueu
     Some(PueueCli::new(bin, vars))
 }
 
-fn setup_wiring(
+/// What the Setup driver needs from the daemon: how scripts start, where their directories
+/// live, what the declared egress hosts feed and which job socket services their unit may use.
+pub(crate) struct SetupSeams<'a> {
+    pub(crate) launcher: AgentLauncher,
+    pub(crate) systemctl: &'a Path,
+    pub(crate) run_root: &'a Path,
+    pub(crate) services: &'a Services,
+    pub(crate) hosts: HostsHook,
+}
+
+fn setup_launcher(seams: &SetupSeams<'_>, job_gid: Option<u32>) -> Arc<dyn SetupLauncher> {
+    if seams.launcher != AgentLauncher::Systemd {
+        return Arc::new(UnavailableLauncher);
+    }
+    let egress: Services = seams
+        .services
+        .get(&ServiceName::EgressProxy)
+        .map(|service| HashMap::from([(ServiceName::EgressProxy, Arc::clone(service))]))
+        .unwrap_or_default();
+    let mut launcher =
+        SystemdSetupLauncher::new(seams.systemctl, seams.run_root).with_job_gid(job_gid);
+    if !egress.is_empty() {
+        launcher = launcher.with_job_socket(JobSocketSetup::new(egress));
+    }
+    Arc::new(launcher)
+}
+
+fn production_setup(
+    config: &Config,
+    end: JobEnd,
+    delivery: Option<&Arc<EnvDelivery>>,
+    job_gid: Option<u32>,
+    services: &Services,
+    hosts: HostsHook,
+) -> (JobEnd, Option<Arc<EnvSetup>>) {
+    let seams = SetupSeams {
+        launcher: config.agent_launcher,
+        systemctl: &config.systemctl_path,
+        run_root: Path::new(DEFAULT_RUN_ROOT),
+        services,
+        hosts,
+    };
+    setup_wiring(end, delivery, job_gid, &seams)
+}
+
+pub(crate) fn setup_wiring(
     mut end: JobEnd,
     delivery: Option<&Arc<EnvDelivery>>,
     job_gid: Option<u32>,
+    seams: &SetupSeams<'_>,
 ) -> (JobEnd, Option<Arc<EnvSetup>>) {
     let Some(delivery) = delivery else {
         return (end, None);
     };
+    let hosts = Arc::clone(&seams.hosts);
+    let egress: EgressHook = Arc::new(move |job_id, declared| hosts(job_id, declared));
     let setup = Arc::new(
         EnvSetup::new(
-            Arc::new(UnavailableLauncher),
+            setup_launcher(seams, job_gid),
             Arc::clone(delivery),
-            SETUP_RUN_DIR,
+            seams.run_root,
         )
-        .with_job_gid(job_gid),
+        .with_job_gid(job_gid)
+        .with_budget(DEFAULT_BUDGET)
+        .with_egress(egress),
     );
     end = end.on_end(delivery.end_hook());
     let ended = Arc::clone(&setup);
@@ -936,27 +989,23 @@ pub(crate) fn build(
     let hosts: HostsHook = Arc::new(move |job_id, hosts| {
         proxy.set_job_hosts(job_id, hosts);
     });
-    let preflight = tool_preflight(config, run.job_gid, wired.services.clone(), Some(hosts))?;
+    let gid = run.job_gid;
+    let preflight = tool_preflight(config, gid, wired.services.clone(), Some(hosts.clone()))?;
     let delivery = env_delivery(config, run.job_gid)?;
-    let launcher =
-        select_launcher_delivering(config, run.job_gid, wired.services, delivery.clone());
-    let wiring = BrokerWiring {
-        registry: wired.broker,
-        launcher: config.agent_launcher,
-        gh_bin: config.gh_bin.clone(),
-        host: run
-            .repo_policy
-            .token_host()
-            .unwrap_or("github.com")
-            .to_owned(),
-        token: String::new(),
-        redactor: redactor.clone(),
-    };
-    let (end, setup) = setup_wiring(
-        wired.end.on_end(book.end_hook()),
-        delivery.as_ref(),
-        run.job_gid,
+    let services = wired.services.clone();
+    let launcher = select_launcher_delivering(config, run.job_gid, services, delivery.clone());
+    let host = run.repo_policy.token_host().unwrap_or("github.com");
+    let wiring = BrokerWiring::new(
+        wired.broker,
+        config.agent_launcher,
+        config.gh_bin.clone(),
+        host.to_owned(),
+        String::new(),
+        redactor.clone(),
     );
+    let end = wired.end.on_end(book.end_hook());
+    let (end, setup) =
+        production_setup(config, end, delivery.as_ref(), gid, &wired.services, hosts);
     let mut agent = AgentRunner::new(run, reporter, redactor)
         .with_hook_hub(hub)
         .with_launcher(launcher);
@@ -3456,5 +3505,150 @@ mod token_wiring_tests {
         let tokens = std::fs::read_to_string(scratch.join("tokens"))?;
         assert_eq!(tokens.lines().collect::<Vec<_>>(), [OLD, NEW]);
         Ok(())
+    }
+
+    mod setup_wiring_tests {
+        use std::os::unix::fs::PermissionsExt;
+        use std::sync::Mutex;
+
+        use tempfile::TempDir;
+
+        use fleet_proto::v1::{EnvironmentOnFail, EnvironmentScriptSpec, GetJobEnvironmentReply};
+
+        use super::*;
+        use crate::envd::{MountCheck, Owner, ReleasedEnvironment};
+
+        const JOB: &str = "job1";
+
+        #[derive(Debug)]
+        struct Tmpfs;
+
+        impl MountCheck for Tmpfs {
+            fn is_tmpfs(&self, _: std::os::fd::BorrowedFd<'_>) -> std::io::Result<bool> {
+                Ok(true)
+            }
+        }
+
+        type Seen = Arc<Mutex<Vec<(String, Vec<String>)>>>;
+
+        struct Rig {
+            dir: TempDir,
+            seen: Seen,
+            delivery: Arc<EnvDelivery>,
+        }
+
+        impl Rig {
+            fn new() -> Self {
+                let dir = TempDir::new().unwrap();
+                let ctl = dir.path().join("systemctl");
+                std::fs::write(
+                    &ctl,
+                    "#!/bin/sh\necho \"$@\" >> \"$(dirname \"$0\")/log\"\nexit 1\n",
+                )
+                .unwrap();
+                std::fs::set_permissions(&ctl, std::fs::Permissions::from_mode(0o755)).unwrap();
+                let root = dir.path().join("run");
+                std::fs::create_dir_all(&root).unwrap();
+                let delivery = Arc::new(
+                    EnvDelivery::new(
+                        &root,
+                        Owner {
+                            uid: None,
+                            gid: None,
+                        },
+                        Arc::new(Tmpfs),
+                    )
+                    .unwrap(),
+                );
+                delivery.hold(
+                    JOB,
+                    ReleasedEnvironment::from_reply(GetJobEnvironmentReply {
+                        scripts: vec![EnvironmentScriptSpec {
+                            name: "one".to_owned(),
+                            body: "#!/bin/sh\ntrue\n".to_owned(),
+                            on_fail: EnvironmentOnFail::Abort.into(),
+                            timeout_s: Some(5),
+                        }],
+                        egress_hosts: vec!["example.test".to_owned()],
+                        ..GetJobEnvironmentReply::default()
+                    }),
+                );
+                Self {
+                    dir,
+                    seen: Arc::default(),
+                    delivery,
+                }
+            }
+
+            fn wire(&self, launcher: AgentLauncher) -> Arc<EnvSetup> {
+                let seen = Arc::clone(&self.seen);
+                let hosts: HostsHook = Arc::new(move |job, declared| {
+                    seen.lock().unwrap().push((
+                        job.to_owned(),
+                        declared.iter().map(|host| (*host).to_owned()).collect(),
+                    ));
+                });
+                let ctl = self.dir.path().join("systemctl");
+                let run_root = self.dir.path().join("env");
+                std::fs::create_dir_all(&run_root).unwrap();
+                let services = Services::new();
+                let seams = SetupSeams {
+                    launcher,
+                    systemctl: &ctl,
+                    run_root: &run_root,
+                    services: &services,
+                    hosts,
+                };
+                let (_, setup) =
+                    setup_wiring(JobEnd::default(), Some(&self.delivery), None, &seams);
+                setup.unwrap()
+            }
+
+            fn log(&self) -> String {
+                std::fs::read_to_string(self.dir.path().join("log")).unwrap_or_default()
+            }
+        }
+
+        #[tokio::test]
+        async fn systemd_wires_the_real_launcher_and_a_unit_that_cannot_start_fails_the_job() {
+            let rig = Rig::new();
+            let setup = rig.wire(AgentLauncher::Systemd);
+            let report = setup.run(JOB, &Redactor::default()).await;
+            assert_eq!(report.failed.as_deref(), Some("one"), "{:?}", report.notes);
+            assert!(
+                rig.log()
+                    .contains("start --no-block fleet-env@job1.service"),
+                "{}",
+                rig.log()
+            );
+        }
+
+        #[tokio::test]
+        async fn direct_keeps_the_unavailable_launcher() {
+            let rig = Rig::new();
+            let setup = rig.wire(AgentLauncher::Direct);
+            let report = setup.run(JOB, &Redactor::default()).await;
+            assert_eq!(report.failed.as_deref(), Some("one"), "{:?}", report.notes);
+            assert_eq!(rig.log(), "");
+        }
+
+        #[tokio::test]
+        async fn the_declared_egress_hosts_reach_the_hosts_hook_before_the_first_step() {
+            let rig = Rig::new();
+            let setup = rig.wire(AgentLauncher::Systemd);
+            let _ = setup.run(JOB, &Redactor::default()).await;
+            let seen = rig.seen.lock().unwrap().clone();
+            assert_eq!(
+                seen,
+                vec![(JOB.to_owned(), vec!["example.test".to_owned()])]
+            );
+        }
+
+        #[tokio::test]
+        async fn the_whole_run_budget_is_the_adr_total() {
+            let rig = Rig::new();
+            let setup = rig.wire(AgentLauncher::Systemd);
+            assert_eq!(setup.budget(), Some(Duration::from_secs(1200)));
+        }
     }
 }

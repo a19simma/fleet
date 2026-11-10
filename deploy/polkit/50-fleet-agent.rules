@@ -10,7 +10,8 @@ polkit.addRule(function(action, subject) {
     var verbs = ["start", "stop", "kill", "reset-failed"];
     if (unit && verb &&
         (/^fleet-agent@[A-Za-z0-9_]{1,64}\.service$/.test(unit) ||
-         /^fleet-tool-install@[A-Za-z0-9_]{1,64}\.service$/.test(unit)) &&
+         /^fleet-tool-install@[A-Za-z0-9_]{1,64}\.service$/.test(unit) ||
+         /^fleet-env@[A-Za-z0-9_]{1,64}\.service$/.test(unit)) &&
         verbs.indexOf(verb) !== -1) {
         return polkit.Result.YES;
     }

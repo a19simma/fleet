@@ -5,6 +5,7 @@ After=fleetd.service
 ConditionPathExists=/run/fleet-env/%i
 
 [Service]
+Slice=system-fleet\x2denv.slice
 Type=oneshot
 RemainAfterExit=yes
 User=fleet-job
@@ -35,3 +36,4 @@ InaccessiblePaths=-/var/run/docker.sock
 TemporaryFileSystem=/run/fleet:ro
 TemporaryFileSystem=/run/fleet-env:ro
 BindReadOnlyPaths=/run/fleet-env/%i
+BindPaths=/run/fleet-env/%i/out

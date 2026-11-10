@@ -2189,12 +2189,14 @@ fn env_unit_differs_from_the_tool_install_unit_only_where_allowed() {
     only_env.sort();
     only_install.sort();
     let want_env = [
+        "BindPaths=/run/fleet-env/%i/out",
         "BindReadOnlyPaths=/run/fleet-env/%i",
         "ConditionPathExists=/run/fleet-env/%i",
         "Description=Fleet environment setup for job %i",
         "Environment=HOME=/run/fleet-env/%i",
         "ExecStart=/usr/local/bin/fleetd env-setup-exec %i",
         "RuntimeMaxSec=20min",
+        "Slice=system-fleet\\x2denv.slice",
         "TemporaryFileSystem=/run/fleet-env:ro",
         "UMask=0077",
     ];

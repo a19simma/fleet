@@ -536,12 +536,22 @@ impl SystemdLauncher {
 }
 
 #[derive(Debug, Clone)]
-struct Ctl {
+pub(crate) struct Ctl {
     systemctl: PathBuf,
 }
 
 impl Ctl {
-    fn command(&self, args: &[&str]) -> Command {
+    pub(crate) fn new(systemctl: impl Into<PathBuf>) -> Self {
+        Self {
+            systemctl: systemctl.into(),
+        }
+    }
+
+    pub(crate) fn is_absolute(&self) -> bool {
+        self.systemctl.is_absolute()
+    }
+
+    pub(crate) fn command(&self, args: &[&str]) -> Command {
         let mut command = Command::new(&self.systemctl);
         command
             .args(args)
@@ -552,7 +562,7 @@ impl Ctl {
         command
     }
 
-    fn run(&self, args: &[&str]) -> io::Result<()> {
+    pub(crate) fn run(&self, args: &[&str]) -> io::Result<()> {
         if self.command(args).status()?.success() {
             Ok(())
         } else {
@@ -560,7 +570,7 @@ impl Ctl {
         }
     }
 
-    async fn show(&self, unit: &str) -> io::Result<String> {
+    pub(crate) async fn show(&self, unit: &str) -> io::Result<String> {
         let mut command = tokio::process::Command::from(self.command(&[
             "show",
             unit,
@@ -583,6 +593,24 @@ impl Ctl {
             return Err(io::Error::from(io::ErrorKind::InvalidData));
         }
         String::from_utf8(out.stdout).map_err(|_| io::Error::from(io::ErrorKind::InvalidData))
+    }
+
+    pub(crate) async fn control_group(&self, unit: &str) -> io::Result<String> {
+        let mut command =
+            tokio::process::Command::from(self.command(&["show", unit, "-p", "ControlGroup"]));
+        command.stdout(Stdio::piped()).kill_on_drop(true);
+        let out = tokio::time::timeout(CALL_TIMEOUT, command.output())
+            .await
+            .map_err(|_| io::Error::from(io::ErrorKind::TimedOut))??;
+        if !out.status.success() || out.stdout.len() > SHOW_CAP {
+            return Err(io::Error::from(io::ErrorKind::InvalidData));
+        }
+        let text = String::from_utf8(out.stdout)
+            .map_err(|_| io::Error::from(io::ErrorKind::InvalidData))?;
+        text.lines()
+            .find_map(|line| line.strip_prefix("ControlGroup="))
+            .map(str::to_owned)
+            .ok_or_else(|| io::Error::from(io::ErrorKind::InvalidData))
     }
 
     async fn start(&self, unit: &str) -> io::Result<()> {
@@ -672,7 +700,7 @@ impl SystemdLauncher {
 ///
 /// The group change follows the bind, so the socket briefly keeps the fleetd group. The run dir
 /// is mode-restricted, so no job uid can reach it in that window.
-fn bind_socket(
+pub(crate) fn bind_socket(
     setup: Option<&JobSocketSetup>,
     run_dir: &Path,
     gid: Option<u32>,
@@ -986,7 +1014,7 @@ impl Drop for SystemdProc {
 }
 
 #[derive(Debug, PartialEq, Eq)]
-enum Show {
+pub(crate) enum Show {
     Running,
     Idle,
     Ended(ExitStatus),
@@ -996,7 +1024,7 @@ fn bad() -> io::Error {
     io::Error::from(io::ErrorKind::InvalidData)
 }
 
-fn parse_show(text: &str, sent: i32) -> io::Result<Show> {
+pub(crate) fn parse_show(text: &str, sent: i32) -> io::Result<Show> {
     let (mut state, mut sub, mut result, mut code, mut status) = (None, None, None, None, None);
     for line in text.lines().filter(|line| !line.is_empty()) {
         let (key, value) = line.split_once('=').ok_or_else(bad)?;

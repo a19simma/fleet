@@ -30,7 +30,7 @@ use rustix::fs::{
 };
 use rustix::io::Errno;
 
-use fleet_core::environment::{DEFAULT_TIMEOUT_S, Delivery};
+use fleet_core::environment::{DEFAULT_TIMEOUT_S, Delivery, MAX_SCRIPT_TIMEOUT_S};
 use fleet_core::{MIN_SECRET_LEN, Redactor};
 use fleet_proto::ERR_ENV_RELEASE_DENIED;
 use fleet_proto::v1::fleet_worker_client::FleetWorkerClient;
@@ -161,7 +161,10 @@ impl ReleasedEnvironment {
                 body: script.body,
                 abort: script.on_fail != i32::from(EnvironmentOnFail::Continue),
                 timeout: Duration::from_secs(u64::from(
-                    script.timeout_s.unwrap_or(DEFAULT_TIMEOUT_S),
+                    script
+                        .timeout_s
+                        .unwrap_or(DEFAULT_TIMEOUT_S)
+                        .clamp(1, MAX_SCRIPT_TIMEOUT_S),
                 )),
             })
             .collect();
@@ -706,6 +709,71 @@ impl EnvDelivery {
         .map_err(io_err)
     }
 
+    /// Writes the setup-only secrets of `job_id` (those the agent may not see) as one file per
+    /// name under `<job_dir>/secrets`, the group modes of [`Owner`]. A job with none gets no
+    /// directory. A failure removes what it wrote. `job_dir` must already exist.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DeliveryError`]. Every refusal happens before any file is created.
+    pub fn write_setup_secrets(&self, job_id: &str, job_dir: &Path) -> Result<(), DeliveryError> {
+        validate_job_id(job_id).map_err(|_| DeliveryError::BadPath)?;
+        if !absolute_plain(job_dir) {
+            return Err(DeliveryError::BadPath);
+        }
+        let files: Vec<(String, Zeroizing<String>)> = {
+            let held = lock(&self.held);
+            let Some(env) = held.get(job_id) else {
+                return Ok(());
+            };
+            let mut files = Vec::new();
+            for (name, value, visible, _) in env.entries() {
+                if visible {
+                    continue;
+                }
+                if !valid_secret_name(name) {
+                    return Err(DeliveryError::InvalidName);
+                }
+                files.push((name.to_owned(), Zeroizing::new(value.to_owned())));
+            }
+            drop(held);
+            files
+        };
+        if files.is_empty() {
+            return Ok(());
+        }
+        let job = open_root(job_dir).map_err(io_err)?;
+        mkdirat(job.as_fd(), SETUP_SECRETS_DIR, self.owner.dir_mode()).map_err(io_err)?;
+        let written = self.fill_secrets(job.as_fd(), &files);
+        if written.is_err() {
+            let _ = remove_entry(job.as_fd(), SETUP_SECRETS_DIR, 0);
+        }
+        written
+    }
+
+    fn fill_secrets(
+        &self,
+        job: BorrowedFd<'_>,
+        files: &[(String, Zeroizing<String>)],
+    ) -> Result<(), DeliveryError> {
+        let dir = open_dir_at(job, SETUP_SECRETS_DIR).map_err(io_err)?;
+        self.chown(dir.as_fd())?;
+        for (name, value) in files {
+            let fd = openat(
+                dir.as_fd(),
+                name.as_str(),
+                OFlags::WRONLY | OFlags::CREATE | OFlags::EXCL | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+                self.owner.file_mode(),
+            )
+            .map_err(io_err)?;
+            self.chown(fd.as_fd())?;
+            let mut file = std::fs::File::from(fd);
+            file.write_all(value.as_bytes()).map_err(io_err)?;
+            file.sync_all().map_err(io_err)?;
+        }
+        Ok(())
+    }
+
     /// Shreds the tree of `job_id`, then drops what is held for it. Idempotent.
     pub fn end(&self, job_id: &str) {
         if validate_job_id(job_id).is_ok() {
@@ -721,6 +789,59 @@ impl EnvDelivery {
     pub fn end_hook(self: &Arc<Self>) -> impl Fn(&str) + Send + Sync + 'static {
         let this = Arc::clone(self);
         move |job_id| this.end(job_id)
+    }
+}
+
+/// Name of the setup-only secret directory inside a setup job directory.
+pub const SETUP_SECRETS_DIR: &str = "secrets";
+
+const SETUP_ASIDE_PREFIX: &str = ".shred-";
+
+/// Shreds `<root>/<job_id>` relative to open directory handles.
+///
+/// Renames it aside, zero-overwrites every regular file, then unlinks the tree. A symlink at
+/// that name is unlinked as a link and never followed. A missing directory does nothing.
+pub fn shred_setup_dir(root: &Path, job_id: &str) {
+    if validate_job_id(job_id).is_err() {
+        return;
+    }
+    let Ok(root) = open_root(root) else {
+        return;
+    };
+    shred_setup_entry(root.as_fd(), job_id);
+}
+
+fn shred_setup_entry(root: BorrowedFd<'_>, job_id: &str) {
+    let aside = format!("{SETUP_ASIDE_PREFIX}{job_id}");
+    let _ = remove_entry(root, &aside, 0);
+    if renameat(root, job_id, root, aside.as_str()).is_ok() {
+        let _ = remove_entry(root, &aside, 0);
+    } else {
+        let _ = remove_entry(root, job_id, 0);
+    }
+}
+
+/// Shreds every entry of the setup root `root` that no live Job owns.
+///
+/// That is a directory or link named like a Job id for which `live` is false, and every
+/// leftover rename-aside. Entries with other names are left alone. A missing root does nothing.
+pub fn sweep_setup_root(root: &Path, live: &dyn Fn(&str) -> bool) {
+    let Ok(dir) = open_root(root) else {
+        return;
+    };
+    let Ok(entries) = Dir::read_from(dir.as_fd()) else {
+        return;
+    };
+    let names: Vec<String> = entries
+        .filter_map(Result::ok)
+        .map(|entry| entry.file_name().to_string_lossy().into_owned())
+        .collect();
+    for name in names {
+        if name.starts_with(SETUP_ASIDE_PREFIX) {
+            let _ = remove_entry(dir.as_fd(), &name, 0);
+        } else if validate_job_id(&name).is_ok() && !live(&name) {
+            shred_setup_entry(dir.as_fd(), &name);
+        }
     }
 }
 

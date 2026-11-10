@@ -432,7 +432,7 @@ pub fn apply_proxy_env(command: &mut Command, proxy: &str) {
     }
 }
 
-fn exit_code(status: ExitStatus) -> i32 {
+pub(crate) fn exit_code(status: ExitStatus) -> i32 {
     status
         .code()
         .or_else(|| status.signal().map(|signal| 128 + signal))

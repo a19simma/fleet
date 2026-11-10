@@ -22,7 +22,7 @@ use std::fmt;
 use std::fs;
 use std::future::Future;
 use std::io::{self, Write};
-use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
+use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -30,11 +30,11 @@ use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
 use fleet_core::Redactor;
-use fleet_core::environment::MAX_SECRET_BYTES;
+use fleet_core::environment::{MAX_SECRET_BYTES, MAX_SETUP_TOTAL_S};
 use fleet_core::text::{Cap, sanitise_lines};
 use tokio::io::{AsyncRead, AsyncReadExt};
 
-use crate::envd::{EnvDelivery, SetupScript};
+use crate::envd::{EnvDelivery, SetupScript, shred_setup_dir};
 use crate::workspace::validate_job_id;
 
 /// Phase name of a Job that fails while its scripts run.
@@ -54,6 +54,13 @@ pub const READ_LIMIT: usize = OUTPUT_CAP + MAX_SECRET_BYTES + 1;
 
 /// How long the output reader may run on after its step ended.
 pub const DEFAULT_DRAIN_GRACE: Duration = Duration::from_millis(500);
+
+/// Name of the writable output directory inside a setup job directory, exported to the step
+/// as `$FLEET_ENV_OUT`.
+pub const OUT_DIR: &str = "out";
+
+/// Hard stop for the scripts of one Job, from ADR-0067.
+pub const DEFAULT_BUDGET: Duration = Duration::from_secs(MAX_SETUP_TOTAL_S as u64);
 
 const SCRIPT_FILE: &str = "step";
 
@@ -140,6 +147,18 @@ impl fmt::Debug for EnvSetup {
 }
 
 static ATTEMPT: AtomicU64 = AtomicU64::new(0);
+
+struct JobDir {
+    root: PathBuf,
+    id: String,
+    path: PathBuf,
+}
+
+impl Drop for JobDir {
+    fn drop(&mut self) {
+        shred_setup_dir(&self.root, &self.id);
+    }
+}
 
 struct Dir(PathBuf);
 
@@ -240,11 +259,17 @@ impl EnvSetup {
     }
 
     /// Sets the hard stop for the whole run. The default is no budget, so the daemon must set
-    /// 1200 s.
+    /// [`DEFAULT_BUDGET`], 1200 s.
     #[must_use]
     pub const fn with_budget(mut self, budget: Duration) -> Self {
         self.budget = Some(budget);
         self
+    }
+
+    /// The hard stop for the whole run.
+    #[must_use]
+    pub const fn budget(&self) -> Option<Duration> {
+        self.budget
     }
 
     /// Sets the hook that receives the declared egress hosts before the first step.
@@ -301,7 +326,7 @@ impl EnvSetup {
                 break;
             }
             let step_started = Instant::now();
-            let (outcome, raw) = self.run_step(job_id, &parent.0, script, left).await;
+            let (outcome, raw) = self.run_step(job_id, &parent.path, script, left).await;
             let millis = step_started.elapsed().as_millis();
             report.notes.push(format!(
                 "setup step {} {} after {millis} ms",
@@ -322,6 +347,10 @@ impl EnvSetup {
             }
             if matches!(outcome, Outcome::Passed) {
                 continue;
+            }
+            if matches!(outcome, Outcome::NotStarted) {
+                report.failed = Some(script.name.clone());
+                break;
             }
             if matches!(outcome, Outcome::BudgetCut) {
                 if script.abort {
@@ -345,31 +374,45 @@ impl EnvSetup {
 
     /// Removes the per-job directory of `job_id`. Safe to call when it is gone.
     pub fn end(&self, job_id: &str) {
-        if validate_job_id(job_id).is_ok() {
-            let _ = fs::remove_dir_all(self.run_root.join(job_id));
-        }
+        shred_setup_dir(&self.run_root, job_id);
     }
 
-    fn make_parent(&self, job_id: &str) -> Option<Dir> {
+    fn make_parent(&self, job_id: &str) -> Option<JobDir> {
         validate_job_id(job_id).ok()?;
         if !self.run_root.is_absolute() {
             return None;
         }
         fs::create_dir_all(&self.run_root).ok()?;
+        shred_setup_dir(&self.run_root, job_id);
         let path = self.run_root.join(job_id);
-        let _ = fs::remove_dir_all(&path);
-        let guard = self.mkdir(&path)?;
+        let mode = if self.gid.is_some() { 0o750 } else { 0o700 };
+        self.make_dir(&path, mode)?;
+        let guard = JobDir {
+            root: self.run_root.clone(),
+            id: job_id.to_owned(),
+            path,
+        };
+        let out_mode = if self.gid.is_some() { 0o770 } else { 0o700 };
+        self.make_dir(&guard.path.join(OUT_DIR), out_mode)?;
+        self.delivery
+            .write_setup_secrets(job_id, &guard.path)
+            .ok()?;
         Some(guard)
+    }
+
+    fn make_dir(&self, path: &Path, mode: u32) -> Option<()> {
+        fs::DirBuilder::new().mode(mode).create(path).ok()?;
+        fs::set_permissions(path, fs::Permissions::from_mode(mode)).ok()?;
+        if let Some(gid) = self.gid {
+            std::os::unix::fs::chown(path, None, Some(gid)).ok()?;
+        }
+        Some(())
     }
 
     fn mkdir(&self, path: &Path) -> Option<Dir> {
         let mode = if self.gid.is_some() { 0o750 } else { 0o700 };
-        fs::DirBuilder::new().mode(mode).create(path).ok()?;
-        let guard = Dir(path.to_path_buf());
-        if let Some(gid) = self.gid {
-            std::os::unix::fs::chown(path, None, Some(gid)).ok()?;
-        }
-        Some(guard)
+        self.make_dir(path, mode)?;
+        Some(Dir(path.to_path_buf()))
     }
 
     async fn run_step(

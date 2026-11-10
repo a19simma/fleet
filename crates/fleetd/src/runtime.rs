@@ -17,6 +17,7 @@ use tokio::time::{Interval, MissedTickBehavior};
 use crate::Error;
 use crate::app::{AppState, hook_router, hook_socket_router, socket_router};
 use crate::config::Config;
+use crate::env_launcher::{DEFAULT_RUN_ROOT, SystemdSetupLauncher};
 use crate::events::Limits;
 use crate::heartbeat::Heartbeat;
 use crate::http1::{Failure, roundtrip};
@@ -521,6 +522,7 @@ async fn run_with_hub(
         crate::envd::sweep_trees(run_root, &|_| false);
     }
     systemd::sweep_stale_runs(&config, run_root).await;
+    sweep_setup_dirs(&config, Path::new(DEFAULT_RUN_ROOT)).await;
     managed_settings::audit(managed_settings);
     let heartbeat_identity = identity.clone();
     let state = AppState::with_hub(
@@ -607,6 +609,17 @@ async fn run_with_hub(
         tracing::info!("stopped");
     }
     result
+}
+
+/// Under the systemd launcher, stops leftover `fleet-env@*` units and shreds the setup
+/// directories of Jobs that cannot still be running: at startup none is.
+async fn sweep_setup_dirs(config: &Config, setup_root: &Path) {
+    if config.agent_launcher != crate::AgentLauncher::Systemd {
+        return;
+    }
+    SystemdSetupLauncher::new(&config.systemctl_path, setup_root)
+        .sweep_stale(&|_| false)
+        .await;
 }
 
 #[cfg(test)]
@@ -980,6 +993,33 @@ mod tests {
         assert!(matches!(result, Err(Error::Runtime(_))), "{result:?}");
         assert!(stale.exists());
         assert!(!ctl.join("calls.log").exists());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn the_setup_sweep_shreds_dead_dirs_and_links_under_systemd_only()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let dir = TempDir::new()?;
+        let ctl = fake_systemctl();
+        let root = dir.path().join("env");
+        let outside = dir.path().join("outside");
+        std::fs::create_dir_all(root.join("job1/secrets"))?;
+        std::fs::write(root.join("job1/secrets/TOKEN"), "s")?;
+        std::fs::create_dir_all(&outside)?;
+        std::fs::write(outside.join("keep"), "k")?;
+        std::os::unix::fs::symlink(&outside, root.join("job2"))?;
+        let mut config = test_config(&dir, 0)?;
+        config.systemctl_path = ctl.join("systemctl");
+        config.agent_launcher = crate::config::AgentLauncher::Direct;
+        sweep_setup_dirs(&config, &root).await;
+        assert!(root.join("job1").exists());
+        config.agent_launcher = crate::config::AgentLauncher::Systemd;
+        sweep_setup_dirs(&config, &root).await;
+        assert!(!root.join("job1").exists());
+        assert!(root.join("job2").symlink_metadata().is_err());
+        assert!(outside.join("keep").exists());
+        let calls = std::fs::read_to_string(ctl.join("calls.log"))?;
+        assert!(calls.contains("list-units"), "{calls}");
         Ok(())
     }
 

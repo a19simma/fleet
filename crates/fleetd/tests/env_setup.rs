@@ -4,6 +4,7 @@
 #![expect(clippy::unwrap_used, reason = "test code asserts by panicking")]
 
 use std::fs;
+use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -11,11 +12,13 @@ use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
 use fleet_core::Redactor;
-use fleet_proto::v1::{EnvironmentOnFail, EnvironmentScriptSpec, GetJobEnvironmentReply};
+use fleet_proto::v1::{
+    EnvironmentOnFail, EnvironmentScriptSpec, GetJobEnvironmentReply, JobEnvironmentSecret,
+};
 use fleetd::env_setup::{
     EnvSetup, OUTPUT_CAP, SetupLauncher, StepProc, StepRun, UnavailableLauncher,
 };
-use fleetd::envd::{EnvDelivery, MountCheck, Owner, ReleasedEnvironment};
+use fleetd::envd::{EnvDelivery, MountCheck, Owner, ReleasedEnvironment, sweep_setup_root};
 
 #[path = "common/bounded.rs"]
 mod bounded;
@@ -725,4 +728,262 @@ async fn a_job_with_no_script_never_calls_the_egress_hook() -> TestResult {
         Ok(())
     })
     .await
+}
+
+const TOKEN_VALUE: &str = "setup-only-token-value-7731";
+
+#[derive(Debug)]
+struct Probing {
+    inner: Arc<ShLauncher>,
+    alias: PathBuf,
+    seen: Mutex<Vec<String>>,
+}
+
+impl SetupLauncher for Probing {
+    fn start(&self, run: &StepRun<'_>) -> std::io::Result<StepProc> {
+        let job_dir = run
+            .scratch
+            .parent()
+            .ok_or_else(|| std::io::Error::from(std::io::ErrorKind::NotFound))?;
+        let secrets = job_dir.join("secrets");
+        let file = secrets.join("TOKEN");
+        let mode = |p: &Path| -> std::io::Result<u32> {
+            Ok(fs::metadata(p)?.permissions().mode() & 0o777)
+        };
+        let line = format!(
+            "job={:o} secrets={:o} file={:o} body={}",
+            mode(job_dir)?,
+            mode(&secrets)?,
+            mode(&file)?,
+            fs::read_to_string(&file)?
+        );
+        self.seen
+            .lock()
+            .map_err(|_| std::io::Error::other("poisoned"))?
+            .push(line);
+        let _ = fs::remove_file(&self.alias);
+        fs::hard_link(&file, &self.alias)?;
+        self.inner.start(run)
+    }
+}
+
+fn setup_only_token() -> Vec<JobEnvironmentSecret> {
+    vec![JobEnvironmentSecret {
+        name: "TOKEN".to_owned(),
+        value: TOKEN_VALUE.to_owned(),
+        agent_visible: false,
+        ..JobEnvironmentSecret::default()
+    }]
+}
+
+fn secret_rig(
+    launcher: impl FnOnce(PathBuf) -> Arc<dyn SetupLauncher>,
+    scripts: Vec<EnvironmentScriptSpec>,
+    gid: Option<u32>,
+) -> (Rig, PathBuf, tempfile::TempDir) {
+    let dir = tempfile::tempdir().unwrap();
+    let delivery_root = dir.path().join("run");
+    fs::create_dir(&delivery_root).unwrap();
+    let root = dir.path().join("env");
+    let keep = tempfile::tempdir().unwrap();
+    let alias = keep.path().join("alias");
+    let delivery = Arc::new(
+        EnvDelivery::new(&delivery_root, Owner { uid: None, gid }, Arc::new(Tmpfs)).unwrap(),
+    );
+    delivery.hold(
+        JOB,
+        ReleasedEnvironment::from_reply(GetJobEnvironmentReply {
+            scripts,
+            secrets: setup_only_token(),
+            ..GetJobEnvironmentReply::default()
+        }),
+    );
+    let setup = EnvSetup::new(launcher(alias.clone()), delivery, &root)
+        .with_job_gid(gid)
+        .with_drain_grace(Duration::from_millis(300));
+    (
+        Rig {
+            _dir: dir,
+            root,
+            setup,
+        },
+        alias,
+        keep,
+    )
+}
+
+fn probing(alias: PathBuf) -> (Arc<Probing>, Arc<dyn SetupLauncher>) {
+    let probe = Arc::new(Probing {
+        inner: ShLauncher::killing(),
+        alias,
+        seen: Mutex::default(),
+    });
+    (Arc::clone(&probe), probe)
+}
+
+fn zeros(path: &Path) -> bool {
+    let bytes = fs::read(path).unwrap();
+    bytes.len() == TOKEN_VALUE.len() && bytes.iter().all(|b| *b == 0)
+}
+
+#[tokio::test]
+async fn a_setup_only_secret_reaches_the_step_and_is_shredded_after_success() -> TestResult {
+    bounded::bounded(async {
+        let seen = Arc::new(Mutex::new(None));
+        let slot = Arc::clone(&seen);
+        let (rig, alias, _keep) = secret_rig(
+            move |alias| {
+                let (probe, dynamic) = probing(alias);
+                *slot.lock().unwrap() = Some(probe);
+                dynamic
+            },
+            vec![script("one", "echo ok", 5)],
+            None,
+        );
+        let report = rig.setup.run(JOB, &redactor()).await;
+        assert_eq!(report.failed, None);
+        let probe = seen.lock().unwrap().clone().unwrap();
+        let seen = probe.seen.lock().unwrap().clone();
+        assert_eq!(
+            seen,
+            [format!("job=700 secrets=700 file=400 body={TOKEN_VALUE}")]
+        );
+        assert!(gone(&rig.root.join(JOB)));
+        assert!(zeros(&alias), "the secret file was not overwritten");
+        Ok(())
+    })
+    .await
+}
+
+#[tokio::test]
+async fn the_setup_secrets_carry_the_group_modes_of_the_tmpfiles_entry() -> TestResult {
+    bounded::bounded(async {
+        let gid = fs::metadata(std::env::temp_dir()).unwrap().gid();
+        let seen = Arc::new(Mutex::new(None));
+        let slot = Arc::clone(&seen);
+        let (rig, _alias, _keep) = secret_rig(
+            move |alias| {
+                let (probe, dynamic) = probing(alias);
+                *slot.lock().unwrap() = Some(probe);
+                dynamic
+            },
+            vec![script("one", "echo ok", 5)],
+            Some(gid),
+        );
+        rig.setup.run(JOB, &redactor()).await;
+        let probe = seen.lock().unwrap().clone().unwrap();
+        let seen = probe.seen.lock().unwrap().clone();
+        assert_eq!(
+            seen,
+            [format!("job=750 secrets=750 file=440 body={TOKEN_VALUE}")]
+        );
+        Ok(())
+    })
+    .await
+}
+
+#[tokio::test]
+async fn setup_secrets_are_shredded_after_failure_timeout_and_cancel() -> TestResult {
+    bounded::bounded(async {
+        for (body, secs, cancel) in [
+            ("exit 3", 5, false),
+            ("sleep 30", 1, false),
+            ("sleep 30", 20, true),
+        ] {
+            let (rig, alias, _keep) = secret_rig(
+                |alias| probing(alias).1,
+                vec![script("one", body, secs)],
+                None,
+            );
+            let root = rig.root.clone();
+            let redactor = redactor();
+            if cancel {
+                let handle = tokio::spawn(async move {
+                    let rig = rig;
+                    rig.setup.run(JOB, &redactor).await
+                });
+                for _ in 0..100 {
+                    if alias.exists() {
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                }
+                assert!(alias.exists(), "the step never started");
+                handle.abort();
+                let _ = handle.await;
+            } else {
+                let report = rig.setup.run(JOB, &redactor).await;
+                assert_eq!(report.failed.as_deref(), Some("one"));
+            }
+            for _ in 0..100 {
+                if gone(&root.join(JOB)) {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+            assert!(gone(&root.join(JOB)), "{body}");
+            assert!(zeros(&alias), "{body}: the secret file was not overwritten");
+        }
+        Ok(())
+    })
+    .await
+}
+
+#[tokio::test]
+async fn a_continue_step_that_cannot_start_still_fails_the_job() -> TestResult {
+    bounded::bounded(async {
+        let rig = rig(
+            Arc::new(UnavailableLauncher),
+            vec![
+                script_continue("first", "true", 5),
+                script("second", "true", 5),
+            ],
+        );
+        let report = rig.setup.run(JOB, &redactor()).await;
+        assert_eq!(report.failed.as_deref(), Some("first"));
+        assert!(!joined(&report.notes).contains("setup step second"));
+        Ok(())
+    })
+    .await
+}
+
+#[test]
+fn the_startup_sweep_removes_dead_trees_a_planted_link_and_asides_and_keeps_live_ones() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("env");
+    fs::create_dir(&root).unwrap();
+    let dead = root.join("dead1/secrets");
+    fs::create_dir_all(&dead).unwrap();
+    fs::write(dead.join("TOKEN"), TOKEN_VALUE).unwrap();
+    let alias = dir.path().join("alias");
+    fs::hard_link(dead.join("TOKEN"), &alias).unwrap();
+    let live = root.join("live1");
+    fs::create_dir(&live).unwrap();
+    fs::write(live.join("keep"), "keep").unwrap();
+    let outside = dir.path().join("outside");
+    fs::create_dir(&outside).unwrap();
+    fs::write(outside.join("victim"), "victim").unwrap();
+    std::os::unix::fs::symlink(&outside, root.join("linkjob")).unwrap();
+    let aside = root.join(".shred-old/secrets");
+    fs::create_dir_all(&aside).unwrap();
+    fs::write(aside.join("TOKEN"), "left").unwrap();
+    sweep_setup_root(&root, &|id| id == "live1");
+    assert!(gone(&root.join("dead1")));
+    assert!(
+        zeros(&alias),
+        "the dead tree was unlinked and not overwritten"
+    );
+    assert!(live.join("keep").exists());
+    assert!(fs::symlink_metadata(root.join("linkjob")).is_err());
+    assert_eq!(
+        fs::read_to_string(outside.join("victim")).unwrap(),
+        "victim"
+    );
+    assert!(gone(&root.join(".shred-old")));
+}
+
+#[test]
+fn the_startup_sweep_of_a_missing_root_does_nothing() {
+    let dir = tempfile::tempdir().unwrap();
+    sweep_setup_root(&dir.path().join("none"), &|_| false);
 }
