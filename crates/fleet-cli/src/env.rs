@@ -5,22 +5,26 @@
 //! takes any stray text into a hidden field and a fixed message refuses it without repeating it.
 //! A terminal on stdin needs an explicit `-`. Every read stops one byte past its cap. A refusal of
 //! the secret put keeps its status code and gets a fixed message, so no server text can echo a
-//! value. `show` prints names, fingerprints and structure: never a value and never a script body.
+//! value. `default` binds an Environment to a repository or a Profile name and checks both keys
+//! locally first. `show` prints names, fingerprints and structure: never a value and never a script body.
 
 use std::io::{Read, Write};
 
-use clap::{Subcommand, ValueEnum};
+use clap::{Args, Subcommand, ValueEnum};
 use fleet_core::environment::{
-    Delivery, EntryName, EnvironmentName, MAX_SCRIPT_BYTES, MAX_SECRET_BYTES, OnFail, ScriptBody,
-    ScriptSpec, SecretSpec, SecretValue,
+    Delivery, EntryName, EnvironmentName, MAX_NAME_BYTES, MAX_SCRIPT_BYTES, MAX_SECRET_BYTES,
+    OnFail, ScriptBody, ScriptSpec, SecretSpec, SecretValue,
 };
+use fleet_core::repo::RepoRef;
+use fleet_proto::v1::environment_binding_key::Key;
 use fleet_proto::v1::environment_entry_spec::Kind;
 use fleet_proto::v1::fleet_environments_client::FleetEnvironmentsClient;
 use fleet_proto::v1::{
-    CreateEnvironmentRequest, DeleteEnvironmentRequest, EnvironmentDelivery, EnvironmentDetail,
-    EnvironmentEntrySpec, EnvironmentOnFail, EnvironmentScriptSpec, EnvironmentSecretSpec,
-    GetEnvironmentRequest, ListEnvironmentsRequest, PutEnvironmentSecretRequest,
-    SaveEnvironmentVersionRequest,
+    ClearEnvironmentDefaultRequest, CreateEnvironmentRequest, DeleteEnvironmentRequest,
+    EnvironmentBindingKey, EnvironmentDelivery, EnvironmentDetail, EnvironmentEntrySpec,
+    EnvironmentOnFail, EnvironmentRepoKey, EnvironmentScriptSpec, EnvironmentSecretSpec,
+    GetEnvironmentDefaultRequest, GetEnvironmentRequest, ListEnvironmentsRequest,
+    PutEnvironmentSecretRequest, SaveEnvironmentVersionRequest, SetEnvironmentDefaultRequest,
 };
 use tonic::service::interceptor::InterceptedService;
 use tonic::transport::Channel;
@@ -40,6 +44,8 @@ const SECRET_NOT_TEXT: &str = "secret value is not valid UTF-8";
 const SCRIPT_NOT_TEXT: &str = "script body is not valid UTF-8";
 const SCRIPT_CLASH: &str = "that name belongs to a secret";
 const SCRIPT_MISSING: &str = "no script with that name";
+const BAD_PROFILE: &str = "invalid profile name";
+const NEEDS_ONE_KEY: &str = "name exactly one of --repo or --profile";
 const SECRET_CLASH: &str = "that name belongs to a script";
 
 /// How a secret reaches the job.
@@ -108,6 +114,59 @@ pub enum EnvAction {
         /// The script action.
         #[command(subcommand)]
         action: ScriptAction,
+    },
+    /// Set, show and clear the default Environment of a repository or Profile.
+    Default {
+        /// The default action.
+        #[command(subcommand)]
+        action: DefaultAction,
+    },
+}
+
+/// What a default binding attaches to: exactly one of a repository or a Profile name.
+#[derive(Debug, Args)]
+#[group(required = true, multiple = false)]
+pub struct KeyArgs {
+    /// Registered repository: host/owner/name or an https URL.
+    #[arg(long, allow_hyphen_values = true)]
+    repo: Option<String>,
+    /// Profile name.
+    #[arg(long, allow_hyphen_values = true)]
+    profile: Option<String>,
+}
+
+/// A `fleet env default` action.
+#[derive(Debug, Subcommand)]
+pub enum DefaultAction {
+    /// Bind an Environment as the default of a repository or Profile.
+    Set {
+        /// Environment name.
+        #[arg(allow_hyphen_values = true)]
+        environment: String,
+        /// The key to bind.
+        #[command(flatten)]
+        key: KeyArgs,
+        /// Refused: this action takes one name.
+        #[arg(hide = true, allow_hyphen_values = true, num_args = 0.., trailing_var_arg = true)]
+        rest: Vec<String>,
+    },
+    /// Show the Environment bound to a repository or Profile.
+    Show {
+        /// The key to read.
+        #[command(flatten)]
+        key: KeyArgs,
+        /// Refused: this action takes no arguments.
+        #[arg(hide = true, allow_hyphen_values = true, num_args = 0.., trailing_var_arg = true)]
+        rest: Vec<String>,
+    },
+    /// Remove the binding of a repository or Profile.
+    Clear {
+        /// The key to clear.
+        #[command(flatten)]
+        key: KeyArgs,
+        /// Refused: this action takes no arguments.
+        #[arg(hide = true, allow_hyphen_values = true, num_args = 0.., trailing_var_arg = true)]
+        rest: Vec<String>,
     },
 }
 
@@ -198,6 +257,35 @@ pub(crate) enum Call {
         environment: EnvironmentName,
         name: EntryName,
     },
+    SetDefault {
+        environment: EnvironmentName,
+        key: EnvironmentBindingKey,
+    },
+    ShowDefault(EnvironmentBindingKey),
+    ClearDefault(EnvironmentBindingKey),
+}
+
+fn binding_key(args: KeyArgs) -> Result<EnvironmentBindingKey, CliError> {
+    let key = match (args.repo, args.profile) {
+        (Some(raw), None) => {
+            let (host, path) = RepoRef::locate(&raw).map_err(invalid)?;
+            Key::Repo(EnvironmentRepoKey { host, path })
+        }
+        (None, Some(name)) => {
+            let ok = !name.is_empty()
+                && !name.starts_with('-')
+                && name.len() <= MAX_NAME_BYTES
+                && name
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-');
+            if !ok {
+                return Err(usage(BAD_PROFILE));
+            }
+            Key::Profile(name)
+        }
+        _ => return Err(usage(NEEDS_ONE_KEY)),
+    };
+    Ok(EnvironmentBindingKey { key: Some(key) })
 }
 
 fn usage(text: &str) -> CliError {
@@ -298,6 +386,34 @@ impl EnvAction {
             }
             Self::Secret { action } => action.prepare(stdin, tty),
             Self::Script { action } => action.prepare(stdin),
+            Self::Default { action } => action.prepare(),
+        }
+    }
+}
+
+impl DefaultAction {
+    fn prepare(self) -> Result<Call, CliError> {
+        match self {
+            Self::Set {
+                environment,
+                key,
+                rest,
+            } => {
+                no_stray(&rest)?;
+                let environment = env_name(&environment)?;
+                Ok(Call::SetDefault {
+                    environment,
+                    key: binding_key(key)?,
+                })
+            }
+            Self::Show { key, rest } => {
+                no_stray(&rest)?;
+                binding_key(key).map(Call::ShowDefault)
+            }
+            Self::Clear { key, rest } => {
+                no_stray(&rest)?;
+                binding_key(key).map(Call::ClearDefault)
+            }
         }
     }
 }
@@ -535,6 +651,43 @@ fn on_fail_name(spec: &EnvironmentScriptSpec) -> &'static str {
     }
 }
 
+async fn execute_default(
+    call: Call,
+    client: &mut EnvironmentsClient,
+    scrub: &Scrub,
+    out: &mut impl Write,
+) -> Result<(), CliError> {
+    match call {
+        Call::SetDefault { environment, key } => {
+            client
+                .set_environment_default(SetEnvironmentDefaultRequest {
+                    key: Some(key),
+                    environment: environment.as_str().to_owned(),
+                })
+                .await?;
+            writeln!(out, "bound\t{}", environment.as_str())?;
+        }
+        Call::ShowDefault(key) => {
+            let reply = client
+                .get_environment_default(GetEnvironmentDefaultRequest { key: Some(key) })
+                .await?
+                .into_inner();
+            match reply.environment {
+                Some(name) => writeln!(out, "{}", scrub.ident(&name))?,
+                None => writeln!(out, "none")?,
+            }
+        }
+        Call::ClearDefault(key) => {
+            client
+                .clear_environment_default(ClearEnvironmentDefaultRequest { key: Some(key) })
+                .await?;
+            writeln!(out, "cleared")?;
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
 /// Runs a checked call and prints its result.
 ///
 /// # Errors
@@ -613,6 +766,9 @@ pub(crate) async fn execute(
             upsert(&mut current.entries, at, entry);
             let version = save(client, &environment, current).await?;
             writeln!(out, "{}\t{version}", spec.name().as_str())?;
+        }
+        Call::SetDefault { .. } | Call::ShowDefault(_) | Call::ClearDefault(_) => {
+            execute_default(call, client, scrub, out).await?;
         }
         Call::RemoveScript { environment, name } => {
             let mut current = structure(client, &environment).await?;

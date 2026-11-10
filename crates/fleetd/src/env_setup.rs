@@ -57,6 +57,9 @@ pub const DEFAULT_DRAIN_GRACE: Duration = Duration::from_millis(500);
 
 const SCRIPT_FILE: &str = "step";
 
+/// Receives the job id and the egress hosts a Job's scripts declared, before its first step.
+pub type EgressHook = Arc<dyn Fn(&str, &[&str]) + Send + Sync>;
+
 /// One step, as the launcher sees it.
 #[derive(Debug, Clone, Copy)]
 pub struct StepRun<'a> {
@@ -113,6 +116,8 @@ pub struct SetupReport {
     pub ran: bool,
     /// Wall time from the start of the first step to the end of the run.
     pub elapsed: Duration,
+    /// The names of the steps the total budget cut off, in order.
+    pub skipped: Vec<String>,
 }
 
 /// Runs the held scripts of a Job.
@@ -122,6 +127,8 @@ pub struct EnvSetup {
     run_root: PathBuf,
     gid: Option<u32>,
     grace: Duration,
+    budget: Option<Duration>,
+    egress: Option<EgressHook>,
 }
 
 impl fmt::Debug for EnvSetup {
@@ -191,6 +198,7 @@ enum Outcome {
     Failed,
     TimedOut,
     NotStarted,
+    BudgetCut,
 }
 
 impl Outcome {
@@ -200,6 +208,7 @@ impl Outcome {
             Self::Failed => "failed",
             Self::TimedOut => "timed out",
             Self::NotStarted => "could not start",
+            Self::BudgetCut => "cut by the budget",
         }
     }
 }
@@ -218,6 +227,8 @@ impl EnvSetup {
             run_root: run_root.into(),
             gid: None,
             grace: DEFAULT_DRAIN_GRACE,
+            budget: None,
+            egress: None,
         }
     }
 
@@ -225,6 +236,21 @@ impl EnvSetup {
     #[must_use]
     pub const fn with_job_gid(mut self, gid: Option<u32>) -> Self {
         self.gid = gid;
+        self
+    }
+
+    /// Sets the hard stop for the whole run. The default is no budget, so the daemon must set
+    /// 1200 s.
+    #[must_use]
+    pub const fn with_budget(mut self, budget: Duration) -> Self {
+        self.budget = Some(budget);
+        self
+    }
+
+    /// Sets the hook that receives the declared egress hosts before the first step.
+    #[must_use]
+    pub fn with_egress(mut self, hook: EgressHook) -> Self {
+        self.egress = Some(hook);
         self
     }
 
@@ -261,9 +287,21 @@ impl EnvSetup {
             report.elapsed = started.elapsed();
             return report;
         };
-        for script in &scripts {
+        if let Some(hook) = &self.egress {
+            let declared = self.delivery.egress_hosts(job_id);
+            let hosts: Vec<&str> = declared.iter().map(String::as_str).collect();
+            hook(job_id, &hosts);
+        }
+        for (index, script) in scripts.iter().enumerate() {
+            let left = self.budget.map_or(Duration::MAX, |budget| {
+                budget.saturating_sub(started.elapsed())
+            });
+            if left.is_zero() {
+                skip_rest(&mut report, scripts.get(index..).unwrap_or_default());
+                break;
+            }
             let step_started = Instant::now();
-            let (outcome, raw) = self.run_step(job_id, &parent.0, script).await;
+            let (outcome, raw) = self.run_step(job_id, &parent.0, script, left).await;
             let millis = step_started.elapsed().as_millis();
             report.notes.push(format!(
                 "setup step {} {} after {millis} ms",
@@ -282,10 +320,23 @@ impl EnvSetup {
                     script.name, clean.text
                 ));
             }
-            if !matches!(outcome, Outcome::Passed) {
+            if matches!(outcome, Outcome::Passed) {
+                continue;
+            }
+            if matches!(outcome, Outcome::BudgetCut) {
+                if script.abort {
+                    report.failed = Some(script.name.clone());
+                }
+                skip_rest(&mut report, scripts.get(index + 1..).unwrap_or_default());
+                break;
+            }
+            if script.abort {
                 report.failed = Some(script.name.clone());
                 break;
             }
+            report
+                .notes
+                .push(format!("setup step {} continuing", script.name));
         }
         report.elapsed = started.elapsed();
         drop(parent);
@@ -326,6 +377,7 @@ impl EnvSetup {
         job_id: &str,
         parent: &Path,
         script: &SetupScript,
+        left: Duration,
     ) -> (Outcome, Vec<u8>) {
         let attempt = ATTEMPT.fetch_add(1, Ordering::Relaxed);
         let Some(scratch) = self.mkdir(&parent.join(format!("a{attempt}"))) else {
@@ -349,9 +401,11 @@ impl EnvSetup {
         let kept: Shared = Arc::default();
         let mut reader = tokio::spawn(read_bounded(output, Arc::clone(&kept)));
         let _abort = AbortOnDrop(reader.abort_handle());
-        let outcome = match tokio::time::timeout(script.timeout, exit).await {
+        let cap = script.timeout.min(left);
+        let outcome = match tokio::time::timeout(cap, exit).await {
             Ok(Ok(true)) => Outcome::Passed,
             Ok(_) => Outcome::Failed,
+            Err(_) if left < script.timeout => Outcome::BudgetCut,
             Err(_) => Outcome::TimedOut,
         };
         end.fire();
@@ -376,6 +430,18 @@ impl EnvSetup {
             std::os::unix::fs::chown(&path, None, Some(gid)).ok()?;
         }
         Some(path)
+    }
+}
+
+fn skip_rest(report: &mut SetupReport, rest: &[SetupScript]) {
+    for script in rest {
+        report
+            .notes
+            .push(format!("setup step {} skipped", script.name));
+        report.skipped.push(script.name.clone());
+        if script.abort && report.failed.is_none() {
+            report.failed = Some(script.name.clone());
+        }
     }
 }
 

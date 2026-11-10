@@ -5,7 +5,8 @@
 //! job id from the client. Before it reads a byte, the listener checks the cgroup of the
 //! peer: its whole path must equal `<agent slice>/fleet-agent@<job id>.service` for the
 //! listener's own id, or `<install slice>/fleet-tool-install@<job id>.service` for the tool
-//! install unit of that id. The install unit may select only [`ServiceName::EgressProxy`]. A
+//! install unit of that id, or `<env slice>/fleet-env@<job id>.service` for the environment setup
+//! unit of that id. The install and setup units may select only [`ServiceName::EgressProxy`]. A
 //! mismatch or an unreadable cgroup closes the connection with no reply and bumps
 //! [`JobSocket::rejected`]. After the handshake line the listener reads the peer pid and
 //! cgroup again and requires both to equal the first reading. The cgroup check reads the
@@ -54,6 +55,11 @@ pub const AGENT_SLICE: &str = "system.slice/system-fleet\\x2dagent.slice";
 /// `fleet-tool-install@.service` sets no `Slice=`, so systemd places an instance in
 /// `system-fleet\x2dtool\x2dinstall.slice` under `system.slice`. UNVERIFIED on a Box.
 pub const TOOL_INSTALL_SLICE: &str = "system.slice/system-fleet\\x2dtool\\x2dinstall.slice";
+/// The cgroup path, below the root, of the slice that holds the environment setup units.
+///
+/// `fleet-env@.service` sets no `Slice=`, so systemd places an instance in
+/// `system-fleet\x2denv.slice` under `system.slice`. UNVERIFIED on a Box.
+pub const ENV_SLICE: &str = "system.slice/system-fleet\\x2denv.slice";
 /// Longest accepted Job id, as in the polkit rule.
 pub const MAX_JOB_ID_BYTES: usize = 64;
 const SOCKET_MODE: u32 = 0o660;
@@ -329,6 +335,14 @@ pub fn cgroup_install_unit(cgroup: &str, slice: &str, job_id: &str) -> bool {
     template_unit(cgroup, slice, "fleet-tool-install", job_id)
 }
 
+/// Whether `cgroup` is the cgroup file of the environment setup unit of `job_id` under `slice`.
+///
+/// The shape is that of [`cgroup_unit`] with `fleet-env` as the template.
+#[must_use]
+pub fn cgroup_env_unit(cgroup: &str, slice: &str, job_id: &str) -> bool {
+    template_unit(cgroup, slice, "fleet-env", job_id)
+}
+
 fn template_unit(cgroup: &str, slice: &str, template: &str, job_id: &str) -> bool {
     valid_job_id(job_id)
         && cgroup.strip_suffix('\n').unwrap_or(cgroup)
@@ -346,6 +360,8 @@ pub struct Limits {
     pub agent_slice: &'static str,
     /// The cgroup path of the slice the tool install unit must sit in.
     pub install_slice: &'static str,
+    /// The cgroup path of the slice the environment setup unit must sit in.
+    pub env_slice: &'static str,
 }
 
 impl Default for Limits {
@@ -355,6 +371,7 @@ impl Default for Limits {
             handshake_timeout: HANDSHAKE_TIMEOUT,
             agent_slice: AGENT_SLICE,
             install_slice: TOOL_INSTALL_SLICE,
+            env_slice: ENV_SLICE,
         }
     }
 }
@@ -369,12 +386,14 @@ struct Shared {
     handshake_timeout: Duration,
     agent_slice: &'static str,
     install_slice: &'static str,
+    env_slice: &'static str,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum PeerUnit {
     Agent,
     Install,
+    Env,
 }
 
 /// A bound Job socket and its accept loop.
@@ -422,6 +441,7 @@ impl JobSocket {
             handshake_timeout: limits.handshake_timeout,
             agent_slice: limits.agent_slice,
             install_slice: limits.install_slice,
+            env_slice: limits.env_slice,
         });
         let task = tokio::spawn(accept_loop(listener, shared));
         Ok(Self {
@@ -539,6 +559,8 @@ fn verified(shared: &Shared, stream: &UnixStream) -> Option<(PeerId, PeerUnit)> 
             PeerUnit::Agent
         } else if cgroup_install_unit(&id.cgroup, shared.install_slice, &shared.job_id) {
             PeerUnit::Install
+        } else if cgroup_env_unit(&id.cgroup, shared.env_slice, &shared.job_id) {
+            PeerUnit::Env
         } else {
             return None;
         };
@@ -570,7 +592,7 @@ async fn serve_peer(shared: &Shared, mut stream: UnixStream) {
     let Some(name) = ServiceName::parse(&line) else {
         return;
     };
-    if first.1 == PeerUnit::Install && name != ServiceName::EgressProxy {
+    if first.1 != PeerUnit::Agent && name != ServiceName::EgressProxy {
         reject(shared);
         return;
     }
@@ -714,10 +736,10 @@ mod tests {
     use tokio::sync::mpsc;
 
     use super::{
-        AGENT_SLICE, JobContext, JobSocket, Limits, MAX_FRAME_BYTES, Peer, PeerId, PerJob,
-        RegisterError, ServeFuture, Service, ServiceName, Services, SocketFacts,
-        TOOL_INSTALL_SLICE, cgroup_install_unit, cgroup_unit, connect, connect_with, read_frame,
-        socket_acceptable, socket_path, write_frame,
+        AGENT_SLICE, ENV_SLICE, JobContext, JobSocket, Limits, MAX_FRAME_BYTES, Peer, PeerId,
+        PerJob, RegisterError, ServeFuture, Service, ServiceName, Services, SocketFacts,
+        TOOL_INSTALL_SLICE, cgroup_env_unit, cgroup_install_unit, cgroup_unit, connect,
+        connect_with, read_frame, socket_acceptable, socket_path, write_frame,
     };
 
     type TestResult = Result<(), Box<dyn std::error::Error>>;
@@ -1720,6 +1742,145 @@ mod tests {
             assert_closed_silently(&mut client).await?;
             assert_eq!(sock.rejected(), 1);
             assert!(rx.try_recv().is_err());
+        }
+        Ok(())
+    }
+
+    fn env_cgroup_of(id: &str) -> String {
+        format!("0::/{ENV_SLICE}/fleet-env@{id}.service\n")
+    }
+
+    #[test]
+    fn cgroup_env_unit_accepts_only_the_listeners_own_env_unit() {
+        let ok = |cgroup: &str, id: &str| cgroup_env_unit(cgroup, ENV_SLICE, id);
+        assert!(ok(&env_cgroup_of("job1"), "job1"));
+        assert!(ok(env_cgroup_of("job1").trim_end(), "job1"));
+        assert!(!ok(&env_cgroup_of("job2"), "job1"));
+        assert!(!ok(&env_cgroup_of("job10"), "job1"));
+        assert!(!ok(&env_cgroup_of("job1"), ""));
+        assert!(!ok(&env_cgroup_of("job1/../x"), "job1/../x"));
+        assert!(!ok(&cgroup_of("job1"), "job1"));
+        assert!(!ok(&install_cgroup_of("job1"), "job1"));
+        assert!(!ok(
+            &format!("0::/{ENV_SLICE}/fleet-other@job1.service\n"),
+            "job1"
+        ));
+        assert!(!ok(
+            &format!("0::/{ENV_SLICE}/fleet-env@job1.service/sub\n"),
+            "job1"
+        ));
+        assert!(!ok(
+            &format!("0::/{AGENT_SLICE}/fleet-env@job1.service\n"),
+            "job1"
+        ));
+        assert!(!ok(
+            &format!("0::/{ENV_SLICE}/fleet-env@job1.service\n0::/x\n"),
+            "job1"
+        ));
+    }
+
+    #[test]
+    fn the_agent_and_install_checks_still_refuse_the_env_unit() {
+        assert!(!cgroup_unit(&env_cgroup_of("job1"), ENV_SLICE, "job1"));
+        assert!(!cgroup_unit(&env_cgroup_of("job1"), AGENT_SLICE, "job1"));
+        assert!(!cgroup_install_unit(
+            &env_cgroup_of("job1"),
+            ENV_SLICE,
+            "job1"
+        ));
+    }
+
+    #[tokio::test]
+    async fn the_env_unit_of_the_job_reaches_the_egress_proxy() -> TestResult {
+        let dir = TempDir::new()?;
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let sock = start(
+            &dir,
+            Ok(env_cgroup_of("job1")),
+            services(ServiceName::EgressProxy, Echo(tx)),
+            Limits::default(),
+        )?;
+        let mut client = UnixStream::connect(sock.path()).await?;
+        write_frame(&mut client, b"egress proxy").await?;
+        client.write_all(b"ping").await?;
+        let mut back = [0u8; 4];
+        tokio::time::timeout(WAIT, client.read_exact(&mut back)).await??;
+        assert_eq!(&back, b"ping");
+        assert_eq!(rx.recv().await, Some(("job1".to_owned(), false)));
+        assert_eq!(sock.rejected(), 0);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn three_services_by_three_units_admit_exactly_the_documented_cells() -> TestResult {
+        type Unit = (&'static str, fn(&str) -> String, [bool; 3]);
+        let units: [Unit; 3] = [
+            ("agent", cgroup_of, [true, true, true]),
+            ("install", install_cgroup_of, [false, false, true]),
+            ("env", env_cgroup_of, [false, false, true]),
+        ];
+        let names = [
+            (ServiceName::Broker, "broker"),
+            (ServiceName::Fetch, "fetch"),
+            (ServiceName::EgressProxy, "egress proxy"),
+        ];
+        for (unit, cgroup, admits) in units {
+            for ((_, word), admitted) in names.into_iter().zip(admits) {
+                let dir = TempDir::new()?;
+                let (tx, mut rx) = mpsc::unbounded_channel();
+                let mut map = Services::new();
+                for (each, _) in names {
+                    map.insert(each, Arc::new(Echo(tx.clone())));
+                }
+                let sock = start(&dir, Ok(cgroup("job1")), map, Limits::default())?;
+                let mut client = UnixStream::connect(sock.path()).await?;
+                write_frame(&mut client, word.as_bytes()).await?;
+                if admitted {
+                    client.write_all(b"ping").await?;
+                    let mut back = [0u8; 4];
+                    tokio::time::timeout(WAIT, client.read_exact(&mut back)).await??;
+                    assert_eq!(rx.recv().await, Some(("job1".to_owned(), false)));
+                    assert_eq!(sock.rejected(), 0, "{unit} {word}");
+                } else {
+                    assert_closed_silently(&mut client).await?;
+                    assert_eq!(sock.rejected(), 1, "{unit} {word}");
+                    assert!(rx.try_recv().is_err(), "{unit} {word}");
+                }
+            }
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn an_env_unit_of_another_id_or_shape_is_refused_for_every_service() -> TestResult {
+        let wrong_slice = format!("0::/{AGENT_SLICE}/fleet-env@job1.service\n");
+        let other_template = format!("0::/{ENV_SLICE}/fleet-other@job1.service\n");
+        let nested = format!("0::/{ENV_SLICE}/fleet-env@job1.service/sub\n");
+        for cgroup in [
+            env_cgroup_of("job2"),
+            env_cgroup_of("job10"),
+            wrong_slice,
+            other_template,
+            nested,
+        ] {
+            for word in ["egress proxy", "broker", "fetch"] {
+                let dir = TempDir::new()?;
+                let (tx, mut rx) = mpsc::unbounded_channel();
+                let mut map = Services::new();
+                for each in [
+                    ServiceName::Broker,
+                    ServiceName::Fetch,
+                    ServiceName::EgressProxy,
+                ] {
+                    map.insert(each, Arc::new(Echo(tx.clone())));
+                }
+                let sock = start(&dir, Ok(cgroup.clone()), map, Limits::default())?;
+                let mut client = UnixStream::connect(sock.path()).await?;
+                let _ = write_frame(&mut client, word.as_bytes()).await;
+                assert_closed_silently(&mut client).await?;
+                assert_eq!(sock.rejected(), 1, "{cgroup:?} {word}");
+                assert!(rx.try_recv().is_err());
+            }
         }
         Ok(())
     }

@@ -1813,6 +1813,67 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn the_setup_host_set_is_the_declared_hosts_inside_the_ceiling() -> TestResult {
+        let rig = Rig::start(Setup {
+            allow: vec!["api.example", "pkg.example"],
+            ..Setup::default()
+        })
+        .await?;
+        assert_eq!(
+            rig.proxy
+                .set_job_hosts("job1", &["api.example", "other.example"]),
+            1
+        );
+        assert!(connect_status(&rig, "api.example").await?);
+        assert!(!connect_status(&rig, "other.example").await?);
+        assert!(!connect_status(&rig, "pkg.example").await?);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_connect_to_a_port_other_than_443_is_refused_for_a_declared_host() -> TestResult {
+        let rig = Rig::start(Setup {
+            allow: vec!["api.example"],
+            ..Setup::default()
+        })
+        .await?;
+        rig.proxy.set_job_hosts("job1", &["api.example"]);
+        let mut stream = rig.connect().await?;
+        stream
+            .write_all(b"CONNECT api.example:8443 HTTP/1.1\r\n\r\n")
+            .await?;
+        assert_eq!(read_until_closed(&mut stream).await?, FORBIDDEN);
+        assert_eq!(rig.dialer.dialed(), Vec::<SocketAddr>::new());
+        Ok(())
+    }
+
+    #[test]
+    fn an_ip_literal_is_never_declared_even_when_the_ceiling_holds_it() {
+        for literal in ["10.0.0.5", "169.254.169.254", "8.8.8.8"] {
+            let proxy = ConnectProxy::new(
+                vec![
+                    HostPattern::Exact("api.example".to_owned()),
+                    HostPattern::Exact(literal.to_owned()),
+                ],
+                ProxyLimits::default(),
+                Fake::default(),
+                Local(Arc::new(LocalInner {
+                    port: 1,
+                    delay: Duration::ZERO,
+                    dialed: Mutex::default(),
+                })),
+            );
+            assert_eq!(
+                proxy.set_job_hosts("job1", &["api.example", literal]),
+                1,
+                "{literal}"
+            );
+            assert!(proxy.allowed("job1", "api.example"));
+            assert!(!proxy.allowed("job1", literal), "{literal}");
+        }
+    }
+
+    #[tokio::test]
     async fn an_uppercase_declared_host_is_normalised_to_the_exact_host() -> TestResult {
         let rig = Rig::start(Setup {
             allow: vec!["api.openai.com"],

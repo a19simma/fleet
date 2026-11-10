@@ -15,7 +15,6 @@ use fleet_server::config::{
 use fleet_server::cred::admin::{AdminError, SETUP_CODE_TTL_HOURS, parse_args, run as run_admin};
 use fleet_server::cred::app_mint::AppClient;
 use fleet_server::cred::github::HttpsGithub;
-use fleet_server::cred::limiter::Limiter;
 use fleet_server::cred::password::BootstrapPassword;
 use fleet_server::cred::pinned::PinnedHttps;
 use fleet_server::cred::release::ReleaseFetcher;
@@ -26,11 +25,10 @@ use fleet_server::cred::{CredentialService, RepoService, Users};
 use fleet_server::environments::{EnvironmentService, EnvironmentStore};
 use fleet_server::reaper::{DEFAULT_REAP_PERIOD, run_reaper};
 use fleet_server::retention::run_retention;
-use fleet_server::service::{UpdateRelay, serve_with_environments};
+use fleet_server::service::{UpdateRelay, build_web, serve_with_environments};
 use fleet_server::store::Store;
 use fleet_server::supervise::{BoxError, supervise};
 use fleet_server::update_feed::{FeedCache, FeedPoller, FeedSource, ReleaseFeed, SystemJitter};
-use fleet_server::web::{Web, WebAuth};
 use sqlx::postgres::{PgConnectOptions, PgPoolOptions};
 use tokio::net::TcpListener;
 use tokio::signal::unix::{SignalKind, signal};
@@ -68,32 +66,6 @@ async fn termination() {
 
 async fn stopped(mut rx: watch::Receiver<bool>) {
     let _ = rx.wait_for(|stop| *stop).await;
-}
-
-fn build_web(
-    config: &Config,
-    pool: &sqlx::PgPool,
-    users: &Users,
-    credentials: Option<CredentialService>,
-    store: Store,
-    password: BootstrapPassword,
-) -> Result<Web, BoxError> {
-    let Some(origin) = config.web_origin.as_deref() else {
-        tracing::warn!("FLEET_WEB_ORIGIN is unset: web login is off");
-        return Ok(Web::new());
-    };
-    let auth = WebAuth::new(
-        pool.clone(),
-        users.clone(),
-        origin,
-        config.web_rp_id.as_deref(),
-    )?
-    .with_bootstrap(
-        password,
-        Arc::new(Limiter::system()),
-        config.trusted_proxy_hops,
-    );
-    Ok(Web::with_console(auth, credentials, store))
 }
 
 async fn bootstrap_password(config: &Config, users: &Users) -> Result<BootstrapPassword, BoxError> {
@@ -268,6 +240,7 @@ async fn run() -> Result<(), BoxError> {
         &pool,
         &users,
         credential_service.clone(),
+        environment_service.clone(),
         store.clone(),
         password,
     )?;
