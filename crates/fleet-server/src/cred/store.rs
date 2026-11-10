@@ -34,7 +34,7 @@ use app_lane::{MintScope, MintedToken};
 const UPSERT: &str = "\
 INSERT INTO credentials (user_id, kind, shape, ciphertext, key_id, fingerprint, login, expires_at) \
 VALUES ($1, $2, $3, '\\x'::bytea, 'pending', $4, $5, to_timestamp($6::bigint / 1000.0)) \
-ON CONFLICT (user_id, kind) DO UPDATE SET shape = EXCLUDED.shape, \
+ON CONFLICT (user_id, kind, host) DO UPDATE SET shape = EXCLUDED.shape, \
 fingerprint = EXCLUDED.fingerprint, login = EXCLUDED.login, expires_at = EXCLUDED.expires_at \
 WHERE credentials.tombstoned_at IS NULL RETURNING id";
 
