@@ -17,6 +17,10 @@ use fleet_core::environment::{MAX_NAME_BYTES, MAX_SCRIPT_BYTES, MAX_SECRET_BYTES
 use fleet_proto::v1::environment_entry_spec::Kind;
 use fleet_proto::v1::fleet_environments_server::{FleetEnvironments, FleetEnvironmentsServer};
 use fleet_proto::v1::{
+    ClearEnvironmentDefaultReply, ClearEnvironmentDefaultRequest, GetEnvironmentDefaultReply,
+    GetEnvironmentDefaultRequest, SetEnvironmentDefaultReply, SetEnvironmentDefaultRequest,
+};
+use fleet_proto::v1::{
     CreateEnvironmentRequest, DeleteEnvironmentReply, DeleteEnvironmentRequest,
     DeleteEnvironmentSecretReply, DeleteEnvironmentSecretRequest, EnvironmentDelivery,
     EnvironmentDetail, EnvironmentEntrySpec, EnvironmentInfo, EnvironmentOnFail,
@@ -62,6 +66,27 @@ impl Stub {
 
 #[tonic::async_trait]
 impl FleetEnvironments for Stub {
+    async fn set_environment_default(
+        &self,
+        _request: Request<SetEnvironmentDefaultRequest>,
+    ) -> Result<Response<SetEnvironmentDefaultReply>, Status> {
+        Err(Status::unimplemented("no binding commands yet"))
+    }
+
+    async fn get_environment_default(
+        &self,
+        _request: Request<GetEnvironmentDefaultRequest>,
+    ) -> Result<Response<GetEnvironmentDefaultReply>, Status> {
+        Err(Status::unimplemented("no binding commands yet"))
+    }
+
+    async fn clear_environment_default(
+        &self,
+        _request: Request<ClearEnvironmentDefaultRequest>,
+    ) -> Result<Response<ClearEnvironmentDefaultReply>, Status> {
+        Err(Status::unimplemented("no binding commands yet"))
+    }
+
     async fn create_environment(
         &self,
         request: Request<CreateEnvironmentRequest>,

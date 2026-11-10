@@ -133,6 +133,9 @@ service FleetEnvironments {
   rpc SaveEnvironmentVersion(SaveEnvironmentVersionRequest) returns (SaveEnvironmentVersionReply);
   rpc GetEnvironmentVersion(GetEnvironmentVersionRequest) returns (EnvironmentVersion);
   rpc ListEnvironmentVersions(ListEnvironmentVersionsRequest) returns (ListEnvironmentVersionsReply);
+  rpc SetEnvironmentDefault(SetEnvironmentDefaultRequest) returns (SetEnvironmentDefaultReply);
+  rpc GetEnvironmentDefault(GetEnvironmentDefaultRequest) returns (GetEnvironmentDefaultReply);
+  rpc ClearEnvironmentDefault(ClearEnvironmentDefaultRequest) returns (ClearEnvironmentDefaultReply);
 }
 
 service FleetWorker {
@@ -1669,3 +1672,39 @@ message ListEnvironmentVersionsRequest {
 message ListEnvironmentVersionsReply {
   repeated EnvironmentVersionInfo versions = 1;
 }
+
+message EnvironmentRepoKey {
+  string host = 1;
+  string path = 2;
+}
+
+// Names what a default Environment binds to: a registered repository of the caller, or a Profile
+// the caller can see, by name. The server stores the Profile by id, so a rename keeps the binding.
+message EnvironmentBindingKey {
+  oneof key {
+    EnvironmentRepoKey repo = 1;
+    string profile = 2;
+  }
+}
+
+message SetEnvironmentDefaultRequest {
+  EnvironmentBindingKey key = 1;
+  string environment = 2;
+}
+
+message SetEnvironmentDefaultReply {}
+
+message GetEnvironmentDefaultRequest {
+  EnvironmentBindingKey key = 1;
+}
+
+// Absent environment means the key has no binding.
+message GetEnvironmentDefaultReply {
+  optional string environment = 1;
+}
+
+message ClearEnvironmentDefaultRequest {
+  EnvironmentBindingKey key = 1;
+}
+
+message ClearEnvironmentDefaultReply {}

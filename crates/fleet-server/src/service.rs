@@ -51,6 +51,10 @@ use fleet_proto::v1::{
     WorkEvent, WorkItem, WorkProject,
 };
 use fleet_proto::v1::{
+    ClearEnvironmentDefaultReply, ClearEnvironmentDefaultRequest, GetEnvironmentDefaultReply,
+    GetEnvironmentDefaultRequest, SetEnvironmentDefaultReply, SetEnvironmentDefaultRequest,
+};
+use fleet_proto::v1::{
     CloseRetroRequest, DecideEditRequest, DispositionImprovementRequest, ExportWorkReply,
     ExportWorkRequest, FileEditRequest, FileImprovementRequest, GetEditRequest, GetWorkBriefReply,
     GetWorkBriefRequest, ImportWorkReply, ImportWorkRequest, Improvement, ListEditsReply,
@@ -1095,6 +1099,36 @@ impl FleetEnvironments for FleetService {
         let (service, user_id) = self.environment_owner(&request)?;
         Ok(Response::new(
             service.list_versions(user_id, request.get_ref()).await?,
+        ))
+    }
+
+    async fn set_environment_default(
+        &self,
+        request: Request<SetEnvironmentDefaultRequest>,
+    ) -> Result<Response<SetEnvironmentDefaultReply>, Status> {
+        let (service, user_id) = self.environment_owner(&request)?;
+        Ok(Response::new(
+            service.set_default(user_id, request.get_ref()).await?,
+        ))
+    }
+
+    async fn get_environment_default(
+        &self,
+        request: Request<GetEnvironmentDefaultRequest>,
+    ) -> Result<Response<GetEnvironmentDefaultReply>, Status> {
+        let (service, user_id) = self.environment_owner(&request)?;
+        Ok(Response::new(
+            service.get_default(user_id, request.get_ref()).await?,
+        ))
+    }
+
+    async fn clear_environment_default(
+        &self,
+        request: Request<ClearEnvironmentDefaultRequest>,
+    ) -> Result<Response<ClearEnvironmentDefaultReply>, Status> {
+        let (service, user_id) = self.environment_owner(&request)?;
+        Ok(Response::new(
+            service.clear_default(user_id, request.get_ref()).await?,
         ))
     }
 }
