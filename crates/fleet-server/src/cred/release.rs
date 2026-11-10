@@ -299,6 +299,7 @@ impl ReleaseFetcher {
                 host: &target.host,
                 path: &target.path,
                 allow_private: false,
+                approved_ips: &[],
                 authorization: None,
                 accept: ACCEPT,
             };

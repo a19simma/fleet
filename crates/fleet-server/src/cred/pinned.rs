@@ -67,28 +67,37 @@ fn unmap(ip: IpAddr) -> IpAddr {
     }
 }
 
+/// Whether `ip` is an RFC 1918 or unique-local `fc00::/7` address, read through IPv4-mapping.
+pub fn is_private_range(ip: IpAddr) -> bool {
+    match unmap(ip) {
+        IpAddr::V4(v4) => v4.is_private(),
+        IpAddr::V6(v6) => v6.segments()[0] & 0xfe00 == 0xfc00,
+    }
+}
+
 /// Whether the forge may be dialled at `ip`.
 ///
 /// The rule is global unicast, not a blocklist. An IPv4-mapped IPv6 address is judged as its
 /// IPv4 address. Metadata addresses, loopback, link-local, unspecified, CGNAT `100.64/10`,
 /// multicast, broadcast, reserved and documentation ranges, NAT64 `64:ff9b::/96` and 6to4
-/// `2002::/16` are always refused. `allow_private` admits only RFC 1918 and unique-local
-/// `fc00::/7`.
-pub fn is_vetted(ip: IpAddr, allow_private: bool) -> bool {
+/// `2002::/16` are always refused. An RFC 1918 or unique-local `fc00::/7` address passes only
+/// when `allow_private` is set and `approved_ips` holds that address.
+pub fn is_vetted(ip: IpAddr, allow_private: bool, approved_ips: &[IpAddr]) -> bool {
     if is_metadata(ip) {
         return false;
     }
+    if is_private_range(ip) {
+        let wanted = unmap(ip);
+        return allow_private && approved_ips.iter().any(|a| unmap(*a) == wanted);
+    }
     match unmap(ip) {
-        IpAddr::V4(v4) => vet_v4(v4, allow_private),
-        IpAddr::V6(v6) => vet_v6(v6, allow_private),
+        IpAddr::V4(v4) => vet_v4(v4),
+        IpAddr::V6(v6) => vet_v6(v6),
     }
 }
 
-fn vet_v4(ip: Ipv4Addr, allow_private: bool) -> bool {
+fn vet_v4(ip: Ipv4Addr) -> bool {
     let [a, b, c, _] = ip.octets();
-    if ip.is_private() {
-        return allow_private;
-    }
     let refused = a == 0
         || a == 127
         || a >= 224
@@ -103,11 +112,8 @@ fn vet_v4(ip: Ipv4Addr, allow_private: bool) -> bool {
     !refused
 }
 
-fn vet_v6(ip: Ipv6Addr, allow_private: bool) -> bool {
+fn vet_v6(ip: Ipv6Addr) -> bool {
     let s = ip.segments();
-    if s[0] & 0xfe00 == 0xfc00 {
-        return allow_private;
-    }
     let global_unicast = s[0] & 0xe000 == 0x2000;
     let sixto4 = s[0] == 0x2002;
     let protocol_assignments = s[0] == 0x2001 && s[1] < 0x0200;
@@ -122,11 +128,18 @@ fn vet_v6(ip: Ipv6Addr, allow_private: bool) -> bool {
 ///
 /// Returns [`FetchError::Blocked`] when any address fails [`is_vetted`] and
 /// [`FetchError::Unavailable`] when the list is empty.
-pub fn vet_all(addrs: &[IpAddr], allow_private: bool) -> Result<IpAddr, FetchError> {
+pub fn vet_all(
+    addrs: &[IpAddr],
+    allow_private: bool,
+    approved_ips: &[IpAddr],
+) -> Result<IpAddr, FetchError> {
     if addrs.len() > MAX_ADDRESSES {
         return Err(FetchError::Blocked);
     }
-    if addrs.iter().any(|ip| !is_vetted(*ip, allow_private)) {
+    if addrs
+        .iter()
+        .any(|ip| !is_vetted(*ip, allow_private, approved_ips))
+    {
         return Err(FetchError::Blocked);
     }
     addrs.first().copied().ok_or(FetchError::Unavailable)
@@ -265,9 +278,10 @@ impl<R: Resolve, D: Dial> ForgeTransport for PinnedHttps<R, D> {
             .resolve(request.host)
             .await
             .map_err(|_| FetchError::Unavailable)?;
-        let ip = vet_all(&addrs, request.allow_private).inspect_err(|err| {
-            tracing::warn!(host = request.host, error = %err, "forge address refused");
-        })?;
+        let ip =
+            vet_all(&addrs, request.allow_private, request.approved_ips).inspect_err(|err| {
+                tracing::warn!(host = request.host, error = %err, "forge address refused");
+            })?;
         let name =
             ServerName::try_from(request.host.to_owned()).map_err(|_| FetchError::Blocked)?;
         let wire = Request::builder()
@@ -395,7 +409,12 @@ mod tests {
         ];
         for (name, ip) in refused {
             for allow_private in [false, true] {
-                assert!(!is_vetted(ip, allow_private), "{name} {ip} {allow_private}");
+                for approved in [&[][..], &[ip][..]] {
+                    assert!(
+                        !is_vetted(ip, allow_private, approved),
+                        "{name} {ip} {allow_private}"
+                    );
+                }
             }
         }
     }
@@ -414,8 +433,10 @@ mod tests {
             v6("::ffff:192.168.1.1"),
         ];
         for ip in private {
-            assert!(!is_vetted(ip, false), "{ip}");
-            assert!(is_vetted(ip, true), "{ip}");
+            assert!(!is_vetted(ip, false, &[]), "{ip}");
+            assert!(!is_vetted(ip, false, &[ip]), "{ip}");
+            assert!(!is_vetted(ip, true, &[]), "{ip}");
+            assert!(is_vetted(ip, true, &[ip]), "{ip}");
         }
     }
 
@@ -451,8 +472,8 @@ mod tests {
             v6("::ffff:93.184.216.34"),
         ];
         for ip in public {
-            assert!(is_vetted(ip, false), "{ip}");
-            assert!(is_vetted(ip, true), "{ip}");
+            assert!(is_vetted(ip, false, &[]), "{ip}");
+            assert!(is_vetted(ip, true, &[]), "{ip}");
         }
     }
 
@@ -470,20 +491,20 @@ mod tests {
     #[test]
     fn one_refused_address_fails_the_whole_list() {
         let good = v4(93, 184, 216, 34);
-        assert_eq!(vet_all(&[good], false), Ok(good));
-        assert_eq!(vet_all(&[good, good], false), Ok(good));
+        assert_eq!(vet_all(&[good], false, &[]), Ok(good));
+        assert_eq!(vet_all(&[good, good], false, &[]), Ok(good));
         for bad in [v4(127, 0, 0, 1), v6("::ffff:127.0.0.1"), v4(10, 0, 0, 1)] {
-            assert_eq!(vet_all(&[good, bad], false), Err(FetchError::Blocked));
-            assert_eq!(vet_all(&[bad, good], false), Err(FetchError::Blocked));
+            assert_eq!(vet_all(&[good, bad], false, &[]), Err(FetchError::Blocked));
+            assert_eq!(vet_all(&[bad, good], false, &[]), Err(FetchError::Blocked));
         }
-        assert_eq!(vet_all(&[], false), Err(FetchError::Unavailable));
+        assert_eq!(vet_all(&[], false, &[]), Err(FetchError::Unavailable));
         assert_eq!(
-            vet_all(&[good, v4(10, 0, 0, 1)], true),
+            vet_all(&[good, v4(10, 0, 0, 1)], true, &[v4(10, 0, 0, 1)]),
             Ok(good),
-            "private passes with allow_private"
+            "an approved private address passes beside a public one"
         );
         assert_eq!(
-            vet_all(&[good, v4(127, 0, 0, 1)], true),
+            vet_all(&[good, v4(127, 0, 0, 1)], true, &[v4(127, 0, 0, 1)]),
             Err(FetchError::Blocked)
         );
     }
@@ -491,9 +512,9 @@ mod tests {
     #[test]
     fn the_address_list_is_capped() {
         let good = v4(93, 184, 216, 34);
-        assert_eq!(vet_all(&vec![good; MAX_ADDRESSES], false), Ok(good));
+        assert_eq!(vet_all(&vec![good; MAX_ADDRESSES], false, &[]), Ok(good));
         assert_eq!(
-            vet_all(&vec![good; MAX_ADDRESSES + 1], false),
+            vet_all(&vec![good; MAX_ADDRESSES + 1], false, &[]),
             Err(FetchError::Blocked)
         );
     }
@@ -692,11 +713,21 @@ mod tests {
         host: &str,
         private: bool,
     ) -> Result<ForgeReply, FetchError> {
+        get_approved(c, host, private, &[]).await
+    }
+
+    async fn get_approved<R: Resolve, D: Dial>(
+        c: &PinnedHttps<R, D>,
+        host: &str,
+        private: bool,
+        approved: &[IpAddr],
+    ) -> Result<ForgeReply, FetchError> {
         let auth = crate::cred::https::bearer_header(b"s3cret-token").unwrap();
         c.get(&ForgeGet {
             host,
             path: "/repos/acme/widget",
             allow_private: private,
+            approved_ips: approved,
             authorization: Some(&auth),
             accept: "application/json",
         })
@@ -789,7 +820,14 @@ mod tests {
     async fn allow_private_admits_private_and_never_loopback() {
         let f = forge(HOST_NAME, http("200 OK", "", b"{}"), false).await;
         let c = connector(vec![v4(10, 1, 2, 3)], &f);
-        assert_eq!(get(&c, HOST_NAME, true).await.unwrap().status, 200);
+        let approved = [v4(10, 1, 2, 3)];
+        assert_eq!(
+            get_approved(&c, HOST_NAME, true, &approved)
+                .await
+                .unwrap()
+                .status,
+            200
+        );
         assert_eq!(
             *f.aim.dialled.lock().unwrap(),
             vec![SocketAddr::new(v4(10, 1, 2, 3), 443)]
@@ -801,7 +839,7 @@ mod tests {
         ] {
             let c = connector(vec![bad], &f);
             assert_eq!(
-                get(&c, HOST_NAME, true).await,
+                get_approved(&c, HOST_NAME, true, &[bad]).await,
                 Err(FetchError::Blocked),
                 "{bad}"
             );
@@ -837,6 +875,7 @@ mod tests {
             host,
             path: "/",
             allow_private: false,
+            approved_ips: &[],
             authorization: Some(&auth),
             accept: "application/json",
         })
@@ -990,6 +1029,7 @@ mod tests {
             host: HOST_NAME,
             path: "/x",
             allow_private: false,
+            approved_ips: &[],
             authorization: None,
             accept: "application/octet-stream",
         })
@@ -1040,5 +1080,273 @@ mod tests {
         let f = forge(HOST_NAME, reply, false).await;
         let c = connector(vec![IpAddr::V4(PUBLIC)], &f);
         assert_eq!(get(&c, HOST_NAME, false).await, Err(FetchError::TooLarge));
+    }
+
+    struct Script {
+        answers: Mutex<Vec<Vec<IpAddr>>>,
+        calls: Arc<AtomicUsize>,
+    }
+
+    impl Script {
+        fn new(answers: Vec<Vec<IpAddr>>) -> (Self, Arc<AtomicUsize>) {
+            let calls = Arc::new(AtomicUsize::new(0));
+            let script = Self {
+                answers: Mutex::new(answers),
+                calls: Arc::clone(&calls),
+            };
+            (script, calls)
+        }
+    }
+
+    #[tonic::async_trait]
+    impl Resolve for Script {
+        async fn resolve(&self, _: &str) -> io::Result<Vec<IpAddr>> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            let mut answers = self.answers.lock().unwrap();
+            if answers.len() > 1 {
+                Ok(answers.remove(0))
+            } else {
+                Ok(answers.first().cloned().unwrap_or_default())
+            }
+        }
+    }
+
+    fn scripted(
+        answers: Vec<Vec<IpAddr>>,
+        f: &Forge,
+    ) -> (PinnedHttps<Script, Aim>, Arc<AtomicUsize>) {
+        let (script, calls) = Script::new(answers);
+        let c = PinnedHttps::new(
+            script,
+            f.aim.clone(),
+            tls_config_with_roots(f.roots.clone()).unwrap(),
+        );
+        (c, calls)
+    }
+
+    #[tokio::test]
+    async fn an_approved_private_address_is_dialled_and_an_unapproved_one_is_not() {
+        let f = forge(HOST_NAME, http("200 OK", "", b"{}"), false).await;
+        let approved = [v4(10, 1, 2, 3)];
+        let c = connector(vec![v4(10, 1, 2, 3)], &f);
+        assert_eq!(
+            get_approved(&c, HOST_NAME, false, &approved).await,
+            Err(FetchError::Blocked)
+        );
+        assert_eq!(
+            get_approved(&c, HOST_NAME, true, &[]).await,
+            Err(FetchError::Blocked)
+        );
+        assert!(f.aim.dialled.lock().unwrap().is_empty());
+        assert_eq!(
+            get_approved(&c, HOST_NAME, true, &approved)
+                .await
+                .unwrap()
+                .status,
+            200
+        );
+        assert_eq!(f.aim.dialled.lock().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn an_approved_host_that_moves_to_a_new_private_address_is_refused() {
+        let f = forge(HOST_NAME, http("200 OK", "", b"{}"), false).await;
+        let approved = [v4(192, 168, 3, 1)];
+        let (c, _) = scripted(vec![vec![v4(192, 168, 3, 1)], vec![v4(192, 168, 3, 2)]], &f);
+        assert_eq!(
+            get_approved(&c, HOST_NAME, true, &approved)
+                .await
+                .unwrap()
+                .status,
+            200
+        );
+        assert_eq!(
+            get_approved(&c, HOST_NAME, true, &approved).await,
+            Err(FetchError::Blocked)
+        );
+        assert_eq!(f.aim.dialled.lock().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn a_mixed_set_with_one_unapproved_private_record_is_refused() {
+        let f = forge(HOST_NAME, http("200 OK", "", b"{}"), false).await;
+        let approved = [v4(10, 0, 0, 5)];
+        let public = IpAddr::V4(PUBLIC);
+        let lists = [
+            vec![public, v4(10, 0, 0, 6)],
+            vec![v4(10, 0, 0, 6), public],
+            vec![v4(10, 0, 0, 5), v4(10, 0, 0, 6)],
+            vec![v4(10, 0, 0, 5), v4(127, 0, 0, 1)],
+            vec![v4(10, 0, 0, 5), v4(169, 254, 169, 254)],
+            vec![v4(10, 0, 0, 5), v4(169, 254, 1, 1)],
+            vec![v4(10, 0, 0, 5), v6("::1")],
+        ];
+        for list in lists {
+            let c = connector(list.clone(), &f);
+            assert_eq!(
+                get_approved(&c, HOST_NAME, true, &approved).await,
+                Err(FetchError::Blocked),
+                "{list:?}"
+            );
+        }
+        assert!(f.aim.dialled.lock().unwrap().is_empty());
+        let ok = connector(vec![public, v4(10, 0, 0, 5)], &f);
+        assert_eq!(
+            get_approved(&ok, HOST_NAME, true, &approved)
+                .await
+                .unwrap()
+                .status,
+            200
+        );
+    }
+
+    #[tokio::test]
+    async fn a_public_host_with_a_private_record_is_refused_even_when_that_address_is_listed() {
+        let f = forge(HOST_NAME, http("200 OK", "", b"{}"), false).await;
+        let c = connector(vec![IpAddr::V4(PUBLIC), v4(10, 0, 0, 5)], &f);
+        assert_eq!(
+            get_approved(&c, HOST_NAME, false, &[v4(10, 0, 0, 5)]).await,
+            Err(FetchError::Blocked)
+        );
+        assert!(f.aim.dialled.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn an_approved_address_written_in_mapped_form_matches_its_v4_record() {
+        let f = forge(HOST_NAME, http("200 OK", "", b"{}"), false).await;
+        let mapped = [v6("::ffff:10.0.0.5")];
+        let c = connector(vec![v4(10, 0, 0, 5)], &f);
+        assert_eq!(
+            get_approved(&c, HOST_NAME, true, &mapped)
+                .await
+                .unwrap()
+                .status,
+            200
+        );
+        let c = connector(vec![v6("::ffff:10.0.0.5")], &f);
+        assert_eq!(
+            get_approved(&c, HOST_NAME, true, &[v4(10, 0, 0, 5)])
+                .await
+                .unwrap()
+                .status,
+            200
+        );
+    }
+
+    #[tokio::test]
+    async fn vetting_reruns_on_every_call_and_the_dial_uses_the_vetted_address() {
+        let f = forge(HOST_NAME, http("200 OK", "", b"{}"), false).await;
+        let (c, calls) = scripted(
+            vec![
+                vec![IpAddr::V4(PUBLIC)],
+                vec![v4(169, 254, 169, 254)],
+                vec![IpAddr::V4(PUBLIC)],
+            ],
+            &f,
+        );
+        assert_eq!(
+            get_approved(&c, HOST_NAME, false, &[])
+                .await
+                .unwrap()
+                .status,
+            200
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            get_approved(&c, HOST_NAME, false, &[]).await,
+            Err(FetchError::Blocked)
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+        assert_eq!(
+            get_approved(&c, HOST_NAME, false, &[])
+                .await
+                .unwrap()
+                .status,
+            200
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 3);
+        assert_eq!(
+            *f.aim.dialled.lock().unwrap(),
+            vec![SocketAddr::new(IpAddr::V4(PUBLIC), 443); 2]
+        );
+    }
+
+    #[tokio::test]
+    async fn a_rebind_after_the_vet_cannot_change_the_dialled_address() {
+        let f = forge(HOST_NAME, http("200 OK", "", b"{}"), false).await;
+        let (c, calls) = scripted(vec![vec![IpAddr::V4(PUBLIC)], vec![v4(127, 0, 0, 1)]], &f);
+        assert_eq!(
+            get_approved(&c, HOST_NAME, false, &[])
+                .await
+                .unwrap()
+                .status,
+            200
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            *f.aim.dialled.lock().unwrap(),
+            vec![SocketAddr::new(IpAddr::V4(PUBLIC), 443)]
+        );
+    }
+
+    #[tokio::test]
+    async fn a_redirect_to_an_internal_address_is_never_followed() {
+        for status in [
+            "301 Moved Permanently",
+            "302 Found",
+            "307 Temporary Redirect",
+            "308 Permanent Redirect",
+        ] {
+            for target in [
+                "http://169.254.169.254/latest/meta-data/",
+                "https://127.0.0.1/admin",
+                "https://[::1]/",
+                "https://internal.test/x",
+            ] {
+                let f = forge(
+                    HOST_NAME,
+                    http(status, &format!("location: {target}\r\n"), b"moved"),
+                    false,
+                )
+                .await;
+                let c = connector(vec![IpAddr::V4(PUBLIC)], &f);
+                let reply = get(&c, HOST_NAME, false).await.unwrap();
+                assert!(reply.status.is_redirection(), "{status}");
+                assert_eq!(reply.location.as_deref(), Some(target));
+                assert_eq!(reply.body.len(), 0);
+                tokio::time::sleep(Duration::from_millis(100)).await;
+                assert_eq!(f.accepted.load(Ordering::SeqCst), 1, "{status} {target}");
+                assert_eq!(f.seen.lock().unwrap().len(), 1);
+                assert_eq!(f.aim.dialled.lock().unwrap().len(), 1);
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn a_redirect_with_authorization_sends_no_second_request_even_for_an_approved_host() {
+        let f = forge(
+            HOST_NAME,
+            http(
+                "307 Temporary Redirect",
+                "location: https://other.test/x\r\n",
+                b"",
+            ),
+            false,
+        )
+        .await;
+        let approved = [v4(10, 0, 0, 5)];
+        let c = connector(vec![v4(10, 0, 0, 5)], &f);
+        let reply = get_approved(&c, HOST_NAME, true, &approved).await.unwrap();
+        assert_eq!(reply.status, 307);
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let seen = f.seen.lock().unwrap().clone();
+        assert_eq!(seen.len(), 1);
+        assert_eq!(
+            seen.iter()
+                .filter(|r| r.contains("authorization: Bearer"))
+                .count(),
+            1
+        );
+        assert_eq!(f.aim.dialled.lock().unwrap().len(), 1);
     }
 }

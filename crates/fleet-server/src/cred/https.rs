@@ -6,6 +6,7 @@
 //!
 //! No error here carries a token or any text from the network.
 
+use std::net::IpAddr;
 use std::sync::Arc;
 
 use http_body_util::{BodyExt, Empty, Limited};
@@ -133,6 +134,9 @@ pub struct ForgeGet<'a> {
     pub path: &'a str,
     /// Whether RFC 1918 and unique-local addresses are acceptable for this host.
     pub allow_private: bool,
+    /// The private addresses an admin approved for this host. With `allow_private`, a private
+    /// address outside this list refuses the call. Empty admits no private address.
+    pub approved_ips: &'a [IpAddr],
     /// The `Authorization` value, marked sensitive, or `None` to send no such header.
     pub authorization: Option<&'a HeaderValue>,
     /// The `Accept` header value.
