@@ -1957,6 +1957,7 @@ async fn deleting_a_minted_app_credential_through_the_service_succeeds(pool: PgP
     let service = super::CredentialService::new(w.creds.clone(), Arc::new(NoGithub));
     let request = fleet_proto::v1::DeleteCredentialRequest {
         id: u64::try_from(id).unwrap(),
+        host: String::new(),
     };
     let reply = service.delete(w.alice, &request).await;
     assert!(reply.is_ok(), "{reply:?}");
@@ -2063,6 +2064,7 @@ async fn the_service_maps_a_tombstoned_put_to_its_fixed_precondition(pool: PgPoo
         shape: "static_secret".to_owned(),
         value: INSTALLATION.to_string(),
         expires_at_ms: None,
+        host: String::new(),
     };
     let status = service.put(w.alice, request).await.unwrap_err();
     assert_eq!(status.code(), tonic::Code::FailedPrecondition);
@@ -2449,6 +2451,7 @@ async fn the_service_put_refuses_an_off_list_installation_with_the_fixed_message
         shape: "static_secret".to_owned(),
         value: INSTALLATION.to_string(),
         expires_at_ms: None,
+        host: String::new(),
     };
     let status = service.put(w.alice, request).await.unwrap_err();
     assert_eq!(status.code(), tonic::Code::FailedPrecondition);

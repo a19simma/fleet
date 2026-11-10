@@ -198,6 +198,7 @@ pub(crate) async fn put(
             shape: STATIC_SECRET.to_owned(),
             value: std::mem::take(&mut *value),
             expires_at_ms: None,
+            host: String::new(),
         })
         .await
         .map_err(|s| notice(&s))?
@@ -218,7 +219,10 @@ pub(crate) async fn delete(
     out: &mut impl Write,
 ) -> Result<(), CliError> {
     client
-        .delete_credential(DeleteCredentialRequest { id })
+        .delete_credential(DeleteCredentialRequest {
+            id,
+            host: String::new(),
+        })
         .await
         .map_err(|s| notice(&s))?;
     writeln!(out, "{}", CredentialNotice::Deleted.text())?;

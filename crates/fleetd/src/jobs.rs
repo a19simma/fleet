@@ -3284,6 +3284,7 @@ mod token_wiring_tests {
                     github,
                     wire("anthropic_api_key", "agent-key-0123456789abcdef"),
                 ],
+                hosts: Vec::new(),
             }))
         }
 

@@ -383,6 +383,7 @@ mod tests {
             };
             Ok(Response::new(GetJobCredentialsReply {
                 credentials: vec![github, wire(self.0, AGENT)],
+                hosts: Vec::new(),
             }))
         }
 

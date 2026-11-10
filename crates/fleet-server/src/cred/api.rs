@@ -61,6 +61,7 @@ fn info(summary: CredentialSummary) -> CredentialInfo {
         fingerprint: summary.fingerprint,
         login: summary.login,
         expires_at_ms: summary.expires_at_ms.and_then(|ms| u64::try_from(ms).ok()),
+        host: String::new(),
     }
 }
 
@@ -276,7 +277,10 @@ impl CredentialService {
                 }),
             });
         }
-        Ok(GetJobCredentialsReply { credentials })
+        Ok(GetJobCredentialsReply {
+            credentials,
+            hosts: Vec::new(),
+        })
     }
 
     /// Checks a stored GitHub credential against GitHub. No use row is written.

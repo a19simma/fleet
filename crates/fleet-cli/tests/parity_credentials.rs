@@ -555,6 +555,7 @@ impl Rig {
                     shape: "static_secret".to_owned(),
                     value: value.to_owned(),
                     expires_at_ms: None,
+                    host: String::new(),
                 },
             )
             .await
@@ -1419,6 +1420,7 @@ fn hostile_info(secret: &str) -> CredentialInfo {
         fingerprint: format!("ab\r\ncd{secret}"),
         login: Some(format!("\u{202e}login\u{85}{secret}")),
         expires_at_ms: Some(EXPIRY_MS.unsigned_abs()),
+        host: String::new(),
     }
 }
 

@@ -229,6 +229,7 @@ async fn put(cx: &Cx, Form(mut form): Form<HashMap<String, String>>) -> Result<S
         shape: STATIC_SECRET.to_owned(),
         value: form.remove("value").unwrap_or_default(),
         expires_at_ms: None,
+        host: String::new(),
     };
     match web.service.put(user_id, request).await {
         Ok(_) => Ok(back("saved")),
@@ -244,7 +245,13 @@ async fn delete(cx: &Cx, Form(form): Form<HashMap<String, String>>) -> Result<Se
     };
     match web
         .service
-        .delete(user_id, &DeleteCredentialRequest { id })
+        .delete(
+            user_id,
+            &DeleteCredentialRequest {
+                id,
+                host: String::new(),
+            },
+        )
         .await
     {
         Ok(_) => Ok(back("deleted")),

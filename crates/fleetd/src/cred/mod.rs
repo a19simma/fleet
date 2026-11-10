@@ -679,6 +679,7 @@ mod tests {
                     ..app_wire("ghs_Other0123456789")
                 },
             ],
+            hosts: Vec::new(),
         };
         assert_eq!(held(&reply), vec![good, at_cap]);
     }
@@ -689,6 +690,7 @@ mod tests {
             credentials: (0..MAX_CREDENTIALS_PER_USER + 5)
                 .map(|n| app_wire(&format!("ghs_Tok{n:010}")))
                 .collect(),
+            hosts: Vec::new(),
         };
         assert_eq!(held(&reply).len(), MAX_CREDENTIALS_PER_USER);
     }

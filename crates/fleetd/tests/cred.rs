@@ -182,6 +182,7 @@ fn good() -> GetJobCredentialsReply {
             wire("github_pat", "static_secret", GITHUB),
             wire("anthropic_api_key", "static_secret", AGENT),
         ],
+        hosts: Vec::new(),
     }
 }
 
@@ -337,7 +338,11 @@ async fn a_reply_that_breaks_a_server_rule_is_malformed() -> TestResult {
         ],
     ];
     for credentials in replies {
-        let (book, _fake) = serve(Ok(GetJobCredentialsReply { credentials })).await?;
+        let (book, _fake) = serve(Ok(GetJobCredentialsReply {
+            credentials,
+            hosts: Vec::new(),
+        }))
+        .await?;
         let got = book.fetch("job1", 1, &box_name()).await;
         assert_eq!(got.err(), Some(CredentialFailure::Malformed));
         assert!(book.get("job1").is_none());
@@ -382,7 +387,11 @@ async fn app_fetch(
     ),
     Box<dyn std::error::Error>,
 > {
-    let (book, _fake) = serve(Ok(GetJobCredentialsReply { credentials })).await?;
+    let (book, _fake) = serve(Ok(GetJobCredentialsReply {
+        credentials,
+        hosts: Vec::new(),
+    }))
+    .await?;
     let got = book.fetch("job1", 1, &box_name()).await;
     Ok((got, book))
 }
@@ -594,6 +603,7 @@ async fn an_installation_token_alone_still_needs_an_agent_credential() -> TestRe
 async fn a_reply_without_github_or_without_an_agent_credential_fails_closed() -> TestResult {
     let (book, _fake) = serve(Ok(GetJobCredentialsReply {
         credentials: vec![wire("anthropic_api_key", "static_secret", AGENT)],
+        hosts: Vec::new(),
     }))
     .await?;
     assert_eq!(
@@ -602,6 +612,7 @@ async fn a_reply_without_github_or_without_an_agent_credential_fails_closed() ->
     );
     let (book, _fake) = serve(Ok(GetJobCredentialsReply {
         credentials: vec![wire("github_pat", "static_secret", GITHUB)],
+        hosts: Vec::new(),
     }))
     .await?;
     assert_eq!(
@@ -631,6 +642,7 @@ async fn values_at_the_length_bounds_pass_and_one_byte_outside_fails() -> TestRe
                 wire("github_pat", "static_secret", GITHUB),
                 wire("codex_api_key", "static_secret", &value),
             ],
+            hosts: Vec::new(),
         }))
         .await?;
         let got = book.fetch("job1", 1, &box_name()).await;
@@ -977,6 +989,7 @@ async fn run_fails_a_claude_job_with_no_claude_credential_and_never_uses_the_box
             wire("github_pat", "static_secret", GITHUB),
             wire("codex_api_key", "static_secret", AGENT),
         ],
+        hosts: Vec::new(),
     };
     let mut lane = lane(Ok(reply), Renew::Quiet, None).await?;
     let (_trigger, shutdown) = Shutdown::channel();
@@ -1138,6 +1151,7 @@ async fn a_bad_identity_fails_the_job_with_the_fixed_reason_before_any_clone() -
         let mut lane = lane(
             Ok(GetJobCredentialsReply {
                 credentials: vec![app, agent_wire()],
+                hosts: Vec::new(),
             }),
             Renew::Quiet,
             None,
@@ -1188,6 +1202,7 @@ fn app_reply(token: &str, expires_ms: Option<u64>) -> GetJobCredentialsReply {
     app.expires_at_ms = expires_ms;
     GetJobCredentialsReply {
         credentials: vec![app, agent_wire()],
+        hosts: Vec::new(),
     }
 }
 
@@ -2186,6 +2201,7 @@ fn rejected_replies() -> Vec<(&'static str, CredentialFailure, GetJobCredentials
             CredentialFailure::AppIdentityMissing,
             GetJobCredentialsReply {
                 credentials: vec![no_identity, agent_wire()],
+                hosts: Vec::new(),
             },
         ),
         (
@@ -2193,6 +2209,7 @@ fn rejected_replies() -> Vec<(&'static str, CredentialFailure, GetJobCredentials
             CredentialFailure::AppIdentityInvalid,
             GetJobCredentialsReply {
                 credentials: vec![bad_identity, agent_wire()],
+                hosts: Vec::new(),
             },
         ),
         (
@@ -2205,6 +2222,7 @@ fn rejected_replies() -> Vec<(&'static str, CredentialFailure, GetJobCredentials
             CredentialFailure::Malformed,
             GetJobCredentialsReply {
                 credentials: two_forges,
+                hosts: Vec::new(),
             },
         ),
     ]

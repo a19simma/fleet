@@ -2117,6 +2117,7 @@ impl FleetWorker for MintStub {
                     None,
                 ),
             ],
+            hosts: Vec::new(),
         }))
     }
 

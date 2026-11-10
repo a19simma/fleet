@@ -165,6 +165,7 @@ impl FleetWorker for Stub {
     ) -> Result<Response<fleet_proto::v1::GetJobCredentialsReply>, Status> {
         Ok(Response::new(fleet_proto::v1::GetJobCredentialsReply {
             credentials: self.0.credentials.clone(),
+            hosts: Vec::new(),
         }))
     }
 

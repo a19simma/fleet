@@ -195,6 +195,7 @@ async fn the_service_maps_a_denied_put_and_release_to_permission_denied(pool: Pg
                 shape: STATIC.wire_name().to_owned(),
                 value: ANT.to_owned(),
                 expires_at_ms: None,
+                host: String::new(),
             },
         )
         .await

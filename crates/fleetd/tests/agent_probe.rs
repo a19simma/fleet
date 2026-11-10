@@ -268,6 +268,7 @@ impl FleetWorker for Worker {
         };
         Ok(Response::new(GetJobCredentialsReply {
             credentials: vec![wire("github_pat", GITHUB), wire(self.kind, self.key)],
+            hosts: Vec::new(),
         }))
     }
 

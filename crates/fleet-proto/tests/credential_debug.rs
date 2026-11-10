@@ -10,6 +10,7 @@ fn put() -> PutCredentialRequest {
         shape: "token".into(),
         value: SECRET.into(),
         expires_at_ms: Some(7),
+        host: String::new(),
     }
 }
 
@@ -62,6 +63,7 @@ fn job_credential_debug_shows_the_expiry_and_identity_but_not_the_value() {
 fn a_reply_holding_credentials_hides_every_value() {
     let reply = GetJobCredentialsReply {
         credentials: vec![job(), job()],
+        hosts: Vec::new(),
     };
     for text in [format!("{reply:?}"), format!("{reply:#?}")] {
         assert!(!text.contains(SECRET), "{text}");

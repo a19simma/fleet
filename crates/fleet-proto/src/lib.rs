@@ -577,6 +577,7 @@ impl std::fmt::Debug for v1::PutCredentialRequest {
             .field("shape", &self.shape)
             .field("value", &"<redacted>")
             .field("expires_at_ms", &self.expires_at_ms)
+            .field("host", &self.host)
             .finish()
     }
 }

@@ -159,6 +159,7 @@ fn put(kind: &str, value: &str) -> PutCredentialRequest {
         shape: STATIC.to_owned(),
         value: value.to_owned(),
         expires_at_ms: None,
+        host: String::new(),
     }
 }
 
@@ -407,7 +408,13 @@ async fn credentials_belong_to_the_caller_only(pool: PgPool) {
     assert_eq!(listed.credentials.len(), 0);
     let err = h
         .client
-        .delete_credential(as_user(&h.bob, DeleteCredentialRequest { id: info.id }))
+        .delete_credential(as_user(
+            &h.bob,
+            DeleteCredentialRequest {
+                id: info.id,
+                host: String::new(),
+            },
+        ))
         .await
         .unwrap_err();
     assert_eq!(err.code(), Code::NotFound);
@@ -421,7 +428,13 @@ async fn credentials_belong_to_the_caller_only(pool: PgPool) {
     assert_eq!(h.github.calls(), calls);
     assert_eq!(stored(&h.pool).await, 1);
     h.client
-        .delete_credential(as_user(&h.alice, DeleteCredentialRequest { id: info.id }))
+        .delete_credential(as_user(
+            &h.alice,
+            DeleteCredentialRequest {
+                id: info.id,
+                host: String::new(),
+            },
+        ))
         .await
         .unwrap();
     assert_eq!(stored(&h.pool).await, 0);
