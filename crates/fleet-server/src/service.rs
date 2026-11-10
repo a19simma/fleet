@@ -1302,6 +1302,13 @@ fn jobs_error(err: &StoreError) -> Status {
         }
         StoreError::NotFound => Status::not_found("job not found"),
         StoreError::UnknownProfile => Status::not_found("profile not found"),
+        StoreError::UnknownEnvironment => Status::not_found(fleet_proto::ERR_ENV_NOT_FOUND),
+        StoreError::EnvironmentWithoutVersion => {
+            Status::not_found(fleet_proto::ERR_ENV_VERSION_NOT_FOUND)
+        }
+        StoreError::EnvironmentScriptsNotGranted => {
+            Status::permission_denied(fleet_proto::ERR_ENV_SCRIPTS_NOT_GRANTED)
+        }
         StoreError::ToolsNotGranted => {
             Status::permission_denied(profiles::ERR_PROFILE_TOOLS_NOT_GRANTED)
         }

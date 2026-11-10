@@ -20,6 +20,7 @@ use sqlx::postgres::PgRow;
 use sqlx::{PgPool, Postgres, Row, Transaction};
 
 use crate::batches::{self, BatchInvalid};
+use crate::environments::{self, EnvPin, EnvRequest, PinRefusal, PinResult};
 use crate::jobs::{
     JobInvalid, MAX_CHUNKS_PER_REPORT, MAX_PHASE_CHARS, MAX_PROGRESS_CHARS, MAX_TRANSCRIPT_BYTES,
     MAX_TRANSCRIPT_ROWS, MIN_CHUNK_COST_BYTES, NewJob, runner_kind, validate_ci, validate_job_id,
@@ -158,18 +159,22 @@ const SELECT_JOB_BY_KEY: &str = concat!(
 );
 
 const INSERT_JOB: &str = "\
-INSERT INTO jobs (job_id, idempotency_key, prompt, repo, base_ref, branch, open_pr, user_id, agent) \
-VALUES ($1, $2, $3, $4, $5, 'swarm/' || $1, $6, $7, $8) \
+INSERT INTO jobs (job_id, idempotency_key, prompt, repo, base_ref, branch, open_pr, user_id, agent, \
+environment_id, environment_version) \
+VALUES ($1, $2, $3, $4, $5, 'swarm/' || $1, $6, $7, $8, $9, $10) \
 ON CONFLICT (idempotency_key) DO NOTHING \
 RETURNING job_id";
+
+const STORED_PIN: &str =
+    "SELECT environment_id, environment_version FROM jobs WHERE idempotency_key = $1";
 
 const KEY_EXISTS: &str = "SELECT EXISTS (SELECT 1 FROM jobs WHERE idempotency_key = $1)";
 
 const INSERT_JOB_WITH_PROFILE: &str = "\
 INSERT INTO jobs (job_id, idempotency_key, prompt, repo, base_ref, branch, open_pr, user_id, agent, \
 profile_name, profile_id, profile_version, profile_hash, snapshot_catalog, snapshot_notes, snapshot_hash, \
-profile_tools_granted) \
-VALUES ($1, $2, $3, $4, $5, 'swarm/' || $1, $6, $7, $8, $9, $10, $11, $12, $13::text::jsonb, $14::text::jsonb, $15, $16) \
+profile_tools_granted, environment_id, environment_version) \
+VALUES ($1, $2, $3, $4, $5, 'swarm/' || $1, $6, $7, $8, $9, $10, $11, $12, $13::text::jsonb, $14::text::jsonb, $15, $16, $17, $18) \
 ON CONFLICT (idempotency_key) DO NOTHING \
 RETURNING job_id";
 
@@ -420,6 +425,17 @@ pub enum StoreError {
     LeaseDenied,
     /// A work tracker call refused. See [`WorkFault`].
     Work(WorkFault),
+    /// A submit named an Environment the submitter does not own or that does not exist, or
+    /// came from the legacy path that has no user. One variant for both causes, so no
+    /// caller can tell a foreign name from an unknown one. The handler maps this to gRPC
+    /// `NOT_FOUND`.
+    UnknownEnvironment,
+    /// A submit named an Environment that has no version yet. The handler maps this to gRPC
+    /// `NOT_FOUND`.
+    EnvironmentWithoutVersion,
+    /// A submit named an Environment whose latest version holds a script and the submitter no
+    /// longer holds `env:scripts`. The handler maps this to gRPC `PERMISSION_DENIED`.
+    EnvironmentScriptsNotGranted,
 }
 
 impl fmt::Display for StoreError {
@@ -443,6 +459,11 @@ impl fmt::Display for StoreError {
             Self::LeaseDenied => f.write_str(fleet_proto::ERR_LEASE_MISMATCH),
             Self::CatalogTooLarge => f.write_str(profiles::ERR_BLOB_CATALOG_TOO_LARGE),
             Self::Work(fault) => fault.fmt(f),
+            Self::UnknownEnvironment => f.write_str(fleet_proto::ERR_ENV_NOT_FOUND),
+            Self::EnvironmentWithoutVersion => f.write_str(fleet_proto::ERR_ENV_VERSION_NOT_FOUND),
+            Self::EnvironmentScriptsNotGranted => {
+                f.write_str(fleet_proto::ERR_ENV_SCRIPTS_NOT_GRANTED)
+            }
         }
     }
 }
@@ -467,7 +488,20 @@ impl std::error::Error for StoreError {
             | Self::UnknownProfile
             | Self::ToolsNotGranted
             | Self::LeaseDenied
-            | Self::CatalogTooLarge => None,
+            | Self::CatalogTooLarge
+            | Self::UnknownEnvironment
+            | Self::EnvironmentWithoutVersion
+            | Self::EnvironmentScriptsNotGranted => None,
+        }
+    }
+}
+
+impl From<PinRefusal> for StoreError {
+    fn from(refusal: PinRefusal) -> Self {
+        match refusal {
+            PinRefusal::UnknownName => Self::UnknownEnvironment,
+            PinRefusal::NoVersion => Self::EnvironmentWithoutVersion,
+            PinRefusal::ScriptsNotGranted => Self::EnvironmentScriptsNotGranted,
         }
     }
 }
@@ -1075,11 +1109,97 @@ impl Store {
         profiles::pin_for_submit(tx, caller, self.model_allowlist.as_ref(), name, runner).await
     }
 
+    async fn insert_pinned(
+        &self,
+        caller: i64,
+        owner: i64,
+        id: String,
+        job: &NewJob,
+    ) -> Result<(), StoreError> {
+        let mut tx = self.pool.begin().await?;
+        let stored: bool = sqlx::query_scalar(KEY_EXISTS)
+            .bind(&job.key)
+            .fetch_one(&mut *tx)
+            .await?;
+        if !stored {
+            let profile = match &job.profile {
+                Some(name) => {
+                    let runner = runner_kind(job.agent).ok_or(JobInvalid::Agent)?;
+                    Some((name, self.pin_profile(&mut tx, caller, name, runner).await?))
+                }
+                None => None,
+            };
+            let pin = match environments::resolve_pin(&mut tx, caller, &job.environment).await? {
+                PinResult::None => None,
+                PinResult::Pinned(pin) => Some(pin),
+                PinResult::Refused(refusal) => return Err(refusal.into()),
+            };
+            let (environment_id, version) = pin.map_or((None, None), |pin| {
+                (Some(pin.environment_id), Some(pin.version))
+            });
+            if let Some((name, pinned)) = profile {
+                sqlx::query(INSERT_JOB_WITH_PROFILE)
+                    .bind(id)
+                    .bind(&job.key)
+                    .bind(&job.prompt)
+                    .bind(&job.repo)
+                    .bind(&job.base_ref)
+                    .bind(job.open_pr)
+                    .bind(owner)
+                    .bind(job.agent)
+                    .bind(name)
+                    .bind(pinned.profile_id)
+                    .bind(pinned.version)
+                    .bind(pinned.hash)
+                    .bind(pinned.snapshot.catalog_json())
+                    .bind(pinned.snapshot.notes_json())
+                    .bind(pinned.snapshot.hash().as_slice())
+                    .bind(pinned.tools_granted)
+                    .bind(environment_id)
+                    .bind(version)
+                    .fetch_optional(&mut *tx)
+                    .await?;
+            } else {
+                sqlx::query(INSERT_JOB)
+                    .bind(id)
+                    .bind(&job.key)
+                    .bind(&job.prompt)
+                    .bind(&job.repo)
+                    .bind(&job.base_ref)
+                    .bind(job.open_pr)
+                    .bind(owner)
+                    .bind(job.agent)
+                    .bind(environment_id)
+                    .bind(version)
+                    .fetch_optional(&mut *tx)
+                    .await?;
+            }
+        }
+        tx.commit().await?;
+        Ok(())
+    }
+
+    async fn check_stored_pin(&self, owner: i64, job: &NewJob) -> Result<(), StoreError> {
+        let (environment_id, version): (Option<i64>, Option<i32>) = sqlx::query_as(STORED_PIN)
+            .bind(&job.key)
+            .fetch_one(&self.pool)
+            .await?;
+        let held = environment_id
+            .zip(version)
+            .map(|(environment_id, version)| EnvPin {
+                environment_id,
+                version,
+            });
+        let mut conn = self.pool.acquire().await?;
+        if environments::pin_matches(&mut conn, owner, &job.environment, held).await? {
+            Ok(())
+        } else {
+            Err(StoreError::KeyConflict)
+        }
+    }
+
     async fn insert_job(&self, owner: Option<i64>, job: NewJob) -> Result<Job, StoreError> {
         let scoped = owner;
-        if job.profile.is_some() && scoped.is_none() {
-            return Err(ProfileFault::Unowned.into());
-        }
         let owner = match owner {
             Some(owner) => owner,
             None => {
@@ -1113,37 +1233,17 @@ impl Store {
                 .fetch_optional(&mut *tx)
                 .await?;
             tx.commit().await?;
-        } else if let (Some(name), Some(caller)) = (&job.profile, scoped) {
-            let runner = runner_kind(job.agent).ok_or(JobInvalid::Agent)?;
-            let mut tx = self.pool.begin().await?;
-            let stored: bool = sqlx::query_scalar(KEY_EXISTS)
-                .bind(&job.key)
-                .fetch_one(&mut *tx)
-                .await?;
-            if !stored {
-                let pinned = self.pin_profile(&mut tx, caller, name, runner).await?;
-                sqlx::query(INSERT_JOB_WITH_PROFILE)
-                    .bind(id)
-                    .bind(&job.key)
-                    .bind(&job.prompt)
-                    .bind(&job.repo)
-                    .bind(&job.base_ref)
-                    .bind(job.open_pr)
-                    .bind(owner)
-                    .bind(job.agent)
-                    .bind(name)
-                    .bind(pinned.profile_id)
-                    .bind(pinned.version)
-                    .bind(pinned.hash)
-                    .bind(pinned.snapshot.catalog_json())
-                    .bind(pinned.snapshot.notes_json())
-                    .bind(pinned.snapshot.hash().as_slice())
-                    .bind(pinned.tools_granted)
-                    .fetch_optional(&mut *tx)
-                    .await?;
-            }
-            tx.commit().await?;
+        } else if let Some(caller) = scoped
+            && (job.profile.is_some() || matches!(job.environment, EnvRequest::Named(_)))
+        {
+            self.insert_pinned(caller, owner, id, &job).await?;
         } else {
+            if job.profile.is_some() {
+                return Err(ProfileFault::Unowned.into());
+            }
+            if matches!(job.environment, EnvRequest::Named(_)) {
+                return Err(StoreError::UnknownEnvironment);
+            }
             sqlx::query(INSERT_JOB)
                 .bind(id)
                 .bind(&job.key)
@@ -1153,6 +1253,8 @@ impl Store {
                 .bind(job.open_pr)
                 .bind(owner)
                 .bind(job.agent)
+                .bind(None::<i64>)
+                .bind(None::<i32>)
                 .fetch_optional(&self.pool)
                 .await?;
         }
@@ -1172,6 +1274,9 @@ impl Store {
             || stored.profile.as_ref().map(|p| p.name.as_str()) != job.profile.as_deref()
         {
             return Err(StoreError::KeyConflict);
+        }
+        if job.target_job_id.is_none() {
+            self.check_stored_pin(owner, &job).await?;
         }
         Ok(stored)
     }

@@ -23,6 +23,7 @@ use std::io::{Read, Write};
 use std::time::Duration;
 
 use clap::{Parser, Subcommand};
+use fleet_core::environment::EnvironmentName;
 use fleet_core::text::{Cap, sanitise_lines, sanitise_text};
 use fleet_proto::v1::fleet_batches_client::FleetBatchesClient;
 use fleet_proto::v1::fleet_credentials_client::FleetCredentialsClient;
@@ -107,6 +108,12 @@ pub enum Command {
             help = "Agent that runs the job [default: claude]"
         )]
         agent: Option<String>,
+        /// Environment to attach to the job, by name.
+        #[arg(long, value_name = "NAME", conflicts_with = "no_env")]
+        env: Option<String>,
+        /// Attach no environment, even when a default binding exists.
+        #[arg(long)]
+        no_env: bool,
         /// Task prompt, or `-` to read it from stdin.
         prompt: String,
     },
@@ -646,6 +653,22 @@ fn bearer(config: &Config) -> Result<Bearer, CliError> {
     Ok(Bearer(value))
 }
 
+/// The wire value of the submit environment choice: `-` for `--no-env`, the checked name for
+/// `--env`, and empty when neither flag is given.
+fn environment_field(name: Option<&str>, no_env: bool) -> Result<String, CliError> {
+    if no_env {
+        return Ok(fleet_proto::ENV_NONE.to_owned());
+    }
+    name.map_or_else(
+        || Ok(String::new()),
+        |raw| {
+            EnvironmentName::new(raw)
+                .map(|checked| checked.as_str().to_owned())
+                .map_err(|err| CliError::Usage(err.to_string()))
+        },
+    )
+}
+
 fn parse_state(name: &str) -> Result<JobState, CliError> {
     let full = format!("JOB_STATE_{}", name.to_ascii_uppercase());
     JobState::from_str_name(&full)
@@ -1145,8 +1168,11 @@ async fn dispatch(
             no_pr,
             idempotency_key,
             agent,
+            env: environment,
+            no_env,
             prompt,
         } => {
+            let environment = environment_field(environment.as_deref(), no_env)?;
             let prompt = read_prompt(prompt, stdin)?;
             let session = session(env, timeouts).await?;
             let scrub = session.scrub;
@@ -1160,6 +1186,7 @@ async fn dispatch(
                     open_pr: !no_pr,
                     agent: agent.unwrap_or_default(),
                     profile: String::new(),
+                    environment,
                 })
                 .await?
                 .into_inner();

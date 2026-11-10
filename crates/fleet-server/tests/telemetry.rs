@@ -39,6 +39,7 @@ async fn claimed(store: &Store) -> Job {
             open_pr: true,
             agent: String::new(),
             profile: String::new(),
+            environment: String::new(),
         })
         .await
         .unwrap();

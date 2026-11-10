@@ -329,6 +329,10 @@ pub const ERR_NEEDS_USER_TOKEN: &str = "credentials need a user token";
 /// token acts as the bootstrap user and names no person.
 pub const ERR_ENV_NEEDS_USER_TOKEN: &str = "environments need a user token";
 
+/// The `SubmitJobRequest.environment` value that asks for no Environment (ADR-0067 decision 10).
+/// No Environment name can equal it, since a name starts with a letter or a digit.
+pub const ENV_NONE: &str = "-";
+
 /// `NOT_FOUND` message of every Environment RPC that names an Environment. An unknown name and
 /// another User's name give this one text.
 pub const ERR_ENV_NOT_FOUND: &str = "environment not found";

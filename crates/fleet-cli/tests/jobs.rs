@@ -288,6 +288,103 @@ async fn submit_sends_the_agent_flag_and_defaults_to_empty() -> TestResult {
 }
 
 #[tokio::test]
+async fn submit_sends_the_environment_name_dash_for_no_env_and_empty_by_default() -> TestResult {
+    let (url, stub) = serve().await?;
+    let base = ["submit", "--repo", "o/r", "--base", "main"];
+    let variants: [&[&str]; 3] = [&["a"], &["--env", "prod", "b"], &["--no-env", "c"]];
+    for tail in variants {
+        let args: Vec<&str> = base.iter().chain(tail).copied().collect();
+        let (res, _) = cli(&url, Some(TOKEN), &args).await;
+        res?;
+    }
+    let sent = submitted(&stub)?;
+    let names: Vec<&str> = sent.iter().map(|r| r.environment.as_str()).collect();
+    assert_eq!(names, ["", "prod", "-"]);
+    Ok(())
+}
+
+#[tokio::test]
+async fn submit_refuses_a_hostile_environment_name_with_the_core_error_before_any_request()
+-> TestResult {
+    let (url, stub) = serve().await?;
+    let long = "a".repeat(65);
+    let table = [
+        (
+            "cr",
+            "prod\r",
+            "environment name has a character outside its grammar",
+        ),
+        (
+            "crlf",
+            "prod\r\n",
+            "environment name has a character outside its grammar",
+        ),
+        (
+            "nel",
+            "prod\u{85}",
+            "environment name has a character outside its grammar",
+        ),
+        (
+            "line separator",
+            "prod\u{2028}",
+            "environment name has a character outside its grammar",
+        ),
+        (
+            "bidi",
+            "pr\u{202e}od",
+            "environment name has a character outside its grammar",
+        ),
+        (
+            "nul",
+            "prod\0",
+            "environment name has a character outside its grammar",
+        ),
+        (
+            "space",
+            "pr od",
+            "environment name has a character outside its grammar",
+        ),
+        (
+            "non-ascii",
+            "prod\u{e9}",
+            "environment name has a character outside its grammar",
+        ),
+        (
+            "slash",
+            "a/b",
+            "environment name has a character outside its grammar",
+        ),
+        (
+            "dot start",
+            ".prod",
+            "environment name has a character outside its grammar",
+        ),
+        ("empty", "", "environment name is empty"),
+        (
+            "dash",
+            "-",
+            "environment name has a character outside its grammar",
+        ),
+        ("over long", long.as_str(), "environment name is too long"),
+    ];
+    for (label, name, text) in table {
+        let (res, _) = cli(
+            &url,
+            Some(TOKEN),
+            &[
+                "submit", "--repo", "o/r", "--base", "main", "--env", name, "a",
+            ],
+        )
+        .await;
+        let err = res.err().ok_or(label)?;
+        assert_eq!(err.exit_code(), 2, "{label}");
+        assert_eq!(err.to_string(), text, "{label}");
+    }
+    assert_eq!(submitted(&stub)?.len(), 0);
+    Ok(())
+}
+
+#[tokio::test]
 async fn submit_rejects_an_unknown_agent_before_any_request() -> TestResult {
     let (_url, stub) = serve().await?;
     let err = Cli::try_parse_from([

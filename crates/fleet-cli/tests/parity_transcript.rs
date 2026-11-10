@@ -265,6 +265,7 @@ async fn seed(pool: PgPool) -> Rendered {
                 open_pr: false,
                 agent: String::new(),
                 profile: String::new(),
+                environment: String::new(),
             },
         )
         .await

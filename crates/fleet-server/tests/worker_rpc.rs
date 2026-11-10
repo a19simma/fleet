@@ -71,6 +71,7 @@ async fn submit(store: &Store, key: &str) {
             open_pr: true,
             agent: String::new(),
             profile: String::new(),
+            environment: String::new(),
         })
         .await
         .unwrap();

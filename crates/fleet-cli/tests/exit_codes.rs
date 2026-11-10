@@ -108,6 +108,26 @@ fn unknown_submit_agent_exits_two_before_connecting() -> TestResult {
 }
 
 #[test]
+fn env_and_no_env_conflict_exits_two_before_connecting() -> TestResult {
+    let out = submit_with_agent(&["--env", "prod", "--no-env"])?;
+    assert_eq!(out.status.code(), Some(2));
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("cannot be used with"), "{stderr}");
+    assert!(stderr.contains("--no-env"), "{stderr}");
+    Ok(())
+}
+
+#[test]
+fn over_long_env_name_exits_two_with_the_core_error_before_connecting() -> TestResult {
+    let long = "a".repeat(65);
+    let out = submit_with_agent(&["--env", &long])?;
+    assert_eq!(out.status.code(), Some(2));
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("environment name is too long"), "{stderr}");
+    Ok(())
+}
+
+#[test]
 fn unknown_batch_agent_exits_two_before_connecting() -> TestResult {
     let out = batch_with_agent(&["--agent", "gpt"])?;
     assert_eq!(out.status.code(), Some(2));

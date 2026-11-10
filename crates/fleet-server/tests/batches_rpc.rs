@@ -528,6 +528,7 @@ async fn plain_jobs_keep_working_beside_batch_jobs(pool: PgPool) {
             open_pr: true,
             agent: String::new(),
             profile: String::new(),
+            environment: String::new(),
         })
         .await
         .unwrap()

@@ -674,6 +674,7 @@ async fn the_job_transcript_page_has_no_inline_style_and_known_classes(pool: PgP
         open_pr: false,
         agent: String::new(),
         profile: String::new(),
+        environment: String::new(),
     };
     let id = h
         .store

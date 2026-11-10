@@ -123,6 +123,7 @@ fn submit(key: &str) -> SubmitJobRequest {
         open_pr: false,
         agent: String::new(),
         profile: String::new(),
+        environment: String::new(),
     }
 }
 
