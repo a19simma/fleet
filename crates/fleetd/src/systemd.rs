@@ -35,6 +35,7 @@ use fleet_core::tools::{ToolName, ToolSpec};
 
 use crate::agent_exec::{SPEC_FILE, TOOL_PROXY_PORT, write_spec_telemetry};
 use crate::config::{AgentLauncher, Config};
+use crate::envd::EnvDelivery;
 use crate::fetch_policy::HostPattern;
 use crate::jobenv::{create_stdout_fifo, open_fifo_reader, render_env_file, write_env_file};
 use crate::jobsock::{JobSocket, Limits, Peer, ProcPeer, ServiceName, Services, socket_path};
@@ -128,6 +129,18 @@ pub fn select_launcher(
     job_gid: Option<u32>,
     services: Services,
 ) -> Arc<dyn Launcher> {
+    select_launcher_delivering(config, job_gid, services, None)
+}
+
+/// [`select_launcher`] with the Environment delivery of the systemd launcher. The direct
+/// launcher ignores it: its agent shares the fleetd uid, so no tree can keep a value from it.
+#[must_use]
+pub fn select_launcher_delivering(
+    config: &Config,
+    job_gid: Option<u32>,
+    services: Services,
+    delivery: Option<Arc<EnvDelivery>>,
+) -> Arc<dyn Launcher> {
     match config.agent_launcher {
         AgentLauncher::Direct => {
             if !services.is_empty() {
@@ -143,6 +156,9 @@ pub fn select_launcher(
                 .with_job_gid(job_gid)
                 .with_run_timeout(config.agent_timeout)
                 .with_job_socket(JobSocketSetup::new(services));
+            if let Some(delivery) = delivery {
+                launcher = launcher.with_delivery(delivery);
+            }
             match config.require_host_netns() {
                 Ok(()) => {
                     launcher = launcher
@@ -256,6 +272,7 @@ pub struct SystemdLauncher {
     socket: Option<JobSocketSetup>,
     tool_install: Option<ToolInstallSetup>,
     telemetry: Option<TelemetrySetup>,
+    delivery: Option<Arc<EnvDelivery>>,
 }
 
 /// Source of a nonzero port for the in-namespace telemetry forwarder.
@@ -397,7 +414,16 @@ impl SystemdLauncher {
             socket: None,
             tool_install: None,
             telemetry: None,
+            delivery: None,
         }
+    }
+
+    /// Writes the Environment delivery tree of each job into its run dir before its unit starts.
+    /// A failed write fails the launch and removes the run dir.
+    #[must_use]
+    pub fn with_delivery(mut self, delivery: Arc<EnvDelivery>) -> Self {
+        self.delivery = Some(delivery);
+        self
     }
 
     /// Writes `tool-env` and checks the install hosts before each unit start.
@@ -726,6 +752,9 @@ impl Launcher for SystemdLauncher {
         )?;
         write_tool_env(&self.run_dir, &id, TOOL_PROXY_PORT, &tools)
             .map_err(|err| io::Error::other(err.to_string()))?;
+        if let Some(delivery) = &self.delivery {
+            delivery.write_tree(&id).map_err(io::Error::other)?;
+        }
         let fifo = dir.join(STDOUT_FIFO);
         create_stdout_fifo(&fifo, self.gid)?;
         let reader = Receiver::from_file(open_fifo_reader(&fifo)?)?;

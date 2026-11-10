@@ -12,6 +12,7 @@ use std::time::{Duration, Instant};
 
 use fleet_core::tools::ToolName;
 use fleetd::agent_exec::write_spec;
+use fleetd::envd::{DELIVERY_DIR, EnvDelivery, MountCheck, Owner, ReleasedEnvironment};
 use fleetd::jobsock::{
     AGENT_SLICE, JobContext, Limits, Peer, PeerId, ServeFuture, Service, ServiceName, Services,
     connect,
@@ -47,6 +48,8 @@ if [ -f "$st/rundir" ]; then
   echo "$1 $s" >> "$st/seen"
   if [ -f "$(cat "$st/rundir")/$id/tool-env" ]; then te=tool-env; else te=no-tool-env; fi
   echo "$1 $te" >> "$st/seen_env"
+  if [ -d "$(cat "$st/rundir")/$id/envd" ]; then ed=envd; else ed=no-envd; fi
+  echo "$1 $ed" >> "$st/seen_envd"
 fi
 case "$1" in
   stop)
@@ -132,6 +135,14 @@ impl Case {
             peer: Arc::new(AgentPeer(self.id.clone())),
             limits: Limits::default(),
         })
+    }
+
+    fn seen_envd(&self) -> Vec<String> {
+        fs::read_to_string(self.state.join("seen_envd"))
+            .unwrap_or_default()
+            .lines()
+            .map(str::to_owned)
+            .collect()
     }
 
     fn seen_env(&self) -> Vec<String> {
@@ -1458,6 +1469,23 @@ fn agent_unit_exposes_only_own_run_dir_and_hook_dir() {
     );
 }
 
+#[test]
+fn agent_unit_reads_the_env_file_then_the_optional_delivery_env_file() {
+    let lines = unit_directives("fleet-agent@.service");
+    let files: Vec<&str> = lines
+        .iter()
+        .filter(|l| l.starts_with("EnvironmentFile="))
+        .map(String::as_str)
+        .collect();
+    assert_eq!(
+        files,
+        [
+            "EnvironmentFile=/run/fleet/%i/env",
+            "EnvironmentFile=-/run/fleet/%i/envd/envd.env"
+        ]
+    );
+}
+
 const INSTALL_UNIT: &str = "fleet-tool-install@.service";
 
 fn has_line(lines: &[String], want: &str) -> bool {
@@ -2017,5 +2045,88 @@ fn the_fleetd_unit_shares_the_host_network_namespace() -> TestResult {
     ))?;
     assert!(!unit.contains("PrivateNetwork"), "{unit}");
     assert!(!unit.contains("NetworkNamespacePath"), "{unit}");
+    Ok(())
+}
+
+#[derive(Debug)]
+struct TmpfsIs(bool);
+
+impl MountCheck for TmpfsIs {
+    fn is_tmpfs(&self, _dir: std::os::fd::BorrowedFd<'_>) -> io::Result<bool> {
+        Ok(self.0)
+    }
+}
+
+fn held_env(marker: &str) -> ReleasedEnvironment {
+    ReleasedEnvironment::from_reply(fleet_proto::v1::GetJobEnvironmentReply {
+        secrets: vec![fleet_proto::v1::JobEnvironmentSecret {
+            name: "PVE_TOKEN".into(),
+            value: marker.into(),
+            agent_visible: true,
+            delivery: fleet_proto::v1::EnvironmentDelivery::File.into(),
+        }],
+        ..fleet_proto::v1::GetJobEnvironmentReply::default()
+    })
+}
+
+fn delivery_for(case: &Case, tmpfs: bool, marker: &str) -> io::Result<Arc<EnvDelivery>> {
+    let delivery = Arc::new(
+        EnvDelivery::new(
+            case.run.path(),
+            Owner {
+                uid: None,
+                gid: None,
+            },
+            Arc::new(TmpfsIs(tmpfs)),
+        )
+        .map_err(io::Error::other)?,
+    );
+    delivery.hold(&case.id, held_env(marker));
+    Ok(delivery)
+}
+
+#[tokio::test]
+async fn the_delivery_tree_exists_before_the_unit_starts_and_leaves_with_the_dir() -> TestResult {
+    const MARKER: &str = "zq-env-marker-9981-unlikely";
+    let case = Case::new("t_delivery_tree")?;
+    case.last(&show("inactive", "success", 1, 0))?;
+    let delivery = delivery_for(&case, true, MARKER)?;
+    let unit = case.launcher().with_delivery(Arc::clone(&delivery));
+    let mut launched = unit.launch(case.spec())?;
+    let secret = case.dir().join(DELIVERY_DIR).join("PVE_TOKEN");
+    assert_eq!(fs::read_to_string(&secret)?, MARKER);
+    assert_eq!(fs::metadata(&secret)?.mode() & 0o7777, 0o400);
+    assert_eq!(case.seen_envd(), ["start envd"]);
+    let env = fs::read_to_string(case.dir().join("env"))?;
+    assert!(!env.contains(MARKER));
+    assert_eq!(waited(launched.proc.as_mut()).await?.code(), Some(0));
+    drop(launched);
+    assert!(!case.dir().exists());
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_refused_delivery_write_fails_the_launch_before_the_unit_and_leaves_nothing() -> TestResult
+{
+    const MARKER: &str = "zq-env-marker-5513-unlikely";
+    let case = Case::new("t_delivery_refused")?;
+    case.last(&show("inactive", "success", 1, 0))?;
+    let delivery = delivery_for(&case, false, MARKER)?;
+    let launcher = case.launcher().with_delivery(delivery);
+    let err = launcher.launch(case.spec()).err().ok_or("launched")?;
+    assert!(!err.to_string().contains(MARKER), "{err}");
+    assert!(case.log().iter().all(|line| !line.starts_with("start")));
+    assert_eq!(fs::read_dir(case.run.path())?.count(), 0);
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_launcher_without_delivery_writes_no_tree_for_a_held_environment() -> TestResult {
+    let case = Case::new("t_delivery_none")?;
+    case.last(&show("inactive", "success", 1, 0))?;
+    let _held = delivery_for(&case, true, "zq-env-marker-0042-unlikely")?;
+    let launched = case.launch()?;
+    assert!(!case.dir().join(DELIVERY_DIR).exists());
+    drop(launched);
     Ok(())
 }
