@@ -46,7 +46,7 @@ pub(super) struct ConsoleSlot(pub Option<Arc<Store>>);
 
 path_param!(job_id);
 
-fn store(cx: &Cx) -> Result<&Store> {
+pub(super) fn store(cx: &Cx) -> Result<&Store> {
     app_context::<ConsoleSlot>(cx)
         .0
         .as_deref()
@@ -858,7 +858,8 @@ async fn jobs_page(cx: &Cx) -> Result<impl View> {
                 <header class="mb-3 flex min-w-0 flex-wrap items-center gap-3 border-b border-base-300 pb-2 text-xs">
                     <span class="text-primary">"$"</span>
                     <h1 class="text-sm font-bold">"Jobs"</h1>
-                    <a class="link link-hover ml-auto" href="/account">"Account"</a>
+                    <a class="link link-hover ml-auto" href="/submit">"Submit a job"</a>
+                    <a class="link link-hover" href="/account">"Account"</a>
                 </header>
                 <div class="overflow-x-auto">
                     <table class="table table-zebra table-xs">
