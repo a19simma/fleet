@@ -63,6 +63,36 @@ pub enum CredentialNotice {
     RepoMissing,
     /// A check rate, a concurrency cap or the per-User row cap refused the call.
     RepoLimit,
+    /// A host was added.
+    HostAdded,
+    /// A host was removed.
+    HostRemoved,
+    /// An admin approved a host for its private addresses.
+    HostApproved,
+    /// An admin revoked the private approval of a host.
+    HostRevoked,
+    /// The host is not allowed, or it resolves to a private address.
+    HostRefused,
+    /// The host does not answer as Forgejo or Gitea.
+    HostNotForge,
+    /// The host is not in the table.
+    HostUnknown,
+    /// The host still has credentials or repositories.
+    HostInUse,
+    /// The host has no pending private request.
+    HostNoRequest,
+    /// The named addresses differ from the resolved set.
+    HostAddressMismatch,
+    /// Private approval does not apply to the host.
+    HostNotApplicable,
+    /// The job owner has no credential for the job host.
+    HostNoCredential,
+    /// The host name is outside the grammar.
+    HostInvalid,
+    /// The host is not in the table.
+    HostMissing,
+    /// A host cap or the check limiter refused the call.
+    HostLimit,
     /// Any other failure.
     Failed,
 }
@@ -96,6 +126,21 @@ impl CredentialNotice {
         Self::RepoInvalid,
         Self::RepoMissing,
         Self::RepoLimit,
+        Self::HostAdded,
+        Self::HostRemoved,
+        Self::HostApproved,
+        Self::HostRevoked,
+        Self::HostRefused,
+        Self::HostNotForge,
+        Self::HostUnknown,
+        Self::HostInUse,
+        Self::HostNoRequest,
+        Self::HostAddressMismatch,
+        Self::HostNotApplicable,
+        Self::HostNoCredential,
+        Self::HostInvalid,
+        Self::HostMissing,
+        Self::HostLimit,
         Self::Failed,
     ];
 
@@ -129,6 +174,21 @@ impl CredentialNotice {
             Self::RepoInvalid => "repo_invalid",
             Self::RepoMissing => "repo_missing",
             Self::RepoLimit => "repo_limit",
+            Self::HostAdded => "host_added",
+            Self::HostRemoved => "host_removed",
+            Self::HostApproved => "host_approved",
+            Self::HostRevoked => "host_revoked",
+            Self::HostRefused => "host_refused",
+            Self::HostNotForge => "host_not_forge",
+            Self::HostUnknown => "host_unknown",
+            Self::HostInUse => "host_in_use",
+            Self::HostNoRequest => "host_no_request",
+            Self::HostAddressMismatch => "host_address_mismatch",
+            Self::HostNotApplicable => "host_not_applicable",
+            Self::HostNoCredential => "host_no_credential",
+            Self::HostInvalid => "host_invalid",
+            Self::HostMissing => "host_missing",
+            Self::HostLimit => "host_limit",
             Self::Failed => "failed",
         }
     }
@@ -191,6 +251,27 @@ impl CredentialNotice {
             Self::RepoLimit => {
                 "Too many repository checks or repositories. Remove one or try again later."
             }
+            Self::HostAdded => "The host was added.",
+            Self::HostRemoved => "The host was removed.",
+            Self::HostApproved => "The host is approved for its private addresses.",
+            Self::HostRevoked => "The private approval of the host was revoked.",
+            Self::HostRefused => {
+                "This host is not allowed. If it is on a private network, ask an admin to approve it."
+            }
+            Self::HostNotForge => "This host does not answer as a Forgejo or Gitea server.",
+            Self::HostUnknown => "This host is not registered. Add it first.",
+            Self::HostInUse => "Remove the credentials and repositories of this host first.",
+            Self::HostNoRequest => "No pending request for this host.",
+            Self::HostAddressMismatch => {
+                "The addresses differ from what the host resolves to now. List the requests and try again."
+            }
+            Self::HostNotApplicable => "Private approval does not apply to this host.",
+            Self::HostNoCredential => "Store a credential for the host of this repository first.",
+            Self::HostInvalid => {
+                "The host was refused. Use a bare host name without a scheme, port or path."
+            }
+            Self::HostMissing => "No such host.",
+            Self::HostLimit => "Too many hosts or host checks. Remove one or try again later.",
             Self::Failed => "The request failed.",
         }
     }
@@ -206,6 +287,34 @@ impl CredentialNotice {
             Code::InvalidArgument => Self::RepoInvalid,
             Code::NotFound => Self::RepoMissing,
             Code::ResourceExhausted => Self::RepoLimit,
+            _ => Self::for_status(status),
+        }
+    }
+
+    /// Classifies a `FleetHosts` refusal into a fixed notice.
+    ///
+    /// It maps the statuses a host call adds: `INVALID_ARGUMENT` to [`Self::HostInvalid`],
+    /// `NOT_FOUND` to [`Self::HostMissing`] and `RESOURCE_EXHAUSTED` to [`Self::HostLimit`], and
+    /// the host reasons to their own notice. A private or refused host reads as
+    /// [`Self::HostRefused`], the same notice for every cause. Every other status reads the same
+    /// closed set as [`Self::for_status`].
+    #[must_use]
+    pub fn for_host_status(status: &Status) -> Self {
+        match status.code() {
+            Code::InvalidArgument => Self::HostInvalid,
+            Code::NotFound => Self::HostMissing,
+            Code::ResourceExhausted => Self::HostLimit,
+            Code::FailedPrecondition => match classify(status.code(), status.message()) {
+                Some(Reason::RepoNotAllowedHost) => Self::HostRefused,
+                Some(Reason::HostNotForge) => Self::HostNotForge,
+                Some(Reason::HostUnknown) => Self::HostUnknown,
+                Some(Reason::HostInUse) => Self::HostInUse,
+                Some(Reason::HostNoRequest) => Self::HostNoRequest,
+                Some(Reason::HostAddressMismatch) => Self::HostAddressMismatch,
+                Some(Reason::HostPrivateNotApplicable) => Self::HostNotApplicable,
+                Some(Reason::HostNoCredential) => Self::HostNoCredential,
+                _ => Self::for_status(status),
+            },
             _ => Self::for_status(status),
         }
     }
@@ -244,6 +353,8 @@ impl CredentialNotice {
                 Some(Reason::RepoNotFoundOrNoAccess) => Self::RepoNotFound,
                 Some(Reason::RepoUpstreamUnavailable) => Self::RepoUpstreamUnavailable,
                 Some(Reason::RepoTimeout) => Self::RepoTimeout,
+                Some(Reason::HostUnknown) => Self::HostUnknown,
+                Some(Reason::HostNoCredential) => Self::HostNoCredential,
                 _ => Self::NoVerifier,
             },
             _ => Self::Failed,

@@ -6,10 +6,13 @@ use crate::{
     ERR_CAPABILITY_NOT_GRANTED, ERR_GITHUB_REJECTED, ERR_LEASE_MISMATCH, ERR_NEEDS_USER_TOKEN,
     PRECONDITION_APP_INSTALLATION, PRECONDITION_APP_MINT, PRECONDITION_APP_MINT_CAP,
     PRECONDITION_APP_MINT_RATE, PRECONDITION_APP_REPO, PRECONDITION_CREDENTIAL_TOMBSTONED,
-    PRECONDITION_EXPIRED, PRECONDITION_NO_AGENT, PRECONDITION_NO_GITHUB,
-    PRECONDITION_NO_VERIFY_REPO, PRECONDITION_NOT_CONFIGURED, PRECONDITION_REPO_NO_CREDENTIAL,
-    PRECONDITION_REPO_NOT_ALLOWED_HOST, PRECONDITION_REPO_NOT_FOUND_OR_NO_ACCESS,
-    PRECONDITION_REPO_TIMEOUT, PRECONDITION_REPO_UPSTREAM_UNAVAILABLE,
+    PRECONDITION_EXPIRED, PRECONDITION_HOST_ADDRESS_MISMATCH, PRECONDITION_HOST_IN_USE,
+    PRECONDITION_HOST_NO_CREDENTIAL, PRECONDITION_HOST_NO_REQUEST, PRECONDITION_HOST_NOT_FORGE,
+    PRECONDITION_HOST_PRIVATE_NOT_APPLICABLE, PRECONDITION_HOST_UNKNOWN, PRECONDITION_NO_AGENT,
+    PRECONDITION_NO_GITHUB, PRECONDITION_NO_VERIFY_REPO, PRECONDITION_NOT_CONFIGURED,
+    PRECONDITION_REPO_NO_CREDENTIAL, PRECONDITION_REPO_NOT_ALLOWED_HOST,
+    PRECONDITION_REPO_NOT_FOUND_OR_NO_ACCESS, PRECONDITION_REPO_TIMEOUT,
+    PRECONDITION_REPO_UPSTREAM_UNAVAILABLE,
 };
 
 /// A fixed server refusal, named by the code and message the server sends.
@@ -48,6 +51,20 @@ pub enum Reason {
     RepoUpstreamUnavailable,
     /// `FAILED_PRECONDITION`: the repository check ran out of budget.
     RepoTimeout,
+    /// `FAILED_PRECONDITION`: the host does not answer as Forgejo or Gitea.
+    HostNotForge,
+    /// `FAILED_PRECONDITION`: the host is not in the table.
+    HostUnknown,
+    /// `FAILED_PRECONDITION`: the host still has credentials or repositories.
+    HostInUse,
+    /// `FAILED_PRECONDITION`: the host has no pending private request.
+    HostNoRequest,
+    /// `FAILED_PRECONDITION`: the named addresses differ from the resolved set.
+    HostAddressMismatch,
+    /// `FAILED_PRECONDITION`: private approval does not apply to the host.
+    HostPrivateNotApplicable,
+    /// `FAILED_PRECONDITION`: the job owner has no credential for the job host.
+    HostNoCredential,
     /// `PERMISSION_DENIED`: the user lacks a capability.
     CapabilityNotGranted,
     /// `PERMISSION_DENIED`: a per-user token is needed.
@@ -56,6 +73,87 @@ pub enum Reason {
     LeaseMismatch,
     /// `INVALID_ARGUMENT`: GitHub rejected the token.
     GithubRejected,
+}
+
+impl Reason {
+    /// Every reason.
+    pub const ALL: &'static [Self] = &[
+        Self::NoGithub,
+        Self::NoAgent,
+        Self::Expired,
+        Self::NotConfigured,
+        Self::AppMint,
+        Self::AppMintCap,
+        Self::AppMintRate,
+        Self::AppInstallation,
+        Self::AppRepo,
+        Self::NoVerifyRepo,
+        Self::Tombstoned,
+        Self::RepoNotAllowedHost,
+        Self::RepoNoCredential,
+        Self::RepoNotFoundOrNoAccess,
+        Self::RepoUpstreamUnavailable,
+        Self::RepoTimeout,
+        Self::HostNotForge,
+        Self::HostUnknown,
+        Self::HostInUse,
+        Self::HostNoRequest,
+        Self::HostAddressMismatch,
+        Self::HostPrivateNotApplicable,
+        Self::HostNoCredential,
+        Self::CapabilityNotGranted,
+        Self::NeedsUserToken,
+        Self::LeaseMismatch,
+        Self::GithubRejected,
+    ];
+
+    /// The code and message the server sends for this reason. [`classify`] is its inverse, so the
+    /// server and its clients read one table.
+    #[must_use]
+    pub const fn status_parts(self) -> (Code, &'static str) {
+        match self {
+            Self::NoGithub => (Code::FailedPrecondition, PRECONDITION_NO_GITHUB),
+            Self::NoAgent => (Code::FailedPrecondition, PRECONDITION_NO_AGENT),
+            Self::Expired => (Code::FailedPrecondition, PRECONDITION_EXPIRED),
+            Self::NotConfigured => (Code::FailedPrecondition, PRECONDITION_NOT_CONFIGURED),
+            Self::AppMint => (Code::FailedPrecondition, PRECONDITION_APP_MINT),
+            Self::AppMintCap => (Code::FailedPrecondition, PRECONDITION_APP_MINT_CAP),
+            Self::AppMintRate => (Code::FailedPrecondition, PRECONDITION_APP_MINT_RATE),
+            Self::AppInstallation => (Code::FailedPrecondition, PRECONDITION_APP_INSTALLATION),
+            Self::AppRepo => (Code::FailedPrecondition, PRECONDITION_APP_REPO),
+            Self::NoVerifyRepo => (Code::FailedPrecondition, PRECONDITION_NO_VERIFY_REPO),
+            Self::Tombstoned => (Code::FailedPrecondition, PRECONDITION_CREDENTIAL_TOMBSTONED),
+            Self::RepoNotAllowedHost => {
+                (Code::FailedPrecondition, PRECONDITION_REPO_NOT_ALLOWED_HOST)
+            }
+            Self::RepoNoCredential => (Code::FailedPrecondition, PRECONDITION_REPO_NO_CREDENTIAL),
+            Self::RepoNotFoundOrNoAccess => (
+                Code::FailedPrecondition,
+                PRECONDITION_REPO_NOT_FOUND_OR_NO_ACCESS,
+            ),
+            Self::RepoUpstreamUnavailable => (
+                Code::FailedPrecondition,
+                PRECONDITION_REPO_UPSTREAM_UNAVAILABLE,
+            ),
+            Self::RepoTimeout => (Code::FailedPrecondition, PRECONDITION_REPO_TIMEOUT),
+            Self::CapabilityNotGranted => (Code::PermissionDenied, ERR_CAPABILITY_NOT_GRANTED),
+            Self::NeedsUserToken => (Code::PermissionDenied, ERR_NEEDS_USER_TOKEN),
+            Self::LeaseMismatch => (Code::PermissionDenied, ERR_LEASE_MISMATCH),
+            Self::GithubRejected => (Code::InvalidArgument, ERR_GITHUB_REJECTED),
+            Self::HostNotForge => (Code::FailedPrecondition, PRECONDITION_HOST_NOT_FORGE),
+            Self::HostUnknown => (Code::FailedPrecondition, PRECONDITION_HOST_UNKNOWN),
+            Self::HostInUse => (Code::FailedPrecondition, PRECONDITION_HOST_IN_USE),
+            Self::HostNoRequest => (Code::FailedPrecondition, PRECONDITION_HOST_NO_REQUEST),
+            Self::HostAddressMismatch => {
+                (Code::FailedPrecondition, PRECONDITION_HOST_ADDRESS_MISMATCH)
+            }
+            Self::HostPrivateNotApplicable => (
+                Code::FailedPrecondition,
+                PRECONDITION_HOST_PRIVATE_NOT_APPLICABLE,
+            ),
+            Self::HostNoCredential => (Code::FailedPrecondition, PRECONDITION_HOST_NO_CREDENTIAL),
+        }
+    }
 }
 
 /// Names the fixed refusal behind `code` and `message`, or `None` when the pair is not one of
@@ -87,6 +185,19 @@ pub fn classify(code: Code, message: &str) -> Option<Reason> {
             Some(Reason::RepoUpstreamUnavailable)
         }
         (Code::FailedPrecondition, PRECONDITION_REPO_TIMEOUT) => Some(Reason::RepoTimeout),
+        (Code::FailedPrecondition, PRECONDITION_HOST_NOT_FORGE) => Some(Reason::HostNotForge),
+        (Code::FailedPrecondition, PRECONDITION_HOST_UNKNOWN) => Some(Reason::HostUnknown),
+        (Code::FailedPrecondition, PRECONDITION_HOST_IN_USE) => Some(Reason::HostInUse),
+        (Code::FailedPrecondition, PRECONDITION_HOST_NO_REQUEST) => Some(Reason::HostNoRequest),
+        (Code::FailedPrecondition, PRECONDITION_HOST_ADDRESS_MISMATCH) => {
+            Some(Reason::HostAddressMismatch)
+        }
+        (Code::FailedPrecondition, PRECONDITION_HOST_PRIVATE_NOT_APPLICABLE) => {
+            Some(Reason::HostPrivateNotApplicable)
+        }
+        (Code::FailedPrecondition, PRECONDITION_HOST_NO_CREDENTIAL) => {
+            Some(Reason::HostNoCredential)
+        }
         (Code::PermissionDenied, ERR_CAPABILITY_NOT_GRANTED) => Some(Reason::CapabilityNotGranted),
         (Code::PermissionDenied, ERR_NEEDS_USER_TOKEN) => Some(Reason::NeedsUserToken),
         (Code::PermissionDenied, ERR_LEASE_MISMATCH) => Some(Reason::LeaseMismatch),

@@ -278,6 +278,51 @@ pub const PRECONDITION_REPO_UPSTREAM_UNAVAILABLE: &str = "repository host unavai
 /// `FAILED_PRECONDITION` message: the repository check ran out of its time budget (ADR-0059).
 pub const PRECONDITION_REPO_TIMEOUT: &str = "repository check timed out";
 
+/// `FAILED_PRECONDITION` message: `AddHost` found a host that does not answer as Forgejo or Gitea
+/// (ADR-0068). A private or unresolvable host gets [`PRECONDITION_REPO_NOT_ALLOWED_HOST`] instead.
+pub const PRECONDITION_HOST_NOT_FORGE: &str = "host is not a forgejo or gitea server";
+
+/// `FAILED_PRECONDITION` message: a credential or repository named a host the table does not hold
+/// (ADR-0068).
+pub const PRECONDITION_HOST_UNKNOWN: &str = "host is not registered";
+
+/// `FAILED_PRECONDITION` message: `RemoveHost` found credentials or repositories on the host
+/// (ADR-0068).
+pub const PRECONDITION_HOST_IN_USE: &str = "host still has credentials or repositories";
+
+/// `FAILED_PRECONDITION` message: `ApproveHostPrivate` found no pending request for the host
+/// (ADR-0068).
+pub const PRECONDITION_HOST_NO_REQUEST: &str = "no pending request for the host";
+
+/// `FAILED_PRECONDITION` message: the addresses an admin named differ from the set the host
+/// resolves to now (ADR-0068).
+pub const PRECONDITION_HOST_ADDRESS_MISMATCH: &str =
+    "named addresses do not match the resolved addresses";
+
+/// `FAILED_PRECONDITION` message: `allow_private` never applies to a GitHub row (ADR-0068).
+pub const PRECONDITION_HOST_PRIVATE_NOT_APPLICABLE: &str =
+    "private approval does not apply to this host";
+
+/// `FAILED_PRECONDITION` message: the job owner stored no credential for the host of the job's
+/// repository (ADR-0068, ADR-0033).
+pub const PRECONDITION_HOST_NO_CREDENTIAL: &str = "no credential for the job host";
+
+/// Most hosts one User may add (ADR-0068).
+pub const MAX_HOSTS_PER_USER: usize = 20;
+
+/// Most rows the host table holds, and so the most one `ListHosts` reply carries (ADR-0068).
+pub const MAX_HOSTS_TOTAL: usize = 500;
+
+/// Most addresses one `approved_ips` list holds.
+pub const MAX_HOST_APPROVED_IPS: usize = 16;
+
+/// `RESOURCE_EXHAUSTED` message: the User added [`MAX_HOSTS_PER_USER`] hosts or the table holds
+/// [`MAX_HOSTS_TOTAL`].
+pub const ERR_HOST_LIMIT: &str = "too many hosts";
+
+/// `NOT_FOUND` message of the host RPCs. A missing row gives this one text.
+pub const ERR_HOST_NOT_FOUND: &str = "host not found";
+
 /// Most repositories one User may register, and so the most one `ListRepos` reply carries
 /// (ADR-0059).
 pub const MAX_REPOS_PER_USER: usize = 100;

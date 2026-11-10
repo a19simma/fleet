@@ -73,6 +73,17 @@ service FleetRepos {
   rpc RemoveRepo(RemoveRepoRequest) returns (RemoveRepoReply);
 }
 
+// Git host table (ADR-0068). Any User adds a host, which is always kind `forgejo`; only an admin
+// removes a host or sets `allow_private`. Every reply names a host in its normalised form.
+service FleetHosts {
+  rpc AddHost(AddHostRequest) returns (HostInfo);
+  rpc ListHosts(ListHostsRequest) returns (ListHostsReply);
+  rpc RemoveHost(RemoveHostRequest) returns (RemoveHostReply);
+  rpc ApproveHostPrivate(ApproveHostPrivateRequest) returns (HostInfo);
+  rpc RevokeHostPrivate(RevokeHostPrivateRequest) returns (HostInfo);
+  rpc ListHostRequests(ListHostRequestsRequest) returns (ListHostRequestsReply);
+}
+
 // Server-side work tracker (ADR-0064). Every mutating request carries a client `key`: a repeat with
 // the same `(project, key)` returns the first result. Items are addressed by their key within a
 // project and projects by name within the caller's account.
@@ -212,6 +223,66 @@ message RemoveRepoRequest {
 }
 
 message RemoveRepoReply {}
+
+message AddHostRequest {
+  string host = 1;
+}
+
+message HostInfo {
+  string host = 1;
+  string kind = 2;
+  bool allow_private = 3;
+  repeated string approved_ips = 4;
+  uint64 added_by = 5;
+  optional uint64 approved_by = 6;
+  optional uint64 approved_at_ms = 7;
+  uint64 created_at_ms = 8;
+}
+
+message ListHostsRequest {}
+
+message ListHostsReply {
+  repeated HostInfo hosts = 1;
+}
+
+message RemoveHostRequest {
+  string host = 1;
+}
+
+message RemoveHostReply {}
+
+// The admin names the addresses being approved. The server refuses the call unless the named set
+// equals the set the host resolves to now.
+message ApproveHostPrivateRequest {
+  string host = 1;
+  repeated string approved_ips = 2;
+}
+
+message RevokeHostPrivateRequest {
+  string host = 1;
+}
+
+message ListHostRequestsRequest {}
+
+message HostRequestInfo {
+  string host = 1;
+  uint64 requested_by = 2;
+  repeated string resolved_ips = 3;
+  uint64 requested_at_ms = 4;
+}
+
+message ListHostRequestsReply {
+  repeated HostRequestInfo requests = 1;
+}
+
+// One credential of a Job with the host it was stored for and the host's delivery facts.
+message JobHostCredential {
+  string host = 1;
+  string host_kind = 2;
+  bool allow_private = 3;
+  repeated string approved_ips = 4;
+  JobCredential credential = 5;
+}
 
 message GetJobCredentialsRequest {
   string job_id = 1;
