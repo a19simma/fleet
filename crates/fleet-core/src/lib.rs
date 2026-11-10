@@ -12,6 +12,7 @@ pub mod environment;
 mod error;
 pub mod forge;
 pub mod graph;
+pub mod host;
 mod id;
 pub mod model_allowlist;
 mod normalize;
