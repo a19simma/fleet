@@ -192,6 +192,21 @@ pub enum PinResult {
     Refused(PinRefusal),
 }
 
+impl PinResult {
+    /// The pin to store, or the refusal that stops the submit.
+    ///
+    /// # Errors
+    ///
+    /// Returns the [`PinRefusal`] of a refused result.
+    pub const fn into_pin(self) -> Result<Option<EnvPin>, PinRefusal> {
+        match self {
+            Self::None => Ok(None),
+            Self::Pinned(pin) => Ok(Some(pin)),
+            Self::Refused(refusal) => Err(refusal),
+        }
+    }
+}
+
 /// Resolves the pin of a submit inside the submit transaction.
 ///
 /// The Environment row is taken `FOR SHARE` first, the latest version is read after the lock,
@@ -235,25 +250,61 @@ pub async fn resolve_pin(
     else {
         return Ok(PinResult::Refused(PinRefusal::NoVersion));
     };
-    let scripts: bool = sqlx::query_scalar(SCRIPTS_IN_VERSION)
-        .bind(environment_id)
-        .bind(version)
-        .fetch_one(&mut *tx)
-        .await?;
-    if scripts
-        && sqlx::query_scalar::<_, i64>(SHARE_CAPABILITY)
-            .bind(user_id)
-            .bind(crate::cred::capability::ENV_SCRIPTS)
-            .fetch_optional(&mut *tx)
-            .await?
-            .is_none()
-    {
-        return Ok(PinResult::Refused(PinRefusal::ScriptsNotGranted));
-    }
-    Ok(PinResult::Pinned(EnvPin {
+    let pin = EnvPin {
         environment_id,
         version,
-    }))
+    };
+    if !scripts_granted(tx, user_id, pin).await? {
+        return Ok(PinResult::Refused(PinRefusal::ScriptsNotGranted));
+    }
+    Ok(PinResult::Pinned(pin))
+}
+
+async fn scripts_granted(
+    tx: &mut PgConnection,
+    user_id: i64,
+    pin: EnvPin,
+) -> Result<bool, sqlx::Error> {
+    let scripts: bool = sqlx::query_scalar(SCRIPTS_IN_VERSION)
+        .bind(pin.environment_id)
+        .bind(pin.version)
+        .fetch_one(&mut *tx)
+        .await?;
+    if !scripts {
+        return Ok(true);
+    }
+    Ok(sqlx::query_scalar::<_, i64>(SHARE_CAPABILITY)
+        .bind(user_id)
+        .bind(crate::cred::capability::ENV_SCRIPTS)
+        .fetch_optional(&mut *tx)
+        .await?
+        .is_some())
+}
+
+/// Whether a pin a Job already holds can still be inherited by a CI retry.
+///
+/// The Environment row is taken `FOR SHARE` first, then `env:scripts` `FOR SHARE` when the
+/// pinned version holds a script, the order of [`resolve_pin`]. A deleted Environment or a
+/// revoked capability answers `false`. The pinned version is read, never the latest.
+///
+/// # Errors
+///
+/// Returns the [`sqlx::Error`] of a failed query.
+pub async fn pin_inheritable(
+    tx: &mut PgConnection,
+    user_id: i64,
+    pin: EnvPin,
+) -> Result<bool, sqlx::Error> {
+    if sqlx::query_scalar::<_, i64>(SHARE_ENVIRONMENT)
+        .bind(pin.environment_id)
+        .bind(user_id)
+        .fetch_optional(&mut *tx)
+        .await?
+        .is_none()
+    {
+        return Ok(false);
+    }
+    scripts_granted(tx, user_id, pin).await
 }
 
 /// Whether the pin stored on a Job equals what `request` asks for now.

@@ -115,6 +115,7 @@ async fn batch_job(store: &Store, profile: &str) -> String {
             repeats: 0,
             profiles: vec![profile.to_owned()],
             agent: String::new(),
+            environment: String::new(),
         })
         .await
         .unwrap();
@@ -401,6 +402,7 @@ async fn the_blob_follows_the_pin_of_either_owner(pool: PgPool) {
             repeats: 0,
             profiles: vec!["alpha".to_owned()],
             agent: String::new(),
+            environment: String::new(),
         };
         let id = store
             .submit_batch_for(Some(owner), &request)
@@ -733,6 +735,7 @@ async fn tools_job(store: &Store, submitter: i64) -> String {
         repeats: 0,
         profiles: vec!["alpha".to_owned()],
         agent: String::new(),
+        environment: String::new(),
     };
     store
         .submit_batch_for(Some(submitter), &request)

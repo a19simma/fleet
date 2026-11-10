@@ -101,6 +101,7 @@ async fn submitted(pool: &PgPool) -> (Store, String, Vec<String>) {
             repeats: 0,
             profiles: vec!["alpha".into(), "beta".into()],
             agent: String::new(),
+            environment: String::new(),
         })
         .await
         .unwrap();

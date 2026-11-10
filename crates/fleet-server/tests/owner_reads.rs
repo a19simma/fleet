@@ -118,6 +118,7 @@ async fn world(pool: PgPool) -> World {
                 repeats: 0,
                 profiles: vec!["alpha".to_owned()],
                 agent: String::new(),
+                environment: String::new(),
             },
         )
         .await
@@ -306,6 +307,7 @@ async fn a_batch_lists_only_the_callers_jobs(pool: PgPool) {
                 repeats: 0,
                 profiles: vec!["alpha".to_owned(), "beta".to_owned()],
                 agent: String::new(),
+                environment: String::new(),
             },
         )
         .await
