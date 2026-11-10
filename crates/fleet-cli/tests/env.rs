@@ -14,6 +14,7 @@ use std::sync::{Arc, Mutex};
 use clap::Parser;
 use fleet_cli::{Cli, CliError, run_with_tty};
 use fleet_core::environment::{MAX_NAME_BYTES, MAX_SCRIPT_BYTES, MAX_SECRET_BYTES};
+use fleet_proto::v1::environment_binding_key::Key;
 use fleet_proto::v1::environment_entry_spec::Kind;
 use fleet_proto::v1::fleet_environments_server::{FleetEnvironments, FleetEnvironmentsServer};
 use fleet_proto::v1::{
@@ -51,6 +52,11 @@ struct Stub {
     gets: Arc<Mutex<Vec<GetEnvironmentRequest>>>,
     fail_list: Option<Status>,
     fail_put: Option<Status>,
+    bound: Option<String>,
+    fail_default: Option<Status>,
+    sets: Arc<Mutex<Vec<SetEnvironmentDefaultRequest>>>,
+    default_gets: Arc<Mutex<Vec<GetEnvironmentDefaultRequest>>>,
+    clears: Arc<Mutex<Vec<ClearEnvironmentDefaultRequest>>>,
 }
 
 fn locked<T>(mutex: &Mutex<T>) -> Result<std::sync::MutexGuard<'_, T>, Status> {
@@ -68,23 +74,40 @@ impl Stub {
 impl FleetEnvironments for Stub {
     async fn set_environment_default(
         &self,
-        _request: Request<SetEnvironmentDefaultRequest>,
+        request: Request<SetEnvironmentDefaultRequest>,
     ) -> Result<Response<SetEnvironmentDefaultReply>, Status> {
-        Err(Status::unimplemented("no binding commands yet"))
+        self.note("set_default")?;
+        locked(&self.sets)?.push(request.into_inner());
+        if let Some(status) = &self.fail_default {
+            return Err(status.clone());
+        }
+        Ok(Response::new(SetEnvironmentDefaultReply {}))
     }
 
     async fn get_environment_default(
         &self,
-        _request: Request<GetEnvironmentDefaultRequest>,
+        request: Request<GetEnvironmentDefaultRequest>,
     ) -> Result<Response<GetEnvironmentDefaultReply>, Status> {
-        Err(Status::unimplemented("no binding commands yet"))
+        self.note("get_default")?;
+        locked(&self.default_gets)?.push(request.into_inner());
+        if let Some(status) = &self.fail_default {
+            return Err(status.clone());
+        }
+        Ok(Response::new(GetEnvironmentDefaultReply {
+            environment: self.bound.clone(),
+        }))
     }
 
     async fn clear_environment_default(
         &self,
-        _request: Request<ClearEnvironmentDefaultRequest>,
+        request: Request<ClearEnvironmentDefaultRequest>,
     ) -> Result<Response<ClearEnvironmentDefaultReply>, Status> {
-        Err(Status::unimplemented("no binding commands yet"))
+        self.note("clear_default")?;
+        locked(&self.clears)?.push(request.into_inner());
+        if let Some(status) = &self.fail_default {
+            return Err(status.clone());
+        }
+        Ok(Response::new(ClearEnvironmentDefaultReply {}))
     }
 
     async fn create_environment(
@@ -992,5 +1015,234 @@ async fn script_rm_drops_only_that_script_and_an_unknown_one_saves_nothing() -> 
     let (result, _) = cli(&url, &["env", "script", "rm", "dev", "nothing"], b"").await;
     assert!(result.is_err());
     assert_eq!(calls(&stub), ["get", "save", "get", "get"]);
+    Ok(())
+}
+
+fn hostile_profiles() -> Vec<String> {
+    let mut names = hostile_names();
+    names.extend(["a@b", "a.b", "a\\b", "[::1]"].map(str::to_owned));
+    names
+}
+
+fn hostile_repos() -> Vec<String> {
+    let mut refs: Vec<String> = [
+        "",
+        "github.com/octo",
+        "github.com/a/b/c",
+        "http://github.com/a/b",
+        "github.com/a/%41",
+        "github.com/a b/c",
+        "github.com/a/b;c",
+        "github.com/a/b\r",
+        "github.com/a/b\r\n",
+        "github.com/a/b\u{85}",
+        "github.com/a/b\u{2028}",
+        "user@github.com/a/b",
+        "github.com\\a/b",
+        "[::1]/a/b",
+        "example.com:80/a/b",
+        "github.com/./b",
+        "github.com/a/..",
+    ]
+    .iter()
+    .map(|s| (*s).to_owned())
+    .collect();
+    refs.push(format!("github.com/{}/b", "a".repeat(4096)));
+    refs
+}
+
+#[tokio::test]
+async fn hostile_names_on_every_default_action_are_refused_before_any_rpc() -> TestResult {
+    let stub = Stub::default();
+    let url = serve(stub.clone()).await?;
+    for action in ["set", "show", "clear"] {
+        if action == "set" {
+            for bad in hostile_names() {
+                let args = ["env", "default", "set", &bad, "--profile", "reviewer"];
+                let (result, out) = cli(&url, &args, b"").await;
+                assert_usage(&result);
+                assert_eq!(out, "");
+            }
+        }
+        for bad in hostile_profiles() {
+            let mut args = vec!["env", "default", action];
+            if action == "set" {
+                args.push("ci");
+            }
+            args.extend(["--profile", &bad]);
+            let (result, out) = cli(&url, &args, b"").await;
+            assert_usage(&result);
+            assert_eq!(out, "");
+        }
+        for bad in hostile_repos() {
+            let mut args = vec!["env", "default", action];
+            if action == "set" {
+                args.push("ci");
+            }
+            args.extend(["--repo", &bad]);
+            let (result, out) = cli(&url, &args, b"").await;
+            assert_usage(&result);
+            assert_eq!(out, "");
+        }
+    }
+    assert_eq!(calls(&stub), Vec::<&str>::new());
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_default_needs_exactly_one_key_and_takes_no_stray_arguments() -> TestResult {
+    let stub = Stub::default();
+    let url = serve(stub.clone()).await?;
+    let both = [
+        "env",
+        "default",
+        "show",
+        "--repo",
+        "github.com/a/b",
+        "--profile",
+        "p",
+    ];
+    assert!(Cli::try_parse_from(["fleet", "--server", &url].into_iter().chain(both)).is_err());
+    let none = ["env", "default", "show"];
+    assert!(Cli::try_parse_from(["fleet", "--server", &url].into_iter().chain(none)).is_err());
+    let (result, _) = cli(
+        &url,
+        &["env", "default", "set", "ci", "--profile", "p", "extra"],
+        b"",
+    )
+    .await;
+    assert_usage(&result);
+    let (result, _) = cli(
+        &url,
+        &["env", "default", "show", "--profile", "p", "x"],
+        b"",
+    )
+    .await;
+    assert_usage(&result);
+    assert_eq!(calls(&stub), Vec::<&str>::new());
+    Ok(())
+}
+
+#[tokio::test]
+async fn set_show_and_clear_send_the_checked_key_by_repo_or_profile() -> TestResult {
+    let stub = Stub {
+        bound: Some("ci".into()),
+        ..Stub::default()
+    };
+    let url = serve(stub.clone()).await?;
+    let (result, out) = cli(
+        &url,
+        &[
+            "env",
+            "default",
+            "set",
+            "ci",
+            "--repo",
+            "GitHub.com/Octo/Hello.git",
+        ],
+        b"",
+    )
+    .await;
+    result?;
+    assert_eq!(out, "bound\tci\n");
+    let (result, out) = cli(
+        &url,
+        &["env", "default", "set", "ci", "--profile", "rev_1"],
+        b"",
+    )
+    .await;
+    result?;
+    assert_eq!(out, "bound\tci\n");
+    let (result, out) = cli(
+        &url,
+        &["env", "default", "show", "--repo", "github.com/octo/hello"],
+        b"",
+    )
+    .await;
+    result?;
+    assert_eq!(out, "ci\n");
+    let (result, out) = cli(&url, &["env", "default", "show", "--profile", "rev_1"], b"").await;
+    result?;
+    assert_eq!(out, "ci\n");
+    let (result, out) = cli(
+        &url,
+        &["env", "default", "clear", "--repo", "github.com/octo/hello"],
+        b"",
+    )
+    .await;
+    result?;
+    assert_eq!(out, "cleared\n");
+    let (result, out) = cli(
+        &url,
+        &["env", "default", "clear", "--profile", "rev_1"],
+        b"",
+    )
+    .await;
+    result?;
+    assert_eq!(out, "cleared\n");
+    assert_eq!(
+        calls(&stub),
+        [
+            "set_default",
+            "set_default",
+            "get_default",
+            "get_default",
+            "clear_default",
+            "clear_default"
+        ]
+    );
+    let sets = stub.sets.lock().unwrap();
+    assert_eq!(sets[0].environment, "ci");
+    let Some(Key::Repo(repo)) = sets[0].key.clone().and_then(|k| k.key) else {
+        panic!("repo key expected");
+    };
+    assert_eq!(
+        (repo.host.as_str(), repo.path.as_str()),
+        ("github.com", "octo/hello")
+    );
+    assert_eq!(
+        sets[1].key.clone().and_then(|k| k.key),
+        Some(Key::Profile("rev_1".into()))
+    );
+    let gets = stub.default_gets.lock().unwrap();
+    assert_eq!(
+        gets[1].key.clone().and_then(|k| k.key),
+        Some(Key::Profile("rev_1".into()))
+    );
+    let clears = stub.clears.lock().unwrap();
+    assert!(matches!(
+        clears[0].key.clone().and_then(|k| k.key),
+        Some(Key::Repo(_))
+    ));
+    assert_eq!(
+        clears[1].key.clone().and_then(|k| k.key),
+        Some(Key::Profile("rev_1".into()))
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn show_of_an_unbound_key_prints_none_and_a_refusal_keeps_its_code() -> TestResult {
+    let stub = Stub::default();
+    let url = serve(stub).await?;
+    let (result, out) = cli(&url, &["env", "default", "show", "--profile", "p"], b"").await;
+    result?;
+    assert_eq!(out, "none\n");
+    let stub = Stub {
+        fail_default: Some(Status::not_found("environment binding key not found")),
+        ..Stub::default()
+    };
+    let url = serve(stub).await?;
+    let (result, out) = cli(
+        &url,
+        &["env", "default", "set", "ci", "--profile", "p"],
+        b"",
+    )
+    .await;
+    let Err(CliError::Rpc(status)) = result else {
+        panic!("rpc refusal expected");
+    };
+    assert_eq!(status.code(), tonic::Code::NotFound);
+    assert_eq!(out, "");
     Ok(())
 }
