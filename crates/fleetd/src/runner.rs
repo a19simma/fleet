@@ -1562,6 +1562,23 @@ impl<R: Reporter> AgentRunner<R> {
     async fn run_setup(
         &self,
         job: &Job,
+        shutdown: Shutdown,
+        stream: &mut Stream<'_, R>,
+    ) -> Option<Result<AgentOutcome, RunError>> {
+        let stop = self.run_setup_steps(job, shutdown, stream).await;
+        let ran = self
+            .setup
+            .as_ref()
+            .is_some_and(|setup| setup.has_scripts(&job.job_id));
+        if ran && let Some(runner) = crate::agent::resolve(&job.agent) {
+            self.end.set_hosts(&job.job_id, runner.model_hosts());
+        }
+        stop
+    }
+
+    async fn run_setup_steps(
+        &self,
+        job: &Job,
         mut shutdown: Shutdown,
         stream: &mut Stream<'_, R>,
     ) -> Option<Result<AgentOutcome, RunError>> {

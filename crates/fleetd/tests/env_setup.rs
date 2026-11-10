@@ -116,6 +116,13 @@ fn script(name: &str, body: &str, secs: u32) -> EnvironmentScriptSpec {
     }
 }
 
+fn script_continue(name: &str, body: &str, secs: u32) -> EnvironmentScriptSpec {
+    EnvironmentScriptSpec {
+        on_fail: EnvironmentOnFail::Continue.into(),
+        ..script(name, body, secs)
+    }
+}
+
 struct Rig {
     _dir: tempfile::TempDir,
     root: PathBuf,
@@ -123,6 +130,15 @@ struct Rig {
 }
 
 fn rig(launcher: Arc<dyn SetupLauncher>, scripts: Vec<EnvironmentScriptSpec>) -> Rig {
+    rig_with(launcher, scripts, Vec::new(), |setup| setup)
+}
+
+fn rig_with(
+    launcher: Arc<dyn SetupLauncher>,
+    scripts: Vec<EnvironmentScriptSpec>,
+    egress_hosts: Vec<String>,
+    tune: impl FnOnce(EnvSetup) -> EnvSetup,
+) -> Rig {
     let dir = tempfile::tempdir().unwrap();
     let delivery_root = dir.path().join("run");
     fs::create_dir(&delivery_root).unwrap();
@@ -142,11 +158,12 @@ fn rig(launcher: Arc<dyn SetupLauncher>, scripts: Vec<EnvironmentScriptSpec>) ->
         JOB,
         ReleasedEnvironment::from_reply(GetJobEnvironmentReply {
             scripts,
+            egress_hosts,
             ..GetJobEnvironmentReply::default()
         }),
     );
     let setup =
-        EnvSetup::new(launcher, delivery, &root).with_drain_grace(Duration::from_millis(300));
+        tune(EnvSetup::new(launcher, delivery, &root).with_drain_grace(Duration::from_millis(300)));
     Rig {
         _dir: dir,
         root,
@@ -498,6 +515,213 @@ async fn the_step_is_killed_before_the_output_drain_wait_begins() -> TestResult 
         let report = setup.run(JOB, &redactor()).await;
         let text = joined(&report.notes);
         assert!(text.contains("after-kill"), "{text}");
+        Ok(())
+    })
+    .await
+}
+
+#[tokio::test]
+async fn a_continue_step_failure_records_a_note_and_runs_the_next() -> TestResult {
+    bounded::bounded(async {
+        let scripts = vec![
+            script_continue("soft", "echo soft-bad; exit 4", 5),
+            script("after", "echo after-ran", 5),
+        ];
+        let rig = rig(ShLauncher::killing(), scripts);
+        let report = rig.setup.run(JOB, &redactor()).await;
+        assert_eq!(report.failed, None);
+        assert_eq!(report.skipped, Vec::<String>::new());
+        let text = joined(&report.notes);
+        assert!(text.contains("setup step soft failed"), "{text}");
+        assert!(text.contains("setup step soft continuing"), "{text}");
+        assert!(text.contains("after-ran"), "{text}");
+        assert!(text.contains("setup step after ok"), "{text}");
+        Ok(())
+    })
+    .await
+}
+
+#[tokio::test]
+async fn an_abort_step_after_a_continue_failure_still_fails_the_job_at_the_abort_step() -> TestResult
+{
+    bounded::bounded(async {
+        let scripts = vec![
+            script_continue("soft", "exit 4", 5),
+            script("hard", "exit 5", 5),
+            script("never", "echo never-ran", 5),
+        ];
+        let rig = rig(ShLauncher::killing(), scripts);
+        let report = rig.setup.run(JOB, &redactor()).await;
+        assert_eq!(report.failed.as_deref(), Some("hard"));
+        assert!(!joined(&report.notes).contains("never-ran"));
+        Ok(())
+    })
+    .await
+}
+
+#[tokio::test]
+async fn a_continue_step_on_its_own_timeout_lets_the_next_step_run() -> TestResult {
+    bounded::bounded(async {
+        let scripts = vec![
+            script_continue("slow", "sleep 120", 1),
+            script("after", "echo after-ran", 5),
+        ];
+        let rig = rig(ShLauncher::killing(), scripts);
+        let report = rig.setup.run(JOB, &redactor()).await;
+        assert_eq!(report.failed, None);
+        assert_eq!(report.skipped, Vec::<String>::new());
+        let text = joined(&report.notes);
+        assert!(text.contains("setup step slow timed out"), "{text}");
+        assert!(text.contains("after-ran"), "{text}");
+        Ok(())
+    })
+    .await
+}
+
+#[tokio::test]
+async fn a_continue_step_cut_by_the_budget_skips_the_rest_and_fails_on_a_skipped_abort()
+-> TestResult {
+    bounded::bounded(async {
+        let launcher = ShLauncher::killing();
+        let scripts = vec![
+            script_continue("soft", "sleep 120", 30),
+            script_continue("soft2", "echo soft2-ran", 5),
+            script("hard", "echo hard-ran", 5),
+        ];
+        let rig = rig_with(launcher.clone(), scripts, Vec::new(), |setup| {
+            setup.with_budget(Duration::from_millis(700))
+        });
+        let report = rig.setup.run(JOB, &redactor()).await;
+        assert_eq!(report.failed.as_deref(), Some("hard"));
+        assert_eq!(report.skipped, ["soft2", "hard"]);
+        let text = joined(&report.notes);
+        assert!(text.contains("setup step soft cut by the budget"), "{text}");
+        assert!(text.contains("setup step soft2 skipped"), "{text}");
+        assert!(
+            !text.contains("soft2-ran") && !text.contains("hard-ran"),
+            "{text}"
+        );
+        assert!(report.elapsed < Duration::from_secs(10));
+        assert_eq!(launcher.pids.lock().unwrap().len(), 1);
+        Ok(())
+    })
+    .await
+}
+
+#[tokio::test]
+async fn a_budget_cut_that_skips_only_continue_steps_does_not_fail_the_job() -> TestResult {
+    bounded::bounded(async {
+        let scripts = vec![
+            script_continue("soft", "sleep 120", 30),
+            script_continue("soft2", "echo soft2-ran", 5),
+        ];
+        let rig = rig_with(ShLauncher::killing(), scripts, Vec::new(), |setup| {
+            setup.with_budget(Duration::from_millis(700))
+        });
+        let report = rig.setup.run(JOB, &redactor()).await;
+        assert_eq!(report.failed, None);
+        assert_eq!(report.skipped, ["soft2"]);
+        assert!(joined(&report.notes).contains("setup step soft2 skipped"));
+        Ok(())
+    })
+    .await
+}
+
+#[tokio::test]
+async fn an_abort_step_cut_by_the_budget_fails_and_names_itself() -> TestResult {
+    bounded::bounded(async {
+        let scripts = vec![
+            script("hard", "sleep 120", 30),
+            script("after", "echo x", 5),
+        ];
+        let rig = rig_with(ShLauncher::killing(), scripts, Vec::new(), |setup| {
+            setup.with_budget(Duration::from_millis(700))
+        });
+        let report = rig.setup.run(JOB, &redactor()).await;
+        assert_eq!(report.failed.as_deref(), Some("hard"));
+        Ok(())
+    })
+    .await
+}
+
+type HostCalls = Arc<Mutex<Vec<(String, Vec<String>, bool)>>>;
+
+fn recording(launcher: &Arc<ShLauncher>) -> (HostCalls, fleetd::env_setup::EgressHook) {
+    let calls: HostCalls = Arc::default();
+    let sink = Arc::clone(&calls);
+    let seen = Arc::clone(launcher);
+    let hook: fleetd::env_setup::EgressHook = Arc::new(move |job, hosts| {
+        sink.lock().unwrap().push((
+            job.to_owned(),
+            hosts.iter().map(|h| (*h).to_owned()).collect(),
+            seen.started.load(Ordering::SeqCst),
+        ));
+    });
+    (calls, hook)
+}
+
+#[tokio::test]
+async fn the_declared_hosts_reach_the_egress_hook_before_the_first_step() -> TestResult {
+    bounded::bounded(async {
+        let launcher = ShLauncher::killing();
+        let (calls, hook) = recording(&launcher);
+        let rig = rig_with(
+            launcher,
+            vec![script("one", "echo ok", 5), script("two", "echo ok", 5)],
+            vec!["api.example".to_owned(), "pkg.example".to_owned()],
+            |setup| setup.with_egress(hook),
+        );
+        let report = rig.setup.run(JOB, &redactor()).await;
+        assert_eq!(report.failed, None);
+        let got = calls.lock().unwrap().clone();
+        assert_eq!(
+            got,
+            [(
+                JOB.to_owned(),
+                vec!["api.example".to_owned(), "pkg.example".to_owned()],
+                false
+            )]
+        );
+        Ok(())
+    })
+    .await
+}
+
+#[tokio::test]
+async fn scripts_with_no_declared_host_call_the_hook_with_an_empty_set() -> TestResult {
+    bounded::bounded(async {
+        let launcher = ShLauncher::killing();
+        let (calls, hook) = recording(&launcher);
+        let rig = rig_with(
+            launcher,
+            vec![script("one", "echo ok", 5)],
+            Vec::new(),
+            |setup| setup.with_egress(hook),
+        );
+        rig.setup.run(JOB, &redactor()).await;
+        assert_eq!(
+            calls.lock().unwrap().clone(),
+            [(JOB.to_owned(), Vec::<String>::new(), false)]
+        );
+        Ok(())
+    })
+    .await
+}
+
+#[tokio::test]
+async fn a_job_with_no_script_never_calls_the_egress_hook() -> TestResult {
+    bounded::bounded(async {
+        let launcher = ShLauncher::killing();
+        let (calls, hook) = recording(&launcher);
+        let rig = rig_with(
+            launcher,
+            Vec::new(),
+            vec!["api.example".to_owned()],
+            |setup| setup.with_egress(hook),
+        );
+        let report = rig.setup.run(JOB, &redactor()).await;
+        assert!(!report.ran);
+        assert!(calls.lock().unwrap().is_empty());
         Ok(())
     })
     .await

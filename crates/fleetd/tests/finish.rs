@@ -3631,6 +3631,15 @@ mod timing_e2e {
         runner: AgentRunner<Fake>,
         launcher: SleepLauncher,
     ) -> Result<AgentRunner<Fake>, Box<dyn std::error::Error>> {
+        with_setup_hooked(rig, runner, launcher, None)
+    }
+
+    fn with_setup_hooked(
+        rig: &Rig,
+        runner: AgentRunner<Fake>,
+        launcher: SleepLauncher,
+        egress: Option<fleetd::env_setup::EgressHook>,
+    ) -> Result<AgentRunner<Fake>, Box<dyn std::error::Error>> {
         let root = rig.dir.path().join("setup-run");
         std::fs::create_dir(&root)?;
         let delivery = Arc::new(EnvDelivery::new(
@@ -3653,11 +3662,14 @@ mod timing_e2e {
                 ..GetJobEnvironmentReply::default()
             }),
         );
-        let setup = EnvSetup::new(
+        let mut setup = EnvSetup::new(
             Arc::new(launcher),
             delivery,
             rig.dir.path().join("setup-work"),
         );
+        if let Some(hook) = egress {
+            setup = setup.with_egress(hook);
+        }
         Ok(runner.with_setup(Arc::new(setup)))
     }
 
@@ -3732,6 +3744,53 @@ mod timing_e2e {
             Ok(())
         }))
         .await
+    }
+
+    #[tokio::test]
+    async fn the_model_hosts_are_the_last_host_set_after_setup_on_success_and_failure() -> TestResult
+    {
+        for pass in [true, false] {
+            common::bounded(Box::pin(async move {
+                let rig = rig("ok").await?;
+                let (runner, _rx, _sink) = runner(&rig, Mode::Store);
+                let calls = Arc::new(Mutex::new(Vec::<Vec<String>>::new()));
+                let end = fleetd::runner::JobEnd::new().on_hosts({
+                    let calls = Arc::clone(&calls);
+                    move |_, hosts| {
+                        calls
+                            .lock()
+                            .unwrap_or_else(PoisonError::into_inner)
+                            .push(hosts.iter().map(|h| (*h).to_owned()).collect());
+                    }
+                });
+                let hook: fleetd::env_setup::EgressHook = {
+                    let end = end.clone();
+                    Arc::new(move |job_id, _| end.set_hosts(job_id, &["declared.example"]))
+                };
+                let runner = with_setup_hooked(
+                    &rig,
+                    runner.with_job_end(end),
+                    SleepLauncher {
+                        run_for: Duration::from_millis(10),
+                        pass,
+                    },
+                    Some(hook),
+                )?;
+                let (_trigger, shutdown) = Shutdown::channel();
+                let job = job(&rig, false);
+                let _ = runner.run(&job, &rig.worktree, shutdown).await?;
+                let model = vec!["api.anthropic.com".to_owned()];
+                let declared = vec!["declared.example".to_owned()];
+                assert_eq!(
+                    *calls.lock().unwrap_or_else(PoisonError::into_inner),
+                    [model.clone(), declared, model],
+                    "pass={pass}"
+                );
+                Ok(())
+            }))
+            .await?;
+        }
+        Ok(())
     }
 
     #[tokio::test]

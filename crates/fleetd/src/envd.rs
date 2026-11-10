@@ -96,6 +96,7 @@ pub struct Redaction {
 pub struct ReleasedEnvironment {
     secrets: BTreeMap<String, Held>,
     scripts: Vec<SetupScript>,
+    egress_hosts: Vec<String>,
 }
 
 /// One Environment script step, in execution order.
@@ -105,7 +106,7 @@ pub struct SetupScript {
     pub name: String,
     /// The script text, which starts with a `#!/` line.
     pub body: String,
-    /// Whether a failure fails the Job. Only `Abort` is acted on; `Continue` is read as `Abort`.
+    /// Whether a failure fails the Job (`Abort`). `Continue` records a note and runs the next step.
     pub abort: bool,
     /// The step timeout.
     pub timeout: Duration,
@@ -164,13 +165,24 @@ impl ReleasedEnvironment {
                 )),
             })
             .collect();
-        Self { secrets, scripts }
+        let egress_hosts = std::mem::take(&mut reply.egress_hosts);
+        Self {
+            secrets,
+            scripts,
+            egress_hosts,
+        }
     }
 
     /// The scripts of this environment, in execution order.
     #[must_use]
     pub fn scripts(&self) -> &[SetupScript] {
         &self.scripts
+    }
+
+    /// The egress hosts the version declares.
+    #[must_use]
+    pub fn egress_hosts(&self) -> &[String] {
+        &self.egress_hosts
     }
 
     /// The value held under `name`.
@@ -210,6 +222,7 @@ impl ReleasedEnvironment {
         }
         self.secrets.clear();
         self.scripts.clear();
+        self.egress_hosts.clear();
     }
 
     /// The redactor of these values under [`MAX_REDACT_LINES`].
@@ -613,6 +626,15 @@ impl EnvDelivery {
         lock(&self.held)
             .get(job_id)
             .map(|env| env.scripts().to_vec())
+            .unwrap_or_default()
+    }
+
+    /// The egress hosts declared for `job_id`, empty when none.
+    #[must_use]
+    pub fn egress_hosts(&self, job_id: &str) -> Vec<String> {
+        lock(&self.held)
+            .get(job_id)
+            .map(|env| env.egress_hosts().to_vec())
             .unwrap_or_default()
     }
 
