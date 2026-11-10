@@ -6,7 +6,7 @@ use fleet_proto::v1::{GetJobEnvironmentReply, JobEnvironmentSecret, PutEnvironme
 
 const MARKER: &str = "MARKER-env-secret-value-9f3a";
 
-const RPCS: [&str; 9] = [
+const RPCS: [&str; 12] = [
     "CreateEnvironment",
     "ListEnvironments",
     "GetEnvironment",
@@ -16,6 +16,9 @@ const RPCS: [&str; 9] = [
     "SaveEnvironmentVersion",
     "GetEnvironmentVersion",
     "ListEnvironmentVersions",
+    "SetEnvironmentDefault",
+    "GetEnvironmentDefault",
+    "ClearEnvironmentDefault",
 ];
 
 #[test]

@@ -56,6 +56,41 @@ SELECT v.version, v.hash FROM environment_version v \
 JOIN environment e ON e.id = v.environment_id \
 WHERE v.environment_id = $1 AND e.user_id = $2 ORDER BY v.version";
 
+const SHARE_REPO_KEY: &str =
+    "SELECT id FROM user_repos WHERE user_id = $1 AND host = $2 AND path = $3 FOR SHARE";
+
+const SHARE_PROFILE_KEY: &str = "\
+SELECT id FROM profile WHERE name = $1 AND (owner_user_id = $2 OR visibility = 'shared') \
+ORDER BY (owner_user_id = $2) DESC NULLS LAST, id LIMIT 1 FOR SHARE";
+
+const UPSERT_REPO_DEFAULT: &str = "\
+INSERT INTO environment_default (user_id, environment_id, repo_id) VALUES ($1, $2, $3) \
+ON CONFLICT (user_id, repo_id) DO UPDATE SET environment_id = EXCLUDED.environment_id";
+
+const UPSERT_PROFILE_DEFAULT: &str = "\
+INSERT INTO environment_default (user_id, environment_id, profile_id) VALUES ($1, $2, $3) \
+ON CONFLICT (user_id, profile_id) DO UPDATE SET environment_id = EXCLUDED.environment_id";
+
+const REPO_DEFAULT_ID: &str =
+    "SELECT environment_id FROM environment_default WHERE user_id = $1 AND repo_id = $2";
+
+const PROFILE_DEFAULT_ID: &str =
+    "SELECT environment_id FROM environment_default WHERE user_id = $1 AND profile_id = $2";
+
+const REPO_DEFAULT_NAME: &str = "\
+SELECT e.name FROM environment_default d JOIN environment e ON e.id = d.environment_id \
+AND e.user_id = d.user_id WHERE d.user_id = $1 AND d.repo_id = $2";
+
+const PROFILE_DEFAULT_NAME: &str = "\
+SELECT e.name FROM environment_default d JOIN environment e ON e.id = d.environment_id \
+AND e.user_id = d.user_id WHERE d.user_id = $1 AND d.profile_id = $2";
+
+const DELETE_REPO_DEFAULT: &str =
+    "DELETE FROM environment_default WHERE user_id = $1 AND repo_id = $2";
+
+const DELETE_PROFILE_DEFAULT: &str =
+    "DELETE FROM environment_default WHERE user_id = $1 AND profile_id = $2";
+
 const LOCK_USER: &str = "SELECT id FROM users WHERE id = $1 FOR UPDATE";
 
 const COUNT_ENVIRONMENTS: &str = "SELECT count(*) FROM environment WHERE user_id = $1";
@@ -153,7 +188,7 @@ type ReleaseParts = (
 /// What a submit asks of the Environment layer (ADR-0067 decision 10).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum EnvRequest {
-    /// The field was empty. No default binding exists yet, so no Environment is pinned.
+    /// The field was empty: the repository binding, then the Profile binding, then none.
     Default,
     /// The field was `-`: the submitter wants no Environment.
     Bare,
@@ -234,6 +269,65 @@ pub async fn resolve_pin(
     else {
         return Ok(PinResult::Refused(PinRefusal::UnknownName));
     };
+    pin_environment(tx, user_id, environment_id).await
+}
+
+/// The repository and Profile a submit resolves default bindings for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct DefaultKeys {
+    /// The registered repository row of the job target, when it is registered.
+    pub repo_id: Option<i64>,
+    /// The Profile the job runs, when it names one.
+    pub profile_id: Option<i64>,
+}
+
+/// Resolves the pin of a submit with default bindings (ADR-0067 decision 10).
+///
+/// An explicit name pins that Environment and [`EnvRequest::Bare`] pins none, and neither reads
+/// a binding. [`EnvRequest::Default`] takes the repository binding, then the Profile binding,
+/// then none. A binding whose Environment vanished is skipped. A binding to an Environment
+/// without a version, or to one with scripts after `env:scripts` was revoked, refuses the
+/// submit and never falls through to the next binding.
+///
+/// # Errors
+///
+/// Returns the [`sqlx::Error`] of a failed query.
+pub async fn resolve_pin_with_defaults(
+    tx: &mut PgConnection,
+    user_id: i64,
+    request: &EnvRequest,
+    keys: DefaultKeys,
+) -> Result<PinResult, sqlx::Error> {
+    if !matches!(request, EnvRequest::Default) {
+        return resolve_pin(tx, user_id, request).await;
+    }
+    let candidates = [
+        (REPO_DEFAULT_ID, keys.repo_id),
+        (PROFILE_DEFAULT_ID, keys.profile_id),
+    ];
+    for (sql, key) in candidates {
+        let Some(key) = key else { continue };
+        let Some(environment_id) = sqlx::query_scalar::<_, i64>(sql)
+            .bind(user_id)
+            .bind(key)
+            .fetch_optional(&mut *tx)
+            .await?
+        else {
+            continue;
+        };
+        match pin_environment(tx, user_id, environment_id).await? {
+            PinResult::Refused(PinRefusal::UnknownName) => {}
+            settled => return Ok(settled),
+        }
+    }
+    Ok(PinResult::None)
+}
+
+async fn pin_environment(
+    tx: &mut PgConnection,
+    user_id: i64,
+    environment_id: i64,
+) -> Result<PinResult, sqlx::Error> {
     if sqlx::query_scalar::<_, i64>(SHARE_ENVIRONMENT)
         .bind(environment_id)
         .bind(user_id)
@@ -340,11 +434,27 @@ pub async fn pin_matches(
     })
 }
 
+/// What a default Environment binds to, already validated.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BindingKey {
+    /// A registered repository: lowercase host and `owner/name` path.
+    Repo {
+        /// The forge host.
+        host: String,
+        /// The repository path.
+        path: String,
+    },
+    /// A Profile name the caller can see.
+    Profile(String),
+}
+
 /// Why an Environment store call failed. Messages are fixed text.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EnvError {
     /// The Environment or secret is unknown, or belongs to another user.
     NotFound,
+    /// A default binding names a repository or Profile the user cannot see.
+    KeyNotFound,
     /// The user already has an Environment of this name.
     Exists,
     /// The secret could not be sealed.
@@ -373,6 +483,7 @@ impl fmt::Display for EnvError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(match self {
             Self::NotFound => "no such environment secret",
+            Self::KeyNotFound => fleet_proto::ERR_ENV_KEY_NOT_FOUND,
             Self::Exists => "environment already exists",
             Self::Seal => "environment secret could not be sealed",
             Self::Open => "environment secret could not be opened",
@@ -625,6 +736,129 @@ impl EnvironmentStore {
             .fetch_optional(&self.pool)
             .await?
             .ok_or(EnvError::NotFound)
+    }
+
+    async fn share_key(
+        tx: &mut PgConnection,
+        user_id: i64,
+        key: &BindingKey,
+    ) -> Result<(bool, i64), EnvError> {
+        let found = match key {
+            BindingKey::Repo { host, path } => {
+                sqlx::query_scalar::<_, i64>(SHARE_REPO_KEY)
+                    .bind(user_id)
+                    .bind(host)
+                    .bind(path)
+                    .fetch_optional(&mut *tx)
+                    .await?
+            }
+            BindingKey::Profile(name) => {
+                sqlx::query_scalar::<_, i64>(SHARE_PROFILE_KEY)
+                    .bind(name)
+                    .bind(user_id)
+                    .fetch_optional(&mut *tx)
+                    .await?
+            }
+        };
+        let id = found.ok_or(EnvError::KeyNotFound)?;
+        Ok((matches!(key, BindingKey::Repo { .. }), id))
+    }
+
+    /// Binds the user's Environment as the default of `key`, replacing an earlier binding.
+    ///
+    /// The Environment row is taken `FOR UPDATE` first, then the key row `FOR SHARE`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`EnvError::NotFound`] when the user owns no such Environment,
+    /// [`EnvError::KeyNotFound`] when the key names no repository or Profile the user can see and
+    /// [`EnvError::Database`] on a database failure.
+    pub async fn set_default(
+        &self,
+        user_id: i64,
+        environment_id: i64,
+        key: &BindingKey,
+    ) -> Result<(), EnvError> {
+        let mut tx = self.pool.begin().await?;
+        Self::lock_owned(&mut tx, user_id, environment_id).await?;
+        let (is_repo, key_id) = Self::share_key(&mut tx, user_id, key).await?;
+        sqlx::query(if is_repo {
+            UPSERT_REPO_DEFAULT
+        } else {
+            UPSERT_PROFILE_DEFAULT
+        })
+        .bind(user_id)
+        .bind(environment_id)
+        .bind(key_id)
+        .execute(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        Ok(())
+    }
+
+    /// Reads the name of the Environment bound to `key`, or `None` when nothing is bound.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`EnvError::KeyNotFound`] when the key names no repository or Profile the user
+    /// can see and [`EnvError::Database`] on a database failure.
+    pub async fn get_default(
+        &self,
+        user_id: i64,
+        key: &BindingKey,
+    ) -> Result<Option<String>, EnvError> {
+        let mut tx = self.pool.begin().await?;
+        let (is_repo, key_id) = Self::share_key(&mut tx, user_id, key).await?;
+        let name = sqlx::query_scalar(if is_repo {
+            REPO_DEFAULT_NAME
+        } else {
+            PROFILE_DEFAULT_NAME
+        })
+        .bind(user_id)
+        .bind(key_id)
+        .fetch_optional(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        Ok(name)
+    }
+
+    /// Removes the binding of `key`. Clearing an unbound key succeeds.
+    ///
+    /// The bound Environment row is taken `FOR UPDATE` before the delete.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`EnvError::KeyNotFound`] when the key names no repository or Profile the user
+    /// can see and [`EnvError::Database`] on a database failure.
+    pub async fn clear_default(&self, user_id: i64, key: &BindingKey) -> Result<(), EnvError> {
+        let mut tx = self.pool.begin().await?;
+        let (is_repo, key_id) = Self::share_key(&mut tx, user_id, key).await?;
+        let bound: Option<i64> = sqlx::query_scalar(if is_repo {
+            REPO_DEFAULT_ID
+        } else {
+            PROFILE_DEFAULT_ID
+        })
+        .bind(user_id)
+        .bind(key_id)
+        .fetch_optional(&mut *tx)
+        .await?;
+        if let Some(environment_id) = bound {
+            match Self::lock_owned(&mut tx, user_id, environment_id).await {
+                Ok(()) | Err(EnvError::NotFound) => {}
+                Err(other) => return Err(other),
+            }
+            sqlx::query(if is_repo {
+                DELETE_REPO_DEFAULT
+            } else {
+                DELETE_PROFILE_DEFAULT
+            })
+            .bind(user_id)
+            .bind(key_id)
+            .execute(&mut *tx)
+            .await?;
+        }
+        tx.commit().await?;
+        Ok(())
     }
 
     /// Lists the secret names of the user's Environment with the fingerprint of each value.
@@ -1222,16 +1456,19 @@ impl TryFrom<StoredEntryRow> for StoredEntry {
     }
 }
 
+use fleet_proto::v1::environment_binding_key as binding_key;
 use fleet_proto::v1::environment_entry_spec::Kind;
 use fleet_proto::v1::{
-    CreateEnvironmentRequest, DeleteEnvironmentReply, DeleteEnvironmentRequest,
-    DeleteEnvironmentSecretReply, DeleteEnvironmentSecretRequest, EnvironmentDelivery,
-    EnvironmentDetail, EnvironmentEntrySpec, EnvironmentInfo as ProtoInfo, EnvironmentOnFail,
-    EnvironmentScriptSpec, EnvironmentSecretInfo, EnvironmentSecretSpec, EnvironmentVersion,
-    EnvironmentVersionInfo, GetEnvironmentRequest, GetEnvironmentVersionRequest,
-    GetJobEnvironmentReply, JobEnvironmentSecret, ListEnvironmentVersionsReply,
-    ListEnvironmentVersionsRequest, ListEnvironmentsReply, PutEnvironmentSecretReply,
-    PutEnvironmentSecretRequest, SaveEnvironmentVersionReply, SaveEnvironmentVersionRequest,
+    ClearEnvironmentDefaultReply, ClearEnvironmentDefaultRequest, CreateEnvironmentRequest,
+    DeleteEnvironmentReply, DeleteEnvironmentRequest, DeleteEnvironmentSecretReply,
+    DeleteEnvironmentSecretRequest, EnvironmentBindingKey, EnvironmentDelivery, EnvironmentDetail,
+    EnvironmentEntrySpec, EnvironmentInfo as ProtoInfo, EnvironmentOnFail, EnvironmentScriptSpec,
+    EnvironmentSecretInfo, EnvironmentSecretSpec, EnvironmentVersion, EnvironmentVersionInfo,
+    GetEnvironmentDefaultReply, GetEnvironmentDefaultRequest, GetEnvironmentRequest,
+    GetEnvironmentVersionRequest, GetJobEnvironmentReply, JobEnvironmentSecret,
+    ListEnvironmentVersionsReply, ListEnvironmentVersionsRequest, ListEnvironmentsReply,
+    PutEnvironmentSecretReply, PutEnvironmentSecretRequest, SaveEnvironmentVersionReply,
+    SaveEnvironmentVersionRequest, SetEnvironmentDefaultReply, SetEnvironmentDefaultRequest,
 };
 use tonic::Status;
 use tonic_prost::prost::Message;
@@ -1255,6 +1492,7 @@ fn number(value: i32) -> Result<u32, Status> {
 fn store_status(err: EnvError) -> Status {
     match err {
         EnvError::NotFound => Status::not_found(fleet_proto::ERR_ENV_NOT_FOUND),
+        EnvError::KeyNotFound => Status::not_found(fleet_proto::ERR_ENV_KEY_NOT_FOUND),
         EnvError::Exists => Status::already_exists(fleet_proto::ERR_ENV_EXISTS),
         EnvError::TooManyEnvironments | EnvError::TooManyEntries | EnvError::TooLarge => {
             Status::resource_exhausted(fleet_proto::ERR_ENV_LIMIT)
@@ -1328,6 +1566,38 @@ fn spec_of(
 
 fn env_name_of(raw: &str) -> Result<EnvironmentName, Status> {
     EnvironmentName::new(raw).map_err(invalid)
+}
+
+const MAX_REPO_HOST_BYTES: usize = 253;
+const MAX_REPO_PATH_BYTES: usize = 141;
+
+fn binding_key_of(key: Option<&EnvironmentBindingKey>) -> Result<BindingKey, Status> {
+    let bad = || Status::invalid_argument(fleet_proto::ERR_ENV_KEY_INVALID);
+    match key.and_then(|k| k.key.as_ref()).ok_or_else(bad)? {
+        binding_key::Key::Repo(repo) => {
+            let host = repo.host.to_ascii_lowercase();
+            let path = repo.path.to_ascii_lowercase();
+            let host_ok = !host.is_empty()
+                && host.len() <= MAX_REPO_HOST_BYTES
+                && host
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || b == b'.' || b == b'-');
+            let path_ok = !path.is_empty()
+                && path.len() <= MAX_REPO_PATH_BYTES
+                && path
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-' | b'/'));
+            if host_ok && path_ok {
+                Ok(BindingKey::Repo { host, path })
+            } else {
+                Err(bad())
+            }
+        }
+        binding_key::Key::Profile(name) => {
+            crate::profiles::validate_name(name).map_err(|_| bad())?;
+            Ok(BindingKey::Profile(name.clone()))
+        }
+    }
 }
 
 fn entry_name_of(raw: &str) -> Result<EntryName, Status> {
@@ -1417,6 +1687,66 @@ impl EnvironmentService {
             .resolve_environment(user_id, name)
             .await
             .map_err(store_status)
+    }
+
+    /// Binds an Environment as the default of a repository or Profile.
+    ///
+    /// # Errors
+    ///
+    /// Returns `INVALID_ARGUMENT` for a bad name or key, `NOT_FOUND` for an unknown or foreign
+    /// Environment, repository or Profile and `INTERNAL` for a store failure.
+    pub async fn set_default(
+        &self,
+        user_id: i64,
+        request: &SetEnvironmentDefaultRequest,
+    ) -> Result<SetEnvironmentDefaultReply, Status> {
+        let name = env_name_of(&request.environment)?;
+        let key = binding_key_of(request.key.as_ref())?;
+        let id = self.resolve(user_id, &name).await?;
+        self.store
+            .set_default(user_id, id, &key)
+            .await
+            .map_err(store_status)?;
+        Ok(SetEnvironmentDefaultReply {})
+    }
+
+    /// Reads the default Environment of a repository or Profile.
+    ///
+    /// # Errors
+    ///
+    /// Returns `INVALID_ARGUMENT` for a bad key, `NOT_FOUND` for an unknown or foreign
+    /// repository or Profile and `INTERNAL` for a store failure.
+    pub async fn get_default(
+        &self,
+        user_id: i64,
+        request: &GetEnvironmentDefaultRequest,
+    ) -> Result<GetEnvironmentDefaultReply, Status> {
+        let key = binding_key_of(request.key.as_ref())?;
+        let environment = self
+            .store
+            .get_default(user_id, &key)
+            .await
+            .map_err(store_status)?;
+        Ok(GetEnvironmentDefaultReply { environment })
+    }
+
+    /// Clears the default Environment of a repository or Profile.
+    ///
+    /// # Errors
+    ///
+    /// Returns `INVALID_ARGUMENT` for a bad key, `NOT_FOUND` for an unknown or foreign
+    /// repository or Profile and `INTERNAL` for a store failure.
+    pub async fn clear_default(
+        &self,
+        user_id: i64,
+        request: &ClearEnvironmentDefaultRequest,
+    ) -> Result<ClearEnvironmentDefaultReply, Status> {
+        let key = binding_key_of(request.key.as_ref())?;
+        self.store
+            .clear_default(user_id, &key)
+            .await
+            .map_err(store_status)?;
+        Ok(ClearEnvironmentDefaultReply {})
     }
 
     /// Releases the Environment pinned by a running job to the box that holds its lease.

@@ -337,6 +337,13 @@ pub const ENV_NONE: &str = "-";
 /// another User's name give this one text.
 pub const ERR_ENV_NOT_FOUND: &str = "environment not found";
 
+/// `NOT_FOUND` message of the default-binding RPCs for a repository the caller has not registered
+/// or a Profile the caller cannot see. An unknown key and another User's key give this one text.
+pub const ERR_ENV_KEY_NOT_FOUND: &str = "environment binding key not found";
+
+/// `INVALID_ARGUMENT` message: a default-binding request names no key, or a malformed one.
+pub const ERR_ENV_KEY_INVALID: &str = "environment binding key is invalid";
+
 /// `NOT_FOUND` message of `DeleteEnvironmentSecret` for an Environment the caller owns that holds
 /// no secret of that name.
 pub const ERR_ENV_SECRET_NOT_FOUND: &str = "environment secret not found";

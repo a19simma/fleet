@@ -12,6 +12,10 @@ use std::sync::{Arc, Mutex};
 use fleet_core::credential::{Secret, fingerprint};
 use fleet_proto::v1::fleet_environments_client::FleetEnvironmentsClient;
 use fleet_proto::v1::{
+    ClearEnvironmentDefaultRequest, EnvironmentBindingKey, GetEnvironmentDefaultRequest,
+    SetEnvironmentDefaultRequest,
+};
+use fleet_proto::v1::{
     CreateEnvironmentRequest, DeleteEnvironmentRequest, DeleteEnvironmentSecretRequest,
     EnvironmentDelivery, EnvironmentEntrySpec, EnvironmentOnFail, EnvironmentScriptSpec,
     EnvironmentSecretSpec, GetEnvironmentRequest, GetEnvironmentVersionRequest,
@@ -163,9 +167,12 @@ enum Rpc {
     Save,
     GetVersion,
     ListVersions,
+    SetDefault,
+    GetDefault,
+    ClearDefault,
 }
 
-const ALL: [Rpc; 9] = [
+const ALL: [Rpc; 12] = [
     Rpc::Create,
     Rpc::List,
     Rpc::Get,
@@ -175,6 +182,9 @@ const ALL: [Rpc; 9] = [
     Rpc::Save,
     Rpc::GetVersion,
     Rpc::ListVersions,
+    Rpc::SetDefault,
+    Rpc::GetDefault,
+    Rpc::ClearDefault,
 ];
 
 async fn call(rig: &Rig, rpc: Rpc, token: Option<&str>, name: &str) -> Result<(), Status> {
@@ -246,6 +256,42 @@ async fn call(rig: &Rig, rpc: Rpc, token: Option<&str>, name: &str) -> Result<()
             ))
             .await
             .map(drop),
+        Rpc::SetDefault => c
+            .set_environment_default(authed(
+                SetEnvironmentDefaultRequest {
+                    key: Some(binding_key()),
+                    environment: n,
+                },
+                token,
+            ))
+            .await
+            .map(drop),
+        Rpc::GetDefault => c
+            .get_environment_default(authed(
+                GetEnvironmentDefaultRequest {
+                    key: Some(binding_key()),
+                },
+                token,
+            ))
+            .await
+            .map(drop),
+        Rpc::ClearDefault => c
+            .clear_environment_default(authed(
+                ClearEnvironmentDefaultRequest {
+                    key: Some(binding_key()),
+                },
+                token,
+            ))
+            .await
+            .map(drop),
+    }
+}
+
+fn binding_key() -> EnvironmentBindingKey {
+    EnvironmentBindingKey {
+        key: Some(fleet_proto::v1::environment_binding_key::Key::Profile(
+            "bound".to_owned(),
+        )),
     }
 }
 
@@ -330,6 +376,11 @@ async fn every_method_meets_the_caller_class_it_is_owed(pool: PgPool) {
     rig.users.revoke_api_token(alice, revoked.id).await.unwrap();
     seed(&rig, alice, "own").await;
     seed(&rig, alice, "doomed").await;
+    sqlx::query("INSERT INTO profile (owner_user_id, name) VALUES ($1, 'bound')")
+        .bind(alice)
+        .execute(&rig.pool)
+        .await
+        .unwrap();
     let before = counts(&rig.pool).await;
     let denied: [(&str, Option<&str>, Code, Option<&str>); 5] = [
         (
@@ -383,7 +434,10 @@ async fn a_foreign_name_answers_exactly_as_an_unknown_name(pool: PgPool) {
     let bob_token = token_of(&rig, bob).await;
     let before = counts(&rig.pool).await;
     for rpc in ALL {
-        if matches!(rpc, Rpc::Create | Rpc::List) {
+        if matches!(
+            rpc,
+            Rpc::Create | Rpc::List | Rpc::GetDefault | Rpc::ClearDefault
+        ) {
             continue;
         }
         let foreign = call(&rig, rpc, Some(&bob_token), "alice-env")
