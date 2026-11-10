@@ -178,7 +178,7 @@ Directories under `/var/lib/fleet`, from `tmpfiles.d/fleet.conf`:
 | `/var/lib/fleet/seed` with `cargo` and `npm` | `fleetd:fleet-work` 0750 | read-only warm-cache seed, filled by an operator as `fleetd`, see Warm caches |
 | `/var/lib/fleet/bin` | `fleetd:fleet-work` 0755 | self-update: `current` and `previous` symlinks, version directories and the guard state files, see Self-update layout |
 
-The agent unit mounts an empty read-only tmpfs over `/run/fleet` (`TemporaryFileSystem=/run/fleet:ro`) and bind-mounts back only `/run/fleet/%i` (`BindPaths=`, its own run dir with the per-job socket) and `/run/fleet/hook` (`BindReadOnlyPaths=`). By design, other jobs' run dirs and sockets are absent from the agent's mount namespace (ADR-0036). The mount shape is unprobed on a box, see Unverified below. This is the first isolation layer; the cgroup check in `jobsock.rs` is the second.
+The agent unit mounts an empty read-only tmpfs over `/run/fleet` (`TemporaryFileSystem=/run/fleet:ro`) and bind-mounts back only `/run/fleet/%i` (`BindPaths=`, its own run dir with the per-job socket) and `/run/fleet/hook` (`BindReadOnlyPaths=`). By design, other jobs' run dirs and sockets are absent from the agent's mount namespace (ADR-0036). The mount shape is unprobed on a box, see Unverified below. This is the first isolation layer; the cgroup check in `jobsock.rs` is the second. The unit also mounts an empty read-only tmpfs over `/run/fleet-env` (`TemporaryFileSystem=/run/fleet-env:ro`, `deploy/fleet-agent@.service:43`) and binds nothing back, so the Setup unit input root is absent from the agent's mount namespace (ADR-0067). That line is unprobed too.
 
 Unverified:
 
@@ -443,7 +443,7 @@ Limits of the probes, from reading the script:
 
 - `proxy-path` proves `lo` and the unix socket path. It does not run the forwarder of `env-setup-exec`, so the TCP to unix relay stays untested.
 - `env-out-writable-visible` copies the marker to `/run/fleet/<id>/envd/out` itself, because the launcher does not carry `out/` to the agent yet. It proves the agent unit sees that path, not the carry.
-- Inferred, not part of the design: `env-dir-unreadable-from-agent` can report `FAIL`. `fleet-agent@.service` now sets `TemporaryFileSystem=/run/fleet-env:ro` (the agent reads its env from `/run/fleet/<id>/envd`, never `/run/fleet-env`), so a `FAIL` there is a regression in the unit, not a script fault.
+- `env-dir-unreadable-from-agent` checks the `TemporaryFileSystem=/run/fleet-env:ro` line of `fleet-agent@.service` (the agent reads its env from `/run/fleet/<id>/envd`, never `/run/fleet-env`). Unrun, so a `FAIL` on a live Box is a unit regression to read first, not a script fault.
 
 ### Credential isolation probe
 
