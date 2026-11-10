@@ -467,6 +467,9 @@ message SubmitJobRequest {
   bool open_pr = 5;
   string agent = 6;
   string profile = 7;
+  // Environment name (ADR-0067). Empty means the default behaviour, "-" means none, any other
+  // value must pass the Environment name rule.
+  string environment = 8;
 }
 
 message SubmitJudgeRequest {

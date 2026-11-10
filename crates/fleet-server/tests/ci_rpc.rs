@@ -108,6 +108,7 @@ fn submit(key: &str, open_pr: bool) -> SubmitJobRequest {
         open_pr,
         agent: String::new(),
         profile: String::new(),
+        environment: String::new(),
     }
 }
 

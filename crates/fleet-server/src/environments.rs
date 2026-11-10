@@ -84,6 +84,14 @@ SELECT count(*), coalesce(sum(octet_length(body)), 0)::bigint FROM environment_e
 WHERE environment_id = $1 AND kind = 'script' \
 AND version = (SELECT max(version) FROM environment_version WHERE environment_id = $1)";
 
+const SCRIPTS_IN_VERSION: &str = "\
+SELECT EXISTS (SELECT 1 FROM environment_entry \
+WHERE environment_id = $1 AND version = $2 AND kind = 'script')";
+
+const LATEST_PIN: &str = "\
+SELECT e.id, (SELECT max(version) FROM environment_version v WHERE v.environment_id = e.id) \
+FROM environment e WHERE e.user_id = $1 AND lower(e.name) = lower($2)";
+
 const LATEST_VERSION: &str = "\
 SELECT version, hash FROM environment_version WHERE environment_id = $1 \
 ORDER BY version DESC LIMIT 1";
@@ -141,6 +149,145 @@ type ReleaseParts = (
     Vec<EnvironmentScriptSpec>,
     Vec<ReleasedSecret>,
 );
+
+/// What a submit asks of the Environment layer (ADR-0067 decision 10).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum EnvRequest {
+    /// The field was empty. No default binding exists yet, so no Environment is pinned.
+    Default,
+    /// The field was `-`: the submitter wants no Environment.
+    Bare,
+    /// The submitter named an Environment.
+    Named(EnvironmentName),
+}
+
+/// The pin a Job stores: both columns or neither.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct EnvPin {
+    /// The Environment row.
+    pub environment_id: i64,
+    /// The latest version at submit.
+    pub version: i32,
+}
+
+/// Why a submit could not take a pin. No variant tells a foreign name from an unknown one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PinRefusal {
+    /// The name is unknown, belongs to another user, or the Environment vanished mid-submit.
+    UnknownName,
+    /// The Environment has no version to pin.
+    NoVersion,
+    /// The latest version holds a script and the submitter does not hold `env:scripts`.
+    ScriptsNotGranted,
+}
+
+/// The outcome of [`resolve_pin`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PinResult {
+    /// The Job gets no Environment.
+    None,
+    /// The Job pins this Environment version.
+    Pinned(EnvPin),
+    /// The submit is refused and writes nothing.
+    Refused(PinRefusal),
+}
+
+/// Resolves the pin of a submit inside the submit transaction.
+///
+/// The Environment row is taken `FOR SHARE` first, the latest version is read after the lock,
+/// and `env:scripts` is read `FOR SHARE` after the Environment lock when that version holds a
+/// script, so a revoke in flight either lands first and refuses the submit or waits for it.
+/// A secrets-only version needs no capability. [`EnvRequest::Default`] and
+/// [`EnvRequest::Bare`] pin nothing and touch no row.
+///
+/// # Errors
+///
+/// Returns the [`sqlx::Error`] of a failed query.
+pub async fn resolve_pin(
+    tx: &mut PgConnection,
+    user_id: i64,
+    request: &EnvRequest,
+) -> Result<PinResult, sqlx::Error> {
+    let EnvRequest::Named(name) = request else {
+        return Ok(PinResult::None);
+    };
+    let Some(environment_id) = sqlx::query_scalar::<_, i64>(RESOLVE_ENVIRONMENT)
+        .bind(user_id)
+        .bind(name.as_str())
+        .fetch_optional(&mut *tx)
+        .await?
+    else {
+        return Ok(PinResult::Refused(PinRefusal::UnknownName));
+    };
+    if sqlx::query_scalar::<_, i64>(SHARE_ENVIRONMENT)
+        .bind(environment_id)
+        .bind(user_id)
+        .fetch_optional(&mut *tx)
+        .await?
+        .is_none()
+    {
+        return Ok(PinResult::Refused(PinRefusal::UnknownName));
+    }
+    let Some((version, _)) = sqlx::query_as::<_, (i32, Vec<u8>)>(LATEST_VERSION)
+        .bind(environment_id)
+        .fetch_optional(&mut *tx)
+        .await?
+    else {
+        return Ok(PinResult::Refused(PinRefusal::NoVersion));
+    };
+    let scripts: bool = sqlx::query_scalar(SCRIPTS_IN_VERSION)
+        .bind(environment_id)
+        .bind(version)
+        .fetch_one(&mut *tx)
+        .await?;
+    if scripts
+        && sqlx::query_scalar::<_, i64>(SHARE_CAPABILITY)
+            .bind(user_id)
+            .bind(crate::cred::capability::ENV_SCRIPTS)
+            .fetch_optional(&mut *tx)
+            .await?
+            .is_none()
+    {
+        return Ok(PinResult::Refused(PinRefusal::ScriptsNotGranted));
+    }
+    Ok(PinResult::Pinned(EnvPin {
+        environment_id,
+        version,
+    }))
+}
+
+/// Whether the pin stored on a Job equals what `request` asks for now.
+///
+/// [`EnvRequest::Default`] and [`EnvRequest::Bare`] equal a Job with no pin. A named request
+/// equals a Job pinned to the same Environment at the version that is latest now, so an
+/// Environment edited between two submits under one key is a conflict (ADR-0067 decision 11
+/// compares the name and the resolved version). An Environment that no longer exists equals
+/// no pin.
+///
+/// # Errors
+///
+/// Returns the [`sqlx::Error`] of a failed query.
+pub async fn pin_matches(
+    conn: &mut PgConnection,
+    user_id: i64,
+    request: &EnvRequest,
+    stored: Option<EnvPin>,
+) -> Result<bool, sqlx::Error> {
+    let EnvRequest::Named(name) = request else {
+        return Ok(stored.is_none());
+    };
+    let current: Option<(i64, Option<i32>)> = sqlx::query_as(LATEST_PIN)
+        .bind(user_id)
+        .bind(name.as_str())
+        .fetch_optional(&mut *conn)
+        .await?;
+    Ok(match (current, stored) {
+        (Some((id, Some(version))), Some(pin)) => {
+            pin.environment_id == id && pin.version == version
+        }
+        _ => false,
+    })
+}
 
 /// Why an Environment store call failed. Messages are fixed text.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

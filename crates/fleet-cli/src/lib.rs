@@ -5,6 +5,7 @@ pub mod catalog;
 pub mod config;
 pub mod credential;
 pub mod edit;
+pub mod env;
 pub mod list;
 pub mod logs;
 pub mod patch;
@@ -23,10 +24,12 @@ use std::io::{Read, Write};
 use std::time::Duration;
 
 use clap::{Parser, Subcommand};
+use fleet_core::environment::EnvironmentName;
 use fleet_core::text::{Cap, sanitise_lines, sanitise_text};
 use fleet_proto::v1::fleet_batches_client::FleetBatchesClient;
 use fleet_proto::v1::fleet_credentials_client::FleetCredentialsClient;
 use fleet_proto::v1::fleet_edit_client::FleetEditClient;
+use fleet_proto::v1::fleet_environments_client::FleetEnvironmentsClient;
 use fleet_proto::v1::fleet_jobs_client::FleetJobsClient;
 use fleet_proto::v1::fleet_profiles_client::FleetProfilesClient;
 use fleet_proto::v1::fleet_query_client::FleetQueryClient;
@@ -107,6 +110,12 @@ pub enum Command {
             help = "Agent that runs the job [default: claude]"
         )]
         agent: Option<String>,
+        /// Environment to attach to the job, by name.
+        #[arg(long, value_name = "NAME", conflicts_with = "no_env")]
+        env: Option<String>,
+        /// Attach no environment, even when a default binding exists.
+        #[arg(long)]
+        no_env: bool,
         /// Task prompt, or `-` to read it from stdin.
         prompt: String,
     },
@@ -213,6 +222,12 @@ pub enum Command {
         /// The repository action.
         #[command(subcommand)]
         action: repo::RepoAction,
+    },
+    /// Create, list, show and remove Environments, store secrets and edit setup scripts.
+    Env {
+        /// The environment action.
+        #[command(subcommand)]
+        action: env::EnvAction,
     },
     /// Manage Work projects, items, claims and Defers on the server.
     Work(work::WorkArgs),
@@ -595,6 +610,7 @@ struct Session {
     work: work::WorkClient,
     retro: retro::RetroClient,
     edit: edit::EditClient,
+    environments: env::EnvironmentsClient,
     scrub: Scrub,
 }
 
@@ -644,6 +660,22 @@ fn bearer(config: &Config) -> Result<Bearer, CliError> {
         .map_err(|_| CliError::Usage("token has invalid characters".into()))?;
     value.set_sensitive(true);
     Ok(Bearer(value))
+}
+
+/// The wire value of the submit environment choice: `-` for `--no-env`, the checked name for
+/// `--env`, and empty when neither flag is given.
+fn environment_field(name: Option<&str>, no_env: bool) -> Result<String, CliError> {
+    if no_env {
+        return Ok(fleet_proto::ENV_NONE.to_owned());
+    }
+    name.map_or_else(
+        || Ok(String::new()),
+        |raw| {
+            EnvironmentName::new(raw)
+                .map(|checked| checked.as_str().to_owned())
+                .map_err(|err| CliError::Usage(err.to_string()))
+        },
+    )
 }
 
 fn parse_state(name: &str) -> Result<JobState, CliError> {
@@ -759,7 +791,9 @@ async fn session(env: &Resolution, timeouts: bool) -> Result<Session, CliError> 
             .max_decoding_message_size(MAX_DECODE_BYTES),
         retro: FleetRetroClient::with_interceptor(channel.clone(), token.clone())
             .max_decoding_message_size(MAX_DECODE_BYTES),
-        edit: FleetEditClient::with_interceptor(channel, token)
+        edit: FleetEditClient::with_interceptor(channel.clone(), token.clone())
+            .max_decoding_message_size(MAX_DECODE_BYTES),
+        environments: FleetEnvironmentsClient::with_interceptor(channel, token)
             .max_decoding_message_size(MAX_DECODE_BYTES),
     })
 }
@@ -885,6 +919,19 @@ async fn run_credential(
             credential::verify(&mut session.credentials, &session.scrub, id, out).await
         }
     }
+}
+
+async fn run_env(
+    action: env::EnvAction,
+    env: &Resolution,
+    timeouts: bool,
+    tty: bool,
+    stdin: &mut impl Read,
+    out: &mut impl Write,
+) -> Result<(), CliError> {
+    let call = action.prepare(stdin, tty)?;
+    let mut session = session(env, timeouts).await?;
+    env::execute(call, &mut session.environments, &session.scrub, out).await
 }
 
 async fn run_repo(
@@ -1095,13 +1142,33 @@ pub async fn run_with_color(
     stdin: &mut impl Read,
     out: &mut impl Write,
 ) -> Result<(), CliError> {
+    run_with_tty(cli, lookup, timeouts, color, false, stdin, out).await
+}
+
+/// Like [`run_with_color`], with `tty` saying whether `stdin` is a terminal.
+///
+/// Test seam and the binary's entry point. A terminal on stdin needs an explicit `-` for
+/// `env secret put`. Not part of the stable interface.
+///
+/// # Errors
+/// Returns [`CliError`] on the same conditions as [`run`].
+#[doc(hidden)]
+pub async fn run_with_tty(
+    cli: Cli,
+    lookup: impl Fn(&str) -> Option<String>,
+    timeouts: bool,
+    color: bool,
+    tty: bool,
+    stdin: &mut impl Read,
+    out: &mut impl Write,
+) -> Result<(), CliError> {
     let Cli {
         server,
         insecure,
         command,
     } = cli;
     let env = resolve(server, insecure, lookup);
-    Box::pin(dispatch(command, &env, timeouts, color, stdin, out))
+    Box::pin(dispatch(command, &env, timeouts, color, tty, stdin, out))
         .await
         .map_err(|e| e.scrubbed(env.as_ref().ok().map(|resolved| &resolved.scrub)))
 }
@@ -1127,6 +1194,7 @@ async fn dispatch(
     env: &Resolution,
     timeouts: bool,
     color: bool,
+    tty: bool,
     stdin: &mut impl Read,
     out: &mut impl Write,
 ) -> Result<(), CliError> {
@@ -1145,8 +1213,11 @@ async fn dispatch(
             no_pr,
             idempotency_key,
             agent,
+            env: environment,
+            no_env,
             prompt,
         } => {
+            let environment = environment_field(environment.as_deref(), no_env)?;
             let prompt = read_prompt(prompt, stdin)?;
             let session = session(env, timeouts).await?;
             let scrub = session.scrub;
@@ -1160,6 +1231,7 @@ async fn dispatch(
                     open_pr: !no_pr,
                     agent: agent.unwrap_or_default(),
                     profile: String::new(),
+                    environment,
                 })
                 .await?
                 .into_inner();
@@ -1220,6 +1292,7 @@ async fn dispatch(
             run_profile(action, env, timeouts, stdin, out).await?;
         }
         Command::Credential { action } => run_credential(action, env, timeouts, stdin, out).await?,
+        Command::Env { action } => run_env(action, env, timeouts, tty, stdin, out).await?,
         Command::Repo { action } => run_repo(action, env, timeouts, out).await?,
         Command::Work(args) => run_work(args, env, timeouts, stdin, out).await?,
         family @ (Command::Retro(_)

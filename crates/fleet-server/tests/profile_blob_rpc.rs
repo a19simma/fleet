@@ -176,6 +176,7 @@ async fn a_job_without_a_profile_carries_none_and_has_no_blob(pool: PgPool) {
             open_pr: false,
             agent: String::new(),
             profile: String::new(),
+            environment: String::new(),
         })
         .await
         .unwrap();
@@ -458,6 +459,7 @@ async fn submitted_job(pool: &PgPool, store: &Store) -> (String, fleet_proto::v1
                 open_pr: false,
                 agent: String::new(),
                 profile: "alpha".to_owned(),
+                environment: String::new(),
             },
         )
         .await

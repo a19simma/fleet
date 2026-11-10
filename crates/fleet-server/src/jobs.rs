@@ -6,6 +6,7 @@ use fleet_core::catalog::{
     CatalogItem, CatalogKind, EffectiveSet, NoteReason, ResolveNote, RunnerKind, validate_id,
 };
 use fleet_core::constant_time_eq;
+use fleet_core::environment::EnvironmentName;
 use fleet_proto::v1::{
     CatalogItem as WireItem, CatalogKind as WireKind, CiState, JobCi, JobState, JobVerdict,
     ReportJobRequest, SubmitJobRequest, SubmitJudgeRequest,
@@ -16,6 +17,8 @@ use fleet_proto::{
 };
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
+
+use crate::environments::EnvRequest;
 
 /// Longest accepted idempotency key, in bytes.
 pub const MAX_KEY_BYTES: usize = 128;
@@ -90,6 +93,8 @@ pub enum JobInvalid {
     Verdict,
     /// The profile name breaks the profile name rule.
     Profile,
+    /// The environment field is neither empty, `-` nor a valid Environment name.
+    Environment,
     /// The profile's effective catalog set cannot be frozen: the selection names an item the
     /// catalog lacks, or the set passes the blob catalog caps.
     Snapshot,
@@ -115,6 +120,7 @@ impl fmt::Display for JobInvalid {
             Self::Target => "invalid target job",
             Self::Verdict => "invalid verdict",
             Self::Profile => "invalid profile",
+            Self::Environment => "invalid environment",
             Self::Snapshot => "profile catalog set cannot be frozen",
         })
     }
@@ -133,6 +139,7 @@ pub struct NewJob {
     pub(crate) agent: &'static str,
     pub(crate) target_job_id: Option<String>,
     pub(crate) profile: Option<String>,
+    pub(crate) environment: EnvRequest,
 }
 
 /// A validated final report: the state a box ends its job in and the result fields.
@@ -231,7 +238,8 @@ pub(crate) fn validate_job_id(job_id: &str) -> Result<(), JobInvalid> {
 /// Validates a submit request. This is the only check on these fields.
 ///
 /// The agent goes through [`validate_agent`]: empty means [`DEFAULT_AGENT`]. An empty profile
-/// means no profile, any other one must pass the profile name rule.
+/// means no profile, any other one must pass the profile name rule. The environment is empty
+/// (default), `-` (none) or a name that passes [`EnvironmentName`].
 ///
 /// # Errors
 ///
@@ -260,6 +268,11 @@ pub fn validate_submit(request: &SubmitJobRequest) -> Result<NewJob, JobInvalid>
         crate::profiles::validate_name(&request.profile).map_err(|_| JobInvalid::Profile)?;
         Some(request.profile.clone())
     };
+    let environment = match request.environment.as_str() {
+        "" => EnvRequest::Default,
+        fleet_proto::ENV_NONE => EnvRequest::Bare,
+        raw => EnvRequest::Named(EnvironmentName::new(raw).map_err(|_| JobInvalid::Environment)?),
+    };
     Ok(NewJob {
         key: request.idempotency_key.clone(),
         prompt: request.prompt.clone(),
@@ -269,6 +282,7 @@ pub fn validate_submit(request: &SubmitJobRequest) -> Result<NewJob, JobInvalid>
         agent,
         target_job_id: None,
         profile,
+        environment,
     })
 }
 
@@ -322,6 +336,7 @@ pub fn validate_judge(request: &SubmitJudgeRequest) -> Result<NewJob, JobInvalid
         agent: DEFAULT_AGENT,
         target_job_id: Some(request.target_job_id.clone()),
         profile: None,
+        environment: EnvRequest::Bare,
     })
 }
 

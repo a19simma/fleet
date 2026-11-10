@@ -215,6 +215,7 @@ impl Rig {
                     open_pr: false,
                     agent: String::new(),
                     profile: String::new(),
+                    environment: String::new(),
                 },
             )
             .await

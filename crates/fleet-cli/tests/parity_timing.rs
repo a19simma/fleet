@@ -333,6 +333,7 @@ async fn seed(pool: PgPool) -> Seeded {
                 open_pr: false,
                 agent: String::new(),
                 profile: String::new(),
+                environment: String::new(),
             },
         )
         .await
