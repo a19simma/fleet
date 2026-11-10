@@ -425,6 +425,26 @@ At startup fleetd parses that file and logs a warning with the count when it fin
 
 After the ownership change in step 5, `/etc/swarm/secrets.env` is mode 0600 `fleetd:fleetd`. The legacy layout (mode 0640 `root:agent`) let any job running as `agent` read it. Whether the job uid is refused on a live box is the first check of the probe below.
 
+### Setup unit probe
+
+Status: not run. No Box was available when the script was written, so `deploy/probe-env-setup.sh` is checked statically only (`bash -n`, `shellcheck`, and `crates/fleetd/tests/env_probe_script.rs`, which parses `fleet-env@.service` and the probe list). No live output exists. [ADR-0067](../docs/adr/0067-job-environments.md) stays unbuilt until the output of a run on a Box is recorded, since decision 6 claims each sandbox directive of the Setup unit and none is verified.
+
+Run it on a Box with both units installed, as root, one command:
+
+```sh
+sudo bash deploy/probe-env-setup.sh
+```
+
+The first output line is `output: <path>`, a file under `/var/tmp` that gets one line per probe, `PASS|FAIL <name> <detail>`. The exit status is 0 only when every probe passes, 1 on a `FAIL` or a missing control, 2 on a missing precondition (not Linux, not root, a unit or user absent). `bash deploy/probe-env-setup.sh --list` prints the probe names and the directives each covers and touches nothing.
+
+Each probe runs the properties of the installed `fleet-env@.service` (or `fleet-agent@.service` for the agent-side probes) in a transient unit and first runs a positive control: the same check with the one directive removed or overridden, or on the host, must show the thing the directive hides. A probe whose control does not show it reports `FAIL <name> control absent: ...`, never `PASS`. The only network targets are `1.1.1.1:443` and a unix socket the probe creates at `/run/fleet-env/<id>/job.sock`; `/etc/swarm` is stat-ed and access-checked, never read. Fixtures are created under the id `probe<pid>`, an existing name is refused and the cleanup trap removes them.
+
+Limits of the probes, from reading the script:
+
+- `proxy-path` proves `lo` and the unix socket path. It does not run the forwarder of `env-setup-exec`, so the TCP to unix relay stays untested.
+- `env-out-writable-visible` copies the marker to `/run/fleet/<id>/envd/out` itself, because the launcher does not carry `out/` to the agent yet. It proves the agent unit sees that path, not the carry.
+- Inferred, not part of the design: `env-dir-unreadable-from-agent` can report `FAIL`. The agent unit runs as `fleet-job`, the owner of `/run/fleet-env/<id>`, and does not hide `/run/fleet-env`. A `FAIL` there is a finding about the units, not a script fault.
+
 ### Credential isolation probe
 
 Status: not run. Set `BOX` to the test box host name and `SERVER` to the fleet server URL. Run the steps as the operator over `ssh agent@$BOX`. Every command prints a status or a count, never a value. `JOBUID` is `fleet-job` and `FPID` is the fleetd main pid.
