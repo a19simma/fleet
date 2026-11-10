@@ -1,0 +1,114 @@
+name: image
+
+on:
+  push:
+    tags: ['v[0-9]+.[0-9]+.[0-9]+*']
+  workflow_dispatch:
+
+env:
+  IMAGE: harbor.simonmalm.com/fleet/fleet-server
+
+jobs:
+  build-amd64:
+    runs-on: docker
+    env:
+      HARBOR_USERNAME: ${{ secrets.HARBOR_USERNAME }}
+      HARBOR_PASSWORD: ${{ secrets.HARBOR_PASSWORD }}
+      DOCKER_BUILDKIT: '1'
+      ARCH: amd64
+    steps:
+      - name: checkout
+        run: git clone --depth 1 --branch "${{ github.ref_name }}" "${{ github.server_url }}/${{ github.repository }}.git" src
+        env:
+          GIT_CONFIG_COUNT: '1'
+          GIT_CONFIG_KEY_0: http.extraheader
+          GIT_CONFIG_VALUE_0: 'Authorization: token ${{ github.token }}'
+      - name: tooling
+        run: |
+          apt-get update -qq
+          apt-get install -y -qq docker.io >/dev/null
+          docker info >/dev/null
+      - name: login
+        run: printf '%s' "$HARBOR_PASSWORD" | docker login harbor.simonmalm.com -u "$HARBOR_USERNAME" --password-stdin
+      - name: build and push
+        working-directory: src
+        run: |
+          if [ "${{ github.ref_type }}" = tag ]; then
+            version="${{ github.ref_name }}"
+            version="${version#v}"
+          else
+            sha="${{ github.sha }}"
+            version="ci-${sha%"${sha#???????}"}"
+          fi
+          docker build --platform "linux/$ARCH" -f Dockerfile.fleet-server \
+            --build-arg VERSION="$version" \
+            --build-arg REVISION="${{ github.sha }}" \
+            -t "$IMAGE:$version-$ARCH" .
+          docker push "$IMAGE:$version-$ARCH"
+
+  build-arm64:
+    runs-on: docker
+    env:
+      HARBOR_USERNAME: ${{ secrets.HARBOR_USERNAME }}
+      HARBOR_PASSWORD: ${{ secrets.HARBOR_PASSWORD }}
+      DOCKER_BUILDKIT: '1'
+      ARCH: arm64
+    steps:
+      - name: checkout
+        run: git clone --depth 1 --branch "${{ github.ref_name }}" "${{ github.server_url }}/${{ github.repository }}.git" src
+        env:
+          GIT_CONFIG_COUNT: '1'
+          GIT_CONFIG_KEY_0: http.extraheader
+          GIT_CONFIG_VALUE_0: 'Authorization: token ${{ github.token }}'
+      - name: tooling
+        run: |
+          apt-get update -qq
+          apt-get install -y -qq docker.io >/dev/null
+          docker info >/dev/null
+      - name: login
+        run: printf '%s' "$HARBOR_PASSWORD" | docker login harbor.simonmalm.com -u "$HARBOR_USERNAME" --password-stdin
+      - name: build and push
+        working-directory: src
+        run: |
+          if [ "${{ github.ref_type }}" = tag ]; then
+            version="${{ github.ref_name }}"
+            version="${version#v}"
+          else
+            sha="${{ github.sha }}"
+            version="ci-${sha%"${sha#???????}"}"
+          fi
+          docker build --platform "linux/$ARCH" -f Dockerfile.fleet-server \
+            --build-arg VERSION="$version" \
+            --build-arg REVISION="${{ github.sha }}" \
+            -t "$IMAGE:$version-$ARCH" .
+          docker push "$IMAGE:$version-$ARCH"
+
+  publish:
+    needs: [build-amd64, build-arm64]
+    runs-on: docker
+    env:
+      HARBOR_USERNAME: ${{ secrets.HARBOR_USERNAME }}
+      HARBOR_PASSWORD: ${{ secrets.HARBOR_PASSWORD }}
+    steps:
+      - name: tooling
+        run: |
+          apt-get update -qq
+          apt-get install -y -qq docker.io >/dev/null
+      - name: login
+        run: printf '%s' "$HARBOR_PASSWORD" | docker login harbor.simonmalm.com -u "$HARBOR_USERNAME" --password-stdin
+      - name: manifest
+        run: |
+          if [ "${{ github.ref_type }}" = tag ]; then
+            version="${{ github.ref_name }}"
+            version="${version#v}"
+            tags="$version $(echo "$version" | cut -d. -f1,2)"
+            case "$version" in *-*) ;; *) tags="$tags latest" ;; esac
+          else
+            sha="${{ github.sha }}"
+            version="ci-${sha%"${sha#???????}"}"
+            tags="$version"
+          fi
+          for t in $tags; do
+            docker manifest create "$IMAGE:$t" --amend "$IMAGE:$version-amd64" --amend "$IMAGE:$version-arm64"
+            docker manifest push --purge "$IMAGE:$t"
+          done
