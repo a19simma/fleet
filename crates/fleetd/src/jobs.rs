@@ -24,7 +24,9 @@ use crate::broker::{Broker, BrokerError, GhCli, MirrorGit};
 use crate::config::Config;
 use crate::connect_proxy::{ConnectProxy, ProxyLimits};
 use crate::cred::{CredentialBook, CredentialClient, ERR_NO_AGENT};
-use crate::envd::{ERR_ENV_DENIED, EnvironmentClient, ReleasedEnvironment};
+use crate::envd::{
+    ERR_ENV_DENIED, EnvDelivery, EnvironmentClient, Owner, ReleasedEnvironment, StatfsCheck,
+};
 use crate::fetch::{Dialer, Fetcher, Resolver, SystemResolver, TcpDialer, webpki_tls_config};
 use crate::fetch_service::{FeedBook, FetchRecorder, FetchService, MAX_CONCURRENT_FETCHES};
 use crate::jobenv::group_id;
@@ -38,7 +40,9 @@ use crate::runner::{
     AgentOutcome, AgentRunner, Interrupt, JobEnd, PueueBg, Reporter, ReporterSink, RunConfig,
     TimingWiring, ToolPreflight,
 };
-use crate::systemd::{HostsHook, select_launcher, select_tool_installer};
+use crate::systemd::{
+    DEFAULT_RUN_DIR, HostsHook, select_launcher_delivering, select_tool_installer,
+};
 use crate::telemetry::{FetchPhase, FetchRecordError};
 use crate::toolhook::HookHub;
 use crate::tools::{TOOL_CACHE_ROOT, ToolCache};
@@ -61,6 +65,7 @@ pub struct DaemonRunner<R> {
     broker: Option<BrokerWiring>,
     credentials: Option<Arc<CredentialBook>>,
     environment: Option<Arc<EnvironmentClient>>,
+    delivery: Option<Arc<EnvDelivery>>,
 }
 
 /// A [`Broker`] with its executor types erased, so one [`PerJob`] registry holds them all.
@@ -123,6 +128,7 @@ impl<R: Reporter + Send + Sync + 'static> DaemonRunner<R> {
             broker: None,
             credentials: None,
             environment: None,
+            delivery: None,
         }
     }
 
@@ -146,6 +152,16 @@ impl<R: Reporter + Send + Sync + 'static> DaemonRunner<R> {
     #[must_use]
     pub fn with_environment(mut self, client: Arc<EnvironmentClient>) -> Self {
         self.environment = Some(client);
+        self
+    }
+
+    /// Hands each fetched environment to `delivery`, which the systemd launcher writes into the
+    /// run dir before the unit starts. The caller also adds [`EnvDelivery::end_hook`] to the
+    /// runner's job end hooks, so the tree is shredded and the values dropped on every end path.
+    /// Without it the runner holds the values for the job and delivers none.
+    #[must_use]
+    pub fn with_delivery(mut self, delivery: Arc<EnvDelivery>) -> Self {
+        self.delivery = Some(delivery);
         self
     }
 
@@ -500,12 +516,19 @@ impl<R: Reporter + Send + Sync + 'static> JobRunner for DaemonRunner<R> {
             self.agent.clear_profile(&job);
             return Err(stop);
         }
-        let _environment = match self.fetch_environment(&job, shutdown.clone()).await {
+        let environment = match self.fetch_environment(&job, shutdown.clone()).await {
             Ok(held) => held,
             Err(stop) => {
                 self.agent.clear_profile(&job);
                 return Err(stop);
             }
+        };
+        let _environment = match (&self.delivery, environment) {
+            (Some(delivery), Some(held)) => {
+                delivery.hold(&job.job_id, held);
+                None
+            }
+            (_, held) => held,
         };
         let result = match self.prepare(&job, shutdown.clone()).await {
             Ok(path) => match self.register_broker(&job, &path).await {
@@ -540,6 +563,22 @@ fn job_gid(config: &Config) -> Result<Option<u32>, Error> {
         .ok_or(Error::InvalidValue {
             name: "job_group",
             value: spec.to_owned(),
+        })
+}
+
+fn env_delivery(config: &Config, job_gid: Option<u32>) -> Result<Option<Arc<EnvDelivery>>, Error> {
+    if config.agent_launcher != AgentLauncher::Systemd {
+        return Ok(None);
+    }
+    let owner = Owner {
+        uid: config.job_uid,
+        gid: job_gid,
+    };
+    EnvDelivery::new(Path::new(DEFAULT_RUN_DIR), owner, Arc::new(StatfsCheck))
+        .map(|delivery| Some(Arc::new(delivery)))
+        .map_err(|err| Error::InvalidValue {
+            name: "run_dir",
+            value: err.to_string(),
         })
 }
 
@@ -854,7 +893,9 @@ pub(crate) fn build(
         proxy.set_job_hosts(job_id, hosts);
     });
     let preflight = tool_preflight(config, run.job_gid, wired.services.clone(), Some(hosts))?;
-    let launcher = select_launcher(config, run.job_gid, wired.services);
+    let delivery = env_delivery(config, run.job_gid)?;
+    let launcher =
+        select_launcher_delivering(config, run.job_gid, wired.services, delivery.clone());
     let wiring = BrokerWiring {
         registry: wired.broker,
         launcher: config.agent_launcher,
@@ -867,6 +908,10 @@ pub(crate) fn build(
         token: String::new(),
         redactor: redactor.clone(),
     };
+    let mut end = wired.end.on_end(book.end_hook());
+    if let Some(delivery) = &delivery {
+        end = end.on_end(delivery.end_hook());
+    }
     let mut agent = AgentRunner::new(run, reporter, redactor)
         .with_hook_hub(hub)
         .with_launcher(launcher);
@@ -875,19 +920,20 @@ pub(crate) fn build(
     }
     let transport = GrpcTimingTransport::new(channel.clone(), &token)?;
     agent = wire_agent(agent, config, transport, env, &PUEUE_SEARCH_DIRS);
-    let runner = DaemonRunner::new(
+    let mut runner = DaemonRunner::new(
         workspace,
-        agent
-            .with_feed_book(feeds)
-            .with_job_end(wired.end.on_end(book.end_hook()).on_end({
-                let tracker = update.tracker.clone();
-                move |job_id| tracker.end(job_id)
-            })),
+        agent.with_feed_book(feeds).with_job_end(end.on_end({
+            let tracker = update.tracker.clone();
+            move |job_id| tracker.end(job_id)
+        })),
         box_name,
     )
     .with_credentials(book)
     .with_environment(environment)
     .with_broker(wiring);
+    if let Some(delivery) = delivery {
+        runner = runner.with_delivery(delivery);
+    }
     Poller::with_channel(
         channel,
         &token,

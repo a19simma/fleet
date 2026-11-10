@@ -517,6 +517,9 @@ async fn run_with_hub(
             return Err(err);
         }
     };
+    if config.agent_launcher == crate::AgentLauncher::Systemd {
+        crate::envd::sweep_trees(run_root, &|_| false);
+    }
     systemd::sweep_stale_runs(&config, run_root).await;
     managed_settings::audit(managed_settings);
     let heartbeat_identity = identity.clone();
@@ -1036,6 +1039,60 @@ mod tests {
         assert!(result.is_ok(), "{result:?}");
         let out = String::from_utf8(sink.0.lock().unwrap().clone())?;
         assert!(out.contains("WARN") && out.contains("http hooks"), "{out}");
+        Ok(())
+    }
+
+    async fn start_over(
+        dir: &TempDir,
+        launcher: crate::config::AgentLauncher,
+    ) -> Result<PathBuf, Box<dyn std::error::Error>> {
+        let run_root = dir.path().join("run");
+        let alias = dir.path().join("alias");
+        let tree = run_root.join("job1").join(crate::envd::DELIVERY_DIR);
+        std::fs::create_dir_all(&tree)?;
+        std::fs::write(tree.join("TOKEN"), TREE_MARKER)?;
+        std::fs::hard_link(tree.join("TOKEN"), &alias)?;
+        let mut config = test_config(dir, 0)?;
+        config.agent_launcher = launcher;
+        config.systemctl_path = fake_systemctl().join("systemctl");
+        let store = open_store(dir).await?;
+        let result = run_with_hub(
+            config,
+            store,
+            test_identity(),
+            Redactor::default(),
+            None,
+            None,
+            HookHub::new(),
+            UpdateWiring::default(),
+            &run_root,
+            Path::new(managed_settings::DEFAULT_PATH),
+            tokio::time::sleep(Duration::from_millis(200)),
+        )
+        .await;
+        assert!(result.is_ok(), "{result:?}");
+        Ok(alias)
+    }
+
+    const TREE_MARKER: &str = "zq-tree-marker-7731-unlikely";
+
+    #[tokio::test]
+    async fn startup_shreds_the_delivery_trees_of_dead_jobs_under_the_systemd_launcher()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let dir = TempDir::new()?;
+        let alias = start_over(&dir, crate::config::AgentLauncher::Systemd).await?;
+        let left = std::fs::read(alias)?;
+        assert_eq!(left.len(), TREE_MARKER.len());
+        assert!(left.iter().all(|byte| *byte == 0));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn startup_leaves_a_delivery_tree_alone_under_the_direct_launcher()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let dir = TempDir::new()?;
+        let alias = start_over(&dir, crate::config::AgentLauncher::Direct).await?;
+        assert_eq!(std::fs::read_to_string(alias)?, TREE_MARKER);
         Ok(())
     }
 
