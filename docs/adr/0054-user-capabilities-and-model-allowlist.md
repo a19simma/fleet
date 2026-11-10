@@ -1,6 +1,6 @@
 # User capabilities and model allowlist
 
-Status: Proposed 2026-11-02. Built: the admin page `/users/{id}/capabilities`, the `profile:tools` capability (save, Job submit, batch submit, blob serve), the startup refusal of `FLEET_ALLOW_PROFILE_TOOLS`, the server `FLEET_MODEL_ALLOWLIST` check at profile save, Job submit, batch submit and blob serve, and the fleetd `model_allowlist`. Amends ADR-0048 (the server gate for `tools`). Builds on ADR-0035, ADR-0042 and ADR-0044. Amended by ADR-0056, ADR-0058 and ADR-0067.
+Status: Proposed 2026-11-02. Built: the admin page `/users/{id}/capabilities`, the `profile:tools` capability (save, Job submit, batch submit, blob serve), the startup refusal of `FLEET_ALLOW_PROFILE_TOOLS`, the server `FLEET_MODEL_ALLOWLIST` check at profile save, Job submit, batch submit and blob serve, and the fleetd `model_allowlist`. Amends ADR-0048 (the server gate for `tools`). Builds on ADR-0035, ADR-0042 and ADR-0044. Amended by ADR-0056, ADR-0058 and ADR-0067. Amended by 0068.
 
 ADR-0048 gates Profile `tools` with one server switch, `FLEET_ALLOW_PROFILE_TOOLS`, because the server then had only box and client scopes. The server now has Users and an admin, a user with `users.is_admin` (ADR-0042, ADR-0056), so a grant can attach to a principal. A global switch lets every client install toolchains once an operator flips it. This ADR replaces it with a per-user capability and adds a model allowlist so a Job cannot select a model the operator never approved.
 
@@ -59,3 +59,9 @@ ADR-0058 (proposed, partly built) adds the capability `forge:github_app`. Built:
 ADR-0067 adds the capability `env:scripts`: save, pin or run an Environment version that holds a script. The server checks it live under `FOR SHARE` at save, submit and release, and a CHECK migration widens the `user_capabilities` list.
 
 See ADR-0067.
+
+## Amendment (ADR-0068)
+
+No capability gates adding a git host. `allow_private` approval is an admin action (ADR-0056 `users.is_admin`), not a capability. A non-admin sees `NOT_FOUND` on approve.
+
+See ADR-0068.

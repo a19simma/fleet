@@ -1,6 +1,6 @@
 # Forge trait
 
-Status: Proposed 2026-10-29. Built in fleetd: the `Forge` trait, the GitHub implementation and the `Unsupported` Gitea slot, with CI read through `Forge::ci_result`. Builds on ADR-0043 and ADR-0033. Amends ADR-0037 and ADR-0024. Amended by ADR-0058 and ADR-0059.
+Status: Proposed 2026-10-29. Built in fleetd: the `Forge` trait, the GitHub implementation and the `Unsupported` Gitea slot, with CI read through `Forge::ci_result`. Builds on ADR-0043 and ADR-0033. Amends ADR-0037 and ADR-0024. Amended by ADR-0058 and ADR-0059. Amended by 0068.
 
 Fleet pushes a branch, opens a pull request and reads CI state on GitHub through the broker (ADR-0037). This ADR puts those operations behind one interface so another forge can fit later.
 
@@ -28,8 +28,8 @@ Gitea and Forgejo have no GitHub App equivalent (https://forgejo.org/docs/latest
 ## Consequences
 
 - The broker calls the trait and not `gh` directly.
-- A Job whose repo host maps to `Unsupported` fails with a fixed error.
-- Gitea behaviour is unknown until someone builds and tests it.
+- Superseded by ADR-0068: A Job whose repo host maps to `Unsupported` fails with a fixed error.
+- Superseded by ADR-0068: Gitea behaviour is unknown until someone builds and tests it.
 
 ## Considered and rejected
 
@@ -39,3 +39,9 @@ Gitea and Forgejo have no GitHub App equivalent (https://forgejo.org/docs/latest
 ## Amendment (ADR-0058)
 
 ADR-0058 (proposed; the server side is partly built and fleetd consumes the token and identity) lets the GitHub implementation use a one-hour installation token and the bot identity instead of the owner's `github_pat`. The `Forge` operations do not change. The Gitea note above stands.
+
+## Amendment (ADR-0068)
+
+The trait moves from fleetd to the `fleet-forge` crate and becomes `ForgeApi` (identify, verify, create_pr, ci_result) plus `ForgeGit` (fetch, push). The Gitea slot is built as `GiteaForge` and is no longer `Unsupported`. `create_pr` and `ci_result` for GitHub use REST, not `gh`. Pull requests on Forgejo are posted as the authenticated user. A contract suite enforces parity. GitHub App leasing and the release feed are documented exceptions.
+
+See ADR-0068.

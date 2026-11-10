@@ -1,6 +1,6 @@
 # Fetch tool and Box egress policy
 
-Status: Proposed 2026-10-28. The fetch core (`fetch.rs`), the fetch event recorder and the fetch service on the job socket (`fetch_service.rs`) are built and wired: `jobs::job_services` registers `Fetch` and `EgressProxy` under the systemd launcher, so `fleetd fetch` works there and fails under the direct launcher, which creates no job socket (ADR-0036), and the runner registers each job's feed with the recorder while its agent runs. The job end hook forgets the fetch service's per-job counters, and migration `0016` is built. The `fleetd fetch` command, the default `fetch` skill and the Floor allow-set (`FLOOR_ALLOW`, `Bash(fleetd fetch *)`, merged into the generated `settings.json` allow list) are built. Amends ADR-0029, ADR-0031 and ADR-0034. Refers to ADR-0036 for the per-job unix socket and ADR-0037 for the credential broker. Amended by ADR-0067.
+Status: Proposed 2026-10-28. The fetch core (`fetch.rs`), the fetch event recorder and the fetch service on the job socket (`fetch_service.rs`) are built and wired: `jobs::job_services` registers `Fetch` and `EgressProxy` under the systemd launcher, so `fleetd fetch` works there and fails under the direct launcher, which creates no job socket (ADR-0036), and the runner registers each job's feed with the recorder while its agent runs. The job end hook forgets the fetch service's per-job counters, and migration `0016` is built. The `fleetd fetch` command, the default `fetch` skill and the Floor allow-set (`FLOOR_ALLOW`, `Bash(fleetd fetch *)`, merged into the generated `settings.json` allow list) are built. Amends ADR-0029, ADR-0031 and ADR-0034. Refers to ADR-0036 for the per-job unix socket and ADR-0037 for the credential broker. Amended by ADR-0067. Amended by 0068.
 
 A Job needs to read web pages: documentation, issue threads, package pages. The Floor denies the built-in `WebFetch` (ADR-0034), and `curl` is denied by pattern. The built-in `WebSearch` stays allowed. This ADR fixes how a Job fetches a URL, which hosts it may reach, where the egress policy lives, and what gets recorded.
 
@@ -109,3 +109,9 @@ The runner now narrows each job before its agent starts: `ConnectProxy::set_job_
 ADR-0067 keeps the egress policy at Box level. The egress of an Environment Setup unit is a subset of `egress_allow`, and an Environment cannot widen it. The exfiltration note above covers agent-visible Environment secrets, and redaction of them stays exact-match.
 
 See ADR-0067.
+
+## Amendment (ADR-0068)
+
+The per-job host list receives the Job's repository host from the server and admits it beyond the operator `egress_allow` ceiling, that host only. For an `allow_private` host the fetch address check admits the `approved_ips` for that Job only. A job end clears both. This is an exfiltration path to a User-chosen public host, of the same class as allow-all fetch above.
+
+See ADR-0068.

@@ -1,6 +1,6 @@
 # Agent credential kinds and shapes
 
-Status: Proposed 2026-10-29. Built in fleet-server and fleet-core: the kind and shape checks, the sealed store, the GitHub verify call and the credentials page. The page shows no last-used time, because `CredentialSummary` carries none. Builds on ADR-0040 for storage and sealing. Supersedes the standing decision "PAT in `/etc/swarm/secrets.env`" for user Jobs only. Leaves the Gitea and Forgejo path to ADR-0045. Amended by ADR-0058 and ADR-0059.
+Status: Proposed 2026-10-29. Built in fleet-server and fleet-core: the kind and shape checks, the sealed store, the GitHub verify call and the credentials page. The page shows no last-used time, because `CredentialSummary` carries none. Builds on ADR-0040 for storage and sealing. Supersedes the standing decision "PAT in `/etc/swarm/secrets.env`" for user Jobs only. Leaves the Gitea and Forgejo path to ADR-0045. Amended by ADR-0058 and ADR-0059. Amended by 0068.
 
 A user stores the credentials their agent and their forge need. This ADR lists the kinds the store accepts, the shapes they take and the risks the user takes on.
 
@@ -73,3 +73,9 @@ The Anthropic legal page says developers "may not collect, store, or intermediat
 ## Amendment (ADR-0058)
 
 ADR-0058 (proposed, partly built) adds the kind `github_app`, shape `static_secret`, holding the installation id. The wire kind `github_installation_token` is delivered to a Box only and `PutCredential` refuses it. When a User holds both GitHub kinds, the App wins. The fleetd holder accepts the wire kind only with shape `static_secret`, a value of `ghs_` plus letters, digits and `_`, and a valid `GitIdentity`, and refuses a reply that holds it together with a `github_pat`.
+
+## Amendment (ADR-0068)
+
+A new kind `forgejo_pat`, shape `static_secret`: 40 lowercase hex characters, opaque, no prefix check, bound to a host. `github_pat` and `github_app` keep host `github.com`. Scopes: `read:repository`, `write:repository`, `write:issue` (to confirm live). The kinds table gains one row.
+
+See ADR-0068.

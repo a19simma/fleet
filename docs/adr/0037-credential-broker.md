@@ -1,6 +1,6 @@
 # Credential broker
 
-Status: Proposed 2026-10-28. Built and wired under the systemd launcher: `BrokerWiring` in `jobs.rs` builds the broker and the runner registers it on the job socket. Builds on ADR-0028 and ADR-0036. Amends ADR-0024 (push and `gh` sections) and the "A credential broker only" rejection in ADR-0031.
+Status: Proposed 2026-10-28. Built and wired under the systemd launcher: `BrokerWiring` in `jobs.rs` builds the broker and the runner registers it on the job socket. Builds on ADR-0028 and ADR-0036. Amends ADR-0024 (push and `gh` sections) and the "A credential broker only" rejection in ADR-0031. Amended by 0068.
 
 Decision by the user: the agent never holds `GH_TOKEN` or `FLEET_TOKEN`. fleetd performs `git push` and `gh` calls on its behalf over the per-job socket of ADR-0036.
 
@@ -65,3 +65,9 @@ Pushes per Job (10, at least 5 s apart), one `pr_create` call per Job that reach
 ## Amendment (ADR-0033, ADR-0045)
 
 The broker holds the Job owner's credentials from `GetJobCredentials` in memory, in place of the Box PAT. Its `push`, `pr_create` and `pr_checks` ops call the `Forge` trait, with GitHub as the only v1 implementation.
+
+## Amendment (ADR-0068)
+
+The broker calls `Forges::for_host` and the `fleet-forge` trait for `push`, `pr_create`, `pr_checks` and `fetch`. No `gh` call remains in `broker.rs`. Per-op limits and the fixed error messages are unchanged and apply to both forges.
+
+See ADR-0068.

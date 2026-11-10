@@ -184,6 +184,18 @@ _Avoid_: agent, model
 The git host of a repository: GitHub, Gitea or Forgejo (ADR-0043, ADR-0045). The fleetd `Forge` trait has a Gitea slot that is not built. The server config enum and the core `ForgeKind` have `Github` and `Forgejo` only, and the config `Forgejo` variant covers Gitea.
 _Avoid_: git server, SCM
 
+**Git host**:
+A row in the `git_hosts` table: host, **Forge kind** and `allow_private`. Any **User** adds one, of kind `forgejo` only. It replaces the operator-listed **Repo host** as the source of hosts, and `FLEET_REPO_HOSTS` only seeds it (ADR-0068).
+
+**Host approval**:
+The admin act that sets `allow_private` on a **Git host** and pins `approved_ips`, the private addresses seen at approval. A later private address outside that set is refused until an admin approves again (ADR-0068).
+
+**Forge interface**:
+`ForgeApi` plus `ForgeGit` in the `fleet-forge` crate, one adapter per forge. It replaces both the server `RepoVerifier` and the fleetd `Forge` trait. The broker dispatches through it only. GitHub App leasing and the release feed are documented exceptions outside it (ADR-0068).
+
+**Contract suite**:
+The shared case table in `fleet-forge/tests/contract.rs`, run against every **Forge interface** adapter on a fake server of its own forge, so feature parity is enforced by tests (ADR-0068).
+
 **Repo host**:
 A forge hostname the operator allows in the operator host list, with its **Forge kind** and an `allow_private` opt-in. A User registers repositories only on a **Repo host** (ADR-0059).
 _Avoid_: git server, remote

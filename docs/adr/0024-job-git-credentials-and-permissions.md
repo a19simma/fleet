@@ -1,6 +1,6 @@
 # Job git credentials and permission policy
 
-Status: Accepted. The runner, push and pull request step and reporter are built and run by the daemon, with a token host, a hardened mirror and a scoped fetch credential. Amends ADR-0011. The Known limit paragraph is superseded and the mirror-hardening window is retired by ADR-0031 (Accepted, P1 built). Amended by ADR-0058.
+Status: Accepted. The runner, push and pull request step and reporter are built and run by the daemon, with a token host, a hardened mirror and a scoped fetch credential. Amends ADR-0011. The Known limit paragraph is superseded and the mirror-hardening window is retired by ADR-0031 (Accepted, P1 built). Amended by ADR-0058. Amended by 0068.
 
 Pushing a branch and opening a pull request need write access to the repo, and ADR-0011 says fleetd holds no git credential. A headless `claude -p` run stalls on any permission prompt, and the agent can run arbitrary shell.
 
@@ -52,3 +52,9 @@ For user Jobs the `GH_TOKEN` comes from the owner's stored `github_pat`, deliver
 ## Amendment (ADR-0058)
 
 For App Jobs (ADR-0058, proposed; the server side, the fleetd consumption of the token and identity, the refresh before a push or `gh` child, a mirror fetch and a broker `gh` call and the revoke of a replaced token and at job end are built) `GH_TOKEN` is a one-hour installation token released through `GetJobCredentials`, and commits use the `GitIdentity` the server sends in place of the fixed Job identity. Under the direct launcher the limit above holds: the agent shares the uid and can read the token from `/proc`. Under the systemd launcher ADR-0031 supersedes the limit and the broker (ADR-0037) holds the token, so the agent holds none; it also has no fleetd token and no network route to the server (ADR-0031), so it cannot call `GetJobCredentials`. The token is clamped to the Job repository. The token sits in the environment of the push, `gh` and mirror fetch children, and git receives it through `fleetd askpass` (ADR-0058 SEC-017, ADR-0058 SEC-023).
+
+## Amendment (ADR-0068)
+
+The repository host allowlist and the single token host become one token host per Job host, taken from the server's `git_hosts` table and not from fleetd config. The Job owner's per-host credential replaces `GH_TOKEN` for non-GitHub hosts. askpass answers only the Job's host.
+
+See ADR-0068.

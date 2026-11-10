@@ -1,6 +1,6 @@
 # Credential delivery
 
-Status: Proposed 2026-10-29. Built: the server `GetJobCredentials`, the fleetd credential holder, and broker, askpass and `gh` use of the held token. Builds on ADR-0035 (lease-authorised worker calls), ADR-0040 (store) and ADR-0043 (kinds). Amends ADR-0014, ADR-0021, ADR-0023, ADR-0024, ADR-0031 and ADR-0037. ADR-0035 reserved this number for delivery. Amended by ADR-0058 and ADR-0067.
+Status: Proposed 2026-10-29. Built: the server `GetJobCredentials`, the fleetd credential holder, and broker, askpass and `gh` use of the held token. Builds on ADR-0035 (lease-authorised worker calls), ADR-0040 (store) and ADR-0043 (kinds). Amends ADR-0014, ADR-0021, ADR-0023, ADR-0024, ADR-0031 and ADR-0037. ADR-0035 reserved this number for delivery. Amended by ADR-0058 and ADR-0067. Amended by 0068.
 
 The server stores user credentials (ADR-0040). A Box needs the credentials of one Job, and only for that Job. This ADR fixes the call, its authorisation, who sees the result and what happens when a credential is missing.
 
@@ -58,3 +58,9 @@ ADR-0058 (proposed, partly built) adds the `github_app` kind. When a User holds 
 Environment secrets (ADR-0067) are a separate class from Credentials. The rule above, that the agent must not see them, governs Credentials and is unchanged. An Environment secret is agent-visible per entry, with `agent_visible` defaulting to false. Release is a second RPC, `GetJobEnvironment`, with the same lease authorisation, the same fixed denial and the same shared Box token risk as `GetJobCredentials`.
 
 See ADR-0067.
+
+## Amendment (ADR-0068)
+
+`GetJobCredentials` returns the owner's credential for the Job's repository host plus the host kind, `allow_private` and `approved_ips`, and never another host's token. The fleetd holder keys by host and refuses a token whose host is not the Job's. The "missing credential fails the Job" rule applies per host.
+
+See ADR-0068.

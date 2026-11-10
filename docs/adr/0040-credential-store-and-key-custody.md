@@ -1,6 +1,6 @@
 # Credential store and key custody
 
-Status: Proposed 2026-10-29. Built in fleet-server: the sealed store, `FileSealer`, the key ring loaded from the master key file at startup, and the insert-only `credential_use` audit (migrations 0017 and 0019). Not built: the re-seal pass (`Sealer::rewrap` exists and no code calls it) and a key ring reload without a restart. Amends ADR-0013 (storage). Refers to ADR-0043 for the credential kinds and shapes this store holds. Amended by ADR-0058 and ADR-0067.
+Status: Proposed 2026-10-29. Built in fleet-server: the sealed store, `FileSealer`, the key ring loaded from the master key file at startup, and the insert-only `credential_use` audit (migrations 0017 and 0019). Not built: the re-seal pass (`Sealer::rewrap` exists and no code calls it) and a key ring reload without a restart. Amends ADR-0013 (storage). Refers to ADR-0043 for the credential kinds and shapes this store holds. Amended by ADR-0058 and ADR-0067. Amended by 0068.
 
 Fleet will run Jobs with the user's own agent and forge credentials. The server must keep them between Jobs and hand them to a Box only for the Job that needs them. This ADR fixes where they live, how they are sealed and who holds the key.
 
@@ -55,3 +55,9 @@ ADR-0058 (proposed, partly built) stores only the installation id for the `githu
 ADR-0067 adds the table `environment_secret`. It uses the same Sealer, key ring and master key file, a new AAD constructor with its own prefix label, and joins the re-seal pass once that pass is built.
 
 See ADR-0067.
+
+## Amendment (ADR-0068)
+
+The `credentials.host` column (migration 0045) and the unique key `(user, kind, host)`. The sealed value is bound to the row's host in the associated data, so a row copied to another host does not unseal. The re-seal pass note is unchanged.
+
+See ADR-0068.

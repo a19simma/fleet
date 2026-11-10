@@ -2,7 +2,7 @@
 
 Status: Proposed 2026-11-07, partly built. The operator decided every point below. Builds on
 ADR-0043, ADR-0045 and ADR-0058. Amends ADR-0043 and ADR-0045, and ADR-0058 (SEC-009 only, see
-Relation to the App ceiling).
+Relation to the App ceiling). Amended by 0068.
 
 Built: the repository reference parser in fleet-core (`crates/fleet-core/src/repo.rs`: `RepoRef`,
 `ForgeKind`, `RepoVerdict`) and the `FLEET_REPO_HOSTS` config (`crates/fleet-server/src/config.rs`,
@@ -18,7 +18,7 @@ are never followed, so a rename gives `UPSTREAM_UNAVAILABLE`. The App probe mint
 Also built: the `FleetRepos` handlers (`cred::repo_api`), the store (`cred::repo_store`, one
 transaction: `FOR UPDATE` on the users row, `FOR SHARE` on the credential row, the 100 row cap, an
 upsert) and the check limiter (`cred::repo_limit`: 10 checks per User per 60 s, 8 concurrent). The
-per-User limiter admits a call before it takes a global permit. Until migration 0037, `add` uses a
+per-User limiter admits a call before it takes a global permit. Until migration 0045, `add` uses a
 stored GitHub credential for `github.com` only: any other github-kind host is refused with
 `NO_CREDENTIAL`. Also built: `fleet repo add`, `list` and `remove` (`crates/fleet-cli/src/repo.rs`)
 and the repositories page (`crates/fleet-server/src/web/repos.rs`), both ending in the shared
@@ -29,8 +29,7 @@ statuses a repository call adds. A refusal exits 1. Hosts print in punycode form
 whatever the grammar of its owner. The CLI and the page show the verified time as the UTC stamp of
 `fleet_core::stamp::utc_stamp`, `YYYY-MM-DD HH:MM UTC`. `crates/fleet-cli/tests/parity_repos.rs`
 holds one scenario per action and outcome, each run through the CLI and the page on one server, plus
-a separate test for the box token, which the page cannot send. Not built: the Forgejo verifier (the
-registry has a slot only), the `credentials.host` column and the `forgejo_pat` kind. The `path`
+a separate test for the box token, which the page cannot send. Not built: the Forgejo verifier, the `credentials.host` column and the `forgejo_pat` kind (ADR-0068, migration 0045). The `path`
 column holds at most 141 bytes: a Forgejo owner of 40, a slash and a name of 100.
 
 A User names the repositories they work on, so the CLI and the web page can list them and later
@@ -47,8 +46,7 @@ GitHub Actions minutes are paid, so users want Forgejo and later GitLab as CI ho
 - Any User adds their own repositories. No capability gates it.
 - The RPCs are `FleetRepos` `AddRepo`, `ListRepos` and `RemoveRepo`. `ListRepos` returns
   `RepoInfo` rows, each with a `runnable` field (see Runnable).
-- Migration 0036 adds the registry table and makes `github_app_mint.job_id` nullable. Migration
-  0037 adds `credentials.host` and the `forgejo_pat` kind.
+- Migration 0036 adds the registry table and makes `github_app_mint.job_id` nullable. Migration 0045 adds `credentials.host` and the `forgejo_pat` kind.
 - Only the interactive User caller kind may call them. Job-scoped tokens and agent tokens are
   refused.
 - The registry is keyed `(user, host, path)`. `host` is the forge hostname and `path` is the
@@ -124,7 +122,7 @@ Unverified, to confirm on a live instance:
 
 ### Credentials
 
-The `credentials` table gains a `host` column and a `forgejo_pat` kind (migration 0037). This
+The `credentials` table gains a `host` column and a `forgejo_pat` kind (migration 0045). This
 lands with the verifier, ahead of any registry code.
 
 ### Runnable
@@ -160,7 +158,7 @@ a vetted address only. Vetting reruns on every call, with no cache. `allow_priva
 private ranges for that host and never loopback, link-local or metadata.
 
 Outbound call. The credential is selected by the exact `(user, host)` pair and never another
-host's. Until migration 0037 adds `credentials.host`, an unhosted GitHub credential serves
+host's. Until migration 0045 adds `credentials.host`, an unhosted GitHub credential serves
 `github.com` only. TLS SNI and certificate verification use the hostname, not the IP. TLS 1.2 is the minimum
 and no option skips verification. Test seams are injected parameters. The `Authorization` header
 is never sent on a redirect: a 3xx is an error and its body is not parsed. The forge response body
@@ -217,3 +215,9 @@ lands.
 - **Check in fleetd or in the CLI.** Both sit outside the sealed store and the audit rows.
 - **Recheck at submit.** It adds a network call to every submit and duplicates the enforcement at
   claim, clone and push.
+
+## Amendment (ADR-0068)
+
+FLEET_REPO_HOSTS is now a seed for the `git_hosts` table. Any User adds a host, of kind `forgejo` only. `allow_private` moves from operator config to an admin-approved row flag with `approved_ips`. The SSRF controls and the hostile-input table of ADR-0068 apply to every User-supplied host. "Reuse the fleetd `Forge` trait" in Considered and rejected is reversed: one `fleet-forge` interface serves server verify and fleetd operations. `runnable` is true once per-host delivery lands. "A User never supplies one" (a subpath) still stands: a User supplies only a host. The Operator config paragraph on host entries moves to the host normaliser, with the same rejection list.
+
+See ADR-0068.
