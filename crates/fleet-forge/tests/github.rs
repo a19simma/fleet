@@ -1256,3 +1256,19 @@ async fn no_runner_text_reaches_a_status_or_an_error() -> TestResult {
     }
     Ok(())
 }
+
+#[tokio::test]
+async fn a_branch_named_like_a_marker_does_not_pick_the_label() -> TestResult {
+    let hook = " ! [remote rejected] non-fast-forward -> non-fast-forward (hook declined)";
+    let real = " ! [rejected] non-fast-forward -> non-fast-forward (non-fast-forward)";
+    for (stderr, want) in [
+        (hook, ForgeError::Rejected),
+        (real, ForgeError::NonFastForward),
+    ] {
+        let git = GitScript::default().output(1, stderr);
+        let target = PushTarget::new(access()?, "non-fast-forward", "main")?;
+        let got = git_forge(&git).push(&target).await;
+        assert_eq!(got, Err(want), "{stderr:?}");
+    }
+    Ok(())
+}
