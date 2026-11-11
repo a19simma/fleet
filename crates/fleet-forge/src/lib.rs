@@ -2,12 +2,14 @@
 //! [`Git`] seams, in-process fake servers and the contract harness.
 //!
 //! No item here reads the environment. A caller injects a seam, and tests inject a [`fake::Fake`].
-//! [`GitHubForge`] implements [`ForgeApi`] over REST. The Forgejo adapter lands in a later task.
+//! [`GitHubForge`] implements [`ForgeApi`] over REST. [`GiteaForge`] implements `identify` for
+//! Gitea and Forgejo.
 
 mod api;
 pub mod contract;
 mod error;
 pub mod fake;
+mod gitea;
 mod github;
 mod model;
 mod seam;
@@ -15,6 +17,7 @@ mod seam;
 pub use api::{ForgeApi, ForgeGit};
 pub use error::ForgeError;
 pub use fleet_core::forge::CiResult;
+pub use gitea::GiteaForge;
 pub use github::GitHubForge;
 pub use model::{Credential, Permission, PushTarget, RepoAccess, RepoRef, Token, Verified};
 pub use seam::{
