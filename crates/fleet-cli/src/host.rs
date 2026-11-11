@@ -159,9 +159,15 @@ fn admin_notice(status: &Status, text: &'static str) -> CliError {
 /// # Errors
 ///
 /// Returns [`CliError::Usage`] with a fixed text, never the value, for a value that is not an IP
-/// address and for more than [`MAX_HOST_APPROVED_IPS`] distinct addresses.
+/// address and for a list of more than [`MAX_HOST_APPROVED_IPS`] arguments, counted before
+/// duplicates are dropped.
 pub(crate) fn parse_addresses(texts: &[String]) -> Result<Vec<IpAddr>, CliError> {
-    let mut parsed = Vec::with_capacity(texts.len().min(MAX_HOST_APPROVED_IPS));
+    if texts.len() > MAX_HOST_APPROVED_IPS {
+        return Err(CliError::Usage(format!(
+            "address: at most {MAX_HOST_APPROVED_IPS} addresses"
+        )));
+    }
+    let mut parsed = Vec::with_capacity(texts.len());
     for text in texts {
         let addr = text
             .parse::<IpAddr>()
@@ -170,11 +176,6 @@ pub(crate) fn parse_addresses(texts: &[String]) -> Result<Vec<IpAddr>, CliError>
     }
     parsed.sort();
     parsed.dedup();
-    if parsed.len() > MAX_HOST_APPROVED_IPS {
-        return Err(CliError::Usage(format!(
-            "address: at most {MAX_HOST_APPROVED_IPS} addresses"
-        )));
-    }
     Ok(parsed)
 }
 

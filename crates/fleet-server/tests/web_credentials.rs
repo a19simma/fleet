@@ -855,7 +855,16 @@ async fn the_page_lists_one_row_per_stored_host_and_the_host_select_lists_regist
     for host in [HOST_A, HOST_B] {
         assert!(page.body.contains(&format!("<td>{host}</td>")), "{host}");
     }
-    assert!(page.body.contains("<option value=\"github.com\""));
+    assert!(!page.body.contains("<option value=\"github.com\""));
+    let start = page
+        .body
+        .find("id=\"credential-host\"")
+        .expect("host select");
+    let end = page.body[start..].find("</select>").expect("select end");
+    assert_eq!(
+        page.body[start..start + end].matches("github.com").count(),
+        1
+    );
     assert!(!page.body.contains(FORGEJO) && !page.body.contains(FORGEJO_B));
     let bob = h.session("bob", 'b').await;
     let bobs = h.page(&bob, "").await;
