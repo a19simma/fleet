@@ -10,7 +10,7 @@ use fleet_core::forge::CiResult;
 use fleet_core::host::{HostKind, HostName};
 use serde_json::{Value, json};
 
-use crate::ci::{Rank, Tally, entries, valid_sha};
+use crate::ci::{Rank, Tally, Totals, entries, valid_sha};
 use crate::git::{ref_name, run};
 use crate::{
     CiCheck, ForgeApi, ForgeError, ForgeGit, Git, GitOp, Http, HttpError, HttpRequest,
@@ -165,7 +165,7 @@ impl<H: Http, G: Send + Sync> GitHubForge<H, G> {
         if runs.status != 200 {
             return Err(status_error(runs.status));
         }
-        tally.add_runs(&parse(&runs)?, "check_runs")?;
+        tally.add_runs(&parse(&runs)?, "check_runs", Totals::Required)?;
         let statuses = self
             .get(format!("{base}/commits/{sha}/status?per_page=100"), token)
             .await?;
@@ -404,7 +404,7 @@ fn pr_number(url: &str, repo: &RepoRef) -> Result<u64, ForgeError> {
 
 impl Tally {
     fn add_statuses(&mut self, body: &Value) -> Result<(), ForgeError> {
-        for status in entries(body, "statuses")? {
+        for status in entries(body, "statuses", Totals::Required)? {
             let rank = match status.get("state").and_then(Value::as_str) {
                 Some("success") => Rank::Success,
                 Some("failure" | "error") => Rank::Failed,
