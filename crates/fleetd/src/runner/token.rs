@@ -116,8 +116,9 @@ impl<R: Reporter> AgentRunner<R> {
 
     /// The token `job_id` holds for `host`, with a lease on it. Empty when the credential reply
     /// named no such host. A reply with no host entries at all comes from a server that predates
-    /// them and holds one GitHub token, so it answers for `github.com` only. Without a book it is the `GH_TOKEN` of the base environment, whatever
-    /// the host. Call it right after [`AgentRunner::refresh_token`].
+    /// them and holds one GitHub token, so it answers for `github.com` only. Without a book it
+    /// is the `GH_TOKEN` of the base environment, whatever the host. Call it right after
+    /// [`AgentRunner::refresh_token`].
     pub(crate) fn leased_token_for(&self, job_id: &str, host: &str) -> LeasedToken {
         let Some(book) = &self.credentials else {
             return LeasedToken::new(self.github_token(job_id).unwrap_or_default(), None);

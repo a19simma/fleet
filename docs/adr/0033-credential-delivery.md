@@ -61,6 +61,6 @@ See ADR-0067.
 
 ## Amendment (ADR-0068)
 
-`GetJobCredentials` returns the owner's credential for the Job's repository host plus the host kind, `allow_private` and `approved_ips`, and never another host's token. The fleetd holder keys by host and refuses a token whose host is not the Job's. The "missing credential fails the Job" rule applies per host.
+`GetJobCredentials` returns the owner's credential for the Job's repository host plus the host kind, `allow_private` and `approved_ips`, and never another host's token. The fleetd holder keys by host and refuses a token whose host is not the Job's. The "missing credential fails the Job" rule applies per host. fleetd passes that one host to `fleetd askpass` in `FLEETD_ASKPASS_HOST`, so askpass answers for the Job's host and no other, and `fleetd` admits the host for the Job only, even when `repo_hosts` does not list it.
 
 See ADR-0068.
