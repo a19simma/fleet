@@ -147,6 +147,10 @@ impl RepoAccess {
         &self.repo
     }
 
+    pub(crate) const fn credential(&self) -> &Credential {
+        &self.credential
+    }
+
     /// The repository and its token, only when the credential was stored for the repository's
     /// host. Every adapter call that sends a token goes through this check first.
     ///
