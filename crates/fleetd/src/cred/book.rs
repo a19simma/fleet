@@ -791,6 +791,7 @@ mod tests {
         let held = JobCredentials {
             items: Vec::new(),
             identity: None,
+            hosts: Vec::new(),
         };
         let fresh = JobCredentials {
             items: vec![Credential {
@@ -799,6 +800,7 @@ mod tests {
                 expires_at_ms: None,
             }],
             identity: None,
+            hosts: Vec::new(),
         };
         assert!(book.renewed(&held, &fresh).is_err());
         let deadline = std::time::Instant::now() + Duration::from_secs(10);
