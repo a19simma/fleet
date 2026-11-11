@@ -3,7 +3,7 @@ use std::future::Future;
 use fleet_core::forge::CiResult;
 use fleet_core::host::{HostKind, HostName};
 
-use crate::{ForgeError, PushTarget, RepoAccess, Verified};
+use crate::{CiCheck, ForgeError, PushTarget, RepoAccess, Verified};
 
 /// The HTTP half of a forge (ADR-0068). It runs where the injected `Http` seam points: the
 /// server for `identify` and `verify`, fleetd for the rest.
@@ -42,6 +42,18 @@ pub trait ForgeApi: Send + Sync {
         target: &PushTarget,
         pr_url: &str,
     ) -> impl Future<Output = Result<CiResult, ForgeError>> + Send;
+
+    /// Lists the checks of the pull request at `pr_url`, one per check run or commit status, in
+    /// the order the forge listed them. Duplicate names are kept.
+    ///
+    /// It reads the same entries as [`ForgeApi::ci_result`] and fails closed in the same cases.
+    /// It also fails with [`ForgeError::Malformed`] on more than [`crate::MAX_CHECKS`] entries
+    /// and on an entry whose name [`CiCheck::new`] refuses, which `ci_result` does not read.
+    fn ci_checks(
+        &self,
+        target: &PushTarget,
+        pr_url: &str,
+    ) -> impl Future<Output = Result<Vec<CiCheck>, ForgeError>> + Send;
 }
 
 /// The git half of a forge: fetch and push over HTTPS through the injected `Git` seam. fleetd
