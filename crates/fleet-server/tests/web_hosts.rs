@@ -52,6 +52,8 @@ impl GithubApi for NoGithub {
 struct Probe {
     verdict: Result<HostKind, HostRefusal>,
     seen: Mutex<Vec<String>>,
+    resolved: Mutex<Vec<IpAddr>>,
+    calls: AtomicUsize,
 }
 
 #[tonic::async_trait]
@@ -62,7 +64,8 @@ impl HostProbe for Probe {
     }
 
     async fn resolve(&self, _host: &HostName) -> Vec<IpAddr> {
-        Vec::new()
+        self.calls.fetch_add(1, Ordering::Relaxed);
+        self.resolved.lock().unwrap().clone()
     }
 
     async fn probe_approved(
@@ -70,6 +73,7 @@ impl HostProbe for Probe {
         _host: &HostName,
         _approved: &[IpAddr],
     ) -> Result<HostKind, HostRefusal> {
+        self.calls.fetch_add(1, Ordering::Relaxed);
         self.verdict
     }
 }
@@ -150,6 +154,8 @@ async fn start(pool: PgPool, setup: Setup) -> Rig {
     let probe = Arc::new(Probe {
         verdict: setup.verdict,
         seen: Mutex::new(Vec::new()),
+        resolved: Mutex::new(vec![PRIVATE_IP.parse().unwrap()]),
+        calls: AtomicUsize::new(0),
     });
     let hosts = setup
         .hosts
@@ -262,6 +268,44 @@ impl Rig {
             .fetch_all(&self.pool)
             .await
             .unwrap()
+    }
+
+    async fn pend(&self, host: &str, user: i64, ip: &str) {
+        sqlx::query(
+            "INSERT INTO git_host_requests (host, user_id, resolved) \
+             VALUES ($1, $2, ARRAY[$3]::inet[])",
+        )
+        .bind(host)
+        .bind(user)
+        .bind(ip)
+        .execute(&self.pool)
+        .await
+        .unwrap();
+    }
+
+    async fn grant(&self) -> (bool, Vec<String>) {
+        sqlx::query_as(
+            "SELECT allow_private, ARRAY(SELECT host(a) FROM unnest(approved_ips) a ORDER BY 1) \
+             FROM git_hosts WHERE host = $1",
+        )
+        .bind(FORGE)
+        .fetch_one(&self.pool)
+        .await
+        .unwrap()
+    }
+
+    async fn post_form(&self, who: &Persona, path: &str, host: &str, addresses: &str) -> Reply {
+        let body = format!(
+            "csrf={}&host={}&addresses={}",
+            who.csrf,
+            enc(host),
+            enc(addresses)
+        );
+        self.http("POST", path, &who.cookie, &body).await
+    }
+
+    fn calls(&self) -> usize {
+        self.probe.calls.load(Ordering::Relaxed)
     }
 
     fn probed(&self) -> Vec<String> {
@@ -625,4 +669,223 @@ async fn the_repository_table_is_the_repos_page_table(pool: PgPool) {
     let bare = start(pool, DEFAULT).await;
     let page = bare.http("GET", "/hosts", &who.cookie, "").await.body;
     assert!(!page.contains("<th>Runnable</th>"));
+}
+
+fn hostile_addresses() -> Vec<String> {
+    let mut list: Vec<String> = [
+        "192.168.3.7\r",
+        "192.168.3.7\n",
+        "192.168.3.7\r\n",
+        "192.168.3.7\u{85}",
+        "192.168.3.7\u{2028}",
+        "user@192.168.3.7",
+        "user:pass@192.168.3.7",
+        "192.168.3.7\\evil",
+        "[::1]",
+        "fe80::1%eth0",
+        "192.168.3.7:80",
+        "192.168.3.7,",
+        ",192.168.3.7",
+        "192.168.3.7,,192.168.3.8",
+        "192.168.3.7, 192.168.3.8",
+        " 192.168.3.7",
+        "192.168.3.7 ",
+        "192.168.3 .7",
+        "\u{FF11}92.168.3.7",
+        "192.168.3.7/24",
+        "FD00::G",
+        "localhost",
+        "git.example.com",
+        "",
+        "   ",
+    ]
+    .into_iter()
+    .map(|text| text.replace(PRIVATE_IP, "198.51.100.9"))
+    .collect();
+    list.push("1".repeat(1000));
+    list.push(["198.51.100.9"; 100].join(","));
+    list.push(
+        (1..=17)
+            .map(|n| format!("10.0.0.{n}"))
+            .collect::<Vec<_>>()
+            .join(","),
+    );
+    list
+}
+
+#[sqlx::test]
+async fn the_request_row_names_the_addresses_and_approve_revoke_call_the_service(pool: PgPool) {
+    let rig = start(pool, DEFAULT).await;
+    let admin = rig.persona("root", 'b', true).await;
+    rig.seed(FORGE).await;
+    rig.pend(FORGE, admin.id, PRIVATE_IP).await;
+    let page = rig.http("GET", "/hosts", &admin.cookie, "").await.body;
+    for needle in [
+        "action=\"/hosts/approve\"",
+        "name=\"addresses\" value=\"192.168.3.7\"",
+        "Approve 192.168.3.7",
+    ] {
+        assert!(page.contains(needle), "page lacks {needle}");
+    }
+    assert!(!page.contains("action=\"/hosts/revoke\""));
+    let mismatch = rig
+        .post_form(&admin, "/hosts/approve", FORGE, "192.168.3.8")
+        .await;
+    assert_eq!(
+        mismatch.notice(),
+        CredentialNotice::HostAddressMismatch.code()
+    );
+    assert_eq!(rig.grant().await, (false, Vec::new()));
+    let repeated = [PRIVATE_IP; 20].join(",");
+    let approved = rig
+        .post_form(&admin, "/hosts/approve", FORGE, &repeated)
+        .await;
+    assert_eq!(approved.notice(), CredentialNotice::HostApproved.code());
+    assert_eq!(rig.grant().await, (true, vec![PRIVATE_IP.to_owned()]));
+    let page = rig.http("GET", "/hosts", &admin.cookie, "").await.body;
+    for needle in ["action=\"/hosts/revoke\"", "Revoke 192.168.3.7"] {
+        assert!(page.contains(needle), "page lacks {needle}");
+    }
+    let revoked = rig.post_form(&admin, "/hosts/revoke", FORGE, "").await;
+    assert_eq!(revoked.notice(), CredentialNotice::HostRevoked.code());
+    assert_eq!(rig.grant().await, (false, Vec::new()));
+}
+
+#[sqlx::test]
+async fn approve_and_revoke_are_not_found_for_a_non_admin(pool: PgPool) {
+    let rig = start(pool.clone(), DEFAULT).await;
+    let user = rig.persona("olive", 'a', false).await;
+    let admin = rig.persona("root", 'b', true).await;
+    rig.seed(FORGE).await;
+    rig.pend(FORGE, user.id, PRIVATE_IP).await;
+    sqlx::query("UPDATE git_hosts SET allow_private = true, approved_ips = ARRAY[$1]::inet[] WHERE host = $2")
+        .bind(PRIVATE_IP)
+        .bind(FORGE)
+        .execute(&pool)
+        .await
+        .unwrap();
+    let want = (true, vec![PRIVATE_IP.to_owned()]);
+    let control = rig
+        .post_form(&admin, "/hosts/approve", FORGE, "192.168.3.8")
+        .await;
+    assert_eq!(
+        control.notice(),
+        CredentialNotice::HostAddressMismatch.code()
+    );
+    let before = rig.calls();
+    assert!(before > 0);
+    for path in ["/hosts/approve", "/hosts/revoke"] {
+        let denied = rig.post_form(&user, path, FORGE, PRIVATE_IP).await;
+        assert_eq!(denied.status, 404, "{path}");
+    }
+    sqlx::query("UPDATE users SET is_admin = false WHERE id = $1")
+        .bind(admin.id)
+        .execute(&pool)
+        .await
+        .unwrap();
+    for path in ["/hosts/approve", "/hosts/revoke"] {
+        let demoted = rig.post_form(&admin, path, FORGE, PRIVATE_IP).await;
+        assert_eq!(demoted.status, 404, "demoted {path}");
+    }
+    assert_eq!(rig.calls(), before);
+    assert_eq!(rig.grant().await, want);
+    let page = rig.http("GET", "/hosts", &user.cookie, "").await.body;
+    assert!(!page.contains("/hosts/approve") && !page.contains("/hosts/revoke"));
+}
+
+#[sqlx::test]
+async fn approve_and_revoke_need_the_session_csrf_token(pool: PgPool) {
+    let rig = start(pool, DEFAULT).await;
+    let admin = rig.persona("root", 'b', true).await;
+    rig.seed(FORGE).await;
+    rig.pend(FORGE, admin.id, PRIVATE_IP).await;
+    let hostile_csrf = enc("csrf-root-token\r\nx");
+    let bodies = [
+        format!("host={FORGE}&addresses={PRIVATE_IP}"),
+        format!("csrf=wrong&host={FORGE}&addresses={PRIVATE_IP}"),
+        format!("csrf=&host={FORGE}&addresses={PRIVATE_IP}"),
+        format!("csrf={hostile_csrf}&host={FORGE}&addresses={PRIVATE_IP}"),
+    ];
+    for path in ["/hosts/approve", "/hosts/revoke"] {
+        for body in &bodies {
+            let reply = rig.http("POST", path, &admin.cookie, body).await;
+            assert_eq!(reply.status, 403, "{path} {body}");
+        }
+        let anon = rig
+            .http(
+                "POST",
+                path,
+                "",
+                &format!("host={FORGE}&addresses={PRIVATE_IP}"),
+            )
+            .await;
+        assert_eq!(anon.status, 403, "{path} anonymous");
+    }
+    assert_eq!(rig.calls(), 0);
+    assert_eq!(rig.grant().await, (false, Vec::new()));
+}
+
+#[sqlx::test]
+async fn hostile_approve_and_revoke_input_is_refused_without_a_service_call(pool: PgPool) {
+    let rig = start(pool, DEFAULT).await;
+    let admin = rig.persona("root", 'b', true).await;
+    rig.seed(FORGE).await;
+    rig.pend(FORGE, admin.id, PRIVATE_IP).await;
+    for host in refused_hosts() {
+        for path in ["/hosts/approve", "/hosts/revoke"] {
+            let reply = rig.post_form(&admin, path, &host, PRIVATE_IP).await;
+            assert_eq!(reply.status, 303, "{path} {host:?}");
+            assert_eq!(
+                reply.notice(),
+                CredentialNotice::HostMissing.code(),
+                "{path} {host:?}"
+            );
+        }
+    }
+    for addresses in hostile_addresses() {
+        let reply = rig
+            .post_form(&admin, "/hosts/approve", FORGE, &addresses)
+            .await;
+        assert_eq!(reply.status, 303, "{addresses:?}");
+        assert_eq!(
+            reply.notice(),
+            CredentialNotice::HostInvalid.code(),
+            "{addresses:?}"
+        );
+        let page = rig
+            .http("GET", &reply.location(), &admin.cookie, "")
+            .await
+            .body;
+        let probe = addresses.trim();
+        assert!(
+            probe.len() < 4 || probe == FORGE || !page.contains(probe),
+            "{addresses:?}"
+        );
+    }
+    let missing = rig
+        .http(
+            "POST",
+            "/hosts/approve",
+            &admin.cookie,
+            &format!("csrf={}&host={FORGE}", admin.csrf),
+        )
+        .await;
+    assert_eq!(missing.notice(), CredentialNotice::HostInvalid.code());
+    assert_eq!(rig.calls(), 0);
+    assert_eq!(rig.grant().await, (false, Vec::new()));
+    for code in [
+        "host_approved%0d%0ax",
+        "host_approved%0A",
+        "HOST_APPROVED",
+        "host_approved%C2%85",
+        "%3Cscript%3Ealert(1)%3C/script%3E",
+        "",
+        "x".repeat(2000).as_str(),
+    ] {
+        let page = rig
+            .http("GET", &format!("/hosts?notice={code}"), &admin.cookie, "")
+            .await
+            .body;
+        assert!(!page.contains("id=\"notice\""), "{code}");
+    }
 }

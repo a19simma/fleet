@@ -1,4 +1,5 @@
-//! Parity of `fleet host add|list|remove` and the web git remotes page, both over one
+//! Parity of `fleet host add|list|remove|approve-private|revoke-private|requests` and the web git
+//! remotes page, both over one
 //! `HostService` shape on one Postgres.
 //!
 //! `ROWS` is the operation table, one row per operation and scenario, each with exactly one
@@ -6,7 +7,7 @@
 //! registered hosts. `Same` means both ended in the same code or list and left the same hosts in
 //! the database. `Differs` names a documented gap with the label each surface gives, and passes
 //! only while the two still disagree in exactly that way. A label is `notice:<code>`,
-//! `listed`, `usage`, `refused`, `403` or `unexpected:<text>`. The CLI reaches the service through
+//! `listed`, `usage`, `refused`, `403`, `404`, `hidden` or `unexpected:<text>`. The CLI reaches the service through
 //! a `FleetHosts` server that sets the caller from the bearer token, the web page through
 //! a session cookie, and both through a probe fake that answers a fixed verdict.
 //!
@@ -49,11 +50,16 @@ const FORGE: &str = "git.example.com";
 const OTHER: &str = "code.example.org";
 const MARK: &str = "zqxmark.example.com";
 const ADMIN_ONLY: &str = "Only an admin can remove a host.";
+const ADMIN_ONLY_PRIVATE: &str = "Only an admin can do this.";
 const PRIVATE_IP: &str = "192.168.3.7";
 static FILES: AtomicUsize = AtomicUsize::new(0);
 
 const D_HOSTILE_ADD: &str = "the CLI normalises a hostile host and refuses it with a usage error before any request; the web form refuses it with the fixed refused notice, the notice the service gives";
 const D_HOSTILE_REMOVE: &str = "the CLI refuses a hostile host with a usage error before any request; the web form refuses it with the fixed unknown-host notice, the notice the service gives";
+const D_APPROVE_NOT_ADMIN: &str = "the CLI approve-private gets the server NOT_FOUND for a non-admin, as for an unknown host, and prints the fixed unknown-host notice; the web page answers 404 before any service call";
+const D_ADMIN_ONLY_PRIVATE: &str = "the CLI prints its fixed admin-only text; the web page answers 404, never 403, and makes no service call";
+const D_REQUESTS_HIDDEN: &str = "the CLI prints its fixed admin-only text; the web page lists the hosts and leaves the pending requests out for a non-admin";
+const D_HOSTILE_APPROVE: &str = "the CLI refuses a hostile host with a usage error before any request; the web form refuses it with the fixed unknown-host notice, the notice the service gives";
 const D_NOT_ADMIN: &str = "the CLI prints its fixed admin-only text; fleet-proto has no notice for it, so the web page answers 403";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -63,6 +69,8 @@ enum Outcome {
     Usage,
     Refused,
     Forbidden,
+    Missing,
+    Hidden,
     Unexpected(String),
 }
 
@@ -74,6 +82,8 @@ impl Outcome {
             Self::Usage => "usage".to_owned(),
             Self::Refused => "refused".to_owned(),
             Self::Forbidden => "403".to_owned(),
+            Self::Missing => "404".to_owned(),
+            Self::Hidden => "hidden".to_owned(),
             Self::Unexpected(text) => format!("unexpected:{text}"),
         }
     }
@@ -90,6 +100,9 @@ enum Act {
     Add(&'static str),
     Remove(&'static str),
     List,
+    Approve(&'static str, &'static [&'static str]),
+    Revoke(&'static str),
+    Requests,
 }
 
 struct Row {
@@ -99,6 +112,9 @@ struct Row {
     admin: bool,
     seed: &'static [&'static str],
     in_use: Option<&'static str>,
+    granted: bool,
+    pending: &'static [&'static str],
+    resolves: &'static [&'static str],
     verdict: Result<HostKind, HostRefusal>,
     class: Class,
 }
@@ -113,16 +129,37 @@ const fn row(name: &'static str, op: &'static str, act: Act, admin: bool, class:
         admin,
         seed: &[],
         in_use: None,
+        granted: false,
+        pending: &[],
+        resolves: &[],
         verdict: OK,
         class,
     }
 }
 
-const REQUIRED_OPERATIONS: &[&str] = &["add", "list", "remove"];
+const REQUIRED_OPERATIONS: &[&str] = &[
+    "add",
+    "list",
+    "remove",
+    "approve-private",
+    "revoke-private",
+    "requests",
+];
+
+const PRIVATE: &[&str] = &[PRIVATE_IP];
+const OTHER_IP: &[&str] = &["192.168.3.8"];
 
 fn rows() -> Vec<Row> {
     let hostile = format!("{MARK}/path");
     let hostile: &'static str = Box::leak(hostile.into_boxed_str());
+    let mut all = host_rows(hostile);
+    all.extend(approve_rows(hostile));
+    all.extend(revoke_rows(hostile));
+    all.extend(request_rows());
+    all
+}
+
+fn host_rows(hostile: &'static str) -> Vec<Row> {
     vec![
         row("add/new", "add", Act::Add(FORGE), false, Class::Same),
         Row {
@@ -218,8 +255,172 @@ fn rows() -> Vec<Row> {
     ]
 }
 
+fn approve_rows(hostile: &'static str) -> Vec<Row> {
+    vec![
+        Row {
+            seed: &[FORGE],
+            pending: PRIVATE,
+            resolves: PRIVATE,
+            ..row(
+                "approve/admin",
+                "approve-private",
+                Act::Approve(FORGE, PRIVATE),
+                true,
+                Class::Same,
+            )
+        },
+        Row {
+            seed: &[FORGE],
+            pending: PRIVATE,
+            resolves: PRIVATE,
+            ..row(
+                "approve/mismatch",
+                "approve-private",
+                Act::Approve(FORGE, OTHER_IP),
+                true,
+                Class::Same,
+            )
+        },
+        Row {
+            resolves: PRIVATE,
+            ..row(
+                "approve/unknown",
+                "approve-private",
+                Act::Approve(OTHER, PRIVATE),
+                true,
+                Class::Same,
+            )
+        },
+        Row {
+            seed: &[FORGE],
+            pending: PRIVATE,
+            resolves: PRIVATE,
+            verdict: Err(HostRefusal::NotForge),
+            ..row(
+                "approve/not_forge",
+                "approve-private",
+                Act::Approve(FORGE, PRIVATE),
+                true,
+                Class::Same,
+            )
+        },
+        Row {
+            seed: &[FORGE],
+            pending: PRIVATE,
+            resolves: PRIVATE,
+            ..row(
+                "approve/not_admin",
+                "approve-private",
+                Act::Approve(FORGE, PRIVATE),
+                false,
+                Class::Differs(D_APPROVE_NOT_ADMIN, "notice:host_missing", "404"),
+            )
+        },
+        Row {
+            seed: &[FORGE],
+            pending: PRIVATE,
+            resolves: PRIVATE,
+            ..row(
+                "approve/hostile",
+                "approve-private",
+                Act::Approve(hostile, PRIVATE),
+                true,
+                Class::Differs(D_HOSTILE_APPROVE, "usage", "notice:host_missing"),
+            )
+        },
+    ]
+}
+
+fn revoke_rows(hostile: &'static str) -> Vec<Row> {
+    vec![
+        Row {
+            seed: &[FORGE],
+            granted: true,
+            ..row(
+                "revoke/admin",
+                "revoke-private",
+                Act::Revoke(FORGE),
+                true,
+                Class::Same,
+            )
+        },
+        Row {
+            seed: &[FORGE],
+            ..row(
+                "revoke/no_grant",
+                "revoke-private",
+                Act::Revoke(FORGE),
+                true,
+                Class::Same,
+            )
+        },
+        row(
+            "revoke/unknown",
+            "revoke-private",
+            Act::Revoke(OTHER),
+            true,
+            Class::Same,
+        ),
+        Row {
+            seed: &[FORGE],
+            granted: true,
+            ..row(
+                "revoke/not_admin",
+                "revoke-private",
+                Act::Revoke(FORGE),
+                false,
+                Class::Differs(D_ADMIN_ONLY_PRIVATE, "refused", "404"),
+            )
+        },
+        Row {
+            seed: &[FORGE],
+            granted: true,
+            ..row(
+                "revoke/hostile",
+                "revoke-private",
+                Act::Revoke(hostile),
+                true,
+                Class::Differs(D_HOSTILE_REMOVE, "usage", "notice:host_missing"),
+            )
+        },
+    ]
+}
+
+fn request_rows() -> Vec<Row> {
+    vec![
+        Row {
+            pending: PRIVATE,
+            ..row(
+                "requests/admin",
+                "requests",
+                Act::Requests,
+                true,
+                Class::Same,
+            )
+        },
+        row(
+            "requests/empty",
+            "requests",
+            Act::Requests,
+            true,
+            Class::Same,
+        ),
+        Row {
+            pending: PRIVATE,
+            ..row(
+                "requests/not_admin",
+                "requests",
+                Act::Requests,
+                false,
+                Class::Differs(D_REQUESTS_HIDDEN, "refused", "hidden"),
+            )
+        },
+    ]
+}
+
 struct Probe {
     verdict: Mutex<Result<HostKind, HostRefusal>>,
+    resolved: Mutex<Vec<IpAddr>>,
 }
 
 #[tonic::async_trait]
@@ -229,7 +430,7 @@ impl HostProbe for Probe {
     }
 
     async fn resolve(&self, _host: &HostName) -> Vec<IpAddr> {
-        Vec::new()
+        self.resolved.lock().unwrap().clone()
     }
 
     async fn probe_approved(
@@ -282,6 +483,7 @@ impl Rig {
         let user = persona(&pool, "olive", 'b', false).await;
         let probe = Arc::new(Probe {
             verdict: Mutex::new(OK),
+            resolved: Mutex::new(Vec::new()),
         });
         let grpc = FleetService::new(store.clone()).with_hosts(Some(HostService::new(
             HostStore::new(pool.clone()),
@@ -356,6 +558,10 @@ impl Rig {
     }
 
     async fn reset(&self, row: &Row) {
+        sqlx::query("DELETE FROM git_host_requests")
+            .execute(&self.pool)
+            .await
+            .unwrap();
         sqlx::query("DELETE FROM user_repos")
             .execute(&self.pool)
             .await
@@ -382,14 +588,44 @@ impl Rig {
             .await
             .unwrap();
         }
+        for ip in row.pending {
+            sqlx::query(
+                "INSERT INTO git_host_requests (host, user_id, resolved) \
+                 VALUES ($1, $2, ARRAY[$3]::inet[])",
+            )
+            .bind(row.seed.first().copied().unwrap_or(FORGE))
+            .bind(self.admin.0)
+            .bind(ip)
+            .execute(&self.pool)
+            .await
+            .unwrap();
+        }
+        if row.granted {
+            sqlx::query(
+                "UPDATE git_hosts SET allow_private = true, approved_ips = ARRAY[$1]::inet[] \
+                 WHERE host = $2",
+            )
+            .bind(PRIVATE_IP)
+            .bind(FORGE)
+            .execute(&self.pool)
+            .await
+            .unwrap();
+        }
+        *self.probe.resolved.lock().unwrap() =
+            row.resolves.iter().map(|ip| ip.parse().unwrap()).collect();
         *self.probe.verdict.lock().unwrap() = row.verdict;
     }
 
     async fn stored(&self) -> Vec<String> {
-        sqlx::query_scalar("SELECT host FROM git_hosts ORDER BY host")
-            .fetch_all(&self.pool)
-            .await
-            .unwrap()
+        sqlx::query_scalar(
+            "SELECT host || ' ' || allow_private::text || ' ' || \
+             COALESCE(array_to_string(approved_ips, ','), '') || ' ' || \
+             (SELECT count(*) FROM git_host_requests r WHERE r.host = g.host)::text \
+             FROM git_hosts g ORDER BY host",
+        )
+        .fetch_all(&self.pool)
+        .await
+        .unwrap()
     }
 
     async fn run_cli(&self, row: &Row) -> Outcome {
@@ -398,6 +634,13 @@ impl Rig {
             Act::Add(host) => vec!["host", "add", host],
             Act::Remove(host) => vec!["host", "remove", host],
             Act::List => vec!["host", "list"],
+            Act::Approve(host, ips) => {
+                let mut args = vec!["host", "approve-private", host];
+                args.extend(ips.iter().copied());
+                args
+            }
+            Act::Revoke(host) => vec!["host", "revoke-private", host],
+            Act::Requests => vec!["host", "requests"],
         };
         let url = format!("http://{}", self.cli);
         let mut full = vec!["fleet", "--server", url.as_str()];
@@ -418,7 +661,7 @@ impl Rig {
         .unwrap();
         let text = String::from_utf8_lossy(&out).into_owned();
         match (result, row.act) {
-            (Ok(()), Act::List) => {
+            (Ok(()), Act::List | Act::Requests) => {
                 Outcome::Listed(text.lines().map(|line| line.replace('\t', " ")).collect())
             }
             (Ok(()), _) => {
@@ -433,7 +676,11 @@ impl Rig {
             }
             (Err(CliError::Credential(notice)), _) => Outcome::Notice(notice.code().to_owned()),
             (Err(CliError::Usage(_)), _) => Outcome::Usage,
-            (Err(CliError::Refused(text)), _) if text == ADMIN_ONLY => Outcome::Refused,
+            (Err(CliError::Refused(text)), _)
+                if text == ADMIN_ONLY || text == ADMIN_ONLY_PRIVATE =>
+            {
+                Outcome::Refused
+            }
             (Err(other), _) => Outcome::Unexpected(other.to_string()),
         }
     }
@@ -472,23 +719,29 @@ impl Rig {
     async fn run_web(&self, row: &Row) -> Outcome {
         let who = if row.admin { &self.admin } else { &self.user };
         let (status, head, body) = match row.act {
-            Act::List => self.http("GET", "/hosts", &who.1, "").await,
-            Act::Add(host) | Act::Remove(host) => {
-                let path = if matches!(row.act, Act::Add(_)) {
-                    "/hosts/add"
-                } else {
-                    "/hosts/remove"
+            Act::List | Act::Requests => self.http("GET", "/hosts", &who.1, "").await,
+            Act::Add(host) | Act::Remove(host) | Act::Revoke(host) | Act::Approve(host, _) => {
+                let path = match row.act {
+                    Act::Add(_) => "/hosts/add",
+                    Act::Remove(_) => "/hosts/remove",
+                    Act::Revoke(_) => "/hosts/revoke",
+                    _ => "/hosts/approve",
                 };
                 let mut encoded = String::new();
                 for byte in host.bytes() {
                     let _ = write!(encoded, "%{byte:02X}");
                 }
-                let form = format!("csrf={}&host={encoded}", who.2);
+                let mut form = format!("csrf={}&host={encoded}", who.2);
+                if let Act::Approve(_, ips) = row.act {
+                    let _ = write!(form, "&addresses={}", ips.join("%2C"));
+                }
                 self.http("POST", path, &who.1, &form).await
             }
         };
         match status {
             403 => Outcome::Forbidden,
+            404 => Outcome::Missing,
+            200 if matches!(row.act, Act::Requests) => requested(&body),
             200 => Outcome::Listed(listed(&body)),
             303 => head
                 .lines()
@@ -517,6 +770,27 @@ fn listed(body: &str) -> Vec<String> {
             cells.iter().take(3).copied().collect::<Vec<_>>().join(" ")
         })
         .collect()
+}
+
+fn requested(body: &str) -> Outcome {
+    let Some(table) = body.split("id=\"host-requests\"").nth(1) else {
+        return Outcome::Hidden;
+    };
+    let table = table.split("</table>").next().unwrap();
+    Outcome::Listed(
+        table
+            .split("<tr data-host=\"")
+            .skip(1)
+            .map(|chunk| {
+                let cells: Vec<&str> = chunk
+                    .split("<td>")
+                    .skip(1)
+                    .map(|cell| cell.split("</td>").next().unwrap())
+                    .collect();
+                cells.iter().take(3).copied().collect::<Vec<_>>().join(" ")
+            })
+            .collect(),
+    )
 }
 
 fn agree(cli: &Outcome, web: &Outcome) -> bool {
@@ -612,4 +886,25 @@ async fn no_surface_shows_an_approved_address_to_a_user(pool: PgPool) {
             "github.com github no".to_owned(),
         ])
     );
+}
+
+#[sqlx::test]
+async fn a_requests_row_lists_the_same_pending_request_on_both_surfaces(pool: PgPool) {
+    let rig = Rig::start(pool).await;
+    let row = Row {
+        pending: PRIVATE,
+        ..row(
+            "requests/admin",
+            "requests",
+            Act::Requests,
+            true,
+            Class::Same,
+        )
+    };
+    rig.reset(&row).await;
+    let cli = rig.run_cli(&row).await;
+    let web = rig.run_web(&row).await;
+    let line = format!("{FORGE} {} {PRIVATE_IP}", rig.admin.0);
+    assert_eq!(cli, Outcome::Listed(vec![line]));
+    assert_eq!(cli, web);
 }

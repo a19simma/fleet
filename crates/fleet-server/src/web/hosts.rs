@@ -4,26 +4,32 @@
 //! Every route needs a session, and every POST also the session's CSRF token. Add and list go
 //! through the same [`HostService`] the `FleetHosts` RPCs use, so a refusal is the same fixed
 //! [`CredentialNotice`] the CLI prints. Remove is admin-only and gated per request on the
-//! database flag, never by hiding the button. The pending requests and the approved addresses
-//! of a host reach an admin only: [`HostService::list`] drops the addresses for anyone else and
+//! database flag, never by hiding the button. Approve and revoke of a private host are admin-only
+//! too, but a caller who is not an admin gets 404, as on the RPCs, and no service call happens.
+//! The approve form names the addresses the pending request resolved to and posts them back, so
+//! [`HostService::approve`] accepts only what the server resolves now. The pending requests and
+//! the approved addresses of a host reach an admin only: [`HostService::list`] drops the addresses for anyone else and
 //! the page leaves the column out. A host typed into a form goes through [`HostName::normalise`]
 //! first, so a hostile value is refused with a fixed notice before any request and is never
 //! echoed. Every server string is shown in [`ascii_form`]. The repository table is the one on
 //! `/repos`.
 
 use std::collections::HashMap;
+use std::net::IpAddr;
 use std::sync::Arc;
 
 use fleet_core::host::HostName;
 use fleet_core::repo::ascii_form;
-use fleet_proto::CredentialNotice;
-use fleet_proto::v1::{AddHostRequest, RemoveHostRequest};
+use fleet_proto::v1::{
+    AddHostRequest, ApproveHostPrivateRequest, RemoveHostRequest, RevokeHostPrivateRequest,
+};
+use fleet_proto::{CredentialNotice, MAX_HOST_APPROVED_IPS};
 use topcoat::{
     Result,
     context::{Cx, app_context},
     router::{
         content::Form,
-        error::{SeeOther, not_found, see_other},
+        error::{SeeOther, forbidden, not_found, see_other},
         page,
         request::uri,
         route,
@@ -35,7 +41,7 @@ use super::catalog::admin_post_gate;
 use super::jobs::when;
 use super::layout::{Nav, shell};
 use super::pages::{auth, csrf_matches, current, fail, signed_in};
-use super::passkeys::AuthError;
+use super::passkeys::{AuthError, SessionInfo};
 use super::repos::{Row as RepoRow, repo_rows, repo_table, repos_of};
 use crate::hosts::HostService;
 
@@ -68,6 +74,7 @@ struct HostLine {
     kind: String,
     private: &'static str,
     addresses: String,
+    revoke: Option<String>,
 }
 
 struct RequestLine {
@@ -75,6 +82,12 @@ struct RequestLine {
     user: String,
     resolved: String,
     requested: String,
+    approve: Option<Approval>,
+}
+
+struct Approval {
+    addresses: String,
+    label: String,
 }
 
 #[component]
@@ -107,6 +120,13 @@ async fn host_table(csrf: &str, rows: &[HostLine], admin: bool) -> Result<impl V
                                     <input type="hidden" name="host" value=(row.host.as_str())>
                                     <button class="btn btn-xs btn-outline btn-error" type="submit">"Remove"</button>
                                 </form>
+                                if let Some(label) = &row.revoke {
+                                    <form class="inline" method="post" action="/hosts/revoke">
+                                        <input type="hidden" name="csrf" value=(csrf)>
+                                        <input type="hidden" name="host" value=(row.host.as_str())>
+                                        <button class="btn btn-xs btn-outline btn-warning" type="submit">"Revoke " (label.as_str())</button>
+                                    </form>
+                                }
                             </td>
                         }
                     </tr>
@@ -118,7 +138,7 @@ async fn host_table(csrf: &str, rows: &[HostLine], admin: bool) -> Result<impl V
 }
 
 #[component]
-async fn request_table(rows: &[RequestLine]) -> Result<impl View> {
+async fn request_table(csrf: &str, rows: &[RequestLine]) -> Result<impl View> {
     Ok(view! {
         <div class="overflow-x-auto">
         <table class="table table-zebra table-xs" id="host-requests">
@@ -128,6 +148,7 @@ async fn request_table(rows: &[RequestLine]) -> Result<impl View> {
                     <th>"Requested by"</th>
                     <th>"Resolved addresses"</th>
                     <th>"Requested"</th>
+                    <th class="text-right">"Actions"</th>
                 </tr>
             </thead>
             <tbody>
@@ -137,6 +158,16 @@ async fn request_table(rows: &[RequestLine]) -> Result<impl View> {
                         <td>(row.user.as_str())</td>
                         <td>(row.resolved.as_str())</td>
                         <td>(row.requested.as_str())</td>
+                        <td class="text-right">
+                            if let Some(approval) = &row.approve {
+                                <form class="inline" method="post" action="/hosts/approve">
+                                    <input type="hidden" name="csrf" value=(csrf)>
+                                    <input type="hidden" name="host" value=(row.host.as_str())>
+                                    <input type="hidden" name="addresses" value=(approval.addresses.as_str())>
+                                    <button class="btn btn-xs btn-outline btn-primary" type="submit">"Approve " (approval.label.as_str())</button>
+                                </form>
+                            }
+                        </td>
                     </tr>
                 }
             </tbody>
@@ -167,6 +198,21 @@ fn join(items: &[String]) -> String {
         .join(", ")
 }
 
+fn approval(ips: &[String]) -> Option<Approval> {
+    let parsed = ips
+        .iter()
+        .map(|ip| ip.parse::<IpAddr>().ok())
+        .collect::<Option<Vec<_>>>()?;
+    if parsed.is_empty() {
+        return None;
+    }
+    let texts: Vec<String> = parsed.iter().map(ToString::to_string).collect();
+    Some(Approval {
+        addresses: texts.join(","),
+        label: texts.join(", "),
+    })
+}
+
 async fn host_lines(svc: &HostService, admin: bool) -> Result<Vec<HostLine>> {
     Ok(svc
         .list(admin)
@@ -179,6 +225,7 @@ async fn host_lines(svc: &HostService, admin: bool) -> Result<Vec<HostLine>> {
             kind: ascii_form(&info.kind),
             private: if info.allow_private { "yes" } else { "no" },
             addresses: join(&info.approved_ips),
+            revoke: info.allow_private.then(|| join(&info.approved_ips)),
         })
         .collect())
 }
@@ -195,6 +242,7 @@ async fn request_lines(svc: &HostService) -> Result<Vec<RequestLine>> {
             user: info.requested_by.to_string(),
             resolved: join(&info.resolved_ips),
             requested: when(info.requested_at_ms),
+            approve: approval(&info.resolved_ips),
         })
         .collect())
 }
@@ -236,7 +284,7 @@ async fn hosts_page(cx: &Cx) -> Result<impl View> {
                 add_form(csrf: csrf.as_str())
                 if admin {
                     <h2 class="mb-1 mt-6 text-xs font-bold uppercase text-base-content/60">"Pending private requests"</h2>
-                    request_table(rows: requests.as_slice())
+                    request_table(csrf: csrf.as_str(), rows: requests.as_slice())
                 }
                 if repos.is_some() {
                     <h2 class="mb-1 mt-6 text-xs font-bold uppercase text-base-content/60">"Repositories"</h2>
@@ -256,7 +304,7 @@ async fn add(cx: &Cx, Form(form): Form<HashMap<String, String>>) -> Result<SeeOt
     let svc = service(cx)?;
     let session = signed_in(cx, auth).await?;
     if !csrf_matches(&session, form.get("csrf").map(String::as_str)) {
-        return Err(topcoat::router::error::forbidden().into());
+        return Err(forbidden().into());
     }
     let Some(host) = host_field(&form) else {
         return Ok(back(CredentialNotice::HostRefused));
@@ -282,6 +330,75 @@ async fn remove(cx: &Cx, Form(form): Form<HashMap<String, String>>) -> Result<Se
     };
     match svc.remove(session.user_id, &request).await {
         Ok(_) => Ok(back(CredentialNotice::HostRemoved)),
+        Err(status) => Ok(back(CredentialNotice::for_host_status(&status))),
+    }
+}
+
+/// Longest accepted address list: [`MAX_HOST_APPROVED_IPS`] addresses of at most 45 characters
+/// and the commas between them.
+const ADDRESS_LIST_MAX: usize = MAX_HOST_APPROVED_IPS * 46;
+
+fn address_field(form: &HashMap<String, String>) -> Option<Vec<IpAddr>> {
+    let text = form.get("addresses")?;
+    if text.len() > ADDRESS_LIST_MAX {
+        return None;
+    }
+    let mut parsed = text
+        .split(',')
+        .map(str::parse::<IpAddr>)
+        .collect::<Result<Vec<_>, _>>()
+        .ok()?;
+    parsed.sort();
+    parsed.dedup();
+    (parsed.len() <= MAX_HOST_APPROVED_IPS).then_some(parsed)
+}
+
+/// Admin gate for the private-host posts: a caller who is not an admin gets 404, read from the
+/// database on every request, then the CSRF token is checked.
+async fn admin_or_missing(cx: &Cx, form: &HashMap<String, String>) -> Result<SessionInfo> {
+    let auth = auth(cx)?;
+    let session = signed_in(cx, auth).await?;
+    if !auth.is_admin(session.user_id).await.map_err(fail)? {
+        return Err(not_found().into());
+    }
+    if !csrf_matches(&session, form.get("csrf").map(String::as_str)) {
+        return Err(forbidden().into());
+    }
+    Ok(session)
+}
+
+#[route(POST "/hosts/approve")]
+async fn approve(cx: &Cx, Form(form): Form<HashMap<String, String>>) -> Result<SeeOther> {
+    let svc = service(cx)?;
+    let session = admin_or_missing(cx, &form).await?;
+    let Some(host) = host_field(&form) else {
+        return Ok(back(CredentialNotice::HostMissing));
+    };
+    let Some(addresses) = address_field(&form) else {
+        return Ok(back(CredentialNotice::HostInvalid));
+    };
+    let request = ApproveHostPrivateRequest {
+        host: host.as_str().to_owned(),
+        approved_ips: addresses.iter().map(ToString::to_string).collect(),
+    };
+    match svc.approve(session.user_id, &request).await {
+        Ok(_) => Ok(back(CredentialNotice::HostApproved)),
+        Err(status) => Ok(back(CredentialNotice::for_host_status(&status))),
+    }
+}
+
+#[route(POST "/hosts/revoke")]
+async fn revoke(cx: &Cx, Form(form): Form<HashMap<String, String>>) -> Result<SeeOther> {
+    let svc = service(cx)?;
+    let session = admin_or_missing(cx, &form).await?;
+    let Some(host) = host_field(&form) else {
+        return Ok(back(CredentialNotice::HostMissing));
+    };
+    let request = RevokeHostPrivateRequest {
+        host: host.as_str().to_owned(),
+    };
+    match svc.revoke(session.user_id, &request).await {
+        Ok(_) => Ok(back(CredentialNotice::HostRevoked)),
         Err(status) => Ok(back(CredentialNotice::for_host_status(&status))),
     }
 }
