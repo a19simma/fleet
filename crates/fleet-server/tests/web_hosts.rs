@@ -311,6 +311,13 @@ impl Rig {
     fn probed(&self) -> Vec<String> {
         self.probe.seen.lock().unwrap().clone()
     }
+
+    async fn audited(&self) -> i64 {
+        sqlx::query_scalar("SELECT count(*) FROM host_audit")
+            .fetch_one(&self.pool)
+            .await
+            .unwrap()
+    }
 }
 
 fn refused_hosts() -> Vec<String> {
@@ -470,7 +477,7 @@ async fn add_goes_through_the_service_with_the_normalised_host(pool: PgPool) {
 }
 
 #[sqlx::test]
-async fn a_refusal_gives_the_same_fixed_text_for_every_cause(pool: PgPool) {
+async fn a_refusal_cause_maps_to_its_own_fixed_notice_and_never_echoes_the_host(pool: PgPool) {
     let table = [
         (HostRefusal::NotAllowedHost, CredentialNotice::HostRefused),
         (HostRefusal::NotForge, CredentialNotice::HostNotForge),
@@ -603,6 +610,7 @@ async fn a_hostile_remove_value_is_refused_without_a_request(pool: PgPool) {
     let rig = start(pool, DEFAULT).await;
     let admin = rig.persona("root", 'b', true).await;
     rig.seed(FORGE).await;
+    assert_eq!(rig.audited().await, 0);
     for host in refused_hosts() {
         let reply = rig.post(&admin, "/hosts/remove", &host).await;
         assert_eq!(
@@ -612,7 +620,64 @@ async fn a_hostile_remove_value_is_refused_without_a_request(pool: PgPool) {
         );
         assert!(!reply.location().contains("example"));
     }
+    assert_eq!(rig.audited().await, 0);
+    assert_eq!(rig.calls(), 0);
+    assert_eq!(rig.probed(), Vec::<String>::new());
     assert_eq!(rig.hosts().await, [FORGE, "github.com"]);
+    let control = rig
+        .post(&admin, "/hosts/remove", "absent.example.com")
+        .await;
+    assert_eq!(control.notice(), CredentialNotice::HostMissing.code());
+    assert_eq!(rig.audited().await, 1);
+}
+
+#[sqlx::test]
+async fn an_unknown_notice_code_renders_no_notice_and_no_echo(pool: PgPool) {
+    let rig = start(pool, DEFAULT).await;
+    let admin = rig.persona("root", 'b', true).await;
+    let control = rig
+        .http("GET", "/hosts?notice=host_added", &admin.cookie, "")
+        .await
+        .body;
+    assert!(control.contains("id=\"notice\""));
+    assert!(control.contains(CredentialNotice::HostAdded.text()));
+    let long = "x".repeat(2000);
+    let table = [
+        "<script>alert(1)</script>",
+        "\"><img src=x onerror=alert(1)>",
+        "%3Cscript%3Ealert(1)%3C/script%3E",
+        "&lt;script&gt;alert(1)&lt;/script&gt;",
+        "&#60;b&#62;zqxmark",
+        "zqxmark_unknown_code",
+        "h\u{f6}st_added",
+        "host_added\u{2028}zqxmark",
+        long.as_str(),
+        "",
+    ];
+    for code in table {
+        let page = rig
+            .http(
+                "GET",
+                &format!("/hosts?notice={}", enc(code)),
+                &admin.cookie,
+                "",
+            )
+            .await
+            .body;
+        assert!(!page.contains("id=\"notice\""), "{code:?}");
+        for notice in CredentialNotice::ALL {
+            assert!(!page.contains(notice.text()), "{code:?} {notice:?}");
+        }
+        if !code.is_empty() {
+            assert!(!page.contains(code), "{code:?}");
+            assert!(!page.contains(&enc(code)), "{code:?}");
+        }
+    }
+    let raw = rig
+        .http("GET", "/hosts?notice=%3Cb%3Ezqxmark", &admin.cookie, "")
+        .await
+        .body;
+    assert!(!raw.contains("zqxmark"));
 }
 
 #[sqlx::test]
