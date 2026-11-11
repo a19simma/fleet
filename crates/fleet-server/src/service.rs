@@ -270,6 +270,13 @@ fn bound_box<T>(request: &Request<T>, requested: &str) -> Result<(), Status> {
         .map_or(Ok(()), |bound| bound.require_box(requested))
 }
 
+fn bound_user<T>(request: &Request<T>) -> Option<i64> {
+    request
+        .extensions()
+        .get::<BoxCaller>()
+        .map(|bound| bound.user_id)
+}
+
 fn same_box(events: &[QueuedEvent]) -> Result<Option<&str>, Status> {
     let mut names = events
         .iter()
@@ -310,7 +317,7 @@ pub struct FleetService {
 }
 
 impl FleetService {
-    /// Refuses a per-Box token reading a job it does not own, with the lease-mismatch text so
+    /// Refuses a per-Box token acting on a job it does not own, with the lease-mismatch text so
     /// a foreign job and an unknown one look alike. A static token passes.
     async fn owned_by_token(&self, bound_user: Option<i64>, job_id: &str) -> Result<(), Status> {
         let Some(user_id) = bound_user else {
@@ -590,10 +597,7 @@ impl FleetWorker for FleetService {
         request: Request<ClaimJobRequest>,
     ) -> Result<Response<ClaimJobReply>, Status> {
         bound_box(&request, &request.get_ref().r#box)?;
-        let owner = request
-            .extensions()
-            .get::<BoxCaller>()
-            .map(|bound| bound.user_id);
+        let owner = bound_user(&request);
         let name = validate_box(&request.into_inner().r#box)
             .map_err(|err| Status::invalid_argument(err.to_string()))?;
         let job = self
@@ -618,6 +622,8 @@ impl FleetWorker for FleetService {
         request: Request<GetProfileBlobRequest>,
     ) -> Result<Response<GetProfileBlobReply>, Status> {
         bound_box(&request, &request.get_ref().r#box)?;
+        self.owned_by_token(bound_user(&request), &request.get_ref().job_id)
+            .await?;
         let request = request.into_inner();
         let name = validate_box(&request.r#box)
             .map_err(|err| Status::invalid_argument(err.to_string()))?;
@@ -634,6 +640,8 @@ impl FleetWorker for FleetService {
         request: Request<GetJobTranscriptRequest>,
     ) -> Result<Response<GetJobTranscriptReply>, Status> {
         bound_box(&request, &request.get_ref().r#box)?;
+        self.owned_by_token(bound_user(&request), &request.get_ref().job_id)
+            .await?;
         let request = request.into_inner();
         let name = validate_box(&request.r#box)
             .map_err(|err| Status::invalid_argument(err.to_string()))?;
@@ -650,11 +658,7 @@ impl FleetWorker for FleetService {
         request: Request<GetJobCredentialsRequest>,
     ) -> Result<Response<GetJobCredentialsReply>, Status> {
         bound_box(&request, &request.get_ref().r#box)?;
-        let bound_user = request
-            .extensions()
-            .get::<BoxCaller>()
-            .map(|bound| bound.user_id);
-        self.owned_by_token(bound_user, &request.get_ref().job_id)
+        self.owned_by_token(bound_user(&request), &request.get_ref().job_id)
             .await?;
         let service = self
             .credentials
@@ -674,11 +678,7 @@ impl FleetWorker for FleetService {
         request: Request<GetJobEnvironmentRequest>,
     ) -> Result<Response<GetJobEnvironmentReply>, Status> {
         bound_box(&request, &request.get_ref().r#box)?;
-        let bound_user = request
-            .extensions()
-            .get::<BoxCaller>()
-            .map(|bound| bound.user_id);
-        self.owned_by_token(bound_user, &request.get_ref().job_id)
+        self.owned_by_token(bound_user(&request), &request.get_ref().job_id)
             .await?;
         let service = self
             .environments
@@ -698,6 +698,8 @@ impl FleetWorker for FleetService {
         request: Request<ReportJobRequest>,
     ) -> Result<Response<ReportJobReply>, Status> {
         bound_box(&request, &request.get_ref().r#box)?;
+        self.owned_by_token(bound_user(&request), &request.get_ref().job_id)
+            .await?;
         let request = request.into_inner();
         let name = validate_box(&request.r#box)
             .map_err(|err| Status::invalid_argument(err.to_string()))?;
@@ -715,6 +717,8 @@ impl FleetWorker for FleetService {
     ) -> Result<Response<ReportTimingReply>, Status> {
         bound_box(&request, &request.get_ref().r#box)?;
         let name = report_box(request.get_ref())?;
+        self.owned_by_token(bound_user(&request), &request.get_ref().job_id)
+            .await?;
         timing::store_timing(self.store.pool(), &name, request.get_ref())
             .await
             .map(Response::new)
@@ -725,6 +729,8 @@ impl FleetWorker for FleetService {
         request: Request<ReportShellLogRequest>,
     ) -> Result<Response<ReportShellLogReply>, Status> {
         bound_box(&request, &request.get_ref().r#box)?;
+        self.owned_by_token(bound_user(&request), &request.get_ref().job_id)
+            .await?;
         let leased_to = request
             .extensions()
             .get::<BoxCaller>()

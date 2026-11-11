@@ -25,7 +25,7 @@ Lookup order in `auth.rs`: static Box token, static client token, per-Box token 
 
 Each Box-scope RPC checks `BoxCaller::require_box` against the Box name in the request and refuses a mismatch with `PERMISSION_DENIED` and a fixed message. The static token carries no `BoxCaller` and passes unchanged.
 
-`ClaimJob` filters to Jobs whose `jobs.user_id` equals the token's User, so a Box serves only its owner's Jobs. The static token claims with no owner filter. `GetJobCredentials` and `GetJobEnvironment` release only when the Job's owner is the token's User, in addition to the Box and lease checks of ADR-0033 and ADR-0035.
+`ClaimJob` filters to Jobs whose `jobs.user_id` equals the token's User, so a Box serves only its owner's Jobs. The static token claims with no owner filter. Every lease-bound worker RPC (`GetProfileBlob`, `GetJobTranscript`, `GetJobCredentials`, `GetJobEnvironment`, `ReportJob`, `ReportTiming`, `ReportShellLog`) acts only when the Job's owner is the token's User, in addition to the Box and lease checks of ADR-0033 and ADR-0035. A token revoked and re-issued under the same name to another User therefore cannot touch the first User's leased Job. A refusal is `PERMISSION_DENIED` with the lease-mismatch text, the same as an unknown Job.
 
 ### Issue, list, revoke
 
