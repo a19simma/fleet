@@ -522,6 +522,10 @@ impl JobCredentials {
             .and_then(Credential::expires_at_ms)
     }
 
+    /// Swaps in the app token of `fresh`. A reply that changes a host or its kind, turns
+    /// `allow_private` on or adds an approved address is refused; one that clears or shrinks
+    /// either is applied, which is how a revoked approval reaches a running job. Addresses
+    /// compare as sent, so an IPv4-mapped form of a held address counts as new.
     fn refreshed(&self, fresh: &Self) -> Result<Self, CredentialFailure> {
         let is_app = |c: &&Credential| c.kind == CredentialKind::GithubApp;
         let (Some(_), Some(token)) = (
@@ -534,11 +538,15 @@ impl JobCredentials {
             return Err(CredentialFailure::Malformed);
         }
         let same_hosts = self.hosts.len() == fresh.hosts.len()
-            && self
-                .hosts
-                .iter()
-                .zip(&fresh.hosts)
-                .all(|(held, new)| held.host == new.host && held.kind == new.kind);
+            && self.hosts.iter().zip(&fresh.hosts).all(|(held, new)| {
+                held.host == new.host
+                    && held.kind == new.kind
+                    && (held.allow_private || !new.allow_private)
+                    && new
+                        .approved_ips
+                        .iter()
+                        .all(|ip| held.approved_ips.contains(ip))
+            });
         if !same_hosts {
             return Err(CredentialFailure::Malformed);
         }
@@ -830,6 +838,93 @@ mod tests {
         PRECONDITION_NO_VERIFY_REPO, PRECONDITION_NOT_CONFIGURED,
     };
     use tonic::{Code, Status};
+
+    fn ip(text: &str) -> std::net::IpAddr {
+        text.parse().expect("test address")
+    }
+
+    fn with_hosts(allow_private: bool, ips: &[&str]) -> super::JobCredentials {
+        super::JobCredentials {
+            items: vec![super::Credential {
+                kind: super::CredentialKind::GithubApp,
+                value: std::sync::Arc::new(super::Secret::new("ghs_Fresh0123456789".to_owned())),
+                expires_at_ms: Some(1),
+            }],
+            identity: None,
+            hosts: vec![super::HostEntry {
+                host: Some(super::HostName::normalise("git.example.org").expect("test host")),
+                kind: super::HostKind::Forgejo,
+                allow_private,
+                approved_ips: ips.iter().map(|t| ip(t)).collect(),
+                credential: None,
+            }],
+        }
+    }
+
+    fn private_addr(last: u8) -> String {
+        format!("{}.{}.{}.{last}", 10, 0, 0)
+    }
+
+    #[test]
+    fn a_refresh_that_turns_allow_private_on_is_refused() {
+        let held = with_hosts(false, &[]);
+        let fresh = with_hosts(true, &[]);
+        assert_eq!(
+            held.refreshed(&fresh).err(),
+            Some(CredentialFailure::Malformed)
+        );
+    }
+
+    #[test]
+    fn a_refresh_that_adds_an_approved_address_is_refused() {
+        let (a, b) = (private_addr(1), private_addr(2));
+        let held = with_hosts(true, &[&a]);
+        let wider = [
+            vec![a.clone(), b.clone()],
+            vec![b],
+            vec![a.clone(), "fd00::1".to_owned()],
+            vec![format!("::ffff:{a}")],
+        ];
+        for ips in wider {
+            let refs: Vec<&str> = ips.iter().map(String::as_str).collect();
+            let fresh = with_hosts(true, &refs);
+            assert_eq!(
+                held.refreshed(&fresh).err(),
+                Some(CredentialFailure::Malformed),
+                "{ips:?}"
+            );
+        }
+        let empty = with_hosts(true, &[]);
+        let fresh = with_hosts(true, &[&a]);
+        assert!(empty.refreshed(&fresh).is_err());
+    }
+
+    #[test]
+    fn a_refresh_that_clears_or_shrinks_the_policy_is_applied() {
+        let (a, b) = (private_addr(1), private_addr(2));
+        let held = with_hosts(true, &[&a, &b]);
+        let shrunk = with_hosts(true, &[&b]);
+        let applied = held.refreshed(&shrunk).expect("subset");
+        assert_eq!(applied.hosts[0].approved_ips, vec![ip(&b)]);
+        assert!(applied.hosts[0].allow_private);
+        let cleared = with_hosts(false, &[]);
+        let applied = held.refreshed(&cleared).expect("narrowed");
+        assert!(!applied.hosts[0].allow_private);
+        assert_eq!(applied.hosts[0].approved_ips.len(), 0);
+    }
+
+    #[test]
+    fn a_refresh_with_an_equal_policy_is_applied_in_any_order() {
+        let (a, b) = (private_addr(1), private_addr(2));
+        let held = with_hosts(true, &[&a, &b]);
+        for ips in [vec![&a, &b], vec![&b, &a], vec![&a, &b, &a]] {
+            let refs: Vec<&str> = ips.iter().map(|s| s.as_str()).collect();
+            let fresh = with_hosts(true, &refs);
+            assert!(held.refreshed(&fresh).is_ok(), "{ips:?}");
+        }
+        let none = with_hosts(false, &[]);
+        assert!(none.refreshed(&with_hosts(false, &[])).is_ok());
+    }
 
     #[test]
     fn from_status_maps_each_code_and_message_pair() {
