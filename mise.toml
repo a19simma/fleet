@@ -10,6 +10,12 @@ components = "rustfmt,clippy"
 description = "Run the built fleet CLI with FLEET_SERVER_URL and FLEET_CLIENT_TOKEN from fnox"
 run = "fnox exec -- target/debug/fleet"
 
+[tasks."fleet:agent"]
+description = "Run the built fleet CLI as the claude service user, with FLEET_AGENT_TOKEN from fnox as the client token"
+run = """
+fnox exec -- sh -c 'FLEET_CLIENT_TOKEN="$FLEET_AGENT_TOKEN" exec target/debug/fleet "$@"' sh
+"""
+
 [tasks."it:linux"]
 description = "Run the fleetd uid and directory suite in a Linux container (needs docker or colima)"
 run = "cargo nextest run -p fleetd --test linux_uid --run-ignored only"
