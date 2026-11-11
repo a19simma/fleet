@@ -135,8 +135,13 @@ impl Tally {
     /// Folds the run entries under `key`. A run is `completed` with a `conclusion`, `in_progress`
     /// or one of the queued words. Any other `status`, and a completed run without a string
     /// `conclusion`, is [`ForgeError::Malformed`].
-    pub(crate) fn add_runs(&mut self, body: &Value, key: &str) -> Result<(), ForgeError> {
-        for run in entries(body, key)? {
+    pub(crate) fn add_runs(
+        &mut self,
+        body: &Value,
+        key: &str,
+        totals: Totals,
+    ) -> Result<(), ForgeError> {
+        for run in entries(body, key, totals)? {
             let rank = match run.get("status").and_then(Value::as_str) {
                 Some("completed") => match run.get("conclusion").and_then(Value::as_str) {
                     Some("success") => Rank::Success,
@@ -165,17 +170,35 @@ impl Tally {
     }
 }
 
-/// The array under `key`, failing closed when `total_count` says the page holds fewer entries
-/// than exist.
-pub(crate) fn entries<'a>(body: &'a Value, key: &str) -> Result<&'a [Value], ForgeError> {
+/// Whether a reply must carry a `total_count`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Totals {
+    /// A missing or non-count `total_count` is [`ForgeError::Malformed`].
+    Required,
+    /// A missing or non-count `total_count` is ignored.
+    Optional,
+}
+
+/// The array under `key`, failing closed when `total_count` says the page holds fewer entries than
+/// exist, and, under [`Totals::Required`], when it is missing or not an unsigned integer.
+pub(crate) fn entries<'a>(
+    body: &'a Value,
+    key: &str,
+    totals: Totals,
+) -> Result<&'a [Value], ForgeError> {
     let list = body
         .get(key)
         .and_then(Value::as_array)
         .ok_or(ForgeError::Malformed)?;
-    let incomplete = body
-        .get("total_count")
-        .and_then(Value::as_u64)
-        .is_some_and(|total| total > list.len() as u64);
+    let total = body.get("total_count");
+    let incomplete = match (totals, total) {
+        (Totals::Required, found) => {
+            found.and_then(Value::as_u64).ok_or(ForgeError::Malformed)? > list.len() as u64
+        }
+        (Totals::Optional, found) => found
+            .and_then(Value::as_u64)
+            .is_some_and(|count| count > list.len() as u64),
+    };
     if incomplete {
         return Err(ForgeError::Malformed);
     }

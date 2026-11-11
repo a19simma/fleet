@@ -29,7 +29,7 @@ use std::fmt;
 
 use serde_json::{Value, json};
 
-use crate::ci::{Rank, Tally, entries, valid_sha};
+use crate::ci::{Rank, Tally, Totals, entries, valid_sha};
 use crate::git::{ref_name, run};
 use crate::{
     CiCheck, ForgeApi, ForgeError, ForgeGit, Git, GitOp, Http, HttpError, HttpRequest,
@@ -247,7 +247,7 @@ fn status_list(body: &Value) -> Result<&[Value], ForgeError> {
 /// The entries under `key` of a page requested with [`PAGE_LIMIT`]. A page at the limit may have
 /// a successor, so it fails closed.
 fn bounded<'a>(body: &'a Value, key: &str) -> Result<&'a [Value], ForgeError> {
-    let list = entries(body, key)?;
+    let list = entries(body, key, Totals::Optional)?;
     if list.len() >= PAGE_LIMIT {
         return Err(ForgeError::Malformed);
     }
@@ -283,7 +283,7 @@ impl<H: Http, G: Send + Sync> GiteaForge<H, G> {
             let path = format!("{base}/actions/runs?head_sha={sha}&page=1&limit={PAGE_LIMIT}");
             let body = self.get_json(repo, path, token).await?;
             bounded(&body, "workflow_runs")?;
-            tally.add_runs(&body, "workflow_runs")?;
+            tally.add_runs(&body, "workflow_runs", Totals::Optional)?;
         } else {
             tally.add_commit_statuses(statuses)?;
         }

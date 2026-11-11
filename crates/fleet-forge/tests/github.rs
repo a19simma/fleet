@@ -800,6 +800,61 @@ async fn ci_result_refuses_malformed_check_data() -> TestResult {
     Ok(())
 }
 
+const BAD_TOTALS: [&str; 7] = [
+    "",
+    r#""total_count":null,"#,
+    r#""total_count":"1","#,
+    r#""total_count":-1,"#,
+    r#""total_count":1.5,"#,
+    r#""total_count":18446744073709551616,"#,
+    r#""total_count":true,"#,
+];
+
+#[tokio::test]
+async fn ci_result_refuses_a_total_count_that_is_not_a_count() -> TestResult {
+    let target = target()?;
+    for total in BAD_TOTALS {
+        let body = format!(r#"{{{total}"check_runs":[{{"status":"queued"}}]}}"#);
+        let script = Script::default()
+            .reply(200, &pull("abc123"))
+            .reply(200, &body);
+        let got = forge(&script).ci_result(&target, PR_URL).await;
+        assert_eq!(got.err(), Some(ForgeError::Malformed), "runs {body}");
+        let body = format!(r#"{{{total}"statuses":[{{"state":"success"}}]}}"#);
+        let script = Script::default()
+            .reply(200, &pull("abc123"))
+            .reply(200, &runs(&[]))
+            .reply(200, &body);
+        let got = forge(&script).ci_result(&target, PR_URL).await;
+        assert_eq!(got.err(), Some(ForgeError::Malformed), "statuses {body}");
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn ci_result_accepts_a_total_count_that_covers_the_page() -> TestResult {
+    let target = target()?;
+    let exact = r#"{"total_count":1,"check_runs":[{"status":"queued"}]}"#;
+    let script = Script::default()
+        .reply(200, &pull("abc123"))
+        .reply(200, exact)
+        .reply(404, "{}");
+    assert_eq!(
+        forge(&script).ci_result(&target, PR_URL).await,
+        Ok(CiResult::Queued)
+    );
+    let empty = r#"{"total_count":0,"check_runs":[]}"#;
+    let script = Script::default()
+        .reply(200, &pull("abc123"))
+        .reply(200, empty)
+        .reply(200, &statuses(&["success"]));
+    assert_eq!(
+        forge(&script).ci_result(&target, PR_URL).await,
+        Ok(CiResult::Success)
+    );
+    Ok(())
+}
+
 #[tokio::test]
 async fn ci_result_refuses_a_pull_without_a_usable_head() -> TestResult {
     let target = target()?;
