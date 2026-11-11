@@ -13,7 +13,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use fleet_core::credential::CredentialKind;
+use fleet_core::credential::{CredentialKind, GITHUB_HOST};
 use fleet_proto::CredentialNotice;
 use fleet_proto::v1::{DeleteCredentialRequest, PutCredentialRequest, VerifyCredentialRequest};
 use sqlx::PgPool;
@@ -150,8 +150,8 @@ async fn host_names(web: &Backend) -> Result<Vec<String>> {
         .collect())
 }
 
-/// The put form: kind, host and value. The host select lists every registered host after the
-/// `github.com` default, and the service decides which kind fits which host.
+/// The put form: kind, host and value. The host select lists every registered host except
+/// `github.com`, which the empty-valued default option already stands for, and the service decides which kind fits which host.
 #[component]
 async fn put_form(csrf: &str, hosts: &[String]) -> Result<impl View> {
     Ok(view! {
@@ -169,7 +169,7 @@ async fn put_form(csrf: &str, hosts: &[String]) -> Result<impl View> {
                         <label class="label" for="credential-host">"Host"</label>
                         <select class="select select-sm" id="credential-host" name="host">
                             <option value="">"default (github.com)"</option>
-                            for host in hosts {
+                            for host in hosts.iter().filter(|host| host.as_str() != GITHUB_HOST) {
                                 <option value=(host.as_str())>(host.as_str())</option>
                             }
                         </select>
@@ -335,6 +335,46 @@ async fn verify(cx: &Cx, Form(form): Form<HashMap<String, String>>) -> Result<Se
 #[cfg(test)]
 mod notice_tests {
     use super::*;
+    use topcoat::view::ViewExt;
+
+    async fn host_select(hosts: &[&str]) -> String {
+        let hosts: Vec<String> = hosts.iter().map(|h| (*h).to_owned()).collect();
+        let cx = Cx::default();
+        let handle = view! { cx => put_form(csrf: "tok", hosts: hosts.as_slice()) }
+            .single()
+            .await
+            .expect("view");
+        let html = handle.render(&cx);
+        let start = html.find("id=\"credential-host\"").expect("host select");
+        let select = &html[start
+            ..html[start..]
+                .find("</select>")
+                .map(|e| start + e)
+                .expect("end")];
+        select.to_owned()
+    }
+
+    fn values(select: &str) -> Vec<&str> {
+        select
+            .split("<option value=\"")
+            .skip(1)
+            .map(|o| o.split('"').next().unwrap_or_default())
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn the_host_select_lists_github_com_once_and_keeps_custom_hosts() {
+        let select = host_select(&["github.com", "git.example.test"]).await;
+        assert_eq!(select.matches("github.com").count(), 1);
+        assert_eq!(values(&select), ["", "git.example.test"]);
+    }
+
+    #[tokio::test]
+    async fn the_default_option_posts_an_empty_host() {
+        let select = host_select(&[]).await;
+        assert_eq!(select.matches("github.com").count(), 1);
+        assert_eq!(values(&select), [""]);
+    }
 
     #[test]
     fn a_missing_job_repo_maps_to_no_job_and_other_preconditions_to_no_verifier() {
