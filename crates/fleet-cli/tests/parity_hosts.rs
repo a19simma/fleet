@@ -59,7 +59,10 @@ const D_APPROVE_NOT_ADMIN: &str = "the CLI approve-private gets the server NOT_F
 const D_ADMIN_ONLY_PRIVATE: &str = "the CLI prints its fixed admin-only text; the web page answers 404, never 403, and makes no service call";
 const D_REQUESTS_HIDDEN: &str = "the CLI prints its fixed admin-only text; the web page lists the hosts and leaves the pending requests out for a non-admin";
 const D_HOSTILE_APPROVE: &str = "the CLI refuses a hostile host with a usage error before any request; the web form refuses it with the fixed unknown-host notice, the notice the service gives";
+const D_OVER_CAP_RAW: &str = "the CLI counts the raw address arguments against the cap and refuses with a usage error before any request; the web form dedups before the cap and approves (gap: web/hosts.rs is outside this slice, see .ralph/slices.md FUP-15)";
 const D_NOT_ADMIN: &str = "the CLI prints its fixed admin-only text; fleet-proto has no notice for it, so the web page answers 403";
+const AT_CAP: &[&str] = &[PRIVATE_IP; fleet_proto::MAX_HOST_APPROVED_IPS];
+const OVER_CAP: &[&str] = &[PRIVATE_IP; fleet_proto::MAX_HOST_APPROVED_IPS + 1];
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum Outcome {
@@ -92,6 +95,7 @@ impl Outcome {
 enum Class {
     Same,
     Differs(&'static str, &'static str, &'static str),
+    Gap(&'static str, &'static str, &'static str),
 }
 
 #[derive(Clone, Copy)]
@@ -266,6 +270,30 @@ fn approve_rows(hostile: &'static str) -> Vec<Row> {
                 Act::Approve(FORGE, PRIVATE),
                 true,
                 Class::Same,
+            )
+        },
+        Row {
+            seed: &[FORGE],
+            pending: PRIVATE,
+            resolves: PRIVATE,
+            ..row(
+                "approve/at_cap_with_duplicates",
+                "approve-private",
+                Act::Approve(FORGE, AT_CAP),
+                true,
+                Class::Same,
+            )
+        },
+        Row {
+            seed: &[FORGE],
+            pending: PRIVATE,
+            resolves: PRIVATE,
+            ..row(
+                "approve/over_cap_raw",
+                "approve-private",
+                Act::Approve(FORGE, OVER_CAP),
+                true,
+                Class::Gap(D_OVER_CAP_RAW, "usage", "notice:host_approved"),
             )
         },
         Row {
@@ -816,6 +844,9 @@ async fn every_row_has_one_classification_and_holds(pool: PgPool) {
                     && cli.label() == want_cli
                     && web.label() == want_web
                     && after_cli == after_web
+            }
+            Class::Gap(why, want_cli, want_web) => {
+                !why.is_empty() && cli != web && cli.label() == want_cli && web.label() == want_web
             }
         };
         if !ok {

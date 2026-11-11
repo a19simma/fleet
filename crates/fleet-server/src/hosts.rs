@@ -21,11 +21,11 @@ use fleet_core::host::{Host, HostKind, HostName};
 use fleet_forge::{
     ForgeApi, ForgeError, GiteaForge, Http, HttpError, HttpRequest, HttpResponse, REPO_CHECK_BUDGET,
 };
-use fleet_proto::Reason;
 use fleet_proto::v1::{
     AddHostRequest, ApproveHostPrivateRequest, HostInfo, HostRequestInfo, ListHostRequestsReply,
     ListHostsReply, RemoveHostReply, RemoveHostRequest, RevokeHostPrivateRequest,
 };
+use fleet_proto::{MAX_HOST_APPROVED_IPS, Reason};
 use sqlx::{PgPool, Row};
 use tokio::sync::Semaphore;
 use tokio::time::timeout;
@@ -33,8 +33,7 @@ use tonic::Status;
 
 use crate::cred::https::{FetchError, ForgeGet, ForgeReply, ForgeTransport, TlsError};
 use crate::cred::pinned::{
-    Dial, MAX_ADDRESSES, PinnedHttps, Resolve, SystemResolver, TcpDial, is_dns_host,
-    is_private_range, vet_all,
+    Dial, PinnedHttps, Resolve, SystemResolver, TcpDial, is_dns_host, is_private_range, vet_all,
 };
 use crate::cred::repo_limit::{CheckLimiter, MAX_CONCURRENT_REPO_CHECKS};
 
@@ -117,7 +116,7 @@ const STALE_REPOS: &str = "UPDATE user_repos SET verified_at = to_timestamp(0) W
 /// The set must hold at least one RFC 1918 or unique-local address and every address must pass
 /// [`vet_all`] with the private ones approved. Loopback, link-local, metadata, CGNAT, multicast,
 /// NAT64, 6to4 and every other range the address rule refuses fail the whole set. An empty set,
-/// a set over [`MAX_ADDRESSES`] and a set with no private address have nothing to approve.
+/// a set over [`crate::cred::pinned::MAX_ADDRESSES`] and a set with no private address have nothing to approve.
 #[must_use]
 pub fn private_grant(resolved: &[IpAddr]) -> Option<Vec<IpAddr>> {
     let private = canonical_set(
@@ -724,8 +723,10 @@ impl HostStore {
     }
 }
 
+/// Parses the named address list. The raw count is checked against
+/// [`MAX_HOST_APPROVED_IPS`] before duplicates are dropped, as the CLI does.
 fn parse_named(named: &[String]) -> Option<Vec<IpAddr>> {
-    if named.len() > MAX_ADDRESSES {
+    if named.len() > MAX_HOST_APPROVED_IPS {
         return None;
     }
     let parsed: Result<Vec<IpAddr>, _> = named.iter().map(|text| text.parse::<IpAddr>()).collect();
