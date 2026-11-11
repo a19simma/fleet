@@ -1434,6 +1434,25 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn an_admitted_host_redirecting_to_another_host_is_refused_before_any_request_to_it() {
+        let handler: Handler =
+            Arc::new(|_| response("302 Found", &[("location", "https://b.example.test/")], b""));
+        let server = serve(handler).await;
+        let resolver = Arc::new(Fake::new(vec![public()]));
+        let policy = FetchPolicy::Allowlist(vec![HostPattern::parse("c.example.test").unwrap()]);
+        let f = fetcher(&server, &resolver, policy, caps());
+        let a = repo("a.example.test", &[]);
+        assert_eq!(
+            run_for(&f, "https://a.example.test/", Some(&a)).await,
+            Err(FetchError::HostNotPermitted)
+        );
+        assert_eq!(resolver.queries(), vec!["a.example.test".to_owned()]);
+        let snis: Vec<_> = server.seen().into_iter().map(|(sni, _)| sni).collect();
+        assert_eq!(snis, vec![Some("a.example.test".to_owned())]);
+        assert_eq!(server.local.dialed().len(), 1);
+    }
+
+    #[tokio::test]
     async fn bad_urls_are_refused_before_any_lookup() {
         let server = serve(text("x")).await;
         let resolver = Arc::new(Fake::new(vec![public()]));

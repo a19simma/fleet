@@ -94,6 +94,7 @@ mod kimi;
 mod preflight;
 pub mod timing;
 mod token;
+pub(crate) use token::is_legacy_github_host;
 
 pub use preflight::{
     InstallFuture, PreflightError, TOOL_PREFLIGHT_FAILED, ToolInstaller, ToolPreflight,
