@@ -1,8 +1,9 @@
 //! The Gitea and Forgejo adapter of [`ForgeApi`]: REST over the injected [`Http`] seam.
 //!
 //! `identify` probes `GET /api/v1/version` on the host itself. The probe carries no credential
-//! and the reply is read as a closed version document. The other operations land in a later task
-//! and refuse with [`ForgeError::Unavailable`] until then.
+//! and the reply is read as a closed version document. `verify` reads `GET /api/v1/repos/{o}/{r}`
+//! with `Authorization: token` for the repository's own host and follows no redirect. The other
+//! operations land in a later task and refuse with [`ForgeError::Unavailable`] until then.
 
 use std::fmt;
 use std::future::Future;
@@ -13,8 +14,8 @@ use fleet_core::host::{HostKind, HostName};
 use serde_json::Value;
 
 use crate::{
-    ForgeApi, ForgeError, Http, HttpError, HttpRequest, MAX_BODY_BYTES, Method, PushTarget,
-    RepoAccess, Verified,
+    ForgeApi, ForgeError, Http, HttpError, HttpRequest, MAX_BODY_BYTES, Method, Permission,
+    PushTarget, RepoAccess, RepoRef, Verified,
 };
 
 const VERSION_PATH: &str = "/api/v1/version";
@@ -48,6 +49,12 @@ const fn map_http(error: HttpError) -> ForgeError {
         HttpError::BodyTooLarge => ForgeError::TooLarge,
         HttpError::HostRefused => ForgeError::Rejected,
     }
+}
+
+/// The repository path. [`RepoRef::new`] already limits both names to 100 bytes of ASCII letters,
+/// digits, `.`, `_` and `-`, never `.` or `..`, so they hold no separator or control byte.
+fn repo_path(repo: &RepoRef) -> String {
+    format!("/api/v1/repos/{}/{}", repo.owner(), repo.repo())
 }
 
 /// Whether `body` is the closed version document: a JSON object whose only key is `version`,
@@ -98,11 +105,51 @@ impl<H: Http> ForgeApi for GiteaForge<H> {
         }
     }
 
-    fn verify(
-        &self,
-        _access: &RepoAccess,
-    ) -> impl Future<Output = Result<Verified, ForgeError>> + Send {
-        std::future::ready(Err(ForgeError::Unavailable))
+    async fn verify(&self, access: &RepoAccess) -> Result<Verified, ForgeError> {
+        let (repo, token) = access.bind()?;
+        let response = self
+            .http
+            .send(HttpRequest {
+                method: Method::Get,
+                host: repo.host().clone(),
+                path: repo_path(repo),
+                headers: vec![
+                    ("Accept".to_owned(), "application/json".to_owned()),
+                    ("User-Agent".to_owned(), USER_AGENT.to_owned()),
+                    (
+                        "Authorization".to_owned(),
+                        format!("token {}", token.expose()),
+                    ),
+                ],
+                body: Vec::new(),
+            })
+            .await
+            .map_err(map_http)?;
+        if response.body.len() > MAX_BODY_BYTES {
+            return Err(ForgeError::TooLarge);
+        }
+        match response.status {
+            200 => {}
+            300..=399 => return Err(ForgeError::Redirected),
+            401 | 403 | 404 => return Err(ForgeError::NotFound),
+            429 | 500..=599 => return Err(ForgeError::Unavailable),
+            400..=499 => return Err(ForgeError::Rejected),
+            _ => return Err(ForgeError::Malformed),
+        }
+        let body: Value =
+            serde_json::from_slice(&response.body).map_err(|_| ForgeError::Malformed)?;
+        if !body.is_object() {
+            return Err(ForgeError::Malformed);
+        }
+        let push = match body.get("permissions") {
+            None | Some(Value::Null) => Permission::Unknown,
+            Some(permissions) => match permissions.get("push") {
+                Some(Value::Bool(true)) => Permission::Granted,
+                Some(Value::Bool(false)) => Permission::Denied,
+                _ => return Err(ForgeError::Malformed),
+            },
+        };
+        Ok(Verified { push })
     }
 
     fn create_pr(
