@@ -13,6 +13,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use fleet_core::Redactor;
+use fleet_core::host::HostName;
 use sha2::{Digest, Sha256};
 use tokio::io::AsyncReadExt;
 use tokio::process::Command;
@@ -101,6 +102,31 @@ impl RepoPolicy {
     pub fn with_token_host(mut self, host: Option<String>) -> Self {
         self.token_host = host.filter(|h| self.allows_host(h));
         self
+    }
+
+    /// Admits the Job repository host the server named and makes it the one host whose
+    /// credential prompts get the token, so the Job's token goes to that host and to no
+    /// other. A host that is not a normalised host name admits nothing and clears the token
+    /// host, so the policy fails closed.
+    #[must_use]
+    pub fn with_job_host(mut self, host: &str) -> Self {
+        let named = HostName::normalise(host)
+            .ok()
+            .filter(|name| name.as_str() == host);
+        let Some(name) = named else {
+            self.token_host = None;
+            return self;
+        };
+        if !self.allows_host(name.as_str()) {
+            self.hosts.push(name.as_str().to_owned());
+        }
+        self.token_host = Some(name.as_str().to_owned());
+        self
+    }
+
+    /// Keeps only `host` as an allowed host.
+    pub(crate) fn restrict_to(&mut self, host: &str) {
+        self.hosts.retain(|h| h.eq_ignore_ascii_case(host));
     }
 
     /// The host whose credential prompts get the token, if any.
@@ -391,6 +417,14 @@ impl Workspace {
     ) -> Self {
         self.credential = None;
         self.token_source = Some((askpass_bin.into(), source));
+        self
+    }
+
+    /// Admits the Job repository host the server named and makes it the token host of this
+    /// workspace. See [`RepoPolicy::with_job_host`].
+    #[must_use]
+    pub fn with_job_host(mut self, host: &str) -> Self {
+        self.policy = self.policy.with_job_host(host);
         self
     }
 

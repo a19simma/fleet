@@ -71,7 +71,7 @@ use tonic::{Code, Status};
 
 use crate::agent_config::{Bundle, JUDGE_PROTOCOL, JobDir, protocol_for};
 use crate::askpass;
-use crate::cred::CredentialBook;
+use crate::cred::{CredentialBook, JobCredentials};
 use crate::env_setup::{ERR_SETUP, EnvSetup, PHASE_SETUP};
 use crate::feed::Feed;
 use crate::fetch_service::FeedBook;
@@ -86,6 +86,7 @@ use crate::profile_apply::{self, Applied, LoadError};
 use crate::publish::{GH_CONFIG_DIR, HOME_DIR, JobPublish, Published};
 use crate::telemetry::Terminal as Ending;
 use crate::toolhook::HookHub;
+use fleet_core::host::HostKind;
 use fleet_core::model_allowlist::ModelAllowlist;
 mod ci;
 mod codex;
@@ -827,6 +828,47 @@ struct Carry {
 }
 
 impl<R: Reporter> AgentRunner<R> {
+    /// The git host `held` was issued for and the kind of its entry, the one host whose
+    /// credential prompts get a token.
+    ///
+    /// A reply that names hosts carries exactly one, the Job repository host: a Forgejo host
+    /// is the host itself, a `github.com` entry is the policy token host when it is that host.
+    /// A reply that names none, or no held credential, takes the policy token host as a GitHub
+    /// host. A file repository entry has no host and gets none.
+    pub(crate) fn job_token_host<'a>(
+        &'a self,
+        held: Option<&'a JobCredentials>,
+    ) -> Option<(&'a str, HostKind)> {
+        let policy = self.config.repo_policy.token_host();
+        let Some(held) = held.filter(|h| !h.hosts().is_empty()) else {
+            return policy.map(|host| (host, HostKind::Github));
+        };
+        let entry = held.hosts().first()?;
+        let name = entry.host()?;
+        match entry.kind() {
+            HostKind::Github => policy
+                .filter(|host| host.eq_ignore_ascii_case(name))
+                .map(|host| (host, HostKind::Github)),
+            HostKind::Forgejo => Some((name, HostKind::Forgejo)),
+        }
+    }
+
+    /// The Job repository host and the token `held` carries for it. A Forgejo token goes to a git
+    /// child only, so a `gh` child gets none.
+    pub(crate) fn job_token<'a>(
+        &'a self,
+        held: Option<&'a JobCredentials>,
+        gh: bool,
+    ) -> Option<(&'a str, Option<&'a str>)> {
+        let (host, kind) = self.job_token_host(held)?;
+        let token = match (kind, held) {
+            (HostKind::Github, Some(held)) => held.github_str(),
+            (HostKind::Forgejo, Some(held)) if !gh => held.token_str_for(host),
+            _ => None,
+        };
+        Some((host, token))
+    }
+
     /// A runner that reports through `reporter` and redacts with `redactor`.
     pub fn new(config: RunConfig, reporter: R, redactor: Redactor) -> Self {
         Self {
@@ -1979,7 +2021,9 @@ impl<R: Reporter> AgentRunner<R> {
                 .envs(askpass::env(&self.config.askpass_bin))
                 .env(
                     askpass::HOST_ENV,
-                    self.config.repo_policy.token_host().unwrap_or_default(),
+                    self.job_token_host(leased.as_ref().map(|(held, _)| held.as_ref()))
+                        .map(|(host, _)| host)
+                        .unwrap_or_default(),
                 ),
             Scope::Gh(_) => command
                 .envs(token_host.map(|host| ("GH_HOST", host)))

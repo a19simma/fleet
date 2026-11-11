@@ -2149,6 +2149,121 @@ impl FleetWorker for MintStub {
     }
 }
 
+const FORGEJO_HOST: &str = "git.example.org";
+const FORGEJO_REPO: &str = "https://git.example.org/o/x.git";
+const FORGEJO_PAT: &str = "0123456789abcdef0123456789abcdef01234567";
+
+struct HostStub(fleet_proto::v1::JobHostCredential);
+
+fn forgejo_entry(host: &str) -> fleet_proto::v1::JobHostCredential {
+    fleet_proto::v1::JobHostCredential {
+        host: host.into(),
+        host_kind: "forgejo".into(),
+        allow_private: false,
+        approved_ips: Vec::new(),
+        credential: Some(JobCredential {
+            kind: "forgejo_pat".into(),
+            shape: "static_secret".into(),
+            value: FORGEJO_PAT.into(),
+            expires_at_ms: None,
+            git_identity: None,
+        }),
+    }
+}
+
+async fn forgejo_agent(
+    rig: &Rig,
+    host: &str,
+) -> Result<
+    (AgentRunner<Fake>, mpsc::UnboundedReceiver<ReportJobRequest>),
+    Box<dyn std::error::Error>,
+> {
+    let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0)).await?;
+    let url = format!("http://{}", listener.local_addr()?);
+    tokio::spawn(
+        tonic::transport::Server::builder()
+            .add_service(FleetWorkerServer::new(HostStub(forgejo_entry(host))))
+            .serve_with_incoming(tokio_stream::wrappers::TcpListenerStream::new(listener)),
+    );
+    let book = Arc::new(CredentialBook::new(CredentialClient::new(
+        fleetd::poller::channel(&url)?,
+        "cred-test-token-0123456789",
+    )?));
+    book.fetch("job1", 1, "boxa").await?;
+    let (agent, rx) = agent_with_policy(
+        rig,
+        PathBuf::from(env!("CARGO_BIN_EXE_fleetd")),
+        RepoPolicy::new(["github.com"]),
+    );
+    Ok((agent.with_credentials(book), rx))
+}
+
+#[tonic::async_trait]
+impl FleetWorker for HostStub {
+    async fn claim_job(
+        &self,
+        _: tonic::Request<ClaimJobRequest>,
+    ) -> Result<tonic::Response<ClaimJobReply>, Status> {
+        Err(Status::unimplemented("unused"))
+    }
+
+    async fn get_profile_blob(
+        &self,
+        _: tonic::Request<GetProfileBlobRequest>,
+    ) -> Result<tonic::Response<GetProfileBlobReply>, Status> {
+        Err(Status::unimplemented("unused"))
+    }
+
+    async fn get_job_transcript(
+        &self,
+        _: tonic::Request<GetJobTranscriptRequest>,
+    ) -> Result<tonic::Response<GetJobTranscriptReply>, Status> {
+        Err(Status::unimplemented("unused"))
+    }
+
+    async fn get_job_environment(
+        &self,
+        _: tonic::Request<fleet_proto::v1::GetJobEnvironmentRequest>,
+    ) -> Result<tonic::Response<fleet_proto::v1::GetJobEnvironmentReply>, Status> {
+        Err(Status::unimplemented("get_job_environment"))
+    }
+
+    async fn get_job_credentials(
+        &self,
+        _: tonic::Request<GetJobCredentialsRequest>,
+    ) -> Result<tonic::Response<GetJobCredentialsReply>, Status> {
+        Ok(tonic::Response::new(GetJobCredentialsReply {
+            credentials: vec![stub_credential(
+                "anthropic_api_key",
+                "agent-key-value-0123456789abcdef",
+                None,
+            )],
+            hosts: vec![self.0.clone()],
+        }))
+    }
+
+    async fn report_job(
+        &self,
+        _: tonic::Request<ReportJobRequest>,
+    ) -> Result<tonic::Response<ReportJobReply>, Status> {
+        Err(Status::unimplemented("unused"))
+    }
+
+    async fn report_shell_log(
+        &self,
+        _: tonic::Request<fleet_proto::v1::ReportShellLogRequest>,
+    ) -> Result<tonic::Response<fleet_proto::v1::ReportShellLogReply>, Status> {
+        Err(Status::unimplemented("unused"))
+    }
+
+    async fn report_timing(
+        &self,
+        _: tonic::Request<fleet_proto::v1::ReportTimingRequest>,
+    ) -> Result<tonic::Response<fleet_proto::v1::ReportTimingReply>, Status> {
+        Err(Status::unimplemented("unused"))
+    }
+}
+
 #[tokio::test]
 async fn a_token_refresh_refused_during_the_wait_fails_the_job_with_its_reason() -> TestResult {
     common::bounded(Box::pin(async {
@@ -3994,6 +4109,90 @@ async fn a_broker_fetch_refreshes_the_mirror_through_the_forge_and_fails_closed_
         let with = brokered(&rig, &spec, &agent)?;
         let reply = with.handle(fleetd::broker::Request::Fetch {}).await;
         assert_eq!(reply, done("fetched"));
+        Ok(())
+    }))
+    .await
+}
+
+#[tokio::test]
+async fn a_forgejo_job_pushes_to_its_host_with_that_hosts_token_only() -> TestResult {
+    common::bounded(Box::pin(async {
+        let rig = rig("ok").await?;
+        commit(&rig)?;
+        let (agent, _rx) = forgejo_agent(&rig, FORGEJO_HOST).await?;
+        let (_trigger, shutdown) = Shutdown::channel();
+        let mut remote = job(&rig, false);
+        FORGEJO_REPO.clone_into(&mut remote.repo);
+        agent.finish(&remote, &rig.worktree, shutdown).await?;
+        let push = recorded(&rig, "push")?;
+        assert!(
+            push.contains(&format!("FLEETD_ASKPASS_HOST={FORGEJO_HOST}\n")),
+            "{push}"
+        );
+        assert!(
+            push.contains(&format!("GH_TOKEN={FORGEJO_PAT}\n")),
+            "{push}"
+        );
+        assert!(push.contains("GIT_ALLOW_PROTOCOL=https\n"), "{push}");
+        Ok(())
+    }))
+    .await
+}
+
+#[tokio::test]
+async fn a_forgejo_job_never_pushes_to_another_host() -> TestResult {
+    common::bounded(Box::pin(async {
+        let rig = rig("ok").await?;
+        commit(&rig)?;
+        let (agent, mut rx) = forgejo_agent(&rig, FORGEJO_HOST).await?;
+        for repo in [
+            "https://github.com/o/x.git",
+            "https://other.example.org/o/x.git",
+            "https://git.example.org.evil.example/o/x.git",
+            "https://git.example.org@evil.example/o/x.git",
+            "https://git.example.org./o/x.git",
+            "https://git.example.org:8443/o/x.git",
+        ] {
+            let (_trigger, shutdown) = Shutdown::channel();
+            let mut bad = job(&rig, false);
+            repo.clone_into(&mut bad.repo);
+            let outcome = agent.finish(&bad, &rig.worktree, shutdown).await?;
+            assert_eq!(
+                outcome,
+                FinishOutcome::Failed {
+                    error: "git push failed"
+                },
+                "{repo}"
+            );
+            drain(&mut rx);
+        }
+        assert!(!rig.dir.path().join("work").join("git-push.env").exists());
+        Ok(())
+    }))
+    .await
+}
+
+#[tokio::test]
+async fn a_github_job_never_pushes_to_a_forgejo_host() -> TestResult {
+    common::bounded(Box::pin(async {
+        let rig = rig("ok").await?;
+        commit(&rig)?;
+        let (agent, _rx) = agent_with_policy(
+            &rig,
+            PathBuf::from(env!("CARGO_BIN_EXE_fleetd")),
+            RepoPolicy::new(["github.com"]),
+        );
+        let (_trigger, shutdown) = Shutdown::channel();
+        let mut remote = job(&rig, false);
+        FORGEJO_REPO.clone_into(&mut remote.repo);
+        let outcome = agent.finish(&remote, &rig.worktree, shutdown).await?;
+        assert_eq!(
+            outcome,
+            FinishOutcome::Failed {
+                error: "git push failed"
+            }
+        );
+        assert!(!rig.dir.path().join("work").join("git-push.env").exists());
         Ok(())
     }))
     .await

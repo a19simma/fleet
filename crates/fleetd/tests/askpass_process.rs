@@ -50,15 +50,14 @@ fn a_password_prompt_prints_only_the_token() -> TestResult {
 }
 
 #[test]
-fn double_userinfo_prompts_are_answered_because_validate_repo_rejects_both_urls_first() -> TestResult
-{
+fn double_userinfo_and_backslash_prompts_print_nothing_and_fail() -> TestResult {
     for prompt in [
         "Password for 'https://x@evil.com@github.com': ",
         "Password for 'https://evil.com\\@github.com': ",
     ] {
         let out = askpass(prompt, Some(TOKEN))?;
-        assert!(out.status.success(), "{prompt}");
-        assert_eq!(String::from_utf8(out.stdout)?.trim_end(), TOKEN, "{prompt}");
+        assert!(!out.status.success(), "{prompt}");
+        assert!(out.stdout.is_empty(), "{prompt}");
     }
     Ok(())
 }
@@ -133,6 +132,16 @@ fn a_password_prompt_without_a_token_prints_nothing_and_fails() -> TestResult {
 }
 
 fn credential_fill(askpass: &str, marker: bool) -> Result<Output, std::io::Error> {
+    credential_fill_for(askpass, marker, "github.com", "github.com", "")
+}
+
+fn credential_fill_for(
+    askpass: &str,
+    marker: bool,
+    token_host: &str,
+    request_host: &str,
+    request_extra: &str,
+) -> Result<Output, std::io::Error> {
     use std::io::Write;
     use std::process::Stdio;
     let mut command = Command::new("git");
@@ -145,7 +154,7 @@ fn credential_fill(askpass: &str, marker: bool) -> Result<Output, std::io::Error
         .env("GIT_TERMINAL_PROMPT", "0")
         .env("GIT_CONFIG_GLOBAL", "/dev/null")
         .env("GIT_CONFIG_NOSYSTEM", "1")
-        .env("FLEETD_ASKPASS_HOST", "github.com")
+        .env("FLEETD_ASKPASS_HOST", token_host)
         .env("GH_TOKEN", TOKEN)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -158,7 +167,7 @@ fn credential_fill(askpass: &str, marker: bool) -> Result<Output, std::io::Error
         .stdin
         .take()
         .ok_or(std::io::ErrorKind::BrokenPipe)?
-        .write_all(b"protocol=https\nhost=github.com\n\n")?;
+        .write_all(format!("protocol=https\nhost={request_host}\n{request_extra}\n").as_bytes())?;
     let (tx, rx) = std::sync::mpsc::channel();
     std::thread::spawn(move || {
         let _ = tx.send(child.wait_with_output());
@@ -211,5 +220,42 @@ fn the_marker_with_a_second_argument_falls_through_to_the_subcommand() -> TestRe
         .output()?;
     assert!(out.status.success());
     assert_eq!(String::from_utf8(out.stdout)?, "x-access-token\n");
+    Ok(())
+}
+
+#[test]
+fn git_gives_each_host_its_own_token_and_no_host_another_hosts_token() -> TestResult {
+    let bin = env!("CARGO_BIN_EXE_fleetd");
+    for (token_host, request_host, extra, gets_token) in [
+        ("git.example.org", "git.example.org", "", true),
+        ("github.com", "github.com", "", true),
+        ("git.example.org", "github.com", "", false),
+        ("github.com", "git.example.org", "", false),
+        ("git.example.org", "git.example.org.evil.example", "", false),
+        ("git.example.org", "git.example.org:8443", "", false),
+        (
+            "git.example.org",
+            "git.example.org",
+            "username=evil\n",
+            false,
+        ),
+        (
+            "git.example.org",
+            "git.example.org",
+            "username=x-access-token\n",
+            true,
+        ),
+    ] {
+        let out = credential_fill_for(bin, true, token_host, request_host, extra)?;
+        let text = String::from_utf8(out.stdout)?;
+        let label = format!("{token_host} {request_host} {extra:?}");
+        assert_eq!(
+            text.contains(&format!("password={TOKEN}\n")),
+            gets_token,
+            "{label}"
+        );
+        assert_eq!(out.status.success(), gets_token, "{label}");
+        assert!(!String::from_utf8(out.stderr)?.contains(TOKEN), "{label}");
+    }
     Ok(())
 }

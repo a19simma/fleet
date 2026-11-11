@@ -155,8 +155,10 @@ impl<R: Reporter> AgentRunner<R> {
         ]
     }
 
-    /// Puts the GitHub token of `held` into `command`. `held` is the credentials the caller
-    /// leased in the same step, so the token is the one the lease covers.
+    /// Puts the token `held` carries for the Job repository host into `command`. `held` is the
+    /// credentials the caller leased in the same step, so the token is the one the lease covers.
+    ///
+    /// A Forgejo token goes to a git child only. A `gh` child targets GitHub, so it gets none.
     pub(crate) fn apply_github_token(
         &self,
         command: &mut Command,
@@ -166,10 +168,10 @@ impl<R: Reporter> AgentRunner<R> {
         if self.credentials.is_none() {
             return;
         }
-        let Some(host) = self.config.repo_policy.token_host() else {
+        let Some((host, token)) = self.job_token(held, gh) else {
             return;
         };
-        let Some(token) = held.and_then(JobCredentials::github_str).map(str::to_owned) else {
+        let Some(token) = token.map(str::to_owned) else {
             return;
         };
         command.env("GH_TOKEN", &token);
@@ -316,6 +318,7 @@ mod tests {
     use crate::runner::Ctl;
     use crate::runner::ci::{PollStop, Watched};
     use crate::runner::{AgentRunner, Reporter, RunConfig, Scope};
+    use crate::workspace::RepoPolicy;
     use fleet_proto::PRECONDITION_APP_MINT_CAP;
 
     const HOLDER: &str = "holder-pat-0123456789abcdef";
@@ -324,6 +327,8 @@ mod tests {
     const BOX_ENT: &str = "box-ent-0123456789abcdef";
     const BOX_OAUTH: &str = "box-oauth-0123456789abcdef";
     const BOX_KEY: &str = "box-key-0123456789abcdef";
+    const FORGEJO_PAT: &str = "0123456789abcdef0123456789abcdef01234567";
+    const FORGEJO_HOST: &str = "git.example.org";
 
     struct Quiet;
 
@@ -357,6 +362,7 @@ mod tests {
         bool,
         std::sync::atomic::AtomicUsize,
         Option<Status>,
+        Option<(&'static str, &'static str)>,
     );
 
     #[tonic::async_trait]
@@ -421,10 +427,28 @@ mod tests {
             } else {
                 wire("github_pat", HOLDER)
             };
-            Ok(Response::new(GetJobCredentialsReply {
-                credentials: vec![github, wire(self.0, AGENT)],
-                hosts: Vec::new(),
-            }))
+            let hosts = match self.4 {
+                None => Vec::new(),
+                Some((host, kind)) => {
+                    let pat = if kind == "forgejo" {
+                        wire("forgejo_pat", FORGEJO_PAT)
+                    } else {
+                        wire("github_pat", HOLDER)
+                    };
+                    vec![fleet_proto::v1::JobHostCredential {
+                        host: host.into(),
+                        host_kind: kind.into(),
+                        allow_private: false,
+                        approved_ips: Vec::new(),
+                        credential: Some(pat),
+                    }]
+                }
+            };
+            let credentials = match self.4 {
+                Some((_, "forgejo")) => vec![wire(self.0, AGENT)],
+                _ => vec![github, wire(self.0, AGENT)],
+            };
+            Ok(Response::new(GetJobCredentialsReply { credentials, hosts }))
         }
 
         async fn report_job(
@@ -483,6 +507,21 @@ mod tests {
         fixture_full(attach, kind, app, clock, None, None).await
     }
 
+    async fn fixture_hosted(
+        entry: (&'static str, &'static str),
+        token_host: Option<&str>,
+    ) -> Result<Fixture, Box<dyn std::error::Error>> {
+        fixture_built(
+            true,
+            "anthropic_api_key",
+            false,
+            Arc::new(crate::cred::SystemClock),
+            (None, None, Some(entry)),
+            token_host,
+        )
+        .await
+    }
+
     async fn fixture_refusing(
         refusal: Status,
         clock: Arc<dyn crate::cred::Clock>,
@@ -498,11 +537,35 @@ mod tests {
         refusal: Option<Status>,
         revoker: Option<Arc<crate::revoke::Revoker>>,
     ) -> Result<Fixture, Box<dyn std::error::Error>> {
+        fixture_built(attach, kind, app, clock, (refusal, revoker, None), None).await
+    }
+
+    type Extras = (
+        Option<Status>,
+        Option<Arc<crate::revoke::Revoker>>,
+        Option<(&'static str, &'static str)>,
+    );
+
+    async fn fixture_built(
+        attach: bool,
+        kind: &'static str,
+        app: bool,
+        clock: Arc<dyn crate::cred::Clock>,
+        extras: Extras,
+        token_host: Option<&str>,
+    ) -> Result<Fixture, Box<dyn std::error::Error>> {
+        let (refusal, revoker, entry) = extras;
         let listener = TcpListener::bind(("127.0.0.1", 0)).await?;
         let url = format!("http://{}", listener.local_addr()?);
         tokio::spawn(
             tonic::transport::Server::builder()
-                .add_service(FleetWorkerServer::new(Stub(kind, app, 0.into(), refusal)))
+                .add_service(FleetWorkerServer::new(Stub(
+                    kind,
+                    app,
+                    0.into(),
+                    refusal,
+                    entry,
+                )))
                 .serve_with_incoming(TcpListenerStream::new(listener)),
         );
         let mut book =
@@ -523,6 +586,9 @@ mod tests {
             ("ANTHROPIC_API_KEY".into(), BOX_KEY.into()),
         ];
         config.env_passthrough = vec!["ANTHROPIC_API_KEY".into()];
+        if let Some(host) = token_host {
+            config.repo_policy = RepoPolicy::new([host]).with_token_host(Some(host.to_owned()));
+        }
         let mut runner = AgentRunner::new(config, Quiet, Redactor::new([BOX_PAT]));
         if attach {
             runner = runner.with_credentials(Arc::clone(&book));
@@ -1752,5 +1818,72 @@ mod tests {
             [APP_TOKEN, NEW_APP_TOKEN]
         );
         Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_forgejo_push_child_gets_that_hosts_token_and_askpass_host_only()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (runner, _book, dir) =
+            fixture_hosted((FORGEJO_HOST, "forgejo"), Some("github.com")).await?;
+        let env = env_of(&runner, dir.path(), Scope::Push("job1")).await?;
+        assert_eq!(value(&env, "GH_TOKEN"), Some(FORGEJO_PAT));
+        assert_eq!(value(&env, "FLEETD_ASKPASS_HOST"), Some(FORGEJO_HOST));
+        assert!(env.iter().all(|(_, v)| v != BOX_PAT && v != BOX_ENT));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_gh_child_never_gets_a_forgejo_token() -> Result<(), Box<dyn std::error::Error>> {
+        let (runner, _book, dir) =
+            fixture_hosted((FORGEJO_HOST, "forgejo"), Some("github.com")).await?;
+        let env = env_of(&runner, dir.path(), Scope::Gh("job1")).await?;
+        assert_eq!(value(&env, "GH_TOKEN"), None);
+        assert_eq!(value(&env, "GH_ENTERPRISE_TOKEN"), None);
+        assert!(env.iter().all(|(_, v)| v != FORGEJO_PAT));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_github_entry_for_a_host_other_than_the_policy_token_host_gets_no_askpass_host()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (runner, _book, dir) =
+            fixture_hosted(("github.com", "github"), Some("gitlab.com")).await?;
+        let env = env_of(&runner, dir.path(), Scope::Push("job1")).await?;
+        assert_eq!(value(&env, "FLEETD_ASKPASS_HOST"), Some(""));
+        assert_eq!(value(&env, "GH_TOKEN"), None);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_github_entry_for_the_policy_token_host_keeps_the_legacy_token_and_host()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (runner, _book, dir) =
+            fixture_hosted(("github.com", "github"), Some("github.com")).await?;
+        let env = env_of(&runner, dir.path(), Scope::Push("job1")).await?;
+        assert_eq!(value(&env, "GH_TOKEN"), Some(HOLDER));
+        assert_eq!(value(&env, "FLEETD_ASKPASS_HOST"), Some("github.com"));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_reply_with_no_host_entry_takes_the_policy_token_host_as_github()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (runner, _book, dir) = fixture_built_legacy("github.com").await?;
+        let env = env_of(&runner, dir.path(), Scope::Push("job1")).await?;
+        assert_eq!(value(&env, "GH_TOKEN"), Some(HOLDER));
+        assert_eq!(value(&env, "FLEETD_ASKPASS_HOST"), Some("github.com"));
+        Ok(())
+    }
+
+    async fn fixture_built_legacy(host: &str) -> Result<Fixture, Box<dyn std::error::Error>> {
+        fixture_built(
+            true,
+            "anthropic_api_key",
+            false,
+            Arc::new(crate::cred::SystemClock),
+            (None, None, None),
+            Some(host),
+        )
+        .await
     }
 }

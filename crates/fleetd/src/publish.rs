@@ -6,6 +6,7 @@ use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, PoisonError};
 
+use fleet_core::host::HostKind;
 use fleet_forge::{Git, GitCommand, GitError, GitOp, GitOutput, Http};
 use fleet_proto::is_ci_url;
 use fleet_proto::is_swarm_branch;
@@ -18,7 +19,7 @@ use crate::phase::{Phases, elapsed_ms};
 use crate::proc::{CAPTURE_BYTES, CaptureError, Captured};
 use crate::runner::{AgentRunner, Failure, IntoFailure, Reporter, Scope};
 use crate::workspace::{
-    Workspace, is_commit_sha, job_owner, validate_job_id, validate_ref, validate_repo,
+    RepoPolicy, Workspace, is_commit_sha, job_owner, validate_job_id, validate_ref, validate_repo,
 };
 
 const MAX_TITLE_CHARS: usize = 256;
@@ -70,6 +71,24 @@ fn push_argv<'a>(repo: &'a str, refspec: &'a str) -> [&'a str; 14] {
 }
 
 impl<R: Reporter> AgentRunner<R> {
+    /// The repository policy for `job`: the static policy, plus the Forgejo host the held
+    /// credentials were issued for. A Forgejo Job accepts only its own host, so a repository on
+    /// another host stays refused. A Job with no Forgejo entry gets the static policy.
+    pub(crate) fn job_policy(&self, job: &Job) -> RepoPolicy {
+        let held = self
+            .credentials
+            .as_ref()
+            .and_then(|book| book.get(&job.job_id));
+        match self.job_token_host(held.as_deref()) {
+            Some((host, HostKind::Forgejo)) => {
+                let mut forgejo = self.config.repo_policy.clone().with_job_host(host);
+                forgejo.restrict_to(host);
+                forgejo
+            }
+            _ => self.config.repo_policy.clone(),
+        }
+    }
+
     pub(crate) async fn publish(
         &self,
         job: &Job,
@@ -77,7 +96,7 @@ impl<R: Reporter> AgentRunner<R> {
         phases: &mut Phases,
     ) -> Result<Published, Failure> {
         validate_job_id(&job.job_id).map_err(|_| Failure::bare(ERR_COMMITS))?;
-        validate_repo(&job.repo, &self.config.repo_policy).map_err(|_| Failure::bare(ERR_PUSH))?;
+        validate_repo(&job.repo, &self.job_policy(job)).map_err(|_| Failure::bare(ERR_PUSH))?;
         validate_ref(&job.base_ref).map_err(|_| Failure::bare(ERR_COMMITS))?;
         let local = format!("swarm/{}", job.job_id);
         let target = PushTarget::from_job(job)?;
@@ -205,7 +224,7 @@ impl<R: Reporter> AgentRunner<R> {
         cwd: &Path,
     ) -> Result<PushBegin<'a>, Failure> {
         validate_job_id(&job.job_id).map_err(|_| Failure::bare(ERR_COMMITS))?;
-        validate_repo(&job.repo, &self.config.repo_policy).map_err(|_| Failure::bare(ERR_PUSH))?;
+        validate_repo(&job.repo, &self.job_policy(job)).map_err(|_| Failure::bare(ERR_PUSH))?;
         validate_ref(&job.base_ref).map_err(|_| Failure::bare(ERR_COMMITS))?;
         let local = format!("swarm/{}", job.job_id);
         let branch = PushTarget::from_job(job)?.remote_branch();
@@ -238,7 +257,7 @@ impl<R: Reporter> AgentRunner<R> {
         job: &Job,
     ) -> Result<PrBegin<'a>, Failure> {
         validate_job_id(&job.job_id).map_err(|_| Failure::bare(ERR_COMMITS))?;
-        validate_repo(&job.repo, &self.config.repo_policy).map_err(|_| Failure::bare(ERR_PR))?;
+        validate_repo(&job.repo, &self.job_policy(job)).map_err(|_| Failure::bare(ERR_PR))?;
         validate_ref(&job.base_ref).map_err(|_| Failure::bare(ERR_PR))?;
         let target = PushTarget::from_job(job)?;
         let branch = target.remote_branch();

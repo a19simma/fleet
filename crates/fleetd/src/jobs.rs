@@ -26,7 +26,7 @@ use crate::bg_command::{BgConfig, PueueCli};
 use crate::broker::{Broker, MirrorGit};
 use crate::config::Config;
 use crate::connect_proxy::{ConnectProxy, ProxyLimits};
-use crate::cred::{CredentialBook, CredentialClient, ERR_NO_AGENT};
+use crate::cred::{CredentialBook, CredentialClient, ERR_NO_AGENT, JobCredentials};
 use crate::env_launcher::{DEFAULT_RUN_ROOT, SystemdSetupLauncher};
 use crate::env_setup::{
     DEFAULT_BUDGET, ERR_SETUP_UNAVAILABLE, EgressHook, EnvSetup, PHASE_SETUP, SetupLauncher,
@@ -40,6 +40,7 @@ use crate::fetch_service::{FeedBook, FetchRecorder, FetchService, MAX_CONCURRENT
 use crate::forge::{ApiChecks, Forges, HostApi, HostPolicy, JobForge, NoGit, PinnedHttp, repo_ref};
 use crate::jobenv::group_id;
 use crate::jobsock::{JobContext, PerJob, ServeFuture, Service, ServiceName, Services};
+use crate::netguard::{AdmissionError, RepoHostAdmission, RepoHostGuard};
 use crate::poller::{
     GrpcReporter, GrpcTimingTransport, JobRunner, PollRandom, Poller, RunError, SERVER_URL_ENV,
     Shutdown, TOKEN_ENV, TimingReporter, TimingTransport, Token, TokioClock, channel,
@@ -62,6 +63,12 @@ const ERR_WORKSPACE: &str = "workspace could not be prepared";
 const ERR_PREPARE_TIMEOUT: &str = "workspace preparation timed out";
 const ERR_SHUTDOWN: &str = "agent stopped by daemon shutdown";
 const ERR_BROKER: &str = "job broker could not be set up";
+const ERR_REPO_HOST: &str = "repository host refused";
+
+/// Admits one Job repository host in every service that gates egress, and returns the guards
+/// that withdraw it. The runner holds them for the whole Job.
+pub(crate) type RepoHostAdmit =
+    Arc<dyn Fn(&str, RepoHostAdmission) -> Vec<RepoHostGuard> + Send + Sync>;
 
 /// The poller the daemon runs.
 pub(crate) type JobPoller = Poller<TrackedRunner<DaemonRunner<GrpcReporter>>>;
@@ -75,6 +82,7 @@ pub struct DaemonRunner<R> {
     credentials: Option<Arc<CredentialBook>>,
     environment: Option<Arc<EnvironmentClient>>,
     delivery: Option<Arc<EnvDelivery>>,
+    repo_hosts: Option<RepoHostAdmit>,
 }
 
 /// A [`Broker`] with its executor types erased, so one [`PerJob`] registry holds them all.
@@ -135,7 +143,17 @@ impl<R: Reporter + Send + Sync + 'static> DaemonRunner<R> {
             credentials: None,
             environment: None,
             delivery: None,
+            repo_hosts: None,
         }
+    }
+
+    /// Admits the Forgejo repository host a job's credentials name through `admit`, once they
+    /// are held and checked, and withdraws it when the job ends on any path. Without it a
+    /// Forgejo host is admitted nowhere.
+    #[must_use]
+    pub fn with_repo_hosts(mut self, admit: RepoHostAdmit) -> Self {
+        self.repo_hosts = Some(admit);
+        self
     }
 
     /// Fetches the credentials of each job into `book` once its profile is loaded and before
@@ -177,20 +195,41 @@ impl<R: Reporter + Send + Sync + 'static> DaemonRunner<R> {
     /// workspace keeps the credential it was built with.
     fn workspace_for(&self, job: &Job) -> Workspace {
         let workspace = self.workspace.clone().with_owner(job_owner(job));
-        if self.credentials.is_none() {
+        let Some(book) = &self.credentials else {
             return workspace;
-        }
+        };
+        let forgejo = book.get(&job.job_id).and_then(|held| {
+            held.hosts()
+                .first()
+                .filter(|entry| entry.kind() == HostKind::Forgejo)
+                .and_then(|entry| entry.host().map(str::to_owned))
+        });
+        let (workspace, source) = match forgejo {
+            Some(host) => (
+                workspace.with_job_host(&host),
+                self.agent.token_source_for(&job.job_id, &host),
+            ),
+            None => (workspace, self.agent.token_source(&job.job_id)),
+        };
         workspace
-            .with_token_source(
-                self.agent.config.askpass_bin.clone(),
-                self.agent.token_source(&job.job_id),
-            )
+            .with_token_source(self.agent.config.askpass_bin.clone(), source)
             .with_redactor(self.agent.job_redactor(&job.job_id).as_ref().clone())
     }
 
-    async fn fetch_credentials(&self, job: &Job, mut shutdown: Shutdown) -> Result<(), RunError> {
+    /// Holds the job's credentials, checks that they name the job repository host and no other,
+    /// and admits that host when it is a Forgejo host. The returned guards withdraw the
+    /// admission when dropped, so the caller holds them for the whole job.
+    ///
+    /// A reply whose entries do not match the repository host fails the job and revokes the
+    /// held token. A reply with no entries comes from a server that predates them and is not
+    /// checked. A refresh keeps the host set of the first fetch, so it needs no second check.
+    async fn fetch_credentials(
+        &self,
+        job: &Job,
+        mut shutdown: Shutdown,
+    ) -> Result<Vec<RepoHostGuard>, RunError> {
         let Some(book) = &self.credentials else {
-            return Ok(());
+            return Ok(Vec::new());
         };
         let work = book.fetch(&job.job_id, job.attempt, &self.box_name);
         let guarded = tokio::select! {
@@ -207,8 +246,23 @@ impl<R: Reporter + Send + Sync + 'static> DaemonRunner<R> {
                     self.agent.fail_job(job, ERR_NO_AGENT).await;
                     return Err(RunError);
                 }
+                let repo_host = repo_ref(&job.repo).map(|repo| repo.host().as_str().to_owned());
+                if !held.hosts().is_empty()
+                    && let Err(failure) = held.check_job_host(repo_host.as_deref())
+                {
+                    book.end(&job.job_id);
+                    tracing::warn!(reason = failure.reason(), "job credentials refused");
+                    self.agent.fail_job(job, failure.reason()).await;
+                    return Err(RunError);
+                }
+                let Ok(guards) = self.admit_repo_host(&job.job_id, &held) else {
+                    book.end(&job.job_id);
+                    tracing::warn!(reason = ERR_REPO_HOST, "job credentials refused");
+                    self.agent.fail_job(job, ERR_REPO_HOST).await;
+                    return Err(RunError);
+                };
                 self.agent.adopt_credentials(&job.job_id, &held);
-                Ok(())
+                Ok(guards)
             }
             Ok(Err(failure)) => {
                 tracing::warn!(reason = failure.reason(), "job credentials refused");
@@ -221,6 +275,35 @@ impl<R: Reporter + Send + Sync + 'static> DaemonRunner<R> {
             }
             Err(_) => Err(RunError),
         }
+    }
+
+    /// The guards that admit the Forgejo host of `held` in the egress and fetch services. Empty
+    /// for a `github.com` entry, a file repository entry, a reply with no entries and a runner
+    /// with no admit hook.
+    ///
+    /// # Errors
+    ///
+    /// [`AdmissionError`] when the entry is not an admissible host.
+    fn admit_repo_host(
+        &self,
+        job_id: &str,
+        held: &JobCredentials,
+    ) -> Result<Vec<RepoHostGuard>, AdmissionError> {
+        let Some(entry) = held
+            .hosts()
+            .first()
+            .filter(|entry| entry.kind() == HostKind::Forgejo)
+        else {
+            return Ok(Vec::new());
+        };
+        let Some(host) = entry.host() else {
+            return Ok(Vec::new());
+        };
+        let admission = RepoHostAdmission::new(host, entry.allow_private(), entry.approved_ips())?;
+        Ok(self
+            .repo_hosts
+            .as_ref()
+            .map_or_else(Vec::new, |admit| admit(job_id, admission)))
     }
 
     async fn require_setup(
@@ -591,10 +674,13 @@ impl<R: Reporter + Send + Sync + 'static> JobRunner for DaemonRunner<R> {
             self.agent.clear_profile(&job);
             return Err(stop);
         }
-        if let Err(stop) = self.fetch_credentials(&job, shutdown.clone()).await {
-            self.agent.clear_profile(&job);
-            return Err(stop);
-        }
+        let _admitted = match self.fetch_credentials(&job, shutdown.clone()).await {
+            Ok(guards) => guards,
+            Err(stop) => {
+                self.agent.clear_profile(&job);
+                return Err(stop);
+            }
+        };
         let environment = match self.fetch_environment(&job, shutdown.clone()).await {
             Ok(held) => held,
             Err(stop) => {
@@ -728,6 +814,8 @@ pub struct JobServices<R = SystemResolver, D = TcpDialer> {
     pub broker: PerJob<DynBroker>,
     /// The egress proxy behind the `EgressProxy` service.
     pub proxy: Arc<ConnectProxy<R, D>>,
+    /// Admits a Job repository host in the egress proxy and the fetch service.
+    pub admit: RepoHostAdmit,
 }
 
 /// The services every Job socket of this daemon offers, built once and shared by all sockets.
@@ -813,6 +901,16 @@ where
             let proxy = Arc::clone(&proxy);
             move |job_id| proxy.forget(job_id)
         });
+    let admit: RepoHostAdmit = {
+        let fetch = Arc::clone(&fetch);
+        let proxy = Arc::clone(&proxy);
+        Arc::new(move |job_id, admission| {
+            vec![
+                proxy.admit_repo_host(job_id, admission.clone()),
+                fetch.admit_repo_host(job_id, admission),
+            ]
+        })
+    };
     let broker = PerJob::new();
     let jobs_dir = PathBuf::from(&config.jobs_dir);
     let end = end.unregistering(broker.clone()).on_end(move |job_id| {
@@ -828,6 +926,7 @@ where
         end,
         broker,
         proxy,
+        admit,
     }
 }
 
@@ -1044,6 +1143,7 @@ pub(crate) fn build(
     let feeds = Arc::new(FeedBook::default());
     let wired = job_services(config, &feeds);
     let proxy = Arc::clone(&wired.proxy);
+    let admit = Arc::clone(&wired.admit);
     let hosts: HostsHook = Arc::new(move |job_id, hosts| {
         proxy.set_job_hosts(job_id, hosts);
     });
@@ -1082,6 +1182,7 @@ pub(crate) fn build(
     )
     .with_credentials(book)
     .with_environment(environment)
+    .with_repo_hosts(admit)
     .with_broker(wiring);
     if let Some(delivery) = delivery {
         runner = runner.with_delivery(delivery);
@@ -3273,7 +3374,7 @@ mod token_wiring_tests {
         }
     }
 
-    struct Minting(AtomicUsize);
+    struct Minting(AtomicUsize, Option<(&'static str, &'static str)>);
 
     #[tonic::async_trait]
     impl FleetWorker for Minting {
@@ -3335,13 +3436,31 @@ mod token_wiring_tests {
                     if call == 0 { OLD } else { NEW },
                 )
             };
-            Ok(Response::new(GetJobCredentialsReply {
-                credentials: vec![
-                    github,
-                    wire("anthropic_api_key", "agent-key-0123456789abcdef"),
-                ],
-                hosts: Vec::new(),
-            }))
+            let agent = wire("anthropic_api_key", "agent-key-0123456789abcdef");
+            let (credentials, hosts) = match self.1 {
+                None => (vec![github, agent], Vec::new()),
+                Some((host, kind)) => {
+                    let credential = if kind == "forgejo" {
+                        wire("forgejo_pat", FORGEJO_PAT)
+                    } else {
+                        github.clone()
+                    };
+                    let entry = fleet_proto::v1::JobHostCredential {
+                        host: host.into(),
+                        host_kind: kind.into(),
+                        allow_private: false,
+                        approved_ips: Vec::new(),
+                        credential: Some(credential),
+                    };
+                    let credentials = if kind == "forgejo" {
+                        vec![agent]
+                    } else {
+                        vec![github, agent]
+                    };
+                    (credentials, vec![entry])
+                }
+            };
+            Ok(Response::new(GetJobCredentialsReply { credentials, hosts }))
         }
 
         async fn report_job(
@@ -3381,7 +3500,7 @@ mod token_wiring_tests {
         let url = format!("http://{}", listener.local_addr()?);
         tokio::spawn(
             tonic::transport::Server::builder()
-                .add_service(FleetWorkerServer::new(Minting(AtomicUsize::new(0))))
+                .add_service(FleetWorkerServer::new(Minting(AtomicUsize::new(0), None)))
                 .serve_with_incoming(TcpListenerStream::new(listener)),
         );
         let clock = Arc::new(TestClock((EXPIRES_MS - 20 * MINUTE_MS).into()));
@@ -3410,6 +3529,376 @@ mod token_wiring_tests {
     }
 
     const ENV_VALUE: &str = "env-value-0123456789abcdef";
+    const FORGEJO_PAT: &str = "0123456789abcdef0123456789abcdef01234567";
+    const FORGEJO_HOST: &str = "git.example.org";
+    const FORGEJO_REPO: &str = "https://git.example.org/o/r.git";
+
+    async fn hosted<Rep: Reporter + Send + Sync + 'static>(
+        entry: Option<(&'static str, &'static str)>,
+        capture: Rep,
+        admitted: Arc<crate::netguard::RepoHostBook>,
+    ) -> Result<(DaemonRunner<Rep>, Arc<CredentialBook>), Box<dyn std::error::Error>> {
+        hosted_with(entry, capture, admitted, None, None).await
+    }
+
+    async fn hosted_with<Rep: Reporter + Send + Sync + 'static>(
+        entry: Option<(&'static str, &'static str)>,
+        capture: Rep,
+        admitted: Arc<crate::netguard::RepoHostBook>,
+        git: Option<&Path>,
+        policy: Option<RepoPolicy>,
+    ) -> Result<(DaemonRunner<Rep>, Arc<CredentialBook>), Box<dyn std::error::Error>> {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).await?;
+        let url = format!("http://{}", listener.local_addr()?);
+        tokio::spawn(
+            tonic::transport::Server::builder()
+                .add_service(FleetWorkerServer::new(Minting(AtomicUsize::new(0), entry)))
+                .serve_with_incoming(TcpListenerStream::new(listener)),
+        );
+        let book = Arc::new(CredentialBook::new(CredentialClient::new(
+            channel(&url)?,
+            "tok-0123456789",
+        )?));
+        let agent = AgentRunner::new(
+            RunConfig::new("claude", false),
+            capture,
+            Redactor::default(),
+        )
+        .with_job_end(JobEnd::new().on_end(book.end_hook()));
+        let dir = tempfile::TempDir::new()?;
+        let mut workspace = Workspace::new(dir.path().join("jobs"));
+        if let Some(policy) = policy {
+            workspace = workspace.with_policy(policy);
+        }
+        if let Some(git) = git {
+            workspace = workspace.with_git(git, Duration::from_secs(30));
+        }
+        let runner = DaemonRunner::new(workspace, agent, "box")
+            .with_credentials(Arc::clone(&book))
+            .with_repo_hosts(Arc::new(move |id, admission| {
+                vec![admitted.admit(id, admission)]
+            }));
+        Ok((runner, book))
+    }
+
+    fn captured(seen: &Arc<std::sync::Mutex<Vec<ReportJobRequest>>>) -> Vec<Option<String>> {
+        seen.lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .iter()
+            .map(|report| report.error.clone())
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn a_forgejo_job_admits_its_host_for_as_long_as_the_guards_live() -> TestResult {
+        let admitted = Arc::<crate::netguard::RepoHostBook>::default();
+        let (runner, book) = hosted(
+            Some((FORGEJO_HOST, "forgejo")),
+            Capturing(Arc::default()),
+            Arc::clone(&admitted),
+        )
+        .await?;
+        let job = Job {
+            repo: FORGEJO_REPO.into(),
+            ..job()
+        };
+        let (_trigger, shutdown) = Shutdown::channel();
+        let guards = runner
+            .fetch_credentials(&job, shutdown)
+            .await
+            .map_err(|_| "fetch refused")?;
+        assert_eq!(guards.len(), 1);
+        assert_eq!(
+            admitted.get("job1").map(|a| a.host().to_owned()).as_deref(),
+            Some(FORGEJO_HOST)
+        );
+        assert!(book.get("job1").is_some());
+        drop(guards);
+        assert!(admitted.get("job1").is_none());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_reply_for_another_host_than_the_repo_fails_the_job_and_revokes_the_token()
+    -> TestResult {
+        for repo in [
+            "https://github.com/o/r.git",
+            "https://git.example.org.evil.example/o/r.git",
+            "https://other.example.org/o/r.git",
+            "/tmp/r.git",
+        ] {
+            let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+            let admitted = Arc::<crate::netguard::RepoHostBook>::default();
+            let (runner, book) = hosted(
+                Some((FORGEJO_HOST, "forgejo")),
+                Capturing(Arc::clone(&seen)),
+                Arc::clone(&admitted),
+            )
+            .await?;
+            let job = Job {
+                repo: repo.into(),
+                ..job()
+            };
+            let (_trigger, shutdown) = Shutdown::channel();
+            assert!(
+                runner.fetch_credentials(&job, shutdown).await.is_err(),
+                "{repo}"
+            );
+            assert!(book.get("job1").is_none(), "{repo}");
+            assert!(admitted.get("job1").is_none(), "{repo}");
+            assert_eq!(
+                captured(&seen).last().cloned().flatten().as_deref(),
+                Some(crate::cred::CredentialFailure::Malformed.reason()),
+                "{repo}"
+            );
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_github_entry_and_an_empty_host_set_admit_nothing_and_keep_the_credentials()
+    -> TestResult {
+        for entry in [Some(("github.com", "github")), None] {
+            let admitted = Arc::<crate::netguard::RepoHostBook>::default();
+            let (runner, book) =
+                hosted(entry, Capturing(Arc::default()), Arc::clone(&admitted)).await?;
+            let (_trigger, shutdown) = Shutdown::channel();
+            let guards = runner
+                .fetch_credentials(&job(), shutdown)
+                .await
+                .map_err(|_| "fetch refused")?;
+            assert!(guards.is_empty(), "{entry:?}");
+            assert!(admitted.get("job1").is_none(), "{entry:?}");
+            assert!(book.get("job1").is_some(), "{entry:?}");
+        }
+        Ok(())
+    }
+
+    struct Watching(
+        Arc<crate::netguard::RepoHostBook>,
+        Arc<std::sync::Mutex<Vec<bool>>>,
+    );
+
+    impl Reporter for Watching {
+        fn report(
+            &self,
+            _: ReportJobRequest,
+        ) -> impl Future<Output = Result<ReportJobReply, Status>> + Send {
+            self.1
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .push(self.0.get("job1").is_some());
+            std::future::ready(Ok(ReportJobReply::default()))
+        }
+    }
+
+    #[tokio::test]
+    async fn the_admission_outlives_the_credential_step_and_ends_with_a_failed_run() -> TestResult {
+        let admitted = Arc::<crate::netguard::RepoHostBook>::default();
+        let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let (runner, book) = hosted(
+            Some((FORGEJO_HOST, "forgejo")),
+            Watching(Arc::clone(&admitted), Arc::clone(&seen)),
+            Arc::clone(&admitted),
+        )
+        .await?;
+        let job = Job {
+            repo: FORGEJO_REPO.into(),
+            has_environment: true,
+            ..job()
+        };
+        let (_trigger, shutdown) = Shutdown::channel();
+        assert!(runner.run(job, shutdown).await.is_err());
+        let during = seen
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        assert_eq!(during.last(), Some(&true), "{during:?}");
+        assert!(admitted.get("job1").is_none());
+        assert!(book.get("job1").is_none());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn the_admission_outlives_the_environment_step_when_the_workspace_fails_later()
+    -> TestResult {
+        let dir = tempfile::TempDir::new()?;
+        let git = script(dir.path(), "git", "#!/bin/sh\nexit 1\n")?;
+        let admitted = Arc::<crate::netguard::RepoHostBook>::default();
+        let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let (runner, book) = hosted_with(
+            Some((FORGEJO_HOST, "forgejo")),
+            Watching(Arc::clone(&admitted), Arc::clone(&seen)),
+            Arc::clone(&admitted),
+            Some(&git),
+            None,
+        )
+        .await?;
+        let job = Job {
+            repo: FORGEJO_REPO.into(),
+            has_environment: false,
+            ..job()
+        };
+        let (_trigger, shutdown) = Shutdown::channel();
+        assert!(runner.run(job, shutdown).await.is_err());
+        let during = seen
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        assert_eq!(during.last(), Some(&true), "{during:?}");
+        assert!(admitted.get("job1").is_none());
+        assert!(book.get("job1").is_none());
+        Ok(())
+    }
+
+    fn recorder(dir: &Path) -> Result<(PathBuf, PathBuf), std::io::Error> {
+        let log = dir.join("calls");
+        let body = format!(
+            "#!/bin/sh\n{{ echo \"ARGS $*\"; env | sort; echo END; }} >> {}\nexit 0\n",
+            log.display()
+        );
+        Ok((script(dir, "git", &body)?, log))
+    }
+
+    fn fetch_env(
+        log: &Path,
+    ) -> Result<std::collections::BTreeMap<String, String>, Box<dyn std::error::Error>> {
+        let text = std::fs::read_to_string(log)?;
+        let mut current: Option<(String, std::collections::BTreeMap<String, String>)> = None;
+        for line in text.lines() {
+            if let Some(args) = line.strip_prefix("ARGS ") {
+                current = Some((args.to_owned(), std::collections::BTreeMap::new()));
+            } else if line == "END" {
+                if let Some((args, env)) = current.take()
+                    && args.contains(" fetch ")
+                    && args.contains("--prune")
+                {
+                    return Ok(env);
+                }
+            } else if let (Some((_, env)), Some((name, value))) =
+                (current.as_mut(), line.split_once('='))
+            {
+                env.insert(name.to_owned(), value.to_owned());
+            }
+        }
+        Err("no fetch call".into())
+    }
+
+    #[tokio::test]
+    async fn a_forgejo_entry_builds_a_workspace_that_clones_with_that_hosts_token() -> TestResult {
+        let dir = tempfile::TempDir::new()?;
+        let (git, log) = recorder(dir.path())?;
+        let admitted = Arc::<crate::netguard::RepoHostBook>::default();
+        let (runner, _book) = hosted_with(
+            Some((FORGEJO_HOST, "forgejo")),
+            Capturing(Arc::default()),
+            Arc::clone(&admitted),
+            Some(&git),
+            None,
+        )
+        .await?;
+        let job = Job {
+            repo: FORGEJO_REPO.into(),
+            ..job()
+        };
+        let (_trigger, shutdown) = Shutdown::channel();
+        let _guards = runner
+            .fetch_credentials(&job, shutdown)
+            .await
+            .map_err(|_| "fetch refused")?;
+        runner
+            .workspace_for(&job)
+            .fetch_mirror(FORGEJO_REPO)
+            .await?;
+        let env = fetch_env(&log)?;
+        assert_eq!(env["FLEETD_ASKPASS_HOST"], FORGEJO_HOST);
+        assert_eq!(env["GH_TOKEN"], FORGEJO_PAT);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_github_entry_never_sets_a_token_host_when_the_policy_has_none() -> TestResult {
+        let dir = tempfile::TempDir::new()?;
+        let (git, log) = recorder(dir.path())?;
+        let admitted = Arc::<crate::netguard::RepoHostBook>::default();
+        let (runner, _book) = hosted_with(
+            Some(("github.com", "github")),
+            Capturing(Arc::default()),
+            Arc::clone(&admitted),
+            Some(&git),
+            Some(RepoPolicy::new(["github.com"]).with_token_host(None)),
+        )
+        .await?;
+        let (_trigger, shutdown) = Shutdown::channel();
+        let _guards = runner
+            .fetch_credentials(&job(), shutdown)
+            .await
+            .map_err(|_| "fetch refused")?;
+        runner
+            .workspace_for(&job())
+            .fetch_mirror("https://github.com/o/r.git")
+            .await?;
+        let env = fetch_env(&log)?;
+        assert!(!env.contains_key("GH_TOKEN"), "{env:?}");
+        assert!(!env.contains_key("FLEETD_ASKPASS_HOST"), "{env:?}");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_github_entry_never_admits_a_repo_host_the_policy_does_not_list() -> TestResult {
+        let dir = tempfile::TempDir::new()?;
+        let (git, log) = recorder(dir.path())?;
+        let admitted = Arc::<crate::netguard::RepoHostBook>::default();
+        let (runner, _book) = hosted_with(
+            Some(("github.com", "github")),
+            Capturing(Arc::default()),
+            Arc::clone(&admitted),
+            Some(&git),
+            Some(RepoPolicy::new(["other.example.org"]).with_token_host(None)),
+        )
+        .await?;
+        let (_trigger, shutdown) = Shutdown::channel();
+        let _guards = runner
+            .fetch_credentials(&job(), shutdown)
+            .await
+            .map_err(|_| "fetch refused")?;
+        assert!(
+            runner
+                .workspace_for(&job())
+                .fetch_mirror("https://github.com/o/r.git")
+                .await
+                .is_err()
+        );
+        assert!(!log.exists());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_forgejo_entry_with_no_admit_hook_admits_nothing() -> TestResult {
+        let admitted = Arc::<crate::netguard::RepoHostBook>::default();
+        let (runner, _book) = hosted(
+            Some((FORGEJO_HOST, "forgejo")),
+            Capturing(Arc::default()),
+            Arc::clone(&admitted),
+        )
+        .await?;
+        let runner = DaemonRunner {
+            repo_hosts: None,
+            ..runner
+        };
+        let job = Job {
+            repo: FORGEJO_REPO.into(),
+            ..job()
+        };
+        let (_trigger, shutdown) = Shutdown::channel();
+        let guards = runner
+            .fetch_credentials(&job, shutdown)
+            .await
+            .map_err(|_| "fetch refused")?;
+        assert!(guards.is_empty());
+        assert!(admitted.get("job1").is_none());
+        Ok(())
+    }
 
     #[tokio::test]
     async fn a_fetched_environment_is_held_and_masked_for_the_rest_of_the_job() -> TestResult {
@@ -3417,7 +3906,7 @@ mod token_wiring_tests {
         let url = format!("http://{}", listener.local_addr()?);
         tokio::spawn(
             tonic::transport::Server::builder()
-                .add_service(FleetWorkerServer::new(Minting(AtomicUsize::new(0))))
+                .add_service(FleetWorkerServer::new(Minting(AtomicUsize::new(0), None)))
                 .serve_with_incoming(TcpListenerStream::new(listener)),
         );
         let dir = tempfile::TempDir::new()?;

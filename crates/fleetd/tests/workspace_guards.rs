@@ -539,6 +539,110 @@ async fn an_empty_token_or_no_token_host_gives_the_fetch_no_credential() -> Test
     .await
 }
 
+const FORGEJO_HOST: &str = "git.example.org";
+const FORGEJO_REPO: &str = "https://git.example.org/o/r.git";
+
+fn fetch_call(root: &Path) -> Result<Call, Box<dyn std::error::Error>> {
+    calls(root)?
+        .into_iter()
+        .find(|c| c.args.contains(" fetch ") && c.args.contains("--prune"))
+        .ok_or_else(|| "fetch".into())
+}
+
+#[tokio::test]
+async fn a_forgejo_job_host_from_the_server_gets_the_token_for_that_host_only() -> TestResult {
+    common::bounded(Box::pin(async {
+        let dir = TempDir::new()?;
+        let root = dir.path().join("jobs");
+        workspace(&root, default_run())
+            .with_job_host(FORGEJO_HOST)
+            .with_credential("/bin/fleetd", "forgejo-tok".to_owned())
+            .prepare("job1", FORGEJO_REPO, "main")
+            .await?;
+        let fetch = fetch_call(&root)?;
+        assert_eq!(fetch.env["GH_TOKEN"], "forgejo-tok");
+        assert_eq!(fetch.env["FLEETD_ASKPASS_HOST"], FORGEJO_HOST);
+        for call in calls(&root)? {
+            let is_fetch = call.args == fetch.args;
+            assert_eq!(call.env.contains_key("GH_TOKEN"), is_fetch, "{}", call.args);
+        }
+        Ok(())
+    }))
+    .await
+}
+
+#[tokio::test]
+async fn a_forgejo_job_host_never_sends_its_token_to_github() -> TestResult {
+    common::bounded(Box::pin(async {
+        let dir = TempDir::new()?;
+        let root = dir.path().join("jobs");
+        workspace(&root, default_run())
+            .with_job_host(FORGEJO_HOST)
+            .with_credential("/bin/fleetd", "forgejo-tok".to_owned())
+            .prepare("job1", REPO, "main")
+            .await?;
+        for call in calls(&root)? {
+            for name in ["GH_TOKEN", "GIT_ASKPASS", "FLEETD_ASKPASS_HOST"] {
+                assert!(!call.env.contains_key(name), "{name} {}", call.args);
+            }
+        }
+        Ok(())
+    }))
+    .await
+}
+
+#[tokio::test]
+async fn the_github_token_never_reaches_a_forgejo_host_it_was_not_given_for() -> TestResult {
+    common::bounded(Box::pin(async {
+        let dir = TempDir::new()?;
+        let root = dir.path().join("jobs");
+        let policy = RepoPolicy::new(["github.com", FORGEJO_HOST]);
+        workspace(&root, policy)
+            .with_credential("/bin/fleetd", "github-tok".to_owned())
+            .prepare("job1", FORGEJO_REPO, "main")
+            .await?;
+        for call in calls(&root)? {
+            assert!(!call.env.contains_key("GH_TOKEN"), "{}", call.args);
+        }
+        Ok(())
+    }))
+    .await
+}
+
+#[test]
+fn a_job_host_that_is_not_a_normalised_host_name_admits_nothing_and_clears_the_token_host() {
+    for host in [
+        "",
+        "GIT.example.org",
+        "git.example.org.",
+        "git.example.org:8443",
+        "x@git.example.org",
+        "https://git.example.org",
+        "git.example.org/o",
+        "10.0.0.1",
+        "git",
+        "git.exa mple.org",
+        "git.example.org\r\n",
+        "git.ex\u{e4}mple.org",
+    ] {
+        let policy = default_run().with_job_host(host);
+        assert_eq!(policy.token_host(), None, "{host:?}");
+        assert_eq!(policy.hosts(), ["github.com"], "{host:?}");
+    }
+}
+
+#[test]
+fn a_job_host_becomes_an_allowed_host_and_the_token_host_once() {
+    let policy = default_run()
+        .with_job_host(FORGEJO_HOST)
+        .with_job_host(FORGEJO_HOST);
+    assert_eq!(policy.token_host(), Some(FORGEJO_HOST));
+    assert_eq!(policy.hosts(), ["github.com", FORGEJO_HOST]);
+    let github = policy.with_job_host("github.com");
+    assert_eq!(github.token_host(), Some("github.com"));
+    assert_eq!(github.hosts(), ["github.com", FORGEJO_HOST]);
+}
+
 #[test]
 fn the_token_host_defaults_to_github_and_must_be_an_allowed_host() {
     assert_eq!(default_run().token_host(), Some("github.com"));
