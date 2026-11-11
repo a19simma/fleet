@@ -264,10 +264,10 @@ fn storage_unavailable(err: &StoreError) -> Status {
 /// Refuses a request naming a Box other than the one a per-Box token is bound to. A request
 /// without a [`BoxCaller`] (a static token) passes.
 fn bound_box<T>(request: &Request<T>, requested: &str) -> Result<(), Status> {
-    match request.extensions().get::<BoxCaller>() {
-        Some(bound) => bound.require_box(requested),
-        None => Ok(()),
-    }
+    request
+        .extensions()
+        .get::<BoxCaller>()
+        .map_or(Ok(()), |bound| bound.require_box(requested))
 }
 
 fn same_box(events: &[QueuedEvent]) -> Result<Option<&str>, Status> {
@@ -312,13 +312,13 @@ pub struct FleetService {
 impl FleetService {
     /// Refuses a per-Box token reading a job it does not own, with the lease-mismatch text so
     /// a foreign job and an unknown one look alike. A static token passes.
-    async fn owned_by_token<T>(&self, request: &Request<T>, job_id: &str) -> Result<(), Status> {
-        let Some(bound) = request.extensions().get::<BoxCaller>() else {
+    async fn owned_by_token(&self, bound_user: Option<i64>, job_id: &str) -> Result<(), Status> {
+        let Some(user_id) = bound_user else {
             return Ok(());
         };
         let owned = self
             .store
-            .job_owned_by(job_id, bound.user_id)
+            .job_owned_by(job_id, user_id)
             .await
             .map_err(|err| storage_unavailable(&err))?;
         if owned {
@@ -650,7 +650,11 @@ impl FleetWorker for FleetService {
         request: Request<GetJobCredentialsRequest>,
     ) -> Result<Response<GetJobCredentialsReply>, Status> {
         bound_box(&request, &request.get_ref().r#box)?;
-        self.owned_by_token(&request, &request.get_ref().job_id)
+        let bound_user = request
+            .extensions()
+            .get::<BoxCaller>()
+            .map(|bound| bound.user_id);
+        self.owned_by_token(bound_user, &request.get_ref().job_id)
             .await?;
         let service = self
             .credentials
@@ -670,7 +674,11 @@ impl FleetWorker for FleetService {
         request: Request<GetJobEnvironmentRequest>,
     ) -> Result<Response<GetJobEnvironmentReply>, Status> {
         bound_box(&request, &request.get_ref().r#box)?;
-        self.owned_by_token(&request, &request.get_ref().job_id)
+        let bound_user = request
+            .extensions()
+            .get::<BoxCaller>()
+            .map(|bound| bound.user_id);
+        self.owned_by_token(bound_user, &request.get_ref().job_id)
             .await?;
         let service = self
             .environments

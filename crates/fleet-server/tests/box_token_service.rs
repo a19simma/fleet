@@ -173,7 +173,7 @@ async fn hostile_input_is_refused_before_any_row(pool: PgPool) {
         (String::new(), "", 0),
         ("box-".to_owned(), "", 0),
         ("Box-1".to_owned(), "", 0),
-        ("box-1a".to_owned(), "", 0),
+        (format!("{}a", name(1)), "", 0),
         ("worker".to_owned(), "", 0),
         ("box-\u{0661}".to_owned(), "", 0),
         (name(1), "a\nb", 0),
@@ -262,7 +262,7 @@ async fn revoke_is_owner_scoped_and_ends_the_token(pool: PgPool) {
         .await
         .unwrap()
         .into_inner();
-    assert!(listed.tokens.is_empty());
+    assert_eq!(listed.tokens.len(), 0);
     svc.revoke_box_token(as_user(alice, RevokeBoxTokenRequest { id: issued.id }))
         .await
         .unwrap();

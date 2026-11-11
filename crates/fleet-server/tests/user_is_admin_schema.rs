@@ -3,7 +3,6 @@
 
 #![expect(clippy::unwrap_used, reason = "test code asserts by panicking")]
 
-use fleet_server::cred::admin::{AdminCommand, run};
 use sqlx::PgPool;
 use sqlx::migrate::Migrator;
 use std::borrow::Cow;
@@ -69,9 +68,13 @@ async fn rows_written_by_the_previous_release_survive_with_no_admin(pool: PgPool
         .await
         .unwrap();
     }
-    run(&pool, &AdminCommand::ResetPasskeys("alice".into()), "op")
-        .await
-        .unwrap();
+    sqlx::query(
+        "INSERT INTO admin_audit (action, user_id, username, operator) \
+         SELECT 'passkey_reset', id, username, 'op' FROM users WHERE username = 'alice'",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
     sqlx::query_scalar::<_, i64>("SELECT bootstrap_user_id()")
         .fetch_one(&pool)
         .await
