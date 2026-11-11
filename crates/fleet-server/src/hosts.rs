@@ -39,7 +39,17 @@ use crate::cred::repo_limit::{CheckLimiter, MAX_CONCURRENT_REPO_CHECKS};
 
 const VERSION_ACCEPT: &str = "application/json";
 
-const LOCK_USER: &str = "SELECT id FROM users WHERE id = $1 FOR UPDATE";
+/// Locks one user row `FOR NO KEY UPDATE`.
+///
+/// Lock order of the host store: user row, then the table-wide advisory lock ([`LOCK_TOTAL`]),
+/// then host rows. [`HostStore::add`] and [`HostStore::record_request`] take the user row first.
+/// [`HostStore::approve`] takes [`LOCK_TOTAL`] first and then writes rows that reference a user
+/// (`added_by`, `approved_by`, the audit row), and each such write takes `FOR KEY SHARE` on that
+/// user row through the foreign key. `FOR UPDATE` conflicts with `FOR KEY SHARE`, so an add
+/// holding the user row and waiting for the advisory lock deadlocked with an approve holding the
+/// advisory lock and waiting for that user row. `FOR NO KEY UPDATE` still serialises one User's
+/// adds and does not conflict with `FOR KEY SHARE`, so approve never waits on a user row.
+const LOCK_USER: &str = "SELECT id FROM users WHERE id = $1 FOR NO KEY UPDATE";
 
 const LOCK_TOTAL: &str = "SELECT pg_advisory_xact_lock(6850, 1)";
 
@@ -610,7 +620,7 @@ impl HostStore {
 
     /// Inserts `host` for `user_id` with its audit row in one transaction.
     ///
-    /// The transaction takes `FOR UPDATE` on the user row, which serialises that User's adds, and
+    /// The transaction takes `FOR NO KEY UPDATE` on the user row, which serialises that User's adds, and
     /// a transaction-scoped advisory lock that serialises every add, before it counts rows for
     /// either cap. A host already in the table is returned as [`AddOutcome::Exists`] and a cap
     /// refusal as [`AddOutcome::UserFull`] or [`AddOutcome::TableFull`]. Each outcome writes one
