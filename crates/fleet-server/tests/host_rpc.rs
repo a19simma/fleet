@@ -1157,6 +1157,31 @@ async fn approve_refuses_a_named_set_that_differs_from_the_fresh_resolve(pool: P
 }
 
 #[sqlx::test(migrations = false)]
+async fn approve_stores_the_canonical_form_of_a_mapped_address(pool: PgPool) {
+    let w = world(pool, dns(&["fd00::1", "10.9.8.7"]), wire(200, FORGE)).await;
+    add(&w, w.alice, "git.example.com").await.unwrap_err();
+    let info = approve(
+        &w,
+        (w.admin, true),
+        "git.example.com",
+        &[
+            "FD00::1",
+            "fd00:0:0:0:0:0:0:1",
+            "::ffff:10.9.8.7",
+            "10.9.8.7",
+        ],
+    )
+    .await
+    .unwrap();
+    let canonical = strings(&["10.9.8.7", "fd00::1"]);
+    assert_eq!(info.approved_ips, canonical);
+    assert_eq!(
+        grant_state(&w.pool, "git.example.com").await,
+        Some((true, canonical))
+    );
+}
+
+#[sqlx::test(migrations = false)]
 async fn approve_never_grants_a_forbidden_range(pool: PgPool) {
     let cgnat = format!("{}.64.0.1", 100);
     let switch = Switch(Arc::new(Mutex::new(Vec::new())));
