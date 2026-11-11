@@ -616,7 +616,7 @@ async fn ci_result_reads_the_head_then_checks_then_statuses() -> TestResult {
         [
             "/repos/octo/widgets/pulls/7",
             "/repos/octo/widgets/commits/abc123/check-runs?per_page=100",
-            "/repos/octo/widgets/commits/abc123/status",
+            "/repos/octo/widgets/commits/abc123/status?per_page=100",
         ]
     );
     for request in &seen {
@@ -971,7 +971,7 @@ async fn ci_checks_reads_the_same_three_requests_as_ci_result() -> TestResult {
         [
             "/repos/octo/widgets/pulls/7",
             "/repos/octo/widgets/commits/abc123/check-runs?per_page=100",
-            "/repos/octo/widgets/commits/abc123/status",
+            "/repos/octo/widgets/commits/abc123/status?per_page=100",
         ]
     );
     Ok(())
