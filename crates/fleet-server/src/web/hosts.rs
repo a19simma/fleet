@@ -8,8 +8,9 @@
 //! too, but a caller who is not an admin gets 404, as on the RPCs, and no service call happens.
 //! The approve form names the addresses the pending request resolved to and posts them back, so
 //! [`HostService::approve`] accepts only what the server resolves now. The pending requests and
-//! the approved addresses of a host reach an admin only: [`HostService::list`] drops the addresses for anyone else and
-//! the page leaves the column out. A host typed into a form goes through [`HostName::normalise`]
+//! the approved addresses of a host reach an admin only: [`HostService::list`] drops the
+//! addresses for anyone else and the page leaves the column out. There is no deny button: a
+//! pending request stays listed until an admin approves it. A host typed into a form goes through [`HostName::normalise`]
 //! first, so a hostile value is refused with a fixed notice before any request and is never
 //! echoed. Every server string is shown in [`ascii_form`]. The repository table is the one on
 //! `/repos`.
