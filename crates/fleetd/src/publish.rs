@@ -6,12 +6,14 @@ use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, PoisonError};
 
+use fleet_forge::{Git, GitCommand, GitError, GitOp, GitOutput, Http};
 use fleet_proto::is_ci_url;
 use fleet_proto::is_swarm_branch;
 use fleet_proto::v1::Job;
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, MutexGuard};
 
-use crate::broker::{ExecError, GhCli, GhExecutor, GitExecutor, MirrorGit};
+use crate::broker::{ExecError, GhExecutor, GitExecutor, MirrorGit};
+use crate::forge::JobForge;
 use crate::phase::{Phases, elapsed_ms};
 use crate::proc::{CAPTURE_BYTES, CaptureError, Captured};
 use crate::runner::{AgentRunner, Failure, IntoFailure, Reporter, Scope};
@@ -45,6 +47,27 @@ const FALLBACK_GUARDS: [&str; 16] = [
     "-c",
     "core.pager=cat",
 ];
+
+/// The argv of every credentialed `git push` of a Job, shared by the finish step and the broker
+/// so the hooks, fsmonitor, redirect and credential-helper guards cannot drift apart.
+fn push_argv<'a>(repo: &'a str, refspec: &'a str) -> [&'a str; 14] {
+    [
+        "-c",
+        "core.hooksPath=/dev/null",
+        "-c",
+        "core.fsmonitor=",
+        "-c",
+        "http.followRedirects=false",
+        "-c",
+        "credential.helper=",
+        "push",
+        "--quiet",
+        "--no-verify",
+        "--",
+        repo,
+        refspec,
+    ]
+}
 
 impl<R: Reporter> AgentRunner<R> {
     pub(crate) async fn publish(
@@ -141,22 +164,7 @@ impl<R: Reporter> AgentRunner<R> {
             .helper(
                 &self.config.git_bin,
                 dir,
-                &[
-                    "-c",
-                    "core.hooksPath=/dev/null",
-                    "-c",
-                    "core.fsmonitor=",
-                    "-c",
-                    "http.followRedirects=false",
-                    "-c",
-                    "credential.helper=",
-                    "push",
-                    "--quiet",
-                    "--no-verify",
-                    "--",
-                    &job.repo,
-                    &refspec,
-                ],
+                &push_argv(&job.repo, &refspec),
                 Scope::Push(&job.job_id),
             )
             .await
@@ -186,45 +194,49 @@ impl<R: Reporter> AgentRunner<R> {
         }
     }
 
-    /// Pushes the Job's committed work for the broker `push`. It runs the finish step's
-    /// push into the Job's bound target, never a refspec of the agent, with no leftover commit.
-    /// A head the shared [`JobPublish`] state already holds is not pushed again.
-    pub(crate) async fn broker_push(
+    /// Starts the broker `push`: validates the Job, takes the publish lock and finds out whether
+    /// the Job's committed work needs pushing. It reads the finish step's state and never a
+    /// refspec of the agent, and adds no leftover commit. A head the shared [`JobPublish`] state
+    /// already holds is [`Pushed::Already`].
+    pub(crate) async fn broker_push_begin<'a>(
         &self,
-        shared: &JobPublish,
+        shared: &'a JobPublish,
         job: &Job,
         cwd: &Path,
-    ) -> Result<Pushed, Failure> {
+    ) -> Result<PushBegin<'a>, Failure> {
         validate_job_id(&job.job_id).map_err(|_| Failure::bare(ERR_COMMITS))?;
         validate_repo(&job.repo, &self.config.repo_policy).map_err(|_| Failure::bare(ERR_PUSH))?;
         validate_ref(&job.base_ref).map_err(|_| Failure::bare(ERR_COMMITS))?;
         let local = format!("swarm/{}", job.job_id);
         let branch = PushTarget::from_job(job)?.remote_branch();
-        let mut book = shared.held.lock().await;
+        let book = shared.held.lock().await;
         let scratch = Scratch::create(cwd, &job.job_id).map_err(|()| Failure::bare(ERR_COMMITS))?;
-        let dir = scratch.path();
-        if !self.ahead(job, &local, cwd, dir).await? {
-            return Ok(Pushed::Nothing);
+        if !self.ahead(job, &local, cwd, scratch.path()).await? {
+            return Ok(PushBegin::Settled(Pushed::Nothing));
         }
-        let head = self.local_head(&local, dir).await?;
+        let head = self.local_head(&local, scratch.path()).await?;
         if book.pushed.as_deref() == Some(head.as_str()) {
-            return Ok(Pushed::Already);
+            return Ok(PushBegin::Settled(Pushed::Already));
         }
-        self.push_branch(job, dir, &local, &branch).await?;
-        book.pushed = Some(head);
-        drop(book);
-        Ok(Pushed::Done)
+        Ok(PushBegin::Run(PushRun {
+            book,
+            scratch,
+            head,
+            local,
+            branch,
+        }))
     }
 
-    /// Opens the Job's pull request for the broker `pr_create`, or returns the one that exists.
-    pub(crate) async fn broker_pr(
+    /// Starts the broker `pr_create`: validates the Job and takes the publish lock. It returns the
+    /// URL the shared state holds, or the `pr_url` a fix Job carries, without opening anything. A
+    /// Job with `open_pr` off, or a branch not yet pushed, fails. Otherwise it marks the attempt,
+    /// so the finish step looks for the pull request before it creates one, and returns the
+    /// branch to open it for.
+    pub(crate) async fn broker_pr_begin<'a>(
         &self,
-        shared: &JobPublish,
+        shared: &'a JobPublish,
         job: &Job,
-        cwd: &Path,
-        title: &str,
-        body: &str,
-    ) -> Result<String, Failure> {
+    ) -> Result<PrBegin<'a>, Failure> {
         validate_job_id(&job.job_id).map_err(|_| Failure::bare(ERR_COMMITS))?;
         validate_repo(&job.repo, &self.config.repo_policy).map_err(|_| Failure::bare(ERR_PR))?;
         validate_ref(&job.base_ref).map_err(|_| Failure::bare(ERR_PR))?;
@@ -232,7 +244,7 @@ impl<R: Reporter> AgentRunner<R> {
         let branch = target.remote_branch();
         let mut book = shared.held.lock().await;
         if let Some(url) = book.pr_url.clone() {
-            return Ok(url);
+            return Ok(PrBegin::Known(url));
         }
         match target {
             PushTarget::Chain(_) => {
@@ -240,6 +252,7 @@ impl<R: Reporter> AgentRunner<R> {
                     .pr_url
                     .clone()
                     .filter(|url| is_ci_url(url))
+                    .map(PrBegin::Known)
                     .ok_or_else(|| Failure::bare(ERR_PR));
             }
             PushTarget::Own(_) if !job.open_pr => return Err(Failure::bare(ERR_PR)),
@@ -248,24 +261,8 @@ impl<R: Reporter> AgentRunner<R> {
         if book.pushed.is_none() {
             return Err(Failure::bare(ERR_PR));
         }
-        let scratch = Scratch::create(cwd, &job.job_id).map_err(|()| Failure::bare(ERR_PR))?;
-        let dir = scratch.path();
-        self.helper(
-            &self.config.git_bin,
-            dir,
-            &["init", "--bare", "--quiet"],
-            Scope::Clean,
-        )
-        .await
-        .map_err(|e| e.failure(ERR_PR))?;
         book.pr_attempted = true;
-        let url = match self.existing_pr(job, &branch, dir).await? {
-            Some(url) => url,
-            None => self.create_pr(job, &branch, dir, title, body).await?,
-        };
-        book.pr_url = Some(url.clone());
-        drop(book);
-        Ok(url)
+        Ok(PrBegin::Open(PrRun { book, branch }))
     }
 
     async fn open_or_find_pr(
@@ -643,102 +640,254 @@ struct Held {
     pr_attempted: bool,
 }
 
-/// The real `push` of the broker: the finish step's publish path for one Job.
+/// What [`AgentRunner::broker_push_begin`] found.
+pub(crate) enum PushBegin<'a> {
+    /// Nothing to push, or the head is already published.
+    Settled(Pushed),
+    /// The head must be pushed.
+    Run(PushRun<'a>),
+}
+
+/// A broker push in progress. It holds the publish lock and the scratch repo until
+/// [`PushRun::done`] or its drop.
+pub(crate) struct PushRun<'a> {
+    book: MutexGuard<'a, Held>,
+    scratch: Scratch,
+    head: String,
+    local: String,
+    branch: String,
+}
+
+impl PushRun<'_> {
+    pub(crate) fn branch(&self) -> &str {
+        &self.branch
+    }
+
+    /// Records the head as published and releases the lock.
+    pub(crate) fn done(mut self) -> Pushed {
+        self.book.pushed = Some(self.head);
+        Pushed::Done
+    }
+}
+
+/// What [`AgentRunner::broker_pr_begin`] found.
+pub(crate) enum PrBegin<'a> {
+    /// The URL is already known.
+    Known(String),
+    /// The pull request must be opened.
+    Open(PrRun<'a>),
+}
+
+/// A broker `pr_create` in progress. It holds the publish lock until [`PrRun::done`] or its drop.
+pub(crate) struct PrRun<'a> {
+    book: MutexGuard<'a, Held>,
+    branch: String,
+}
+
+impl PrRun<'_> {
+    pub(crate) fn branch(&self) -> &str {
+        &self.branch
+    }
+
+    /// Records the URL and releases the lock.
+    pub(crate) fn done(mut self, url: &str) {
+        self.book.pr_url = Some(url.to_owned());
+    }
+}
+
+/// The git seam of one broker push: the finish step's `git push` into the Job's repo, run in
+/// the scratch repo.
+///
+/// The adapter calls it with the branch it validated. It pushes `refs/heads/{local}` to that
+/// branch of the Job's repo with hooks, redirects and credential helpers off, and takes the
+/// token from the runner's own refresh, lease and askpass path, so it ignores the credential of
+/// the command. A start failure, a timeout and a credential failure are all
+/// [`GitError::Spawn`] or [`GitError::Timeout`] with no text. It refuses any other operation.
+struct PushGit<'a, R> {
+    runner: &'a AgentRunner<R>,
+    job: &'a Job,
+    dir: &'a Path,
+    local: &'a str,
+}
+
+impl<R: Reporter + Send + Sync + 'static> Git for PushGit<'_, R> {
+    async fn run(&self, command: GitCommand) -> Result<GitOutput, GitError> {
+        let branch = command
+            .branch
+            .filter(|_| command.op == GitOp::Push)
+            .ok_or(GitError::Spawn)?;
+        let refspec = format!("refs/heads/{}:refs/heads/{branch}", self.local);
+        let pushed = self
+            .runner
+            .helper(
+                &self.runner.config.git_bin,
+                self.dir,
+                &push_argv(&self.job.repo, &refspec),
+                Scope::Push(&self.job.job_id),
+            )
+            .await
+            .map_err(|error| match error {
+                CaptureError::Timeout => GitError::Timeout,
+                CaptureError::Start | CaptureError::Credentials(_) => {
+                    tracing::warn!(error = error.failure(ERR_PUSH).error, "broker push failed");
+                    GitError::Spawn
+                }
+            })?;
+        Ok(GitOutput {
+            code: i32::from(!pushed.success),
+            stderr: pushed.stderr,
+        })
+    }
+}
+
+/// The real `push` of the broker: the finish step's publish path for one Job, through
+/// [`JobForge::push`].
 ///
 /// Branch and repo come from the claimed Job, never from a request. The push is fast-forward
 /// only, as in the finish step. A failure logs a fixed line and replies with the broker's fixed
-/// error: no git stderr leaves this executor. `fetch` is [`MirrorGit`]'s. `DaemonRunner` builds it per
-/// claimed Job under the systemd launcher.
-pub struct PublishGit<R> {
+/// error: no git stderr leaves this executor. `fetch` goes through [`JobForge::fetch`] with
+/// [`MirrorGit`] as its git seam. A Job with no [`JobForge`] gets the fixed error from both.
+/// `DaemonRunner` builds it per claimed Job under the systemd launcher.
+pub struct PublishGit<R, H> {
     runner: Arc<AgentRunner<R>>,
     shared: Arc<JobPublish>,
     job: Job,
     cwd: PathBuf,
     mirror: MirrorGit,
+    forge: Option<JobForge<H>>,
 }
 
-impl<R: Reporter> PublishGit<R> {
+impl<R: Reporter, H> PublishGit<R, H> {
     /// An executor that publishes the worktree `cwd` of `job`, on the publish state the
     /// runner keeps for the Job.
     #[must_use]
-    pub fn new(runner: Arc<AgentRunner<R>>, job: Job, cwd: PathBuf, mirror: MirrorGit) -> Self {
+    pub fn new(
+        runner: Arc<AgentRunner<R>>,
+        job: Job,
+        cwd: PathBuf,
+        mirror: MirrorGit,
+        forge: Option<JobForge<H>>,
+    ) -> Self {
         Self {
             shared: runner.publish_state(&job.job_id),
             runner,
             job,
             cwd,
             mirror,
+            forge,
         }
     }
 }
 
-impl<R: Reporter + Send + Sync + 'static> GitExecutor for PublishGit<R> {
+/// The git seam of one broker fetch: it refreshes the Job's mirror and refuses any other
+/// operation. A failure is exit code 1 with no text, since [`MirrorGit`] logs the cause.
+struct MirrorFetch(MirrorGit);
+
+impl Git for MirrorFetch {
+    async fn run(&self, command: GitCommand) -> Result<GitOutput, GitError> {
+        if command.op != GitOp::Fetch {
+            return Err(GitError::Spawn);
+        }
+        Ok(GitOutput {
+            code: i32::from(!self.0.refresh().await),
+            stderr: String::new(),
+        })
+    }
+}
+
+impl<R: Reporter + Send + Sync + 'static, H: Http> GitExecutor for PublishGit<R, H> {
     async fn push(&self, _target: &crate::broker::PushTarget) -> Result<String, ExecError> {
-        match self
+        let forge = self.forge.as_ref().ok_or(ExecError)?;
+        let run = match self
             .runner
-            .broker_push(&self.shared, &self.job, &self.cwd)
+            .broker_push_begin(&self.shared, &self.job, &self.cwd)
             .await
-        {
-            Ok(pushed) => Ok(pushed.status().to_owned()),
-            Err(failure) => {
+            .map_err(|failure| {
                 tracing::warn!(error = failure.error, "broker push failed");
-                Err(ExecError)
-            }
-        }
+                ExecError
+            })? {
+            PushBegin::Settled(pushed) => return Ok(pushed.status().to_owned()),
+            PushBegin::Run(run) => run,
+        };
+        let git = PushGit {
+            runner: &self.runner,
+            job: &self.job,
+            dir: run.scratch.path(),
+            local: &run.local,
+        };
+        forge.push(git, run.branch()).await?;
+        Ok(run.done().status().to_owned())
     }
 
-    fn fetch(&self) -> impl Future<Output = Result<String, ExecError>> + Send {
-        self.mirror.fetch()
+    async fn fetch(&self) -> Result<String, ExecError> {
+        let forge = self.forge.as_ref().ok_or(ExecError)?;
+        forge.fetch(MirrorFetch(self.mirror.clone())).await
     }
 }
 
-/// The real `pr_create` of the broker, with `pr_checks` delegated to [`GhCli`].
+/// The real `pr_create` of the broker, through [`JobForge::create_pr`], with `pr_checks`
+/// delegated to the executor `C`.
 ///
-/// It returns the URL the shared [`JobPublish`] state holds, else the open pull request of the
-/// Job's branch, else creates one with the title and body the broker validated and redacted. A
-/// Job with `open_pr` off, or a branch not yet pushed, fails. A fix Job returns the `pr_url`
-/// its Job carries.
-pub struct PublishGh<R> {
+/// It returns the URL the shared [`JobPublish`] state holds, else the URL the adapter returns:
+/// the open pull request of the Job's branch, or a new one with the title and body the broker
+/// validated and redacted. A Job with `open_pr` off, or a branch not yet pushed, fails. A fix Job
+/// returns the `pr_url` its Job carries. A Job with no [`JobForge`] gets the fixed error.
+pub struct PublishGh<R, C, H> {
     runner: Arc<AgentRunner<R>>,
     shared: Arc<JobPublish>,
     job: Job,
-    cwd: PathBuf,
-    checks: GhCli,
+    checks: C,
+    forge: Option<JobForge<H>>,
 }
 
-impl<R: Reporter> PublishGh<R> {
+impl<R: Reporter, C, H> PublishGh<R, C, H> {
     /// An executor that opens the pull request of `job`, on the publish state the runner
     /// keeps for the Job.
     #[must_use]
-    pub fn new(runner: Arc<AgentRunner<R>>, job: Job, cwd: PathBuf, checks: GhCli) -> Self {
+    pub fn new(
+        runner: Arc<AgentRunner<R>>,
+        job: Job,
+        checks: C,
+        forge: Option<JobForge<H>>,
+    ) -> Self {
         Self {
             shared: runner.publish_state(&job.job_id),
             runner,
             job,
-            cwd,
             checks,
+            forge,
         }
     }
 }
 
-impl<R: Reporter + Send + Sync + 'static> GhExecutor for PublishGh<R> {
+impl<R: Reporter + Send + Sync + 'static, C: GhExecutor, H: Http> GhExecutor
+    for PublishGh<R, C, H>
+{
+    #[expect(
+        clippy::significant_drop_tightening,
+        reason = "the publish lock must span the forge call, and done consumes the guard"
+    )]
     async fn pr_create(
         &self,
         _target: &crate::broker::PushTarget,
         title: &str,
         body: &str,
     ) -> Result<String, ExecError> {
-        match self
+        let run = match self
             .runner
-            .broker_pr(&self.shared, &self.job, &self.cwd, title, body)
+            .broker_pr_begin(&self.shared, &self.job)
             .await
-        {
-            Ok(url) => Ok(url),
-            Err(failure) => {
+            .map_err(|failure| {
                 tracing::warn!(error = failure.error, "broker pr_create failed");
-                Err(ExecError)
-            }
-        }
+                ExecError
+            })? {
+            PrBegin::Known(url) => return Ok(url),
+            PrBegin::Open(run) => run,
+        };
+        let forge = self.forge.as_ref().ok_or(ExecError)?;
+        let url = forge.create_pr(run.branch(), title, body).await?;
+        run.done(&url);
+        Ok(url)
     }
 
     fn pr_checks(

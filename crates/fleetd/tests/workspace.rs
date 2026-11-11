@@ -11,8 +11,8 @@ use fleet_core::Redactor;
 use fleet_proto::v1::Job;
 use fleetd::AgentLauncher;
 use fleetd::broker::{
-    Broker, BrokerError, Denial, ExecError, GH_PATH, GhCli, GhExecutor, GitExecutor, Limits,
-    MAX_CHECKS, MAX_OUTPUT_BYTES, MirrorGit, PushTarget, Request, Response,
+    Broker, Denial, ExecError, GhExecutor, GitExecutor, Limits, MirrorGit, PushTarget, Request,
+    Response,
 };
 use fleetd::cred::{CredentialFailure, LeaseFuture, LeasedToken, TokenSource};
 use fleetd::workspace::{RepoPolicy, Workspace, WorkspaceError};
@@ -1558,389 +1558,45 @@ fn script_dir() -> &'static Path {
     .path()
 }
 
-struct GhCase {
-    _dir: TempDir,
-    scratch: PathBuf,
-    gh: GhCli,
+/// Fixed-output checks executor standing in for the forge API.
+#[derive(Clone)]
+struct Stub {
+    out: String,
 }
 
-impl GhCase {
-    fn new(out: &str, code: &str) -> Result<Self, Box<dyn std::error::Error>> {
-        Self::on_host("github.com", out, code)
+impl Stub {
+    fn new(out: &str) -> Self {
+        Self {
+            out: out.to_owned(),
+        }
+    }
+}
+
+impl GhExecutor for Stub {
+    fn pr_create(
+        &self,
+        _: &PushTarget,
+        _: &str,
+        _: &str,
+    ) -> impl Future<Output = Result<String, ExecError>> + Send {
+        std::future::ready(Ok(GH_URL.to_owned()))
     }
 
-    fn on_host(host: &str, out: &str, code: &str) -> Result<Self, Box<dyn std::error::Error>> {
+    fn pr_checks(
+        &self,
+        _: &PushTarget,
+        _: &str,
+    ) -> impl Future<Output = Result<String, ExecError>> + Send {
+        std::future::ready(Ok(self.out.clone()))
+    }
+}
+
+#[tokio::test]
+async fn the_mirror_git_executor_refuses_push() -> TestResult {
+    common::bounded(Box::pin(async {
         let dir = TempDir::new()?;
-        let scratch = Workspace::new(dir.path().join("jobs")).create_broker_scratch("job1")?;
-        std::fs::write(scratch.join("gh.out"), out)?;
-        std::fs::write(scratch.join("gh.code"), code)?;
-        let gh = GhCli::new(script_dir().join("gh"), host, TOKEN.to_owned(), &scratch)?;
-        Ok(Self {
-            _dir: dir,
-            scratch,
-            gh,
-        })
-    }
-
-    fn target() -> PushTarget {
-        PushTarget::Own("job1".to_owned())
-    }
-
-    async fn checks(&self, url: &str) -> Result<serde_json::Value, ExecError> {
-        let out = self.gh.pr_checks(&Self::target(), url).await?;
-        serde_json::from_str(&out).map_err(|_| ExecError)
-    }
-}
-
-fn item(bucket: &str, name: &str, link: &str) -> String {
-    serde_json::json!({"bucket": bucket, "name": name, "link": link, "state": "x", "workflow": "w"})
-        .to_string()
-}
-
-#[tokio::test]
-async fn pr_checks_runs_the_exact_gh_argv_with_the_token_only_on_the_child() -> TestResult {
-    common::bounded(Box::pin(async {
-        let case = GhCase::new("[]", "0")?;
-        let parent_token = std::env::var_os("GH_TOKEN");
-        case.checks(GH_URL).await.map_err(|_| "pr_checks failed")?;
-        assert_eq!(std::env::var_os("GH_TOKEN"), parent_token);
-        let args = std::fs::read_to_string(case.scratch.join("gh.args"))?;
-        assert_eq!(
-            args.lines().collect::<Vec<_>>(),
-            ["pr", "checks", GH_URL, "--json", "bucket,link,name"]
-        );
-        assert!(!args.contains(TOKEN));
-        let env = std::fs::read_to_string(case.scratch.join("gh.env"))?;
-        let names: Vec<&str> = env
-            .lines()
-            .filter_map(|l| l.split_once('=').map(|(k, _)| k))
-            .collect();
-        let allowed = [
-            "PATH",
-            "HOME",
-            "XDG_CONFIG_HOME",
-            "GH_CONFIG_DIR",
-            "GH_TOKEN",
-            "GH_HOST",
-            "GH_PROMPT_DISABLED",
-            "GH_NO_UPDATE_NOTIFIER",
-            "NO_COLOR",
-            "PWD",
-            "OLDPWD",
-            "SHLVL",
-            "_",
-        ];
-        for name in &names {
-            assert!(allowed.contains(name), "child inherited {name}");
-        }
-        assert!(env.contains(&format!("GH_TOKEN={TOKEN}")));
-        assert!(env.contains("GH_HOST=github.com"));
-        assert!(!names.contains(&"GH_ENTERPRISE_TOKEN"));
-        assert!(env.contains(&format!("HOME={}", case.scratch.display())));
-        Ok(())
-    }))
-    .await
-}
-
-#[tokio::test]
-async fn pr_checks_off_github_com_adds_the_enterprise_token() -> TestResult {
-    common::bounded(Box::pin(async {
-        let case = GhCase::on_host("ghe.example", "[]", "0")?;
-        case.checks("https://ghe.example/o/r/pull/7")
-            .await
-            .map_err(|_| "pr_checks failed")?;
-        let env = std::fs::read_to_string(case.scratch.join("gh.env"))?;
-        assert!(env.contains(&format!("GH_ENTERPRISE_TOKEN={TOKEN}")));
-        assert!(env.contains("GH_HOST=ghe.example"));
-        Ok(())
-    }))
-    .await
-}
-
-const SHELL_VARS: [&str; 4] = ["PWD", "OLDPWD", "SHLVL", "_"];
-
-fn env_of_child(
-    case: &GhCase,
-) -> Result<std::collections::BTreeMap<String, String>, std::io::Error> {
-    Ok(std::fs::read_to_string(case.scratch.join("gh.env"))?
-        .lines()
-        .filter_map(|line| line.split_once('='))
-        .filter(|(name, _)| !SHELL_VARS.contains(name))
-        .map(|(name, value)| (name.to_owned(), value.to_owned()))
-        .collect())
-}
-
-#[tokio::test]
-async fn the_gh_child_env_is_exactly_the_fixed_set() -> TestResult {
-    common::bounded(Box::pin(async {
-        let case = GhCase::new("[]", "0")?;
-        case.checks(GH_URL).await.map_err(|_| "pr_checks failed")?;
-        let env = env_of_child(&case)?;
-        let home = case.scratch.display().to_string();
-        let expected: std::collections::BTreeMap<String, String> = [
-            ("GH_CONFIG_DIR", format!("{home}/gh")),
-            ("GH_HOST", "github.com".to_owned()),
-            ("GH_NO_UPDATE_NOTIFIER", "1".to_owned()),
-            ("GH_PROMPT_DISABLED", "1".to_owned()),
-            ("GH_TOKEN", TOKEN.to_owned()),
-            ("HOME", home.clone()),
-            ("NO_COLOR", "1".to_owned()),
-            ("PATH", GH_PATH.to_owned()),
-            ("XDG_CONFIG_HOME", format!("{home}/.config")),
-        ]
-        .into_iter()
-        .map(|(name, value)| (name.to_owned(), value))
-        .collect();
-        assert_eq!(env, expected);
-        Ok(())
-    }))
-    .await
-}
-
-#[tokio::test]
-async fn the_gh_child_env_off_github_com_adds_only_the_enterprise_token() -> TestResult {
-    common::bounded(Box::pin(async {
-        let case = GhCase::on_host("ghe.example", "[]", "0")?;
-        case.checks("https://ghe.example/o/r/pull/7")
-            .await
-            .map_err(|_| "pr_checks failed")?;
-        let env = env_of_child(&case)?;
-        let names: Vec<&str> = env.keys().map(String::as_str).collect();
-        assert_eq!(
-            names,
-            [
-                "GH_CONFIG_DIR",
-                "GH_ENTERPRISE_TOKEN",
-                "GH_HOST",
-                "GH_NO_UPDATE_NOTIFIER",
-                "GH_PROMPT_DISABLED",
-                "GH_TOKEN",
-                "HOME",
-                "NO_COLOR",
-                "PATH",
-                "XDG_CONFIG_HOME",
-            ]
-        );
-        assert_eq!(env.get("PATH").map(String::as_str), Some(GH_PATH));
-        Ok(())
-    }))
-    .await
-}
-
-#[test]
-fn a_relative_gh_bin_is_refused_at_construction() {
-    let dir = TempDir::new().unwrap_or_else(|_| std::process::abort());
-    for bin in ["gh", "./gh", "bin/gh", "../gh", ""] {
-        let built = GhCli::new(bin, "github.com", TOKEN.to_owned(), dir.path());
-        assert_eq!(built.err(), Some(BrokerError::RelativeGhBin), "{bin:?}");
-    }
-    assert!(GhCli::new("/usr/bin/gh", "github.com", TOKEN.to_owned(), dir.path()).is_ok());
-}
-
-#[tokio::test]
-async fn a_gh_bin_that_is_missing_or_a_directory_fails_the_op_with_the_fixed_error() -> TestResult {
-    common::bounded(Box::pin(async {
-        let case = GhCase::new("[]", "0")?;
-        for bin in [
-            case.scratch.join("no-such-gh"),
-            case.scratch.clone(),
-            PathBuf::from("/"),
-        ] {
-            let gh = GhCli::new(&bin, "github.com", TOKEN.to_owned(), &case.scratch)?;
-            let got = gh.pr_checks(&GhCase::target(), GH_URL).await;
-            assert!(got.is_err(), "{bin:?}");
-        }
-        Ok(())
-    }))
-    .await
-}
-
-#[tokio::test]
-async fn a_scratch_that_is_not_private_is_refused_and_gh_never_runs() -> TestResult {
-    common::bounded(Box::pin(async {
-        for mode in [0o755, 0o770, 0o707, 0o2700, 0o500] {
-            let case = GhCase::new("[]", "0")?;
-            std::fs::set_permissions(&case.scratch, std::fs::Permissions::from_mode(mode))?;
-            assert!(case.checks(GH_URL).await.is_err(), "{mode:o}");
-            std::fs::set_permissions(&case.scratch, std::fs::Permissions::from_mode(0o700))?;
-            assert!(!case.scratch.join("gh.env").exists(), "{mode:o}");
-        }
-        Ok(())
-    }))
-    .await
-}
-
-#[tokio::test]
-async fn a_symlink_or_a_missing_dir_at_the_scratch_path_is_refused() -> TestResult {
-    common::bounded(Box::pin(async {
-        let case = GhCase::new("[]", "0")?;
-        let target = case.scratch.with_file_name("victim");
-        std::fs::create_dir(&target)?;
-        std::fs::write(target.join("gh.out"), "[]")?;
-        std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o700))?;
-        std::fs::remove_dir_all(&case.scratch)?;
-        std::os::unix::fs::symlink(&target, &case.scratch)?;
-        assert!(case.checks(GH_URL).await.is_err());
-        assert!(!target.join("gh.env").exists());
-        std::fs::remove_file(&case.scratch)?;
-        assert!(case.checks(GH_URL).await.is_err());
-        assert!(!case.scratch.exists(), "the executor does not create it");
-        Ok(())
-    }))
-    .await
-}
-
-#[tokio::test]
-async fn the_scratch_is_checked_on_every_run_not_once() -> TestResult {
-    common::bounded(Box::pin(async {
-        let case = GhCase::new("[]", "0")?;
-        case.checks(GH_URL).await.map_err(|_| "first run")?;
-        std::fs::set_permissions(&case.scratch, std::fs::Permissions::from_mode(0o755))?;
-        assert!(case.checks(GH_URL).await.is_err());
-        std::fs::set_permissions(&case.scratch, std::fs::Permissions::from_mode(0o700))?;
-        case.checks(GH_URL).await.map_err(|_| "third run")?;
-        Ok(())
-    }))
-    .await
-}
-
-#[tokio::test]
-async fn pr_checks_returns_a_redacted_subset_with_host_validated_links() -> TestResult {
-    common::bounded(Box::pin(async {
-        let good = "https://github.com/o/r/actions/runs/9/job/41";
-        let items = [
-            item("pass", "build", good),
-            item(
-                "weird",
-                "ansi\u{1b}[31m\u{202e}name\nsecond",
-                "http://github.com/x",
-            ),
-            item("fail", "other host", "https://evil.example/x"),
-            item("pending", "userinfo", "https://github.com@evil.example/x"),
-            item("cancel", "spaced", "https://github.com/a b"),
-            item("skipping", &"n".repeat(500), ""),
-        ];
-        let case = GhCase::new(&format!("[{}]", items.join(",")), "0")?;
-        let value = case.checks(GH_URL).await.map_err(|_| "pr_checks failed")?;
-        let checks = value["checks"].as_array().ok_or("checks")?;
-        assert_eq!(checks.len(), 6);
-        assert_eq!(checks[0]["bucket"], "pass");
-        assert_eq!(checks[0]["link"], good);
-        assert_eq!(checks[1]["bucket"], "unknown");
-        assert_eq!(checks[1]["name"], "ansi[31mnamesecond");
-        for hostile in &checks[1..5] {
-            assert!(hostile.get("link").is_none(), "{hostile}");
-        }
-        assert_eq!(
-            checks[5]["name"].as_str().map(|n| n.chars().count()),
-            Some(120)
-        );
-        for check in checks {
-            let mut keys: Vec<_> = check.as_object().ok_or("object")?.keys().cloned().collect();
-            keys.sort();
-            assert!(
-                keys == ["bucket", "link", "name"] || keys == ["bucket", "name"],
-                "{keys:?}"
-            );
-        }
-        assert_eq!(value["truncated"], false);
-        Ok(())
-    }))
-    .await
-}
-
-#[tokio::test]
-async fn pr_checks_caps_the_count_and_the_bytes() -> TestResult {
-    common::bounded(Box::pin(async {
-        let many: Vec<String> = (0..MAX_CHECKS * 2)
-            .map(|i| item("pass", &format!("c{i}"), ""))
-            .collect();
-        let case = GhCase::new(&format!("[{}]", many.join(",")), "0")?;
-        let value = case.checks(GH_URL).await.map_err(|_| "pr_checks failed")?;
-        assert_eq!(value["checks"].as_array().map(Vec::len), Some(MAX_CHECKS));
-        assert_eq!(value["truncated"], true);
-
-        let link = format!("https://github.com/{}", "a".repeat(1900));
-        let heavy: Vec<String> = (0..MAX_CHECKS)
-            .map(|_| item("pass", &"n".repeat(120), &link))
-            .collect();
-        let case = GhCase::new(&format!("[{}]", heavy.join(",")), "0")?;
-        let out = case
-            .gh
-            .pr_checks(&GhCase::target(), GH_URL)
-            .await
-            .map_err(|_| "pr_checks failed")?;
-        assert!(out.len() <= MAX_OUTPUT_BYTES, "{}", out.len());
-        let value: serde_json::Value = serde_json::from_str(&out)?;
-        assert_eq!(value["truncated"], true);
-        assert!(
-            value["checks"]
-                .as_array()
-                .is_some_and(|c| !c.is_empty() && c.len() < MAX_CHECKS)
-        );
-        Ok(())
-    }))
-    .await
-}
-
-#[tokio::test]
-async fn pr_checks_fails_closed_on_bad_gh_output() -> TestResult {
-    common::bounded(Box::pin(async {
-        for out in ["", "not json", "{\"bucket\":\"pass\"}", "[1,2]", "null"] {
-            let case = GhCase::new(out, "0")?;
-            assert!(case.checks(GH_URL).await.is_err(), "{out}");
-        }
-        let huge = format!("[{}]", "0,".repeat(200 * 1024));
-        let case = GhCase::new(&huge, "0")?;
-        assert!(case.checks(GH_URL).await.is_err());
-        let pending = GhCase::new(&format!("[{}]", item("pending", "a", "")), "8")?;
-        assert!(pending.checks(GH_URL).await.is_ok());
-        Ok(())
-    }))
-    .await
-}
-
-#[tokio::test]
-async fn pr_checks_refuses_a_url_that_is_not_a_pull_request_of_the_host_without_running_gh()
--> TestResult {
-    common::bounded(Box::pin(async {
-        let case = GhCase::new("[]", "0")?;
-        for url in [
-            "https://evil.example/o/r/pull/7",
-            "https://github.com.evil.example/o/r/pull/7",
-            "https://github.com@evil.example/o/r/pull/7",
-            "http://github.com/o/r/pull/7",
-            "https://github.com/o/r/pull/7?x=1",
-            "https://github.com/o/r/pull/7#frag",
-            "https://github.com/o/r/pull/7/files",
-            "https://github.com/o/r/pull/x",
-            "https://github.com/o/r/issues/7",
-            "https://github.com/o/pull/7",
-            "https://github.com/../r/pull/7",
-            "https://github.com/o/r/pull/7 --repo x",
-            "--json=x",
-            "",
-        ] {
-            assert!(case.checks(url).await.is_err(), "{url}");
-        }
-        assert!(!case.scratch.join("gh.args").exists());
-        Ok(())
-    }))
-    .await
-}
-
-#[tokio::test]
-async fn the_real_executors_refuse_push_and_pr_create() -> TestResult {
-    common::bounded(Box::pin(async {
-        let case = GhCase::new("[]", "0")?;
-        assert!(
-            case.gh
-                .pr_create(&GhCase::target(), "t", "b")
-                .await
-                .is_err()
-        );
-        let git = MirrorGit::new(Workspace::new(case.scratch.join("jobs")), &Job::default());
-        assert!(git.push(&GhCase::target()).await.is_err());
+        let git = MirrorGit::new(Workspace::new(dir.path().join("jobs")), &Job::default());
+        assert!(git.push(&PushTarget::Own("job1".to_owned())).await.is_err());
         Ok(())
     }))
     .await
@@ -2009,7 +1665,7 @@ async fn a_failing_fake_git_fetch_replies_with_the_fixed_failure() -> TestResult
             AgentLauncher::Systemd,
             &job_for(PRODUCTION_REPO),
             git,
-            GhCase::new("[]", "0")?.gh,
+            Stub::new("[]"),
             Redactor::new([TOKEN]),
         )?;
         let reply = broker.handle(Request::Fetch {}).await;
@@ -2025,31 +1681,12 @@ async fn a_failing_fake_git_fetch_replies_with_the_fixed_failure() -> TestResult
     .await
 }
 
-#[derive(Clone)]
-struct Recording {
-    gh: GhCli,
-}
-
-impl GhExecutor for Recording {
-    fn pr_create(
-        &self,
-        _: &PushTarget,
-        _: &str,
-        _: &str,
-    ) -> impl Future<Output = Result<String, ExecError>> + Send {
-        std::future::ready(Ok(GH_URL.to_owned()))
-    }
-
-    async fn pr_checks(&self, target: &PushTarget, pr_url: &str) -> Result<String, ExecError> {
-        self.gh.pr_checks(target, pr_url).await
-    }
-}
-
 #[tokio::test]
 async fn the_broker_serves_checks_of_the_recorded_url_and_redacts_the_reply() -> TestResult {
     common::bounded(Box::pin(async {
-        let out = format!("[{}]", item("pass", &format!("leak {TOKEN}"), ""));
-        let case = GhCase::new(&out, "0")?;
+        let out = format!(
+            "{{\"checks\":[{{\"bucket\":\"pass\",\"name\":\"leak {TOKEN}\"}}],\"truncated\":false}}"
+        );
         let dir = TempDir::new()?;
         let broker = Broker::new(
             AgentLauncher::Systemd,
@@ -2058,9 +1695,7 @@ async fn the_broker_serves_checks_of_the_recorded_url_and_redacts_the_reply() ->
                 fake_git_workspace(&dir.path().join("jobs")),
                 &job_for(PRODUCTION_REPO),
             ),
-            Recording {
-                gh: case.gh.clone(),
-            },
+            Stub::new(&out),
             Redactor::new([TOKEN]),
         )?
         .with_limits(Limits::default());
@@ -2091,8 +1726,6 @@ async fn the_broker_serves_checks_of_the_recorded_url_and_redacts_the_reply() ->
         };
         assert!(!output.contains(TOKEN), "{output}");
         assert!(output.contains("[REDACTED]"), "{output}");
-        let args = std::fs::read_to_string(case.scratch.join("gh.args"))?;
-        assert!(args.contains(GH_URL));
         assert!(matches!(
             broker.handle(Request::PrChecks {}).await,
             Response::Denied {
@@ -2124,7 +1757,7 @@ async fn a_broker_fetch_refreshes_the_job_repo_mirror_and_ignores_a_repo_in_the_
             AgentLauncher::Systemd,
             &job_for(PRODUCTION_REPO),
             MirrorGit::new(ws.clone(), &job_for(PRODUCTION_REPO)),
-            GhCase::new("[]", "0")?.gh,
+            Stub::new("[]"),
             Redactor::default(),
         )?;
         assert!(matches!(

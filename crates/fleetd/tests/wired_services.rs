@@ -1,7 +1,6 @@
 //! Serves the three job services for real: a live job socket over the production wiring, a fake
 //! peer, fake upstreams behind the injected resolver and dialer, and a job run by `DaemonRunner`.
 
-use std::collections::BTreeSet;
 use std::error::Error;
 use std::future::Future;
 use std::io;
@@ -60,7 +59,6 @@ struct Tools {
     _dir: TempDir,
     claude: PathBuf,
     gh: PathBuf,
-    gh_env: PathBuf,
 }
 
 fn tools() -> io::Result<&'static Tools> {
@@ -85,7 +83,6 @@ fn make_tools() -> io::Result<Tools> {
         "if [ \"$1\" = \"--version\" ]; then echo '2.1.289 (Claude Code)'; fi\nexit 0",
     )?;
     let gh = root.join("gh");
-    let gh_env = root.join("gh.env");
     script(
         &gh,
         &format!(
@@ -96,7 +93,6 @@ fn make_tools() -> io::Result<Tools> {
         _dir: dir,
         claude,
         gh,
-        gh_env,
     })
 }
 
@@ -426,7 +422,6 @@ async fn world(job_id: &str) -> Result<World, Box<dyn Error>> {
     let wiring = BrokerWiring::new(
         wired.broker.clone(),
         AgentLauncher::Systemd,
-        tools.gh.clone(),
         "github.com".to_owned(),
         TOKEN.to_owned(),
         Redactor::default(),
@@ -620,7 +615,7 @@ async fn egress_proxy_tunnels_allowed_and_refuses_the_rest() -> TestResult {
 }
 
 #[tokio::test]
-async fn broker_serves_pr_checks_and_fetch_with_a_scrubbed_env() -> TestResult {
+async fn broker_serves_a_chain_pr_and_refuses_checks_and_fetch_without_a_forge() -> TestResult {
     let mut world = world("joba").await?;
     let running = world.start(chain_job(&world.origin, "joba")).await?;
     let created = json(
@@ -634,50 +629,20 @@ async fn broker_serves_pr_checks_and_fetch_with_a_scrubbed_env() -> TestResult {
     )?;
     assert_eq!(created["status"], "done", "{created}");
     let checks = json(&broker_reply(&world, "joba", "pr_checks").await?)?;
-    assert_eq!(checks["status"], "done", "{checks}");
-    assert!(
-        checks["output"]
-            .as_str()
-            .is_some_and(|out| out.contains("build")),
-        "{checks}"
-    );
-    let env = std::fs::read_to_string(&tools()?.gh_env)?;
-    let names: BTreeSet<&str> = env
-        .lines()
-        .filter_map(|line| line.split_once('='))
-        .map(|(k, _)| k)
-        .collect();
-    let allowed: BTreeSet<&str> = [
-        "PATH",
-        "HOME",
-        "XDG_CONFIG_HOME",
-        "GH_CONFIG_DIR",
-        "GH_TOKEN",
-        "GH_HOST",
-        "GH_PROMPT_DISABLED",
-        "GH_NO_UPDATE_NOTIFIER",
-        "NO_COLOR",
-        "PWD",
-        "SHLVL",
-        "_",
-        "OLDPWD",
-    ]
-    .into_iter()
-    .collect();
-    let extra: Vec<_> = names.difference(&allowed).collect();
-    assert!(extra.is_empty(), "leaked env: {extra:?}");
-    assert!(env.contains(&format!("GH_TOKEN={TOKEN}")) && env.contains("GH_HOST=github.com"));
+    assert_eq!(checks["status"], "denied", "{checks}");
+    assert_eq!(checks["error"], "failed", "{checks}");
+    assert_eq!(checks["message"], "operation failed", "{checks}");
     let advanced = world.origin.advance()?;
     let fetched = json(&broker_reply(&world, "joba", "fetch").await?)?;
-    assert_eq!(fetched["status"], "done", "{fetched}");
-    let mut mirrors = Vec::new();
+    assert_eq!(fetched["status"], "denied", "{fetched}");
+    assert_eq!(fetched["message"], "operation failed", "{fetched}");
     for entry in std::fs::read_dir(world.jobs.join(".cache"))? {
         let path = entry?.path();
-        if path.is_dir() && git(&path, &["for-each-ref"]).is_ok_and(|r| r.contains(&advanced)) {
-            mirrors.push(path);
-        }
+        assert!(
+            !(path.is_dir() && git(&path, &["for-each-ref"]).is_ok_and(|r| r.contains(&advanced))),
+            "a file-path repo has no forge, so the broker fetch must not refresh {path:?}"
+        );
     }
-    assert_eq!(mirrors.len(), 1, "mirror lacking {advanced}: {mirrors:?}");
     finish(running).await
 }
 

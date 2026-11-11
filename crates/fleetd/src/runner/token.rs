@@ -11,6 +11,7 @@ use std::ffi::OsString;
 use std::sync::{Arc, PoisonError};
 
 use fleet_core::Redactor;
+use fleet_core::credential::GITHUB_HOST;
 use fleet_proto::v1 as pb;
 use fleet_proto::v1::Job;
 use tokio::process::Command;
@@ -26,6 +27,7 @@ use crate::runner::{AgentRunner, Reporter};
 struct JobTokenSource<R: Reporter> {
     agent: Arc<AgentRunner<R>>,
     job_id: String,
+    host: Option<String>,
 }
 
 impl<R: Reporter> std::fmt::Debug for JobTokenSource<R> {
@@ -40,7 +42,10 @@ impl<R: Reporter + Send + Sync + 'static> TokenSource for JobTokenSource<R> {
     fn lease(&self) -> LeaseFuture<'_> {
         Box::pin(async move {
             self.agent.refresh_token(&self.job_id).await?;
-            Ok(self.agent.leased_github_token(&self.job_id))
+            Ok(self.host.as_ref().map_or_else(
+                || self.agent.leased_github_token(&self.job_id),
+                |host| self.agent.leased_token_for(&self.job_id, host),
+            ))
         })
     }
 }
@@ -51,6 +56,21 @@ impl<R: Reporter + Send + Sync + 'static> AgentRunner<R> {
         Arc::new(JobTokenSource {
             agent: Arc::clone(self),
             job_id: job_id.to_owned(),
+            host: None,
+        })
+    }
+
+    /// A [`TokenSource`] that resolves the token `job_id` holds for `host` on every call, through
+    /// `JobCredentials::token_for`. It resolves nothing for a host the credential reply did not name.
+    pub(crate) fn token_source_for(
+        self: &Arc<Self>,
+        job_id: &str,
+        host: &str,
+    ) -> Arc<dyn TokenSource> {
+        Arc::new(JobTokenSource {
+            agent: Arc::clone(self),
+            job_id: job_id.to_owned(),
+            host: Some(host.to_owned()),
         })
     }
 }
@@ -92,6 +112,26 @@ impl<R: Reporter> AgentRunner<R> {
         };
         let token = held.github_str().map(str::to_owned).unwrap_or_default();
         LeasedToken::new(token, Some(lease))
+    }
+
+    /// The token `job_id` holds for `host`, with a lease on it. Empty when the credential reply
+    /// named no such host. A reply with no host entries at all comes from a server that predates
+    /// them and holds one GitHub token, so it answers for `github.com` only. Without a book it is the `GH_TOKEN` of the base environment, whatever
+    /// the host. Call it right after [`AgentRunner::refresh_token`].
+    pub(crate) fn leased_token_for(&self, job_id: &str, host: &str) -> LeasedToken {
+        let Some(book) = &self.credentials else {
+            return LeasedToken::new(self.github_token(job_id).unwrap_or_default(), None);
+        };
+        let Some((held, lease)) = book.lease_held(job_id) else {
+            return LeasedToken::new(String::new(), None);
+        };
+        let legacy = held.hosts().is_empty() && host.eq_ignore_ascii_case(GITHUB_HOST);
+        let token = if legacy {
+            held.github_str()
+        } else {
+            held.token_str_for(host)
+        };
+        LeasedToken::new(token.map(str::to_owned).unwrap_or_default(), Some(lease))
     }
 
     /// The git author and committer environment for `job_id`: the bot identity of a held
@@ -1657,16 +1697,14 @@ mod tests {
     #[tokio::test]
     async fn a_broker_gh_call_after_a_refresh_uses_the_new_token_and_the_old_is_revoked_after_the_call()
     -> Result<(), Box<dyn std::error::Error>> {
-        use crate::broker::{GhCli, GhExecutor, PushTarget};
-        let (runner, book, clock, hits, dir) = leased_swap_fixture().await?;
-        let scratch = crate::workspace::Workspace::new(dir.path().join("jobs"))
-            .create_broker_scratch("job1")?;
-        let bin = script(
-            dir.path(),
-            "gh",
-            "#!/bin/sh\nprintf '%s\\n' \"$GH_TOKEN\" >> \"$HOME/tokens\"\nsleep 1\necho '[]'\n",
-        )?;
-        let gh = GhCli::new(bin, "github.com", String::new(), &scratch)?
+        use crate::broker::{GhExecutor, PushTarget};
+        use crate::forge::ApiChecks;
+        use crate::forge::testing::StubForge;
+        let (runner, book, clock, hits, _dir) = leased_swap_fixture().await?;
+        let mut forge = StubForge::new(Ok(Vec::new()));
+        forge.delay = std::time::Duration::from_secs(1);
+        let repo = crate::forge::repo_ref("https://github.com/o/r.git").ok_or("repo")?;
+        let gh = ApiChecks::new(forge.clone(), repo, "main", String::new())
             .with_token_source(runner.token_source("job1"));
         let target = PushTarget::Own("job1".to_owned());
         let url = "https://github.com/o/r/pull/1";
@@ -1678,11 +1716,8 @@ mod tests {
         assert_eq!(during?, 0);
         wait_revoked(&hits).await;
         assert!(gh.pr_checks(&target, url).await.is_ok());
-        let tokens = std::fs::read_to_string(scratch.join("tokens"))?;
-        assert_eq!(
-            tokens.lines().collect::<Vec<_>>(),
-            [APP_TOKEN, NEW_APP_TOKEN]
-        );
+        let tokens: Vec<String> = forge.calls().into_iter().map(|c| c.token).collect();
+        assert_eq!(tokens, [APP_TOKEN, NEW_APP_TOKEN]);
         Ok(())
     }
 

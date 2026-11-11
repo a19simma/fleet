@@ -988,6 +988,7 @@ dependencies = [
  "flate2",
  "fleet-cli",
  "fleet-core",
+ "fleet-forge",
  "fleet-proto",
  "fleet-server",
  "fleetd",

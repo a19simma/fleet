@@ -10,6 +10,8 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use fleet_core::Redactor;
+use fleet_core::host::{HostKind, HostName};
+use fleet_forge::{ForgeApi, RepoRef};
 use fleet_proto::v1::{Job, JobKind};
 use rustls::ClientConfig;
 use tokio::net::UnixStream;
@@ -21,7 +23,7 @@ use crate::Error;
 use crate::agent_config::Bundle;
 use crate::backoff::SystemRandom;
 use crate::bg_command::{BgConfig, PueueCli};
-use crate::broker::{Broker, BrokerError, GhCli, MirrorGit};
+use crate::broker::{Broker, MirrorGit};
 use crate::config::Config;
 use crate::connect_proxy::{ConnectProxy, ProxyLimits};
 use crate::cred::{CredentialBook, CredentialClient, ERR_NO_AGENT};
@@ -35,6 +37,7 @@ use crate::envd::{
 };
 use crate::fetch::{Dialer, Fetcher, Resolver, SystemResolver, TcpDialer, webpki_tls_config};
 use crate::fetch_service::{FeedBook, FetchRecorder, FetchService, MAX_CONCURRENT_FETCHES};
+use crate::forge::{ApiChecks, Forges, HostApi, HostPolicy, JobForge, NoGit, PinnedHttp, repo_ref};
 use crate::jobenv::group_id;
 use crate::jobsock::{JobContext, PerJob, ServeFuture, Service, ServiceName, Services};
 use crate::poller::{
@@ -87,7 +90,6 @@ impl Service for DynBroker {
 pub struct BrokerWiring {
     registry: PerJob<DynBroker>,
     launcher: AgentLauncher,
-    gh_bin: PathBuf,
     host: String,
     /// Used only by a runner with no credential book. With a book, each job's token is its
     /// owner's held GitHub credential and this value is ignored.
@@ -97,12 +99,11 @@ pub struct BrokerWiring {
 
 impl BrokerWiring {
     /// The broker settings of a daemon: the registry the job socket reads, the launcher kind,
-    /// the absolute `gh` path, the token host, its token and the redactor.
+    /// the token host, its token and the redactor.
     #[must_use]
     pub const fn new(
         registry: PerJob<DynBroker>,
         launcher: AgentLauncher,
-        gh_bin: PathBuf,
         host: String,
         token: String,
         redactor: Redactor,
@@ -110,7 +111,6 @@ impl BrokerWiring {
         Self {
             registry,
             launcher,
-            gh_bin,
             host,
             token,
             redactor,
@@ -454,35 +454,95 @@ impl<R: Reporter + Send + Sync + 'static> DaemonRunner<R> {
         }
     }
 
-    /// The `gh` executor of `job`. With a credential book it resolves the job owner's token
-    /// through [`TokenSource`] on every call, so a refresh between two calls never leaves it
-    /// with a revoked token. Without one it keeps the wiring's token.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`BrokerError::RelativeGhBin`] when the wiring's `gh` path is not absolute.
-    fn gh_cli(
+    /// The hosts `job` may reach: with a credential book, the entries the server sent for it;
+    /// without one, or when the reply names none, `github.com` when it is the wiring's host and
+    /// nothing else.
+    fn host_policies(&self, wiring: &BrokerWiring, job: &Job) -> Vec<HostPolicy> {
+        let legacy = || {
+            HostName::normalise(&wiring.host)
+                .ok()
+                .filter(|host| host.as_str() == "github.com")
+                .map(|host| HostPolicy::new(host, HostKind::Github, Vec::new()))
+                .into_iter()
+                .collect()
+        };
+        self.credentials.as_ref().map_or_else(legacy, |book| {
+            book.get(&job.job_id).map_or_else(Vec::new, |held| {
+                if held.hosts().is_empty() {
+                    return legacy();
+                }
+                held.hosts()
+                    .iter()
+                    .filter_map(HostPolicy::from_entry)
+                    .collect()
+            })
+        })
+    }
+
+    /// The `pr_checks` executor of `job` over `forge`. With a credential book it resolves the
+    /// token the job holds for the repo host through [`TokenSource`] on every call, so a refresh
+    /// between two calls never leaves it with a revoked token. Without one it keeps the wiring's
+    /// token.
+    fn checks_over<F: ForgeApi>(
+        &self,
+        forge: F,
+        repo: RepoRef,
+        wiring: &BrokerWiring,
+        job: &Job,
+    ) -> ApiChecks<F> {
+        let host = repo.host().as_str().to_owned();
+        let checks = ApiChecks::new(forge, repo, &job.base_ref, wiring.token.clone());
+        if self.credentials.is_some() {
+            checks.with_token_source(self.agent.token_source_for(&job.job_id, &host))
+        } else {
+            checks
+        }
+    }
+
+    /// The `pr_checks` executor of `job`: the adapter of the repo host's kind. `None` when the
+    /// repo is no `https` URL or its host has no policy, and then every `pr_checks` call gets the
+    /// broker's fixed error.
+    fn api_checks(
         &self,
         wiring: &BrokerWiring,
         job: &Job,
-        scratch: PathBuf,
-    ) -> Result<GhCli, BrokerError> {
-        let checks = GhCli::new(
-            wiring.gh_bin.clone(),
-            wiring.host.clone(),
-            wiring.token.clone(),
-            scratch,
-        )?;
-        Ok(if self.credentials.is_some() {
-            checks.with_token_source(self.agent.token_source(&job.job_id))
+    ) -> Option<ApiChecks<HostApi<PinnedHttp, NoGit>>> {
+        let repo = repo_ref(&job.repo)?;
+        let forges = Forges::new(self.host_policies(wiring, job));
+        match forges.for_host(repo.host().as_str()) {
+            Ok(forge) => Some(self.checks_over(forge, repo, wiring, job)),
+            Err(error) => {
+                tracing::warn!(%error, "no forge adapter for the job repo host");
+                None
+            }
+        }
+    }
+
+    /// The push, pull request and fetch forge of `job`: the adapter of the repo host's kind over a
+    /// pinned client. With a credential book it resolves the token the job holds for the repo
+    /// host through [`TokenSource`] on every call. `None` when the repo is no `https` URL or its
+    /// host has no policy, and then those broker calls get the fixed error.
+    fn job_forge(&self, wiring: &BrokerWiring, job: &Job) -> Option<JobForge<PinnedHttp>> {
+        let repo = repo_ref(&job.repo)?;
+        let host = repo.host().as_str().to_owned();
+        let forges = Forges::new(self.host_policies(wiring, job));
+        let http = match forges.http_for(&host) {
+            Ok(http) => http,
+            Err(error) => {
+                tracing::warn!(%error, "no forge adapter for the job repo host");
+                return None;
+            }
+        };
+        let forge = JobForge::new(forges, http, repo, &job.base_ref, wiring.token.clone());
+        Some(if self.credentials.is_some() {
+            forge.with_token_source(self.agent.token_source_for(&job.job_id, &host))
         } else {
-            checks
+            forge
         })
     }
 
     fn build_broker(&self, wiring: &BrokerWiring, job: &Job, cwd: &Path) -> Result<(), String> {
-        let scratch = self
-            .workspace
+        self.workspace
             .create_broker_scratch(&job.job_id)
             .map_err(|err| err.to_string())?;
         let git = PublishGit::new(
@@ -490,15 +550,13 @@ impl<R: Reporter + Send + Sync + 'static> DaemonRunner<R> {
             job.clone(),
             cwd.to_path_buf(),
             MirrorGit::new(self.workspace_for(job), job),
+            self.job_forge(wiring, job),
         );
-        let checks = self
-            .gh_cli(wiring, job, scratch)
-            .map_err(|err| err.to_string())?;
         let gh = PublishGh::new(
             Arc::clone(&self.agent),
             job.clone(),
-            cwd.to_path_buf(),
-            checks,
+            self.api_checks(wiring, job),
+            self.job_forge(wiring, job),
         );
         let redactor = wiring
             .redactor
@@ -998,7 +1056,6 @@ pub(crate) fn build(
     let wiring = BrokerWiring::new(
         wired.broker,
         config.agent_launcher,
-        config.gh_bin.clone(),
         host.to_owned(),
         String::new(),
         redactor.clone(),
@@ -2505,7 +2562,6 @@ mod tests {
                     let wiring = BrokerWiring {
                         registry: wired.broker.clone(),
                         launcher,
-                        gh_bin: PathBuf::from("/usr/bin/gh"),
                         host: "github.com".to_owned(),
                         token: "tok".to_owned(),
                         redactor: Redactor::default(),
@@ -3481,30 +3537,28 @@ mod token_wiring_tests {
     async fn the_broker_gh_executor_resolves_the_token_again_after_a_refresh() -> TestResult {
         let dir = tempfile::TempDir::new()?;
         let (runner, clock) = runner_holding(dir.path(), Path::new("/usr/bin/git")).await?;
-        let job = job();
-        let scratch = runner.workspace.create_broker_scratch("job1")?;
-        let gh_bin = script(
-            dir.path(),
-            "gh",
-            "#!/bin/sh\nprintf '%s\\n' \"$GH_TOKEN\" >> \"$HOME/tokens\"\necho '[]'\n",
-        )?;
+        let job = Job {
+            base_ref: "main".into(),
+            ..job()
+        };
         let registry = PerJob::new();
         let wiring = BrokerWiring::new(
             registry,
             AgentLauncher::Direct,
-            gh_bin,
             "github.com".to_owned(),
             "box-token".to_owned(),
             Redactor::default(),
         );
-        let gh = runner.gh_cli(&wiring, &job, scratch.clone())?;
+        let forge = crate::forge::testing::StubForge::new(Ok(Vec::new()));
+        let repo = repo_ref(&job.repo).ok_or("repo")?;
+        let gh = runner.checks_over(forge.clone(), repo, &wiring, &job);
         let target = PushTarget::Own("job1".to_owned());
         let url = "https://github.com/o/r/pull/1";
         gh.pr_checks(&target, url).await?;
         clock.0.store(EXPIRES_MS - 5 * MINUTE_MS, Ordering::SeqCst);
         gh.pr_checks(&target, url).await?;
-        let tokens = std::fs::read_to_string(scratch.join("tokens"))?;
-        assert_eq!(tokens.lines().collect::<Vec<_>>(), [OLD, NEW]);
+        let tokens: Vec<String> = forge.calls().into_iter().map(|c| c.token).collect();
+        assert_eq!(tokens, [OLD, NEW]);
         Ok(())
     }
 

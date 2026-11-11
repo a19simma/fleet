@@ -11,7 +11,7 @@
 //! `fetch` refreshes the mirror of the Job's own repo. Both are paced: at most
 //! [`MAX_PR_CHECKS_PER_JOB`] and [`MAX_FETCHES_PER_JOB`] attempts per Job, no closer together
 //! than [`MIN_PR_CHECKS_INTERVAL`] and [`MIN_FETCH_INTERVAL`] ([`Limits`]), and one `fetch`
-//! at a time per Job. [`GhCli`] and [`MirrorGit`] are the real executors of these two reads.
+//! at a time per Job. [`MirrorGit`] and `forge::ApiChecks` are the real executors of these two reads.
 //!
 //! Per Job the broker allows [`MAX_PUSHES_PER_JOB`] pushes, no closer together than
 //! [`MIN_PUSH_INTERVAL`], and [`MAX_PRS_PER_JOB`] pull request creation. A title holds at most
@@ -27,7 +27,7 @@
 //! `push` and `pr_create` are real in `crate::publish`: `PublishGit` and `PublishGh` run the
 //! finish step's publish path for the Job's bound target and share its state, so the finish step
 //! skips a head already pushed and reuses the pull request. A broker failure changes nothing the
-//! finish step needs. [`MirrorGit`] and [`GhCli`] refuse those two ops themselves.
+//! finish step needs. [`MirrorGit`] and `forge::ApiChecks` refuse those two ops themselves.
 //!
 //! `DaemonRunner` builds one [`Broker`] per claimed Job under the systemd launcher and registers
 //! it in the `PerJob` registry before launch; the direct launcher registers none. The
@@ -41,26 +41,21 @@
 
 use std::fmt;
 use std::future::Future;
-use std::path::PathBuf;
-use std::process::Stdio;
-use std::sync::{Arc, Mutex, PoisonError};
+use std::sync::{Mutex, PoisonError};
 use std::time::Duration;
 
 use fleet_core::Redactor;
-use fleet_core::text::{Cap, is_hostile_allowing_joiners, sanitise_text};
+use fleet_core::text::is_hostile_allowing_joiners;
 use fleet_proto::v1::Job;
 use fleet_proto::{is_ci_url, is_swarm_branch};
 use serde::{Deserialize, Serialize};
-use tokio::io::{AsyncReadExt, BufReader};
+use tokio::io::BufReader;
 use tokio::net::UnixStream;
-use tokio::process::Command;
 use tokio::time::Instant;
 
 use crate::AgentLauncher;
-use crate::cred::TokenSource;
-use crate::group::GroupGuard;
 use crate::jobsock::{JobContext, MAX_FRAME_BYTES, ServeFuture, Service, read_frame, write_frame};
-use crate::workspace::{Workspace, scratch_is_private};
+use crate::workspace::Workspace;
 
 /// Most `push` calls one Job may attempt.
 pub const MAX_PUSHES_PER_JOB: u32 = 10;
@@ -85,11 +80,10 @@ pub const MIN_PR_CHECKS_INTERVAL: Duration = Duration::from_secs(5);
 pub const MIN_FETCH_INTERVAL: Duration = Duration::from_secs(30);
 /// Most bytes in a recorded pull request URL.
 pub const MAX_PR_URL_BYTES: usize = 2048;
-/// Most checks `pr_checks` returns.
-pub const MAX_CHECKS: usize = 50;
+/// Most checks `pr_checks` returns, the cap of `fleet_forge`.
+pub use fleet_forge::MAX_CHECKS;
 /// Most characters of a check name `pr_checks` returns.
 pub const MAX_CHECK_NAME_CHARS: usize = 120;
-const MAX_GH_STDOUT_BYTES: usize = 256 * 1024;
 /// Timeout of `push`.
 pub const PUSH_TIMEOUT: Duration = Duration::from_secs(120);
 /// Timeout of `pr_create`.
@@ -98,9 +92,6 @@ pub const PR_CREATE_TIMEOUT: Duration = Duration::from_secs(60);
 pub const PR_CHECKS_TIMEOUT: Duration = Duration::from_secs(30);
 /// Timeout of `fetch`.
 pub const FETCH_TIMEOUT: Duration = Duration::from_secs(120);
-
-/// The `PATH` of every `gh` child: fixed, never copied from fleetd.
-pub const GH_PATH: &str = "/usr/local/bin:/usr/bin:/bin";
 
 /// An operation the agent may request. No variant has a field for a branch, repo, URL or id.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
@@ -203,8 +194,6 @@ pub enum BrokerError {
     DirectLauncher,
     /// The claimed Job names no valid push target.
     Target,
-    /// The `gh` binary path is not absolute.
-    RelativeGhBin,
 }
 
 impl fmt::Display for BrokerError {
@@ -212,7 +201,6 @@ impl fmt::Display for BrokerError {
         f.write_str(match self {
             Self::DirectLauncher => "broker refused: agent_launcher is direct",
             Self::Target => "broker refused: the job names no valid push target",
-            Self::RelativeGhBin => "broker refused: the gh binary path is not absolute",
         })
     }
 }
@@ -624,6 +612,18 @@ impl MirrorGit {
     }
 }
 
+impl MirrorGit {
+    pub(crate) async fn refresh(&self) -> bool {
+        match self.workspace.fetch_mirror(&self.repo).await {
+            Ok(()) => true,
+            Err(err) => {
+                tracing::warn!(error = %err, detail = err.detail(), "broker fetch failed");
+                false
+            }
+        }
+    }
+}
+
 impl GitExecutor for MirrorGit {
     fn push(&self, _target: &PushTarget) -> impl Future<Output = Result<String, ExecError>> + Send {
         std::future::ready(Err(ExecError))
@@ -638,258 +638,6 @@ impl GitExecutor for MirrorGit {
             }
         }
     }
-}
-
-/// Runs `gh pr checks` for the broker. Its `pr_create` always refuses: the real one is
-/// `PublishGh` in `crate::publish`, which wraps this executor for `pr_checks`.
-///
-/// The child gets an empty environment plus the fixed [`GH_PATH`], a scratch `HOME`, `XDG_CONFIG_HOME` and
-/// `GH_CONFIG_DIR`, `GH_TOKEN`, `GH_HOST` and, off `github.com`, `GH_ENTERPRISE_TOKEN`. The
-/// token never reaches argv or fleetd's own environment. The agent shares fleetd's uid under
-/// some launchers, so this hides the token from other uids only (ADR-0024 Known limit).
-#[derive(Clone)]
-pub struct GhCli {
-    bin: PathBuf,
-    host: String,
-    token: String,
-    source: Option<Arc<dyn TokenSource>>,
-    scratch: PathBuf,
-}
-
-impl fmt::Debug for GhCli {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("GhCli")
-            .field("bin", &self.bin)
-            .field("host", &self.host)
-            .finish_non_exhaustive()
-    }
-}
-
-#[derive(Debug, Deserialize)]
-struct RawCheck {
-    bucket: Option<String>,
-    name: Option<String>,
-    link: Option<String>,
-}
-
-#[derive(Debug, Serialize)]
-struct Check {
-    bucket: &'static str,
-    name: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    link: Option<String>,
-}
-
-#[derive(Debug, Serialize)]
-struct Checks {
-    checks: Vec<Check>,
-    truncated: bool,
-}
-
-impl GhCli {
-    /// A `gh` executor for the pull requests of `host`, with `token` as that host's credential
-    /// and `scratch` as the child's home and working directory.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`BrokerError::RelativeGhBin`] when `bin` is not an absolute path.
-    pub fn new(
-        bin: impl Into<PathBuf>,
-        host: impl Into<String>,
-        token: String,
-        scratch: impl Into<PathBuf>,
-    ) -> Result<Self, BrokerError> {
-        let bin = bin.into();
-        if !bin.is_absolute() {
-            return Err(BrokerError::RelativeGhBin);
-        }
-        Ok(Self {
-            bin,
-            host: host.into(),
-            token,
-            source: None,
-            scratch: scratch.into(),
-        })
-    }
-
-    /// Resolves the token from `source` on every `gh` call and holds its lease until the child
-    /// exits, instead of the token given to [`GhCli::new`]. A refresh between two calls never
-    /// leaves a call with a revoked token.
-    #[must_use]
-    pub fn with_token_source(mut self, source: Arc<dyn TokenSource>) -> Self {
-        self.source = Some(source);
-        self
-    }
-
-    fn command(&self, pr_url: &str, token: &str) -> Command {
-        let home = &self.scratch;
-        let mut command = Command::new(&self.bin);
-        command.env_clear();
-        command
-            .env("PATH", GH_PATH)
-            .env("HOME", home)
-            .env("XDG_CONFIG_HOME", home.join(".config"))
-            .env("GH_CONFIG_DIR", home.join("gh"))
-            .env("GH_TOKEN", token)
-            .env("GH_HOST", &self.host)
-            .env("GH_PROMPT_DISABLED", "1")
-            .env("GH_NO_UPDATE_NOTIFIER", "1")
-            .env("NO_COLOR", "1");
-        if !self.host.eq_ignore_ascii_case("github.com") {
-            command.env("GH_ENTERPRISE_TOKEN", token);
-        }
-        command
-            .args(["pr", "checks", pr_url, "--json", "bucket,link,name"])
-            .current_dir(home)
-            .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::null())
-            .process_group(0)
-            .kill_on_drop(true);
-        command
-    }
-
-    async fn run(&self, pr_url: &str) -> Result<(Vec<u8>, Redactor), ExecError> {
-        if !scratch_is_private(&self.scratch) {
-            return Err(ExecError);
-        }
-        let leased = match &self.source {
-            Some(source) => Some(source.lease().await.map_err(|failure| {
-                tracing::warn!(
-                    reason = failure.reason(),
-                    "broker token could not be resolved"
-                );
-                ExecError
-            })?),
-            None => None,
-        };
-        let token = leased.as_ref().map_or(self.token.as_str(), |l| l.token());
-        let mut child = self.command(pr_url, token).spawn().map_err(|_| ExecError)?;
-        let _guard = GroupGuard::new(child.id());
-        let mut stdout = child.stdout.take().ok_or(ExecError)?;
-        let mut raw = Vec::new();
-        (&mut stdout)
-            .take(MAX_GH_STDOUT_BYTES as u64 + 1)
-            .read_to_end(&mut raw)
-            .await
-            .map_err(|_| ExecError)?;
-        if raw.len() > MAX_GH_STDOUT_BYTES {
-            return Err(ExecError);
-        }
-        let _ = child.wait().await;
-        let redactor = check_redactor(
-            &self.token,
-            leased.as_ref().map(crate::cred::LeasedToken::token),
-        );
-        drop(leased);
-        Ok((raw, redactor))
-    }
-
-    fn subset(&self, raw: &[u8], redactor: &Redactor) -> Result<String, ExecError> {
-        let items: Vec<RawCheck> = serde_json::from_slice(raw).map_err(|_| ExecError)?;
-        let mut shown = Checks {
-            checks: Vec::new(),
-            truncated: items.len() > MAX_CHECKS,
-        };
-        for item in items.into_iter().take(MAX_CHECKS) {
-            shown.checks.push(Check {
-                bucket: bucket_name(item.bucket.as_deref()),
-                name: check_name(redactor, item.name.as_deref()),
-                link: item.link.filter(|link| link_on_host(link, &self.host)),
-            });
-            if serde_json::to_string(&shown).map_err(|_| ExecError)?.len() > MAX_OUTPUT_BYTES {
-                shown.checks.pop();
-                shown.truncated = true;
-                break;
-            }
-        }
-        serde_json::to_string(&shown).map_err(|_| ExecError)
-    }
-}
-
-impl GhExecutor for GhCli {
-    fn pr_create(
-        &self,
-        _target: &PushTarget,
-        _title: &str,
-        _body: &str,
-    ) -> impl Future<Output = Result<String, ExecError>> + Send {
-        std::future::ready(Err(ExecError))
-    }
-
-    async fn pr_checks(&self, _target: &PushTarget, pr_url: &str) -> Result<String, ExecError> {
-        if !is_pull_url(pr_url, &self.host) {
-            return Err(ExecError);
-        }
-        let (raw, redactor) = self.run(pr_url).await?;
-        self.subset(&raw, &redactor)
-    }
-}
-
-fn bucket_name(bucket: Option<&str>) -> &'static str {
-    match bucket {
-        Some("pass") => "pass",
-        Some("fail") => "fail",
-        Some("pending") => "pending",
-        Some("skipping") => "skipping",
-        Some("cancel") => "cancel",
-        _ => "unknown",
-    }
-}
-
-/// A redactor for check names: the static token, the leased token when one is in use, and every
-/// installation token by shape.
-fn check_redactor(token: &str, leased: Option<&str>) -> Redactor {
-    Redactor::new([token, leased.unwrap_or_default()]).with_installation_tokens()
-}
-
-fn check_name(redactor: &Redactor, name: Option<&str>) -> String {
-    sanitise_text(
-        redactor,
-        name.unwrap_or_default(),
-        Cap::Chars(MAX_CHECK_NAME_CHARS),
-    )
-    .text
-    .trim()
-    .to_owned()
-}
-
-fn host_of(url: &str) -> Option<&str> {
-    url.strip_prefix("https://")?.split(['/', '?', '#']).next()
-}
-
-fn link_on_host(link: &str, host: &str) -> bool {
-    is_ci_url(link) && host_of(link).is_some_and(|h| h.eq_ignore_ascii_case(host))
-}
-
-fn is_pull_url(url: &str, host: &str) -> bool {
-    if url.len() > MAX_PR_URL_BYTES || !link_on_host(url, host) {
-        return false;
-    }
-    let Some(path) = url
-        .strip_prefix("https://")
-        .and_then(|rest| rest.split_once('/'))
-        .map(|(_, path)| path)
-    else {
-        return false;
-    };
-    let mut parts = path.split('/');
-    let plain = |part: Option<&str>| {
-        part.is_some_and(|p| {
-            !p.is_empty()
-                && p != "."
-                && p != ".."
-                && p.bytes()
-                    .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.'))
-        })
-    };
-    plain(parts.next())
-        && plain(parts.next())
-        && parts.next() == Some("pull")
-        && parts
-            .next()
-            .is_some_and(|n| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()))
-        && parts.next().is_none()
 }
 
 /// The pull request URL in the redacted `pr_create` output: the last non-empty line, when it
@@ -1024,6 +772,209 @@ mod tests {
     type TestResult = Result<(), Box<dyn std::error::Error>>;
 
     const SECRET: &str = "ghp_secretsecret1234";
+
+    fn forbidden() -> Vec<String> {
+        [
+            ["Comm", "and"].concat(),
+            ["proc", "ess::"].concat(),
+            ["\"g", "h\""].concat(),
+            ["Gh", "Cli"].concat(),
+            ["GH", "_PATH"].concat(),
+            ["git", "hub"].concat(),
+            ["git", "ea"].concat(),
+            ["forge", "jo"].concat(),
+            ["Host", "Kind"].concat(),
+            ["Forg", "es"].concat(),
+        ]
+        .into()
+    }
+
+    fn violations(source: &str) -> Vec<String> {
+        let names = forbidden();
+        source
+            .lines()
+            .filter(|line| !line.trim_start().starts_with("//"))
+            .filter(|line| {
+                let lower = line.to_ascii_lowercase();
+                names
+                    .iter()
+                    .any(|name| lower.contains(&name.to_ascii_lowercase()))
+            })
+            .map(str::to_owned)
+            .collect()
+    }
+
+    #[test]
+    fn the_scan_flags_an_invocation_and_a_forge_name_branch() {
+        let spawn = ["let out = Comm", "and::new(\"g", "h\");"].concat();
+        let branch = ["match kind { Host", "Kind::Git", "hub => 1 }"].concat();
+        assert_eq!(violations(&spawn), std::slice::from_ref(&spawn));
+        assert_eq!(violations(&branch), std::slice::from_ref(&branch));
+        let comment = ["/// runs g", "ithub"].concat();
+        assert_eq!(violations(&comment), Vec::<String>::new());
+        assert_eq!(
+            violations("self.gh.pr_checks(&target, url)"),
+            Vec::<String>::new()
+        );
+    }
+
+    fn non_test(source: &str) -> &str {
+        source
+            .split("\n#[cfg(test)]\nmod tests")
+            .next()
+            .unwrap_or_default()
+    }
+
+    fn body_of(source: &str, header: &str) -> String {
+        let Some(start) = source.find(header) else {
+            return String::new();
+        };
+        let mut depth = 0usize;
+        let mut opened = false;
+        let mut end = source.len();
+        for (at, c) in source.get(start..).unwrap_or_default().char_indices() {
+            match c {
+                '{' => {
+                    depth += 1;
+                    opened = true;
+                }
+                '}' if opened => {
+                    depth -= 1;
+                    if depth == 0 {
+                        end = start + at + 1;
+                        break;
+                    }
+                }
+                _ => {}
+            }
+        }
+        source.get(start..end).unwrap_or_default().to_owned()
+    }
+
+    fn gh_markers() -> Vec<String> {
+        [
+            ["gh", "_bin"].concat(),
+            ["Scope::", "Gh"].concat(),
+            ["Gh", "Cli"].concat(),
+            ["\"g", "h\""].concat(),
+            ["Host", "Kind::"].concat(),
+            ["\"p", "r\", \"c", "reate\""].concat(),
+            ["\"p", "r\", \"l", "ist\""].concat(),
+            ["\"p", "r\", \"c", "hecks\""].concat(),
+            ["push", "_branch("].concat(),
+            ["exist", "ing_pr("].concat(),
+            ["open", "_pr("].concat(),
+            ["open_or", "_find_pr("].concat(),
+            ["self.create", "_pr("].concat(),
+        ]
+        .into()
+    }
+
+    fn marked(source: &str) -> Vec<String> {
+        let markers = gh_markers();
+        source
+            .lines()
+            .filter(|line| !line.trim_start().starts_with("//"))
+            .filter(|line| markers.iter().any(|marker| line.contains(marker.as_str())))
+            .map(str::to_owned)
+            .collect()
+    }
+
+    fn sources(dir: &std::path::Path, out: &mut Vec<(String, String)>) -> std::io::Result<()> {
+        let mut entries = std::fs::read_dir(dir)?.collect::<Result<Vec<_>, _>>()?;
+        entries.sort_by_key(std::fs::DirEntry::path);
+        for entry in entries {
+            let path = entry.path();
+            if path.is_dir() {
+                sources(&path, out)?;
+            } else if path.extension().is_some_and(|ext| ext == "rs") {
+                out.push((
+                    path.to_string_lossy().into_owned(),
+                    std::fs::read_to_string(&path)?,
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn the_broker_source_has_no_gh_invocation_and_no_forge_name_branch() {
+        let source = include_str!("broker.rs");
+        let code = non_test(source);
+        assert!(code.lines().count() > 100, "scan lost its input");
+        assert_eq!(violations(code), Vec::<String>::new());
+    }
+
+    #[test]
+    fn the_marker_scan_flags_each_marker_and_skips_comments() {
+        for marker in gh_markers() {
+            let line = format!("let x = {marker};");
+            assert_eq!(marked(&line), vec![line.clone()], "{marker}");
+        }
+        assert_eq!(marked("// gh_bin"), Vec::<String>::new());
+        assert_eq!(marked("forge.create_pr(a, b, c)"), Vec::<String>::new());
+        let body = body_of("fn a() { if x { y } }\nfn b() { z }", "fn a");
+        assert_eq!(body, "fn a() { if x { y } }");
+        assert_eq!(body_of("fn a() {}", "fn missing"), "");
+    }
+
+    const BROKER_FNS: [&str; 5] = [
+        "pub(crate) async fn broker_push_begin",
+        "pub(crate) async fn broker_pr_begin",
+        "impl<R: Reporter + Send + Sync + 'static> Git for PushGit<",
+        "> GitExecutor for PublishGit<",
+        "> GhExecutor",
+    ];
+
+    /// Files outside the scan, each for one reason. `config.rs` and `runner.rs` define the `gh`
+    /// path and its child scope, `runner/ci.rs` and the finish-step half of `publish.rs` are the
+    /// finish step's own CI follow-up and publish, `jobs.rs` and `forge/mod.rs` hold the host
+    /// policy and the one adapter selection, and `cred/mod.rs` stores a credential per host kind.
+    /// The broker functions of `publish.rs` are scanned by name below.
+    const EXEMPT: [&str; 7] = [
+        "config.rs",
+        "runner.rs",
+        "runner/ci.rs",
+        "jobs.rs",
+        "forge/mod.rs",
+        "publish.rs",
+        "cred/mod.rs",
+    ];
+
+    #[test]
+    fn no_source_calls_gh_or_branches_on_a_forge_name_for_the_four_operations() -> TestResult {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let mut all = Vec::new();
+        sources(&root, &mut all)?;
+        assert!(all.len() > 20, "scan lost its input");
+        let mut hits = Vec::new();
+        for (path, source) in &all {
+            let relative = path
+                .strip_prefix(root.to_string_lossy().as_ref())
+                .unwrap_or(path)
+                .trim_start_matches('/');
+            if EXEMPT.contains(&relative) {
+                continue;
+            }
+            for line in marked(non_test(source)) {
+                hits.push(format!("{relative}: {line}"));
+            }
+        }
+        let publish = all
+            .iter()
+            .find(|(path, _)| path.ends_with("src/publish.rs"))
+            .map(|(_, source)| non_test(source))
+            .unwrap_or_default();
+        for header in BROKER_FNS {
+            let body = body_of(publish, header);
+            assert!(body.lines().count() > 5, "scan lost {header}");
+            for line in marked(&body) {
+                hits.push(format!("publish.rs {header}: {line}"));
+            }
+        }
+        assert_eq!(hits, Vec::<String>::new());
+        Ok(())
+    }
 
     #[derive(Clone, Default)]
     struct Fake {
@@ -1761,52 +1712,6 @@ mod tests {
         ("byte order mark", '\u{feff}'),
         ("soft hyphen", '\u{ad}'),
     ];
-
-    fn name(raw: &str) -> String {
-        check_name(&Redactor::new([SECRET]), Some(raw))
-    }
-
-    #[test]
-    fn a_check_name_loses_every_hostile_character() {
-        for (label, c) in HOSTILE {
-            assert_eq!(name(&format!("a{c}b")), "ab", "{label}");
-        }
-        assert_eq!(name("a\rb"), "ab", "cr");
-        assert_eq!(name("a\r\nb"), "ab", "crlf");
-        assert_eq!(name("a\nb\tc"), "abc", "newline and tab");
-    }
-
-    #[test]
-    fn an_installation_token_is_redacted_when_the_static_token_is_empty() {
-        const INSTALLATION: &str = "ghs_AbCdEfGhIjKlMnOpQrStUvWxYz0123456789";
-        let redactor = check_redactor("", None);
-        let shown = check_name(&redactor, Some(&format!("build {INSTALLATION}")));
-        assert!(!shown.contains(INSTALLATION), "{shown}");
-        let leased = check_redactor("", Some("leased-token-value-123456"));
-        let shown = check_name(&leased, Some("x leased-token-value-123456"));
-        assert!(!shown.contains("leased-token-value"), "{shown}");
-    }
-
-    #[test]
-    fn a_check_name_cap_counts_chars_after_the_strip() {
-        let exact = "\u{e9}".repeat(MAX_CHECK_NAME_CHARS);
-        assert_eq!(name(&exact), exact);
-        let over = "\u{e9}".repeat(MAX_CHECK_NAME_CHARS + 1);
-        assert_eq!(name(&over), exact);
-        let hidden = "a\u{200b}".repeat(MAX_CHECK_NAME_CHARS + 1);
-        assert_eq!(name(&hidden), "a".repeat(MAX_CHECK_NAME_CHARS));
-        assert_eq!(name("  padded \u{feff} "), "padded");
-        assert_eq!(check_name(&Redactor::default(), None), "");
-    }
-
-    #[test]
-    fn a_check_name_secret_hidden_by_a_character_or_cut_by_the_cap_leaves_no_trace() {
-        let split = format!("run {}\u{200b}{}", &SECRET[..8], &SECRET[8..]);
-        assert!(!name(&split).contains(&SECRET[..8]));
-        let edge = format!("{}{SECRET}", "a".repeat(MAX_CHECK_NAME_CHARS - 6));
-        let shown = name(&edge);
-        assert!(!shown.contains("ghp_se"), "{shown}");
-    }
 
     #[test]
     fn a_title_refuses_every_hostile_character_and_both_ends_of_the_cap() {

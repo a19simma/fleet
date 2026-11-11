@@ -1,21 +1,21 @@
 //! Watches the checks of the pull request a job opened, until they settle or a deadline passes.
 
-use std::future::{self, Future};
 use std::path::Path;
 use std::time::Duration;
 
 use fleet_core::Redactor;
+use fleet_core::forge::{CiResult, ForgeError};
 use fleet_core::text::{Cap, sanitise_lines};
 use fleet_proto::v1::{CiState, Job, JobCi};
 use fleet_proto::{MAX_CI_LOG_BYTES, is_ci_log, is_ci_url};
+use serde::Deserialize;
 use serde_json::{Value, json};
 use tokio::time::Instant;
 use tonic::Code;
 
 use super::{AgentRunner, Ctl, Interrupt, Reporter, Scope, Stop, report_request};
-use crate::broker::{ExecError, GhExecutor, GitExecutor, PushTarget};
+use crate::broker::PushTarget;
 use crate::cred::CredentialFailure;
-use crate::forge::{CiResult, Forge, GitHubForge};
 use crate::proc::CaptureError;
 use crate::publish::Scratch;
 
@@ -88,69 +88,78 @@ pub(super) fn classify(stdout: &str) -> Seen {
     }
 }
 
-struct Replay(String);
-
-impl GitExecutor for Replay {
-    fn push(&self, _target: &PushTarget) -> impl Future<Output = Result<String, ExecError>> + Send {
-        future::ready(Err(ExecError))
-    }
-
-    fn fetch(&self) -> impl Future<Output = Result<String, ExecError>> + Send {
-        future::ready(Err(ExecError))
-    }
-}
-
-impl GhExecutor for Replay {
-    fn pr_create(
-        &self,
-        _target: &PushTarget,
-        _title: &str,
-        _body: &str,
-    ) -> impl Future<Output = Result<String, ExecError>> + Send {
-        future::ready(Err(ExecError))
-    }
-
-    fn pr_checks(
-        &self,
-        _target: &PushTarget,
-        _pr_url: &str,
-    ) -> impl Future<Output = Result<String, ExecError>> + Send {
-        future::ready(Ok(self.0.clone()))
-    }
-}
-
 fn link_of(seen: Seen) -> Option<String> {
     match seen {
         Seen::Passed { url } | Seen::Failed { url } | Seen::Waiting { url } => url,
     }
 }
 
-/// Reads one `gh pr checks` answer through [`Forge::ci_result`], with the capture's
-/// `truncated` flag carried into the forge input.
+/// Reads one `gh pr checks` answer, with the capture's `truncated` flag folded in.
 ///
 /// `Success` and `Neutral` give [`Seen::Passed`] only when `success` holds, `Failure` gives
-/// [`Seen::Failed`], and everything else gives [`Seen::Waiting`]. A forge error, which
-/// includes a list the capture cut without a visible failure, is [`Seen::Waiting`], so an
-/// unknown or truncated result never counts as success.
-pub(super) async fn read_checks(
-    target: &PushTarget,
-    pr_url: &str,
-    stdout: &str,
-    truncated: bool,
-    success: bool,
-) -> Seen {
+/// [`Seen::Failed`], and everything else gives [`Seen::Waiting`]. A list the capture cut without
+/// a visible failure is [`Seen::Waiting`], so an unknown or truncated result never counts as
+/// success.
+pub(super) fn read_checks(stdout: &str, truncated: bool, success: bool) -> Seen {
     let Ok(Value::Array(items)) = serde_json::from_str::<Value>(stdout) else {
         return Seen::Waiting { url: None };
     };
     let url = link_of(classify(stdout));
     let body = json!({ "checks": items, "truncated": truncated }).to_string();
-    let forge = GitHubForge::new(Replay(body.clone()), Replay(body));
-    match forge.ci_result(target, pr_url).await {
+    match from_buckets(&body) {
         Ok(CiResult::Failure) => Seen::Failed { url },
         Ok(CiResult::Success | CiResult::Neutral) if success => Seen::Passed { url },
         Ok(CiResult::Success | CiResult::Neutral) => Seen::Waiting { url: None },
         _ => Seen::Waiting { url },
     }
+}
+
+#[derive(Deserialize)]
+struct Listed {
+    checks: Vec<Bucketed>,
+    #[serde(default)]
+    truncated: bool,
+}
+
+#[derive(Deserialize)]
+struct Bucketed {
+    bucket: String,
+}
+
+/// Folds the buckets of `gh pr checks` into one [`CiResult`].
+///
+/// `fail` and `cancel` give `Failure`, then `pending` gives `InProgress`, any other bucket
+/// besides `pass` and `skipping` gives `Queued`, `pass` gives `Success` and only `skipping`
+/// gives `Neutral`. An empty list gives `NoChecks`. A truncated list without a visible `fail` or
+/// `cancel`, and output that is not the expected JSON, give [`ForgeError::Failed`].
+fn from_buckets(output: &str) -> Result<CiResult, ForgeError> {
+    let listed: Listed = serde_json::from_str(output).map_err(|_| ForgeError::Failed)?;
+    let has = |wanted: &[&str]| {
+        listed
+            .checks
+            .iter()
+            .any(|check| wanted.contains(&check.bucket.as_str()))
+    };
+    if listed.truncated && !has(&["fail", "cancel"]) {
+        return Err(ForgeError::Failed);
+    }
+    Ok(if listed.checks.is_empty() {
+        CiResult::NoChecks
+    } else if has(&["fail", "cancel"]) {
+        CiResult::Failure
+    } else if has(&["pending"]) {
+        CiResult::InProgress
+    } else if listed
+        .checks
+        .iter()
+        .any(|check| !matches!(check.bucket.as_str(), "pass" | "skipping"))
+    {
+        CiResult::Queued
+    } else if has(&["pass"]) {
+        CiResult::Success
+    } else {
+        CiResult::Neutral
+    })
 }
 
 fn next_pause(pause: Duration, cap: Duration) -> Duration {
@@ -327,9 +336,9 @@ impl<R: Reporter> AgentRunner<R> {
         dir: &Path,
         pr_url: &str,
     ) -> Result<Seen, CredentialFailure> {
-        let Ok(target) = PushTarget::from_job(job) else {
+        if PushTarget::from_job(job).is_err() {
             return Ok(Seen::Waiting { url: None });
-        };
+        }
         let checked = self
             .helper(
                 &self.config.gh_bin,
@@ -339,9 +348,7 @@ impl<R: Reporter> AgentRunner<R> {
             )
             .await;
         match checked {
-            Ok(out) => {
-                Ok(read_checks(&target, pr_url, &out.stdout, out.truncated, out.success).await)
-            }
+            Ok(out) => Ok(read_checks(&out.stdout, out.truncated, out.success)),
             Err(CaptureError::Credentials(failure)) => Err(failure),
             Err(_) => Ok(Seen::Waiting { url: None }),
         }
@@ -394,8 +401,6 @@ mod tests {
     use super::*;
 
     use fleet_proto::MAX_CI_URL_BYTES;
-
-    use crate::broker::PushTarget;
 
     const LINK: &str = "https://example.invalid/actions/runs/9/job/41";
 
@@ -503,26 +508,22 @@ mod tests {
         );
     }
 
-    fn own() -> PushTarget {
-        PushTarget::Own("job1".to_owned())
-    }
-
-    #[tokio::test]
-    async fn a_truncated_all_pass_list_waits_and_never_passes() {
+    #[test]
+    fn a_truncated_all_pass_list_waits_and_never_passes() {
         let items: Vec<String> = (0..50).map(|_| item("pass", LINK)).collect();
-        let seen = read_checks(&own(), "u", &list(&items), true, true).await;
+        let seen = read_checks(&list(&items), true, true);
         assert!(matches!(seen, Seen::Waiting { .. }), "{seen:?}");
     }
 
-    #[tokio::test]
-    async fn a_truncated_list_with_a_visible_failure_fails() {
+    #[test]
+    fn a_truncated_list_with_a_visible_failure_fails() {
         let out = list(&[item("pass", LINK), item("fail", LINK)]);
-        let seen = read_checks(&own(), "u", &out, true, false).await;
+        let seen = read_checks(&out, true, false);
         assert!(matches!(seen, Seen::Failed { .. }), "{seen:?}");
     }
 
-    #[tokio::test]
-    async fn the_forge_result_maps_to_the_seen_state() {
+    #[test]
+    fn the_forge_result_maps_to_the_seen_state() {
         let cases = [
             (list(&[item("pass", LINK)]), true, true),
             (list(&[item("pass", LINK)]), false, false),
@@ -533,16 +534,72 @@ mod tests {
             ),
         ];
         for (out, success, passed) in cases {
-            let seen = read_checks(&own(), "u", &out, false, success).await;
+            let seen = read_checks(&out, false, success);
             assert_eq!(matches!(seen, Seen::Passed { .. }), passed, "{seen:?}");
         }
         let pending = list(&[item("pass", LINK), item("pending", LINK)]);
-        let seen = read_checks(&own(), "u", &pending, false, false).await;
+        let seen = read_checks(&pending, false, false);
         assert!(matches!(seen, Seen::Waiting { .. }), "{seen:?}");
-        let seen = read_checks(&own(), "u", "[]", false, true).await;
+        let seen = read_checks("[]", false, true);
         assert!(matches!(seen, Seen::Waiting { .. }), "{seen:?}");
-        let seen = read_checks(&own(), "u", "junk", false, true).await;
+        let seen = read_checks("junk", false, true);
         assert!(matches!(seen, Seen::Waiting { .. }), "{seen:?}");
+    }
+
+    fn buckets(names: &[&str]) -> String {
+        let items: Vec<String> = names
+            .iter()
+            .map(|b| format!(r#"{{"bucket":"{b}","name":"n"}}"#))
+            .collect();
+        format!(r#"{{"checks":[{}],"truncated":false}}"#, items.join(","))
+    }
+
+    #[test]
+    fn buckets_map_to_the_six_results() {
+        let cases: [(&[&str], CiResult); 7] = [
+            (&[], CiResult::NoChecks),
+            (&["pending"], CiResult::InProgress),
+            (&["mystery"], CiResult::Queued),
+            (&["pass", "skipping"], CiResult::Success),
+            (&["pass", "cancel"], CiResult::Failure),
+            (&["fail"], CiResult::Failure),
+            (&["skipping"], CiResult::Neutral),
+        ];
+        for (names, want) in cases {
+            assert_eq!(from_buckets(&buckets(names)), Ok(want), "{names:?}");
+        }
+    }
+
+    #[test]
+    fn a_truncated_bucket_list_never_reads_as_passing() {
+        let passes = vec!["pass"; 50];
+        for names in [
+            passes,
+            vec!["pending"],
+            vec!["mystery"],
+            vec!["skipping"],
+            vec![],
+        ] {
+            let cut = buckets(&names).replace(r#""truncated":false"#, r#""truncated":true"#);
+            assert_eq!(
+                from_buckets(&cut),
+                Err(ForgeError::Failed),
+                "{}",
+                names.len()
+            );
+        }
+        for bad in ["fail", "cancel"] {
+            let cut =
+                buckets(&["pass", bad]).replace(r#""truncated":false"#, r#""truncated":true"#);
+            assert_eq!(from_buckets(&cut), Ok(CiResult::Failure), "{bad}");
+        }
+    }
+
+    #[test]
+    fn a_missing_truncated_flag_reads_as_not_truncated_and_junk_fails() {
+        let body = r#"{"checks":[{"bucket":"pass","name":"n"}]}"#;
+        assert_eq!(from_buckets(body), Ok(CiResult::Success));
+        assert_eq!(from_buckets("not json"), Err(ForgeError::Failed));
     }
 
     #[test]

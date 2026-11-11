@@ -16,6 +16,7 @@ dist = true
 axum.workspace = true
 clap.workspace = true
 fleet-core.workspace = true
+fleet-forge.workspace = true
 fleet-proto.workspace = true
 http-body-util = "0.1.5"
 hyper = { version = "1.12.0", default-features = false, features = ["client", "http1"] }

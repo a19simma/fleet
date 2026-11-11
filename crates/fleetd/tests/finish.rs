@@ -12,6 +12,10 @@ use std::sync::{Arc, Mutex, OnceLock, PoisonError};
 use std::time::Duration;
 
 use fleet_core::Redactor;
+use fleet_core::host::{HostKind, HostName};
+use fleet_forge::contract::Case;
+use fleet_forge::fake::{Fake as ForgeFake, Shape};
+use fleet_forge::{Http, HttpError, HttpRequest, HttpResponse, Method, RepoRef};
 use fleet_proto::MAX_CI_LOG_BYTES;
 use fleet_proto::PRECONDITION_APP_MINT_CAP;
 use fleet_proto::is_ci_log;
@@ -24,9 +28,11 @@ use fleet_proto::v1::{
 };
 use fleetd::AgentLauncher;
 use fleetd::broker::{
-    Broker, Denial, GhCli, Limits, MAX_BODY_BYTES, MAX_TITLE_CHARS, MirrorGit, Response,
+    Broker, Denial, ExecError, GhExecutor, Limits, MAX_BODY_BYTES, MAX_TITLE_CHARS, MirrorGit,
+    Response,
 };
 use fleetd::cred::{CredentialBook, CredentialClient, ERR_MINT_CAP};
+use fleetd::forge::{Forges, HostPolicy, JobForge};
 use fleetd::phase::Clock;
 use fleetd::poller::Shutdown;
 use fleetd::publish::{PublishGh, PublishGit};
@@ -2731,9 +2737,80 @@ async fn a_fix_job_with_a_bad_pull_request_url_pushes_and_skips_the_ci_watch() -
     .await
 }
 
-type Brokered = Broker<PublishGit<Fake>, PublishGh<Fake>>;
+/// Checks executor that refuses every call; no brokered test reads checks.
+#[derive(Clone)]
+struct NoChecks;
+
+impl GhExecutor for NoChecks {
+    fn pr_create(
+        &self,
+        _: &fleetd::broker::PushTarget,
+        _: &str,
+        _: &str,
+    ) -> impl Future<Output = Result<String, ExecError>> + Send {
+        ready(Err(ExecError))
+    }
+
+    fn pr_checks(
+        &self,
+        _: &fleetd::broker::PushTarget,
+        _: &str,
+    ) -> impl Future<Output = Result<String, ExecError>> + Send {
+        ready(Err(ExecError))
+    }
+}
+
+type Brokered = Broker<PublishGit<Fake, Recording>, PublishGh<Fake, NoChecks, Recording>>;
 
 const PR: &str = "https://example.invalid/pr/7";
+const FORGE_PR: &str = "https://github.com/octo/widgets/pull/7";
+
+#[derive(Clone)]
+struct Recording(ForgeFake, Arc<Mutex<Vec<HttpRequest>>>);
+
+impl Http for Recording {
+    fn send(
+        &self,
+        request: HttpRequest,
+    ) -> impl Future<Output = Result<HttpResponse, HttpError>> + Send {
+        self.1
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .push(request.clone());
+        self.0.send(request)
+    }
+}
+
+impl Recording {
+    fn posts(&self) -> Vec<HttpRequest> {
+        self.1
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .iter()
+            .filter(|r| r.method == Method::Post)
+            .cloned()
+            .collect()
+    }
+}
+
+fn recording(case: Case) -> Result<Recording, Box<dyn std::error::Error>> {
+    let fake = ForgeFake::new(Shape::GitHub);
+    fake.arm(case)?;
+    Ok(Recording(fake, Arc::new(Mutex::new(Vec::new()))))
+}
+
+fn job_forge(http: Recording) -> Result<JobForge<Recording>, Box<dyn std::error::Error>> {
+    let host = HostName::normalise("github.com")?;
+    let repo = RepoRef::new(host.clone(), "octo", "widgets")?;
+    let forges = Forges::new(vec![HostPolicy::new(host, HostKind::Github, Vec::new())]);
+    Ok(JobForge::new(
+        forges,
+        http,
+        repo,
+        "main",
+        ForgeFake::TOKEN.to_owned(),
+    ))
+}
 const FIXED_FAILURE: &str = r#"{"status":"denied","error":"failed","message":"operation failed"}"#;
 
 fn brokered(
@@ -2741,24 +2818,33 @@ fn brokered(
     spec: &Job,
     runner: &Arc<AgentRunner<Fake>>,
 ) -> Result<Brokered, Box<dyn std::error::Error>> {
+    brokered_with(rig, spec, runner, recording(Case::CreatePrOk)?, true)
+}
+
+fn brokered_with(
+    rig: &Rig,
+    spec: &Job,
+    runner: &Arc<AgentRunner<Fake>>,
+    http: Recording,
+    forge: bool,
+) -> Result<Brokered, Box<dyn std::error::Error>> {
     let workspace = Workspace::new(rig.dir.path().join("work")).with_policy(test_policy());
     let git = PublishGit::new(
         Arc::clone(runner),
         spec.clone(),
         rig.worktree.clone(),
-        MirrorGit::new(workspace.clone(), spec),
+        MirrorGit::new(workspace, spec),
+        if forge {
+            Some(job_forge(http.clone())?)
+        } else {
+            None
+        },
     );
-    let checks = GhCli::new(
-        gh(),
-        "example.invalid",
-        "not-a-real-gh-value".to_owned(),
-        workspace.create_broker_scratch(&spec.job_id)?,
-    )?;
     let gh = PublishGh::new(
         Arc::clone(runner),
         spec.clone(),
-        rig.worktree.clone(),
-        checks,
+        NoChecks,
+        if forge { Some(job_forge(http)?) } else { None },
     );
     let broker = Broker::new(
         AgentLauncher::Systemd,
@@ -2849,6 +2935,53 @@ async fn a_broker_push_publishes_the_bound_branch_fast_forward_only() -> TestRes
             "{args:?}"
         );
         assert_eq!(calls(&rig, "push.calls"), 1);
+        Ok(())
+    }))
+    .await
+}
+
+#[tokio::test]
+async fn a_broker_push_runs_the_hardened_argv_and_env() -> TestResult {
+    common::bounded(Box::pin(async {
+        let rig = rig("ok").await?;
+        commit(&rig)?;
+        let (agent, _rx) = agent(&rig);
+        let agent = Arc::new(agent);
+        let spec = job(&rig, true);
+        let broker = brokered(&rig, &spec, &agent)?;
+        assert_eq!(
+            broker.handle(fleetd::broker::Request::Push {}).await,
+            done("pushed")
+        );
+        let args = recorded_args(&rig, "push")?;
+        let expected: Vec<String> = [
+            "-c",
+            "core.hooksPath=/dev/null",
+            "-c",
+            "core.fsmonitor=",
+            "-c",
+            "http.followRedirects=false",
+            "-c",
+            "credential.helper=",
+            "push",
+            "--quiet",
+            "--no-verify",
+            "--",
+            spec.repo.as_str(),
+            "refs/heads/swarm/job1:refs/heads/swarm/job1",
+        ]
+        .iter()
+        .map(|a| (*a).to_owned())
+        .collect();
+        assert_eq!(args, expected);
+        let env = recorded(&rig, "push")?;
+        assert!(env.contains("GIT_ALLOW_PROTOCOL=file:https\n"), "{env}");
+        assert!(
+            env.contains(&format!("GIT_ASKPASS={}\n", env!("CARGO_BIN_EXE_fleetd"))),
+            "{env}"
+        );
+        assert!(env.contains("FLEETD_ASKPASS=1\n"), "{env}");
+        assert!(env.contains("FLEETD_ASKPASS_HOST=github.com\n"), "{env}");
         Ok(())
     }))
     .await
@@ -3104,7 +3237,8 @@ async fn pr_create_opens_once_and_a_repeat_returns_the_same_url() -> TestResult 
         let (agent, _rx) = agent(&rig);
         let agent = Arc::new(agent);
         let spec = job(&rig, true);
-        let broker = brokered(&rig, &spec, &agent)?;
+        let http = recording(Case::CreatePrOk)?;
+        let broker = brokered_with(&rig, &spec, &agent, http.clone(), true)?;
         let create = |title: &str| fleetd::broker::Request::PrCreate {
             title: title.to_owned(),
             body: "agent body".to_owned(),
@@ -3114,27 +3248,20 @@ async fn pr_create_opens_once_and_a_repeat_returns_the_same_url() -> TestResult 
             FIXED_FAILURE,
             "a branch that is not pushed gets no pull request"
         );
+        assert_eq!(http.posts().len(), 0);
         assert_eq!(calls(&rig, "create.calls"), 0);
         broker.handle(fleetd::broker::Request::Push {}).await;
-        std::fs::write(rig.dir.path().join("mode"), "ok")?;
-        let broker = brokered(&rig, &spec, &agent)?;
-        assert_eq!(broker.handle(create("agent title")).await, done(PR));
-        assert_eq!(broker.handle(create("other title")).await, done(PR));
-        assert_eq!(calls(&rig, "create.calls"), 1);
-        let args = std::fs::read_to_string(rig.dir.path().join("gh.args"))?;
-        let lines: Vec<&str> = args.lines().collect();
-        assert!(
-            lines.windows(2).any(|w| w == ["--title", "agent title"]),
-            "{args}"
-        );
-        assert!(
-            lines.windows(2).any(|w| w == ["--body", "agent body"]),
-            "{args}"
-        );
-        assert!(
-            lines.windows(2).any(|w| w == ["--head", "swarm/job1"]),
-            "{args}"
-        );
+        let broker = brokered_with(&rig, &spec, &agent, http.clone(), true)?;
+        assert_eq!(broker.handle(create("agent title")).await, done(FORGE_PR));
+        assert_eq!(broker.handle(create("other title")).await, done(FORGE_PR));
+        assert_eq!(calls(&rig, "create.calls"), 0);
+        let posts = http.posts();
+        assert_eq!(posts.len(), 1);
+        let sent: serde_json::Value = serde_json::from_slice(&posts[0].body)?;
+        assert_eq!(sent["title"], "agent title");
+        assert_eq!(sent["body"], "agent body");
+        assert_eq!(sent["head"], "swarm/job1");
+        assert_eq!(sent["base"], "main");
         Ok(())
     }))
     .await
@@ -3145,14 +3272,11 @@ async fn pr_create_returns_an_existing_open_pull_request_without_creating() -> T
     common::bounded(Box::pin(async {
         let rig = rig("ok").await?;
         commit(&rig)?;
-        std::fs::write(
-            rig.dir.path().join("existing"),
-            "https://example.invalid/pr/3\n",
-        )?;
         let (agent, _rx) = agent(&rig);
         let agent = Arc::new(agent);
         let spec = job(&rig, true);
-        let broker = brokered(&rig, &spec, &agent)?;
+        let http = recording(Case::CreatePrExists)?;
+        let broker = brokered_with(&rig, &spec, &agent, http, true)?;
         broker.handle(fleetd::broker::Request::Push {}).await;
         let reply = broker
             .handle(fleetd::broker::Request::PrCreate {
@@ -3160,10 +3284,9 @@ async fn pr_create_returns_an_existing_open_pull_request_without_creating() -> T
                 body: "b".into(),
             })
             .await;
-        assert_eq!(reply, done("https://example.invalid/pr/3"));
+        assert_eq!(reply, done(FORGE_PR));
         assert_eq!(calls(&rig, "create.calls"), 0);
-        let args = std::fs::read_to_string(rig.dir.path().join("list.args"))?;
-        assert!(args.lines().any(|l| l == "swarm/job1"), "{args}");
+        assert_eq!(calls(&rig, "list.calls"), 0);
         Ok(())
     }))
     .await
@@ -3190,10 +3313,10 @@ async fn finish_reuses_the_pull_request_the_broker_opened() -> TestResult {
             outcome,
             FinishOutcome::Succeeded {
                 branch: Some("swarm/job1".into()),
-                pr_url: Some(PR.into()),
+                pr_url: Some(FORGE_PR.into()),
             }
         );
-        assert_eq!(calls(&rig, "create.calls"), 1);
+        assert_eq!(calls(&rig, "create.calls"), 0);
         assert_eq!(calls(&rig, "push.calls"), 1);
         Ok(())
     }))
@@ -3203,12 +3326,13 @@ async fn finish_reuses_the_pull_request_the_broker_opened() -> TestResult {
 #[tokio::test]
 async fn a_failed_broker_pr_create_leaves_finish_to_find_or_open_the_pull_request() -> TestResult {
     common::bounded(Box::pin(async {
-        let rig = rig("fail").await?;
+        let rig = rig("ok").await?;
         commit(&rig)?;
         let (agent, _rx) = agent(&rig);
         let agent = Arc::new(agent);
         let spec = job(&rig, true);
-        let broker = brokered(&rig, &spec, &agent)?;
+        let http = recording(Case::CreatePrRejected)?;
+        let broker = brokered_with(&rig, &spec, &agent, http, true)?;
         broker.handle(fleetd::broker::Request::Push {}).await;
         let reply = broker
             .handle(fleetd::broker::Request::PrCreate {
@@ -3229,7 +3353,7 @@ async fn a_failed_broker_pr_create_leaves_finish_to_find_or_open_the_pull_reques
                 pr_url: Some("https://example.invalid/pr/3".into()),
             }
         );
-        assert_eq!(calls(&rig, "create.calls"), 1);
+        assert_eq!(calls(&rig, "create.calls"), 0);
         Ok(())
     }))
     .await
@@ -3243,7 +3367,8 @@ async fn a_job_with_open_pr_off_gets_no_broker_pull_request() -> TestResult {
         let (agent, _rx) = agent(&rig);
         let agent = Arc::new(agent);
         let spec = job(&rig, false);
-        let broker = brokered(&rig, &spec, &agent)?;
+        let http = recording(Case::CreatePrOk)?;
+        let broker = brokered_with(&rig, &spec, &agent, http.clone(), true)?;
         broker.handle(fleetd::broker::Request::Push {}).await;
         let reply = broker
             .handle(fleetd::broker::Request::PrCreate {
@@ -3252,7 +3377,33 @@ async fn a_job_with_open_pr_off_gets_no_broker_pull_request() -> TestResult {
             })
             .await;
         assert_eq!(wire(&reply)?, FIXED_FAILURE);
-        assert_eq!(calls(&rig, "create.calls"), 0);
+        assert_eq!(http.posts().len(), 0);
+        Ok(())
+    }))
+    .await
+}
+
+#[tokio::test]
+async fn a_job_with_no_forge_gets_the_fixed_error_for_push_and_pr_create() -> TestResult {
+    common::bounded(Box::pin(async {
+        let rig = rig("ok").await?;
+        commit(&rig)?;
+        let (agent, _rx) = agent(&rig);
+        let agent = Arc::new(agent);
+        let spec = job(&rig, true);
+        let http = recording(Case::CreatePrOk)?;
+        let broker = brokered_with(&rig, &spec, &agent, http.clone(), false)?;
+        let push = broker.handle(fleetd::broker::Request::Push {}).await;
+        assert_eq!(wire(&push)?, FIXED_FAILURE);
+        let pr = broker
+            .handle(fleetd::broker::Request::PrCreate {
+                title: "t".into(),
+                body: "b".into(),
+            })
+            .await;
+        assert_eq!(wire(&pr)?, FIXED_FAILURE);
+        assert_eq!(calls(&rig, "push.calls"), 0);
+        assert_eq!(http.posts().len(), 0);
         Ok(())
     }))
     .await
@@ -3826,4 +3977,24 @@ mod timing_e2e {
         }))
         .await
     }
+}
+
+#[tokio::test]
+async fn a_broker_fetch_refreshes_the_mirror_through_the_forge_and_fails_closed_without_one()
+-> TestResult {
+    common::bounded(Box::pin(async {
+        let rig = rig("ok").await?;
+        commit(&rig)?;
+        let (agent, _rx) = agent(&rig);
+        let agent = Arc::new(agent);
+        let spec = job(&rig, false);
+        let without = brokered_with(&rig, &spec, &agent, recording(Case::CreatePrOk)?, false)?;
+        let reply = without.handle(fleetd::broker::Request::Fetch {}).await;
+        assert_eq!(wire(&reply)?, FIXED_FAILURE);
+        let with = brokered(&rig, &spec, &agent)?;
+        let reply = with.handle(fleetd::broker::Request::Fetch {}).await;
+        assert_eq!(reply, done("fetched"));
+        Ok(())
+    }))
+    .await
 }
