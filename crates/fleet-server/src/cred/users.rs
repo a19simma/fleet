@@ -19,6 +19,21 @@ pub const BOOTSTRAP_USERNAME: &str = "bootstrap";
 /// The longest accepted username in bytes, matching the table check.
 pub const MAX_USERNAME_LEN: usize = 64;
 
+/// The most active per-Box tokens one user holds.
+pub const MAX_ACTIVE_BOX_TOKENS: i64 = 20;
+
+/// The default lifetime of a per-Box token in days.
+pub const DEFAULT_BOX_TOKEN_DAYS: u32 = 90;
+
+/// The longest lifetime of a per-Box token in days.
+pub const MAX_BOX_TOKEN_DAYS: u32 = 365;
+
+/// The longest per-Box token label in characters.
+pub const MAX_BOX_TOKEN_LABEL_CHARS: usize = 64;
+
+/// The prefix of a per-Box token.
+pub const BOX_TOKEN_PREFIX: &str = "fbx_";
+
 const TOKEN_PREFIX: &str = "flt_";
 const RANDOM_BYTES: usize = 32;
 const SETUP_LOCK: i64 = 0x4655_5345_5253;
@@ -55,6 +70,31 @@ VALUES ('bootstrap_password_revoked', $1, $2, 'server')";
 const REVOKE_TOKEN: &str = "\
 UPDATE api_tokens SET revoked_at = now() WHERE id = $1 AND user_id = $2 AND revoked_at IS NULL";
 
+const LOCK_BOX_TOKEN_OWNER: &str = "SELECT id FROM users WHERE id = $1 FOR UPDATE";
+const EXPIRE_BOX_TOKENS: &str = "\
+UPDATE box_tokens SET revoked_at = expires_at \
+WHERE box_name = $1 AND revoked_at IS NULL AND expires_at <= now()";
+const COUNT_BOX_TOKENS: &str = "\
+SELECT count(*) FROM box_tokens WHERE user_id = $1 AND revoked_at IS NULL AND expires_at > now()";
+const INSERT_BOX_TOKEN: &str = "\
+INSERT INTO box_tokens (user_id, box_name, hash, label, expires_at) \
+VALUES ($1, $2, sha256($3::bytea), $4, now() + make_interval(days => $5)) \
+RETURNING id, expires_at::text";
+const AUDIT_BOX_TOKEN: &str = "\
+INSERT INTO box_token_audit (token_id, user_id, box_name, action) VALUES ($1, $2, $3, $4)";
+const FIND_BOX_TOKEN: &str = "\
+SELECT id, user_id, box_name, last_used_at IS NULL OR last_used_at < now() - interval '1 minute' \
+FROM box_tokens WHERE hash = sha256($1::bytea) AND revoked_at IS NULL AND expires_at > now()";
+const TOUCH_BOX_TOKEN: &str = "\
+UPDATE box_tokens SET last_used_at = now() \
+WHERE id = $1 AND (last_used_at IS NULL OR last_used_at < now() - interval '1 minute')";
+const REVOKE_BOX_TOKEN: &str = "\
+UPDATE box_tokens SET revoked_at = now() \
+WHERE id = $1 AND user_id = $2 AND revoked_at IS NULL RETURNING box_name";
+const LIST_BOX_TOKENS: &str = "\
+SELECT id, box_name, label, created_at::text, expires_at::text, last_used_at::text, revoked_at::text \
+FROM box_tokens WHERE user_id = $1 ORDER BY id";
+
 /// The user an API token belongs to and whether that user is an admin right now.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct TokenOwner {
@@ -83,6 +123,14 @@ pub enum UserError {
     NoSuchUser,
     /// The reserved `bootstrap` user can never be admin.
     BootstrapNotAdmin,
+    /// A per-Box token label is too long or holds control or hostile characters.
+    InvalidLabel,
+    /// A per-Box token lifetime is above [`MAX_BOX_TOKEN_DAYS`].
+    InvalidTtl,
+    /// An active per-Box token already exists for the Box name.
+    BoxNameTaken,
+    /// The user already holds [`MAX_ACTIVE_BOX_TOKENS`] active per-Box tokens.
+    TooManyBoxTokens,
     /// The database failed.
     Db(sqlx::Error),
 }
@@ -98,6 +146,10 @@ impl fmt::Display for UserError {
             Self::NotFound => "token not found",
             Self::NoSuchUser => "no such user",
             Self::BootstrapNotAdmin => "the bootstrap user cannot be admin",
+            Self::InvalidLabel => "invalid label",
+            Self::InvalidTtl => "invalid lifetime",
+            Self::BoxNameTaken => "box name is taken",
+            Self::TooManyBoxTokens => "too many active box tokens",
             Self::Db(_) => "user store database error",
         })
     }
@@ -141,6 +193,107 @@ pub(crate) fn random_hex() -> String {
         let _ = write!(out, "{byte:02x}");
     }
     out
+}
+
+/// A validated per-Box token label: at most 64 characters, no control or hostile character.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BoxTokenLabel(String);
+
+impl BoxTokenLabel {
+    /// Validates a label. An empty label is allowed.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`UserError::InvalidLabel`].
+    pub fn new(raw: &str) -> Result<Self, UserError> {
+        let ok = raw.chars().count() <= MAX_BOX_TOKEN_LABEL_CHARS
+            && !raw
+                .chars()
+                .any(|c| c.is_control() || fleet_core::text::is_hostile(c));
+        if ok {
+            Ok(Self(raw.to_owned()))
+        } else {
+            Err(UserError::InvalidLabel)
+        }
+    }
+
+    /// The label text.
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+/// A validated per-Box token lifetime in days, 1 to [`MAX_BOX_TOKEN_DAYS`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BoxTokenTtl(u32);
+
+impl BoxTokenTtl {
+    /// Validates a lifetime. Zero means [`DEFAULT_BOX_TOKEN_DAYS`].
+    ///
+    /// # Errors
+    ///
+    /// Returns [`UserError::InvalidTtl`] above [`MAX_BOX_TOKEN_DAYS`].
+    pub const fn new(days: u32) -> Result<Self, UserError> {
+        match days {
+            0 => Ok(Self(DEFAULT_BOX_TOKEN_DAYS)),
+            1..=MAX_BOX_TOKEN_DAYS => Ok(Self(days)),
+            _ => Err(UserError::InvalidTtl),
+        }
+    }
+
+    /// The lifetime in days.
+    pub const fn days(self) -> u32 {
+        self.0
+    }
+}
+
+/// A freshly issued per-Box token. The plaintext is shown once and never stored.
+pub struct NewBoxToken {
+    /// Row id, used to revoke.
+    pub id: i64,
+    /// The bearer value to give the Box.
+    pub token: Secret,
+    /// The expiry as Postgres renders it.
+    pub expires_at: String,
+}
+
+impl fmt::Debug for NewBoxToken {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("NewBoxToken")
+            .field("id", &self.id)
+            .field("token", &"<redacted>")
+            .finish_non_exhaustive()
+    }
+}
+
+/// What a valid per-Box token resolves to.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BoxTokenOwner {
+    /// The token row id.
+    pub token_id: i64,
+    /// The user the token was issued to.
+    pub user_id: i64,
+    /// The one Box name the token is bound to.
+    pub box_name: String,
+}
+
+/// One row of a user's per-Box token list. It never holds the secret.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BoxTokenRow {
+    /// The token row id.
+    pub id: i64,
+    /// The Box name the token is bound to.
+    pub box_name: String,
+    /// The label given at issue.
+    pub label: String,
+    /// Creation time as Postgres renders it.
+    pub created_at: String,
+    /// Expiry as Postgres renders it.
+    pub expires_at: String,
+    /// The last use, throttled to once a minute.
+    pub last_used_at: Option<String>,
+    /// The revocation time, when revoked.
+    pub revoked_at: Option<String>,
 }
 
 /// A freshly created API token. The plaintext is shown once and never stored.
@@ -556,6 +709,160 @@ impl Users {
             .fetch_one(&self.pool)
             .await?;
         Ok(NewApiToken { id, token })
+    }
+
+    /// Issues a per-Box token for `user_id` bound to `box_name`.
+    ///
+    /// The user row is locked `FOR UPDATE`, so two issues cannot both pass the cap. Expired
+    /// tokens of the name are closed first, because the partial unique index cannot see time.
+    /// The audit row is written in the same transaction.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`UserError::NoSuchUser`], [`UserError::BoxNameTaken`] when an active token holds
+    /// the name, [`UserError::TooManyBoxTokens`] at the cap and [`UserError::Db`].
+    pub async fn issue_box_token(
+        &self,
+        user_id: i64,
+        box_name: &fleet_core::BoxName,
+        label: &BoxTokenLabel,
+        ttl: BoxTokenTtl,
+    ) -> Result<NewBoxToken, UserError> {
+        let mut tx = self.pool.begin().await?;
+        sqlx::query(LOCK_BOX_TOKEN_OWNER)
+            .bind(user_id)
+            .fetch_optional(&mut *tx)
+            .await?
+            .ok_or(UserError::NoSuchUser)?;
+        sqlx::query(EXPIRE_BOX_TOKENS)
+            .bind(box_name.as_str())
+            .execute(&mut *tx)
+            .await?;
+        let active: i64 = sqlx::query_scalar(COUNT_BOX_TOKENS)
+            .bind(user_id)
+            .fetch_one(&mut *tx)
+            .await?;
+        if active >= MAX_ACTIVE_BOX_TOKENS {
+            return Err(UserError::TooManyBoxTokens);
+        }
+        let token = Secret::new(format!("{BOX_TOKEN_PREFIX}{}", random_hex()));
+        let (id, expires_at): (i64, String) = sqlx::query_as(INSERT_BOX_TOKEN)
+            .bind(user_id)
+            .bind(box_name.as_str())
+            .bind(token.expose())
+            .bind(label.as_str())
+            .bind(i32::try_from(ttl.days()).unwrap_or(i32::MAX))
+            .fetch_one(&mut *tx)
+            .await
+            .map_err(|e| match &e {
+                sqlx::Error::Database(db) if db.is_unique_violation() => UserError::BoxNameTaken,
+                _ => UserError::Db(e),
+            })?;
+        sqlx::query(AUDIT_BOX_TOKEN)
+            .bind(id)
+            .bind(user_id)
+            .bind(box_name.as_str())
+            .bind("issue")
+            .execute(&mut *tx)
+            .await?;
+        tx.commit().await?;
+        Ok(NewBoxToken {
+            id,
+            token,
+            expires_at,
+        })
+    }
+
+    /// Resolves a bearer value to its per-Box token, or `None` for an unknown, expired or
+    /// revoked one. `last_used_at` moves at most once a minute.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`UserError::Db`] for a database failure.
+    pub async fn resolve_box_token(
+        &self,
+        token: &[u8],
+    ) -> Result<Option<BoxTokenOwner>, UserError> {
+        let row: Option<(i64, i64, String, bool)> = sqlx::query_as(FIND_BOX_TOKEN)
+            .bind(token)
+            .fetch_optional(&self.pool)
+            .await?;
+        let Some((token_id, user_id, box_name, stale)) = row else {
+            return Ok(None);
+        };
+        if stale {
+            sqlx::query(TOUCH_BOX_TOKEN)
+                .bind(token_id)
+                .execute(&self.pool)
+                .await?;
+        }
+        Ok(Some(BoxTokenOwner {
+            token_id,
+            user_id,
+            box_name,
+        }))
+    }
+
+    /// Lists every per-Box token of `user_id`, revoked and expired ones included.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`UserError::Db`] for a database failure.
+    pub async fn list_box_tokens(&self, user_id: i64) -> Result<Vec<BoxTokenRow>, UserError> {
+        type Row = (
+            i64,
+            String,
+            String,
+            String,
+            String,
+            Option<String>,
+            Option<String>,
+        );
+        let rows: Vec<Row> = sqlx::query_as(LIST_BOX_TOKENS)
+            .bind(user_id)
+            .fetch_all(&self.pool)
+            .await?;
+        Ok(rows
+            .into_iter()
+            .map(
+                |(id, box_name, label, created_at, expires_at, last_used_at, revoked_at)| {
+                    BoxTokenRow {
+                        id,
+                        box_name,
+                        label,
+                        created_at,
+                        expires_at,
+                        last_used_at,
+                        revoked_at,
+                    }
+                },
+            )
+            .collect())
+    }
+
+    /// Revokes the user's per-Box token and audits it in the same transaction.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`UserError::NotFound`] when the id is unknown, already revoked or owned by
+    /// another user, and [`UserError::Db`].
+    pub async fn revoke_box_token(&self, user_id: i64, token_id: i64) -> Result<(), UserError> {
+        let mut tx = self.pool.begin().await?;
+        let name: String = sqlx::query_scalar(REVOKE_BOX_TOKEN)
+            .bind(token_id)
+            .bind(user_id)
+            .fetch_optional(&mut *tx)
+            .await?
+            .ok_or(UserError::NotFound)?;
+        sqlx::query(AUDIT_BOX_TOKEN)
+            .bind(token_id)
+            .bind(user_id)
+            .bind(name)
+            .bind("revoke")
+            .execute(&mut *tx)
+            .await?;
+        tx.commit().await?;
+        Ok(())
     }
 
     /// Revokes the user's token. A revoked token no longer authenticates.

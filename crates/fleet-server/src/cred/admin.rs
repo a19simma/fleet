@@ -27,6 +27,11 @@ const DELETE_PASSKEYS: &str = "DELETE FROM passkeys WHERE user_id = $1";
 const DELETE_SESSIONS: &str = "DELETE FROM web_sessions WHERE user_id = $1";
 const REVOKE_TOKENS: &str =
     "UPDATE api_tokens SET revoked_at = now() WHERE user_id = $1 AND revoked_at IS NULL";
+const REVOKE_BOX_TOKENS_AUDITED: &str = "\
+WITH revoked AS (UPDATE box_tokens SET revoked_at = now() WHERE user_id = $1 AND revoked_at IS NULL \
+RETURNING id, user_id, box_name) \
+INSERT INTO box_token_audit (token_id, user_id, box_name, action) \
+SELECT id, user_id, box_name, 'reset' FROM revoked";
 const DELETE_OPEN_CODES: &str = "DELETE FROM setup_codes WHERE user_id = $1 AND used_at IS NULL";
 const INSERT_CODE: &str = "\
 INSERT INTO setup_codes (user_id, hash, expires_at) \
@@ -211,6 +216,10 @@ pub async fn run(
                 .execute(&mut *tx)
                 .await?
                 .rows_affected();
+            sqlx::query(REVOKE_BOX_TOKENS_AUDITED)
+                .bind(id)
+                .execute(&mut *tx)
+                .await?;
             sqlx::query(DELETE_OPEN_CODES)
                 .bind(id)
                 .execute(&mut *tx)
