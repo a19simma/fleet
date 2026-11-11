@@ -1034,3 +1034,53 @@ async fn file_repos_on_do_not_relax_junk_text(pool: PgPool) {
 async fn file_repos_on_do_not_relax_a_relative_path(pool: PgPool) {
     assert_repo_refused(true, pool, "relative/dir/origin.git").await;
 }
+
+async fn assert_hostless_release(pool: PgPool, repo: &str) {
+    let (mut w, job) = file_repo_world(true, pool, repo).await;
+    let reply = w.fetch(&job, job.attempt, &box_a()).await.unwrap();
+    assert_eq!(
+        pairs(&reply),
+        vec![entry("anthropic_api_key", ANT), entry("github_pat", PAT)]
+    );
+    let host = host_entry(&reply);
+    assert_eq!(host.host, "");
+    assert_eq!(host.host_kind, "github");
+    assert!(!host.allow_private);
+    assert_eq!(host.approved_ips, Vec::<String>::new());
+    assert_eq!(w.uses().await, 2);
+}
+
+#[sqlx::test]
+async fn file_repos_on_release_hostless_for_a_file_url_naming_a_host(pool: PgPool) {
+    assert_hostless_release(pool, "file://evil.example/x").await;
+}
+
+#[sqlx::test]
+async fn file_repos_on_release_hostless_for_a_double_slash_path(pool: PgPool) {
+    assert_hostless_release(pool, "//evil.example/a/b").await;
+}
+
+#[sqlx::test]
+async fn file_repos_on_refuse_an_uppercase_file_scheme(pool: PgPool) {
+    assert_repo_refused(true, pool, "FILE://x").await;
+}
+
+#[sqlx::test]
+async fn file_repos_on_refuse_a_mixed_case_file_scheme(pool: PgPool) {
+    assert_repo_refused(true, pool, "File:///srv/origin.git").await;
+}
+
+#[sqlx::test]
+async fn file_repos_on_refuse_a_backslash_path(pool: PgPool) {
+    assert_repo_refused(true, pool, "\\srv\\origin.git").await;
+}
+
+#[sqlx::test]
+async fn file_repos_on_refuse_a_leading_space_path(pool: PgPool) {
+    assert_repo_refused(true, pool, " /srv/origin.git").await;
+}
+
+#[sqlx::test]
+async fn file_repos_on_refuse_a_leading_space_file_url(pool: PgPool) {
+    assert_repo_refused(true, pool, " file:///srv/origin.git").await;
+}
