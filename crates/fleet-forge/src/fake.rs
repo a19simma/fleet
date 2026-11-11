@@ -343,9 +343,11 @@ impl Fake {
                     json_reply(200, &json!({"total_count": runs.len(), "check_runs": runs}))
                 }
                 Shape::Gitea => {
-                    let overall = if states.contains(&"failure") {
+                    let overall = if states.is_empty() {
+                        ""
+                    } else if states.contains(&"failure") {
                         "failure"
-                    } else if states.iter().all(|s| *s == "success") && !states.is_empty() {
+                    } else if states.iter().all(|s| *s == "success") {
                         "success"
                     } else {
                         "pending"
@@ -354,14 +356,15 @@ impl Fake {
                         .iter()
                         .map(|(name, state)| json!({"context": name, "status": state}))
                         .collect();
+                    let total = statuses.len();
                     let listed = if statuses.is_empty() {
                         Value::Null
                     } else {
-                        Value::Array(statuses.clone())
+                        Value::Array(statuses)
                     };
                     json_reply(
                         200,
-                        &json!({"state": overall, "total_count": statuses.len(), "statuses": listed}),
+                        &json!({"state": overall, "total_count": total, "statuses": listed}),
                     )
                 }
             },

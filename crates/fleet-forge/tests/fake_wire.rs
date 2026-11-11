@@ -485,7 +485,7 @@ async fn gitea_combined_status_reports_the_expected_state() -> TestResult {
         (Case::CiPending, "pending", &["pending"]),
         (Case::CiSuccess, "success", &["success"]),
         (Case::CiFailure, "failure", &["failure"]),
-        (Case::CiNone, "pending", &[]),
+        (Case::CiNone, "", &[]),
         (Case::CiMixed, "failure", &["success", "failure", "pending"]),
     ];
     for (case, state, statuses) in rows {

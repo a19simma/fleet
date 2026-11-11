@@ -23,8 +23,9 @@ use serde_json::{Value, json};
 
 use cases::{ORDER, Plan, plan};
 use support::{
-    Api, Auth, BOGUS_TOKEN, Counter, Curl, LiveGit, NAME_PREFIX, RepoGuard, Scratch, Settings,
-    Wire, header, header_names, leaked_names, local_git, random_hex, shape, sweep,
+    Api, Auth, BOGUS_TOKEN, CLEANUP_MAX_PAGES, CLEANUP_PAGE_SIZE, Counter, Curl, LiveGit,
+    NAME_PREFIX, RepoGuard, Scratch, Settings, Wire, header, header_names, leaked_names,
+    list_leaked, local_git, random_hex, shape, sweep,
 };
 
 type Adapter = GiteaForge<Curl, GiteaGit<LiveGit>>;
@@ -620,20 +621,12 @@ async fn cleanup_leaked_throwaway_repositories() -> Result<(), String> {
         .and_then(Value::as_str)
         .map(str::to_owned)
         .ok_or("user reply holds no login")?;
-    let mut names = Vec::new();
-    for page in 1..=40 {
-        let path = format!("/api/v1/user/repos?page={page}&limit=50");
+    let names = list_leaked(&login, |page| {
+        let path = format!("/api/v1/user/repos?page={page}&limit={CLEANUP_PAGE_SIZE}");
         let reply = api.call("GET", &path, Auth::Token, None)?;
-        if reply.status != 200 {
-            return Err(format!("list repositories: status {}", reply.status));
-        }
         let body = api.json(&reply)?;
-        let count = body.as_array().map_or(0, Vec::len);
-        names.extend(leaked_names(&body, &login));
-        if count < 50 {
-            break;
-        }
-    }
+        Ok((reply.status, body))
+    })?;
     let leaked = sweep(&names, |name| {
         let path = format!("/api/v1/repos/{login}/{name}");
         api.call("DELETE", &path, Auth::Token, None)
@@ -688,6 +681,43 @@ fn a_cleanup_sweep_reports_every_name_that_may_still_exist() {
     assert_eq!(sweep(&names, |_| Some(404)), Vec::<String>::new());
     let foreign = vec!["precious".to_owned()];
     assert_eq!(sweep(&foreign, |_| unreachable!()), Vec::<String>::new());
+}
+
+#[test]
+fn a_cleanup_listing_that_is_still_full_at_the_page_cap_fails_naming_the_cap() {
+    let full: Vec<Value> = (0..CLEANUP_PAGE_SIZE)
+        .map(|i| json!({"name": format!("fleet-e2e-{i}"), "owner": {"login": "me"}}))
+        .collect();
+    let mut asked = 0;
+    let outcome = list_leaked("me", |_| {
+        asked += 1;
+        Ok((200, Value::Array(full.clone())))
+    });
+    assert_eq!(asked, 40);
+    let message = outcome.err().unwrap_or_default();
+    assert!(message.contains("CLEANUP_MAX_PAGES"), "{message}");
+}
+
+#[test]
+fn a_cleanup_listing_that_ends_short_before_the_cap_succeeds() {
+    let mut asked = 0;
+    let names = list_leaked("me", |page| {
+        asked += 1;
+        let rows = if page < CLEANUP_MAX_PAGES {
+            CLEANUP_PAGE_SIZE
+        } else {
+            1
+        };
+        let body: Vec<Value> = (0..rows)
+            .map(|i| json!({"name": format!("fleet-e2e-{page}-{i}"), "owner": {"login": "me"}}))
+            .collect();
+        Ok((200, Value::Array(body)))
+    });
+    assert_eq!(asked, CLEANUP_MAX_PAGES);
+    assert_eq!(
+        names.map(|n| n.len()),
+        Ok(CLEANUP_MAX_PAGES as usize * CLEANUP_PAGE_SIZE - CLEANUP_PAGE_SIZE + 1)
+    );
 }
 
 #[test]
