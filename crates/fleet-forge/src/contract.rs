@@ -124,7 +124,9 @@ pub enum Calls {
 }
 
 impl Calls {
-    const fn allows(self, count: usize) -> bool {
+    /// Whether `count` requests satisfy the allowance.
+    #[must_use]
+    pub const fn allows(self, count: usize) -> bool {
         match self {
             Self::None => count == 0,
             Self::One => count == 1,

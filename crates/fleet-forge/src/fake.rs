@@ -354,9 +354,14 @@ impl Fake {
                         .iter()
                         .map(|(name, state)| json!({"context": name, "status": state}))
                         .collect();
+                    let listed = if statuses.is_empty() {
+                        Value::Null
+                    } else {
+                        Value::Array(statuses.clone())
+                    };
                     json_reply(
                         200,
-                        &json!({"state": overall, "total_count": statuses.len(), "statuses": statuses}),
+                        &json!({"state": overall, "total_count": statuses.len(), "statuses": listed}),
                     )
                 }
             },

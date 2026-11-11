@@ -1339,6 +1339,49 @@ async fn ci_result_maps_every_run_state() {
     }
 }
 
+const LIVE_NO_STATUS: &str = r#"{"commit_url":"u","repository":null,"sha":"abc123","state":"","statuses":null,"total_count":0,"url":"u"}"#;
+const LIVE_NO_RUNS: &str = r#"{"total_count":0,"workflow_runs":[]}"#;
+
+#[tokio::test]
+async fn a_live_no_status_reply_reads_as_no_checks() -> TestResult {
+    let target = target()?;
+    let script = Script::default()
+        .reply(200, &head_of("abc123"))
+        .reply(200, LIVE_NO_STATUS)
+        .reply(200, LIVE_NO_RUNS);
+    assert_eq!(
+        forge(&script).ci_result(&target, PR_URL).await,
+        Ok(CiResult::NoChecks)
+    );
+    let script = Script::default()
+        .reply(200, &head_of("abc123"))
+        .reply(200, LIVE_NO_STATUS)
+        .reply(200, LIVE_NO_RUNS);
+    assert_eq!(checks_from(&script).await?.len(), 0);
+    assert_eq!(script.seen().len(), 3);
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_null_status_list_is_empty_only_with_a_zero_count() -> TestResult {
+    let target = target()?;
+    let bad = [
+        r#"{"statuses":null}"#,
+        r#"{"total_count":1,"statuses":null}"#,
+        r#"{"total_count":"0","statuses":null}"#,
+        r#"{"total_count":null,"statuses":null}"#,
+        r#"{"total_count":0}"#,
+    ];
+    for body in bad {
+        let script = Script::default()
+            .reply(200, &head_of("abc123"))
+            .reply(200, body);
+        let got = forge(&script).ci_result(&target, PR_URL).await;
+        assert_eq!(got.err(), Some(ForgeError::Malformed), "{body}");
+    }
+    Ok(())
+}
+
 #[tokio::test]
 async fn ci_result_refuses_malformed_status_data() -> TestResult {
     let target = target()?;

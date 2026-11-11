@@ -4,7 +4,7 @@ Status: Proposed 2026-11-10, not built. The user decided every point below: any 
 
 ADR-0059 lets a User register repositories on hosts the operator lists in `FLEET_REPO_HOSTS`. Only `github.com` is runnable. The motivation is cost: GitHub Actions minutes are paid, and a Forgejo host runs CI for free. This ADR makes Forgejo a second, fully supported forge: verify, clone, push, pull request and CI status. Any User may add a git host. Both forges sit behind one interface with one shared contract test suite, so feature parity is enforced by tests.
 
-Target host for the first slice: `git.simonmalm.com`, Forgejo 17.0.1 on the Gitea 1.22 API, valid public certificate, port 443, root path, resolving to the private address 192.168.3.1.
+Target host for the first slice: the dev Forgejo 17.0.1 on the Gitea 1.22 API, valid public certificate, port 443, root path, resolving to a private address.
 
 ## Decision
 
@@ -42,12 +42,12 @@ Residual risk, accepted: a public host can answer slowly or send a large body up
 A host whose records are not all public is refused unless an admin approved that host.
 
 - `allow_private` is a flag on the host row. Only an admin sets it, by `fleet host approve-private <host>` or the admin button on the Git remotes page. Both are audited and both name the resolved addresses the admin is approving.
-- Approval records `approved_ips`, the private addresses seen at approval. A later call whose resolved set holds a private address outside `approved_ips` is refused, with the reason `NOT_ALLOWED_HOST`, until an admin re-approves. This blocks a host that an admin approved for 192.168.3.1 from moving to another internal service.
+- Approval records `approved_ips`, the private addresses seen at approval. A later call whose resolved set holds a private address outside `approved_ips` is refused, with the reason `NOT_ALLOWED_HOST`, until an admin re-approves. This blocks a host that an admin approved for one private address from moving to another internal service.
 - Loopback, link-local and cloud-metadata addresses stay refused with the flag set (the rule of ADR-0059).
 - The flag is a revocable grant: `fleet host revoke-private`. Revoking marks the host's registered repositories stale and a running Job keeps its already-open connections only until job end.
 - A User who adds a private-resolving host gets the plain refusal and the hint "ask an admin to approve this host". No row is created until approval, so the admin approves from a pending request: the refusal inserts a `pending` request row (host, user, resolved set) that the admin lists.
 
-Choice A for `git.simonmalm.com`: it resolves to 192.168.3.1, so it needs this approval. Its certificate is public, so no private CA is needed.
+Choice A for the dev Forgejo 17.0.1: it resolves to a private address, so it needs this approval. Its certificate is public, so no private CA is needed.
 
 ### One Forge interface for GitHub and Forgejo
 
@@ -167,8 +167,39 @@ Every row is a test at the host normaliser and at the add RPC. Each result is `N
 - **Keep `gh` for GitHub inside the adapter.** One fake HTTP server could not serve both adapters, so parity would be asserted by hand.
 - **Build Forgejo as an extra GitHub-shaped special case in the broker.** It fails the "broker dispatches only through the trait" rule.
 
+## Live results
+
+Run 2026-11-11 by `mise run live:forgejo` (`crates/fleet-forge/tests/live`) against the dev Forgejo 17.0.1, reached over HTTPS with the token from fnox. The token now carries `write:user`, so the suite creates and deletes its own throwaway repositories. Of the 35 contract cases 22 run live and 13 are skipped with a reason (an injected fault or a second account or host is needed); the 22 pass.
+
+| Probe | Result |
+|---|---|
+| `GET /api/v1/version`, no credential | 200, body `{"version":"17.0.1+gitea-1.22.0"}`, so the closed version document of `identify` matches |
+| Invalid token (40 zeros) on `GET /api/v1/user`, `/repos/search` and a repository | 401, message `token is malformed: token contains an invalid number of segments` |
+| Real token on `GET /api/v1/user` and `/repos/search?limit=1` | 200 |
+| No credential on `/repos/search?limit=1` | 200 |
+| No credential on a private repository, and on a missing one | 404 for both |
+| Real token on a missing repository | 404 |
+| Real token on `GET /api/v1/repos/{o}/{r}` for its own repository | 200, `permissions` is `{"admin":true,"pull":true,"push":true}`, `private` is true |
+| Second `POST /api/v1/user/repos` with the same name | 409 |
+| Scopes granted (status of one probe per scope) | `read:repository=200 write:repository=200 write:issue=201 read:issue=200 read:user=200 read:organization=200 read:notification=200 read:package=200`; none denied |
+| `PATCH /api/v1/repos/{o}/{r}` with a new `name` | 200 |
+| `GET /api/v1/repos/{o}/{old}` after the rename | 301, `Location: /api/v1/repos/{o}/{new}` (a relative path), no body parsed |
+| `GET .../commits/{sha}/status?page=1&limit=50` with no status posted | 200, keys `commit_url`, `repository` (null), `sha`, `state` (string), `statuses` (null), `total_count` (number 0), `url` |
+| `GET .../actions/runs?head_sha={sha}&page=1&limit=50` with no run | 200, `{"total_count": 0, "workflow_runs": []}` |
+
+Findings:
+
+- A token without the needed scope answers 403 with a scope message, and a malformed token answers 401. `status_error` maps both to `Unauthorized`, and `verify` maps both to `NotFound`, as the contract table owes.
+- Creating a repository over REST needs `write:user`.
+- Renaming a repository leaves the old name answering 301 with a relative `Location`. `verify` makes one request and returns `Redirected`, because decision 3 follows no redirect, so the token never leaves the first request. The contract case `verify-redirect` owes exactly one request and the live run meets it. The rename changes the name a stored credential's repository is known by, so the user must update the remote after a rename.
+- A commit with no status makes the dev Forgejo 17.0.1 send `statuses: null` with `total_count: 0`, where the fake sent `[]`. The adapter read the null as malformed. It now reads `null` as an empty list only when `total_count` is the number zero, and then reads Actions runs, which answer an empty list. The fake serves the live shape, so `ci-none` and `ci-checks-none` hold live and in the fake.
+- Posting commit statuses `pending`, `success` and `failure` on a pull request head yields `InProgress`, `Success` and `Failure`, and a mix of the three yields `Failure`, so the combined status field names (`status`, `context`) hold.
+- Push, non-fast-forward push, fetch with a valid and with a bad token, pull request creation, the second creation that returns the existing pull request, and the rejected creation from `main` onto `main` all match the contract.
+- Cleanup of a renamed repository must delete the newest name first, because the old name answers 301 on `DELETE`.
+
 ## Not verified
 
-- The invalid-token status, the 403 against 404 split for a missing scope, `permissions` presence on every reply, rename redirects over REST and the CI status field names on Forgejo 17.0.1. the live e2e task confirms them on the live instance and the ADR is amended with the results.
-- The three token scopes above suffice for push, pull request and CI read.
+- The 403 against 404 split for a repository the token cannot see: it needs a second account. Only the anonymous 404 on a private repository is verified.
+- `permissions` on a token without write access: the live token is the owner's, so only the owner shape is verified.
+- That the three token scopes above are the minimum for push, pull request and CI read: the live token carries more, and the probe shows what it is granted, not what suffices.
 - A Forgejo host behind a subpath is unsupported until a later ADR.

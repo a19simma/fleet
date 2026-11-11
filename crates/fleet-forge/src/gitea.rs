@@ -19,7 +19,9 @@
 //! `skipped`); a run list is `{total_count, workflow_runs}` with `status` and `conclusion` per
 //! run. Both lists page with `page` and `limit`, and the server clamps `limit` to 50 by default.
 //! The combined status reports `total_count` as the page length, so a full page cannot be told
-//! from a truncated one and is refused.
+//! from a truncated one and is refused. The dev Forgejo 17.0.1 answers a commit with no status
+//! with `statuses: null` and `total_count: 0`; that pair reads as an empty list, and `null` with
+//! any other count is refused.
 
 use fleet_core::forge::CiResult;
 use fleet_core::host::{HostKind, HostName};
@@ -232,6 +234,16 @@ impl Tally {
     }
 }
 
+/// The status list of a combined status. A `null` list counts as empty only when `total_count`
+/// is the number zero.
+fn status_list(body: &Value) -> Result<&[Value], ForgeError> {
+    let null_list = body.get("statuses").is_some_and(Value::is_null);
+    if null_list && body.get("total_count").and_then(Value::as_u64) == Some(0) {
+        return Ok(&[]);
+    }
+    bounded(body, "statuses")
+}
+
 /// The entries under `key` of a page requested with [`PAGE_LIMIT`]. A page at the limit may have
 /// a successor, so it fails closed.
 fn bounded<'a>(body: &'a Value, key: &str) -> Result<&'a [Value], ForgeError> {
@@ -265,7 +277,7 @@ impl<H: Http, G: Send + Sync> GiteaForge<H, G> {
         let base = repo_path(repo);
         let path = format!("{base}/commits/{sha}/status?page=1&limit={PAGE_LIMIT}");
         let body = self.get_json(repo, path, token).await?;
-        let statuses = bounded(&body, "statuses")?;
+        let statuses = status_list(&body)?;
         let mut tally = Tally::default();
         if statuses.is_empty() {
             let path = format!("{base}/actions/runs?head_sha={sha}&page=1&limit={PAGE_LIMIT}");

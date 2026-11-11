@@ -10,6 +10,14 @@ components = "rustfmt,clippy"
 description = "Run the built fleet CLI with FLEET_SERVER_URL and FLEET_CLIENT_TOKEN from fnox"
 run = "fnox exec -- target/debug/fleet"
 
+[tasks."live:forgejo"]
+description = "Run the live fleet-forge contract suite against the dev Forgejo with FORGEJO_TOKEN and FORGEJO_E2E_URL from fnox"
+run = "fnox exec --if-missing error -- cargo nextest run -p fleet-forge --test live --run-ignored only --success-output immediate -E 'not test(cleanup_leaked_throwaway_repositories)'"
+
+[tasks."live:forgejo:cleanup"]
+description = "Delete every repository of the FORGEJO_TOKEN user whose name starts with fleet-e2e-, leaked by an aborted live run"
+run = "fnox exec --if-missing error -- cargo nextest run -p fleet-forge --test live --run-ignored only --success-output immediate -E 'test(cleanup_leaked_throwaway_repositories)'"
+
 [tasks."fleet:agent"]
 description = "Run the built fleet CLI as the claude service user, with FLEET_AGENT_TOKEN from fnox as the client token"
 run = """

@@ -499,6 +499,7 @@ async fn gitea_combined_status_reports_the_expected_state() -> TestResult {
             .map(|a| a.iter().filter_map(|s| s["status"].as_str()).collect())
             .unwrap_or_default();
         assert_eq!(&listed, statuses);
+        assert_eq!(body["statuses"].is_null(), statuses.is_empty());
     }
     Ok(())
 }
