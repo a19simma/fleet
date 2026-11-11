@@ -56,4 +56,4 @@ Submit and batch pins follow ADR-0067 decisions 10 and 11. `environments::resolv
 
 ## Git remotes page
 
-`/hosts` lists hosts, adds through `HostService`, removes for admins only (`admin_post_gate`), and shows pending private requests and approved addresses to admins only. `Web::with_hosts` injects the service for tests. The registered-repositories table is `repos::repo_table`, shared with `/repos`.
+`/hosts` lists hosts, adds through `HostService`, removes for admins only (`admin_post_gate`), and shows pending private requests and approved addresses to admins only. `Web::with_hosts` injects the service for tests. The registered-repositories table is `repos::repo_table`, shared with `/repos`. `/hosts/approve` and `/hosts/revoke` call `HostService::approve` and `revoke`, as the RPCs do. They use their own `admin_or_missing` gate, not `admin_post_gate`: a non-admin gets 404 (the remove route still gives 403), and the approve form posts back the addresses of the pending request so the service accepts only what it resolves now.
