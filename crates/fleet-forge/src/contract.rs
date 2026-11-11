@@ -15,7 +15,8 @@ use fleet_core::host::{HostKind, HostName};
 
 use crate::fake::{Fake, Shape};
 use crate::{
-    Credential, ForgeApi, ForgeError, ForgeGit, Permission, PushTarget, RepoAccess, RepoRef, Token,
+    CheckState, CiCheck, Credential, ForgeApi, ForgeError, ForgeGit, Permission, PushTarget,
+    RepoAccess, RepoRef, Token,
 };
 
 /// Which operation a case drives.
@@ -29,6 +30,8 @@ pub enum Op {
     CreatePr,
     /// `ForgeApi::ci_result`.
     CiResult,
+    /// `ForgeApi::ci_checks`.
+    CiChecks,
     /// `ForgeGit::push`.
     Push,
     /// `ForgeGit::fetch`.
@@ -95,6 +98,11 @@ cases! {
     CiNone => ("ci-none", CiResult, Any),
     CiMixed => ("ci-mixed", CiResult, Any),
     Ci404 => ("ci-404", CiResult, Any),
+    CiChecksMixed => ("ci-checks-mixed", CiChecks, Any),
+    CiChecksNone => ("ci-checks-none", CiChecks, Any),
+    CiChecks404 => ("ci-checks-404", CiChecks, Any),
+    CiChecksBadName => ("ci-checks-bad-name", CiChecks, Any),
+    CiChecksOverCap => ("ci-checks-over-cap", CiChecks, Any),
     PushOk => ("push-ok", Push, Any),
     PushNonFastForward => ("push-non-fast-forward", Push, Any),
     PushRevoked => ("push-revoked", Push, Any),
@@ -138,12 +146,48 @@ pub enum Outcome {
     BadUrl,
     /// `ci_result` returned this result.
     Ci(CiResult),
+    /// `ci_checks` returned this list.
+    Checks(ChecksSeen),
     /// `push` succeeded.
     Pushed,
     /// `fetch` succeeded.
     Fetched,
     /// The operation failed with this error.
     Failed(ForgeError),
+}
+
+/// What `ci_checks` returned, compared against the list the fake serves for `ci-checks-mixed`:
+/// `build` passed, `lint` failed, a second `build` is running.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ChecksSeen {
+    /// Exactly the three checks of `ci-checks-mixed`, in that order.
+    Mixed,
+    /// No check.
+    Empty,
+    /// Any other list.
+    Other,
+}
+
+impl ChecksSeen {
+    fn of(list: &[CiCheck]) -> Self {
+        let mixed = [
+            ("build", CheckState::Success),
+            ("lint", CheckState::Failed),
+            ("build", CheckState::Running),
+        ];
+        let is_mixed = list.len() == mixed.len()
+            && list
+                .iter()
+                .zip(mixed)
+                .all(|(check, (name, state))| check.name() == name && check.state() == state);
+        if is_mixed {
+            Self::Mixed
+        } else if list.is_empty() {
+            Self::Empty
+        } else {
+            Self::Other
+        }
+    }
 }
 
 /// What driving one case produced: the [`Outcome`] and every free-text string the adapter
@@ -175,8 +219,8 @@ impl Case {
     #[must_use]
     pub const fn expected(self, shape: Shape) -> Outcome {
         use ForgeError::{
-            HostMismatch, NonFastForward, NotFound, Redirected, Timeout, TooLarge, Unauthorized,
-            Unavailable, WrongKind,
+            HostMismatch, Malformed, NonFastForward, NotFound, Redirected, Timeout, TooLarge,
+            Unauthorized, Unavailable, WrongKind,
         };
         match self {
             Self::IdentifyOk => Outcome::Identified(shape.kind()),
@@ -184,9 +228,11 @@ impl Case {
             Self::VerifyReadPush => Outcome::Verified(Permission::Granted),
             Self::VerifyReadOnly => Outcome::Verified(Permission::Denied),
             Self::VerifyNoPermissions => Outcome::Verified(Permission::Unknown),
-            Self::Verify404 | Self::Verify401 | Self::Verify403 | Self::Ci404 => {
-                Outcome::Failed(NotFound)
-            }
+            Self::Verify404
+            | Self::Verify401
+            | Self::Verify403
+            | Self::Ci404
+            | Self::CiChecks404 => Outcome::Failed(NotFound),
             Self::Verify5xx | Self::VerifyReset | Self::RedactedError => {
                 Outcome::Failed(Unavailable)
             }
@@ -199,6 +245,9 @@ impl Case {
             Self::CiSuccess => Outcome::Ci(CiResult::Success),
             Self::CiFailure | Self::CiMixed => Outcome::Ci(CiResult::Failure),
             Self::CiNone => Outcome::Ci(CiResult::NoChecks),
+            Self::CiChecksMixed => Outcome::Checks(ChecksSeen::Mixed),
+            Self::CiChecksNone => Outcome::Checks(ChecksSeen::Empty),
+            Self::CiChecksBadName | Self::CiChecksOverCap => Outcome::Failed(Malformed),
             Self::PushOk => Outcome::Pushed,
             Self::PushNonFastForward => Outcome::Failed(NonFastForward),
             Self::PushRevoked | Self::FetchAuthFailure => Outcome::Failed(Unauthorized),
@@ -322,6 +371,12 @@ pub async fn drive<A: ForgeApi + ForgeGit>(adapter: &A, case: Case, fake: &Fake)
             let target = fixture_target(access);
             failed(adapter.ci_result(&target, &fake.pr_url()).await, |ci| {
                 plain(Outcome::Ci(ci))
+            })
+        }
+        Op::CiChecks => {
+            let target = fixture_target(access);
+            failed(adapter.ci_checks(&target, &fake.pr_url()).await, |list| {
+                plain(Outcome::Checks(ChecksSeen::of(&list)))
             })
         }
         Op::Push => {
