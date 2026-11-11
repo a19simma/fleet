@@ -1,6 +1,6 @@
 # Box to server bearer token
 
-Status: Accepted, amended 2026-10-24: two scoped tokens
+Status: Accepted, amended 2026-10-24: two scoped tokens. Amended by ADR-0069 (per-Box tokens).
 
 Amended 2026-10-24: one token became two, a box token and a client token, each scoped by service. The current decision is below. The original single-token decision is kept under "Original decision (2026-10-24)" at the end. See also plan.md Authorization.
 
@@ -79,3 +79,7 @@ A shared bearer token, for the proof of concept.
 ## Amendment (ADR-0033)
 
 The Box token also reaches `FleetWorker.GetJobCredentials`, which releases a Job owner's stored credentials. A leaked Box token therefore exposes those credentials for any live Job. The user accepted this while there is one Box and one user.
+
+## Amendment (ADR-0069)
+
+Per-Box tokens replace the shared Box token as the intended credential. The shared token keeps working until a later deprecation. See ADR-0069.

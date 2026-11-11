@@ -1,6 +1,6 @@
 # Two bearer token scopes
 
-Status: Accepted. Built: the server checks the box token and the client token by service path. Amends ADR-0014.
+Status: Accepted. Built: the server checks the box token and the client token by service path. Amends ADR-0014. Amended by ADR-0069 (per-Box tokens).
 
 ADR-0014 uses one shared token for ingest, claim, query and Job control, and says the services stay separate so a read credential can be added later. The laptop CLI now submits and cancels Jobs and reads transcripts, so it needs its own credential.
 
@@ -40,3 +40,7 @@ The server holds two static bearer tokens, each with a scope.
 ## Amendment (ADR-0033)
 
 `FleetWorker.GetJobCredentials` is worker scope and is authorised against the lease. The shared Box token makes the lease check the only guard until per-Box tokens exist. ADR-0033 records the accepted risk.
+
+## Amendment (ADR-0069)
+
+A per-Box token (`fbx_`) is a third way into the Box scope, bound to one Box name and one User. See ADR-0069.

@@ -236,6 +236,18 @@ _Avoid_: creator, tenant
 The bearer token a Box uses with the server, `FLEET_TOKEN`, in box scope (ADR-0014, ADR-0023).
 _Avoid_: token, worker token
 
+**Per-Box token**:
+A bearer token `fbx_...` bound to one **Box owner** and one Box name, with a mandatory expiry. It covers the Box scope for that Box only and releases only that owner's Jobs and **Credentials** (ADR-0069).
+_Avoid_: box key, worker token
+
+**Shared Box token**:
+The static **Box token** `FLEET_TOKEN`, held by every Box that has no **Per-Box token**. It carries no Box or User binding (ADR-0014, ADR-0069).
+_Avoid_: global token
+
+**Box owner**:
+The **User** a **Per-Box token** is issued to. A Box with that token claims only the Jobs of its Box owner (ADR-0069).
+_Avoid_: box admin
+
 **Client token**:
 The bearer token the CLI uses with the server, `FLEET_CLIENT_TOKEN`, in client scope (ADR-0014, ADR-0023).
 _Avoid_: token, API token

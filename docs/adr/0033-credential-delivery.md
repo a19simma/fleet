@@ -1,6 +1,6 @@
 # Credential delivery
 
-Status: Proposed 2026-10-29. Built: the server `GetJobCredentials`, the fleetd credential holder, and broker, askpass and `gh` use of the held token. Builds on ADR-0035 (lease-authorised worker calls), ADR-0040 (store) and ADR-0043 (kinds). Amends ADR-0014, ADR-0021, ADR-0023, ADR-0024, ADR-0031 and ADR-0037. ADR-0035 reserved this number for delivery. Amended by ADR-0058 and ADR-0067. Amended by 0068.
+Status: Proposed 2026-10-29. Built: the server `GetJobCredentials`, the fleetd credential holder, and broker, askpass and `gh` use of the held token. Builds on ADR-0035 (lease-authorised worker calls), ADR-0040 (store) and ADR-0043 (kinds). Amends ADR-0014, ADR-0021, ADR-0023, ADR-0024, ADR-0031 and ADR-0037. ADR-0035 reserved this number for delivery. Amended by ADR-0058 and ADR-0067. Amended by 0068 and ADR-0069.
 
 The server stores user credentials (ADR-0040). A Box needs the credentials of one Job, and only for that Job. This ADR fixes the call, its authorisation, who sees the result and what happens when a credential is missing.
 
@@ -64,3 +64,7 @@ See ADR-0067.
 `GetJobCredentials` returns the owner's credential for the Job's repository host plus the host kind, `allow_private` and `approved_ips`, and never another host's token. The fleetd holder keys by host and refuses a token whose host is not the Job's. The "missing credential fails the Job" rule applies per host. fleetd passes that one host to `fleetd askpass` in `FLEETD_ASKPASS_HOST`, so askpass answers for the Job's host and no other, and `fleetd` admits the host for the Job only, even when `repo_hosts` does not list it.
 
 See ADR-0068.
+
+## Amendment (ADR-0069)
+
+With a per-Box token, `GetJobCredentials` releases only when the Job's owner is the token's User. See ADR-0069.

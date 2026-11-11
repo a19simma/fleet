@@ -1,6 +1,6 @@
 # Users and auth
 
-Status: Proposed 2026-10-29. Built in fleet-server: users, hashed API tokens, passkey login, server-side sessions, the first-admin setup code, the `fleet-server admin` recovery subcommand, `jobs.user_id` and owner-scoped reads. Bootstrap password and passkey management are built. Not built: login rate limiting and a decoy challenge for unknown usernames. Amends ADR-0013 and ADR-0014. Amended by ADR-0056. Builds on ADR-0041 (web UI) and ADR-0040 (credential store).
+Status: Proposed 2026-10-29. Built in fleet-server: users, hashed API tokens, passkey login, server-side sessions, the first-admin setup code, the `fleet-server admin` recovery subcommand, `jobs.user_id` and owner-scoped reads. Bootstrap password and passkey management are built. Not built: login rate limiting and a decoy challenge for unknown usernames. Amends ADR-0013 and ADR-0014. Amended by ADR-0056 and ADR-0069. Builds on ADR-0041 (web UI) and ADR-0040 (credential store).
 
 Credentials and the web UI make Fleet multi-user. The shared client token cannot say whose a Job or a credential is. This ADR adds users, browser login, per-user API tokens and Job ownership.
 
@@ -84,3 +84,7 @@ Postgres also holds users, passkeys, sessions and API tokens. Auth on `FleetQuer
 `FleetEnvironments` (ADR-0067) joins the Client scope and stays out of the Box scope. All nine methods accept only a per-user API token: the auth layer refuses the static Client token, which maps to the Bootstrap user, with a fixed reason.
 
 `FleetHosts` (ADR-0068, not built) joins the Client scope and stays out of the Box scope. `AddHost` and `ListHosts` accept a per-user API token and are not owner scoped, because the host table is global. `RemoveHost`, `ApproveHostPrivate`, `RevokeHostPrivate` and `ListHostRequests` accept only an admin user API token.
+
+## Amendment (ADR-0069)
+
+A User issues per-Box tokens, and `reset-passkeys` revokes them with the User's other credentials. See ADR-0069.
