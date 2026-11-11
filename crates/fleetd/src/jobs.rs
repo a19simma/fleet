@@ -48,7 +48,7 @@ use crate::poller::{
 use crate::publish::{PublishGh, PublishGit};
 use crate::runner::{
     AgentOutcome, AgentRunner, Interrupt, JobEnd, PueueBg, Reporter, ReporterSink, RunConfig,
-    TimingWiring, ToolPreflight,
+    TimingWiring, ToolPreflight, is_legacy_github_host,
 };
 use crate::systemd::{
     DEFAULT_RUN_DIR, HostsHook, JobSocketSetup, select_launcher_delivering, select_tool_installer,
@@ -542,9 +542,11 @@ impl<R: Reporter + Send + Sync + 'static> DaemonRunner<R> {
     /// nothing else.
     fn host_policies(&self, wiring: &BrokerWiring, job: &Job) -> Vec<HostPolicy> {
         let legacy = || {
+            if !is_legacy_github_host(&wiring.host) {
+                return Vec::new();
+            }
             HostName::normalise(&wiring.host)
                 .ok()
-                .filter(|host| host.as_str() == "github.com")
                 .map(|host| HostPolicy::new(host, HostKind::Github, Vec::new()))
                 .into_iter()
                 .collect()
@@ -1738,6 +1740,61 @@ mod tests {
             attempt: 1,
             ..Job::default()
         }
+    }
+
+    #[test]
+    fn legacy_github_fallback_answers_for_github_com_only() -> TestResult {
+        let dir = tempfile::TempDir::new()?;
+        let long = format!("{}.com", "a".repeat(250));
+        let hostile = [
+            "github.com\u{85}",
+            "github.com\u{2028}",
+            "github.com\r",
+            "github.com\r\n",
+            long.as_str(),
+            "github..com",
+            ".github.com",
+            "[::1]:443",
+            "github.com:443",
+            "user@github.com",
+            "user:pw@github.com",
+            "github.com.",
+            "github.com..",
+            "GitHub.com",
+            "GITHUB.COM",
+            "g\u{456}thub.com",
+            "github.com ",
+            "",
+        ];
+        for host in std::iter::once("github.com").chain(hostile) {
+            let (tx, _rx) = mpsc::unbounded_channel();
+            let runner = DaemonRunner::new(
+                Workspace::new(dir.path().join("jobs")),
+                AgentRunner::new(
+                    RunConfig::new("claude", false),
+                    Recorder(tx),
+                    Redactor::default(),
+                ),
+                "",
+            );
+            let wiring = BrokerWiring::new(
+                PerJob::new(),
+                AgentLauncher::Systemd,
+                host.to_owned(),
+                String::new(),
+                Redactor::default(),
+            );
+            let policies = runner.host_policies(&wiring, &sample_job());
+            let want = usize::from(host == "github.com");
+            assert_eq!(policies.len(), want, "host {host:?}");
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn legacy_predicate_is_the_shared_one() {
+        assert!(is_legacy_github_host("github.com"));
+        assert!(!is_legacy_github_host("GITHUB.COM"));
     }
 
     #[tokio::test]

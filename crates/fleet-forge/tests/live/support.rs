@@ -601,6 +601,30 @@ pub(crate) fn shape(value: &Value, depth: usize) -> String {
 
 /// The names of the repositories on one page of `GET /user/repos` that a cleanup may delete: the
 /// authenticated user's own repositories whose name carries the throwaway prefix.
+pub(crate) const CLEANUP_MAX_PAGES: u32 = 40;
+pub(crate) const CLEANUP_PAGE_SIZE: usize = 50;
+
+pub(crate) fn list_leaked(
+    login: &str,
+    mut fetch: impl FnMut(u32) -> Result<(u16, Value), String>,
+) -> Result<Vec<String>, String> {
+    let mut names = Vec::new();
+    for page in 1..=CLEANUP_MAX_PAGES {
+        let (status, body) = fetch(page)?;
+        if status != 200 {
+            return Err(format!("list repositories: status {status}"));
+        }
+        let count = body.as_array().map_or(0, Vec::len);
+        names.extend(leaked_names(&body, login));
+        if count < CLEANUP_PAGE_SIZE {
+            return Ok(names);
+        }
+    }
+    Err(format!(
+        "list repositories: page {CLEANUP_MAX_PAGES} (CLEANUP_MAX_PAGES) is still full, more repositories may leak"
+    ))
+}
+
 pub(crate) fn leaked_names(page: &Value, login: &str) -> Vec<String> {
     page.as_array()
         .map(Vec::as_slice)

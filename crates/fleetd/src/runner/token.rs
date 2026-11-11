@@ -21,6 +21,19 @@ use crate::cred::{CredentialFailure, JobCredentials, LeaseFuture, LeasedToken, T
 use crate::envd::{NOTE_COVERAGE_REDUCED, ReleasedEnvironment};
 use crate::runner::{AgentRunner, Reporter};
 
+/// Whether `host` is the one host the legacy GitHub fallback answers for: exactly `github.com`.
+///
+/// A credential reply with no host entries, and a runner with no book, come from a server or
+/// a config that predates host entries. Both ask this one question, and no other spelling of
+/// the name passes.
+#[expect(
+    unreachable_pub,
+    reason = "re-exported crate-wide by the parent module"
+)]
+pub fn is_legacy_github_host(host: &str) -> bool {
+    host == GITHUB_HOST
+}
+
 /// The [`TokenSource`] of one job.
 ///
 /// It refreshes the job's installation token through the runner, then leases the held one.
@@ -126,7 +139,7 @@ impl<R: Reporter> AgentRunner<R> {
         let Some((held, lease)) = book.lease_held(job_id) else {
             return LeasedToken::new(String::new(), None);
         };
-        let legacy = held.hosts().is_empty() && host.eq_ignore_ascii_case(GITHUB_HOST);
+        let legacy = held.hosts().is_empty() && is_legacy_github_host(host);
         let token = if legacy {
             held.github_str()
         } else {
@@ -176,7 +189,7 @@ impl<R: Reporter> AgentRunner<R> {
             return;
         };
         command.env("GH_TOKEN", &token);
-        if gh && !host.eq_ignore_ascii_case("github.com") {
+        if gh && !is_legacy_github_host(host) {
             command.env("GH_ENTERPRISE_TOKEN", &token);
         }
     }
