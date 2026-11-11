@@ -13,6 +13,7 @@
 //! row lock, so it queues behind a put and never waits on a credential row: no cycle exists.
 
 use std::fmt;
+use std::net::IpAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -22,16 +23,18 @@ use fleet_forge::{
 };
 use fleet_proto::Reason;
 use fleet_proto::v1::{
-    AddHostRequest, HostInfo, ListHostsReply, RemoveHostReply, RemoveHostRequest,
+    AddHostRequest, ApproveHostPrivateRequest, HostInfo, HostRequestInfo, ListHostRequestsReply,
+    ListHostsReply, RemoveHostReply, RemoveHostRequest, RevokeHostPrivateRequest,
 };
 use sqlx::{PgPool, Row};
 use tokio::sync::Semaphore;
 use tokio::time::timeout;
 use tonic::Status;
 
-use crate::cred::https::{FetchError, ForgeGet, ForgeTransport, TlsError};
+use crate::cred::https::{FetchError, ForgeGet, ForgeReply, ForgeTransport, TlsError};
 use crate::cred::pinned::{
-    Dial, PinnedHttps, Resolve, SystemResolver, TcpDial, is_dns_host, vet_all,
+    Dial, MAX_ADDRESSES, PinnedHttps, Resolve, SystemResolver, TcpDial, is_dns_host,
+    is_private_range, vet_all,
 };
 use crate::cred::repo_limit::{CheckLimiter, MAX_CONCURRENT_REPO_CHECKS};
 
@@ -71,6 +74,112 @@ const HAS_REPOSITORIES: &str = "SELECT EXISTS (SELECT 1 FROM user_repos WHERE ho
 
 const INSERT_AUDIT: &str =
     "INSERT INTO host_audit (user_id, host, action, outcome) VALUES ($1, $2, $3, $4)";
+
+const INSERT_AUDIT_ADDRESSES: &str = "INSERT INTO host_audit (user_id, host, action, outcome, addresses) \
+VALUES ($1, $2, $3, $4, $5::text[]::inet[])";
+
+const COUNT_PENDING_BY_USER: &str =
+    "SELECT count(*) FROM git_host_requests WHERE user_id = $1 AND status = 'pending'";
+
+const COUNT_PENDING_ALL: &str = "SELECT count(*) FROM git_host_requests WHERE status = 'pending'";
+
+const HAS_PENDING: &str = "SELECT EXISTS (SELECT 1 FROM git_host_requests \
+WHERE user_id = $1 AND host = $2 AND status = 'pending')";
+
+const UPSERT_REQUEST: &str = "INSERT INTO git_host_requests (host, user_id, resolved) \
+VALUES ($1, $2, $3::text[]::inet[]) \
+ON CONFLICT (user_id, host) WHERE status = 'pending' DO UPDATE SET resolved = EXCLUDED.resolved";
+
+const SELECT_PENDING: &str = "SELECT host, user_id, \
+ARRAY(SELECT host(a) FROM unnest(resolved) AS a)::text[] AS resolved, \
+(EXTRACT(EPOCH FROM created_at) * 1000)::bigint AS created_ms \
+FROM git_host_requests WHERE status = 'pending' ORDER BY id";
+
+const CAN_APPROVE: &str = "SELECT EXISTS (SELECT 1 FROM git_hosts WHERE host = $1 AND kind = 'forgejo') \
+OR EXISTS (SELECT 1 FROM git_host_requests WHERE host = $1 AND status = 'pending')";
+
+const FIRST_REQUESTER: &str = "SELECT user_id FROM git_host_requests \
+WHERE host = $1 AND status = 'pending' ORDER BY id LIMIT 1";
+
+const GRANT: &str = "UPDATE git_hosts SET allow_private = true, approved_ips = $2::text[]::inet[], \
+approved_by = $3, approved_at = now() WHERE host = $1";
+
+const CLOSE_REQUESTS: &str =
+    "UPDATE git_host_requests SET status = 'approved' WHERE host = $1 AND status = 'pending'";
+
+const UNGRANT: &str = "UPDATE git_hosts SET allow_private = false, approved_ips = '{}', \
+approved_by = NULL, approved_at = NULL WHERE host = $1";
+
+const STALE_REPOS: &str = "UPDATE user_repos SET verified_at = to_timestamp(0) WHERE host = $1";
+
+/// The private addresses of `resolved` an admin may approve, or `None`.
+///
+/// The set must hold at least one RFC 1918 or unique-local address and every address must pass
+/// [`vet_all`] with the private ones approved. Loopback, link-local, metadata, CGNAT, multicast,
+/// NAT64, 6to4 and every other range the address rule refuses fail the whole set. An empty set,
+/// a set over [`MAX_ADDRESSES`] and a set with no private address have nothing to approve.
+#[must_use]
+pub fn private_grant(resolved: &[IpAddr]) -> Option<Vec<IpAddr>> {
+    let private = canonical_set(
+        resolved
+            .iter()
+            .copied()
+            .filter(|ip| is_private_range(*ip))
+            .collect(),
+    );
+    if private.is_empty() || vet_all(resolved, true, &private).is_err() {
+        return None;
+    }
+    Some(private)
+}
+
+fn canonical_set(mut addrs: Vec<IpAddr>) -> Vec<IpAddr> {
+    for ip in &mut addrs {
+        *ip = ip.to_canonical();
+    }
+    addrs.sort();
+    addrs.dedup();
+    addrs
+}
+
+fn texts(addrs: &[IpAddr]) -> Vec<String> {
+    addrs.iter().map(ToString::to_string).collect()
+}
+
+/// One pending request for a private host.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RequestRow {
+    /// The requested host.
+    pub host: String,
+    /// The User who tried to add it.
+    pub user_id: i64,
+    /// The addresses the host resolved to at the request.
+    pub resolved: Vec<String>,
+    /// When the request was made, in milliseconds since the Unix epoch.
+    pub created_at_ms: i64,
+}
+
+/// The result of [`HostStore::approve`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ApproveOutcome {
+    /// The grant was stored.
+    Approved(HostRow),
+    /// The table holds no forgejo row and no pending request for the host.
+    Unknown,
+    /// The host needed a new row and the table holds [`fleet_proto::MAX_HOSTS_TOTAL`] hosts.
+    TableFull,
+}
+
+/// The result of [`HostStore::revoke`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RevokeOutcome {
+    /// The grant was cleared and the host's repositories were marked stale.
+    Revoked(HostRow),
+    /// The host held no grant. Nothing changed.
+    NoGrant(HostRow),
+    /// The table holds no forgejo row for the host.
+    Unknown,
+}
 
 /// One row of `git_hosts`.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -258,6 +367,248 @@ impl HostStore {
         Ok(())
     }
 
+    /// Writes one audit row that names `addresses`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`HostStoreError::Db`] for a database failure.
+    pub async fn audit_addresses(
+        &self,
+        user_id: i64,
+        host: &HostName,
+        action: &str,
+        outcome: &str,
+        addresses: &[IpAddr],
+    ) -> Result<(), HostStoreError> {
+        sqlx::query(INSERT_AUDIT_ADDRESSES)
+            .bind(user_id)
+            .bind(host.as_str())
+            .bind(action)
+            .bind(outcome)
+            .bind(texts(addresses))
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
+    /// Records a pending request of `user_id` for `host` with the addresses it resolved to.
+    ///
+    /// One pending row exists per User and host: a repeat refreshes the addresses. A new row is
+    /// skipped, with no error, when the User already holds the per-user cap of pending rows or
+    /// the table holds the total cap. Returns whether a row now exists.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`HostStoreError::UserGone`] when the user row is missing and
+    /// [`HostStoreError::Db`] for a database failure.
+    pub async fn record_request(
+        &self,
+        user_id: i64,
+        host: &HostName,
+        resolved: &[IpAddr],
+    ) -> Result<bool, HostStoreError> {
+        let mut tx = self.pool.begin().await?;
+        sqlx::query(LOCK_USER)
+            .bind(user_id)
+            .fetch_optional(&mut *tx)
+            .await?
+            .ok_or(HostStoreError::UserGone)?;
+        sqlx::query(LOCK_TOTAL).execute(&mut *tx).await?;
+        let held: bool = sqlx::query_scalar(HAS_PENDING)
+            .bind(user_id)
+            .bind(host.as_str())
+            .fetch_one(&mut *tx)
+            .await?;
+        let room = held
+            || (!over(
+                &mut tx,
+                COUNT_PENDING_BY_USER,
+                Some(user_id),
+                self.max_per_user,
+            )
+            .await?
+                && !over(&mut tx, COUNT_PENDING_ALL, None, self.max_total).await?);
+        if room {
+            sqlx::query(UPSERT_REQUEST)
+                .bind(host.as_str())
+                .bind(user_id)
+                .bind(texts(resolved))
+                .execute(&mut *tx)
+                .await?;
+        }
+        tx.commit().await?;
+        Ok(room)
+    }
+
+    /// Every pending request, oldest first.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`HostStoreError::Db`] for a database failure.
+    pub async fn pending_requests(&self) -> Result<Vec<RequestRow>, HostStoreError> {
+        let rows = sqlx::query(SELECT_PENDING).fetch_all(&self.pool).await?;
+        rows.iter()
+            .map(|row| {
+                Ok(RequestRow {
+                    host: row.try_get("host")?,
+                    user_id: row.try_get("user_id")?,
+                    resolved: row.try_get("resolved")?,
+                    created_at_ms: row.try_get("created_ms")?,
+                })
+            })
+            .collect::<Result<_, sqlx::Error>>()
+            .map_err(Into::into)
+    }
+
+    /// Whether an approval of `host` has anything to act on: a forgejo row or a pending request.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`HostStoreError::Db`] for a database failure.
+    pub async fn can_approve(&self, host: &HostName) -> Result<bool, HostStoreError> {
+        Ok(sqlx::query_scalar(CAN_APPROVE)
+            .bind(host.as_str())
+            .fetch_one(&self.pool)
+            .await?)
+    }
+
+    /// Stores the approval of `private` for `host` by the admin `admin_id`.
+    ///
+    /// One transaction takes the table-wide advisory lock the add path takes, then the host row
+    /// `FOR UPDATE`, which is the lock a credential put takes `FOR SHARE` before it writes, so the
+    /// order `git_hosts` before `credentials` holds. A host with no row gets one, of kind
+    /// `forgejo`, owned by the first pending requester. The grant, the closing of every pending
+    /// request for the host and the audit row naming `private` commit together.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`HostStoreError::Db`] for a database failure. Nothing is written on an error.
+    pub async fn approve(
+        &self,
+        admin_id: i64,
+        host: &HostName,
+        private: &[IpAddr],
+    ) -> Result<ApproveOutcome, HostStoreError> {
+        let name = host.as_str();
+        let mut tx = self.pool.begin().await?;
+        sqlx::query(LOCK_TOTAL).execute(&mut *tx).await?;
+        let existing = sqlx::query(LOCK_HOST)
+            .bind(name)
+            .fetch_optional(&mut *tx)
+            .await?;
+        if let Some(row) = existing {
+            let kind: String = row.try_get("kind")?;
+            if HostKind::from_stored(&kind) != Some(HostKind::Forgejo) {
+                return Ok(ApproveOutcome::Unknown);
+            }
+        } else {
+            let requester: Option<i64> = sqlx::query_scalar(FIRST_REQUESTER)
+                .bind(name)
+                .fetch_optional(&mut *tx)
+                .await?;
+            let Some(requester) = requester else {
+                return Ok(ApproveOutcome::Unknown);
+            };
+            if over(&mut tx, COUNT_ALL, None, self.max_total).await? {
+                return Ok(ApproveOutcome::TableFull);
+            }
+            sqlx::query(INSERT)
+                .bind(name)
+                .bind(HostKind::Forgejo.as_str())
+                .bind(requester)
+                .execute(&mut *tx)
+                .await?;
+        }
+        sqlx::query(GRANT)
+            .bind(name)
+            .bind(texts(private))
+            .bind(admin_id)
+            .execute(&mut *tx)
+            .await?;
+        sqlx::query(CLOSE_REQUESTS)
+            .bind(name)
+            .execute(&mut *tx)
+            .await?;
+        sqlx::query(INSERT_AUDIT_ADDRESSES)
+            .bind(admin_id)
+            .bind(name)
+            .bind("approve_private")
+            .bind("approved")
+            .bind(texts(private))
+            .execute(&mut *tx)
+            .await?;
+        let row = sqlx::query(SELECT_ONE)
+            .bind(name)
+            .fetch_one(&mut *tx)
+            .await?;
+        let row = HostRow::from_row(&row)?;
+        tx.commit().await?;
+        Ok(ApproveOutcome::Approved(row))
+    }
+
+    /// Clears the grant of `host` for the admin `admin_id`.
+    ///
+    /// The host row is taken `FOR UPDATE` first. A granted host loses `allow_private` and
+    /// `approved_ips`, every repository row on the host is marked stale by moving `verified_at` to
+    /// the Unix epoch, and the audit row names the addresses that were approved. A host with no
+    /// grant changes nothing and writes a `refused` audit row.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`HostStoreError::Db`] for a database failure. Nothing is written on an error.
+    pub async fn revoke(
+        &self,
+        admin_id: i64,
+        host: &HostName,
+    ) -> Result<RevokeOutcome, HostStoreError> {
+        let name = host.as_str();
+        let mut tx = self.pool.begin().await?;
+        let Some(locked) = sqlx::query(LOCK_HOST)
+            .bind(name)
+            .fetch_optional(&mut *tx)
+            .await?
+        else {
+            return Ok(RevokeOutcome::Unknown);
+        };
+        let kind: String = locked.try_get("kind")?;
+        if HostKind::from_stored(&kind) != Some(HostKind::Forgejo) {
+            return Ok(RevokeOutcome::Unknown);
+        }
+        let row = sqlx::query(SELECT_ONE)
+            .bind(name)
+            .fetch_one(&mut *tx)
+            .await?;
+        let before = HostRow::from_row(&row)?;
+        let audit = |outcome: &'static str, addresses: Vec<String>| {
+            sqlx::query(INSERT_AUDIT_ADDRESSES)
+                .bind(admin_id)
+                .bind(name)
+                .bind("revoke_private")
+                .bind(outcome)
+                .bind(addresses)
+        };
+        if !before.allow_private {
+            audit("refused", Vec::new()).execute(&mut *tx).await?;
+            tx.commit().await?;
+            return Ok(RevokeOutcome::NoGrant(before));
+        }
+        sqlx::query(UNGRANT).bind(name).execute(&mut *tx).await?;
+        sqlx::query(STALE_REPOS)
+            .bind(name)
+            .execute(&mut *tx)
+            .await?;
+        audit("revoked", before.approved_ips.clone())
+            .execute(&mut *tx)
+            .await?;
+        let row = sqlx::query(SELECT_ONE)
+            .bind(name)
+            .fetch_one(&mut *tx)
+            .await?;
+        let after = HostRow::from_row(&row)?;
+        tx.commit().await?;
+        Ok(RevokeOutcome::Revoked(after))
+    }
+
     /// Inserts `host` for `user_id` with its audit row in one transaction.
     ///
     /// The transaction takes `FOR UPDATE` on the user row, which serialises that User's adds, and
@@ -373,6 +724,14 @@ impl HostStore {
     }
 }
 
+fn parse_named(named: &[String]) -> Option<Vec<IpAddr>> {
+    if named.len() > MAX_ADDRESSES {
+        return None;
+    }
+    let parsed: Result<Vec<IpAddr>, _> = named.iter().map(|text| text.parse::<IpAddr>()).collect();
+    parsed.ok().map(canonical_set)
+}
+
 async fn over(
     tx: &mut sqlx::PgConnection,
     statement: &'static str,
@@ -445,11 +804,26 @@ pub trait HostProbe: Send + Sync {
     ///
     /// Returns the closed [`HostRefusal`].
     async fn probe(&self, host: &HostName) -> Result<HostKind, HostRefusal>;
+
+    /// Every address `host` resolves to now, or none when the lookup fails.
+    async fn resolve(&self, host: &HostName) -> Vec<IpAddr>;
+
+    /// Like [`HostProbe::probe`], but a private address passes when `approved` holds it.
+    ///
+    /// # Errors
+    ///
+    /// Returns the closed [`HostRefusal`].
+    async fn probe_approved(
+        &self,
+        host: &HostName,
+        approved: &[IpAddr],
+    ) -> Result<HostKind, HostRefusal>;
 }
 
 /// The [`Http`] seam over a [`ForgeTransport`]: public addresses only, no credential, no redirect.
 pub struct PinnedHttp<T> {
     transport: T,
+    approved: Vec<IpAddr>,
 }
 
 impl<T> fmt::Debug for PinnedHttp<T> {
@@ -459,9 +833,20 @@ impl<T> fmt::Debug for PinnedHttp<T> {
 }
 
 impl<T: ForgeTransport> PinnedHttp<T> {
-    /// An adapter that sends through `transport`.
+    /// An adapter that sends through `transport` and admits public addresses only.
     pub const fn new(transport: T) -> Self {
-        Self { transport }
+        Self {
+            transport,
+            approved: Vec::new(),
+        }
+    }
+
+    /// An adapter that also admits the private addresses in `approved`, and no other.
+    pub const fn approved(transport: T, approved: Vec<IpAddr>) -> Self {
+        Self {
+            transport,
+            approved,
+        }
     }
 }
 
@@ -476,8 +861,8 @@ impl<T: ForgeTransport> Http for PinnedHttp<T> {
             .get(&ForgeGet {
                 host: request.host.as_str(),
                 path: &request.path,
-                allow_private: false,
-                approved_ips: &[],
+                allow_private: !self.approved.is_empty(),
+                approved_ips: &self.approved,
                 authorization: None,
                 accept,
             })
@@ -499,11 +884,24 @@ impl<T: ForgeTransport> Http for PinnedHttp<T> {
     }
 }
 
-/// The production [`HostProbe`]: [`is_dns_host`], one lookup vetted with [`vet_all`] for public
-/// addresses only, then `GiteaForge::identify` over the pinned connector.
+struct Borrowed<'a, T>(&'a T);
+
+#[tonic::async_trait]
+impl<T: ForgeTransport> ForgeTransport for Borrowed<'_, T> {
+    async fn get(&self, request: &ForgeGet<'_>) -> Result<ForgeReply, FetchError> {
+        self.0.get(request).await
+    }
+}
+
+/// The production [`HostProbe`]: [`is_dns_host`], one lookup vetted with [`vet_all`], then
+/// `GiteaForge::identify` over the pinned connector.
+///
+/// [`HostProbe::probe`] admits public addresses only. [`HostProbe::probe_approved`] admits the
+/// private addresses an admin approved and no other, through the same [`vet_all`] and the same
+/// connector.
 pub struct PinnedProbe<R, T> {
     resolver: R,
-    forge: GiteaForge<PinnedHttp<T>>,
+    transport: T,
 }
 
 impl<R, T> fmt::Debug for PinnedProbe<R, T> {
@@ -517,8 +915,35 @@ impl<R: Resolve, T: ForgeTransport> PinnedProbe<R, T> {
     pub const fn new(resolver: R, transport: T) -> Self {
         Self {
             resolver,
-            forge: GiteaForge::new(PinnedHttp::new(transport)),
+            transport,
         }
+    }
+
+    async fn vetted_identify(
+        &self,
+        host: &HostName,
+        approved: &[IpAddr],
+    ) -> Result<HostKind, HostRefusal> {
+        if !is_dns_host(host.as_str()) {
+            return Err(HostRefusal::NotAllowedHost);
+        }
+        let addrs = self
+            .resolver
+            .resolve(host.as_str())
+            .await
+            .map_err(|error| {
+                tracing::warn!(host = %host, %error, "host lookup failed");
+                HostRefusal::NotAllowedHost
+            })?;
+        vet_all(&addrs, !approved.is_empty(), approved).map_err(|error| {
+            tracing::warn!(host = %host, %error, "host address refused");
+            HostRefusal::NotAllowedHost
+        })?;
+        let http = PinnedHttp::approved(Borrowed(&self.transport), approved.to_vec());
+        GiteaForge::new(http).identify(host).await.map_err(|error| {
+            tracing::warn!(host = %host, %error, "host identify failed");
+            refusal_of(error)
+        })
     }
 }
 
@@ -536,25 +961,28 @@ impl PinnedProbe<SystemResolver, PinnedHttps<SystemResolver, TcpDial>> {
 #[tonic::async_trait]
 impl<R: Resolve, T: ForgeTransport> HostProbe for PinnedProbe<R, T> {
     async fn probe(&self, host: &HostName) -> Result<HostKind, HostRefusal> {
+        self.vetted_identify(host, &[]).await
+    }
+
+    async fn resolve(&self, host: &HostName) -> Vec<IpAddr> {
         if !is_dns_host(host.as_str()) {
-            return Err(HostRefusal::NotAllowedHost);
+            return Vec::new();
         }
-        let addrs = self
-            .resolver
+        self.resolver
             .resolve(host.as_str())
             .await
-            .map_err(|error| {
+            .unwrap_or_else(|error| {
                 tracing::warn!(host = %host, %error, "host lookup failed");
-                HostRefusal::NotAllowedHost
-            })?;
-        vet_all(&addrs, false, &[]).map_err(|error| {
-            tracing::warn!(host = %host, %error, "host address refused");
-            HostRefusal::NotAllowedHost
-        })?;
-        self.forge.identify(host).await.map_err(|error| {
-            tracing::warn!(host = %host, %error, "host identify failed");
-            refusal_of(error)
-        })
+                Vec::new()
+            })
+    }
+
+    async fn probe_approved(
+        &self,
+        host: &HostName,
+        approved: &[IpAddr],
+    ) -> Result<HostKind, HostRefusal> {
+        self.vetted_identify(host, approved).await
     }
 }
 
@@ -699,6 +1127,9 @@ impl HostService {
             {
                 tracing::error!(%error, "host audit row failed");
             }
+            if refusal == HostRefusal::NotAllowedHost {
+                self.record_request(user_id, host.name()).await;
+            }
             return Err(refusal.status());
         }
         match self
@@ -712,6 +1143,152 @@ impl HostService {
                 Err(Status::resource_exhausted(fleet_proto::ERR_HOST_LIMIT))
             }
         }
+    }
+
+    async fn record_request(&self, user_id: i64, host: &HostName) {
+        let resolved = timeout(self.budget, self.probe.resolve(host))
+            .await
+            .unwrap_or_default();
+        if private_grant(&resolved).is_none() {
+            return;
+        }
+        if let Err(error) = self.store.record_request(user_id, host, &resolved).await {
+            tracing::error!(%error, "host request row failed");
+        }
+    }
+
+    /// Approves the private addresses of a host for the admin `admin_id`.
+    ///
+    /// The host must have a forgejo row or a pending request. The host is resolved afresh, the
+    /// named addresses must equal that set, and the set must pass [`private_grant`]. The host is
+    /// then identified through the approved addresses only, and the grant, the request and the
+    /// audit row commit together. A refusal after the resolve writes a `refused` audit row.
+    ///
+    /// # Errors
+    ///
+    /// `NOT_FOUND` for a name outside the grammar, `github.com`, and a host with no row and no
+    /// pending request. `FAILED_PRECONDITION` with `HOST_ADDRESS_MISMATCH` when the named set is
+    /// not the fresh resolve, `NOT_ALLOWED_HOST` when the set has no approvable private address or
+    /// holds a forbidden range, and the probe reasons when the host is not a forge.
+    /// `RESOURCE_EXHAUSTED` at the concurrency cap or the table cap. `UNAVAILABLE` when storage
+    /// fails.
+    pub async fn approve(
+        &self,
+        admin_id: i64,
+        request: &ApproveHostPrivateRequest,
+    ) -> Result<HostInfo, Status> {
+        let not_found = || Status::not_found(fleet_proto::ERR_HOST_NOT_FOUND);
+        let host = HostName::normalise(&request.host).map_err(|_| not_found())?;
+        if !self
+            .store
+            .can_approve(&host)
+            .await
+            .map_err(|error| store_status(&error))?
+        {
+            return Err(not_found());
+        }
+        let _permit = self
+            .permits
+            .try_acquire()
+            .map_err(|_| Status::resource_exhausted(fleet_proto::ERR_REPO_BUSY))?;
+        let resolved = canonical_set(
+            timeout(self.budget, self.probe.resolve(&host))
+                .await
+                .unwrap_or_default(),
+        );
+        let (audited_host, audited) = (&host, &resolved);
+        let refuse = |reason: Reason| async move {
+            if let Err(error) = self
+                .store
+                .audit_addresses(
+                    admin_id,
+                    audited_host,
+                    "approve_private",
+                    "refused",
+                    audited,
+                )
+                .await
+            {
+                tracing::error!(%error, "host audit row failed");
+            }
+            let (code, message) = reason.status_parts();
+            Status::new(code, message)
+        };
+        let named = parse_named(&request.approved_ips);
+        if resolved.is_empty() || named.as_ref() != Some(&resolved) {
+            return Err(refuse(Reason::HostAddressMismatch).await);
+        }
+        let Some(private) = private_grant(&resolved) else {
+            return Err(refuse(Reason::RepoNotAllowedHost).await);
+        };
+        let verdict = timeout(self.budget, self.probe.probe_approved(&host, &private))
+            .await
+            .unwrap_or(Err(HostRefusal::Timeout));
+        match verdict {
+            Ok(HostKind::Forgejo) => {}
+            Ok(HostKind::Github) => return Err(refuse(HostRefusal::NotForge.reason()).await),
+            Err(refusal) => return Err(refuse(refusal.reason()).await),
+        }
+        match self
+            .store
+            .approve(admin_id, &host, &private)
+            .await
+            .map_err(|error| store_status(&error))?
+        {
+            ApproveOutcome::Approved(row) => Ok(row.into_info(true)),
+            ApproveOutcome::Unknown => Err(not_found()),
+            ApproveOutcome::TableFull => {
+                Err(Status::resource_exhausted(fleet_proto::ERR_HOST_LIMIT))
+            }
+        }
+    }
+
+    /// Clears the private grant of a host for the admin `admin_id` and marks the repositories on
+    /// the host stale.
+    ///
+    /// # Errors
+    ///
+    /// `NOT_FOUND` for a name the table does not hold as a forgejo row, `UNAVAILABLE` when storage
+    /// fails. A host with no grant is returned unchanged.
+    pub async fn revoke(
+        &self,
+        admin_id: i64,
+        request: &RevokeHostPrivateRequest,
+    ) -> Result<HostInfo, Status> {
+        let not_found = || Status::not_found(fleet_proto::ERR_HOST_NOT_FOUND);
+        let host = HostName::normalise(&request.host).map_err(|_| not_found())?;
+        match self
+            .store
+            .revoke(admin_id, &host)
+            .await
+            .map_err(|error| store_status(&error))?
+        {
+            RevokeOutcome::Revoked(row) | RevokeOutcome::NoGrant(row) => Ok(row.into_info(true)),
+            RevokeOutcome::Unknown => Err(not_found()),
+        }
+    }
+
+    /// Lists the pending requests for private hosts, oldest first.
+    ///
+    /// # Errors
+    ///
+    /// `UNAVAILABLE` when storage fails.
+    pub async fn list_requests(&self) -> Result<ListHostRequestsReply, Status> {
+        let unsigned = |value: i64| u64::try_from(value).unwrap_or_default();
+        let requests = self
+            .store
+            .pending_requests()
+            .await
+            .map_err(|error| store_status(&error))?
+            .into_iter()
+            .map(|row| HostRequestInfo {
+                host: row.host,
+                requested_by: unsigned(row.user_id),
+                resolved_ips: row.resolved,
+                requested_at_ms: unsigned(row.created_at_ms),
+            })
+            .collect();
+        Ok(ListHostRequestsReply { requests })
     }
 
     /// Lists every host. Approved private addresses go to an admin only.

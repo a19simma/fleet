@@ -416,6 +416,98 @@ async fn host_audit_rejects_update_delete_and_truncate(pool: PgPool) {
     }
 }
 
+#[sqlx::test(migrations = false)]
+async fn host_audit_takes_the_private_actions_with_addresses_and_refuses_the_rest(pool: PgPool) {
+    migrated(&pool).await;
+    let admin = user(&pool, "root").await;
+    let insert = |action: &'static str, outcome: &'static str| {
+        sqlx::query(
+            "INSERT INTO host_audit (user_id, host, action, outcome, addresses) \
+             VALUES ($1, 'git.example.com', $2, $3, ARRAY['192.168.3.1']::inet[])",
+        )
+        .bind(admin)
+        .bind(action)
+        .bind(outcome)
+        .execute(&pool)
+    };
+    for (action, outcome) in [
+        ("approve_private", "approved"),
+        ("approve_private", "refused"),
+        ("revoke_private", "revoked"),
+        ("revoke_private", "refused"),
+    ] {
+        insert(action, outcome).await.unwrap();
+    }
+    for (action, outcome) in [
+        ("approve_private", "revoked"),
+        ("approve_private", "added"),
+        ("revoke_private", "approved"),
+        ("revoke_private", "removed"),
+        ("add", "approved"),
+        ("add", "revoked"),
+        ("remove", "approved"),
+        ("remove", "revoked"),
+        ("grant_private", "approved"),
+        ("", "refused"),
+    ] {
+        let err = insert(action, outcome).await.unwrap_err();
+        assert!(
+            err.to_string().contains("host_audit_"),
+            "{action}/{outcome}: {err}"
+        );
+    }
+    let old = sqlx::query(
+        "INSERT INTO host_audit (user_id, host, action, outcome) \
+         VALUES ($1, 'git.example.com', 'add', 'added')",
+    )
+    .bind(admin)
+    .execute(&pool)
+    .await;
+    old.unwrap();
+    let empty: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM host_audit WHERE action = 'add' AND addresses = '{}'",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(empty, 1);
+    for statement in [
+        "UPDATE host_audit SET addresses = '{}'",
+        "DELETE FROM host_audit",
+        "TRUNCATE host_audit",
+    ] {
+        let err = sqlx::query(statement).execute(&pool).await.unwrap_err();
+        assert!(
+            err.to_string().contains("insert-only"),
+            "{statement}: {err}"
+        );
+    }
+}
+
+#[sqlx::test(migrations = false)]
+async fn one_pending_request_per_user_and_host(pool: PgPool) {
+    migrated(&pool).await;
+    let alice = user(&pool, "alice").await;
+    let bob = user(&pool, "bob").await;
+    let insert = |who: i64, host: &'static str, status: &'static str| {
+        sqlx::query("INSERT INTO git_host_requests (host, user_id, status) VALUES ($1, $2, $3)")
+            .bind(host)
+            .bind(who)
+            .bind(status)
+            .execute(&pool)
+    };
+    insert(alice, "a.example.com", "pending").await.unwrap();
+    insert(bob, "a.example.com", "pending").await.unwrap();
+    insert(alice, "b.example.com", "pending").await.unwrap();
+    insert(alice, "a.example.com", "denied").await.unwrap();
+    insert(alice, "a.example.com", "approved").await.unwrap();
+    let err = insert(alice, "a.example.com", "pending").await.unwrap_err();
+    assert!(
+        err.to_string().contains("git_host_requests_pending_key"),
+        "{err}"
+    );
+}
+
 async fn add_waits_while(pool: &PgPool, lock: &'static str, bind_user: Option<i64>) {
     let alice = user(pool, "alice").await;
     let store = HostStore::new(pool.clone());
