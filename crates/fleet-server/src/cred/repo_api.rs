@@ -97,12 +97,14 @@ impl RepoService {
         self
     }
 
-    fn parse(&self, input: &str) -> Result<(RepoRef, ForgeKind), Status> {
+    async fn parse(&self, input: &str) -> Result<(RepoRef, ForgeKind), Status> {
         let first =
             RepoRef::parse(input).map_err(|err| Status::invalid_argument(err.to_string()))?;
         let kind = self
             .verifiers
-            .kind_of(first.host())
+            .kind_for(first.host())
+            .await
+            .map_err(refused)?
             .ok_or_else(|| refused(RepoRefusal::NotAllowedHost))?;
         let repo = RepoRef::parse_as(input, kind)
             .map_err(|err| Status::invalid_argument(err.to_string()))?;
@@ -122,7 +124,7 @@ impl RepoService {
     /// concurrency cap or the per-User row cap. `INTERNAL` when a credential cannot be opened,
     /// `UNAVAILABLE` when storage fails. Nothing is stored on any error.
     pub async fn add(&self, user_id: i64, request: &AddRepoRequest) -> Result<RepoInfo, Status> {
-        let (repo, kind) = self.parse(&request.repo)?;
+        let (repo, kind) = self.parse(&request.repo).await?;
         let (credential_id, verdict) = {
             if !self.limiter.admit(user_id) {
                 return Err(Status::resource_exhausted(
@@ -136,6 +138,11 @@ impl RepoService {
             let credential = if kind == ForgeKind::Github && repo.host() == GITHUB_HOST {
                 self.store
                     .github_credential(user_id)
+                    .await
+                    .map_err(|err| store_status(&err))?
+            } else if kind == ForgeKind::Forgejo {
+                self.store
+                    .forgejo_credential(user_id, repo.host())
                     .await
                     .map_err(|err| store_status(&err))?
             } else {
