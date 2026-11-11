@@ -4,6 +4,7 @@
 #![expect(clippy::unwrap_used, reason = "test code asserts by panicking")]
 
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use fleet_core::credential::{CredentialKind, CredentialShape, Secret};
 use fleet_core::host::HostError;
@@ -20,11 +21,23 @@ const STATIC: CredentialShape = CredentialShape::StaticSecret;
 
 type Res<T> = Result<T, Box<dyn std::error::Error>>;
 
+static KEY_FILES: AtomicUsize = AtomicUsize::new(0);
+
+fn key_path(prefix: &str) -> std::path::PathBuf {
+    std::env::temp_dir().join(format!(
+        "{prefix}-{}-{}.keys",
+        std::process::id(),
+        KEY_FILES.fetch_add(1, Ordering::Relaxed)
+    ))
+}
+
+#[test]
+fn key_paths_are_distinct_per_call() {
+    assert_ne!(key_path("fleet-x"), key_path("fleet-x"));
+}
+
 fn store(pool: &PgPool, tag: &str) -> Res<CredentialStore> {
-    let path = std::env::temp_dir().join(format!(
-        "fleet-cred-store-{}-{tag}.keys",
-        std::process::id()
-    ));
+    let path = key_path(&format!("fleet-cred-store-{tag}"));
     std::fs::write(&path, format!("k1:{}\n", "ab".repeat(32)))?;
     let sealer = FileSealer::load(&path);
     std::fs::remove_file(&path)?;
@@ -853,8 +866,7 @@ async fn the_cap_counts_a_second_host_as_another_credential(pool: PgPool) {
 }
 
 fn cap_sealer() -> Arc<FileSealer> {
-    let path =
-        std::env::temp_dir().join(format!("fleet-cred-store-{}-cap.keys", std::process::id()));
+    let path = key_path("fleet-cred-store-cap");
     std::fs::write(&path, format!("k1:{}\n", "ab".repeat(32))).unwrap();
     let sealer = FileSealer::load(&path);
     std::fs::remove_file(&path).unwrap();
