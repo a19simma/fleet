@@ -1,8 +1,8 @@
 //! Repository verification (ADR-0059).
 //!
 //! The closed [`RepoRefusal`] set, the [`RepoVerifier`] seam, the GitHub verifier and the
-//! [`RepoVerifiers`] registry that picks a verifier by the operator host list and applies
-//! [`REPO_CHECK_BUDGET`].
+//! [`RepoVerifiers`] registry that picks a verifier by the kind of the `git_hosts` row (or by the
+//! operator host list when no directory is set) and applies [`REPO_CHECK_BUDGET`].
 //!
 //! No log line or refusal carries an upstream body, a resolved address or a credential. A
 //! credential prints as `[REDACTED]`.
@@ -13,14 +13,15 @@ use std::time::Duration;
 
 use fleet_core::credential::Secret;
 use fleet_core::repo::{ForgeKind, RepoRef, RepoVerdict};
+use fleet_forge::GitHubForge;
 use fleet_proto::{
     CALL_BUDGET, PRECONDITION_REPO_NO_CREDENTIAL, PRECONDITION_REPO_NOT_ALLOWED_HOST,
     PRECONDITION_REPO_NOT_FOUND_OR_NO_ACCESS, PRECONDITION_REPO_TIMEOUT,
     PRECONDITION_REPO_UPSTREAM_UNAVAILABLE,
 };
-use hyper::StatusCode;
 
-use super::https::{ForgeGet, ForgeTransport, bearer_header};
+use super::forge_verify::{ForgeHttp, HostDirectory, verify_with};
+use super::https::ForgeTransport;
 use super::store::{CredentialStore, ProbeLease, ProbeTarget, StoreError};
 use crate::config::{Forge, HostConfig, RepoHosts};
 
@@ -30,7 +31,7 @@ pub const REPO_CHECK_BUDGET: Duration = Duration::from_secs(7);
 
 const _: () = assert!(REPO_CHECK_BUDGET.as_millis() < CALL_BUDGET.as_millis());
 
-const GITHUB_API_HOST: &str = "api.github.com";
+const GITHUB_WEB_HOST: &str = "github.com";
 
 /// Why a repository check gave no verdict. The set is closed and maps one-to-one to the
 /// `PRECONDITION_REPO_*` reasons.
@@ -197,19 +198,8 @@ impl ProbeMint for CredentialStore {
     }
 }
 
-fn api_parts(api_base: &str) -> Option<(&str, String)> {
-    let rest = api_base.strip_prefix("https://")?;
-    let (host, path) = rest.split_once('/').unwrap_or((rest, ""));
-    let path = path.trim_end_matches('/');
-    let prefix = if path.is_empty() {
-        String::new()
-    } else {
-        format!("/{path}")
-    };
-    Some((host, prefix))
-}
-
-/// The GitHub verifier: `GET /repos/{owner}/{repo}`.
+/// The GitHub verifier: `GitHubForge::verify` over the pinned transport. A `github_app`
+/// credential mints a probe token first and revokes it after the check.
 pub struct GithubVerifier {
     transport: Arc<dyn ForgeTransport>,
     minter: Option<Arc<dyn ProbeMint>>,
@@ -234,62 +224,12 @@ impl GithubVerifier {
         token: &[u8],
         repo: &RepoRef,
     ) -> Result<RepoVerdict, RepoRefusal> {
-        let (api_host, prefix) =
-            api_parts(&host.api_base).ok_or(RepoRefusal::UpstreamUnavailable)?;
-        let authorization = bearer_header(token).ok_or(RepoRefusal::UpstreamUnavailable)?;
-        let path = format!("{prefix}/repos/{}", repo.path());
-        let reply = self
-            .transport
-            .get(&ForgeGet {
-                host: api_host,
-                path: &path,
-                allow_private: host.allow_private,
-                approved_ips: &[],
-                authorization: Some(&authorization),
-                accept: "application/json",
-            })
-            .await
-            .map_err(|err| {
-                tracing::warn!(host = %repo.host(), error = %err, "repository lookup failed");
-                RepoRefusal::UpstreamUnavailable
-            })?;
-        match reply.status {
-            StatusCode::OK => verdict_of(&reply.body, repo.host()),
-            StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN | StatusCode::NOT_FOUND => {
-                Err(RepoRefusal::NotFoundOrNoAccess)
-            }
-            status => {
-                tracing::warn!(host = %repo.host(), status = status.as_u16(), "repository lookup refused");
-                Err(RepoRefusal::UpstreamUnavailable)
-            }
+        if repo.host() != GITHUB_WEB_HOST {
+            return Err(RepoRefusal::NotAllowedHost);
         }
+        let http = ForgeHttp::new(self.transport.as_ref(), host.allow_private, &[]);
+        verify_with(&GitHubForge::new(http, ()), repo, token).await
     }
-}
-
-fn verdict_of(body: &[u8], host: &str) -> Result<RepoVerdict, RepoRefusal> {
-    let unusable = || {
-        tracing::warn!("repository reply is unusable");
-        RepoRefusal::UpstreamUnavailable
-    };
-    let value: serde_json::Value = serde_json::from_slice(body).map_err(|_| unusable())?;
-    let full_name = value
-        .get("full_name")
-        .and_then(serde_json::Value::as_str)
-        .ok_or_else(unusable)?;
-    let canonical = RepoRef::parse_as(&format!("{host}/{full_name}"), ForgeKind::Github)
-        .map_err(|_| unusable())?;
-    let permissions = value.get("permissions");
-    let flag = |name: &str| {
-        permissions
-            .and_then(|p| p.get(name))
-            .and_then(serde_json::Value::as_bool)
-    };
-    Ok(RepoVerdict {
-        canonical_path: canonical.path().to_owned(),
-        read: flag("pull").unwrap_or(true),
-        push: flag("push"),
-        login: None,
-    })
 }
 
 #[tonic::async_trait]
@@ -308,7 +248,7 @@ impl RepoVerifier for GithubVerifier {
                 credential_id,
                 installation,
             }) => {
-                if api_parts(&host.api_base).map(|(h, _)| h) != Some(GITHUB_API_HOST) {
+                if repo.host() != GITHUB_WEB_HOST {
                     return Err(RepoRefusal::NoCredential);
                 }
                 let minter = self
@@ -332,6 +272,7 @@ impl RepoVerifier for GithubVerifier {
 /// Picks the verifier for a repository by the operator host list and applies the total budget.
 pub struct RepoVerifiers {
     hosts: RepoHosts,
+    directory: Option<Arc<dyn HostDirectory>>,
     by_forge: HashMap<ForgeId, Arc<dyn RepoVerifier>>,
     budget: Duration,
 }
@@ -360,6 +301,7 @@ impl RepoVerifiers {
     pub fn new(hosts: RepoHosts) -> Self {
         Self {
             hosts,
+            directory: None,
             by_forge: HashMap::new(),
             budget: REPO_CHECK_BUDGET,
         }
@@ -369,6 +311,15 @@ impl RepoVerifiers {
     #[must_use]
     pub fn with(mut self, forge: Forge, verifier: Arc<dyn RepoVerifier>) -> Self {
         self.by_forge.insert(forge_id(forge), verifier);
+        self
+    }
+
+    /// Reads host rows from `directory`. A row then decides the kind, the verifier and the
+    /// private-address flag of a host, and the operator list is not consulted: a host without a
+    /// row is [`RepoRefusal::NotAllowedHost`].
+    #[must_use]
+    pub fn with_directory(mut self, directory: Arc<dyn HostDirectory>) -> Self {
+        self.directory = Some(directory);
         self
     }
 
@@ -388,29 +339,70 @@ impl RepoVerifiers {
         })
     }
 
-    /// Verifies `repo` for `credential`. The host is matched against the operator list before
-    /// any lookup, and the whole call fits the budget.
+    /// The grammar for `host` from its `git_hosts` row, or from the operator list when no
+    /// directory is set. `None` means no row or entry serves the host.
     ///
     /// # Errors
     ///
-    /// Returns [`RepoRefusal::NotAllowedHost`] for a host outside the list or with no verifier
-    /// and [`RepoRefusal::Timeout`] when the budget runs out, else the verifier's refusal.
+    /// Returns the refusal of the directory when the table cannot be read.
+    pub async fn kind_for(&self, host: &str) -> Result<Option<ForgeKind>, RepoRefusal> {
+        match &self.directory {
+            Some(directory) => Ok(directory.find(host).await?.map(|row| row.kind)),
+            None => Ok(self.kind_of(host)),
+        }
+    }
+
+    /// Verifies `repo` for `credential`. The host is matched against its row (or the operator
+    /// list when no directory is set) before any lookup, and the whole call fits the budget.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RepoRefusal::NotAllowedHost`] for a host with no row or entry or with no
+    /// verifier for its kind and [`RepoRefusal::Timeout`] when the budget runs out, else the
+    /// verifier's refusal.
     pub async fn verify(
         &self,
         credential: Option<&RepoCredential>,
         repo: &RepoRef,
     ) -> Result<RepoVerdict, RepoRefusal> {
-        let host = self
-            .hosts
-            .lookup(repo.host())
-            .ok_or(RepoRefusal::NotAllowedHost)?;
+        tokio::time::timeout(self.budget, self.dispatch(credential, repo))
+            .await
+            .unwrap_or(Err(RepoRefusal::Timeout))
+    }
+
+    async fn dispatch(
+        &self,
+        credential: Option<&RepoCredential>,
+        repo: &RepoRef,
+    ) -> Result<RepoVerdict, RepoRefusal> {
+        let host = match &self.directory {
+            Some(directory) => {
+                let row = directory
+                    .find(repo.host())
+                    .await?
+                    .ok_or(RepoRefusal::NotAllowedHost)?;
+                let forge = match row.kind {
+                    ForgeKind::Github => Forge::Github,
+                    ForgeKind::Forgejo => Forge::Forgejo,
+                };
+                HostConfig {
+                    host: repo.host().to_owned(),
+                    forge,
+                    api_base: format!("https://{}", repo.host()),
+                    allow_private: row.allow_private,
+                }
+            }
+            None => self
+                .hosts
+                .lookup(repo.host())
+                .ok_or(RepoRefusal::NotAllowedHost)?
+                .clone(),
+        };
         let verifier = self
             .by_forge
             .get(&forge_id(host.forge))
             .ok_or(RepoRefusal::NotAllowedHost)?;
-        tokio::time::timeout(self.budget, verifier.verify(host, credential, repo))
-            .await
-            .unwrap_or(Err(RepoRefusal::Timeout))
+        verifier.verify(&host, credential, repo).await
     }
 }
 
@@ -420,11 +412,12 @@ mod tests {
     use std::sync::Mutex;
 
     use fleet_proto::classify;
+    use hyper::StatusCode;
     use hyper::header::HeaderValue;
     use tonic::Code;
 
     use super::*;
-    use crate::cred::https::{FetchError, ForgeReply};
+    use crate::cred::https::{FetchError, ForgeGet, ForgeReply};
     use crate::cred::repo_fake::FakeVerifier;
 
     const TOKEN: &str = "ghp_secretsecretsecret0123456789";
@@ -595,24 +588,6 @@ mod tests {
     }
 
     #[test]
-    fn api_bases_split_into_host_and_prefix() {
-        assert_eq!(
-            api_parts("https://api.github.com"),
-            Some(("api.github.com", String::new()))
-        );
-        assert_eq!(
-            api_parts("https://ghe.example/api/v3"),
-            Some(("ghe.example", "/api/v3".to_owned()))
-        );
-        assert_eq!(
-            api_parts("https://ghe.example/api/v3/"),
-            Some(("ghe.example", "/api/v3".to_owned()))
-        );
-        assert_eq!(api_parts("http://ghe.example"), None);
-        assert_eq!(api_parts("ghe.example"), None);
-    }
-
-    #[test]
     fn probe_mint_failures_map_to_closed_refusals() {
         for (err, want) in [
             (StoreError::CapabilityDenied, RepoRefusal::NoCredential),
@@ -670,51 +645,42 @@ mod tests {
 
     #[tokio::test]
     async fn push_comes_from_permissions_only_when_reported() {
-        for (body, push, read) in [
+        for (body, push) in [
+            (r#"{"permissions":{"push":false,"pull":true}}"#, Some(false)),
+            (r#"{"permissions":{"push":true}}"#, Some(true)),
             (
-                r#"{"full_name":"a/b","permissions":{"push":false,"pull":true}}"#,
+                r#"{"permissions":{"push":false,"pull":false}}"#,
                 Some(false),
-                true,
             ),
-            (
-                r#"{"full_name":"a/b","permissions":{"push":true}}"#,
-                Some(true),
-                true,
-            ),
-            (
-                r#"{"full_name":"a/b","permissions":{"pull":true}}"#,
-                None,
-                true,
-            ),
-            (r#"{"full_name":"a/b","permissions":{}}"#, None, true),
-            (r#"{"full_name":"a/b"}"#, None, true),
-            (r#"{"full_name":"a/b","permissions":null}"#, None, true),
-            (
-                r#"{"full_name":"a/b","permissions":{"push":"yes"}}"#,
-                None,
-                true,
-            ),
-            (
-                r#"{"full_name":"a/b","permissions":{"push":false,"pull":false}}"#,
-                Some(false),
-                false,
-            ),
+            ("{}", None),
+            (r#"{"permissions":null}"#, None),
         ] {
             let verdict = check(&Script::status(200, body), Some(&pat()))
                 .await
                 .unwrap();
-            assert_eq!((verdict.push, verdict.read), (push, read), "{body}");
+            assert_eq!((verdict.push, verdict.read), (push, true), "{body}");
+        }
+        for body in [
+            r#"{"permissions":{"push":"yes"}}"#,
+            r#"{"permissions":{"pull":true}}"#,
+            r#"{"permissions":{}}"#,
+        ] {
+            assert_eq!(
+                check(&Script::status(200, body), Some(&pat())).await,
+                Err(RepoRefusal::UpstreamUnavailable),
+                "{body}"
+            );
         }
     }
 
     #[tokio::test]
-    async fn a_renamed_repository_reports_the_new_canonical_path() {
+    async fn the_canonical_path_is_the_requested_one() {
         let script = Script::status(
             200,
             r#"{"full_name":"Acme/Gadget","permissions":{"push":true}}"#,
         );
         let verdict = check(&script, Some(&pat())).await.unwrap();
-        assert_eq!(verdict.canonical_path, "acme/gadget");
+        assert_eq!(verdict.canonical_path, "acme/widget");
         assert_eq!(
             script.calls().first().map(|c| c.path.as_str()),
             Some("/repos/acme/widget")
@@ -728,17 +694,8 @@ mod tests {
             "nope",
             "null",
             "[]",
-            "{}",
-            r#"{"full_name":1}"#,
-            r#"{"full_name":""}"#,
-            r#"{"full_name":"a"}"#,
-            r#"{"full_name":"a/b/c"}"#,
-            r#"{"full_name":"../etc"}"#,
-            r#"{"full_name":"a/b?x=1"}"#,
-            r#"{"full_name":"a/b\r\nX: y"}"#,
-            r#"{"full_name":"a b/c"}"#,
-            r#"{"full_name":"https://evil.test/a/b"}"#,
-            r#"{"full_name":"acme/widget","permissions":{"push":true}"#,
+            "1",
+            r#"{"permissions":{"push":true}"#,
         ] {
             assert_eq!(
                 check(&Script::status(200, body), Some(&pat())).await,
@@ -792,25 +749,38 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn the_host_entry_decides_the_api_host_path_and_private_flag() {
+    async fn the_host_entry_decides_the_private_flag_and_only_github_com_is_served() {
         let hosts = RepoHosts::parse(
-            "host=ghe.example,forge=github,api=https://ghe.example/api/v3,allow_private=true",
+            "host=github.com,forge=github,api=https://api.github.com,allow_private=true;host=ghe.example,forge=github,api=https://ghe.example/api/v3",
         )
         .unwrap();
-        let host = hosts.lookup("ghe.example").unwrap();
-        let script = Script::status(200, r#"{"full_name":"acme/widget"}"#);
+        let script = Script::status(200, "{}");
         let verifier = GithubVerifier::new(script.clone(), None);
         verifier
-            .verify(host, Some(&pat()), &repo("ghe.example/acme/widget"))
+            .verify(
+                hosts.lookup("github.com").unwrap(),
+                Some(&pat()),
+                &repo("github.com/acme/widget"),
+            )
             .await
             .unwrap();
         let seen = script.calls();
-        assert_eq!(seen.first().map(|c| c.host.as_str()), Some("ghe.example"));
         assert_eq!(
-            seen.first().map(|c| c.path.as_str()),
-            Some("/api/v3/repos/acme/widget")
+            seen.first().map(|c| c.host.as_str()),
+            Some("api.github.com")
         );
         assert_eq!(seen.first().map(|c| c.allow_private), Some(true));
+
+        let before = script.calls().len();
+        let got = verifier
+            .verify(
+                hosts.lookup("ghe.example").unwrap(),
+                Some(&pat()),
+                &repo("ghe.example/acme/widget"),
+            )
+            .await;
+        assert_eq!(got, Err(RepoRefusal::NotAllowedHost));
+        assert_eq!(script.calls().len(), before);
     }
 
     #[tokio::test]

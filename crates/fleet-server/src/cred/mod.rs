@@ -13,6 +13,9 @@ pub mod app_jwt;
 pub mod app_mint;
 pub mod app_policy;
 pub mod capability;
+pub mod forge_verify;
+#[cfg(test)]
+mod forge_verify_tests;
 pub mod github;
 pub mod https;
 pub mod limiter;
@@ -21,6 +24,8 @@ pub mod pinned;
 pub mod release;
 pub mod repo_api;
 pub mod repo_fake;
+#[cfg(test)]
+mod repo_forgejo_tests;
 pub mod repo_limit;
 pub mod repo_store;
 pub mod repo_verify;
