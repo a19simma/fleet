@@ -3676,6 +3676,36 @@ mod token_wiring_tests {
     }
 
     #[tokio::test]
+    async fn a_forgejo_job_never_refreshes_so_its_admission_stays() -> TestResult {
+        let admitted = Arc::<crate::netguard::RepoHostBook>::default();
+        let (runner, book) = hosted(
+            Some((FORGEJO_HOST, "forgejo")),
+            Capturing(Arc::default()),
+            Arc::clone(&admitted),
+        )
+        .await?;
+        let job = Job {
+            repo: FORGEJO_REPO.into(),
+            ..job()
+        };
+        let (_trigger, shutdown) = Shutdown::channel();
+        let _guards = runner
+            .fetch_credentials(&job, shutdown)
+            .await
+            .map_err(|_| "fetch refused")?;
+        let held = book.get("job1").ok_or("held")?;
+        let admission = admitted.get("job1").ok_or("admitted")?;
+        assert_eq!(held.app_expires_at_ms(), None);
+        assert!(book.refresh_if_due("job1").await?.is_none());
+        assert!(Arc::ptr_eq(&held, &book.get("job1").ok_or("held")?));
+        assert!(Arc::ptr_eq(
+            &admission,
+            &admitted.get("job1").ok_or("admitted")?
+        ));
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn a_reply_for_another_host_than_the_repo_fails_the_job_and_revokes_the_token()
     -> TestResult {
         for repo in [
