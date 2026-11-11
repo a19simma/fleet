@@ -304,6 +304,24 @@ pub struct FleetService {
 }
 
 impl FleetService {
+    /// Refuses a per-Box token reading a job it does not own, with the lease-mismatch text so
+    /// a foreign job and an unknown one look alike. A static token passes.
+    async fn owned_by_token<T>(&self, request: &Request<T>, job_id: &str) -> Result<(), Status> {
+        let Some(bound) = request.extensions().get::<BoxCaller>() else {
+            return Ok(());
+        };
+        let owned = self
+            .store
+            .job_owned_by(job_id, bound.user_id)
+            .await
+            .map_err(|err| storage_unavailable(&err))?;
+        if owned {
+            Ok(())
+        } else {
+            Err(Status::permission_denied(fleet_proto::ERR_LEASE_MISMATCH))
+        }
+    }
+
     /// Builds the handler over `store`. The credential RPCs answer `FAILED_PRECONDITION`.
     pub fn new(store: Store) -> Self {
         Self {
@@ -566,11 +584,15 @@ impl FleetWorker for FleetService {
         request: Request<ClaimJobRequest>,
     ) -> Result<Response<ClaimJobReply>, Status> {
         bound_box(&request, &request.get_ref().r#box)?;
+        let owner = request
+            .extensions()
+            .get::<BoxCaller>()
+            .map(|bound| bound.user_id);
         let name = validate_box(&request.into_inner().r#box)
             .map_err(|err| Status::invalid_argument(err.to_string()))?;
         let job = self
             .store
-            .claim_job(&name)
+            .claim_job_for(&name, owner)
             .await
             .map_err(|err| worker_error(&err))?;
         let lease_s = if job.is_some() {
@@ -622,6 +644,8 @@ impl FleetWorker for FleetService {
         request: Request<GetJobCredentialsRequest>,
     ) -> Result<Response<GetJobCredentialsReply>, Status> {
         bound_box(&request, &request.get_ref().r#box)?;
+        self.owned_by_token(&request, &request.get_ref().job_id)
+            .await?;
         let service = self
             .credentials
             .as_ref()
@@ -640,6 +664,8 @@ impl FleetWorker for FleetService {
         request: Request<GetJobEnvironmentRequest>,
     ) -> Result<Response<GetJobEnvironmentReply>, Status> {
         bound_box(&request, &request.get_ref().r#box)?;
+        self.owned_by_token(&request, &request.get_ref().job_id)
+            .await?;
         let service = self
             .environments
             .as_ref()

@@ -181,7 +181,7 @@ RETURNING job_id";
 const INSERT_JUDGE: &str = "\
 INSERT INTO jobs (job_id, idempotency_key, prompt, repo, base_ref, branch, open_pr, kind, target_job_id, \
 user_id, agent) \
-SELECT $1, $2, $3, '', '', '', false, 'judge', t.job_id, $5, $6 FROM jobs t \
+SELECT $1, $2, $3, '', '', '', false, 'judge', t.job_id, COALESCE(t.user_id, $5), $6 FROM jobs t \
 WHERE t.job_id = $4 AND t.kind = 'agent' \
 AND t.state IN ('SUCCEEDED', 'FAILED', 'CANCELLED', 'LOST') \
 AND NOT EXISTS (\
@@ -234,7 +234,7 @@ const CLAIM_JOB: &str = concat!(
     "UPDATE jobs SET state = 'RUNNING', box = $1, attempt = attempt + 1, \
 claimed_at = now(), lease_expires_at = now() + make_interval(secs => $2) \
 WHERE job_id = ( \
-SELECT job_id FROM jobs WHERE state = 'QUEUED' \
+SELECT job_id FROM jobs WHERE state = 'QUEUED' AND ($3::bigint IS NULL OR user_id = $3) \
 ORDER BY created_at, job_id LIMIT 1 FOR UPDATE SKIP LOCKED) \
 RETURNING ",
     job_columns!()
@@ -1320,7 +1320,8 @@ impl Store {
             .await?
             .ok_or(JobInvalid::Target)?;
         let stored = job_from_row(&row)?;
-        if i64::try_from(stored.user_id) != Ok(owner)
+        let inherits_owner = scoped.is_none() && job.target_job_id.is_some();
+        if (!inherits_owner && i64::try_from(stored.user_id) != Ok(owner))
             || stored.agent != job.agent
             || stored.prompt != job.prompt
             || stored.repo != job.repo
@@ -1349,12 +1350,43 @@ impl Store {
     ///
     /// Returns [`StoreError::Database`] when the statement fails.
     pub async fn claim_job(&self, box_name: &BoxName) -> Result<Option<Job>, StoreError> {
+        self.claim_job_for(box_name, None).await
+    }
+
+    /// Claims the oldest queued job like [`Store::claim_job`], only among jobs `owner` owns.
+    ///
+    /// `Some(user)` is a per-Box token (ADR-0069). `None` is a static box token, the shared
+    /// pool, and claims any job.
+    ///
+    /// # Errors
+    ///
+    /// The errors of [`Store::claim_job`].
+    pub async fn claim_job_for(
+        &self,
+        box_name: &BoxName,
+        owner: Option<i64>,
+    ) -> Result<Option<Job>, StoreError> {
         let row = sqlx::query(CLAIM_JOB)
             .bind(box_name.as_str())
             .bind(self.lease.as_secs_f64())
+            .bind(owner)
             .fetch_optional(&self.pool)
             .await?;
         row.as_ref().map(job_from_row).transpose()
+    }
+
+    /// Whether `user_id` owns the job `job_id`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StoreError::Database`] when the query fails.
+    pub async fn job_owned_by(&self, job_id: &str, user_id: i64) -> Result<bool, StoreError> {
+        Ok(sqlx::query(SELECT_OWNED_JOB)
+            .bind(job_id)
+            .bind(user_id)
+            .fetch_optional(&self.pool)
+            .await?
+            .is_some())
     }
 
     /// Returns the job with `job_id` with no owner check.
