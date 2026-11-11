@@ -302,6 +302,36 @@ impl Curl {
     }
 }
 
+/// The request seam of the live suite: one call over a wire, and a handle whose requests no
+/// counter sees. `Curl` is the real wire, a test passes a scripted one.
+pub(crate) trait Wire: Clone {
+    fn call(
+        &self,
+        method: &str,
+        path: &str,
+        headers: &[(String, String)],
+        body: &[u8],
+    ) -> Result<HttpResponse, HttpError>;
+
+    fn uncounted(&self) -> Self;
+}
+
+impl Wire for Curl {
+    fn call(
+        &self,
+        method: &str,
+        path: &str,
+        headers: &[(String, String)],
+        body: &[u8],
+    ) -> Result<HttpResponse, HttpError> {
+        Self::call(self, method, path, headers, body)
+    }
+
+    fn uncounted(&self) -> Self {
+        Self::uncounted(self)
+    }
+}
+
 impl Http for Curl {
     fn send(
         &self,
@@ -327,14 +357,14 @@ pub(crate) enum Auth {
     Anonymous,
 }
 
-pub(crate) struct Api {
-    pub(crate) curl: Curl,
+pub(crate) struct Api<W = Curl> {
+    pub(crate) curl: W,
     token: String,
     pub(crate) redactor: Redactor,
 }
 
-impl Api {
-    pub(crate) fn new(curl: Curl, token: &Token, host: &HostName) -> Self {
+impl<W: Wire> Api<W> {
+    pub(crate) fn new(curl: W, token: &Token, host: &HostName) -> Self {
         Self {
             curl,
             token: token.expose().to_owned(),
@@ -439,15 +469,18 @@ impl Drop for Scratch {
     }
 }
 
-pub(crate) struct RepoGuard {
-    curl: Curl,
+/// Deletes the throwaway repositories it holds when dropped. It is armed as soon as the forge
+/// answers 201, before the reply is read, so a reply that cannot be read still deletes the
+/// repository. A guard that never learned the owner asks the forge for the token's own login.
+pub(crate) struct RepoGuard<W: Wire = Curl> {
+    curl: W,
     token: String,
-    owner: String,
+    owner: Option<String>,
     names: Vec<String>,
 }
 
-impl RepoGuard {
-    pub(crate) fn create(api: &Api, name: &str) -> Result<(Self, String), String> {
+impl<W: Wire> RepoGuard<W> {
+    pub(crate) fn create(api: &Api<W>, name: &str) -> Result<(Self, String), String> {
         if !name.starts_with(NAME_PREFIX) {
             return Err("throwaway names carry the fleet-e2e prefix".to_owned());
         }
@@ -466,18 +499,19 @@ impl RepoGuard {
                 api.message(&response)
             ));
         }
+        let mut guard = Self {
+            curl: api.curl.uncounted(),
+            token: api.token.clone(),
+            owner: None,
+            names: vec![name.to_owned()],
+        };
         let owner = api
             .json(&response)?
             .pointer("/owner/login")
             .and_then(Value::as_str)
             .ok_or("create reply holds no owner")?
             .to_owned();
-        let guard = Self {
-            curl: api.curl.uncounted(),
-            token: api.token.clone(),
-            owner: owner.clone(),
-            names: vec![name.to_owned()],
-        };
+        guard.owner = Some(owner.clone());
         Ok((guard, owner))
     }
 
@@ -486,11 +520,28 @@ impl RepoGuard {
     }
 }
 
-impl Drop for RepoGuard {
+impl<W: Wire> RepoGuard<W> {
+    fn own_login(&self, headers: &[(String, String)]) -> Option<String> {
+        let reply = self
+            .curl
+            .call("GET", "/api/v1/user", headers, &[])
+            .ok()
+            .filter(|reply| reply.status == 200)?;
+        serde_json::from_slice::<Value>(&reply.body)
+            .ok()?
+            .get("login")
+            .and_then(Value::as_str)
+            .map(str::to_owned)
+    }
+}
+
+impl<W: Wire> Drop for RepoGuard<W> {
     fn drop(&mut self) {
         let headers = vec![("Authorization".to_owned(), format!("token {}", self.token))];
+        let owner = self.owner.clone().or_else(|| self.own_login(&headers));
         let leaked = sweep(&self.names, |name| {
-            let path = format!("/api/v1/repos/{}/{name}", self.owner);
+            let owner = owner.as_deref()?;
+            let path = format!("/api/v1/repos/{owner}/{name}");
             self.curl
                 .call("DELETE", &path, &headers, &[])
                 .ok()
