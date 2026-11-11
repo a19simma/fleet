@@ -56,6 +56,7 @@ const WORK: &str = "/fleet.v1.FleetWork/";
 const RETRO: &str = "/fleet.v1.FleetRetro/";
 const EDIT: &str = "/fleet.v1.FleetEdit/";
 const ENVIRONMENTS: &str = "/fleet.v1.FleetEnvironments/";
+const HOSTS: &str = "/fleet.v1.FleetHosts/";
 
 /// The one edit RPC that needs a signed-in user.
 pub const DECIDE_EDIT: &str = "/fleet.v1.FleetEdit/DecideEdit";
@@ -82,8 +83,18 @@ pub const ADMIN_RPCS: [&str; 5] = [
     "/fleet.v1.FleetCapabilityAdmin/ListCapabilities",
 ];
 
+/// The four `FleetHosts` RPCs that need an admin. The other `FleetHosts` RPCs need any User.
+pub const HOST_ADMIN_RPCS: [&str; 4] = [
+    "/fleet.v1.FleetHosts/RemoveHost",
+    "/fleet.v1.FleetHosts/ApproveHostPrivate",
+    "/fleet.v1.FleetHosts/RevokeHostPrivate",
+    "/fleet.v1.FleetHosts/ListHostRequests",
+];
+
 fn is_admin_path(path: &str) -> bool {
-    path.starts_with(CATALOG_ADMIN) || path.starts_with(fleet_proto::CAPABILITY_ADMIN_PATH)
+    path.starts_with(CATALOG_ADMIN)
+        || path.starts_with(fleet_proto::CAPABILITY_ADMIN_PATH)
+        || HOST_ADMIN_RPCS.contains(&path)
 }
 
 /// The user a request acts as, set by [`BearerAuth`] on every client-scope request when it has a
@@ -198,6 +209,7 @@ impl BearerAuth {
                     || path.starts_with(RETRO)
                     || path.starts_with(EDIT)
                     || path.starts_with(ENVIRONMENTS)
+                    || path.starts_with(HOSTS)
             }
         }
     }
@@ -273,7 +285,12 @@ impl BearerAuth {
         };
         if is_admin_path(path) {
             return match caller {
-                Some(caller) if caller.is_admin && ADMIN_RPCS.contains(&path) => Ok(Some(caller)),
+                Some(caller)
+                    if caller.is_admin
+                        && (ADMIN_RPCS.contains(&path) || HOST_ADMIN_RPCS.contains(&path)) =>
+                {
+                    Ok(Some(caller))
+                }
                 _ => Err(Status::permission_denied(ADMIN_REQUIRED)),
             };
         }
