@@ -588,7 +588,7 @@ async fn approve_names_the_addresses_it_approved() -> TestResult {
 }
 
 #[tokio::test]
-async fn approve_canonicalises_and_dedups_the_named_addresses() -> TestResult {
+async fn approve_sorts_and_dedups_the_named_addresses() -> TestResult {
     let stub = Stub::default();
     *stub.approve.lock().unwrap() = Some(Ok(approved("git.example.org", &["10.0.0.2"])));
     let url = serve(stub.clone()).await?;
@@ -598,9 +598,9 @@ async fn approve_canonicalises_and_dedups_the_named_addresses() -> TestResult {
             "host",
             "approve-private",
             "git.example.org",
+            "fd00::1",
             "10.0.0.2",
             "10.0.0.2",
-            "FD00:0:0::1",
         ],
     )
     .await;
