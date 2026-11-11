@@ -28,7 +28,7 @@ use topcoat::{
         request::uri,
         route,
     },
-    view::{View, view},
+    view::{View, component, view},
 };
 
 use super::credentials::{Backend, CredentialSlot};
@@ -38,12 +38,15 @@ use super::pages::{auth, csrf_matches, current, fail, signed_in};
 use super::passkeys::AuthError;
 use crate::cred::RepoService;
 
-fn registry(cx: &Cx) -> Result<&RepoService> {
+pub(super) fn repos_of(cx: &Cx) -> Option<&RepoService> {
     app_context::<CredentialSlot>(cx)
         .0
         .as_deref()
         .and_then(|backend: &Backend| backend.service.repos())
-        .ok_or_else(|| not_found().into())
+}
+
+fn registry(cx: &Cx) -> Result<&RepoService> {
+    repos_of(cx).ok_or_else(|| not_found().into())
 }
 
 fn notice_text(code: &str) -> Option<&'static str> {
@@ -96,7 +99,7 @@ fn from_hex(text: &str) -> Option<String> {
     String::from_utf8(bytes?).ok()
 }
 
-struct Row {
+pub(super) struct Row {
     key: String,
     host: String,
     path: String,
@@ -110,15 +113,10 @@ fn yes_no(value: bool) -> &'static str {
     if value { "yes" } else { "no" }
 }
 
-#[page("/repos")]
-async fn repos_page(cx: &Cx) -> Result<impl View> {
-    let auth = auth(cx)?;
-    let repos = registry(cx)?;
-    let Some(session) = current(cx, auth).await? else {
-        return Err(see_other("/login").into());
-    };
-    let rows: Vec<Row> = repos
-        .list(session.user_id)
+/// Lists the repositories of `user_id` as table rows.
+pub(super) async fn repo_rows(repos: &RepoService, user_id: i64) -> Result<Vec<Row>> {
+    Ok(repos
+        .list(user_id)
         .await
         .map_err(|_| fail(AuthError::Internal))?
         .repos
@@ -132,19 +130,13 @@ async fn repos_page(cx: &Cx) -> Result<impl View> {
             push: info.push.map_or("unknown", yes_no),
             verified: when(info.verified_at_ms),
         })
-        .collect();
-    let notice = notice_code(cx).and_then(notice_text);
-    let csrf = String::from_utf8_lossy(session.csrf.expose()).into_owned();
+        .collect())
+}
+
+/// The repository table with its remove forms, shared by `/repos` and `/hosts`.
+#[component]
+pub(super) async fn repo_table(csrf: &str, rows: &[Row]) -> Result<impl View> {
     Ok(view! {
-        shell(title: "fleet repositories", active: Nav::Repos, user: session.username.as_str(), csrf: csrf.as_str(), mode: "",
-                <header class="mb-3 flex min-w-0 flex-wrap items-center gap-3 border-b border-base-300 pb-2 text-xs">
-                    <span class="text-primary">"$"</span>
-                    <h1 class="text-sm font-bold">"Repositories"</h1>
-                    <a class="link link-hover ml-auto" href="/credentials">"Credentials"</a>
-                </header>
-                if let Some(text) = notice {
-                    <p id="notice" class="mb-2 border border-base-300 bg-base-200 p-2 text-xs">(text)</p>
-                }
                 <div class="overflow-x-auto">
                 <table class="table table-zebra table-xs">
                     <thead>
@@ -163,13 +155,13 @@ async fn repos_page(cx: &Cx) -> Result<impl View> {
                             <tr>
                                 <td>(row.host.as_str())</td>
                                 <td>(row.path.as_str())</td>
-                                <td>(row.forge)</td>
+                                <td>(row.forge.as_str())</td>
                                 <td>(row.runnable)</td>
                                 <td>(row.push)</td>
-                                <td>(row.verified)</td>
+                                <td>(row.verified.as_str())</td>
                                 <td class="text-right">
                                     <form class="inline" method="post" action="/repos/remove">
-                                        <input type="hidden" name="csrf" value=(csrf.as_str())>
+                                        <input type="hidden" name="csrf" value=(csrf)>
                                         <input type="hidden" name="repo" value=(row.key.as_str())>
                                         <button class="btn btn-xs btn-outline btn-error" type="submit">"Remove"</button>
                                     </form>
@@ -179,6 +171,30 @@ async fn repos_page(cx: &Cx) -> Result<impl View> {
                     </tbody>
                 </table>
                 </div>
+    })
+}
+
+#[page("/repos")]
+async fn repos_page(cx: &Cx) -> Result<impl View> {
+    let auth = auth(cx)?;
+    let repos = registry(cx)?;
+    let Some(session) = current(cx, auth).await? else {
+        return Err(see_other("/login").into());
+    };
+    let rows = repo_rows(repos, session.user_id).await?;
+    let notice = notice_code(cx).and_then(notice_text);
+    let csrf = String::from_utf8_lossy(session.csrf.expose()).into_owned();
+    Ok(view! {
+        shell(title: "fleet repositories", active: Nav::Repos, user: session.username.as_str(), csrf: csrf.as_str(), mode: "",
+                <header class="mb-3 flex min-w-0 flex-wrap items-center gap-3 border-b border-base-300 pb-2 text-xs">
+                    <span class="text-primary">"$"</span>
+                    <h1 class="text-sm font-bold">"Repositories"</h1>
+                    <a class="link link-hover ml-auto" href="/credentials">"Credentials"</a>
+                </header>
+                if let Some(text) = notice {
+                    <p id="notice" class="mb-2 border border-base-300 bg-base-200 p-2 text-xs">(text)</p>
+                }
+                repo_table(csrf: csrf.as_str(), rows: rows.as_slice())
                 <h2 class="mb-1 mt-6 text-xs font-bold uppercase text-base-content/60">"Add a repository"</h2>
                 <form class="mt-1 flex items-end gap-2" method="post" action="/repos/add" autocomplete="off">
                     <input type="hidden" name="csrf" value=(csrf.as_str())>

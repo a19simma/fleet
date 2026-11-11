@@ -53,3 +53,7 @@ Submit and batch pins follow ADR-0067 decisions 10 and 11. `environments::resolv
 ## Retro rpcs
 
 `FleetRetro` lives in `store/work/{retro,pitfall,brief}.rs`. Filing an improvement locks the `work_project` row, then bumps `occurrences` and inserts the occurrence row in one transaction. `CloseRetro` is refused while an improvement of the retro has no disposition. A pitfall with no project is user-level and scoped to its owner. `GetWorkBrief` ranks pitfalls before improvements and caps the text at `BRIEF_TOKEN_BUDGET` tokens of `BYTES_PER_TOKEN` bytes.
+
+## Git remotes page
+
+`/hosts` lists hosts, adds through `HostService`, removes for admins only (`admin_post_gate`), and shows pending private requests and approved addresses to admins only. `Web::with_hosts` injects the service for tests. The registered-repositories table is `repos::repo_table`, shared with `/repos`.

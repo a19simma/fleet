@@ -14,6 +14,7 @@ mod clientip;
 mod credentials;
 mod dispatch;
 mod env;
+mod hosts;
 mod jobs;
 mod layout;
 mod pages;
