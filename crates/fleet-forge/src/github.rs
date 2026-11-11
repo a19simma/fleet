@@ -11,10 +11,10 @@ use fleet_core::host::{HostKind, HostName};
 use serde_json::{Value, json};
 
 use crate::ci::{Rank, Tally, entries, valid_sha};
+use crate::git::{ref_name, run};
 use crate::{
-    ForgeApi, ForgeError, ForgeGit, Git, GitCommand, GitError, GitOp, GitOutput, Http, HttpError,
-    HttpRequest, HttpResponse, MAX_BODY_BYTES, Method, Permission, PushTarget, RepoAccess, RepoRef,
-    Token, Verified,
+    ForgeApi, ForgeError, ForgeGit, Git, GitOp, Http, HttpError, HttpRequest, HttpResponse,
+    MAX_BODY_BYTES, Method, Permission, PushTarget, RepoAccess, RepoRef, Token, Verified,
 };
 
 const API_HOST: &str = "api.github.com";
@@ -23,17 +23,6 @@ const API_VERSION: &str = "2022-11-28";
 const USER_AGENT: &str = "fleet-forge";
 const MAX_SEGMENT_BYTES: usize = 100;
 const MAX_NUMBER_DIGITS: usize = 10;
-const LOCK_SUFFIX: &str = ".lock";
-const MAX_STDERR_BYTES: usize = 8 * 1024;
-const AUTH_MARKERS: [&str; 7] = [
-    "authentication failed",
-    "invalid username or password",
-    "could not read username",
-    "could not read password",
-    "denied to",
-    "returned error: 401",
-    "returned error: 403",
-];
 
 /// The GitHub adapter: REST over the [`Http`] seam for [`ForgeApi`] and git over HTTPS through the
 /// [`Git`] seam for [`ForgeGit`]. It holds the two seams and nothing else, so it has no token to
@@ -186,21 +175,7 @@ impl<H: Send + Sync, G: Git> GitHubForge<H, G> {
         branch: Option<&str>,
     ) -> Result<(), ForgeError> {
         let (repo, _) = bound(access)?;
-        let output = self
-            .git
-            .run(GitCommand {
-                op,
-                repo: repo.clone(),
-                branch: branch.map(str::to_owned),
-                credential: access.credential().clone(),
-            })
-            .await
-            .map_err(map_git)?;
-        if output.code == 0 {
-            Ok(())
-        } else {
-            Err(classify(op, &output))
-        }
+        run(&self.git, op, repo, access, branch).await
     }
 }
 
@@ -313,64 +288,6 @@ fn bound(access: &RepoAccess) -> Result<(&RepoRef, &Token), ForgeError> {
         Ok((repo, token))
     } else {
         Err(ForgeError::WrongKind)
-    }
-}
-
-const fn map_git(error: GitError) -> ForgeError {
-    match error {
-        GitError::Spawn => ForgeError::Unavailable,
-        GitError::Timeout => ForgeError::Timeout,
-    }
-}
-
-fn has(haystack: &[u8], needle: &str) -> bool {
-    haystack
-        .windows(needle.len())
-        .any(|window| window == needle.as_bytes())
-}
-
-/// Maps a failed git run to a fixed error from the first [`MAX_STDERR_BYTES`] of stderr, matched
-/// without regard to ASCII case. The text itself goes nowhere. Authentication markers win over
-/// `non-fast-forward`, and only a push reports [`ForgeError::NonFastForward`].
-fn classify(op: GitOp, output: &GitOutput) -> ForgeError {
-    let raw = output.stderr.as_bytes();
-    let head = raw
-        .get(..MAX_STDERR_BYTES)
-        .unwrap_or(raw)
-        .to_ascii_lowercase();
-    if AUTH_MARKERS.iter().any(|marker| has(&head, marker)) {
-        ForgeError::Unauthorized
-    } else if has(&head, "repository not found") {
-        ForgeError::NotFound
-    } else if op == GitOp::Push
-        && ["non-fast-forward", "fetch first"]
-            .iter()
-            .any(|m| has(&head, m))
-    {
-        ForgeError::NonFastForward
-    } else {
-        ForgeError::Rejected
-    }
-}
-
-fn ends_with_lock(part: &str) -> bool {
-    part.len()
-        .checked_sub(LOCK_SUFFIX.len())
-        .and_then(|start| part.as_bytes().get(start..))
-        .is_some_and(|tail| tail.eq_ignore_ascii_case(LOCK_SUFFIX.as_bytes()))
-}
-
-/// A branch name git accepts as a ref: no component starts with `.` or ends with `.lock`, in any
-/// ASCII case. The
-/// wider hostile set is already refused by `PushTarget::new`.
-fn ref_name(text: &str) -> Result<&str, ForgeError> {
-    let bad = text
-        .split('/')
-        .any(|part| part.starts_with('.') || ends_with_lock(part));
-    if bad {
-        Err(ForgeError::Malformed)
-    } else {
-        Ok(text)
     }
 }
 
