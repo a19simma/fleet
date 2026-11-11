@@ -7,6 +7,7 @@
 
 use fleet_core::forge::CiResult;
 use serde_json::Value;
+use unicode_general_category::{GeneralCategory, get_general_category};
 
 use crate::ForgeError;
 
@@ -55,12 +56,13 @@ impl CiCheck {
     /// # Errors
     ///
     /// [`ForgeError::Malformed`] when the name is over [`MAX_CHECK_NAME_BYTES`], holds no letter or
-    /// digit, or holds a character that is not a letter, a digit, an ASCII graphic or a space. The
+    /// digit, or holds a character that is not a letter or number by Unicode general category (L*, N*), an
+    /// ASCII graphic or a space. Combining marks (Mn, Mc) are refused. The
     /// Hangul fillers U+115F, U+1160, U+3164 and U+FFA0 do not count as letters.
     pub fn new(name: &str, state: Rank) -> Result<Self, ForgeError> {
         let ok = name.len() <= MAX_CHECK_NAME_BYTES
             && name.chars().all(allowed_char)
-            && name.chars().any(char::is_alphanumeric);
+            && name.chars().any(is_letter_or_number);
         if ok {
             Ok(Self {
                 name: name.to_owned(),
@@ -85,7 +87,25 @@ impl CiCheck {
 }
 
 fn allowed_char(c: char) -> bool {
-    (c.is_alphanumeric() && !hangul_filler(c)) || c.is_ascii_graphic() || c == ' '
+    is_letter_or_number(c) || c.is_ascii_graphic() || c == ' '
+}
+
+fn is_letter_or_number(c: char) -> bool {
+    use GeneralCategory::{
+        DecimalNumber, LetterNumber, LowercaseLetter, ModifierLetter, OtherLetter, OtherNumber,
+        TitlecaseLetter, UppercaseLetter,
+    };
+    matches!(
+        get_general_category(c),
+        UppercaseLetter
+            | LowercaseLetter
+            | TitlecaseLetter
+            | ModifierLetter
+            | OtherLetter
+            | DecimalNumber
+            | LetterNumber
+            | OtherNumber
+    ) && !hangul_filler(c)
 }
 
 /// The Hangul filler code points are letters by category and draw nothing.
