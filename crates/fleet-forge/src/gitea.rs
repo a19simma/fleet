@@ -4,20 +4,34 @@
 //! and the reply is read as a closed version document. `verify` reads `GET /api/v1/repos/{o}/{r}`
 //! with `Authorization: token` for the repository's own host and follows no redirect.
 //! `create_pr` posts the pull request and, when the forge answers that one exists, finds the open
-//! pull for the exact head branch and returns its URL. `ci_result` lands in a later task and
-//! refuses with [`ForgeError::Unavailable`] until then.
-
-use std::fmt;
-use std::future::Future;
+//! pull for the exact head branch and returns its URL. `ci_result` reads the pull's head sha, then
+//! the combined commit status of that sha, and reads Actions runs for the sha only when the
+//! status list is empty.
+//!
+//! `fetch` and `push` run through the injected [`Git`] seam for the one host given to
+//! [`GiteaForge::with_git`]. A repository on any other host is refused with
+//! [`ForgeError::WrongKind`] before a git command starts, so the token of one host never reaches
+//! another. The ref check, the stderr classification and the output cap are shared with the
+//! GitHub adapter.
+//!
+//! Wire shapes follow the Gitea sources: the combined status is `{state, total_count, statuses}`
+//! with each entry's state under `status` (`pending`, `success`, `error`, `failure`, `warning`,
+//! `skipped`); a run list is `{total_count, workflow_runs}` with `status` and `conclusion` per
+//! run. Both lists page with `page` and `limit`, and the server clamps `limit` to 50 by default.
+//! The combined status reports `total_count` as the page length, so a full page cannot be told
+//! from a truncated one and is refused.
 
 use fleet_core::forge::CiResult;
 use fleet_core::host::{HostKind, HostName};
+use std::fmt;
 
 use serde_json::{Value, json};
 
+use crate::ci::{Rank, Tally, entries, valid_sha};
+use crate::git::{ref_name, run};
 use crate::{
-    ForgeApi, ForgeError, Http, HttpError, HttpRequest, HttpResponse, MAX_BODY_BYTES, Method,
-    Permission, PushTarget, RepoAccess, RepoRef, Token, Verified,
+    ForgeApi, ForgeError, ForgeGit, Git, GitOp, Http, HttpError, HttpRequest, HttpResponse,
+    MAX_BODY_BYTES, Method, Permission, PushTarget, RepoAccess, RepoRef, Token, Verified,
 };
 
 const VERSION_PATH: &str = "/api/v1/version";
@@ -29,23 +43,81 @@ const MAX_NUMBER_DIGITS: usize = 10;
 const PAGE_LIMIT: usize = 50;
 const MAX_PAGES: usize = 5;
 
-/// The Gitea and Forgejo REST adapter. It holds the [`Http`] seam and nothing else, so it has no
-/// token to print.
-pub struct GiteaForge<H> {
-    http: H,
+/// The git seam of a [`GiteaForge`] together with the one host it may run for. The host is fixed
+/// at construction, so the adapter has no path that hands a token to another host.
+pub struct GiteaGit<G> {
+    host: HostName,
+    git: G,
 }
 
-impl<H> fmt::Debug for GiteaForge<H> {
+impl<G> fmt::Debug for GiteaGit<G> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("GiteaGit")
+            .field("host", &self.host)
+            .finish_non_exhaustive()
+    }
+}
+
+/// The Gitea and Forgejo adapter: REST for [`ForgeApi`], git over HTTPS for [`ForgeGit`].
+///
+/// REST goes over the [`Http`] seam. [`ForgeGit`] exists once [`GiteaForge::with_git`] set a git
+/// seam. The adapter holds seams and one host and nothing else, so it has no token to print.
+pub struct GiteaForge<H, G = ()> {
+    http: H,
+    git: G,
+}
+
+impl<H, G> fmt::Debug for GiteaForge<H, G> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("GiteaForge").finish_non_exhaustive()
     }
 }
 
 impl<H: Http> GiteaForge<H> {
-    /// An adapter that sends through `http`.
+    /// An adapter that sends through `http`. It has no git seam, so it is a [`ForgeApi`] only.
     #[must_use]
     pub const fn new(http: H) -> Self {
-        Self { http }
+        Self { http, git: () }
+    }
+
+    /// Adds the git seam for `host`. [`ForgeGit`] then runs for repositories on `host` only and
+    /// refuses any other before a git command starts.
+    #[must_use]
+    pub fn with_git<G>(self, host: HostName, git: G) -> GiteaForge<H, GiteaGit<G>> {
+        GiteaForge {
+            http: self.http,
+            git: GiteaGit { host, git },
+        }
+    }
+}
+
+impl<G: Git> GiteaGit<G> {
+    async fn run(
+        &self,
+        op: GitOp,
+        access: &RepoAccess,
+        branch: Option<&str>,
+    ) -> Result<(), ForgeError> {
+        let (repo, _) = access.bind()?;
+        if *repo.host() != self.host {
+            return Err(ForgeError::WrongKind);
+        }
+        run(&self.git, op, repo, access, branch).await
+    }
+}
+
+impl<H: Send + Sync, G: Git> ForgeGit for GiteaForge<H, GiteaGit<G>> {
+    async fn fetch(&self, access: &RepoAccess) -> Result<String, ForgeError> {
+        self.git.run(GitOp::Fetch, access, None).await?;
+        Ok("fetched".to_owned())
+    }
+
+    async fn push(&self, target: &PushTarget) -> Result<String, ForgeError> {
+        let branch = ref_name(target.branch())?;
+        self.git
+            .run(GitOp::Push, target.access(), Some(branch))
+            .await?;
+        Ok("pushed".to_owned())
     }
 }
 
@@ -143,7 +215,67 @@ fn from_branch(pull: &Value, branch: &str, repo: &RepoRef) -> bool {
     named && own
 }
 
-impl<H: Http> GiteaForge<H> {
+impl Tally {
+    fn add_commit_statuses(&mut self, list: &[Value]) -> Result<(), ForgeError> {
+        for status in list {
+            let rank = match status.get("status").and_then(Value::as_str) {
+                Some("success") => Rank::Success,
+                Some("skipped") => Rank::Neutral,
+                Some("failure" | "error" | "warning") => Rank::Failed,
+                Some("pending") => Rank::Running,
+                _ => return Err(ForgeError::Malformed),
+            };
+            self.note(rank);
+        }
+        Ok(())
+    }
+}
+
+/// The entries under `key` of a page requested with [`PAGE_LIMIT`]. A page at the limit may have
+/// a successor, so it fails closed.
+fn bounded<'a>(body: &'a Value, key: &str) -> Result<&'a [Value], ForgeError> {
+    let list = entries(body, key)?;
+    if list.len() >= PAGE_LIMIT {
+        return Err(ForgeError::Malformed);
+    }
+    Ok(list)
+}
+
+impl<H: Http, G: Send + Sync> GiteaForge<H, G> {
+    async fn get_json(
+        &self,
+        repo: &RepoRef,
+        path: String,
+        token: &Token,
+    ) -> Result<Value, ForgeError> {
+        let response = self
+            .call(Method::Get, repo, path, token, Vec::new())
+            .await?;
+        if response.status != 200 {
+            return Err(status_error(response.status));
+        }
+        parse(&response)
+    }
+
+    async fn pull_head(
+        &self,
+        repo: &RepoRef,
+        token: &Token,
+        number: u64,
+    ) -> Result<String, ForgeError> {
+        let path = format!("{}/pulls/{number}", repo_path(repo));
+        let body = self.get_json(repo, path, token).await?;
+        let sha = body
+            .pointer("/head/sha")
+            .and_then(Value::as_str)
+            .ok_or(ForgeError::Malformed)?;
+        if valid_sha(sha) {
+            Ok(sha.to_owned())
+        } else {
+            Err(ForgeError::Malformed)
+        }
+    }
+
     async fn call(
         &self,
         method: Method,
@@ -217,7 +349,7 @@ impl<H: Http> GiteaForge<H> {
     }
 }
 
-impl<H: Http> ForgeApi for GiteaForge<H> {
+impl<H: Http, G: Send + Sync> ForgeApi for GiteaForge<H, G> {
     async fn identify(&self, host: &HostName) -> Result<HostKind, ForgeError> {
         let response = self
             .http
@@ -330,11 +462,23 @@ impl<H: Http> ForgeApi for GiteaForge<H> {
         }
     }
 
-    fn ci_result(
-        &self,
-        _target: &PushTarget,
-        _pr_url: &str,
-    ) -> impl Future<Output = Result<CiResult, ForgeError>> + Send {
-        std::future::ready(Err(ForgeError::Unavailable))
+    async fn ci_result(&self, target: &PushTarget, pr_url: &str) -> Result<CiResult, ForgeError> {
+        let (repo, token) = target.access().bind()?;
+        let number = pr_number(pr_url, repo)?;
+        let sha = self.pull_head(repo, token, number).await?;
+        let base = repo_path(repo);
+        let path = format!("{base}/commits/{sha}/status?page=1&limit={PAGE_LIMIT}");
+        let body = self.get_json(repo, path, token).await?;
+        let statuses = bounded(&body, "statuses")?;
+        let mut tally = Tally::default();
+        if statuses.is_empty() {
+            let path = format!("{base}/actions/runs?head_sha={sha}&page=1&limit={PAGE_LIMIT}");
+            let body = self.get_json(repo, path, token).await?;
+            bounded(&body, "workflow_runs")?;
+            tally.add_runs(&body, "workflow_runs")?;
+        } else {
+            tally.add_commit_statuses(statuses)?;
+        }
+        Ok(tally.result())
     }
 }

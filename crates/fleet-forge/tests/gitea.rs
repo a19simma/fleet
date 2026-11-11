@@ -11,9 +11,9 @@ use fleet_core::host::{HostKind, HostName};
 use fleet_forge::contract::{AdapterSubject, Case, Finding, Op, run_contract};
 use fleet_forge::fake::{Fake, Shape};
 use fleet_forge::{
-    Credential, ForgeApi, ForgeError, ForgeGit, GiteaForge, Http, HttpError, HttpRequest,
-    HttpResponse, MAX_BODY_BYTES, Method, Permission, PushTarget, RepoAccess, RepoRef, Token,
-    Verified,
+    Credential, ForgeApi, ForgeError, ForgeGit, Git, GitCommand, GitError, GitOp, GitOutput,
+    GiteaForge, GiteaGit, Http, HttpError, HttpRequest, HttpResponse, MAX_BODY_BYTES, Method,
+    Permission, PushTarget, RepoAccess, RepoRef, Token, Verified,
 };
 
 type TestResult = Result<(), Box<dyn Error>>;
@@ -668,20 +668,6 @@ async fn verify_errors_and_debug_hold_no_token_or_response_text() {
     assert!(!format!("{forge:?}").contains(TOKEN));
 }
 
-#[tokio::test]
-async fn the_other_operations_refuse_until_they_land() -> TestResult {
-    let script = Script::default();
-    let access = access()?;
-    let target = PushTarget::new(access, "fleet/job-1", "main")?;
-    let adapter = forge(&script);
-    assert_eq!(
-        adapter.ci_result(&target, "u").await.err(),
-        Some(ForgeError::Unavailable)
-    );
-    assert_eq!(script.seen().len(), 0);
-    Ok(())
-}
-
 const PR_URL: &str = "https://git.example.com/octo/widgets/pulls/7";
 const EXISTS: &str = r#"{"message":"pull request already exists for these targets [id: 7]"}"#;
 
@@ -1148,5 +1134,885 @@ async fn create_pr_validates_the_url_against_the_repository_host() -> TestResult
     let script = Script::default().reply(201, &created(PR_URL));
     let got = forge(&script).create_pr(&target, "t", "b").await;
     assert_eq!(got.err(), Some(ForgeError::Malformed));
+    Ok(())
+}
+
+const fn is_ci(case: Case) -> bool {
+    matches!(case.op(), Op::CiResult)
+}
+
+#[tokio::test]
+async fn every_ci_result_case_passes_on_the_gitea_fake() {
+    let subject = AdapterSubject(|fake: &Fake| ApiOnly(GiteaForge::new(fake.clone())));
+    let report = run_contract(&subject, Shape::Gitea, || Fake::new(Shape::Gitea)).await;
+    let findings: Vec<String> = report
+        .findings
+        .iter()
+        .filter(|f| is_ci(case_of(f)))
+        .map(ToString::to_string)
+        .collect();
+    assert!(findings.is_empty(), "{findings:?}");
+    let ran = report.ran.iter().filter(|c| is_ci(**c)).count();
+    let owed = Case::ALL.iter().filter(|c| is_ci(**c)).count();
+    assert_eq!(ran, owed);
+    assert_eq!(owed, 6);
+}
+
+fn head_of(sha: &str) -> String {
+    format!(r#"{{"number":7,"head":{{"sha":"{sha}"}}}}"#)
+}
+
+fn statuses(states: &[&str]) -> String {
+    let list: Vec<String> = states
+        .iter()
+        .map(|s| format!(r#"{{"status":"{s}"}}"#))
+        .collect();
+    format!(
+        r#"{{"state":"x","total_count":{},"statuses":[{}]}}"#,
+        list.len(),
+        list.join(",")
+    )
+}
+
+type Items<'a> = Vec<(&'a str, Option<&'a str>)>;
+
+fn runs(items: &[(&str, Option<&str>)]) -> String {
+    let list: Vec<String> = items
+        .iter()
+        .map(|(status, conclusion)| {
+            conclusion.map_or_else(
+                || format!(r#"{{"status":"{status}"}}"#),
+                |c| format!(r#"{{"status":"{status}","conclusion":"{c}"}}"#),
+            )
+        })
+        .collect();
+    format!(
+        r#"{{"total_count":{},"workflow_runs":[{}]}}"#,
+        list.len(),
+        list.join(",")
+    )
+}
+
+async fn ci_from_statuses(states: &[&str]) -> Result<CiResult, ForgeError> {
+    let script = Script::default()
+        .reply(200, &head_of("abc123"))
+        .reply(200, &statuses(states))
+        .reply(200, &runs(&[("completed", Some("failure"))]));
+    let target = target().map_err(|_| ForgeError::Malformed)?;
+    forge(&script).ci_result(&target, PR_URL).await
+}
+
+async fn ci_from_runs(items: &[(&str, Option<&str>)]) -> Result<CiResult, ForgeError> {
+    let script = Script::default()
+        .reply(200, &head_of("abc123"))
+        .reply(200, &statuses(&[]))
+        .reply(200, &runs(items));
+    let target = target().map_err(|_| ForgeError::Malformed)?;
+    forge(&script).ci_result(&target, PR_URL).await
+}
+
+#[tokio::test]
+async fn ci_result_reads_the_head_then_the_statuses() -> TestResult {
+    let script = Script::default()
+        .reply(200, &head_of("abc123"))
+        .reply(200, &statuses(&["success"]));
+    assert_eq!(
+        forge(&script).ci_result(&target()?, PR_URL).await?,
+        CiResult::Success
+    );
+    let seen = script.seen();
+    let paths: Vec<&str> = seen.iter().map(|r| r.path.as_str()).collect();
+    assert_eq!(
+        paths,
+        [
+            "/api/v1/repos/octo/widgets/pulls/7",
+            "/api/v1/repos/octo/widgets/commits/abc123/status?page=1&limit=50",
+        ]
+    );
+    for request in &seen {
+        assert_eq!(request.method, Method::Get);
+        assert_eq!(request.host.as_str(), "git.example.com");
+        assert_eq!(
+            request.header("authorization"),
+            Some(&*format!("token {TOKEN}"))
+        );
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn ci_result_reads_the_runs_only_when_the_statuses_are_empty() -> TestResult {
+    let script = Script::default()
+        .reply(200, &head_of("abc123"))
+        .reply(200, &statuses(&[]))
+        .reply(200, &runs(&[("completed", Some("success"))]));
+    assert_eq!(
+        forge(&script).ci_result(&target()?, PR_URL).await?,
+        CiResult::Success
+    );
+    let seen = script.seen();
+    let paths: Vec<&str> = seen.iter().map(|r| r.path.as_str()).collect();
+    assert_eq!(
+        paths[2],
+        "/api/v1/repos/octo/widgets/actions/runs?head_sha=abc123&page=1&limit=50"
+    );
+    assert_eq!(paths.len(), 3);
+    for request in &seen {
+        assert_eq!(request.method, Method::Get);
+        assert_eq!(
+            request.header("authorization"),
+            Some(&*format!("token {TOKEN}"))
+        );
+    }
+    let script = Script::default()
+        .reply(200, &head_of("abc123"))
+        .reply(200, &statuses(&["pending"]))
+        .reply(200, &runs(&[("completed", Some("failure"))]));
+    assert_eq!(
+        forge(&script).ci_result(&target()?, PR_URL).await?,
+        CiResult::InProgress
+    );
+    assert_eq!(script.seen().len(), 2);
+    Ok(())
+}
+
+#[tokio::test]
+async fn ci_result_maps_every_status_state() {
+    let table: Vec<(Vec<&str>, CiResult)> = vec![
+        (vec!["success"], CiResult::Success),
+        (vec!["pending"], CiResult::InProgress),
+        (vec!["failure"], CiResult::Failure),
+        (vec!["error"], CiResult::Failure),
+        (vec!["warning"], CiResult::Failure),
+        (vec!["skipped"], CiResult::Neutral),
+        (vec!["skipped", "success"], CiResult::Success),
+        (vec!["success", "pending"], CiResult::InProgress),
+        (vec!["success", "failure", "pending"], CiResult::Failure),
+    ];
+    for (states, expected) in table {
+        assert_eq!(ci_from_statuses(&states).await, Ok(expected), "{states:?}");
+    }
+}
+
+#[tokio::test]
+async fn ci_result_maps_every_run_state() {
+    let table: Vec<(Items<'_>, CiResult)> = vec![
+        (vec![], CiResult::NoChecks),
+        (vec![("queued", None)], CiResult::Queued),
+        (vec![("waiting", None)], CiResult::Queued),
+        (vec![("requested", None)], CiResult::Queued),
+        (vec![("pending", None)], CiResult::Queued),
+        (vec![("in_progress", None)], CiResult::InProgress),
+        (vec![("completed", Some("success"))], CiResult::Success),
+        (vec![("completed", Some("skipped"))], CiResult::Neutral),
+        (vec![("completed", Some("neutral"))], CiResult::Neutral),
+        (vec![("completed", Some("failure"))], CiResult::Failure),
+        (vec![("completed", Some("cancelled"))], CiResult::Failure),
+        (
+            vec![("completed", Some("something_new"))],
+            CiResult::Failure,
+        ),
+        (
+            vec![("completed", Some("success")), ("queued", None)],
+            CiResult::Queued,
+        ),
+        (
+            vec![("completed", Some("success")), ("in_progress", None)],
+            CiResult::InProgress,
+        ),
+        (
+            vec![("completed", Some("failure")), ("in_progress", None)],
+            CiResult::Failure,
+        ),
+    ];
+    for (items, expected) in table {
+        assert_eq!(ci_from_runs(&items).await, Ok(expected), "{items:?}");
+    }
+}
+
+#[tokio::test]
+async fn ci_result_refuses_malformed_status_data() -> TestResult {
+    let target = target()?;
+    let cap = format!(
+        r#"{{"statuses":[{}]}}"#,
+        vec![r#"{"status":"success"}"#; 50].join(",")
+    );
+    let bad = [
+        "",
+        "{",
+        "[]",
+        "{}",
+        r#"{"statuses":3}"#,
+        r#"{"statuses":[3]}"#,
+        r#"{"statuses":[{}]}"#,
+        r#"{"statuses":[{"state":"success"}]}"#,
+        r#"{"statuses":[{"status":"weird"}]}"#,
+        r#"{"statuses":[{"status":3}]}"#,
+        r#"{"statuses":[{"status":null}]}"#,
+        r#"{"total_count":2,"statuses":[{"status":"success"}]}"#,
+        cap.as_str(),
+    ];
+    for body in bad {
+        let script = Script::default()
+            .reply(200, &head_of("abc123"))
+            .reply(200, body);
+        let got = forge(&script).ci_result(&target, PR_URL).await;
+        assert_eq!(got.err(), Some(ForgeError::Malformed), "{body}");
+    }
+    let under = format!(
+        r#"{{"statuses":[{}]}}"#,
+        vec![r#"{"status":"success"}"#; 49].join(",")
+    );
+    let script = Script::default()
+        .reply(200, &head_of("abc123"))
+        .reply(200, &under);
+    assert_eq!(
+        forge(&script).ci_result(&target, PR_URL).await,
+        Ok(CiResult::Success)
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn ci_result_refuses_malformed_run_data() -> TestResult {
+    let target = target()?;
+    let cap = format!(
+        r#"{{"workflow_runs":[{}]}}"#,
+        vec![r#"{"status":"queued"}"#; 50].join(",")
+    );
+    let bad = [
+        "",
+        "{",
+        "[]",
+        "{}",
+        r#"{"workflow_runs":3}"#,
+        r#"{"workflow_runs":[3]}"#,
+        r#"{"workflow_runs":[{}]}"#,
+        r#"{"workflow_runs":[{"status":3}]}"#,
+        r#"{"workflow_runs":[{"status":"weird"}]}"#,
+        r#"{"workflow_runs":[{"status":"completed"}]}"#,
+        r#"{"workflow_runs":[{"status":"completed","conclusion":null}]}"#,
+        r#"{"workflow_runs":[{"status":"completed","conclusion":3}]}"#,
+        r#"{"total_count":2,"workflow_runs":[{"status":"queued"}]}"#,
+        cap.as_str(),
+    ];
+    for body in bad {
+        let script = Script::default()
+            .reply(200, &head_of("abc123"))
+            .reply(200, &statuses(&[]))
+            .reply(200, body);
+        let got = forge(&script).ci_result(&target, PR_URL).await;
+        assert_eq!(got.err(), Some(ForgeError::Malformed), "{body}");
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn ci_result_refuses_a_pull_without_a_usable_head() -> TestResult {
+    let target = target()?;
+    let bad = [
+        "",
+        "{",
+        "[]",
+        "{}",
+        r#"{"head":3}"#,
+        r#"{"head":{}}"#,
+        r#"{"head":{"sha":3}}"#,
+        r#"{"head":{"sha":""}}"#,
+        r#"{"head":{"sha":"../../x"}}"#,
+        r#"{"head":{"sha":"abc/def"}}"#,
+        r#"{"head":{"sha":"abc def"}}"#,
+        r#"{"head":{"sha":"abc?x=1"}}"#,
+    ];
+    for body in bad {
+        let script = Script::default().reply(200, body);
+        let got = forge(&script).ci_result(&target, PR_URL).await;
+        assert_eq!(got.err(), Some(ForgeError::Malformed), "{body}");
+        assert_eq!(script.seen().len(), 1, "{body}");
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn ci_result_maps_status_and_cap_on_every_step() -> TestResult {
+    let target = target()?;
+    let table = [
+        (404, ForgeError::NotFound),
+        (401, ForgeError::Unauthorized),
+        (403, ForgeError::Unauthorized),
+        (500, ForgeError::Unavailable),
+        (302, ForgeError::Redirected),
+        (204, ForgeError::Malformed),
+    ];
+    for (status, expected) in table {
+        let script = Script::default().reply(status, "{}");
+        let got = forge(&script).ci_result(&target, PR_URL).await;
+        assert_eq!(got.err(), Some(expected), "pull {status}");
+        let script = Script::default()
+            .reply(200, &head_of("abc123"))
+            .reply(status, "{}");
+        let got = forge(&script).ci_result(&target, PR_URL).await;
+        assert_eq!(got.err(), Some(expected), "statuses {status}");
+        let script = Script::default()
+            .reply(200, &head_of("abc123"))
+            .reply(200, &statuses(&[]))
+            .reply(status, "{}");
+        let got = forge(&script).ci_result(&target, PR_URL).await;
+        assert_eq!(got.err(), Some(expected), "runs {status}");
+    }
+    let big = vec![b' '; MAX_BODY_BYTES + 1];
+    let steps = [
+        Script::default().raw(200, big.clone()),
+        Script::default()
+            .reply(200, &head_of("abc123"))
+            .raw(200, big.clone()),
+        Script::default()
+            .reply(200, &head_of("abc123"))
+            .reply(200, &statuses(&[]))
+            .raw(200, big),
+    ];
+    for script in steps {
+        assert_eq!(
+            forge(&script).ci_result(&target, PR_URL).await.err(),
+            Some(ForgeError::TooLarge)
+        );
+    }
+    let script = Script::default()
+        .reply(200, &head_of("abc123"))
+        .fail(HttpError::Timeout);
+    assert_eq!(
+        forge(&script).ci_result(&target, PR_URL).await.err(),
+        Some(ForgeError::Timeout)
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn ci_result_refuses_a_foreign_pull_url_before_any_request() -> TestResult {
+    let urls = [
+        "",
+        "https://git.example.com/octo/other/pulls/7",
+        "https://evil.example/octo/widgets/pulls/7",
+        "https://git.example.com@evil.example/octo/widgets/pulls/7",
+        "https://git.example.com/octo/widgets/pulls/7\r\nX: y",
+        "https://git.example.com/octo/widgets/pulls/../../x",
+        "https://git.example.com/octo/widgets/pulls/0",
+    ];
+    for url in urls {
+        let script = Script::default();
+        let got = forge(&script).ci_result(&target()?, url).await;
+        assert_eq!(got.err(), Some(ForgeError::Malformed), "{url:?}");
+        assert!(script.seen().is_empty(), "{url:?}");
+    }
+    let other = RepoAccess::new(
+        RepoRef::new(host("git.example.com")?, "octo", "widgets")?,
+        Credential::new(host("other.example.com")?, Token::new(TOKEN.to_owned())?),
+    );
+    let script = Script::default();
+    let got = forge(&script).ci_result(&target_for(other)?, PR_URL).await;
+    assert_eq!(got.err(), Some(ForgeError::HostMismatch));
+    assert_eq!(script.seen().len(), 0);
+    Ok(())
+}
+
+#[tokio::test]
+async fn every_case_passes_on_the_gitea_fake() {
+    let subject = AdapterSubject(|fake: &Fake| {
+        GiteaForge::new(fake.clone()).with_git(fake.host(), fake.clone())
+    });
+    let report = run_contract(&subject, Shape::Gitea, || Fake::new(Shape::Gitea)).await;
+    let findings: Vec<String> = report.findings.iter().map(ToString::to_string).collect();
+    assert!(findings.is_empty(), "{findings:?}");
+    assert_eq!(report.ran.len(), Case::ALL.len());
+    let git_cases = Case::ALL
+        .iter()
+        .filter(|c| matches!(c.op(), Op::Push | Op::Fetch))
+        .count();
+    assert_eq!(git_cases, 5);
+}
+
+#[derive(Clone, Default)]
+struct GitScript {
+    outputs: Arc<Mutex<VecDeque<Result<GitOutput, GitError>>>>,
+    seen: Arc<Mutex<Vec<GitCommand>>>,
+}
+
+impl GitScript {
+    fn output(self, code: i32, stderr: &str) -> Self {
+        self.push(Ok(GitOutput {
+            code,
+            stderr: stderr.to_owned(),
+        }))
+    }
+
+    fn fail(self, error: GitError) -> Self {
+        self.push(Err(error))
+    }
+
+    fn push(self, reply: Result<GitOutput, GitError>) -> Self {
+        self.outputs
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .push_back(reply);
+        self
+    }
+
+    fn seen(&self) -> Vec<GitCommand> {
+        self.seen
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()
+    }
+}
+
+impl Git for GitScript {
+    fn run(&self, command: GitCommand) -> impl Future<Output = Result<GitOutput, GitError>> + Send {
+        self.seen
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .push(command);
+        let reply = self
+            .outputs
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .pop_front()
+            .unwrap_or(Err(GitError::Spawn));
+        std::future::ready(reply)
+    }
+}
+
+fn git_forge(git: &GitScript) -> Result<GiteaForge<Script, GiteaGit<GitScript>>, Box<dyn Error>> {
+    Ok(GiteaForge::new(Script::default()).with_git(host("git.example.com")?, git.clone()))
+}
+
+fn access_on(repo_host: &str, credential_host: &str) -> Result<RepoAccess, Box<dyn Error>> {
+    let repo = RepoRef::new(host(repo_host)?, "octo", "widgets")?;
+    let credential = Credential::new(host(credential_host)?, Token::new(TOKEN.to_owned())?);
+    Ok(RepoAccess::new(repo, credential))
+}
+
+#[tokio::test]
+async fn push_runs_one_command_for_the_validated_target() -> TestResult {
+    let git = GitScript::default().output(0, "To https://git.example.com/octo/widgets.git\n");
+    let status = git_forge(&git)?.push(&target()?).await?;
+    assert_eq!(status, "pushed");
+    let seen = git.seen();
+    assert_eq!(seen.len(), 1);
+    let command = &seen[0];
+    assert_eq!(command.op, GitOp::Push);
+    assert_eq!(command.branch.as_deref(), Some("fleet/job-1"));
+    assert_eq!(command.repo.host().as_str(), "git.example.com");
+    assert_eq!(command.repo.owner(), "octo");
+    assert_eq!(command.repo.repo(), "widgets");
+    assert_eq!(command.credential.host().as_str(), "git.example.com");
+    Ok(())
+}
+
+#[tokio::test]
+async fn fetch_runs_one_command_with_no_branch() -> TestResult {
+    let git = GitScript::default().output(0, "");
+    let status = git_forge(&git)?.fetch(&access()?).await?;
+    assert_eq!(status, "fetched");
+    let seen = git.seen();
+    assert_eq!(seen.len(), 1);
+    assert_eq!(seen[0].op, GitOp::Fetch);
+    assert_eq!(seen[0].branch, None);
+    assert_eq!(seen[0].repo.owner(), "octo");
+    Ok(())
+}
+
+#[tokio::test]
+async fn the_command_and_the_adapter_print_no_token() -> TestResult {
+    let git = GitScript::default().output(0, "");
+    let forge = git_forge(&git)?;
+    forge.push(&target()?).await?;
+    let text = format!("{:?} {:?} {:?}", git.seen(), forge, access()?);
+    assert!(!text.contains(TOKEN), "{text}");
+    Ok(())
+}
+
+#[tokio::test]
+async fn push_refuses_a_branch_git_would_refuse_before_running_anything() -> TestResult {
+    for branch in [
+        "a/.hidden",
+        ".hidden",
+        "x.lock",
+        "a.lock/b",
+        "a/b.lock",
+        "a.LOCK",
+        "a/B.Lock",
+    ] {
+        let git = GitScript::default().output(0, "");
+        let target = PushTarget::new(access()?, branch, "main")?;
+        let got = git_forge(&git)?.push(&target).await;
+        assert_eq!(got, Err(ForgeError::Malformed), "{branch:?}");
+        assert!(git.seen().is_empty(), "{branch:?}");
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn push_accepts_the_branch_edges() -> TestResult {
+    for branch in ["a", "fleet/job-1", "a.b/c_d", "v1.0", "a.lockx", "lock"] {
+        let git = GitScript::default().output(0, "");
+        let target = PushTarget::new(access()?, branch, "main")?;
+        assert_eq!(
+            git_forge(&git)?.push(&target).await?,
+            "pushed",
+            "{branch:?}"
+        );
+        assert_eq!(git.seen()[0].branch.as_deref(), Some(branch));
+    }
+    Ok(())
+}
+
+#[test]
+fn hostile_branches_never_reach_a_push_target() -> TestResult {
+    let long = "a".repeat(256);
+    let hostile = [
+        "",
+        "-x",
+        "--upload-pack=x",
+        "/a",
+        "a/",
+        "a.",
+        "a..b",
+        "..",
+        "a//b",
+        "a\\b",
+        "a b",
+        "a\tb",
+        "a\rb",
+        "a\nb",
+        "a\r\nb",
+        "a\0b",
+        "a\u{7f}b",
+        "a\u{85}b",
+        "a\u{2028}b",
+        "a:b",
+        "a?b",
+        "a*b",
+        "a[b",
+        "a~b",
+        "a^b",
+        "a@{b",
+        "a@b",
+        "a%2fb",
+        "é",
+        long.as_str(),
+    ];
+    for branch in hostile {
+        assert!(
+            PushTarget::new(access()?, branch, "main").is_err(),
+            "{branch:?}"
+        );
+        assert!(
+            PushTarget::new(access()?, "main", branch).is_err(),
+            "{branch:?}"
+        );
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_host_other_than_the_adapters_own_runs_no_command() -> TestResult {
+    let git = GitScript::default().output(0, "").output(0, "");
+    let forge = git_forge(&git)?;
+    let off = access_on("other.example.com", "other.example.com")?;
+    let mismatch = access_on("git.example.com", "other.example.com")?;
+    assert_eq!(forge.fetch(&off).await, Err(ForgeError::WrongKind));
+    assert_eq!(forge.fetch(&mismatch).await, Err(ForgeError::HostMismatch));
+    assert_eq!(
+        forge
+            .push(&PushTarget::new(off, "fleet/job-1", "main")?)
+            .await,
+        Err(ForgeError::WrongKind)
+    );
+    assert_eq!(
+        forge
+            .push(&PushTarget::new(mismatch, "fleet/job-1", "main")?)
+            .await,
+        Err(ForgeError::HostMismatch)
+    );
+    assert_eq!(git.seen().len(), 0);
+    Ok(())
+}
+
+#[tokio::test]
+async fn two_adapters_each_serve_only_their_own_host() -> TestResult {
+    let first = GitScript::default().output(0, "").output(0, "");
+    let second = GitScript::default().output(0, "").output(0, "");
+    let one = GiteaForge::new(Script::default()).with_git(host("one.example.com")?, first.clone());
+    let two = GiteaForge::new(Script::default()).with_git(host("two.example.com")?, second.clone());
+    let on_one = access_on("one.example.com", "one.example.com")?;
+    let on_two = access_on("two.example.com", "two.example.com")?;
+    assert_eq!(one.fetch(&on_one).await?, "fetched");
+    assert_eq!(two.fetch(&on_two).await?, "fetched");
+    assert_eq!(one.fetch(&on_two).await, Err(ForgeError::WrongKind));
+    assert_eq!(two.fetch(&on_one).await, Err(ForgeError::WrongKind));
+    let pushed = PushTarget::new(on_one, "fleet/job-1", "main")?;
+    assert_eq!(two.push(&pushed).await, Err(ForgeError::WrongKind));
+    assert_eq!(one.push(&pushed).await?, "pushed");
+    assert_eq!(first.seen().len(), 2);
+    assert_eq!(second.seen().len(), 1);
+    assert_eq!(
+        first.seen()[0].credential.host().as_str(),
+        "one.example.com"
+    );
+    assert_eq!(
+        second.seen()[0].credential.host().as_str(),
+        "two.example.com"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn lookalike_and_hostile_hosts_never_reach_a_command() -> TestResult {
+    let long = format!("{}.example.com", "a".repeat(300));
+    let hostile = [
+        "git.example.com.evil.net",
+        "xgit.example.com",
+        "sub.git.example.com",
+        "example.com",
+        "git.example.com@evil.net",
+        "evil.net\r\ngit.example.com",
+        "git.example.com\u{85}evil.net",
+        "git.example.com\u{2028}evil.net",
+        "git.example.com\\evil.net",
+        "git.example.com:8443",
+        "[::1]",
+        "git.example.com ",
+        "",
+        "git..example.com",
+        "gıt.example.com",
+        "git.example.com\0",
+        long.as_str(),
+    ];
+    for text in hostile {
+        let git = GitScript::default().output(0, "").output(0, "");
+        let forge = git_forge(&git)?;
+        if let Ok(name) = HostName::normalise(text) {
+            let repo = RepoRef::new(name.clone(), "octo", "widgets")?;
+            let credential = Credential::new(name, Token::new(TOKEN.to_owned())?);
+            let access = RepoAccess::new(repo, credential);
+            assert_eq!(
+                forge.fetch(&access).await,
+                Err(ForgeError::WrongKind),
+                "{text:?}"
+            );
+            let target = PushTarget::new(access, "fleet/job-1", "main")?;
+            assert_eq!(
+                forge.push(&target).await,
+                Err(ForgeError::WrongKind),
+                "{text:?}"
+            );
+        }
+        assert!(git.seen().is_empty(), "{text:?}");
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn the_own_host_matches_in_any_spelling_of_the_same_name() -> TestResult {
+    for text in ["GIT.EXAMPLE.COM", "git.example.com.", "Git.Example.Com"] {
+        let git = GitScript::default().output(0, "");
+        let access = access_on(text, text)?;
+        assert_eq!(
+            git_forge(&git)?.fetch(&access).await?,
+            "fetched",
+            "{text:?}"
+        );
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn runner_failures_map_to_fixed_errors() -> TestResult {
+    let git = GitScript::default()
+        .fail(GitError::Spawn)
+        .fail(GitError::Timeout)
+        .fail(GitError::Spawn)
+        .fail(GitError::Timeout);
+    let forge = git_forge(&git)?;
+    assert_eq!(forge.push(&target()?).await, Err(ForgeError::Unavailable));
+    assert_eq!(forge.push(&target()?).await, Err(ForgeError::Timeout));
+    assert_eq!(forge.fetch(&access()?).await, Err(ForgeError::Unavailable));
+    assert_eq!(forge.fetch(&access()?).await, Err(ForgeError::Timeout));
+    Ok(())
+}
+
+#[tokio::test]
+async fn push_classifies_stderr_into_fixed_errors() -> TestResult {
+    let cases: [(i32, &str, ForgeError); 12] = [
+        (
+            128,
+            "fatal: could not read Password for 'https://git.example.com'",
+            ForgeError::Unauthorized,
+        ),
+        (
+            22,
+            "error: The requested URL returned error: 401",
+            ForgeError::Unauthorized,
+        ),
+        (
+            1,
+            " ! [rejected] a -> a (non-fast-forward)",
+            ForgeError::NonFastForward,
+        ),
+        (
+            1,
+            " ! [rejected] a -> a (fetch first)",
+            ForgeError::NonFastForward,
+        ),
+        (
+            128,
+            "remote: Invalid username or password.",
+            ForgeError::Unauthorized,
+        ),
+        (
+            128,
+            "remote: Permission to o/r.git denied to x.",
+            ForgeError::Unauthorized,
+        ),
+        (
+            22,
+            "error: The requested URL returned error: 403",
+            ForgeError::Unauthorized,
+        ),
+        (128, "remote: Repository not found.", ForgeError::NotFound),
+        (
+            1,
+            "non-fast-forward but also Authentication failed",
+            ForgeError::Unauthorized,
+        ),
+        (
+            1,
+            " ! [REJECTED] a -> a (NON-FAST-FORWARD)",
+            ForgeError::NonFastForward,
+        ),
+        (1, "something else entirely", ForgeError::Rejected),
+        (255, "", ForgeError::Rejected),
+    ];
+    for (code, stderr, want) in cases {
+        let git = GitScript::default().output(code, stderr);
+        let got = git_forge(&git)?.push(&target()?).await;
+        assert_eq!(got, Err(want), "{stderr:?}");
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_branch_named_like_a_marker_does_not_pick_the_label() -> TestResult {
+    let cases: [(&str, &str, ForgeError); 4] = [
+        (
+            "non-fast-forward",
+            " ! [remote rejected] non-fast-forward -> non-fast-forward (hook declined)",
+            ForgeError::Rejected,
+        ),
+        (
+            "x-non-fast-forward-y",
+            " ! [remote rejected] x-non-fast-forward-y -> x-non-fast-forward-y (hook declined)",
+            ForgeError::Rejected,
+        ),
+        (
+            "Non-Fast-Forward",
+            " ! [remote rejected] non-fast-forward -> non-fast-forward (hook declined)",
+            ForgeError::Rejected,
+        ),
+        (
+            "non-fast-forward",
+            " ! [rejected] non-fast-forward -> non-fast-forward (non-fast-forward)",
+            ForgeError::NonFastForward,
+        ),
+    ];
+    for (branch, stderr, want) in cases {
+        let git = GitScript::default().output(1, stderr);
+        let target = PushTarget::new(access()?, branch, "main")?;
+        let got = git_forge(&git)?.push(&target).await;
+        assert_eq!(got, Err(want), "{branch:?} {stderr:?}");
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn fetch_never_reports_non_fast_forward() -> TestResult {
+    let cases: [(&str, ForgeError); 3] = [
+        ("non-fast-forward", ForgeError::Rejected),
+        ("fatal: Authentication failed", ForgeError::Unauthorized),
+        ("remote: Repository not found.", ForgeError::NotFound),
+    ];
+    for (stderr, want) in cases {
+        let git = GitScript::default().output(128, stderr);
+        assert_eq!(
+            git_forge(&git)?.fetch(&access()?).await,
+            Err(want),
+            "{stderr:?}"
+        );
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_marker_past_the_stderr_cap_is_ignored() -> TestResult {
+    for (pad, want) in [
+        (8 * 1024, ForgeError::Rejected),
+        (8 * 1024 - 15, ForgeError::Rejected),
+        (8 * 1024 - 16, ForgeError::NonFastForward),
+    ] {
+        let text = format!("{}non-fast-forward", "x".repeat(pad));
+        let git = GitScript::default().output(1, &text);
+        assert_eq!(git_forge(&git)?.push(&target()?).await, Err(want), "{pad}");
+    }
+    let wide = format!("{}é non-fast-forward", "é".repeat(4096));
+    let git = GitScript::default().output(1, &wide);
+    assert_eq!(
+        git_forge(&git)?.push(&target()?).await,
+        Err(ForgeError::Rejected)
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn no_runner_text_reaches_a_status_or_an_error() -> TestResult {
+    let hostile = [
+        format!(
+            "fatal: Authentication failed for 'https://x-access-token:{TOKEN}@git.example.com/o/r.git/'"
+        ),
+        format!("{TOKEN} non-fast-forward"),
+        format!("remote: Repository not found. {TOKEN}"),
+        format!("{TOKEN}\r\nX-Injected: 1"),
+        TOKEN.to_owned(),
+    ];
+    for stderr in &hostile {
+        for code in [0, 1, 128] {
+            let git = GitScript::default()
+                .output(code, stderr)
+                .output(code, stderr);
+            let forge = git_forge(&git)?;
+            for got in [forge.push(&target()?).await, forge.fetch(&access()?).await] {
+                let text = match got {
+                    Ok(text) => {
+                        assert!(text == "pushed" || text == "fetched", "{text:?}");
+                        text
+                    }
+                    Err(error) => error.to_string(),
+                };
+                assert!(!text.contains(TOKEN), "{text}");
+                assert!(!text.contains("x-access-token"), "{text}");
+                assert!(!text.contains("X-Injected"), "{text}");
+            }
+        }
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn the_masked_echo_never_joins_the_text_around_it_into_a_marker() -> TestResult {
+    let git = GitScript::default().output(1, "non-fastb -> b-forward");
+    let target = PushTarget::new(access()?, "b", "main")?;
+    assert_eq!(
+        git_forge(&git)?.push(&target).await,
+        Err(ForgeError::Rejected)
+    );
     Ok(())
 }
