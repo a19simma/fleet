@@ -105,7 +105,7 @@ AND verified_at <= to_timestamp(0))";
 
 const SELECT_HOST_PAT: &str = "\
 SELECT id, (expires_at IS NOT NULL AND expires_at <= now()) AS expired \
-FROM credentials WHERE user_id = $1 AND kind = 'forgejo_pat' AND host = $2 AND tombstoned_at IS NULL";
+FROM credentials WHERE user_id = $1 AND kind = 'forgejo_pat' AND host = $2 AND tombstoned_at IS NULL FOR UPDATE";
 
 const LATEST_JOB: &str = "\
 SELECT job_id, repo FROM jobs WHERE user_id = $1 ORDER BY created_at DESC, job_id DESC LIMIT 1";

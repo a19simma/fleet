@@ -873,6 +873,26 @@ async fn a_host_row_removed_before_the_fetch_releases_nothing(pool: PgPool) {
 }
 
 #[sqlx::test]
+async fn a_forgejo_pat_tombstoned_while_the_release_waits_is_never_released(pool: PgPool) {
+    let mut w = world(pool).await;
+    let job = w.forgejo_job(FGJ_REPO).await;
+    w.put_forgejo(w.alice, FGJ_HOST, FGJ, None).await;
+    let mut deleting = w.pool.begin().await.unwrap();
+    sqlx::query("UPDATE credentials SET tombstoned_at = now() WHERE kind = 'forgejo_pat'")
+        .execute(&mut *deleting)
+        .await
+        .unwrap();
+    let commit = async {
+        tokio::time::sleep(std::time::Duration::from_millis(700)).await;
+        deleting.commit().await.unwrap();
+    };
+    let box_name = box_a();
+    let (outcome, ()) = tokio::join!(w.fetch(&job, job.attempt, &box_name), commit);
+    assert_refused(&outcome.unwrap_err(), NO_HOST_CREDENTIAL);
+    assert_eq!(w.uses().await, 0);
+}
+
+#[sqlx::test]
 async fn a_github_row_on_another_host_releases_no_github_token(pool: PgPool) {
     let mut w = world(pool).await;
     w.put(w.alice, CredentialKind::AnthropicApiKey, ANT, None)
