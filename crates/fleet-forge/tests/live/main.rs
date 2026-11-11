@@ -24,7 +24,7 @@ use serde_json::{Value, json};
 use cases::{ORDER, Plan, plan};
 use support::{
     Api, Auth, BOGUS_TOKEN, Counter, Curl, LiveGit, NAME_PREFIX, RepoGuard, Scratch, Settings,
-    header, header_names, leaked_names, local_git, random_hex, shape, sweep,
+    Wire, header, header_names, leaked_names, local_git, random_hex, shape, sweep,
 };
 
 type Adapter = GiteaForge<Curl, GiteaGit<LiveGit>>;
@@ -898,4 +898,97 @@ fn two_run_ids_differ_and_are_twelve_hex_digits() {
     let second = random_hex();
     assert_ne!(first, second);
     assert_eq!(first.map(|h| h.len()), Ok(12));
+}
+
+#[derive(Clone)]
+struct Script {
+    reply: fn(&str, &str) -> (u16, &'static str),
+    log: std::sync::Arc<std::sync::Mutex<Vec<(String, String)>>>,
+}
+
+impl Script {
+    fn new(reply: fn(&str, &str) -> (u16, &'static str)) -> Self {
+        Self {
+            reply,
+            log: std::sync::Arc::default(),
+        }
+    }
+
+    fn deletes(&self) -> Vec<String> {
+        self.log
+            .lock()
+            .map(|log| {
+                log.iter()
+                    .filter(|(method, _)| method == "DELETE")
+                    .map(|(_, path)| path.clone())
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+}
+
+impl Wire for Script {
+    fn call(
+        &self,
+        method: &str,
+        path: &str,
+        _headers: &[(String, String)],
+        _body: &[u8],
+    ) -> Result<fleet_forge::HttpResponse, fleet_forge::HttpError> {
+        if let Ok(mut log) = self.log.lock() {
+            log.push((method.to_owned(), path.to_owned()));
+        }
+        let (status, body) = (self.reply)(method, path);
+        Ok(fleet_forge::HttpResponse {
+            status,
+            headers: Vec::new(),
+            body: body.as_bytes().to_vec(),
+        })
+    }
+
+    fn uncounted(&self) -> Self {
+        self.clone()
+    }
+}
+
+fn scripted_forge(method: &str, path: &str) -> (u16, &'static str) {
+    match (method, path) {
+        ("POST", _) => (201, r#"{"name":"fleet-e2e-x"}"#),
+        ("GET", "/api/v1/user") => (200, r#"{"login":"me"}"#),
+        ("DELETE", _) => (204, ""),
+        _ => (500, ""),
+    }
+}
+
+fn scripted_forge_with_owner(method: &str, path: &str) -> (u16, &'static str) {
+    match method {
+        "POST" => (201, r#"{"owner":{"login":"me"}}"#),
+        _ => scripted_forge(method, path),
+    }
+}
+
+fn scripted_api(script: &Script) -> Result<Api<Script>, String> {
+    let token = Token::new("0123456789abcdef0123456789abcdef01234567".to_owned())
+        .map_err(|_| "token".to_owned())?;
+    let host = HostName::normalise("forge.example.org").map_err(|_| "host".to_owned())?;
+    Ok(Api::new(script.clone(), &token, &host))
+}
+
+#[test]
+fn a_create_reply_without_an_owner_still_deletes_the_repository() {
+    let script = Script::new(scripted_forge);
+    let api = scripted_api(&script).unwrap_or_else(|_| unreachable!());
+    assert!(RepoGuard::create(&api, "fleet-e2e-x").is_err());
+    assert_eq!(script.deletes(), vec!["/api/v1/repos/me/fleet-e2e-x"]);
+}
+
+#[test]
+fn a_create_reply_with_an_owner_deletes_the_repository_when_the_guard_drops() {
+    let script = Script::new(scripted_forge_with_owner);
+    let api = scripted_api(&script).unwrap_or_else(|_| unreachable!());
+    let made = RepoGuard::create(&api, "fleet-e2e-x");
+    assert_eq!(made.as_ref().map(|(_, owner)| owner.as_str()), Ok("me"));
+    assert_eq!(script.deletes(), Vec::<String>::new());
+    drop(made);
+    assert_eq!(script.deletes(), vec!["/api/v1/repos/me/fleet-e2e-x"]);
 }
