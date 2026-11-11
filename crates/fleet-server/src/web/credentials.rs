@@ -4,6 +4,11 @@
 //! write-only: it goes from the form into the service and no response carries it back.
 //! Outcomes travel as fixed notice codes in the query string, so a redirect never echoes
 //! user input.
+//!
+//! A credential belongs to a host (ADR-0068). The list shows one row per stored credential with
+//! its host, the put form picks the host from the registered ones, and a delete names the host
+//! of its row. The service owns the host rules, so a hostile or mismatched host comes back as
+//! the same fixed notice the CLI prints.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -23,13 +28,14 @@ use topcoat::{
         request::uri,
         route,
     },
-    view::{View, view},
+    view::{View, component, view},
 };
 
 use super::layout::{Nav, shell};
 use super::pages::{auth, csrf_matches, current, fail, signed_in};
 use super::passkeys::AuthError;
 use crate::cred::CredentialService;
+use crate::hosts::HostStore;
 
 const STATIC_SECRET: &str = "static_secret";
 
@@ -75,6 +81,7 @@ fn back(code: &str) -> SeeOther {
 
 struct Row {
     kind: &'static str,
+    host: String,
     id: Option<i64>,
     fingerprint: String,
     login: String,
@@ -94,26 +101,86 @@ async fn rows(web: &Backend, user_id: i64) -> Result<Vec<Row>> {
         .fetch_all(&web.pool)
         .await
         .map_err(|_| fail(AuthError::Internal))?;
-    Ok(CredentialKind::ALL
-        .into_iter()
-        .map(|kind| {
-            let found = listed.iter().find(|c| c.kind == kind.wire_name());
-            let id = found.and_then(|c| i64::try_from(c.id).ok());
-            let extra = extras.iter().find(|(row, ..)| Some(*row) == id);
-            Row {
+    let mut out = Vec::new();
+    for kind in CredentialKind::ALL {
+        let mut found: Vec<_> = listed
+            .iter()
+            .filter(|c| c.kind == kind.wire_name())
+            .collect();
+        found.sort_by(|a, b| a.host.cmp(&b.host));
+        if found.is_empty() {
+            out.push(Row {
                 kind: kind.wire_name(),
+                host: String::new(),
+                id: None,
+                fingerprint: String::new(),
+                login: String::new(),
+                expires: String::new(),
+                last_used: String::new(),
+            });
+        }
+        for c in found {
+            let id = i64::try_from(c.id).ok();
+            let extra = extras.iter().find(|(row, ..)| Some(*row) == id);
+            out.push(Row {
+                kind: kind.wire_name(),
+                host: c.host.clone(),
                 id,
-                fingerprint: found.map(|c| c.fingerprint.clone()).unwrap_or_default(),
-                login: found.and_then(|c| c.login.clone()).unwrap_or_default(),
+                fingerprint: c.fingerprint.clone(),
+                login: c.login.clone().unwrap_or_default(),
                 expires: extra
                     .and_then(|(_, expires, _)| expires.clone())
                     .unwrap_or_default(),
                 last_used: extra
                     .and_then(|(.., used)| used.clone())
                     .unwrap_or_default(),
-            }
-        })
+            });
+        }
+    }
+    Ok(out)
+}
+
+async fn host_names(web: &Backend) -> Result<Vec<String>> {
+    Ok(HostStore::new(web.pool.clone())
+        .list()
+        .await
+        .map_err(|_| fail(AuthError::Internal))?
+        .into_iter()
+        .map(|row| row.host)
         .collect())
+}
+
+/// The put form: kind, host and value. The host select lists every registered host after the
+/// `github.com` default, and the service decides which kind fits which host.
+#[component]
+async fn put_form(csrf: &str, hosts: &[String]) -> Result<impl View> {
+    Ok(view! {
+                <form class="mt-1 flex items-end gap-2" method="post" action="/credentials/put" autocomplete="off">
+                    <input type="hidden" name="csrf" value=(csrf)>
+                    <fieldset class="fieldset">
+                        <label class="label" for="credential-kind">"Kind"</label>
+                        <select class="select select-sm" id="credential-kind" name="kind">
+                            for kind in CredentialKind::ALL {
+                                <option value=(kind.wire_name())>(kind.wire_name())</option>
+                            }
+                        </select>
+                    </fieldset>
+                    <fieldset class="fieldset">
+                        <label class="label" for="credential-host">"Host"</label>
+                        <select class="select select-sm" id="credential-host" name="host">
+                            <option value="">"default (github.com)"</option>
+                            for host in hosts {
+                                <option value=(host.as_str())>(host.as_str())</option>
+                            }
+                        </select>
+                    </fieldset>
+                    <fieldset class="fieldset">
+                        <label class="label" for="credential-value">"Value"</label>
+                        <input class="input input-sm" id="credential-value" type="password" name="value" autocomplete="off" required="">
+                    </fieldset>
+                    <button class="btn btn-sm btn-primary" type="submit">"Save"</button>
+                </form>
+    })
 }
 
 #[page("/credentials")]
@@ -124,6 +191,7 @@ async fn credentials_page(cx: &Cx) -> Result<impl View> {
         return Err(see_other("/login").into());
     };
     let rows = rows(web, session.user_id).await?;
+    let hosts = host_names(web).await?;
     let notice = notice_code(cx).and_then(notice_text);
     let csrf = String::from_utf8_lossy(session.csrf.expose()).into_owned();
     Ok(view! {
@@ -141,6 +209,7 @@ async fn credentials_page(cx: &Cx) -> Result<impl View> {
                     <thead>
                         <tr>
                             <th>"Kind"</th>
+                            <th>"Host"</th>
                             <th>"Status"</th>
                             <th>"Login"</th>
                             <th>"Fingerprint"</th>
@@ -151,8 +220,9 @@ async fn credentials_page(cx: &Cx) -> Result<impl View> {
                     </thead>
                     <tbody>
                         for row in rows {
-                            <tr data-kind=(row.kind)>
+                            <tr data-kind=(row.kind) data-host=(row.host.as_str())>
                                 <td>(row.kind)</td>
+                                <td>(row.host.as_str())</td>
                                 if let Some(id) = row.id {
                                     <td><span class="badge badge-sm badge-success">"stored"</span></td>
                                     <td>(row.login)</td>
@@ -163,6 +233,7 @@ async fn credentials_page(cx: &Cx) -> Result<impl View> {
                                         <form class="inline" method="post" action="/credentials/delete">
                                             <input type="hidden" name="csrf" value=(csrf.as_str())>
                                             <input type="hidden" name="id" value=(id.to_string())>
+                                            <input type="hidden" name="host" value=(row.host.as_str())>
                                             <button class="btn btn-xs btn-outline btn-error" type="submit">"Delete"</button>
                                         </form>
                                         if row.kind == CredentialKind::GithubPat.wire_name() || row.kind == CredentialKind::GithubApp.wire_name() {
@@ -187,22 +258,7 @@ async fn credentials_page(cx: &Cx) -> Result<impl View> {
                 </table>
                 </div>
                 <h2 class="mb-1 mt-6 text-xs font-bold uppercase text-base-content/60">"Set a credential"</h2>
-                <form class="mt-1 flex items-end gap-2" method="post" action="/credentials/put" autocomplete="off">
-                    <input type="hidden" name="csrf" value=(csrf.as_str())>
-                    <fieldset class="fieldset">
-                        <label class="label" for="credential-kind">"Kind"</label>
-                        <select class="select select-sm" id="credential-kind" name="kind">
-                            for kind in CredentialKind::ALL {
-                                <option value=(kind.wire_name())>(kind.wire_name())</option>
-                            }
-                        </select>
-                    </fieldset>
-                    <fieldset class="fieldset">
-                        <label class="label" for="credential-value">"Value"</label>
-                        <input class="input input-sm" id="credential-value" type="password" name="value" autocomplete="off" required="">
-                    </fieldset>
-                    <button class="btn btn-sm btn-primary" type="submit">"Save"</button>
-                </form>
+                put_form(csrf: csrf.as_str(), hosts: hosts.as_slice())
             )
     })
 }
@@ -229,7 +285,7 @@ async fn put(cx: &Cx, Form(mut form): Form<HashMap<String, String>>) -> Result<S
         shape: STATIC_SECRET.to_owned(),
         value: form.remove("value").unwrap_or_default(),
         expires_at_ms: None,
-        host: String::new(),
+        host: form.remove("host").unwrap_or_default(),
     };
     match web.service.put(user_id, request).await {
         Ok(_) => Ok(back("saved")),
@@ -238,7 +294,7 @@ async fn put(cx: &Cx, Form(mut form): Form<HashMap<String, String>>) -> Result<S
 }
 
 #[route(POST "/credentials/delete")]
-async fn delete(cx: &Cx, Form(form): Form<HashMap<String, String>>) -> Result<SeeOther> {
+async fn delete(cx: &Cx, Form(mut form): Form<HashMap<String, String>>) -> Result<SeeOther> {
     let (user_id, web) = gate(cx, &form).await?;
     let Some(id) = row_id(&form) else {
         return Ok(back("not_found"));
@@ -249,7 +305,7 @@ async fn delete(cx: &Cx, Form(form): Form<HashMap<String, String>>) -> Result<Se
             user_id,
             &DeleteCredentialRequest {
                 id,
-                host: String::new(),
+                host: form.remove("host").unwrap_or_default(),
             },
         )
         .await

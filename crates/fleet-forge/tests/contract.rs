@@ -12,13 +12,13 @@ use std::sync::Mutex;
 use fleet_core::forge::CiResult;
 use fleet_core::host::{HostKind, HostName};
 use fleet_forge::contract::{
-    AdapterSubject, Calls, Case, Driven, Finding, Outcome, Subject, drive, run_contract,
+    AdapterSubject, Calls, Case, ChecksSeen, Driven, Finding, Outcome, Subject, drive, run_contract,
 };
 use fleet_forge::fake::{Fake, Shape};
 use fleet_forge::{
-    Credential, ForgeApi, ForgeError, ForgeGit, Git, GitCommand, GitOp, GitOutput, Http,
-    HttpRequest, HttpResponse, Method, Permission, PushTarget, RepoAccess, RepoRef, Token,
-    Verified,
+    CheckState, CiCheck, Credential, ForgeApi, ForgeError, ForgeGit, Git, GitCommand, GitOp,
+    GitOutput, Http, HttpRequest, HttpResponse, Method, Permission, PushTarget, RepoAccess,
+    RepoRef, Token, Verified,
 };
 
 type TestResult = Result<(), Box<dyn Error>>;
@@ -56,6 +56,16 @@ const ADR_TABLE: &[(&str, &[&str])] = &[
         ],
     ),
     ("ci_result 404", &["ci-404"]),
+    (
+        "ci_checks mixed with duplicates, none, 404, bad name, over cap",
+        &[
+            "ci-checks-mixed",
+            "ci-checks-none",
+            "ci-checks-404",
+            "ci-checks-bad-name",
+            "ci-checks-over-cap",
+        ],
+    ),
     (
         "push ok, non-fast-forward, revoked token",
         &["push-ok", "push-non-fast-forward", "push-revoked"],
@@ -313,6 +323,7 @@ async fn a_case_that_sends_nothing_is_a_finding() {
 struct Canned {
     verify: Result<Verified, ForgeError>,
     url: String,
+    checks: Vec<CiCheck>,
 }
 
 impl ForgeApi for Canned {
@@ -343,6 +354,14 @@ impl ForgeApi for Canned {
     ) -> impl Future<Output = Result<CiResult, ForgeError>> + Send {
         ready(Ok(CiResult::Queued))
     }
+
+    fn ci_checks(
+        &self,
+        _: &PushTarget,
+        _: &str,
+    ) -> impl Future<Output = Result<Vec<CiCheck>, ForgeError>> + Send {
+        ready(Ok(self.checks.clone()))
+    }
 }
 
 impl ForgeGit for Canned {
@@ -361,6 +380,7 @@ fn canned(url: &str) -> Canned {
             push: Permission::Granted,
         }),
         url: url.to_owned(),
+        checks: Vec::new(),
     }
 }
 
@@ -389,6 +409,14 @@ impl ForgeApi for Chatter {
         _: &PushTarget,
         _: &str,
     ) -> impl Future<Output = Result<CiResult, ForgeError>> + Send {
+        ready(Err(ForgeError::Malformed))
+    }
+
+    fn ci_checks(
+        &self,
+        _: &PushTarget,
+        _: &str,
+    ) -> impl Future<Output = Result<Vec<CiCheck>, ForgeError>> + Send {
         ready(Err(ForgeError::Malformed))
     }
 }
@@ -449,10 +477,73 @@ async fn drive_maps_each_operation_to_an_outcome() {
     assert_eq!(drove(Case::CreatePrOk).await, Outcome::PrUrl);
     assert_eq!(drove(Case::CiSuccess).await, Outcome::Ci(CiResult::Queued));
     assert_eq!(
+        drove(Case::CiChecksNone).await,
+        Outcome::Checks(ChecksSeen::Empty)
+    );
+    assert_eq!(
+        drove(Case::CiChecksMixed).await,
+        Outcome::Checks(ChecksSeen::Empty)
+    );
+    assert_eq!(
         drove(Case::PushOk).await,
         Outcome::Failed(ForgeError::Rejected)
     );
     assert_eq!(drove(Case::FetchOk).await, Outcome::Fetched);
+}
+
+fn listed(items: &[(&str, CheckState)]) -> Result<Vec<CiCheck>, ForgeError> {
+    items.iter().map(|(n, s)| CiCheck::new(n, *s)).collect()
+}
+
+#[tokio::test]
+async fn drive_tells_the_fixture_list_from_any_other_list() -> TestResult {
+    use CheckState::{Failed, Running, Success};
+    let fake = Fake::new(Shape::Gitea);
+    let rows = [
+        (
+            vec![("build", Success), ("lint", Failed), ("build", Running)],
+            ChecksSeen::Mixed,
+        ),
+        (
+            vec![("lint", Failed), ("build", Success), ("build", Running)],
+            ChecksSeen::Other,
+        ),
+        (
+            vec![("build", Success), ("lint", Failed), ("build", Success)],
+            ChecksSeen::Other,
+        ),
+        (
+            vec![("build", Success), ("lint", Failed), ("Build", Running)],
+            ChecksSeen::Other,
+        ),
+        (
+            vec![("build", Success), ("lint", Failed)],
+            ChecksSeen::Other,
+        ),
+        (
+            vec![
+                ("build", Success),
+                ("lint", Failed),
+                ("build", Running),
+                ("build", Running),
+            ],
+            ChecksSeen::Other,
+        ),
+        (vec![("build", Success)], ChecksSeen::Other),
+        (vec![], ChecksSeen::Empty),
+    ];
+    for (items, want) in rows {
+        let adapter = Canned {
+            checks: listed(&items)?,
+            ..canned(&fake.pr_url())
+        };
+        assert_eq!(
+            drive(&adapter, Case::CiChecksMixed, &fake).await.outcome,
+            Outcome::Checks(want),
+            "{items:?}"
+        );
+    }
+    Ok(())
 }
 
 #[tokio::test]

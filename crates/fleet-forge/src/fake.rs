@@ -297,14 +297,31 @@ impl Fake {
     }
 
     fn ci_reply(&self, case: Case, endpoint: &Endpoint) -> Result<HttpResponse, HttpError> {
-        let states: &[&str] = match case {
-            Case::CiPending => &["pending"],
-            Case::CiSuccess => &["success"],
-            Case::CiFailure => &["failure"],
-            Case::CiMixed => &["success", "failure", "pending"],
-            Case::CiNone => &[],
+        let named = |states: &[&'static str]| -> Vec<(String, &'static str)> {
+            states
+                .iter()
+                .enumerate()
+                .map(|(index, state)| (format!("check-{index}"), *state))
+                .collect()
+        };
+        let checks: Vec<(String, &'static str)> = match case {
+            Case::CiPending => named(&["pending"]),
+            Case::CiSuccess => named(&["success"]),
+            Case::CiFailure => named(&["failure"]),
+            Case::CiMixed => named(&["success", "failure", "pending"]),
+            Case::CiNone | Case::CiChecksNone => Vec::new(),
+            Case::CiChecksMixed => vec![
+                ("build".to_owned(), "success"),
+                ("lint".to_owned(), "failure"),
+                ("build".to_owned(), "pending"),
+            ],
+            Case::CiChecksBadName => vec![("bu\nild".to_owned(), "success")],
+            Case::CiChecksOverCap => (0..=50)
+                .map(|index| (format!("check-{index}"), "success"))
+                .collect(),
             _ => return not_found(),
         };
+        let states: Vec<&str> = checks.iter().map(|(_, state)| *state).collect();
         match endpoint {
             Endpoint::PullNumber => json_reply(
                 200,
@@ -312,11 +329,15 @@ impl Fake {
             ),
             Endpoint::Checks => match self.shape {
                 Shape::GitHub => {
-                    let runs: Vec<Value> = states
+                    let runs: Vec<Value> = checks
                         .iter()
-                        .map(|state| match *state {
-                            "pending" => json!({"status": "in_progress", "conclusion": null}),
-                            other => json!({"status": "completed", "conclusion": other}),
+                        .map(|(name, state)| match *state {
+                            "pending" => {
+                                json!({"name": name, "status": "in_progress", "conclusion": null})
+                            }
+                            other => {
+                                json!({"name": name, "status": "completed", "conclusion": other})
+                            }
                         })
                         .collect();
                     json_reply(200, &json!({"total_count": runs.len(), "check_runs": runs}))
@@ -329,8 +350,10 @@ impl Fake {
                     } else {
                         "pending"
                     };
-                    let statuses: Vec<Value> =
-                        states.iter().map(|s| json!({"status": s})).collect();
+                    let statuses: Vec<Value> = checks
+                        .iter()
+                        .map(|(name, state)| json!({"context": name, "status": state}))
+                        .collect();
                     json_reply(
                         200,
                         &json!({"state": overall, "total_count": statuses.len(), "statuses": statuses}),

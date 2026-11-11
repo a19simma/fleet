@@ -11,9 +11,10 @@ use fleet_core::host::{HostKind, HostName};
 use fleet_forge::contract::{AdapterSubject, Case, Finding, Op, run_contract};
 use fleet_forge::fake::{Fake, Shape};
 use fleet_forge::{
-    Credential, ForgeApi, ForgeError, ForgeGit, Git, GitCommand, GitError, GitOp, GitOutput,
-    GiteaForge, GiteaGit, Http, HttpError, HttpRequest, HttpResponse, MAX_BODY_BYTES, Method,
-    Permission, PushTarget, RepoAccess, RepoRef, Token, Verified,
+    CheckState, CiCheck, Credential, ForgeApi, ForgeError, ForgeGit, Git, GitCommand, GitError,
+    GitOp, GitOutput, GiteaForge, GiteaGit, Http, HttpError, HttpRequest, HttpResponse,
+    MAX_BODY_BYTES, MAX_CHECK_NAME_BYTES, MAX_CHECKS, Method, Permission, PushTarget, RepoAccess,
+    RepoRef, Token, Verified,
 };
 
 type TestResult = Result<(), Box<dyn Error>>;
@@ -50,6 +51,14 @@ impl<A: ForgeApi> ForgeApi for ApiOnly<A> {
         pr_url: &str,
     ) -> impl Future<Output = Result<CiResult, ForgeError>> + Send {
         self.0.ci_result(target, pr_url)
+    }
+
+    fn ci_checks(
+        &self,
+        target: &PushTarget,
+        pr_url: &str,
+    ) -> impl Future<Output = Result<Vec<CiCheck>, ForgeError>> + Send {
+        self.0.ci_checks(target, pr_url)
     }
 }
 
@@ -1510,6 +1519,229 @@ async fn ci_result_refuses_a_foreign_pull_url_before_any_request() -> TestResult
     );
     let script = Script::default();
     let got = forge(&script).ci_result(&target_for(other)?, PR_URL).await;
+    assert_eq!(got.err(), Some(ForgeError::HostMismatch));
+    assert_eq!(script.seen().len(), 0);
+    Ok(())
+}
+
+fn named_statuses(items: &[(&str, &str)]) -> String {
+    let list: Vec<String> = items
+        .iter()
+        .map(|(context, status)| {
+            let context = serde_json::Value::from(*context);
+            format!(r#"{{"context":{context},"status":"{status}"}}"#)
+        })
+        .collect();
+    format!(
+        r#"{{"state":"x","total_count":{},"statuses":[{}]}}"#,
+        list.len(),
+        list.join(",")
+    )
+}
+
+fn named_runs(items: &[(&str, &str, Option<&str>)]) -> String {
+    let list: Vec<String> = items
+        .iter()
+        .map(|(name, status, conclusion)| {
+            let name = serde_json::Value::from(*name);
+            conclusion.map_or_else(
+                || format!(r#"{{"name":{name},"status":"{status}"}}"#),
+                |c| format!(r#"{{"name":{name},"status":"{status}","conclusion":"{c}"}}"#),
+            )
+        })
+        .collect();
+    format!(
+        r#"{{"total_count":{},"workflow_runs":[{}]}}"#,
+        list.len(),
+        list.join(",")
+    )
+}
+
+fn pair(name: &str, state: CheckState) -> (String, CheckState) {
+    (name.to_owned(), state)
+}
+
+async fn checks_from(script: &Script) -> Result<Vec<(String, CheckState)>, ForgeError> {
+    let target = target().map_err(|_| ForgeError::Malformed)?;
+    let list = forge(script).ci_checks(&target, PR_URL).await?;
+    Ok(list
+        .iter()
+        .map(|c| (c.name().to_owned(), c.state()))
+        .collect())
+}
+
+fn status_script(body: &str) -> Script {
+    Script::default()
+        .reply(200, &head_of("abc123"))
+        .reply(200, body)
+}
+
+#[tokio::test]
+async fn ci_checks_lists_the_statuses_in_order_and_keeps_duplicates() -> TestResult {
+    let script = status_script(&named_statuses(&[
+        ("build", "success"),
+        ("build", "pending"),
+        ("docs", "skipped"),
+        ("lint", "failure"),
+        ("e2e", "error"),
+        ("sec", "warning"),
+    ]));
+    assert_eq!(
+        checks_from(&script).await?,
+        [
+            pair("build", CheckState::Success),
+            pair("build", CheckState::Running),
+            pair("docs", CheckState::Neutral),
+            pair("lint", CheckState::Failed),
+            pair("e2e", CheckState::Failed),
+            pair("sec", CheckState::Failed),
+        ]
+    );
+    let seen = script.seen();
+    let paths: Vec<&str> = seen.iter().map(|r| r.path.as_str()).collect();
+    assert_eq!(
+        paths,
+        [
+            "/api/v1/repos/octo/widgets/pulls/7",
+            "/api/v1/repos/octo/widgets/commits/abc123/status?page=1&limit=50",
+        ]
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn ci_checks_reads_the_runs_only_when_the_statuses_are_empty() -> TestResult {
+    let script = Script::default()
+        .reply(200, &head_of("abc123"))
+        .reply(200, &named_statuses(&[]))
+        .reply(
+            200,
+            &named_runs(&[
+                ("ci", "completed", Some("success")),
+                ("ci", "in_progress", None),
+                ("fmt", "queued", None),
+                ("old", "completed", Some("skipped")),
+                ("bad", "completed", Some("failure")),
+            ]),
+        );
+    assert_eq!(
+        checks_from(&script).await?,
+        [
+            pair("ci", CheckState::Success),
+            pair("ci", CheckState::Running),
+            pair("fmt", CheckState::Queued),
+            pair("old", CheckState::Neutral),
+            pair("bad", CheckState::Failed),
+        ]
+    );
+    assert_eq!(script.seen().len(), 3);
+    let none = Script::default()
+        .reply(200, &head_of("abc123"))
+        .reply(200, &named_statuses(&[]))
+        .reply(200, &named_runs(&[]));
+    assert_eq!(checks_from(&none).await?.len(), 0);
+    Ok(())
+}
+
+#[tokio::test]
+async fn ci_checks_fails_closed_on_a_full_page_and_accepts_one_short_of_it() -> TestResult {
+    let names: Vec<String> = (0..MAX_CHECKS).map(|i| format!("check-{i}")).collect();
+    let refs: Vec<(&str, &str)> = names.iter().map(|n| (n.as_str(), "success")).collect();
+    let short = status_script(&named_statuses(&refs[..MAX_CHECKS - 1]));
+    assert_eq!(checks_from(&short).await?.len(), MAX_CHECKS - 1);
+    let full = status_script(&named_statuses(&refs));
+    assert_eq!(checks_from(&full).await.err(), Some(ForgeError::Malformed));
+    let over =
+        status_script(&named_statuses(&refs).replace(r#""total_count":50"#, r#""total_count":51"#));
+    assert_eq!(checks_from(&over).await.err(), Some(ForgeError::Malformed));
+    Ok(())
+}
+
+#[tokio::test]
+async fn ci_checks_refuses_a_missing_or_hostile_name_and_ci_result_does_not() -> TestResult {
+    let long = "x".repeat(MAX_CHECK_NAME_BYTES + 1);
+    for name in [
+        "",
+        "a\nb",
+        "a\u{2028}b",
+        "a\u{202e}b",
+        "a\u{85}b",
+        "a\rb",
+        long.as_str(),
+    ] {
+        let got = checks_from(&status_script(&named_statuses(&[(name, "success")]))).await;
+        assert_eq!(got.err(), Some(ForgeError::Malformed), "status {name:?}");
+        let script = Script::default()
+            .reply(200, &head_of("abc123"))
+            .reply(200, &named_statuses(&[]))
+            .reply(200, &named_runs(&[(name, "completed", Some("success"))]));
+        assert_eq!(
+            checks_from(&script).await.err(),
+            Some(ForgeError::Malformed),
+            "run {name:?}"
+        );
+        let script = status_script(&named_statuses(&[(name, "success")]));
+        assert_eq!(
+            forge(&script).ci_result(&target()?, PR_URL).await?,
+            CiResult::Success,
+            "{name:?}"
+        );
+    }
+    let nameless = r#"{"total_count":1,"statuses":[{"status":"success"}]}"#;
+    assert_eq!(
+        checks_from(&status_script(nameless)).await.err(),
+        Some(ForgeError::Malformed)
+    );
+    let numeric = r#"{"total_count":1,"statuses":[{"context":7,"status":"success"}]}"#;
+    assert_eq!(
+        checks_from(&status_script(numeric)).await.err(),
+        Some(ForgeError::Malformed)
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn ci_checks_fails_closed_exactly_where_ci_result_does() -> TestResult {
+    let short = r#"{"total_count":2,"statuses":[{"context":"a","status":"success"}]}"#;
+    assert_eq!(
+        checks_from(&status_script(short)).await.err(),
+        Some(ForgeError::Malformed)
+    );
+    let weird = named_statuses(&[("a", "weird")]);
+    assert_eq!(
+        checks_from(&status_script(&weird)).await.err(),
+        Some(ForgeError::Malformed)
+    );
+    for status in [401, 403, 404, 429, 503] {
+        let script = Script::default().reply(status, "{}");
+        let ours = forge(&script).ci_checks(&target()?, PR_URL).await.err();
+        let script = Script::default().reply(status, "{}");
+        let theirs = forge(&script).ci_result(&target()?, PR_URL).await.err();
+        assert_eq!(ours, theirs, "{status}");
+        assert!(ours.is_some(), "{status}");
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn ci_checks_refuses_a_foreign_pull_url_and_credential_before_any_request() -> TestResult {
+    for url in [
+        "",
+        "https://git.example.com/octo/other/pulls/7",
+        "https://git.example.com@evil.example/octo/widgets/pulls/7",
+        "https://git.example.com/octo/widgets/pulls/0",
+    ] {
+        let script = Script::default();
+        let got = forge(&script).ci_checks(&target()?, url).await;
+        assert_eq!(got.err(), Some(ForgeError::Malformed), "{url:?}");
+        assert!(script.seen().is_empty(), "{url:?}");
+    }
+    let other = RepoAccess::new(
+        RepoRef::new(host("git.example.com")?, "octo", "widgets")?,
+        Credential::new(host("other.example.com")?, Token::new(TOKEN.to_owned())?),
+    );
+    let script = Script::default();
+    let got = forge(&script).ci_checks(&target_for(other)?, PR_URL).await;
     assert_eq!(got.err(), Some(ForgeError::HostMismatch));
     assert_eq!(script.seen().len(), 0);
     Ok(())
