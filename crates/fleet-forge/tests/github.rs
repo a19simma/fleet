@@ -8,12 +8,12 @@ use std::sync::{Arc, Mutex, PoisonError};
 
 use fleet_core::forge::CiResult;
 use fleet_core::host::{HostKind, HostName};
-use fleet_forge::contract::{AdapterSubject, Case, Finding, Op, run_contract};
+use fleet_forge::contract::{AdapterSubject, Case, Op, run_contract};
 use fleet_forge::fake::{Fake, Shape};
 use fleet_forge::{
-    Credential, ForgeApi, ForgeError, ForgeGit, GitHubForge, Http, HttpError, HttpRequest,
-    HttpResponse, MAX_BODY_BYTES, Method, Permission, PushTarget, RepoAccess, RepoRef, Token,
-    Verified,
+    Credential, ForgeApi, ForgeError, ForgeGit, Git, GitCommand, GitError, GitHubForge, GitOp,
+    GitOutput, Http, HttpError, HttpRequest, HttpResponse, MAX_BODY_BYTES, Method, Permission,
+    PushTarget, RepoAccess, RepoRef, Token,
 };
 
 type TestResult = Result<(), Box<dyn Error>>;
@@ -22,84 +22,69 @@ type Items<'a> = Vec<(&'a str, Option<&'a str>)>;
 const TOKEN: &str = "0123456789abcdef0123456789abcdef01234567";
 const PR_URL: &str = "https://github.com/octo/widgets/pull/7";
 
-struct ApiOnly<A>(A);
-
-impl<A: ForgeApi> ForgeApi for ApiOnly<A> {
-    fn identify(
-        &self,
-        host: &HostName,
-    ) -> impl Future<Output = Result<HostKind, ForgeError>> + Send {
-        self.0.identify(host)
-    }
-
-    fn verify(
-        &self,
-        access: &RepoAccess,
-    ) -> impl Future<Output = Result<Verified, ForgeError>> + Send {
-        self.0.verify(access)
-    }
-
-    fn create_pr(
-        &self,
-        target: &PushTarget,
-        title: &str,
-        body: &str,
-    ) -> impl Future<Output = Result<String, ForgeError>> + Send {
-        self.0.create_pr(target, title, body)
-    }
-
-    fn ci_result(
-        &self,
-        target: &PushTarget,
-        pr_url: &str,
-    ) -> impl Future<Output = Result<CiResult, ForgeError>> + Send {
-        self.0.ci_result(target, pr_url)
-    }
-}
-
-impl<A: Send + Sync> ForgeGit for ApiOnly<A> {
-    fn fetch(&self, _: &RepoAccess) -> impl Future<Output = Result<String, ForgeError>> + Send {
-        std::future::ready(Err(ForgeError::Unavailable))
-    }
-
-    fn push(&self, _: &PushTarget) -> impl Future<Output = Result<String, ForgeError>> + Send {
-        std::future::ready(Err(ForgeError::Unavailable))
-    }
-}
-
-const fn case_of(finding: &Finding) -> Case {
-    match finding {
-        Finding::FakeLacksCase(case)
-        | Finding::SubjectLacksCase(case)
-        | Finding::AuthorizationReplayed(case)
-        | Finding::TokenLeaked(case)
-        | Finding::Mismatch { case, .. }
-        | Finding::Calls { case, .. } => *case,
-    }
-}
-
 #[tokio::test]
-async fn every_forge_api_case_passes_on_the_github_fake() {
-    let subject = AdapterSubject(|fake: &Fake| ApiOnly(GitHubForge::new(fake.clone())));
+async fn every_case_passes_on_the_github_fake() {
+    let subject = AdapterSubject(|fake: &Fake| GitHubForge::new(fake.clone(), fake.clone()));
     let report = run_contract(&subject, Shape::GitHub, || Fake::new(Shape::GitHub)).await;
-    let api_findings: Vec<String> = report
-        .findings
+    let findings: Vec<String> = report.findings.iter().map(ToString::to_string).collect();
+    assert!(findings.is_empty(), "{findings:?}");
+    assert_eq!(report.ran.len(), Case::ALL.len());
+    assert_eq!(Case::ALL.len(), 30);
+    let git_cases = Case::ALL
         .iter()
-        .filter(|f| !matches!(case_of(f).op(), Op::Push | Op::Fetch))
-        .map(ToString::to_string)
-        .collect();
-    assert!(api_findings.is_empty(), "{api_findings:?}");
-    let api_cases = Case::ALL
-        .iter()
-        .filter(|c| !matches!(c.op(), Op::Push | Op::Fetch))
+        .filter(|c| matches!(c.op(), Op::Push | Op::Fetch))
         .count();
-    let ran_api = report
-        .ran
-        .iter()
-        .filter(|c| !matches!(c.op(), Op::Push | Op::Fetch))
-        .count();
-    assert_eq!(ran_api, api_cases);
-    assert_eq!(api_cases, 25);
+    assert_eq!(git_cases, 5);
+}
+
+#[derive(Clone, Default)]
+struct GitScript {
+    outputs: Arc<Mutex<VecDeque<Result<GitOutput, GitError>>>>,
+    seen: Arc<Mutex<Vec<GitCommand>>>,
+}
+
+impl GitScript {
+    fn output(self, code: i32, stderr: &str) -> Self {
+        self.push(Ok(GitOutput {
+            code,
+            stderr: stderr.to_owned(),
+        }))
+    }
+
+    fn fail(self, error: GitError) -> Self {
+        self.push(Err(error))
+    }
+
+    fn push(self, reply: Result<GitOutput, GitError>) -> Self {
+        self.outputs
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .push_back(reply);
+        self
+    }
+
+    fn seen(&self) -> Vec<GitCommand> {
+        self.seen
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()
+    }
+}
+
+impl Git for GitScript {
+    fn run(&self, command: GitCommand) -> impl Future<Output = Result<GitOutput, GitError>> + Send {
+        self.seen
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .push(command);
+        let reply = self
+            .outputs
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .pop_front()
+            .unwrap_or(Err(GitError::Spawn));
+        std::future::ready(reply)
+    }
 }
 
 #[derive(Clone, Default)]
@@ -182,8 +167,8 @@ fn target() -> Result<PushTarget, Box<dyn Error>> {
     Ok(PushTarget::new(access()?, "fleet/job-1", "main")?)
 }
 
-fn forge(script: &Script) -> GitHubForge<Script> {
-    GitHubForge::new(script.clone())
+fn forge(script: &Script) -> GitHubForge<Script, GitScript> {
+    GitHubForge::new(script.clone(), GitScript::default())
 }
 
 fn pull(sha: &str) -> String {
@@ -921,5 +906,353 @@ fn the_adapter_prints_no_token() -> TestResult {
     let script = Script::default();
     let text = format!("{:?} {:?}", forge(&script), access()?);
     assert!(!text.contains(TOKEN));
+    Ok(())
+}
+
+fn git_forge(git: &GitScript) -> GitHubForge<Script, GitScript> {
+    GitHubForge::new(Script::default(), git.clone())
+}
+
+#[tokio::test]
+async fn push_runs_one_command_for_the_validated_target() -> TestResult {
+    let git = GitScript::default().output(0, "To https://github.com/octo/widgets.git\n");
+    let status = git_forge(&git).push(&target()?).await?;
+    assert_eq!(status, "pushed");
+    let seen = git.seen();
+    assert_eq!(seen.len(), 1);
+    let command = &seen[0];
+    assert_eq!(command.op, GitOp::Push);
+    assert_eq!(command.branch.as_deref(), Some("fleet/job-1"));
+    assert_eq!(command.repo.host().as_str(), "github.com");
+    assert_eq!(command.repo.owner(), "octo");
+    assert_eq!(command.repo.repo(), "widgets");
+    assert_eq!(command.credential.host().as_str(), "github.com");
+    Ok(())
+}
+
+#[tokio::test]
+async fn fetch_runs_one_command_with_no_branch() -> TestResult {
+    let git = GitScript::default().output(0, "");
+    let status = git_forge(&git).fetch(&access()?).await?;
+    assert_eq!(status, "fetched");
+    let seen = git.seen();
+    assert_eq!(seen.len(), 1);
+    assert_eq!(seen[0].op, GitOp::Fetch);
+    assert_eq!(seen[0].branch, None);
+    assert_eq!(seen[0].repo.owner(), "octo");
+    Ok(())
+}
+
+#[tokio::test]
+async fn the_command_text_never_holds_the_token() -> TestResult {
+    let git = GitScript::default().output(0, "");
+    git_forge(&git).push(&target()?).await?;
+    let text = format!("{:?}", git.seen());
+    assert!(!text.contains(TOKEN), "{text}");
+    Ok(())
+}
+
+#[tokio::test]
+async fn push_refuses_a_branch_git_would_refuse_before_running_anything() -> TestResult {
+    for branch in [
+        "a/.hidden",
+        ".hidden",
+        "x.lock",
+        "a.lock/b",
+        "a/b.lock",
+        "a.LOCK",
+        "a/B.Lock",
+    ] {
+        let git = GitScript::default().output(0, "");
+        let target = PushTarget::new(access()?, branch, "main")?;
+        let got = git_forge(&git).push(&target).await;
+        assert_eq!(got, Err(ForgeError::Malformed), "{branch:?}");
+        assert!(git.seen().is_empty(), "{branch:?}");
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn push_accepts_the_branch_edges() -> TestResult {
+    for branch in ["a", "fleet/job-1", "a.b/c_d", "v1.0", "a.lockx", "lock"] {
+        let git = GitScript::default().output(0, "");
+        let target = PushTarget::new(access()?, branch, "main")?;
+        assert_eq!(git_forge(&git).push(&target).await?, "pushed", "{branch:?}");
+        assert_eq!(git.seen()[0].branch.as_deref(), Some(branch));
+    }
+    Ok(())
+}
+
+#[test]
+fn hostile_branches_never_reach_a_push_target() -> TestResult {
+    let long = "a".repeat(256);
+    let hostile = [
+        "",
+        "-x",
+        "--upload-pack=x",
+        "/a",
+        "a/",
+        "a.",
+        "a..b",
+        "..",
+        "a//b",
+        "a\\b",
+        "a b",
+        "a\tb",
+        "a\rb",
+        "a\nb",
+        "a\r\nb",
+        "a\0b",
+        "a\u{7f}b",
+        "a\u{85}b",
+        "a\u{2028}b",
+        "a:b",
+        "a?b",
+        "a*b",
+        "a[b",
+        "a~b",
+        "a^b",
+        "a@{b",
+        "a@b",
+        "a%2fb",
+        "é",
+        long.as_str(),
+    ];
+    for branch in hostile {
+        assert!(
+            PushTarget::new(access()?, branch, "main").is_err(),
+            "{branch:?}"
+        );
+        assert!(
+            PushTarget::new(access()?, "main", branch).is_err(),
+            "{branch:?}"
+        );
+    }
+    Ok(())
+}
+
+#[test]
+fn hostile_owner_and_repo_never_reach_a_repo_ref() -> TestResult {
+    let long = "a".repeat(101);
+    let hostile = [
+        "",
+        ".",
+        "..",
+        "a/b",
+        "a\\b",
+        "a b",
+        "a\rb",
+        "a\nb",
+        "a\r\nb",
+        "a\0b",
+        "a@b",
+        "a:b",
+        "a?b",
+        "a#b",
+        "a%2fb",
+        "é",
+        "a\u{85}b",
+        "a\u{2028}b",
+        long.as_str(),
+    ];
+    for text in hostile {
+        let github = host("github.com")?;
+        assert!(
+            RepoRef::new(github.clone(), text, "widgets").is_err(),
+            "{text:?}"
+        );
+        assert!(RepoRef::new(github, "octo", text).is_err(), "{text:?}");
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_foreign_host_or_credential_runs_no_command() -> TestResult {
+    let git = GitScript::default().output(0, "").output(0, "");
+    let forge = git_forge(&git);
+    let off = access_on("git.example.com", "git.example.com")?;
+    let mismatch = access_on("github.com", "git.example.com")?;
+    assert_eq!(forge.fetch(&off).await, Err(ForgeError::WrongKind));
+    assert_eq!(forge.fetch(&mismatch).await, Err(ForgeError::HostMismatch));
+    assert_eq!(
+        forge
+            .push(&PushTarget::new(off, "fleet/job-1", "main")?)
+            .await,
+        Err(ForgeError::WrongKind)
+    );
+    assert_eq!(
+        forge
+            .push(&PushTarget::new(mismatch, "fleet/job-1", "main")?)
+            .await,
+        Err(ForgeError::HostMismatch)
+    );
+    assert_eq!(git.seen().len(), 0);
+    Ok(())
+}
+
+#[tokio::test]
+async fn runner_failures_map_to_fixed_errors() -> TestResult {
+    let git = GitScript::default()
+        .fail(GitError::Spawn)
+        .fail(GitError::Timeout)
+        .fail(GitError::Spawn)
+        .fail(GitError::Timeout);
+    let forge = git_forge(&git);
+    assert_eq!(forge.push(&target()?).await, Err(ForgeError::Unavailable));
+    assert_eq!(forge.push(&target()?).await, Err(ForgeError::Timeout));
+    assert_eq!(forge.fetch(&access()?).await, Err(ForgeError::Unavailable));
+    assert_eq!(forge.fetch(&access()?).await, Err(ForgeError::Timeout));
+    Ok(())
+}
+
+#[tokio::test]
+async fn push_classifies_stderr_into_fixed_errors() -> TestResult {
+    let cases: [(i32, &str, ForgeError); 14] = [
+        (
+            128,
+            "fatal: could not read Password for 'https://github.com'",
+            ForgeError::Unauthorized,
+        ),
+        (
+            22,
+            "error: The requested URL returned error: 401",
+            ForgeError::Unauthorized,
+        ),
+        (
+            1,
+            " ! [rejected] a -> a (non-fast-forward)",
+            ForgeError::NonFastForward,
+        ),
+        (
+            1,
+            " ! [rejected] a -> a (fetch first)",
+            ForgeError::NonFastForward,
+        ),
+        (
+            1,
+            " ! [REJECTED] a -> a (NON-FAST-FORWARD)",
+            ForgeError::NonFastForward,
+        ),
+        (
+            128,
+            "fatal: Authentication failed for 'https://github.com/o/r.git/'",
+            ForgeError::Unauthorized,
+        ),
+        (
+            128,
+            "remote: Invalid username or password.",
+            ForgeError::Unauthorized,
+        ),
+        (
+            128,
+            "fatal: could not read Username for 'https://github.com'",
+            ForgeError::Unauthorized,
+        ),
+        (
+            128,
+            "remote: Permission to o/r.git denied to x.",
+            ForgeError::Unauthorized,
+        ),
+        (
+            22,
+            "error: The requested URL returned error: 403",
+            ForgeError::Unauthorized,
+        ),
+        (128, "remote: Repository not found.", ForgeError::NotFound),
+        (
+            1,
+            "non-fast-forward but also Authentication failed",
+            ForgeError::Unauthorized,
+        ),
+        (1, "something else entirely", ForgeError::Rejected),
+        (255, "", ForgeError::Rejected),
+    ];
+    for (code, stderr, want) in cases {
+        let git = GitScript::default().output(code, stderr);
+        let got = git_forge(&git).push(&target()?).await;
+        assert_eq!(got, Err(want), "{stderr:?}");
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn fetch_never_reports_non_fast_forward() -> TestResult {
+    let cases: [(&str, ForgeError); 3] = [
+        ("non-fast-forward", ForgeError::Rejected),
+        ("fatal: Authentication failed", ForgeError::Unauthorized),
+        ("remote: Repository not found.", ForgeError::NotFound),
+    ];
+    for (stderr, want) in cases {
+        let git = GitScript::default().output(128, stderr);
+        assert_eq!(
+            git_forge(&git).fetch(&access()?).await,
+            Err(want),
+            "{stderr:?}"
+        );
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_marker_past_the_stderr_cap_is_ignored() -> TestResult {
+    let padding = "x".repeat(8 * 1024);
+    let late = format!("{padding}non-fast-forward");
+    let git = GitScript::default().output(1, &late);
+    assert_eq!(
+        git_forge(&git).push(&target()?).await,
+        Err(ForgeError::Rejected)
+    );
+    let one_over = format!("{}non-fast-forward", "x".repeat(8 * 1024 - 15));
+    let git = GitScript::default().output(1, &one_over);
+    assert_eq!(
+        git_forge(&git).push(&target()?).await,
+        Err(ForgeError::Rejected)
+    );
+    let inside = format!("{}non-fast-forward", "x".repeat(8 * 1024 - 16));
+    let git = GitScript::default().output(1, &inside);
+    assert_eq!(
+        git_forge(&git).push(&target()?).await,
+        Err(ForgeError::NonFastForward)
+    );
+    let wide = format!("{}é non-fast-forward", "é".repeat(4096));
+    let git = GitScript::default().output(1, &wide);
+    assert_eq!(
+        git_forge(&git).push(&target()?).await,
+        Err(ForgeError::Rejected)
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn no_runner_text_reaches_a_status_or_an_error() -> TestResult {
+    let hostile = [
+        format!(
+            "fatal: Authentication failed for 'https://x-access-token:{TOKEN}@github.com/o/r.git/'"
+        ),
+        format!("{TOKEN} non-fast-forward"),
+        format!("remote: Repository not found. {TOKEN}"),
+        format!("{TOKEN}\r\nX-Injected: 1"),
+        TOKEN.to_owned(),
+    ];
+    for stderr in &hostile {
+        for code in [0, 1, 128] {
+            let git = GitScript::default()
+                .output(code, stderr)
+                .output(code, stderr);
+            let forge = git_forge(&git);
+            for got in [forge.push(&target()?).await, forge.fetch(&access()?).await] {
+                let text = match got {
+                    Ok(text) => {
+                        assert!(text == "pushed" || text == "fetched", "{text:?}");
+                        text
+                    }
+                    Err(error) => error.to_string(),
+                };
+                assert!(!text.contains(TOKEN), "{text}");
+                assert!(!text.contains("x-access-token"), "{text}");
+                assert!(!text.contains("X-Injected"), "{text}");
+            }
+        }
+    }
     Ok(())
 }

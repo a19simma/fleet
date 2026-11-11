@@ -2,7 +2,7 @@
 //! [`Git`] seams, in-process fake servers and the contract harness.
 //!
 //! No item here reads the environment. A caller injects a seam, and tests inject a [`fake::Fake`].
-//! [`GitHubForge`] implements [`ForgeApi`] over REST. [`GiteaForge`] implements `identify` for
+//! [`GitHubForge`] implements [`ForgeApi`] over REST and [`ForgeGit`] through the [`Git`] seam. [`GiteaForge`] implements `identify` for
 //! Gitea and Forgejo.
 
 mod api;
