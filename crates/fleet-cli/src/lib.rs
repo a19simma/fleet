@@ -6,6 +6,7 @@ pub mod config;
 pub mod credential;
 pub mod edit;
 pub mod env;
+pub mod host;
 pub mod list;
 pub mod logs;
 pub mod patch;
@@ -30,6 +31,7 @@ use fleet_proto::v1::fleet_batches_client::FleetBatchesClient;
 use fleet_proto::v1::fleet_credentials_client::FleetCredentialsClient;
 use fleet_proto::v1::fleet_edit_client::FleetEditClient;
 use fleet_proto::v1::fleet_environments_client::FleetEnvironmentsClient;
+use fleet_proto::v1::fleet_hosts_client::FleetHostsClient;
 use fleet_proto::v1::fleet_jobs_client::FleetJobsClient;
 use fleet_proto::v1::fleet_profiles_client::FleetProfilesClient;
 use fleet_proto::v1::fleet_query_client::FleetQueryClient;
@@ -217,6 +219,12 @@ pub enum Command {
         #[command(subcommand)]
         action: credential::CredentialAction,
     },
+    /// Add, list and remove git hosts. Removing a host is for admins.
+    Host {
+        /// The host action.
+        #[command(subcommand)]
+        action: host::HostAction,
+    },
     /// Add, list and remove the repositories you work on. Each add is checked with the forge.
     Repo {
         /// The repository action.
@@ -372,6 +380,8 @@ pub enum CliError {
     NoTimingReport,
     /// A credential command ended in a fixed notice. It holds no server text or input.
     Credential(CredentialNotice),
+    /// A command was refused with fixed text that is not a credential notice.
+    Refused(&'static str),
     /// `edit apply` refused or failed. The message is fixed text and scrubbed git output.
     Apply(String),
 }
@@ -399,6 +409,7 @@ impl CliError {
             | Self::Io(_)
             | Self::JobEnded(_)
             | Self::Apply(_)
+            | Self::Refused(_)
             | Self::Credential(_) => 1,
         }
     }
@@ -562,6 +573,7 @@ impl fmt::Display for CliError {
         match self {
             Self::Config(e) => write!(f, "{e}"),
             Self::Usage(m) | Self::Apply(m) => write!(f, "{m}"),
+            Self::Refused(m) => f.write_str(m),
             Self::Connect(m) => write!(f, "cannot connect: {m}"),
             Self::Rpc(s) => write!(
                 f,
@@ -606,6 +618,7 @@ struct Session {
     profiles: profile::ProfilesClient,
     batches: batch::BatchesClient,
     credentials: credential::CredentialsClient,
+    hosts: host::HostsClient,
     repos: repo::ReposClient,
     work: work::WorkClient,
     retro: retro::RetroClient,
@@ -785,6 +798,8 @@ async fn session(env: &Resolution, timeouts: bool) -> Result<Session, CliError> 
             .max_decoding_message_size(MAX_DECODE_BYTES),
         credentials: FleetCredentialsClient::with_interceptor(channel.clone(), token.clone())
             .max_decoding_message_size(MAX_DECODE_BYTES),
+        hosts: FleetHostsClient::with_interceptor(channel.clone(), token.clone())
+            .max_decoding_message_size(MAX_DECODE_BYTES),
         repos: FleetReposClient::with_interceptor(channel.clone(), token.clone())
             .max_decoding_message_size(MAX_DECODE_BYTES),
         work: FleetWorkClient::with_interceptor(channel.clone(), token.clone())
@@ -943,6 +958,31 @@ async fn run_env(
     let call = action.prepare(stdin, tty)?;
     let mut session = session(env, timeouts).await?;
     env::execute(call, &mut session.environments, &session.scrub, out).await
+}
+
+async fn run_host(
+    action: host::HostAction,
+    env: &Resolution,
+    timeouts: bool,
+    out: &mut impl Write,
+) -> Result<(), CliError> {
+    action.no_stray()?;
+    match action {
+        host::HostAction::Add { host: text, .. } => {
+            let name = host::parse_host(&text)?;
+            let mut session = session(env, timeouts).await?;
+            host::add(&mut session.hosts, &session.scrub, &name, out).await
+        }
+        host::HostAction::List { .. } => {
+            let mut session = session(env, timeouts).await?;
+            host::list(&mut session.hosts, &session.scrub, out).await
+        }
+        host::HostAction::Remove { host: text, .. } => {
+            let name = host::parse_host(&text)?;
+            let mut session = session(env, timeouts).await?;
+            host::remove(&mut session.hosts, &name, out).await
+        }
+    }
 }
 
 async fn run_repo(
@@ -1300,10 +1340,11 @@ async fn dispatch(
             run_batch(action, env, timeouts, stdin, out).await?;
         }
         Command::Profile { action } => {
-            run_profile(action, env, timeouts, stdin, out).await?;
+            Box::pin(run_profile(action, env, timeouts, stdin, out)).await?;
         }
         Command::Credential { action } => run_credential(action, env, timeouts, stdin, out).await?,
         Command::Env { action } => run_env(action, env, timeouts, tty, stdin, out).await?,
+        Command::Host { action } => run_host(action, env, timeouts, out).await?,
         Command::Repo { action } => run_repo(action, env, timeouts, out).await?,
         Command::Work(args) => run_work(args, env, timeouts, stdin, out).await?,
         family @ (Command::Retro(_)
