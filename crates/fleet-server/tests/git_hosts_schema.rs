@@ -208,3 +208,59 @@ async fn host_requests_default_to_pending_and_refuse_other_status(pool: PgPool) 
         Some("git_host_requests_status_check")
     );
 }
+
+const CHECK_VIOLATION: &str = "23514";
+
+fn sqlstate(err: &sqlx::Error) -> Option<String> {
+    err.as_database_error()
+        .and_then(sqlx::error::DatabaseError::code)
+        .map(Cow::into_owned)
+}
+
+async fn request(pool: &PgPool, user_id: i64, name: &str) -> Result<(), sqlx::Error> {
+    sqlx::query("INSERT INTO git_host_requests (host, user_id) VALUES ($1, $2)")
+        .bind(name)
+        .bind(user_id)
+        .execute(pool)
+        .await
+        .map(drop)
+}
+
+#[sqlx::test(migrations = false)]
+async fn git_hosts_host_length_check_bounds(pool: PgPool) {
+    migrate_all(&pool).await;
+    for bad in [String::new(), "a".repeat(254)] {
+        let err = host(&pool, &bad, "forgejo", false, "{}").await.unwrap_err();
+        assert_eq!(sqlstate(&err).as_deref(), Some(CHECK_VIOLATION));
+        assert_eq!(constraint(&err).as_deref(), Some("git_hosts_host_check"));
+    }
+    host(&pool, &"a".repeat(253), "forgejo", false, "{}")
+        .await
+        .unwrap();
+    let stored: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM git_hosts WHERE host <> 'github.com'")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(stored, 1);
+}
+
+#[sqlx::test(migrations = false)]
+async fn git_host_requests_host_length_check_bounds(pool: PgPool) {
+    migrate_all(&pool).await;
+    let alice = user(&pool, "alice").await;
+    for bad in [String::new(), "a".repeat(254)] {
+        let err = request(&pool, alice, &bad).await.unwrap_err();
+        assert_eq!(sqlstate(&err).as_deref(), Some(CHECK_VIOLATION));
+        assert_eq!(
+            constraint(&err).as_deref(),
+            Some("git_host_requests_host_check")
+        );
+    }
+    request(&pool, alice, &"a".repeat(253)).await.unwrap();
+    let stored: i64 = sqlx::query_scalar("SELECT count(*) FROM git_host_requests")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(stored, 1);
+}
