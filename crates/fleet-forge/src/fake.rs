@@ -265,7 +265,11 @@ impl Fake {
         endpoint: &Endpoint,
         token: &str,
     ) -> Result<HttpResponse, HttpError> {
-        let created = json!({"number": 7, "html_url": self.pr_url()});
+        let created = json!({
+            "number": 7,
+            "html_url": self.pr_url(),
+            "head": {"ref": "fleet/job-1", "repo": {"full_name": "octo/widgets"}},
+        });
         match (case, method, endpoint) {
             (Case::CreatePrOk, Method::Post, Endpoint::Pulls) => json_reply(201, &created),
             (Case::CreatePrExists, Method::Post, Endpoint::Pulls) => match self.shape {

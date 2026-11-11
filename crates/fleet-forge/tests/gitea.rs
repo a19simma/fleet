@@ -95,6 +95,27 @@ async fn every_identify_case_passes_on_the_gitea_fake() {
     assert_eq!(owed, 3);
 }
 
+const fn is_create_pr(case: Case) -> bool {
+    matches!(case.op(), Op::CreatePr)
+}
+
+#[tokio::test]
+async fn every_create_pr_case_passes_on_the_gitea_fake() {
+    let subject = AdapterSubject(|fake: &Fake| ApiOnly(GiteaForge::new(fake.clone())));
+    let report = run_contract(&subject, Shape::Gitea, || Fake::new(Shape::Gitea)).await;
+    let findings: Vec<String> = report
+        .findings
+        .iter()
+        .filter(|f| is_create_pr(case_of(f)))
+        .map(ToString::to_string)
+        .collect();
+    assert!(findings.is_empty(), "{findings:?}");
+    let ran = report.ran.iter().filter(|c| is_create_pr(**c)).count();
+    let owed = Case::ALL.iter().filter(|c| is_create_pr(**c)).count();
+    assert_eq!(ran, owed);
+    assert_eq!(owed, 3);
+}
+
 const fn is_verify(case: Case) -> bool {
     matches!(case.op(), Op::Verify)
 }
@@ -654,13 +675,478 @@ async fn the_other_operations_refuse_until_they_land() -> TestResult {
     let target = PushTarget::new(access, "fleet/job-1", "main")?;
     let adapter = forge(&script);
     assert_eq!(
-        adapter.create_pr(&target, "t", "b").await.err(),
-        Some(ForgeError::Unavailable)
-    );
-    assert_eq!(
         adapter.ci_result(&target, "u").await.err(),
         Some(ForgeError::Unavailable)
     );
     assert_eq!(script.seen().len(), 0);
+    Ok(())
+}
+
+const PR_URL: &str = "https://git.example.com/octo/widgets/pulls/7";
+const EXISTS: &str = r#"{"message":"pull request already exists for these targets [id: 7]"}"#;
+
+fn target_for(access: RepoAccess) -> Result<PushTarget, Box<dyn Error>> {
+    Ok(PushTarget::new(access, "fleet/job-1", "main")?)
+}
+
+fn target() -> Result<PushTarget, Box<dyn Error>> {
+    target_for(access()?)
+}
+
+async fn create(script: &Script) -> Result<String, ForgeError> {
+    forge(script)
+        .create_pr(&target().map_err(|_| ForgeError::Malformed)?, "t", "b")
+        .await
+}
+
+fn created(url: &str) -> String {
+    serde_json::json!({"number": 7, "html_url": url}).to_string()
+}
+
+fn pull(branch: &str, full_name: &str, url: &str) -> serde_json::Value {
+    serde_json::json!({
+        "number": 7,
+        "html_url": url,
+        "head": {"ref": branch, "repo": {"full_name": full_name}},
+    })
+}
+
+fn list(pulls: &[serde_json::Value]) -> String {
+    serde_json::Value::Array(pulls.to_vec()).to_string()
+}
+
+#[tokio::test]
+async fn create_pr_posts_a_pull_with_the_job_branch() -> TestResult {
+    let script = Script::default().reply(201, &created(PR_URL));
+    let url = forge(&script)
+        .create_pr(&target()?, "A \"title\"\r\n\\ \u{0}", "line\nbody \"q\" \\")
+        .await?;
+    assert_eq!(url, PR_URL);
+    let seen = script.seen();
+    assert_eq!(seen.len(), 1);
+    let request = &seen[0];
+    assert_eq!(request.method, Method::Post);
+    assert_eq!(request.host.as_str(), "git.example.com");
+    assert_eq!(request.path, "/api/v1/repos/octo/widgets/pulls");
+    assert_eq!(request.header("content-type"), Some("application/json"));
+    assert_eq!(request.header("accept"), Some("application/json"));
+    assert!(request.header("user-agent").is_some());
+    assert_eq!(
+        request.header("authorization"),
+        Some(&*format!("token {TOKEN}"))
+    );
+    let sent: serde_json::Value = serde_json::from_slice(&request.body)?;
+    assert_eq!(sent["title"], "A \"title\"\r\n\\ \u{0}");
+    assert_eq!(sent["body"], "line\nbody \"q\" \\");
+    assert_eq!(sent["head"], "fleet/job-1");
+    assert_eq!(sent["base"], "main");
+    assert_eq!(sent.as_object().map(serde_json::Map::len), Some(4));
+    assert!(!String::from_utf8_lossy(&request.body).contains(TOKEN));
+    assert!(!request.path.contains(TOKEN));
+    Ok(())
+}
+
+#[tokio::test]
+async fn create_pr_bounds_the_title_and_body_before_any_request() -> TestResult {
+    let adapter_target = target()?;
+    let long_title = "t".repeat(257);
+    let long_body = "b".repeat(64 * 1024 + 1);
+    let cases = [
+        ("", "b"),
+        (long_title.as_str(), "b"),
+        ("t", long_body.as_str()),
+    ];
+    for (title, body) in cases {
+        let script = Script::default().reply(201, &created(PR_URL));
+        let got = forge(&script).create_pr(&adapter_target, title, body).await;
+        assert_eq!(got.err(), Some(ForgeError::Malformed), "{}", title.len());
+        assert_eq!(script.seen().len(), 0);
+    }
+    let edge_title = "t".repeat(256);
+    let edge_body = "b".repeat(64 * 1024);
+    let script = Script::default().reply(201, &created(PR_URL));
+    let got = forge(&script)
+        .create_pr(&adapter_target, &edge_title, &edge_body)
+        .await;
+    assert_eq!(got.ok().as_deref(), Some(PR_URL));
+    let multibyte = "\u{e9}".repeat(129);
+    let script = Script::default().reply(201, &created(PR_URL));
+    let got = forge(&script)
+        .create_pr(&adapter_target, &multibyte, "b")
+        .await;
+    assert_eq!(got.err(), Some(ForgeError::Malformed));
+    Ok(())
+}
+
+#[tokio::test]
+async fn create_pr_refuses_a_foreign_credential_and_sends_nothing() -> TestResult {
+    let script = Script::default().reply(201, &created(PR_URL));
+    let mismatch = target_for(access_for("octo", "widgets", "other.example.com")?)?;
+    let got = forge(&script).create_pr(&mismatch, "t", "b").await;
+    assert_eq!(got.err(), Some(ForgeError::HostMismatch));
+    assert_eq!(script.seen().len(), 0);
+    Ok(())
+}
+
+#[tokio::test]
+async fn create_pr_refuses_a_created_url_it_cannot_trust() {
+    let bad = [
+        "{}".to_owned(),
+        r#"{"html_url":3}"#.to_owned(),
+        r#"{"html_url":null}"#.to_owned(),
+        r#"{"html_url":["x"]}"#.to_owned(),
+        created("https://evil.example/octo/widgets/pulls/7"),
+        created("https://git.example.com.evil.example/octo/widgets/pulls/7"),
+        created("https://user@git.example.com/octo/widgets/pulls/7"),
+        created("https://user:pw@git.example.com/octo/widgets/pulls/7"),
+        created("https://git.example.com@evil.example/octo/widgets/pulls/7"),
+        created("https://git.example.com:8443/octo/widgets/pulls/7"),
+        created("http://git.example.com/octo/widgets/pulls/7"),
+        created("https://git.example.com/octo/other/pulls/7"),
+        created("https://git.example.com/other/widgets/pulls/7"),
+        created("https://git.example.com/octo/widgets/pull/7"),
+        created("https://git.example.com/octo/widgets/issues/7"),
+        created("https://git.example.com/octo/widgets/pulls/"),
+        created("https://git.example.com/octo/widgets/pulls/0"),
+        created("https://git.example.com/octo/widgets/pulls/-1"),
+        created("https://git.example.com/octo/widgets/pulls/+7"),
+        created("https://git.example.com/octo/widgets/pulls/7a"),
+        created("https://git.example.com/octo/widgets/pulls/7/files"),
+        created("https://git.example.com/octo/widgets/pulls/7?x=1"),
+        created("https://git.example.com/octo/widgets/pulls/7#f"),
+        created("https://git.example.com/octo/widgets/pulls/\u{661}"),
+        created("https://git.example.com/octo/widgets/pulls/12345678901"),
+        created("https://git.example.com/octo/widgets/pulls/99999999999999999999"),
+        created("https://git.example.com/octo/widgets/pulls/7\r\nX: y"),
+        created("https://git.example.com/octo/widgets/pulls/7\n"),
+        created("https://git.example.com/octo/widgets/pulls/7 "),
+        created("https://git.example.com\\@evil.example/octo/widgets/pulls/7"),
+        created("https://git.example.com/octo/widgets/pulls/7\u{2028}"),
+        created("https://git.example.com/octo/widgets/pulls/7\u{85}"),
+        created("https://\u{ff47}it.example.com/octo/widgets/pulls/7"),
+        created(""),
+        "[]".to_owned(),
+        "null".to_owned(),
+        "\"x\"".to_owned(),
+        "{".to_owned(),
+        String::new(),
+    ];
+    for body in bad {
+        let script = Script::default().reply(201, &body);
+        assert_eq!(
+            create(&script).await.err(),
+            Some(ForgeError::Malformed),
+            "{body}"
+        );
+        assert_eq!(script.seen().len(), 1);
+    }
+    for status in [200, 202, 204] {
+        let script = Script::default().reply(status, &created(PR_URL));
+        assert_eq!(
+            create(&script).await.err(),
+            Some(ForgeError::Malformed),
+            "{status}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn create_pr_accepts_the_url_in_any_ascii_case_of_host_and_path() {
+    let script = Script::default().reply(
+        201,
+        &created("https://GIT.example.com/OCTO/Widgets/pulls/42"),
+    );
+    assert_eq!(
+        create(&script).await.ok().as_deref(),
+        Some("https://GIT.example.com/OCTO/Widgets/pulls/42")
+    );
+    let script = Script::default().reply(
+        201,
+        &created("https://git.example.com/octo/widgets/pulls/9999999999"),
+    );
+    assert!(create(&script).await.is_ok());
+}
+
+#[tokio::test]
+async fn create_pr_maps_status_codes() {
+    let table = [
+        (401, ForgeError::Unauthorized),
+        (403, ForgeError::Unauthorized),
+        (404, ForgeError::NotFound),
+        (400, ForgeError::Rejected),
+        (409, ForgeError::Rejected),
+        (422, ForgeError::Rejected),
+        (429, ForgeError::Unavailable),
+        (500, ForgeError::Unavailable),
+        (599, ForgeError::Unavailable),
+        (300, ForgeError::Redirected),
+        (301, ForgeError::Redirected),
+        (302, ForgeError::Redirected),
+        (307, ForgeError::Redirected),
+        (399, ForgeError::Redirected),
+        (100, ForgeError::Malformed),
+    ];
+    for (status, expected) in table {
+        let script = Script::default().reply(status, "{}");
+        assert_eq!(create(&script).await.err(), Some(expected), "{status}");
+        assert_eq!(script.seen().len(), 1, "{status}");
+    }
+    let transport = [
+        (HttpError::Timeout, ForgeError::Timeout),
+        (HttpError::Reset, ForgeError::Unavailable),
+        (HttpError::BodyTooLarge, ForgeError::TooLarge),
+        (HttpError::HostRefused, ForgeError::Rejected),
+    ];
+    for (error, expected) in transport {
+        let script = Script::default().fail(error);
+        assert_eq!(create(&script).await.err(), Some(expected));
+    }
+}
+
+#[tokio::test]
+async fn create_pr_checks_the_cap_before_the_status() {
+    for status in [201, 409, 302, 404, 422, 503] {
+        let script = Script::default().raw(status, vec![b' '; MAX_BODY_BYTES + 1]);
+        assert_eq!(
+            create(&script).await.err(),
+            Some(ForgeError::TooLarge),
+            "{status}"
+        );
+        assert_eq!(script.seen().len(), 1);
+    }
+    let mut body = created(PR_URL).into_bytes();
+    body.resize(MAX_BODY_BYTES, b' ');
+    let script = Script::default().raw(201, body);
+    assert_eq!(create(&script).await.ok().as_deref(), Some(PR_URL));
+}
+
+#[tokio::test]
+async fn create_pr_on_an_existing_pull_returns_the_existing_url() -> TestResult {
+    let other = pull(
+        "fleet/job-10",
+        "octo/widgets",
+        "https://git.example.com/octo/widgets/pulls/3",
+    );
+    let mine = pull("fleet/job-1", "octo/widgets", PR_URL);
+    let script = Script::default()
+        .reply(409, EXISTS)
+        .reply(200, &list(&[other, mine]));
+    assert_eq!(create(&script).await?, PR_URL);
+    let seen = script.seen();
+    assert_eq!(seen.len(), 2);
+    assert_eq!(seen[1].method, Method::Get);
+    assert_eq!(seen[1].host.as_str(), "git.example.com");
+    assert_eq!(
+        seen[1].path,
+        "/api/v1/repos/octo/widgets/pulls?state=open&page=1&limit=50"
+    );
+    assert_eq!(
+        seen[1].header("authorization"),
+        Some(&*format!("token {TOKEN}"))
+    );
+    assert_eq!(seen[1].body.len(), 0);
+    Ok(())
+}
+
+#[tokio::test]
+async fn create_pr_exists_detection_is_case_blind_and_exact_to_the_message() {
+    let script = Script::default()
+        .reply(409, r#"{"message":"PULL REQUEST ALREADY EXISTS"}"#)
+        .reply(200, &list(&[pull("fleet/job-1", "octo/widgets", PR_URL)]));
+    assert_eq!(create(&script).await.ok().as_deref(), Some(PR_URL));
+    let other = [
+        r#"{"message":"conflict"}"#,
+        r#"{"message":3}"#,
+        r#"{"message":null}"#,
+        r#"{"errors":["already exists"]}"#,
+        "{}",
+        "[]",
+        "not json",
+        "",
+    ];
+    for body in other {
+        let script = Script::default().reply(409, body);
+        assert_eq!(
+            create(&script).await.err(),
+            Some(ForgeError::Rejected),
+            "{body}"
+        );
+        assert_eq!(script.seen().len(), 1, "{body}");
+    }
+    let script = Script::default().reply(422, EXISTS);
+    assert_eq!(create(&script).await.err(), Some(ForgeError::Rejected));
+    assert_eq!(script.seen().len(), 1);
+}
+
+#[tokio::test]
+async fn the_lookup_matches_the_head_branch_and_repository_exactly() {
+    let url2 = "https://git.example.com/octo/widgets/pulls/2";
+    let wrong = [
+        pull("fleet/job-1x", "octo/widgets", url2),
+        pull("xfleet/job-1", "octo/widgets", url2),
+        pull("Fleet/Job-1", "octo/widgets", url2),
+        pull("fleet/job-1", "fork/widgets", url2),
+        pull("fleet/job-1", "octo/other", url2),
+        serde_json::json!({"html_url": url2, "head": {"ref": "fleet/job-1"}}),
+        serde_json::json!({"html_url": url2, "head": {"ref": "fleet/job-1", "repo": null}}),
+        serde_json::json!({"html_url": url2, "head": {"ref": 3, "repo": {"full_name": "octo/widgets"}}}),
+        serde_json::json!({"html_url": url2, "base": {"ref": "fleet/job-1"}}),
+        serde_json::json!({"html_url": url2}),
+        serde_json::json!("fleet/job-1"),
+        serde_json::json!(null),
+    ];
+    let script = Script::default()
+        .reply(409, EXISTS)
+        .reply(200, &list(&wrong));
+    assert_eq!(create(&script).await.err(), Some(ForgeError::Rejected));
+    let mut mixed = wrong.to_vec();
+    mixed.push(pull("fleet/job-1", "OCTO/Widgets", PR_URL));
+    let script = Script::default()
+        .reply(409, EXISTS)
+        .reply(200, &list(&mixed));
+    assert_eq!(create(&script).await.ok().as_deref(), Some(PR_URL));
+}
+
+#[tokio::test]
+async fn the_lookup_pages_to_a_bound() {
+    let filler: Vec<serde_json::Value> = (0..50)
+        .map(|n| {
+            pull(
+                &format!("other/{n}"),
+                "octo/widgets",
+                "https://git.example.com/octo/widgets/pulls/2",
+            )
+        })
+        .collect();
+    let full = list(&filler);
+    let hit = list(&[pull("fleet/job-1", "octo/widgets", PR_URL)]);
+    let script = Script::default()
+        .reply(409, EXISTS)
+        .reply(200, &full)
+        .reply(200, &hit);
+    assert_eq!(create(&script).await.ok().as_deref(), Some(PR_URL));
+    let seen = script.seen();
+    assert_eq!(seen.len(), 3);
+    assert_eq!(
+        seen[2].path,
+        "/api/v1/repos/octo/widgets/pulls?state=open&page=2&limit=50"
+    );
+    let mut script = Script::default().reply(409, EXISTS);
+    for _ in 0..5 {
+        script = script.reply(200, &full);
+    }
+    script = script.reply(200, &hit);
+    assert_eq!(create(&script).await.err(), Some(ForgeError::Rejected));
+    assert_eq!(script.seen().len(), 6);
+    let script = Script::default()
+        .reply(409, EXISTS)
+        .reply(200, &list(&[pull("other", "octo/widgets", PR_URL)]))
+        .reply(200, &hit);
+    assert_eq!(create(&script).await.err(), Some(ForgeError::Rejected));
+    assert_eq!(script.seen().len(), 2);
+}
+
+#[tokio::test]
+async fn create_pr_exists_with_no_findable_pull_fails_closed() {
+    let foreign = list(&[pull(
+        "fleet/job-1",
+        "octo/widgets",
+        "https://evil.example/octo/widgets/pulls/7",
+    )]);
+    let numberless = list(&[pull(
+        "fleet/job-1",
+        "octo/widgets",
+        "https://git.example.com/octo/widgets/pulls/x",
+    )]);
+    let urlless = serde_json::json!([{"head": {"ref": "fleet/job-1", "repo": {"full_name": "octo/widgets"}}}]).to_string();
+    let urltyped = serde_json::json!([{"html_url": 3, "head": {"ref": "fleet/job-1", "repo": {"full_name": "octo/widgets"}}}]).to_string();
+    let lookups = [
+        (200, "[]".to_owned(), ForgeError::Rejected),
+        (200, "{}".to_owned(), ForgeError::Malformed),
+        (200, "null".to_owned(), ForgeError::Malformed),
+        (200, "{".to_owned(), ForgeError::Malformed),
+        (200, String::new(), ForgeError::Malformed),
+        (200, foreign, ForgeError::Malformed),
+        (200, numberless, ForgeError::Malformed),
+        (200, urlless, ForgeError::Malformed),
+        (200, urltyped, ForgeError::Malformed),
+        (401, "{}".to_owned(), ForgeError::Unauthorized),
+        (404, "{}".to_owned(), ForgeError::NotFound),
+        (429, "{}".to_owned(), ForgeError::Unavailable),
+        (500, "{}".to_owned(), ForgeError::Unavailable),
+        (302, "{}".to_owned(), ForgeError::Redirected),
+        (422, "{}".to_owned(), ForgeError::Rejected),
+    ];
+    for (status, body, expected) in lookups {
+        let script = Script::default().reply(409, EXISTS).reply(status, &body);
+        assert_eq!(create(&script).await.err(), Some(expected), "{body}");
+        assert_eq!(script.seen().len(), 2, "{body}");
+    }
+    let script = Script::default()
+        .reply(409, EXISTS)
+        .raw(200, vec![b' '; MAX_BODY_BYTES + 1]);
+    assert_eq!(create(&script).await.err(), Some(ForgeError::TooLarge));
+    let oversized = serde_json::Value::Array(vec![serde_json::Value::Null; 51]).to_string();
+    let script = Script::default().reply(409, EXISTS).reply(200, &oversized);
+    assert_eq!(create(&script).await.err(), Some(ForgeError::Malformed));
+    let script = Script::default()
+        .reply(409, EXISTS)
+        .fail(HttpError::Timeout);
+    assert_eq!(create(&script).await.err(), Some(ForgeError::Timeout));
+}
+
+#[tokio::test]
+async fn create_pr_follows_no_redirect_and_replays_nothing() {
+    let script = Script::default()
+        .reply(302, "")
+        .reply(201, &created(PR_URL));
+    assert_eq!(create(&script).await.err(), Some(ForgeError::Redirected));
+    assert_eq!(script.seen().len(), 1);
+    let script = Script::default()
+        .reply(409, EXISTS)
+        .reply(307, "")
+        .reply(200, &list(&[pull("fleet/job-1", "octo/widgets", PR_URL)]));
+    assert_eq!(create(&script).await.err(), Some(ForgeError::Redirected));
+    assert_eq!(script.seen().len(), 2);
+}
+
+#[tokio::test]
+async fn create_pr_errors_hold_no_response_text_or_token() -> TestResult {
+    let marker = "SECRET-MARKER-xyz";
+    let bodies = [
+        format!(r#"{{"message":"{marker} {TOKEN}"}}"#),
+        format!(r#"{{"message":"already exists {marker} {TOKEN}"}}"#),
+        format!("<html>{marker}</html>"),
+    ];
+    for body in bodies {
+        for status in [201, 302, 401, 404, 409, 422, 503] {
+            let script = Script::default()
+                .reply(status, &body)
+                .reply(200, &body)
+                .reply(200, &body);
+            if let Err(error) = create(&script).await {
+                for text in [error.to_string(), format!("{error:?}")] {
+                    assert!(!text.contains(marker));
+                    assert!(!text.contains(TOKEN));
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn create_pr_validates_the_url_against_the_repository_host() -> TestResult {
+    let repo = RepoRef::new(host("forge.example.org")?, "octo", "widgets")?;
+    let credential = Credential::new(host("forge.example.org")?, Token::new(TOKEN.to_owned())?);
+    let target = target_for(RepoAccess::new(repo, credential))?;
+    let good = "https://forge.example.org/octo/widgets/pulls/7";
+    let script = Script::default().reply(201, &created(good));
+    let got = forge(&script).create_pr(&target, "t", "b").await;
+    assert_eq!(got.ok().as_deref(), Some(good));
+    assert_eq!(script.seen()[0].host.as_str(), "forge.example.org");
+    let script = Script::default().reply(201, &created(PR_URL));
+    let got = forge(&script).create_pr(&target, "t", "b").await;
+    assert_eq!(got.err(), Some(ForgeError::Malformed));
     Ok(())
 }
