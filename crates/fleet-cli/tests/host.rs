@@ -883,7 +883,8 @@ async fn a_malformed_address_exits_two_before_any_request_and_is_never_echoed() 
 }
 
 #[tokio::test]
-async fn more_than_the_address_cap_exits_two_and_duplicates_do_not_count() -> TestResult {
+async fn more_than_the_address_cap_exits_two_counting_duplicates_and_the_cap_itself_passes()
+-> TestResult {
     let stub = Stub::default();
     *stub.approve.lock().unwrap() = Some(Ok(approved("git.example.org", &["10.0.0.1"])));
     let url = serve(stub.clone()).await?;
@@ -900,7 +901,16 @@ async fn more_than_the_address_cap_exits_two_and_duplicates_do_not_count() -> Te
 
     let mut args = vec!["host", "approve-private", "git.example.org"];
     args.extend(many[..cap].iter().map(String::as_str));
-    args.extend(many[..cap].iter().map(String::as_str));
+    args.push("10.0.0.1");
+    let (res, _) = cli(&url, &args).await;
+    assert_eq!(
+        refusal(res),
+        (2, format!("address: at most {cap} addresses"))
+    );
+    assert_eq!(stub.seen(), Vec::<String>::new());
+
+    let mut args = vec!["host", "approve-private", "git.example.org"];
+    args.extend(std::iter::repeat_n("10.0.0.1", cap));
     let (res, _) = cli(&url, &args).await;
     res?;
     assert_eq!(stub.seen().len(), 1);
