@@ -824,6 +824,38 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_replaced_repo_host_admission_turns_the_old_guard_into_a_no_op() {
+        let log = Log::default();
+        let count = Count::new(&log);
+        let recorder = Recorder::new(&log, false);
+        let policy = FetchPolicy::Allowlist(vec![HostPattern::parse("docs.example.test").unwrap()]);
+        let svc = build(
+            policy,
+            caps(),
+            MAX_CONCURRENT_FETCHES,
+            &count,
+            RootCertStore::empty(),
+            Arc::clone(&recorder),
+        );
+        let refused = Err("fetch host not permitted".to_owned());
+        let old = svc.admit_repo_host(
+            "j",
+            RepoHostAdmission::new("b.example.test", false, &[]).unwrap(),
+        );
+        let newer = svc.admit_repo_host(
+            "j",
+            RepoHostAdmission::new("a.example.test", false, &[]).unwrap(),
+        );
+        drop(old);
+        assert_eq!(
+            run(&svc, "j", GOOD).await.err().as_deref(),
+            Some("fetch connect failed")
+        );
+        drop(newer);
+        assert_eq!(run(&svc, "j", GOOD).await, refused);
+    }
+
+    #[tokio::test]
     async fn a_failed_intent_record_refuses_the_fetch_with_no_network_call() {
         let log = Log::default();
         let count = Count::new(&log);
