@@ -71,6 +71,7 @@ const KIMI_MEMBER: &str = "sk-kimi-abcdefghijklmnopqrstuv";
 const KIMI_PLATFORM: &str = "sk-abcdefghijklmnopqrstuvwxyz0";
 const CODEX: &str = "sk-proj-abcdefghijklmnopqrstuv";
 const CODEX_ALT: &str = "sk-proj-zyxwvutsrqponmlkjihgfe";
+const FORGEJO: &str = "0123456789abcdef0123456789abcdef01234567";
 const CLASSIC: &str = "ghp_abcdefghijklmnopqrstuvwxyz0123456789";
 const SHORT: &str = "short";
 const INNER_SPACE: &str = "sk-ant-api03-abcdefgh ijklmnopqrstuv";
@@ -213,6 +214,7 @@ const ROWS: &[Row] = &[
     same("put/kimi_membership_key", "put"),
     same("put/kimi_platform_key", "put"),
     same("put/codex_api_key", "put"),
+    same("put/forgejo_pat", "put"),
     same("put/replace-existing", "put"),
     same("put/github_pat-classic", "put"),
     same("put/github_pat-github-refuses", "put"),
@@ -1055,6 +1057,7 @@ rows! {
     put_kimi_member: "put/kimi_membership_key", DEFAULT, put_ok("kimi_membership_key", KIMI_MEMBER, Cap::Never);
     put_kimi_platform: "put/kimi_platform_key", DEFAULT, put_ok("kimi_platform_key", KIMI_PLATFORM, Cap::Never);
     put_codex: "put/codex_api_key", DEFAULT, put_ok("codex_api_key", CODEX, Cap::Never);
+    put_forgejo: "put/forgejo_pat", DEFAULT, put_refused("forgejo_pat", FORGEJO.as_bytes());
     put_replace: "put/replace-existing", DEFAULT, Case { seed: &["anthropic_api_key"], done: &["anthropic_api_key"], saved: Some(("anthropic_api_key", ANT_NEW)), ..case(Act::Put("anthropic_api_key", ANT_NEW.as_bytes())) };
     put_classic: "put/github_pat-classic", DEFAULT, put_refused("github_pat", CLASSIC.as_bytes());
     put_gh_rejects: "put/github_pat-github-refuses", DEFAULT, Case { github: Gh::Rejects, ..put_refused("github_pat", PAT.as_bytes()) };

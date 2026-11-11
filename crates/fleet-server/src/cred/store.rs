@@ -10,8 +10,10 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use fleet_core::capability::Capability;
 use fleet_core::credential::{
-    BotIdentity, CredentialError, CredentialKind, CredentialShape, Secret, fingerprint, validate,
+    BotIdentity, CredentialError, CredentialKind, CredentialShape, GITHUB_HOST, Secret,
+    fingerprint, validate,
 };
+use fleet_core::host::{HostError, HostName};
 use fleet_proto::MAX_CREDENTIALS_PER_USER;
 use sqlx::{PgPool, Row};
 
@@ -32,28 +34,45 @@ pub use app_lane::MintPolicy;
 use app_lane::{MintScope, MintedToken};
 
 const UPSERT: &str = "\
-INSERT INTO credentials (user_id, kind, shape, ciphertext, key_id, fingerprint, login, expires_at) \
-VALUES ($1, $2, $3, '\\x'::bytea, 'pending', $4, $5, to_timestamp($6::bigint / 1000.0)) \
+INSERT INTO credentials (user_id, kind, shape, ciphertext, key_id, fingerprint, login, expires_at, host) \
+VALUES ($1, $2, $3, '\\x'::bytea, 'pending', $4, $5, to_timestamp($6::bigint / 1000.0), $7) \
 ON CONFLICT (user_id, kind, host) DO UPDATE SET shape = EXCLUDED.shape, \
 fingerprint = EXCLUDED.fingerprint, login = EXCLUDED.login, expires_at = EXCLUDED.expires_at \
 WHERE credentials.tombstoned_at IS NULL RETURNING id";
 
 const LOCK_USER: &str = "SELECT pg_advisory_xact_lock($1)";
 
-const COUNT_OTHERS: &str =
-    "SELECT count(*) FROM credentials WHERE user_id = $1 AND kind <> $2 AND tombstoned_at IS NULL";
+const COUNT_OTHERS: &str = "\
+SELECT count(*) FROM credentials WHERE user_id = $1 AND NOT (kind = $2 AND host = $3) AND tombstoned_at IS NULL";
+
+const HOST_KIND_FOR_SHARE: &str = "SELECT kind FROM git_hosts WHERE host = $1 FOR SHARE";
+
+const HOST_KIND: &str = "SELECT kind FROM git_hosts WHERE host = $1";
+
+const INSERT_AUDIT: &str = "\
+INSERT INTO credential_audit (user_id, host, kind, action, outcome) VALUES ($1, $2, $3, $4, $5)";
+
+const SELECT_FOR_HOST: &str = "\
+SELECT id, shape, fingerprint, login, (EXTRACT(EPOCH FROM expires_at) * 1000)::bigint AS expires_ms, \
+ciphertext, key_id FROM credentials \
+WHERE user_id = $1 AND kind = $2 AND host = $3 AND tombstoned_at IS NULL FOR SHARE";
 
 const STORE_SEALED: &str = "UPDATE credentials SET ciphertext = $1, key_id = $2 WHERE id = $3";
 
 const LIST: &str = "\
-SELECT id, kind, shape, fingerprint, login, \
+SELECT id, kind, shape, fingerprint, login, host, \
 (EXTRACT(EPOCH FROM expires_at) * 1000)::bigint AS expires_ms \
 FROM credentials WHERE user_id = $1 AND tombstoned_at IS NULL ORDER BY id";
+
+const LIST_FOR_HOST: &str = "\
+SELECT id, kind, shape, fingerprint, login, host, \
+(EXTRACT(EPOCH FROM expires_at) * 1000)::bigint AS expires_ms \
+FROM credentials WHERE user_id = $1 AND host = $2 AND tombstoned_at IS NULL ORDER BY id";
 
 const DELETE: &str = "DELETE FROM credentials WHERE id = $1 AND user_id = $2";
 
 const LOCK_FOR_DELETE: &str = "\
-SELECT id FROM credentials WHERE id = $1 AND user_id = $2 AND tombstoned_at IS NULL FOR UPDATE";
+SELECT kind, host FROM credentials WHERE id = $1 AND user_id = $2 AND tombstoned_at IS NULL FOR UPDATE";
 
 const HAS_MINT_HISTORY: &str =
     "SELECT EXISTS (SELECT 1 FROM github_app_mint WHERE credential_id = $1)";
@@ -74,7 +93,7 @@ AND lease_expires_at > now() FOR SHARE";
 
 const SELECT_RELEASABLE: &str = "\
 SELECT id, kind, (expires_at IS NOT NULL AND expires_at <= now()) AS expired \
-FROM credentials WHERE user_id = $1 AND kind = ANY($2) AND tombstoned_at IS NULL ORDER BY id";
+FROM credentials WHERE user_id = $1 AND kind = ANY($2) AND host = 'github.com' AND tombstoned_at IS NULL ORDER BY id";
 
 const LATEST_JOB: &str = "\
 SELECT job_id, repo FROM jobs WHERE user_id = $1 ORDER BY created_at DESC, job_id DESC LIMIT 1";
@@ -708,6 +727,7 @@ pub const fn required_capability(kind: CredentialKind) -> Option<Capability> {
         CredentialKind::AnthropicApiKey
         | CredentialKind::ClaudeSubscriptionToken
         | CredentialKind::GithubPat
+        | CredentialKind::ForgejoPat
         | CredentialKind::KimiMembershipKey
         | CredentialKind::KimiPlatformKey
         | CredentialKind::CodexApiKey => None,
@@ -744,6 +764,8 @@ pub struct CredentialSummary {
     pub login: Option<String>,
     /// Expiry in milliseconds since the Unix epoch, when known.
     pub expires_at_ms: Option<i64>,
+    /// The normalised host the credential is stored for.
+    pub host: String,
 }
 
 /// Why a store operation failed. Messages are fixed text.
@@ -789,9 +811,18 @@ pub enum StoreError {
     /// The Job repository is outside the operator allowlist or its owner is not the configured
     /// account (ADR-0058, SEC-002, SEC-009, SEC-014).
     RepoDenied,
+    /// The host argument is outside the host grammar, or a kind that needs a host got none.
+    HostInvalid(HostError),
+    /// The host is not in `git_hosts`.
+    HostUnknown,
+    /// The credential kind does not belong to the kind of this host.
+    HostKindMismatch,
     /// The database failed.
     Db(sqlx::Error),
 }
+
+/// `INVALID_ARGUMENT` message: the credential kind does not belong to the host.
+pub const ERR_HOST_KIND_MISMATCH: &str = "credential kind does not fit the host";
 
 impl fmt::Display for StoreError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -812,6 +843,9 @@ impl fmt::Display for StoreError {
             Self::Tombstoned => f.write_str(fleet_proto::PRECONDITION_CREDENTIAL_TOMBSTONED),
             Self::InstallationDenied => f.write_str(fleet_proto::PRECONDITION_APP_INSTALLATION),
             Self::RepoDenied => f.write_str(fleet_proto::PRECONDITION_APP_REPO),
+            Self::HostInvalid(e) => f.write_str(e.as_str()),
+            Self::HostUnknown => f.write_str(fleet_proto::PRECONDITION_HOST_UNKNOWN),
+            Self::HostKindMismatch => f.write_str(ERR_HOST_KIND_MISMATCH),
             Self::Seal(e) => e.fmt(f),
             Self::Db(_) => f.write_str("credential store database error"),
         }
@@ -823,7 +857,10 @@ impl StoreError {
     #[must_use]
     pub const fn code(&self) -> tonic::Code {
         match self {
-            Self::Invalid(_) | Self::InvalidExpiry => tonic::Code::InvalidArgument,
+            Self::Invalid(_)
+            | Self::InvalidExpiry
+            | Self::HostInvalid(_)
+            | Self::HostKindMismatch => tonic::Code::InvalidArgument,
             Self::NotFound => tonic::Code::NotFound,
             Self::TooMany => tonic::Code::ResourceExhausted,
             Self::LeaseDenied | Self::CapabilityDenied => tonic::Code::PermissionDenied,
@@ -836,7 +873,8 @@ impl StoreError {
             | Self::NoJobRepo
             | Self::Tombstoned
             | Self::InstallationDenied
-            | Self::RepoDenied => tonic::Code::FailedPrecondition,
+            | Self::RepoDenied
+            | Self::HostUnknown => tonic::Code::FailedPrecondition,
             Self::Seal(_) => tonic::Code::Internal,
             Self::Db(_) => tonic::Code::Unavailable,
         }
@@ -889,6 +927,75 @@ impl fmt::Debug for CredentialStore {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str("CredentialStore(..)")
     }
+}
+
+fn parse_host(host: &str) -> Result<Option<HostName>, StoreError> {
+    if host.is_empty() {
+        return Ok(None);
+    }
+    HostName::normalise(host)
+        .map(Some)
+        .map_err(StoreError::HostInvalid)
+}
+
+fn host_for_kind(kind: CredentialKind, host: Option<HostName>) -> Result<String, StoreError> {
+    match host {
+        None if kind.needs_host() => Err(StoreError::HostInvalid(HostError::Empty)),
+        None => Ok(GITHUB_HOST.to_owned()),
+        Some(name) if !kind.needs_host() && name.as_str() != GITHUB_HOST => {
+            Err(StoreError::HostKindMismatch)
+        }
+        Some(name) => Ok(name.as_str().to_owned()),
+    }
+}
+
+/// Resolves the host argument of a credential call to the normalised host the row is keyed by.
+///
+/// An empty host means `github.com` for every kind except `forgejo_pat`, which must name its
+/// host. A supplied host is normalised with [`HostName::normalise`], and a kind other than
+/// `forgejo_pat` accepts only `github.com`. This does not read `git_hosts`.
+///
+/// # Errors
+///
+/// Returns [`StoreError::HostInvalid`] for a host outside the grammar or a missing host on a
+/// `forgejo_pat`, and [`StoreError::HostKindMismatch`] for another host on a kind that belongs
+/// to `github.com`.
+pub fn credential_host(kind: CredentialKind, host: &str) -> Result<String, StoreError> {
+    host_for_kind(kind, parse_host(host)?)
+}
+
+async fn require_host(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    kind: CredentialKind,
+    host: &str,
+) -> Result<(), StoreError> {
+    let stored: Option<String> = sqlx::query_scalar(HOST_KIND_FOR_SHARE)
+        .bind(host)
+        .fetch_optional(&mut **tx)
+        .await?;
+    match stored {
+        None => Err(StoreError::HostUnknown),
+        Some(found) if found == kind.host_kind().as_str() => Ok(()),
+        Some(_) => Err(StoreError::HostKindMismatch),
+    }
+}
+
+fn summaries(rows: &[sqlx::postgres::PgRow]) -> Result<Vec<CredentialSummary>, StoreError> {
+    let mut out = Vec::with_capacity(rows.len());
+    for row in rows {
+        let kind: String = row.try_get("kind")?;
+        let shape: String = row.try_get("shape")?;
+        out.push(CredentialSummary {
+            id: row.try_get("id")?,
+            kind: kind_of(&kind)?,
+            shape: shape_of(&shape),
+            fingerprint: row.try_get("fingerprint")?,
+            login: row.try_get("login")?,
+            expires_at_ms: row.try_get("expires_ms")?,
+            host: row.try_get("host")?,
+        });
+    }
+    Ok(out)
 }
 
 fn kind_of(name: &str) -> Result<CredentialKind, StoreError> {
@@ -990,6 +1097,38 @@ impl CredentialStore {
         login: Option<String>,
         expires_at_ms: Option<i64>,
     ) -> Result<CredentialSummary, StoreError> {
+        self.put_for_host(user_id, "", kind, shape, value, login, expires_at_ms)
+            .await
+    }
+
+    /// Validates, seals and stores `value` for `host`, replacing the user's credential of the
+    /// same kind and host (ADR-0068).
+    ///
+    /// The row is keyed by `(user, kind, host)`. `host` goes through [`credential_host`], then
+    /// the row of `git_hosts` is read under `FOR SHARE` in the same transaction: the host must
+    /// exist and its kind must be [`CredentialKind::host_kind`]. One `credential_audit` row
+    /// with outcome `stored` is written in the same transaction.
+    ///
+    /// # Errors
+    ///
+    /// Every error of [`CredentialStore::put`], plus [`StoreError::HostInvalid`],
+    /// [`StoreError::HostKindMismatch`] and [`StoreError::HostUnknown`]. A refused host writes
+    /// nothing.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "the credential, its host and the owner are separate inputs of one write"
+    )]
+    pub async fn put_for_host(
+        &self,
+        user_id: i64,
+        host: &str,
+        kind: CredentialKind,
+        shape: CredentialShape,
+        value: Secret,
+        login: Option<String>,
+        expires_at_ms: Option<i64>,
+    ) -> Result<CredentialSummary, StoreError> {
+        let host = credential_host(kind, host)?;
         let text = std::str::from_utf8(value.expose()).map_err(|_| CredentialError::Whitespace)?;
         validate(kind, shape, text)?;
         if expires_at_ms.is_some_and(|ms| !(0..=MAX_EXPIRY_MS).contains(&ms)) {
@@ -998,6 +1137,7 @@ impl CredentialStore {
         let print = fingerprint(&value);
         let mut tx = self.pool.begin().await?;
         self.require_capability(&mut tx, user_id, kind).await?;
+        require_host(&mut tx, kind, &host).await?;
         sqlx::query(LOCK_USER)
             .bind(user_id)
             .execute(&mut *tx)
@@ -1005,6 +1145,7 @@ impl CredentialStore {
         let others: i64 = sqlx::query_scalar(COUNT_OTHERS)
             .bind(user_id)
             .bind(kind.wire_name())
+            .bind(&host)
             .fetch_one(&mut *tx)
             .await?;
         if usize::try_from(others).map_or(true, |n| n >= self.limit) {
@@ -1017,6 +1158,7 @@ impl CredentialStore {
             .bind(&print)
             .bind(&login)
             .bind(expires_at_ms)
+            .bind(&host)
             .fetch_optional(&mut *tx)
             .await?
             .ok_or(StoreError::Tombstoned)?;
@@ -1028,6 +1170,14 @@ impl CredentialStore {
             .bind(id)
             .execute(&mut *tx)
             .await?;
+        sqlx::query(INSERT_AUDIT)
+            .bind(user_id)
+            .bind(&host)
+            .bind(kind.wire_name())
+            .bind("put")
+            .bind("stored")
+            .execute(&mut *tx)
+            .await?;
         tx.commit().await?;
         Ok(CredentialSummary {
             id,
@@ -1036,6 +1186,7 @@ impl CredentialStore {
             fingerprint: print,
             login,
             expires_at_ms,
+            host,
         })
     }
 
@@ -1084,23 +1235,61 @@ impl CredentialStore {
             .bind(user_id)
             .fetch_all(&self.pool)
             .await?;
-        let mut out = Vec::with_capacity(rows.len());
-        for row in rows {
-            let kind: String = row.try_get("kind")?;
-            let shape: String = row.try_get("shape")?;
-            out.push(CredentialSummary {
-                id: row.try_get("id")?,
-                kind: kind_of(&kind)?,
-                shape: shape_of(&shape),
-                fingerprint: row.try_get("fingerprint")?,
-                login: row.try_get("login")?,
-                expires_at_ms: row.try_get("expires_ms")?,
-            });
+        summaries(&rows)
+    }
+
+    /// Lists the user's credentials stored for `host`, without secret material.
+    ///
+    /// An empty `host` lists every host. A supplied host is normalised and must be in
+    /// `git_hosts`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StoreError::HostInvalid`] for a host outside the grammar,
+    /// [`StoreError::HostUnknown`] for a host not in `git_hosts`, and the errors of
+    /// [`CredentialStore::list`].
+    pub async fn list_for_host(
+        &self,
+        user_id: i64,
+        host: &str,
+    ) -> Result<Vec<CredentialSummary>, StoreError> {
+        let Some(name) = parse_host(host)? else {
+            return self.list(user_id).await;
+        };
+        let known: Option<String> = sqlx::query_scalar(HOST_KIND)
+            .bind(name.as_str())
+            .fetch_optional(&self.pool)
+            .await?;
+        if known.is_none() {
+            return Err(StoreError::HostUnknown);
         }
-        Ok(out)
+        let rows = sqlx::query(LIST_FOR_HOST)
+            .bind(user_id)
+            .bind(name.as_str())
+            .fetch_all(&self.pool)
+            .await?;
+        summaries(&rows)
     }
 
     /// Deletes the user's credential. Use rows stay.
+    ///
+    /// An empty host is `github.com`, so a `forgejo_pat` row needs
+    /// [`CredentialStore::delete_for_host`] with its host.
+    ///
+    /// # Errors
+    ///
+    /// See [`CredentialStore::delete_for_host`].
+    pub async fn delete(&self, user_id: i64, credential_id: i64) -> Result<(), StoreError> {
+        self.delete_for_host(user_id, credential_id, "").await
+    }
+
+    /// Deletes the user's credential, which must be stored for `host` (ADR-0068).
+    ///
+    /// An empty `host` means `github.com` for every kind but `forgejo_pat`, which needs its
+    /// host. The host is normalised, must be in `git_hosts`, and must equal the row's host:
+    /// any other host answers [`StoreError::NotFound`] and the row stays. One
+    /// `credential_audit` row is written in the same transaction, with outcome `removed`, or
+    /// `tombstoned` when the credential has mint history.
     ///
     /// A credential with mint history in `github_app_mint` is tombstoned instead of removed:
     /// the row stays, no read returns it and a `put` of the same kind is refused (ADR-0058,
@@ -1109,28 +1298,104 @@ impl CredentialStore {
     ///
     /// # Errors
     ///
-    /// Returns [`StoreError::NotFound`] when the id is unknown, owned by another user or
-    /// already tombstoned, and [`StoreError::Db`] for a database failure.
-    pub async fn delete(&self, user_id: i64, credential_id: i64) -> Result<(), StoreError> {
+    /// Returns [`StoreError::HostInvalid`], [`StoreError::HostKindMismatch`] and
+    /// [`StoreError::HostUnknown`] for a refused host, [`StoreError::NotFound`] when the id is
+    /// unknown, owned by another user, already tombstoned or stored for another host, and
+    /// [`StoreError::Db`] for a database failure.
+    pub async fn delete_for_host(
+        &self,
+        user_id: i64,
+        credential_id: i64,
+        host: &str,
+    ) -> Result<(), StoreError> {
+        let parsed = parse_host(host)?;
         let mut tx = self.pool.begin().await?;
-        sqlx::query(LOCK_FOR_DELETE)
+        let row = sqlx::query(LOCK_FOR_DELETE)
             .bind(credential_id)
             .bind(user_id)
             .fetch_optional(&mut *tx)
             .await?
             .ok_or(StoreError::NotFound)?;
+        let name: String = row.try_get("kind")?;
+        let stored_host: String = row.try_get("host")?;
+        let kind = kind_of(&name)?;
+        let wanted = host_for_kind(kind, parsed)?;
+        require_host(&mut tx, kind, &wanted).await?;
+        if wanted != stored_host {
+            return Err(StoreError::NotFound);
+        }
         let history: bool = sqlx::query_scalar(HAS_MINT_HISTORY)
             .bind(credential_id)
             .fetch_one(&mut *tx)
             .await?;
-        let statement = if history { TOMBSTONE } else { DELETE };
+        let (statement, outcome) = if history {
+            (TOMBSTONE, "tombstoned")
+        } else {
+            (DELETE, "removed")
+        };
         sqlx::query(statement)
             .bind(credential_id)
             .bind(user_id)
             .execute(&mut *tx)
             .await?;
+        sqlx::query(INSERT_AUDIT)
+            .bind(user_id)
+            .bind(&stored_host)
+            .bind(kind.wire_name())
+            .bind("delete")
+            .bind(outcome)
+            .execute(&mut *tx)
+            .await?;
         tx.commit().await?;
         Ok(())
+    }
+
+    /// Opens the user's credential of `kind` stored for exactly `host`. No use row is written.
+    ///
+    /// The row is selected by `(user, kind, host)` and nothing else. A credential of the same
+    /// kind stored for another host is never returned, so a token reaches only the host it was
+    /// stored for (ADR-0068).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StoreError::HostInvalid`] and [`StoreError::HostKindMismatch`] for a refused
+    /// host, [`StoreError::NotFound`] when the user holds no live credential of this kind for
+    /// this host, [`StoreError::Seal`] when the value cannot be opened and [`StoreError::Db`]
+    /// for a database failure.
+    pub async fn open_for_host(
+        &self,
+        user_id: i64,
+        kind: CredentialKind,
+        host: &str,
+    ) -> Result<(CredentialSummary, Secret), StoreError> {
+        let host = credential_host(kind, host)?;
+        let mut tx = self.pool.begin().await?;
+        let row = sqlx::query(SELECT_FOR_HOST)
+            .bind(user_id)
+            .bind(kind.wire_name())
+            .bind(&host)
+            .fetch_optional(&mut *tx)
+            .await?
+            .ok_or(StoreError::NotFound)?;
+        let id: i64 = row.try_get("id")?;
+        let shape: String = row.try_get("shape")?;
+        let ciphertext: Vec<u8> = row.try_get("ciphertext")?;
+        let key_id: String = row.try_get("key_id")?;
+        let aad = Aad::new(&user_id.to_string(), &id.to_string(), kind);
+        let mut plain = self.sealer.open(&aad, &key_id, &ciphertext)?;
+        let text = String::from_utf8(std::mem::take(&mut *plain))
+            .map_err(|_| StoreError::Seal(SealError::Open))?;
+        let summary = CredentialSummary {
+            id,
+            kind,
+            shape: shape_of(&shape),
+            fingerprint: row.try_get("fingerprint")?,
+            login: row.try_get("login")?,
+            expires_at_ms: row.try_get("expires_ms")?,
+            host,
+        };
+        tx.commit().await?;
+        Ok((summary, Secret::new(text)))
     }
 
     /// Unseals the user's credential to check it with its provider. No use row is written.

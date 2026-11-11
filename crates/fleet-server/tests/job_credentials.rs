@@ -572,3 +572,61 @@ async fn job_writers_wait_while_a_release_is_open(pool: PgPool) {
         .unwrap();
     assert_eq!(released.len(), 2);
 }
+
+const FGJ: &str = "0123456789abcdef0123456789abcdef01234567";
+const FGJ_HOST: &str = "git.example.com";
+
+async fn forgejo_host(pool: &PgPool) {
+    sqlx::query("INSERT INTO git_hosts (host, kind) VALUES ($1, 'forgejo')")
+        .bind(FGJ_HOST)
+        .execute(pool)
+        .await
+        .unwrap();
+}
+
+#[sqlx::test]
+async fn a_forgejo_pat_is_never_released_to_a_github_job(pool: PgPool) {
+    let mut w = world(pool).await;
+    forgejo_host(&w.pool).await;
+    w.put(w.alice, CredentialKind::AnthropicApiKey, ANT, None)
+        .await;
+    w.put(w.alice, CredentialKind::GithubPat, PAT, None).await;
+    w.creds
+        .put_for_host(
+            w.alice,
+            FGJ_HOST,
+            CredentialKind::ForgejoPat,
+            STATIC,
+            Secret::new(FGJ.into()),
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+    let job = w.running(w.alice, "claude", "k1").await;
+    let reply = w.fetch(&job, job.attempt, &box_a()).await.unwrap();
+    assert_eq!(
+        pairs(&reply),
+        vec![entry("anthropic_api_key", ANT), entry("github_pat", PAT)]
+    );
+    assert!(reply.credentials.iter().all(|c| c.value != FGJ));
+}
+
+#[sqlx::test]
+async fn a_github_credential_stored_for_another_host_is_not_released(pool: PgPool) {
+    let mut w = world(pool).await;
+    forgejo_host(&w.pool).await;
+    w.put(w.alice, CredentialKind::AnthropicApiKey, ANT, None)
+        .await;
+    w.put(w.alice, CredentialKind::GithubPat, PAT, None).await;
+    sqlx::query("UPDATE credentials SET host = $1 WHERE kind = 'github_pat'")
+        .bind(FGJ_HOST)
+        .execute(&w.pool)
+        .await
+        .unwrap();
+    let job = w.running(w.alice, "claude", "k1").await;
+    let err = w.fetch(&job, job.attempt, &box_a()).await.unwrap_err();
+    assert_eq!(err.code(), Code::FailedPrecondition);
+    assert_eq!(err.message(), "no github credential");
+    assert_eq!(w.uses().await, 0);
+}

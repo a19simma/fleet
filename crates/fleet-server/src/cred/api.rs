@@ -16,7 +16,7 @@ use tonic::Status;
 
 use super::github::{GithubApi, GithubError, GithubUser, MAX_EXPIRY_MS};
 use super::repo_api::RepoService;
-use super::store::{CredentialStore, CredentialSummary, StoreError};
+use super::store::{CredentialStore, CredentialSummary, StoreError, credential_host};
 
 /// The credential RPC logic over a sealed store and a GitHub seam.
 #[derive(Clone)]
@@ -61,7 +61,7 @@ fn info(summary: CredentialSummary) -> CredentialInfo {
         fingerprint: summary.fingerprint,
         login: summary.login,
         expires_at_ms: summary.expires_at_ms.and_then(|ms| u64::try_from(ms).ok()),
-        host: String::new(),
+        host: summary.host,
     }
 }
 
@@ -118,6 +118,11 @@ impl CredentialService {
     ///
     /// `INTERNAL` when the value cannot be sealed or a stored kind is unknown.
     ///
+    /// The host follows ADR-0068. An empty host is `github.com` for every kind but
+    /// `forgejo_pat`, which must name its host. `INVALID_ARGUMENT` for a host outside the host
+    /// grammar or a kind stored for a host of another kind, `FAILED_PRECONDITION` with
+    /// `PRECONDITION_HOST_UNKNOWN` for a host that is not in the host table.
+    ///
     /// `UNAVAILABLE` when GitHub or storage cannot answer. Nothing is stored on any error.
     pub async fn put(
         &self,
@@ -136,6 +141,7 @@ impl CredentialService {
         }
         validate(kind, CredentialShape::StaticSecret, &request.value)
             .map_err(|fault| Status::invalid_argument(fault.to_string()))?;
+        let host = credential_host(kind, &request.host).map_err(|e| store_status(&e))?;
         let mut expires_at_ms = match request.expires_at_ms {
             Some(ms) => Some(
                 i64::try_from(ms)
@@ -150,7 +156,9 @@ impl CredentialService {
             .list(user_id)
             .await
             .map_err(|e| store_status(&e))?;
-        if existing.len() >= MAX_CREDENTIALS_PER_USER && existing.iter().all(|c| c.kind != kind) {
+        if existing.len() >= MAX_CREDENTIALS_PER_USER
+            && existing.iter().all(|c| c.kind != kind || c.host != host)
+        {
             return Err(Status::resource_exhausted("too many credentials"));
         }
         let value = Secret::new(request.value);
@@ -174,8 +182,9 @@ impl CredentialService {
         }
         let summary = self
             .store
-            .put(
+            .put_for_host(
                 user_id,
+                &host,
                 kind,
                 CredentialShape::StaticSecret,
                 value,
@@ -209,15 +218,17 @@ impl CredentialService {
     ///
     /// # Errors
     ///
-    /// `NOT_FOUND` when the id is unknown, belongs to another user or is already tombstoned,
-    /// `UNAVAILABLE` when storage fails.
+    /// `NOT_FOUND` when the id is unknown, belongs to another user, is already tombstoned or is
+    /// stored for another host than `request.host`, `INVALID_ARGUMENT` for a host outside the
+    /// grammar, `FAILED_PRECONDITION` for a host not in the host table, `UNAVAILABLE` when
+    /// storage fails. An empty host is `github.com`, so a `forgejo_pat` is deleted with its host.
     pub async fn delete(
         &self,
         user_id: i64,
         request: &DeleteCredentialRequest,
     ) -> Result<DeleteCredentialReply, Status> {
         self.store
-            .delete(user_id, row_id(request.id)?)
+            .delete_for_host(user_id, row_id(request.id)?, &request.host)
             .await
             .map_err(|e| store_status(&e))?;
         Ok(DeleteCredentialReply {})
@@ -462,6 +473,33 @@ mod tests {
             if let Some(message) = message {
                 assert_eq!(status.message(), message, "{err}");
             }
+        }
+    }
+
+    #[test]
+    fn host_errors_keep_their_wire_code_and_message() {
+        let cases = [
+            (
+                StoreError::HostInvalid(fleet_core::host::HostError::Empty),
+                Code::InvalidArgument,
+                "host is empty",
+            ),
+            (
+                StoreError::HostUnknown,
+                Code::FailedPrecondition,
+                fleet_proto::PRECONDITION_HOST_UNKNOWN,
+            ),
+            (
+                StoreError::HostKindMismatch,
+                Code::InvalidArgument,
+                "credential kind does not fit the host",
+            ),
+        ];
+        for (err, code, message) in cases {
+            let status = store_status(&err);
+            assert_eq!(status.code(), code, "{err}");
+            assert_eq!(err.code(), code, "{err}");
+            assert_eq!(status.message(), message, "{err}");
         }
     }
 

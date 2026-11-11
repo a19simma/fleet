@@ -33,6 +33,10 @@ const ANT: &str = "sk-ant-api03-abcdefghijklmnopqrstuv";
 static KEY_FILES: AtomicUsize = AtomicUsize::new(0);
 const CLIENT: &str = "client-token-0123456789abcdef012345";
 const STATIC: &str = "static_secret";
+const FGJ: &str = "0123456789abcdef0123456789abcdef01234567";
+const FGJ2: &str = "fedcba9876543210fedcba9876543210fedcba98";
+const FGJ_HOST: &str = "git.example.com";
+const FGJ_HOST_B: &str = "code.example.org";
 const EXPIRY_MS: i64 = 1_900_000_000_000;
 
 #[derive(Clone)]
@@ -161,6 +165,20 @@ fn put(kind: &str, value: &str) -> PutCredentialRequest {
         expires_at_ms: None,
         host: String::new(),
     }
+}
+
+async fn add_host(pool: &PgPool, host: &str) {
+    sqlx::query("INSERT INTO git_hosts (host, kind) VALUES ($1, 'forgejo')")
+        .bind(host)
+        .execute(pool)
+        .await
+        .unwrap();
+}
+
+fn put_on(host: &str, kind: &str, value: &str) -> PutCredentialRequest {
+    let mut request = put(kind, value);
+    host.clone_into(&mut request.host);
+    request
 }
 
 async fn stored(pool: &PgPool) -> i64 {
@@ -534,11 +552,18 @@ async fn box_token_is_denied(pool: PgPool) {
 async fn out_of_range_expiry_is_invalid_argument_for_every_kind(pool: PgPool) {
     let mut h = harness(pool, FakeGithub::ok()).await;
     grant_app(&h).await;
+    add_host(&h.pool, FGJ_HOST).await;
     for kind in CredentialKind::ALL {
         let value = match kind {
             CredentialKind::GithubPat => PAT,
             CredentialKind::GithubApp => "12345678",
+            CredentialKind::ForgejoPat => FGJ,
             _ => ANT,
+        };
+        let host = if kind == CredentialKind::ForgejoPat {
+            FGJ_HOST
+        } else {
+            ""
         };
         for ms in [
             253_402_300_800_000,
@@ -546,6 +571,7 @@ async fn out_of_range_expiry_is_invalid_argument_for_every_kind(pool: PgPool) {
             u64::try_from(i64::MAX).unwrap() + 1,
         ] {
             let mut request = put(kind.wire_name(), value);
+            request.host = host.to_owned();
             request.expires_at_ms = Some(ms);
             let err = h
                 .client
@@ -556,6 +582,7 @@ async fn out_of_range_expiry_is_invalid_argument_for_every_kind(pool: PgPool) {
         }
         assert_eq!(stored(&h.pool).await, 0, "{kind:?}");
         let mut request = put(kind.wire_name(), value);
+        request.host = host.to_owned();
         request.expires_at_ms = Some(253_402_300_799_000);
         h.client
             .put_credential(as_user(&h.alice, request))
@@ -628,4 +655,225 @@ async fn a_user_token_on_an_unconfigured_server_is_failed_precondition(pool: PgP
         .await
         .unwrap_err();
     assert_eq!(err.code(), Code::FailedPrecondition);
+}
+
+#[sqlx::test]
+async fn forgejo_pat_is_stored_for_its_host_without_a_github_call(pool: PgPool) {
+    let mut h = harness(pool, FakeGithub::ok()).await;
+    add_host(&h.pool, FGJ_HOST).await;
+    let info = h
+        .client
+        .put_credential(as_user(
+            &h.alice,
+            put_on("Git.Example.COM", "forgejo_pat", FGJ),
+        ))
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(info.host, FGJ_HOST);
+    assert_eq!(info.kind, "forgejo_pat");
+    assert_eq!(info.login, None);
+    assert_eq!(h.github.calls(), 0);
+    let listed = h
+        .client
+        .list_credentials(as_user(&h.alice, ListCredentialsRequest {}))
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(listed.credentials, vec![info]);
+}
+
+#[sqlx::test]
+async fn put_refuses_a_missing_unknown_or_mismatched_host(pool: PgPool) {
+    let mut h = harness(pool, FakeGithub::ok()).await;
+    add_host(&h.pool, FGJ_HOST).await;
+    for (request, code, message) in [
+        (
+            put_on("", "forgejo_pat", FGJ),
+            Code::InvalidArgument,
+            "host is empty",
+        ),
+        (
+            put_on(FGJ_HOST_B, "forgejo_pat", FGJ),
+            Code::FailedPrecondition,
+            fleet_proto::PRECONDITION_HOST_UNKNOWN,
+        ),
+        (
+            put_on("github.com", "forgejo_pat", FGJ),
+            Code::InvalidArgument,
+            "credential kind does not fit the host",
+        ),
+        (
+            put_on(FGJ_HOST, "github_pat", PAT),
+            Code::InvalidArgument,
+            "credential kind does not fit the host",
+        ),
+        (
+            put_on("https://git.example.com", "forgejo_pat", FGJ),
+            Code::InvalidArgument,
+            "host contains a scheme",
+        ),
+    ] {
+        let err = h
+            .client
+            .put_credential(as_user(&h.alice, request))
+            .await
+            .unwrap_err();
+        assert_eq!(err.code(), code, "{message}");
+        assert_eq!(err.message(), message);
+        assert!(!err.message().contains(FGJ));
+    }
+    assert_eq!(h.github.calls(), 0);
+    assert_eq!(stored(&h.pool).await, 0);
+}
+
+#[sqlx::test]
+async fn put_refuses_a_malformed_forgejo_token_before_the_host_lookup(pool: PgPool) {
+    let mut h = harness(pool, FakeGithub::ok()).await;
+    add_host(&h.pool, FGJ_HOST).await;
+    for bad in [FGJ.to_uppercase(), FGJ[..39].to_owned(), format!("{FGJ}0")] {
+        let err = h
+            .client
+            .put_credential(as_user(&h.alice, put_on(FGJ_HOST, "forgejo_pat", &bad)))
+            .await
+            .unwrap_err();
+        assert_eq!(err.code(), Code::InvalidArgument);
+        assert_eq!(
+            err.message(),
+            "forgejo_pat must be 40 lowercase hex characters"
+        );
+        assert!(!err.message().contains(&bad));
+    }
+    assert_eq!(stored(&h.pool).await, 0);
+}
+
+#[sqlx::test]
+async fn delete_takes_the_host_and_refuses_another(pool: PgPool) {
+    let mut h = harness(pool, FakeGithub::ok()).await;
+    add_host(&h.pool, FGJ_HOST).await;
+    add_host(&h.pool, FGJ_HOST_B).await;
+    let a = h
+        .client
+        .put_credential(as_user(&h.alice, put_on(FGJ_HOST, "forgejo_pat", FGJ)))
+        .await
+        .unwrap()
+        .into_inner();
+    h.client
+        .put_credential(as_user(&h.alice, put_on(FGJ_HOST_B, "forgejo_pat", FGJ2)))
+        .await
+        .unwrap();
+    for (host, code) in [
+        (FGJ_HOST_B, Code::NotFound),
+        ("", Code::InvalidArgument),
+        ("unregistered.example.net", Code::FailedPrecondition),
+        ("a\\b.example.com", Code::InvalidArgument),
+    ] {
+        let err = h
+            .client
+            .delete_credential(as_user(
+                &h.alice,
+                DeleteCredentialRequest {
+                    id: a.id,
+                    host: host.to_owned(),
+                },
+            ))
+            .await
+            .unwrap_err();
+        assert_eq!(err.code(), code, "{host:?}");
+    }
+    assert_eq!(stored(&h.pool).await, 2);
+    h.client
+        .delete_credential(as_user(
+            &h.alice,
+            DeleteCredentialRequest {
+                id: a.id,
+                host: FGJ_HOST.to_owned(),
+            },
+        ))
+        .await
+        .unwrap();
+    assert_eq!(stored(&h.pool).await, 1);
+}
+
+#[sqlx::test]
+async fn a_second_host_does_not_replace_the_first(pool: PgPool) {
+    let mut h = harness(pool, FakeGithub::ok()).await;
+    add_host(&h.pool, FGJ_HOST).await;
+    add_host(&h.pool, FGJ_HOST_B).await;
+    for (host, value) in [(FGJ_HOST, FGJ), (FGJ_HOST_B, FGJ2)] {
+        h.client
+            .put_credential(as_user(&h.alice, put_on(host, "forgejo_pat", value)))
+            .await
+            .unwrap();
+    }
+    assert_eq!(stored(&h.pool).await, 2);
+}
+
+#[sqlx::test]
+async fn a_forgejo_credential_cannot_be_verified(pool: PgPool) {
+    let mut h = harness(pool, FakeGithub::ok()).await;
+    add_host(&h.pool, FGJ_HOST).await;
+    let info = h
+        .client
+        .put_credential(as_user(&h.alice, put_on(FGJ_HOST, "forgejo_pat", FGJ)))
+        .await
+        .unwrap()
+        .into_inner();
+    let err = h
+        .client
+        .verify_credential(as_user(&h.alice, VerifyCredentialRequest { id: info.id }))
+        .await
+        .unwrap_err();
+    assert_eq!(err.code(), Code::FailedPrecondition);
+    assert_eq!(h.github.calls(), 0);
+}
+
+#[sqlx::test]
+async fn the_cap_counts_each_host_and_lets_an_existing_pair_be_replaced(pool: PgPool) {
+    let mut h = harness(pool, FakeGithub::ok()).await;
+    let cap = fleet_proto::MAX_CREDENTIALS_PER_USER;
+    sqlx::query(
+        "INSERT INTO git_hosts (host, kind) SELECT 'h' || g || '.example.com', 'forgejo' \
+         FROM generate_series(1, $1::int + 1) g",
+    )
+    .bind(i32::try_from(cap).unwrap())
+    .execute(&h.pool)
+    .await
+    .unwrap();
+    for n in 1..cap {
+        h.client
+            .put_credential(as_user(
+                &h.alice,
+                put_on(&format!("h{n}.example.com"), "forgejo_pat", FGJ),
+            ))
+            .await
+            .unwrap();
+    }
+    h.client
+        .put_credential(as_user(&h.alice, put("anthropic_api_key", ANT)))
+        .await
+        .unwrap();
+    let extra = format!("h{}.example.com", cap + 1);
+    let err = h
+        .client
+        .put_credential(as_user(&h.alice, put_on(&extra, "forgejo_pat", FGJ)))
+        .await
+        .unwrap_err();
+    assert_eq!(err.code(), Code::ResourceExhausted);
+    assert_eq!(stored(&h.pool).await, i64::try_from(cap).unwrap());
+    h.client
+        .put_credential(as_user(
+            &h.alice,
+            put_on("h1.example.com", "forgejo_pat", FGJ2),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(stored(&h.pool).await, i64::try_from(cap).unwrap());
+    let github = h
+        .client
+        .put_credential(as_user(&h.alice, put("github_pat", PAT)))
+        .await
+        .unwrap_err();
+    assert_eq!(github.code(), Code::ResourceExhausted);
+    assert_eq!(h.github.calls(), 0);
 }

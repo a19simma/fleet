@@ -1,9 +1,12 @@
 //! Credential store tests. They need a Postgres superuser URL in `DATABASE_URL`, which
 //! `#[sqlx::test]` reads to create one database per test.
 
+#![expect(clippy::unwrap_used, reason = "test code asserts by panicking")]
+
 use std::sync::Arc;
 
 use fleet_core::credential::{CredentialKind, CredentialShape, Secret};
+use fleet_core::host::HostError;
 use fleet_server::cred::FileSealer;
 use fleet_server::cred::github::MAX_EXPIRY_MS;
 use fleet_server::cred::store::{CredentialStore, StoreError};
@@ -435,4 +438,450 @@ async fn setup_is_inert_once_any_user_exists(pool: PgPool) {
     ));
     let fresh = Users::new(pool);
     assert!(fresh.issue_setup_code().await.unwrap().is_none());
+}
+
+const FGJ_A: &str = "0123456789abcdef0123456789abcdef01234567";
+const FGJ_B: &str = "fedcba9876543210fedcba9876543210fedcba98";
+const HOST_A: &str = "git.example.com";
+const HOST_B: &str = "code.example.org";
+
+async fn add_host(pool: &PgPool, host: &str) {
+    sqlx::query("INSERT INTO git_hosts (host, kind) VALUES ($1, 'forgejo')")
+        .bind(host)
+        .execute(pool)
+        .await
+        .unwrap();
+}
+
+async fn put_forgejo(
+    store: &CredentialStore,
+    user: i64,
+    host: &str,
+    value: &str,
+) -> Result<fleet_server::cred::store::CredentialSummary, StoreError> {
+    store
+        .put_for_host(
+            user,
+            host,
+            CredentialKind::ForgejoPat,
+            STATIC,
+            Secret::new(value.into()),
+            None,
+            None,
+        )
+        .await
+}
+
+async fn count(pool: &PgPool, table: &str) -> i64 {
+    let sql = match table {
+        "credentials" => "SELECT count(*) FROM credentials",
+        _ => "SELECT count(*) FROM credential_audit",
+    };
+    sqlx::query_scalar(sql).fetch_one(pool).await.unwrap()
+}
+
+fn hostile_hosts() -> Vec<String> {
+    let long_label = format!("{}.example.com", "a".repeat(64));
+    let long_name = format!("{}.example.com", "a.".repeat(130));
+    let raw_long = "a".repeat(1025);
+    [
+        "",
+        "a b.example.com",
+        "a\tb.example.com",
+        "a\r\nb.example.com",
+        "a\u{85}b.example.com",
+        "a\u{2028}b.example.com",
+        "a\0b.example.com",
+        "https://git.example.com",
+        "git.example.com/path",
+        "git.example.com?q=1",
+        "git.example.com#f",
+        "//git.example.com",
+        "user@git.example.com",
+        "git.example.com:443",
+        "127.0.0.1",
+        "2130706433",
+        "0x7f000001",
+        "[::1]",
+        "*.example.com",
+        "a\\b.example.com",
+        "-a.example.com",
+        "a-.example.com",
+        "a..example.com",
+        "localhost",
+        "printer.local",
+        "svc.internal",
+        "a\u{200b}b.example.com",
+        long_label.as_str(),
+        long_name.as_str(),
+        raw_long.as_str(),
+    ]
+    .iter()
+    .map(|h| (*h).to_owned())
+    .filter(|h| !h.is_empty())
+    .collect()
+}
+
+#[sqlx::test]
+async fn forgejo_pat_is_stored_for_its_host_and_listed_with_it(pool: PgPool) {
+    let store = store(&pool, "fgj-put").unwrap();
+    let alice = user(&pool, "alice").await.unwrap();
+    add_host(&pool, HOST_A).await;
+    let put = put_forgejo(&store, alice, HOST_A, FGJ_A).await.unwrap();
+    assert_eq!(put.host, HOST_A);
+    assert_eq!(put.kind, CredentialKind::ForgejoPat);
+    assert_eq!(store.list(alice).await.unwrap(), vec![put]);
+}
+
+#[sqlx::test]
+async fn a_github_kind_keeps_github_com_by_default_and_explicitly(pool: PgPool) {
+    let store = store(&pool, "fgj-gh").unwrap();
+    let alice = user(&pool, "alice").await.unwrap();
+    let bare = store
+        .put(
+            alice,
+            CredentialKind::GithubPat,
+            STATIC,
+            Secret::new(PAT.into()),
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+    assert_eq!(bare.host, "github.com");
+    let explicit = store
+        .put_for_host(
+            alice,
+            "GitHub.COM",
+            CredentialKind::GithubPat,
+            STATIC,
+            Secret::new(PAT2.into()),
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+    assert_eq!(explicit.host, "github.com");
+    assert_eq!(explicit.id, bare.id);
+    let agent = store
+        .put(
+            alice,
+            CredentialKind::AnthropicApiKey,
+            STATIC,
+            Secret::new(ANT.into()),
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+    assert_eq!(agent.host, "github.com");
+}
+
+#[sqlx::test]
+async fn a_forgejo_pat_needs_a_host(pool: PgPool) {
+    let store = store(&pool, "fgj-empty").unwrap();
+    let alice = user(&pool, "alice").await.unwrap();
+    add_host(&pool, HOST_A).await;
+    let err = put_forgejo(&store, alice, "", FGJ_A).await.unwrap_err();
+    assert!(matches!(err, StoreError::HostInvalid(HostError::Empty)));
+    assert_eq!(count(&pool, "credentials").await, 0);
+    assert_eq!(count(&pool, "audit").await, 0);
+}
+
+#[sqlx::test]
+async fn a_host_missing_from_git_hosts_is_refused(pool: PgPool) {
+    let store = store(&pool, "fgj-unknown").unwrap();
+    let alice = user(&pool, "alice").await.unwrap();
+    let err = put_forgejo(&store, alice, HOST_A, FGJ_A).await.unwrap_err();
+    assert!(matches!(err, StoreError::HostUnknown));
+    assert_eq!(count(&pool, "credentials").await, 0);
+    assert_eq!(count(&pool, "audit").await, 0);
+}
+
+#[sqlx::test]
+async fn kind_and_host_kind_must_agree(pool: PgPool) {
+    let store = store(&pool, "fgj-mismatch").unwrap();
+    let alice = user(&pool, "alice").await.unwrap();
+    add_host(&pool, HOST_A).await;
+    let err = put_forgejo(&store, alice, "github.com", FGJ_A)
+        .await
+        .unwrap_err();
+    assert!(matches!(err, StoreError::HostKindMismatch));
+    let err = store
+        .put_for_host(
+            alice,
+            HOST_A,
+            CredentialKind::GithubPat,
+            STATIC,
+            Secret::new(PAT.into()),
+            None,
+            None,
+        )
+        .await
+        .unwrap_err();
+    assert!(matches!(err, StoreError::HostKindMismatch));
+    let err = store
+        .put_for_host(
+            alice,
+            HOST_A,
+            CredentialKind::AnthropicApiKey,
+            STATIC,
+            Secret::new(ANT.into()),
+            None,
+            None,
+        )
+        .await
+        .unwrap_err();
+    assert!(matches!(err, StoreError::HostKindMismatch));
+    assert_eq!(count(&pool, "credentials").await, 0);
+    assert_eq!(count(&pool, "audit").await, 0);
+}
+
+#[sqlx::test]
+async fn a_github_row_whose_host_row_is_gone_is_refused(pool: PgPool) {
+    let store = store(&pool, "fgj-gone").unwrap();
+    let alice = user(&pool, "alice").await.unwrap();
+    sqlx::query("DELETE FROM git_hosts WHERE host = 'github.com'")
+        .execute(&pool)
+        .await
+        .unwrap();
+    let err = store
+        .put(
+            alice,
+            CredentialKind::GithubPat,
+            STATIC,
+            Secret::new(PAT.into()),
+            None,
+            None,
+        )
+        .await
+        .unwrap_err();
+    assert!(matches!(err, StoreError::HostUnknown));
+}
+
+#[sqlx::test]
+async fn hostile_hosts_are_refused_on_every_call(pool: PgPool) {
+    let store = store(&pool, "fgj-hostile").unwrap();
+    let alice = user(&pool, "alice").await.unwrap();
+    add_host(&pool, HOST_A).await;
+    let kept = put_forgejo(&store, alice, HOST_A, FGJ_A).await.unwrap();
+    for host in hostile_hosts() {
+        let put = put_forgejo(&store, alice, &host, FGJ_B).await;
+        assert!(
+            matches!(put, Err(StoreError::HostInvalid(_))),
+            "put {host:?}"
+        );
+        let list = store.list_for_host(alice, &host).await;
+        assert!(
+            matches!(list, Err(StoreError::HostInvalid(_))),
+            "list {host:?}"
+        );
+        let delete = store.delete_for_host(alice, kept.id, &host).await;
+        assert!(
+            matches!(delete, Err(StoreError::HostInvalid(_))),
+            "delete {host:?}"
+        );
+        let open = store
+            .open_for_host(alice, CredentialKind::ForgejoPat, &host)
+            .await;
+        assert!(
+            matches!(open, Err(StoreError::HostInvalid(_))),
+            "open {host:?}"
+        );
+    }
+    assert_eq!(store.list(alice).await.unwrap(), vec![kept]);
+    assert_eq!(count(&pool, "audit").await, 1);
+}
+
+#[sqlx::test]
+async fn host_case_and_trailing_dot_normalise_to_one_row(pool: PgPool) {
+    let store = store(&pool, "fgj-case").unwrap();
+    let alice = user(&pool, "alice").await.unwrap();
+    add_host(&pool, HOST_A).await;
+    let first = put_forgejo(&store, alice, "GIT.Example.COM", FGJ_A)
+        .await
+        .unwrap();
+    let second = put_forgejo(&store, alice, "git.example.com.", FGJ_B)
+        .await
+        .unwrap();
+    assert_eq!(first.host, HOST_A);
+    assert_eq!(second.id, first.id);
+    assert_eq!(store.list(alice).await.unwrap().len(), 1);
+}
+
+#[sqlx::test]
+async fn one_user_holds_one_forgejo_pat_per_host(pool: PgPool) {
+    let store = store(&pool, "fgj-two").unwrap();
+    let alice = user(&pool, "alice").await.unwrap();
+    add_host(&pool, HOST_A).await;
+    add_host(&pool, HOST_B).await;
+    let a = put_forgejo(&store, alice, HOST_A, FGJ_A).await.unwrap();
+    let b = put_forgejo(&store, alice, HOST_B, FGJ_B).await.unwrap();
+    assert_ne!(a.id, b.id);
+    assert_eq!(store.list(alice).await.unwrap(), vec![a.clone(), b.clone()]);
+    assert_eq!(store.list_for_host(alice, HOST_A).await.unwrap(), vec![a]);
+    assert_eq!(store.list_for_host(alice, HOST_B).await.unwrap(), vec![b]);
+    assert_eq!(store.list_for_host(alice, "").await.unwrap().len(), 2);
+    let err = store.list_for_host(alice, "other.example.com").await;
+    assert!(matches!(err, Err(StoreError::HostUnknown)));
+}
+
+#[sqlx::test]
+async fn a_token_is_opened_only_for_the_host_it_was_stored_for(pool: PgPool) {
+    let store = store(&pool, "fgj-iso").unwrap();
+    let alice = user(&pool, "alice").await.unwrap();
+    let bob = user(&pool, "bob").await.unwrap();
+    add_host(&pool, HOST_A).await;
+    add_host(&pool, HOST_B).await;
+    add_host(&pool, "empty.example.net").await;
+    put_forgejo(&store, alice, HOST_A, FGJ_A).await.unwrap();
+    put_forgejo(&store, alice, HOST_B, FGJ_B).await.unwrap();
+    put_forgejo(&store, bob, HOST_B, FGJ_A).await.unwrap();
+    let (summary, secret) = store
+        .open_for_host(alice, CredentialKind::ForgejoPat, HOST_B)
+        .await
+        .unwrap();
+    assert_eq!(summary.host, HOST_B);
+    assert_eq!(secret.expose(), FGJ_B.as_bytes());
+    let (_, secret) = store
+        .open_for_host(alice, CredentialKind::ForgejoPat, "Git.Example.com")
+        .await
+        .unwrap();
+    assert_eq!(secret.expose(), FGJ_A.as_bytes());
+    let none = store
+        .open_for_host(alice, CredentialKind::ForgejoPat, "empty.example.net")
+        .await;
+    assert!(matches!(none, Err(StoreError::NotFound)));
+    let (_, secret) = store
+        .open_for_host(bob, CredentialKind::ForgejoPat, HOST_B)
+        .await
+        .unwrap();
+    assert_eq!(secret.expose(), FGJ_A.as_bytes());
+    let none = store
+        .open_for_host(bob, CredentialKind::ForgejoPat, HOST_A)
+        .await;
+    assert!(matches!(none, Err(StoreError::NotFound)));
+    let bare = store
+        .open_for_host(alice, CredentialKind::ForgejoPat, "")
+        .await;
+    assert!(matches!(
+        bare,
+        Err(StoreError::HostInvalid(HostError::Empty))
+    ));
+    let other_kind = store
+        .open_for_host(alice, CredentialKind::GithubPat, HOST_A)
+        .await;
+    assert!(matches!(other_kind, Err(StoreError::HostKindMismatch)));
+}
+
+#[sqlx::test]
+async fn delete_needs_the_host_the_row_is_stored_for(pool: PgPool) {
+    let store = store(&pool, "fgj-del").unwrap();
+    let alice = user(&pool, "alice").await.unwrap();
+    add_host(&pool, HOST_A).await;
+    add_host(&pool, HOST_B).await;
+    let a = put_forgejo(&store, alice, HOST_A, FGJ_A).await.unwrap();
+    let wrong = store.delete_for_host(alice, a.id, HOST_B).await;
+    assert!(matches!(wrong, Err(StoreError::NotFound)));
+    let unknown = store
+        .delete_for_host(alice, a.id, "other.example.net")
+        .await;
+    assert!(matches!(unknown, Err(StoreError::HostUnknown)));
+    let bare = store.delete_for_host(alice, a.id, "").await;
+    assert!(matches!(
+        bare,
+        Err(StoreError::HostInvalid(HostError::Empty))
+    ));
+    let github = store.delete_for_host(alice, a.id, "github.com").await;
+    assert!(matches!(github, Err(StoreError::HostKindMismatch)));
+    assert_eq!(store.list(alice).await.unwrap().len(), 1);
+    assert_eq!(count(&pool, "audit").await, 1);
+    store
+        .delete_for_host(alice, a.id, "GIT.example.com")
+        .await
+        .unwrap();
+    assert_eq!(store.list(alice).await.unwrap().len(), 0);
+}
+
+#[sqlx::test]
+async fn a_github_row_is_deleted_with_an_empty_or_github_host_only(pool: PgPool) {
+    let store = store(&pool, "fgj-delgh").unwrap();
+    let alice = user(&pool, "alice").await.unwrap();
+    add_host(&pool, HOST_A).await;
+    let put = store
+        .put(
+            alice,
+            CredentialKind::GithubPat,
+            STATIC,
+            Secret::new(PAT.into()),
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+    let other = store.delete_for_host(alice, put.id, HOST_A).await;
+    assert!(matches!(other, Err(StoreError::HostKindMismatch)));
+    store
+        .delete_for_host(alice, put.id, "github.com")
+        .await
+        .unwrap();
+    assert_eq!(store.list(alice).await.unwrap().len(), 0);
+}
+
+#[sqlx::test]
+async fn another_users_row_is_not_found_whatever_the_host(pool: PgPool) {
+    let store = store(&pool, "fgj-foreign").unwrap();
+    let alice = user(&pool, "alice").await.unwrap();
+    let bob = user(&pool, "bob").await.unwrap();
+    add_host(&pool, HOST_A).await;
+    let a = put_forgejo(&store, alice, HOST_A, FGJ_A).await.unwrap();
+    let err = store.delete_for_host(bob, a.id, HOST_A).await;
+    assert!(matches!(err, Err(StoreError::NotFound)));
+    assert_eq!(store.list(alice).await.unwrap().len(), 1);
+}
+
+#[sqlx::test]
+async fn the_cap_counts_a_second_host_as_another_credential(pool: PgPool) {
+    let alice = user(&pool, "alice").await.unwrap();
+    add_host(&pool, HOST_A).await;
+    add_host(&pool, HOST_B).await;
+    let limited = CredentialStore::with_limit(pool.clone(), cap_sealer(), 1);
+    put_forgejo(&limited, alice, HOST_A, FGJ_A).await.unwrap();
+    put_forgejo(&limited, alice, HOST_A, FGJ_B).await.unwrap();
+    let err = put_forgejo(&limited, alice, HOST_B, FGJ_B).await;
+    assert!(matches!(err, Err(StoreError::TooMany)));
+}
+
+fn cap_sealer() -> Arc<FileSealer> {
+    let path =
+        std::env::temp_dir().join(format!("fleet-cred-store-{}-cap.keys", std::process::id()));
+    std::fs::write(&path, format!("k1:{}\n", "ab".repeat(32))).unwrap();
+    let sealer = FileSealer::load(&path);
+    std::fs::remove_file(&path).unwrap();
+    Arc::new(sealer.unwrap())
+}
+
+#[sqlx::test]
+async fn a_put_waits_on_a_lock_held_on_the_host_row(pool: PgPool) {
+    let store = store(&pool, "fgj-lock").unwrap();
+    let alice = user(&pool, "alice").await.unwrap();
+    add_host(&pool, HOST_A).await;
+    let mut holder = pool.begin().await.unwrap();
+    sqlx::query("SELECT host FROM git_hosts WHERE host = $1 FOR UPDATE")
+        .bind(HOST_A)
+        .fetch_one(&mut *holder)
+        .await
+        .unwrap();
+    let writer = store.clone();
+    let task = tokio::spawn(async move { put_forgejo(&writer, alice, HOST_A, FGJ_A).await });
+    tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
+    assert!(!task.is_finished());
+    assert_eq!(count(&pool, "credentials").await, 0);
+    holder.rollback().await.unwrap();
+    tokio::time::timeout(std::time::Duration::from_secs(30), task)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    assert_eq!(count(&pool, "credentials").await, 1);
 }

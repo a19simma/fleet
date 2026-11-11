@@ -8,6 +8,8 @@ use std::fmt;
 use sha2::{Digest, Sha256};
 use zeroize::{Zeroize, ZeroizeOnDrop, Zeroizing};
 
+use crate::host::HostKind;
+
 /// Shortest accepted credential, in bytes.
 pub const MIN_CREDENTIAL_LEN: usize = 20;
 
@@ -16,6 +18,12 @@ pub const MAX_CREDENTIAL_LEN: usize = 512;
 
 /// Prefix of every GitHub App installation token. The rest is letters, digits and underscores.
 pub const GITHUB_INSTALLATION_TOKEN_PREFIX: &str = "ghs_";
+
+/// Length of a Forgejo personal access token, in lowercase hex characters (ADR-0068).
+pub const FORGEJO_PAT_LEN: usize = 40;
+
+/// The host every credential of a kind other than `forgejo_pat` belongs to.
+pub const GITHUB_HOST: &str = "github.com";
 
 /// Number of hex characters in a fingerprint. It must be even: an odd value would cut off
 /// its last half byte without warning.
@@ -34,6 +42,8 @@ pub enum CredentialKind {
     GithubPat,
     /// GitHub App installation, minted into short-lived installation tokens.
     GithubApp,
+    /// Forgejo or Gitea personal access token: 40 lowercase hex characters, opaque (ADR-0068).
+    ForgejoPat,
     /// Kimi membership key.
     KimiMembershipKey,
     /// Kimi platform key.
@@ -44,11 +54,12 @@ pub enum CredentialKind {
 
 impl CredentialKind {
     /// Every kind, in declaration order.
-    pub const ALL: [Self; 7] = [
+    pub const ALL: [Self; 8] = [
         Self::AnthropicApiKey,
         Self::ClaudeSubscriptionToken,
         Self::GithubPat,
         Self::GithubApp,
+        Self::ForgejoPat,
         Self::KimiMembershipKey,
         Self::KimiPlatformKey,
         Self::CodexApiKey,
@@ -61,15 +72,31 @@ impl CredentialKind {
             Self::ClaudeSubscriptionToken => "claude_subscription_token",
             Self::GithubPat => "github_pat",
             Self::GithubApp => "github_app",
+            Self::ForgejoPat => "forgejo_pat",
             Self::KimiMembershipKey => "kimi_membership_key",
             Self::KimiPlatformKey => "kimi_platform_key",
             Self::CodexApiKey => "codex_api_key",
         }
     }
 
-    /// True for kinds that authenticate against the git forge.
+    /// True for kinds that authenticate against GitHub. `forgejo_pat` is not one of them.
     pub const fn is_forge(self) -> bool {
         matches!(self, Self::GithubPat | Self::GithubApp)
+    }
+
+    /// The kind of host a credential of this kind is stored for: Forgejo for `forgejo_pat`,
+    /// GitHub for every other kind.
+    pub const fn host_kind(self) -> HostKind {
+        match self {
+            Self::ForgejoPat => HostKind::Forgejo,
+            _ => HostKind::Github,
+        }
+    }
+
+    /// True when a credential of this kind must name its host. Every other kind belongs to
+    /// [`GITHUB_HOST`].
+    pub const fn needs_host(self) -> bool {
+        matches!(self, Self::ForgejoPat)
     }
 
     /// Parses a wire name.
@@ -81,7 +108,11 @@ impl CredentialKind {
         match self {
             Self::AnthropicApiKey | Self::ClaudeSubscriptionToken => Some("sk-ant-"),
             Self::KimiMembershipKey => Some("sk-kimi-"),
-            Self::GithubPat | Self::GithubApp | Self::KimiPlatformKey | Self::CodexApiKey => None,
+            Self::GithubPat
+            | Self::GithubApp
+            | Self::ForgejoPat
+            | Self::KimiPlatformKey
+            | Self::CodexApiKey => None,
         }
     }
 }
@@ -323,6 +354,8 @@ pub enum CredentialError {
     GithubNotFineGrained,
     /// The `github_app` value is not an installation id.
     GithubAppInstallationId,
+    /// The `forgejo_pat` value is not 40 lowercase hex characters.
+    ForgejoPatShape,
 }
 
 impl fmt::Display for CredentialError {
@@ -337,6 +370,7 @@ impl fmt::Display for CredentialError {
                 "github credential must be a fine-grained token starting with github_pat_"
             }
             Self::GithubAppInstallationId => "github_app value must be an installation id",
+            Self::ForgejoPatShape => "forgejo_pat must be 40 lowercase hex characters",
         })
     }
 }
@@ -361,9 +395,9 @@ pub struct Validated {
 ///
 /// # Errors
 ///
-/// Returns a [`CredentialError`] for an unsupported shape, an empty, short, long or
-/// whitespace-containing value, a GitHub token that is not fine-grained, or a `github_app`
-/// value that is not an installation id. The error text never carries the value.
+/// Returns a [`CredentialError`] for an unsupported shape, an empty or whitespace-containing
+/// value, a `forgejo_pat` that is not 40 lowercase hex characters, a short or long value, a
+/// GitHub token that is not fine-grained, or a `github_app` value that is not an installation id. The error text never carries the value.
 ///
 /// The whitespace check uses Unicode whitespace and control characters, so zero-width
 /// characters pass. Length bounds count bytes.
@@ -387,6 +421,19 @@ pub fn validate(
                 unknown_prefix: false,
             })
             .map_err(|_| CredentialError::GithubAppInstallationId);
+    }
+    if kind == CredentialKind::ForgejoPat {
+        return if value.len() == FORGEJO_PAT_LEN
+            && value
+                .bytes()
+                .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+        {
+            Ok(Validated {
+                unknown_prefix: false,
+            })
+        } else {
+            Err(CredentialError::ForgejoPatShape)
+        };
     }
     if value.len() < MIN_CREDENTIAL_LEN {
         return Err(CredentialError::TooShort);
@@ -684,6 +731,7 @@ mod tests {
                 "claude_subscription_token",
                 "github_pat",
                 "github_app",
+                "forgejo_pat",
                 "kimi_membership_key",
                 "kimi_platform_key",
                 "codex_api_key"
@@ -861,6 +909,115 @@ mod tests {
         assert_eq!(secret.len(), PAT.len());
         secret.wipe();
         assert!(secret.is_empty());
+    }
+
+    const FORGEJO: &str = "0123456789abcdef0123456789abcdef01234567";
+
+    #[test]
+    fn forgejo_pat_accepts_forty_lowercase_hex() {
+        assert_eq!(FORGEJO.len(), 40);
+        assert_eq!(
+            validate(CredentialKind::ForgejoPat, STATIC, FORGEJO),
+            Ok(Validated {
+                unknown_prefix: false
+            })
+        );
+        assert_eq!(
+            validate(CredentialKind::ForgejoPat, STATIC, &"0".repeat(40)),
+            Ok(Validated {
+                unknown_prefix: false
+            })
+        );
+        assert_eq!(
+            validate(CredentialKind::ForgejoPat, STATIC, &"f".repeat(40)),
+            Ok(Validated {
+                unknown_prefix: false
+            })
+        );
+    }
+
+    #[test]
+    fn forgejo_pat_hostile_value_table() {
+        let upper = FORGEJO.to_uppercase();
+        let g = format!("g{}", &FORGEJO[1..]);
+        let slash = format!("/{}", &FORGEJO[1..]);
+        let wide = format!("\u{ff10}{}", &FORGEJO[1..]);
+        let short = FORGEJO[..39].to_owned();
+        let long = format!("{FORGEJO}0");
+        let prefixed = format!("ghs_{}", &FORGEJO[4..]);
+        let github = "github_pat_11ABCDEFG0abcdefghijklmnop".to_owned();
+        let mixed = format!("A{}", &FORGEJO[1..]);
+        let huge = "a".repeat(MAX_CREDENTIAL_LEN + 1);
+        let multibyte = format!("{}\u{e9}", &FORGEJO[..38]);
+        for bad in [
+            upper, g, slash, wide, short, long, prefixed, github, mixed, huge, multibyte,
+        ] {
+            assert_eq!(
+                validate(CredentialKind::ForgejoPat, STATIC, &bad),
+                Err(CredentialError::ForgejoPatShape),
+                "{bad:?}"
+            );
+        }
+        for bad in [
+            format!("{FORGEJO}\n"),
+            format!(" {FORGEJO}"),
+            format!("{FORGEJO}\u{85}"),
+            format!("{FORGEJO}\u{2028}"),
+            format!("{}\0", &FORGEJO[..39]),
+        ] {
+            assert_eq!(
+                validate(CredentialKind::ForgejoPat, STATIC, &bad),
+                Err(CredentialError::Whitespace),
+                "{bad:?}"
+            );
+        }
+        assert_eq!(
+            validate(CredentialKind::ForgejoPat, STATIC, ""),
+            Err(CredentialError::Empty)
+        );
+    }
+
+    #[test]
+    fn forgejo_shape_is_not_required_of_other_kinds() {
+        assert_eq!(
+            validate(CredentialKind::CodexApiKey, STATIC, FORGEJO),
+            Ok(Validated {
+                unknown_prefix: false
+            })
+        );
+        assert_eq!(
+            validate(CredentialKind::GithubPat, STATIC, FORGEJO),
+            Err(CredentialError::GithubNotFineGrained)
+        );
+    }
+
+    #[test]
+    fn forgejo_pat_is_opaque_and_redacted() {
+        let secret = Secret::new(FORGEJO.to_owned());
+        assert!(!format!("{secret:?}").contains(FORGEJO));
+        assert!(!format!("{secret}").contains(FORGEJO));
+        let err = validate(CredentialKind::ForgejoPat, STATIC, "zz").unwrap_err();
+        assert!(!err.to_string().contains("zz"));
+        assert_eq!(
+            err.to_string(),
+            "forgejo_pat must be 40 lowercase hex characters"
+        );
+        assert!(!CredentialKind::ForgejoPat.is_forge());
+    }
+
+    #[test]
+    fn host_kind_and_host_need_follow_the_kind() {
+        for kind in CredentialKind::ALL {
+            let forgejo = kind == CredentialKind::ForgejoPat;
+            assert_eq!(kind.needs_host(), forgejo, "{}", kind.wire_name());
+            let want = if forgejo {
+                HostKind::Forgejo
+            } else {
+                HostKind::Github
+            };
+            assert_eq!(kind.host_kind(), want, "{}", kind.wire_name());
+        }
+        assert_eq!(GITHUB_HOST, "github.com");
     }
 
     #[test]
