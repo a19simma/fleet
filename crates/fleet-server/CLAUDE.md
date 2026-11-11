@@ -13,6 +13,7 @@
 - **Job owner default.** `jobs.user_id` is NOT NULL with `DEFAULT bootstrap_user_id()` (migration 0018). Every production insert (`store.rs`, `batches.rs`, `store/ci_retry.rs`) binds `user_id` and `agent`; only a raw `INSERT INTO jobs` in a test falls back to the default and lands on the `bootstrap` user, which the function creates on first use.
 - **Migration backfill tests.** Use `#[sqlx::test(migrations = false)]`, run a `Migrator` filtered to versions below the new one, insert old-shape rows, then run the full `sqlx::migrate!`.
 - **Recovery and reset tasks.** Enumerate every credential class of the user (passkeys, sessions, api tokens, setup codes) and test that each is revoked.
+- **A new RPC or service in `fleet.proto` needs a classification.** Add the RPC to `CLASSIFIED` in `tests/owner_reads.rs` and to the ADR-0042 table, then run `cargo nextest run -p fleet-server --test owner_reads`. `every_rpc_in_the_proto_is_classified` enumerates the proto, and FGJ-3 went red on it after a service add.
 
 ## Catalog, capabilities and admin
 
