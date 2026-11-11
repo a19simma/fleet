@@ -219,7 +219,7 @@ pub enum Command {
         #[command(subcommand)]
         action: credential::CredentialAction,
     },
-    /// Add, list and remove git hosts. Removing a host is for admins.
+    /// Add, list and remove git hosts. Removing and approving private hosts is for admins.
     Host {
         /// The host action.
         #[command(subcommand)]
@@ -981,6 +981,24 @@ async fn run_host(
             let name = host::parse_host(&text)?;
             let mut session = session(env, timeouts).await?;
             host::remove(&mut session.hosts, &name, out).await
+        }
+        host::HostAction::ApprovePrivate {
+            host: text,
+            addresses,
+        } => {
+            let name = host::parse_host(&text)?;
+            let ips = host::parse_addresses(&addresses)?;
+            let mut session = session(env, timeouts).await?;
+            host::approve(&mut session.hosts, &session.scrub, &name, &ips, out).await
+        }
+        host::HostAction::RevokePrivate { host: text, .. } => {
+            let name = host::parse_host(&text)?;
+            let mut session = session(env, timeouts).await?;
+            host::revoke(&mut session.hosts, &session.scrub, &name, out).await
+        }
+        host::HostAction::Requests { .. } => {
+            let mut session = session(env, timeouts).await?;
+            host::requests(&mut session.hosts, &session.scrub, out).await
         }
     }
 }
