@@ -13,7 +13,7 @@ use std::time::Duration;
 
 use fleet_core::credential::Secret;
 use fleet_core::repo::{ForgeKind, RepoRef, RepoVerdict};
-use fleet_forge::GitHubForge;
+use fleet_forge::{GitHubForge, REPO_CHECK_BUDGET};
 use fleet_proto::{
     CALL_BUDGET, PRECONDITION_REPO_NO_CREDENTIAL, PRECONDITION_REPO_NOT_ALLOWED_HOST,
     PRECONDITION_REPO_NOT_FOUND_OR_NO_ACCESS, PRECONDITION_REPO_TIMEOUT,
@@ -25,10 +25,8 @@ use super::https::ForgeTransport;
 use super::store::{CredentialStore, ProbeLease, ProbeTarget, StoreError};
 use crate::config::{Forge, HostConfig, RepoHosts};
 
-/// The whole repository check, from host lookup to verdict. It sits under
-/// [`fleet_proto::CALL_BUDGET`] so the server answers before the client's deadline.
-pub const REPO_CHECK_BUDGET: Duration = Duration::from_secs(7);
-
+/// The forge budget sits under [`fleet_proto::CALL_BUDGET`] so the server answers before the
+/// client's deadline.
 const _: () = assert!(REPO_CHECK_BUDGET.as_millis() < CALL_BUDGET.as_millis());
 
 const GITHUB_WEB_HOST: &str = "github.com";
