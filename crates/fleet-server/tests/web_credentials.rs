@@ -660,3 +660,294 @@ async fn the_no_job_notice_tells_the_user_to_submit_a_job(pool: PgPool) {
     ));
     h.finish().await;
 }
+
+const FORGEJO: &str = "0123456789abcdef0123456789abcdef01234567";
+const FORGEJO_B: &str = "fedcba9876543210fedcba9876543210fedcba98";
+const HOST_A: &str = "git.example.com";
+const HOST_B: &str = "code.example.org";
+
+fn enc(text: &str) -> String {
+    text.bytes().fold(String::new(), |mut out, byte| {
+        let _ = write!(out, "%{byte:02X}");
+        out
+    })
+}
+
+async fn add_host(pool: &PgPool, host: &str) {
+    sqlx::query("INSERT INTO git_hosts (host, kind) VALUES ($1, 'forgejo')")
+        .bind(host)
+        .execute(pool)
+        .await
+        .unwrap();
+}
+
+async fn put_for(h: &Harness, who: &Session, kind: &str, value: &str, host: &str) -> Reply {
+    let body = format!(
+        "csrf={}&kind={kind}&value={value}&host={}",
+        who.csrf,
+        enc(host)
+    );
+    h.act(who, "put", &body).await
+}
+
+async fn delete_for(h: &Harness, who: &Session, id: i64, host: &str) -> Reply {
+    let body = format!("csrf={}&id={id}&host={}", who.csrf, enc(host));
+    h.act(who, "delete", &body).await
+}
+
+async fn hosts_of(pool: &PgPool, user_id: i64, kind: &str) -> Vec<String> {
+    sqlx::query_scalar(
+        "SELECT host FROM credentials WHERE user_id = $1 AND kind = $2 ORDER BY host",
+    )
+    .bind(user_id)
+    .bind(kind)
+    .fetch_all(pool)
+    .await
+    .unwrap()
+}
+
+#[sqlx::test]
+async fn a_forgejo_token_is_stored_for_the_posted_host_and_never_echoed(pool: PgPool) {
+    let h = Harness::start(pool).await;
+    add_host(&h.pool, HOST_A).await;
+    let alice = h.session("alice", 'a').await;
+    let reply = put_for(&h, &alice, "forgejo_pat", FORGEJO, HOST_A).await;
+    assert_eq!(reply.location(), "/credentials?notice=saved");
+    assert!(!format!("{}{}", reply.head, reply.body).contains(FORGEJO));
+    assert_eq!(
+        hosts_of(&h.pool, alice.user_id, "forgejo_pat").await,
+        [HOST_A]
+    );
+    let page = h.page(&alice, "?notice=saved").await;
+    assert!(!page.body.contains(FORGEJO));
+    assert!(page.body.contains(&format!("data-host=\"{HOST_A}\"")));
+    h.finish().await;
+}
+
+#[sqlx::test]
+async fn a_forgejo_token_without_a_host_or_for_an_unregistered_host_is_refused(pool: PgPool) {
+    let h = Harness::start(pool).await;
+    add_host(&h.pool, HOST_A).await;
+    let alice = h.session("alice", 'a').await;
+    let none = put_for(&h, &alice, "forgejo_pat", FORGEJO, "").await;
+    assert_eq!(none.location(), "/credentials?notice=invalid");
+    let legacy = h
+        .act(
+            &alice,
+            "put",
+            &format!("csrf={}&kind=forgejo_pat&value={FORGEJO}", alice.csrf),
+        )
+        .await;
+    assert_eq!(legacy.location(), "/credentials?notice=invalid");
+    let unknown = put_for(&h, &alice, "forgejo_pat", FORGEJO, "nowhere.example.net").await;
+    assert_eq!(unknown.location(), "/credentials?notice=host_unknown");
+    assert_eq!(stored(&h.pool).await, 0);
+    h.finish().await;
+}
+
+#[sqlx::test]
+async fn a_github_kind_accepts_only_github_com_as_host(pool: PgPool) {
+    let h = Harness::start(pool).await;
+    add_host(&h.pool, HOST_A).await;
+    let alice = h.session("alice", 'a').await;
+    let other = put_for(&h, &alice, "github_pat", PAT, HOST_A).await;
+    assert_eq!(other.location(), "/credentials?notice=invalid");
+    assert_eq!(stored(&h.pool).await, 0);
+    let own = put_for(&h, &alice, "github_pat", PAT, "GitHub.com").await;
+    assert_eq!(own.location(), "/credentials?notice=saved");
+    assert_eq!(
+        hosts_of(&h.pool, alice.user_id, "github_pat").await,
+        ["github.com"]
+    );
+    h.finish().await;
+}
+
+#[sqlx::test]
+async fn a_hostile_host_is_refused_with_the_fixed_notice_and_never_echoed(pool: PgPool) {
+    let h = Harness::start(pool).await;
+    add_host(&h.pool, HOST_A).await;
+    let alice = h.session("alice", 'a').await;
+    let long = format!("{}.example.com", "a".repeat(300));
+    let hostile = [
+        "git.example.com/path",
+        "https://git.example.com",
+        "user@git.example.com",
+        "user:pw@git.example.com",
+        "git.example.com:8080",
+        "git example.com",
+        " git.example.com",
+        "git.example.com ",
+        "git.example.com\r\nX-Evil: 1",
+        "git.example.com\n",
+        "git.example.com\u{85}",
+        "git.example.com\u{2028}",
+        "git.example.com\\evil",
+        "[::1]",
+        "127.0.0.1",
+        "*.example.com",
+        "git..example.com",
+        "-git.example.com",
+        "localhost",
+        "g\u{456}t.example.com",
+        "<script>alert(1)</script>",
+        "\"><img src=x>",
+        long.as_str(),
+    ];
+    for host in hostile {
+        for kind in ["forgejo_pat", "github_pat"] {
+            let value = if kind == "github_pat" { PAT } else { FORGEJO };
+            let reply = put_for(&h, &alice, kind, value, host).await;
+            let location = reply.location();
+            assert!(
+                location.starts_with("/credentials?notice="),
+                "{host:?} {kind}: {location}"
+            );
+            assert!(
+                !location.ends_with("notice=saved"),
+                "{host:?} {kind} was stored"
+            );
+            let page = h.page(&alice, &location["/credentials".len()..]).await;
+            let shown = format!("{}{}{}", reply.head, reply.body, page.body);
+            assert!(!shown.contains(value), "{host:?} echoed the token");
+            for needle in ["X-Evil", "<img src=x>", "<script>alert(1)</script>"] {
+                assert!(!shown.contains(needle), "{host:?} echoed {needle}");
+            }
+        }
+    }
+    assert_eq!(stored(&h.pool).await, 0);
+    h.finish().await;
+}
+
+#[sqlx::test]
+async fn the_page_lists_one_row_per_stored_host_and_the_host_select_lists_registered_hosts(
+    pool: PgPool,
+) {
+    let h = Harness::start(pool).await;
+    add_host(&h.pool, HOST_A).await;
+    add_host(&h.pool, HOST_B).await;
+    let alice = h.session("alice", 'a').await;
+    assert_eq!(
+        put_for(&h, &alice, "forgejo_pat", FORGEJO, HOST_A)
+            .await
+            .location(),
+        "/credentials?notice=saved"
+    );
+    assert_eq!(
+        put_for(&h, &alice, "forgejo_pat", FORGEJO_B, HOST_B)
+            .await
+            .location(),
+        "/credentials?notice=saved"
+    );
+    let page = h.page(&alice, "").await;
+    assert_eq!(page.body.matches("data-kind=\"forgejo_pat\"").count(), 2);
+    for host in [HOST_A, HOST_B] {
+        assert!(
+            page.body.contains(&format!("data-host=\"{host}\"")),
+            "{host}"
+        );
+        assert!(
+            page.body.contains(&format!("<option value=\"{host}\"")),
+            "{host}"
+        );
+    }
+    assert!(page.body.contains("name=\"host\""));
+    assert!(page.body.contains("<option value=\"\">"));
+    for host in [HOST_A, HOST_B] {
+        assert!(page.body.contains(&format!("<td>{host}</td>")), "{host}");
+    }
+    assert!(page.body.contains("<option value=\"github.com\""));
+    assert!(!page.body.contains(FORGEJO) && !page.body.contains(FORGEJO_B));
+    let bob = h.session("bob", 'b').await;
+    let bobs = h.page(&bob, "").await;
+    assert_eq!(bobs.body.matches("data-kind=\"forgejo_pat\"").count(), 1);
+    assert!(!bobs.body.contains("data-host=\"git.example.com\""));
+    h.finish().await;
+}
+
+#[sqlx::test]
+async fn a_registered_host_name_is_escaped_in_the_page(pool: PgPool) {
+    let h = Harness::start(pool).await;
+    add_host(&h.pool, "\"><script>alert(1)</script>.example.com").await;
+    let alice = h.session("alice", 'a').await;
+    let page = h.page(&alice, "").await;
+    assert!(!page.body.contains("\"><script>"));
+    assert!(!page.body.contains("<td><script>"));
+    assert!(page.body.contains("&lt;script&gt;alert(1)"));
+    h.finish().await;
+}
+
+#[sqlx::test]
+async fn delete_names_the_host_and_a_wrong_or_hostile_host_removes_nothing(pool: PgPool) {
+    let h = Harness::start(pool).await;
+    add_host(&h.pool, HOST_A).await;
+    add_host(&h.pool, HOST_B).await;
+    let alice = h.session("alice", 'a').await;
+    put_for(&h, &alice, "forgejo_pat", FORGEJO, HOST_A).await;
+    put_for(&h, &alice, "forgejo_pat", FORGEJO_B, HOST_B).await;
+    let id: i64 = sqlx::query_scalar("SELECT id FROM credentials WHERE host = $1")
+        .bind(HOST_A)
+        .fetch_one(&h.pool)
+        .await
+        .unwrap();
+    let wrong = delete_for(&h, &alice, id, HOST_B).await;
+    assert_eq!(wrong.location(), "/credentials?notice=not_found");
+    let blank = delete_for(&h, &alice, id, "").await;
+    assert_eq!(blank.location(), "/credentials?notice=invalid");
+    let hostile = delete_for(&h, &alice, id, "git.example.com/x").await;
+    assert_eq!(hostile.location(), "/credentials?notice=invalid");
+    assert_eq!(stored(&h.pool).await, 2);
+    let gone = delete_for(&h, &alice, id, "GIT.example.com").await;
+    assert_eq!(gone.location(), "/credentials?notice=deleted");
+    assert_eq!(
+        hosts_of(&h.pool, alice.user_id, "forgejo_pat").await,
+        [HOST_B]
+    );
+    h.finish().await;
+}
+
+#[sqlx::test]
+async fn the_delete_form_of_a_row_carries_its_host(pool: PgPool) {
+    let h = Harness::start(pool).await;
+    add_host(&h.pool, HOST_A).await;
+    let alice = h.session("alice", 'a').await;
+    put_for(&h, &alice, "forgejo_pat", FORGEJO, HOST_A).await;
+    let page = h.page(&alice, "").await;
+    let form = page
+        .body
+        .split("action=\"/credentials/delete\"")
+        .nth(1)
+        .unwrap();
+    assert!(form.contains(&format!("name=\"host\" value=\"{HOST_A}\"")));
+    h.finish().await;
+}
+
+#[sqlx::test]
+async fn the_host_actions_need_a_session_and_the_csrf_token(pool: PgPool) {
+    let h = Harness::start(pool).await;
+    add_host(&h.pool, HOST_A).await;
+    let alice = h.session("alice", 'a').await;
+    let host = enc(HOST_A);
+    let forged = h
+        .act(
+            &alice,
+            "put",
+            &format!("csrf=wrong&kind=forgejo_pat&value={FORGEJO}&host={host}"),
+        )
+        .await;
+    assert_eq!(forged.status, 403);
+    let anonymous = h
+        .send(
+            "POST",
+            "/credentials/put",
+            &[FORM],
+            format!(
+                "csrf={}&kind=forgejo_pat&value={FORGEJO}&host={host}",
+                alice.csrf
+            )
+            .as_bytes(),
+        )
+        .await;
+    assert_ne!(anonymous.status, 303);
+    assert_eq!(stored(&h.pool).await, 0);
+    h.finish().await;
+}

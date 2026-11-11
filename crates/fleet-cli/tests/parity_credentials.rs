@@ -72,6 +72,9 @@ const KIMI_PLATFORM: &str = "sk-abcdefghijklmnopqrstuvwxyz0";
 const CODEX: &str = "sk-proj-abcdefghijklmnopqrstuv";
 const CODEX_ALT: &str = "sk-proj-zyxwvutsrqponmlkjihgfe";
 const FORGEJO_HOST: &str = "git.example.com";
+const OTHER_HOST: &str = "code.example.org";
+const UNREGISTERED_HOST: &str = "nowhere.example.net";
+const HOSTILE_HOST: &str = "git.example.com/path";
 const FORGEJO: &str = "0123456789abcdef0123456789abcdef01234567";
 const CLASSIC: &str = "ghp_abcdefghijklmnopqrstuvwxyz0123456789";
 const SHORT: &str = "short";
@@ -104,8 +107,7 @@ const CAPABILITY_TEXT: &str =
 const D_NEWLINE: &str = "stdin carries a line ending the shell added, so the CLI strips exactly one trailing newline; the web form posts the value as typed and refuses any whitespace";
 const D_NON_UTF8: &str =
     "the CLI reads raw bytes from stdin and refuses invalid UTF-8; a web form always posts text";
-const D_HOST_FLAG: &str = "the CLI sends --host with a forgejo_pat and the server stores it for that host; the web form has no host field until FGJ-25, so it sends none and the server refuses a forgejo_pat without one";
-const D_HOST_USAGE: &str = "the CLI refuses a forgejo_pat without --host, and any host but github.com for a github kind, before a request; the web form sends no host, so the server refuses the first and stores the second for github.com";
+const D_HOST_USAGE: &str = "the CLI refuses a missing, hostile or wrong-kind host with a fixed usage error before any request; the web form posts the host as typed and the server refuses it with the fixed invalid notice";
 const D_ARGV: &str = "the CLI refuses a secret given as an argument, with a fixed usage error; the web form has no argument";
 const D_NOT_CONFIGURED: &str = "a server without a credential store answers the CLI with the fixed not-configured notice and the web page with a 404";
 const D_STATIC_TOKEN: &str = "the shared client token acts as the bootstrap user, so the CLI lists that user's credentials; the web page is only reachable with a user session";
@@ -196,6 +198,7 @@ const ROWS: &[Row] = &[
     same("list/owner", "list"),
     same("list/other-user", "list"),
     same("list/empty", "list"),
+    same("list/shows-host", "list"),
     differs(
         "list/not-configured",
         "list",
@@ -217,11 +220,14 @@ const ROWS: &[Row] = &[
     same("put/kimi_membership_key", "put"),
     same("put/kimi_platform_key", "put"),
     same("put/codex_api_key", "put"),
+    same("put/forgejo_pat", "put"),
+    same("put/forgejo_pat-host-case-folded", "put"),
+    same("put/forgejo_pat-unregistered-host", "put"),
     differs(
-        "put/forgejo_pat",
+        "put/forgejo_pat-hostile-host",
         "put",
-        D_HOST_FLAG,
-        "notice:saved",
+        D_HOST_USAGE,
+        "usage",
         "notice:invalid",
     ),
     differs(
@@ -236,7 +242,7 @@ const ROWS: &[Row] = &[
         "put",
         D_HOST_USAGE,
         "usage",
-        "notice:saved",
+        "notice:invalid",
     ),
     same("put/github_pat-explicit-host", "put"),
     same("put/replace-existing", "put"),
@@ -280,6 +286,17 @@ const ROWS: &[Row] = &[
     same("delete/non-numeric-id", "delete"),
     same("delete/negative-id", "delete"),
     same("delete/id-over-i64", "delete"),
+    same("delete/forgejo_pat-with-host", "delete"),
+    same("delete/forgejo_pat-wrong-host", "delete"),
+    same("delete/forgejo_pat-no-host", "delete"),
+    differs(
+        "delete/forgejo_pat-hostile-host",
+        "delete",
+        D_HOST_USAGE,
+        "usage",
+        "notice:invalid",
+    ),
+    same("delete/github_pat-explicit-host", "delete"),
     same("verify/github_pat-valid", "verify"),
     same("verify/github_pat-refused", "verify"),
     same("verify/github_pat-unavailable", "verify"),
@@ -581,7 +598,11 @@ impl Rig {
                     shape: "static_secret".to_owned(),
                     value: value.to_owned(),
                     expires_at_ms: None,
-                    host: String::new(),
+                    host: if kind == "forgejo_pat" {
+                        FORGEJO_HOST.to_owned()
+                    } else {
+                        String::new()
+                    },
                 },
             )
             .await
@@ -667,6 +688,7 @@ enum Act {
     PutHost(&'static str, &'static str, &'static [u8]),
     PutArgv(&'static str, &'static str),
     Delete(Target),
+    DeleteHost(Target, &'static str),
     Verify(Target),
 }
 
@@ -714,8 +736,12 @@ fn value_of(kind: &str) -> &'static str {
 fn kinds_in_cli_list(out: &str) -> Vec<String> {
     let mut kinds: Vec<String> = out
         .lines()
-        .filter_map(|line| line.split('\t').nth(1))
-        .map(ToOwned::to_owned)
+        .filter_map(|line| {
+            let mut cells = line.split('\t');
+            let kind = cells.nth(1)?;
+            let host = cells.nth(3)?;
+            Some(format!("{kind}@{host}"))
+        })
         .collect();
     kinds.sort();
     kinds
@@ -733,7 +759,12 @@ fn web_stored_kinds(page: &str) -> Vec<String> {
         .split("data-kind=\"")
         .skip(1)
         .filter(|chunk| chunk.contains("badge-success"))
-        .filter_map(|chunk| chunk.split('"').next().map(ToOwned::to_owned))
+        .filter_map(|chunk| {
+            let mut parts = chunk.split('"');
+            let kind = parts.next()?;
+            let host = parts.nth(1)?;
+            Some(format!("{kind}@{host}"))
+        })
         .collect();
     kinds.sort();
     kinds
@@ -748,7 +779,7 @@ fn cli_outcome(act: Act, result: &Result<(), CliError>, out: &str) -> Outcome {
             Act::Put(..) | Act::PutHost(..) | Act::PutArgv(..) => {
                 Outcome::Notice("saved".to_owned())
             }
-            Act::Delete(_) => Outcome::Notice("deleted".to_owned()),
+            Act::Delete(_) | Act::DeleteHost(..) => Outcome::Notice("deleted".to_owned()),
             Act::Verify(_) => Outcome::Notice("verified".to_owned()),
         },
         Err(CliError::Credential(notice)) => {
@@ -781,6 +812,14 @@ fn no_secret(surface: Surface, text: &str) {
     }
 }
 
+fn no_hostile_host(surface: Surface, act: Act, text: &str) {
+    if let Act::PutHost(_, host, _) | Act::DeleteHost(_, host) = act
+        && host == HOSTILE_HOST
+    {
+        assert!(!text.contains(host), "{surface} echoed a hostile host");
+    }
+}
+
 async fn target_text(rig: &Rig, owner: &Persona, other: &Persona, target: Target) -> String {
     match target {
         Target::Own(kind) => rig.id_of(owner.id, kind).await,
@@ -802,13 +841,15 @@ async fn run_case(rig: &Rig, surface: Surface, case: Case) -> Outcome {
             .unwrap();
     }
     if case.forgejo_host {
-        sqlx::query(
-            "INSERT INTO git_hosts (host, kind) VALUES ($1, 'forgejo') ON CONFLICT DO NOTHING",
-        )
-        .bind(FORGEJO_HOST)
-        .execute(&rig.pool)
-        .await
-        .unwrap();
+        for host in [FORGEJO_HOST, OTHER_HOST] {
+            sqlx::query(
+                "INSERT INTO git_hosts (host, kind) VALUES ($1, 'forgejo') ON CONFLICT DO NOTHING",
+            )
+            .bind(host)
+            .execute(&rig.pool)
+            .await
+            .unwrap();
+        }
     }
     for kind in case.seed {
         rig.seed(owner.id, kind, value_of(kind)).await;
@@ -896,6 +937,17 @@ async fn cli_step(rig: &Rig, owner: &Persona, other: &Persona, case: Case) -> Ou
                 .await;
             (r, o, owner.token.as_str())
         }
+        Act::DeleteHost(target, host) => {
+            let id = target_text(rig, owner, other, target).await;
+            let (r, o) = rig
+                .cli(
+                    &owner.token,
+                    &["credential", "delete", &id, "--host", host],
+                    b"",
+                )
+                .await;
+            (r, o, owner.token.as_str())
+        }
         Act::Verify(target) => {
             let id = target_text(rig, owner, other, target).await;
             let (r, o) = rig
@@ -912,6 +964,7 @@ async fn cli_step(rig: &Rig, owner: &Persona, other: &Persona, case: Case) -> Ou
             .map_or(String::new(), ToString::to_string)
     );
     no_secret(Surface::Cli, &shown);
+    no_hostile_host(Surface::Cli, case.act, &shown);
     assert!(!shown.contains(token), "cli printed its token");
     if matches!(case.act, Act::ListOwn | Act::ListOther) && result.is_ok() {
         let page = rig.get_page(owner, other, case.act).await;
@@ -937,11 +990,33 @@ async fn web_step(rig: &Rig, owner: &Persona, other: &Persona, case: Case) -> Ou
     let reply = match case.act {
         Act::ListOwn => rig.http("GET", "/credentials", owner, "").await,
         Act::ListOther => rig.http("GET", "/credentials", other, "").await,
-        Act::Put(kind, value) | Act::PutHost(kind, _, value) => {
+        Act::Put(kind, value) => {
             rig.post(
                 owner,
                 "/credentials/put",
                 &format!("kind={}&value={}", enc(kind.as_bytes()), enc(value)),
+            )
+            .await
+        }
+        Act::PutHost(kind, host, value) => {
+            rig.post(
+                owner,
+                "/credentials/put",
+                &format!(
+                    "kind={}&value={}&host={}",
+                    enc(kind.as_bytes()),
+                    enc(value),
+                    enc(host.as_bytes())
+                ),
+            )
+            .await
+        }
+        Act::DeleteHost(target, host) => {
+            let id = target_text(rig, owner, other, target).await;
+            rig.post(
+                owner,
+                "/credentials/delete",
+                &format!("id={}&host={}", enc(id.as_bytes()), enc(host.as_bytes())),
             )
             .await
         }
@@ -965,7 +1040,9 @@ async fn web_step(rig: &Rig, owner: &Persona, other: &Persona, case: Case) -> Ou
         }
         Act::ListStatic | Act::PutArgv(..) => return Outcome::Absent,
     };
-    no_secret(Surface::Web, &format!("{}{}", reply.head, reply.body));
+    let shown = format!("{}{}", reply.head, reply.body);
+    no_secret(Surface::Web, &shown);
+    no_hostile_host(Surface::Web, case.act, &shown);
     web_outcome(case.act, &reply)
 }
 
@@ -1097,6 +1174,7 @@ macro_rules! rows {
 rows! {
     list_owner: "list/owner", DEFAULT, Case { seed: &["anthropic_api_key", "github_pat"], foreign: &["codex_api_key"], ..case(Act::ListOwn) };
     list_other: "list/other-user", DEFAULT, Case { seed: &["anthropic_api_key", "github_pat"], foreign: &["codex_api_key"], ..case(Act::ListOther) };
+    list_shows_host: "list/shows-host", DEFAULT, Case { forgejo_host: true, seed: &["forgejo_pat", "github_pat"], foreign: &["codex_api_key"], ..case(Act::ListOwn) };
     list_empty: "list/empty", DEFAULT, case(Act::ListOwn);
     list_not_configured: "list/not-configured", NOT_CONFIGURED, case(Act::ListOwn);
     list_static: "list/static-client-token", DEFAULT, Case { web_absent: true, ..case(Act::ListStatic) };
@@ -1108,6 +1186,9 @@ rows! {
     put_kimi_platform: "put/kimi_platform_key", DEFAULT, put_ok("kimi_platform_key", KIMI_PLATFORM, Cap::Never);
     put_codex: "put/codex_api_key", DEFAULT, put_ok("codex_api_key", CODEX, Cap::Never);
     put_forgejo: "put/forgejo_pat", DEFAULT, Case { forgejo_host: true, done: &["forgejo_pat"], saved: Some(("forgejo_pat", FORGEJO)), ..case(Act::PutHost("forgejo_pat", FORGEJO_HOST, FORGEJO.as_bytes())) };
+    put_forgejo_folded: "put/forgejo_pat-host-case-folded", DEFAULT, Case { forgejo_host: true, done: &["forgejo_pat"], saved: Some(("forgejo_pat", FORGEJO)), ..case(Act::PutHost("forgejo_pat", "GIT.Example.com", FORGEJO.as_bytes())) };
+    put_forgejo_unregistered: "put/forgejo_pat-unregistered-host", DEFAULT, Case { forgejo_host: true, ..case(Act::PutHost("forgejo_pat", UNREGISTERED_HOST, FORGEJO.as_bytes())) };
+    put_forgejo_hostile: "put/forgejo_pat-hostile-host", DEFAULT, Case { forgejo_host: true, ..case(Act::PutHost("forgejo_pat", HOSTILE_HOST, FORGEJO.as_bytes())) };
     put_forgejo_no_host: "put/forgejo_pat-no-host", DEFAULT, Case { forgejo_host: true, ..put_refused("forgejo_pat", FORGEJO.as_bytes()) };
     put_pat_other_host: "put/github_pat-other-host", DEFAULT, Case { done: &["github_pat"], ..case(Act::PutHost("github_pat", FORGEJO_HOST, PAT.as_bytes())) };
     put_pat_explicit_host: "put/github_pat-explicit-host", DEFAULT, Case { done: &["github_pat"], saved: Some(("github_pat", PAT)), ..case(Act::PutHost("github_pat", "GitHub.com", PAT.as_bytes())) };
@@ -1134,6 +1215,11 @@ rows! {
     delete_non_numeric: "delete/non-numeric-id", DEFAULT, delete_raw("abc");
     delete_negative: "delete/negative-id", DEFAULT, delete_raw("-1");
     delete_over_i64: "delete/id-over-i64", DEFAULT, delete_raw("18446744073709551615");
+    delete_forgejo_host: "delete/forgejo_pat-with-host", DEFAULT, Case { forgejo_host: true, seed: &["forgejo_pat", "codex_api_key"], done: &["codex_api_key"], ..case(Act::DeleteHost(Target::Own("forgejo_pat"), FORGEJO_HOST)) };
+    delete_forgejo_wrong_host: "delete/forgejo_pat-wrong-host", DEFAULT, Case { forgejo_host: true, seed: &["forgejo_pat"], ..case(Act::DeleteHost(Target::Own("forgejo_pat"), OTHER_HOST)) };
+    delete_forgejo_no_host: "delete/forgejo_pat-no-host", DEFAULT, Case { forgejo_host: true, seed: &["forgejo_pat"], ..case(Act::Delete(Target::Own("forgejo_pat"))) };
+    delete_forgejo_hostile: "delete/forgejo_pat-hostile-host", DEFAULT, Case { forgejo_host: true, seed: &["forgejo_pat"], ..case(Act::DeleteHost(Target::Own("forgejo_pat"), HOSTILE_HOST)) };
+    delete_pat_explicit_host: "delete/github_pat-explicit-host", DEFAULT, Case { seed: &["github_pat"], done: &[], ..case(Act::DeleteHost(Target::Own("github_pat"), "github.com")) };
     verify_valid: "verify/github_pat-valid", DEFAULT, verify_seeded("github_pat", Gh::Accepts);
     verify_refused: "verify/github_pat-refused", DEFAULT, Case { github: Gh::Rejects, ..verify_seeded("github_pat", Gh::Rejects) };
     verify_unavailable: "verify/github_pat-unavailable", DEFAULT, verify_seeded("github_pat", Gh::Unavailable);

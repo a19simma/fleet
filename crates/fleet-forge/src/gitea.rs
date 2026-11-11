@@ -30,8 +30,9 @@ use serde_json::{Value, json};
 use crate::ci::{Rank, Tally, entries, valid_sha};
 use crate::git::{ref_name, run};
 use crate::{
-    ForgeApi, ForgeError, ForgeGit, Git, GitOp, Http, HttpError, HttpRequest, HttpResponse,
-    MAX_BODY_BYTES, Method, Permission, PushTarget, RepoAccess, RepoRef, Token, Verified,
+    CiCheck, ForgeApi, ForgeError, ForgeGit, Git, GitOp, Http, HttpError, HttpRequest,
+    HttpResponse, MAX_BODY_BYTES, Method, Permission, PushTarget, RepoAccess, RepoRef, Token,
+    Verified,
 };
 
 const VERSION_PATH: &str = "/api/v1/version";
@@ -225,7 +226,7 @@ impl Tally {
                 Some("pending") => Rank::Running,
                 _ => return Err(ForgeError::Malformed),
             };
-            self.note(rank);
+            self.note_entry(status, "context", rank);
         }
         Ok(())
     }
@@ -255,6 +256,26 @@ impl<H: Http, G: Send + Sync> GiteaForge<H, G> {
             return Err(status_error(response.status));
         }
         parse(&response)
+    }
+
+    async fn collect(&self, target: &PushTarget, pr_url: &str) -> Result<Tally, ForgeError> {
+        let (repo, token) = target.access().bind()?;
+        let number = pr_number(pr_url, repo)?;
+        let sha = self.pull_head(repo, token, number).await?;
+        let base = repo_path(repo);
+        let path = format!("{base}/commits/{sha}/status?page=1&limit={PAGE_LIMIT}");
+        let body = self.get_json(repo, path, token).await?;
+        let statuses = bounded(&body, "statuses")?;
+        let mut tally = Tally::default();
+        if statuses.is_empty() {
+            let path = format!("{base}/actions/runs?head_sha={sha}&page=1&limit={PAGE_LIMIT}");
+            let body = self.get_json(repo, path, token).await?;
+            bounded(&body, "workflow_runs")?;
+            tally.add_runs(&body, "workflow_runs")?;
+        } else {
+            tally.add_commit_statuses(statuses)?;
+        }
+        Ok(tally)
     }
 
     async fn pull_head(
@@ -463,22 +484,14 @@ impl<H: Http, G: Send + Sync> ForgeApi for GiteaForge<H, G> {
     }
 
     async fn ci_result(&self, target: &PushTarget, pr_url: &str) -> Result<CiResult, ForgeError> {
-        let (repo, token) = target.access().bind()?;
-        let number = pr_number(pr_url, repo)?;
-        let sha = self.pull_head(repo, token, number).await?;
-        let base = repo_path(repo);
-        let path = format!("{base}/commits/{sha}/status?page=1&limit={PAGE_LIMIT}");
-        let body = self.get_json(repo, path, token).await?;
-        let statuses = bounded(&body, "statuses")?;
-        let mut tally = Tally::default();
-        if statuses.is_empty() {
-            let path = format!("{base}/actions/runs?head_sha={sha}&page=1&limit={PAGE_LIMIT}");
-            let body = self.get_json(repo, path, token).await?;
-            bounded(&body, "workflow_runs")?;
-            tally.add_runs(&body, "workflow_runs")?;
-        } else {
-            tally.add_commit_statuses(statuses)?;
-        }
-        Ok(tally.result())
+        Ok(self.collect(target, pr_url).await?.result())
+    }
+
+    async fn ci_checks(
+        &self,
+        target: &PushTarget,
+        pr_url: &str,
+    ) -> Result<Vec<CiCheck>, ForgeError> {
+        self.collect(target, pr_url).await?.checks()
     }
 }

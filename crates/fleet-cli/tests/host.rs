@@ -1,0 +1,526 @@
+//! Runs `fleet host add`, `list` and `remove` against an in-process `FleetHosts` stub that
+//! records every request and answers a scripted reply or status.
+//!
+//! Each outcome of each action is one test: the printed text is the shared notice text, a server
+//! message never reaches the terminal, a hostile argument is refused before a request leaves, and
+//! the exit codes follow the repo convention (2 for usage, 1 for a refusal).
+
+#![expect(clippy::unwrap_used, reason = "test code asserts by panicking")]
+
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
+
+use clap::Parser;
+use fleet_cli::{Cli, CliError, run_with};
+use fleet_proto::v1::fleet_hosts_server::{FleetHosts, FleetHostsServer};
+use fleet_proto::v1::{
+    AddHostRequest, ApproveHostPrivateRequest, HostInfo, ListHostRequestsReply,
+    ListHostRequestsRequest, ListHostsReply, ListHostsRequest, RemoveHostReply, RemoveHostRequest,
+    RevokeHostPrivateRequest,
+};
+use fleet_proto::{
+    CredentialNotice, ERR_HOST_LIMIT, ERR_HOST_NOT_FOUND, PRECONDITION_HOST_IN_USE,
+    PRECONDITION_HOST_NOT_FORGE, PRECONDITION_HOST_UNKNOWN, PRECONDITION_REPO_NOT_ALLOWED_HOST,
+};
+use tokio::net::TcpListener;
+use tokio_stream::wrappers::TcpListenerStream;
+use tonic::{Code, Request, Response, Status};
+
+type TestResult = Result<(), Box<dyn std::error::Error>>;
+
+const TOKEN: &str = "client-token-0123456789";
+const MARKER: &str = "zqxmark";
+const ADMIN_ONLY: &str = "Only an admin can remove a host.";
+
+type Script<T> = Arc<Mutex<Option<Result<T, Status>>>>;
+
+#[derive(Default, Clone)]
+struct Stub {
+    add: Script<HostInfo>,
+    list: Script<Vec<HostInfo>>,
+    remove: Script<()>,
+    seen: Arc<Mutex<Vec<String>>>,
+}
+
+impl Stub {
+    fn note(&self, line: String) {
+        self.seen.lock().unwrap().push(line);
+    }
+
+    fn seen(&self) -> Vec<String> {
+        self.seen.lock().unwrap().clone()
+    }
+}
+
+fn check(request: &Request<impl Sized>) -> Result<(), Status> {
+    let expected = format!("Bearer {TOKEN}");
+    match request.metadata().get("authorization") {
+        Some(v) if v.as_bytes() == expected.as_bytes() => Ok(()),
+        _ => Err(Status::unauthenticated("bad token")),
+    }
+}
+
+fn unused<T>() -> Result<Response<T>, Status> {
+    Err(Status::unimplemented("not used"))
+}
+
+#[tonic::async_trait]
+impl FleetHosts for Stub {
+    async fn add_host(
+        &self,
+        request: Request<AddHostRequest>,
+    ) -> Result<Response<HostInfo>, Status> {
+        check(&request)?;
+        self.note(format!("add {}", request.get_ref().host));
+        self.add
+            .lock()
+            .unwrap()
+            .clone()
+            .unwrap_or_else(|| Err(Status::internal("no script")))
+            .map(Response::new)
+    }
+
+    async fn list_hosts(
+        &self,
+        request: Request<ListHostsRequest>,
+    ) -> Result<Response<ListHostsReply>, Status> {
+        check(&request)?;
+        self.note("list".to_owned());
+        self.list
+            .lock()
+            .unwrap()
+            .clone()
+            .unwrap_or_else(|| Err(Status::internal("no script")))
+            .map(|hosts| Response::new(ListHostsReply { hosts }))
+    }
+
+    async fn remove_host(
+        &self,
+        request: Request<RemoveHostRequest>,
+    ) -> Result<Response<RemoveHostReply>, Status> {
+        check(&request)?;
+        self.note(format!("remove {}", request.get_ref().host));
+        self.remove
+            .lock()
+            .unwrap()
+            .clone()
+            .unwrap_or_else(|| Err(Status::internal("no script")))
+            .map(|()| Response::new(RemoveHostReply {}))
+    }
+
+    async fn approve_host_private(
+        &self,
+        _: Request<ApproveHostPrivateRequest>,
+    ) -> Result<Response<HostInfo>, Status> {
+        unused()
+    }
+
+    async fn revoke_host_private(
+        &self,
+        _: Request<RevokeHostPrivateRequest>,
+    ) -> Result<Response<HostInfo>, Status> {
+        unused()
+    }
+
+    async fn list_host_requests(
+        &self,
+        _: Request<ListHostRequestsRequest>,
+    ) -> Result<Response<ListHostRequestsReply>, Status> {
+        unused()
+    }
+}
+
+async fn serve(stub: Stub) -> Result<String, Box<dyn std::error::Error>> {
+    let listener = TcpListener::bind("127.0.0.1:0").await?;
+    let url = format!("http://{}", listener.local_addr()?);
+    tokio::spawn(
+        tonic::transport::Server::builder()
+            .add_service(FleetHostsServer::new(stub))
+            .serve_with_incoming(TcpListenerStream::new(listener)),
+    );
+    Ok(url)
+}
+
+async fn cli(url: &str, args: &[&str]) -> (Result<(), CliError>, String) {
+    let mut full = vec!["fleet", "--server", url];
+    full.extend_from_slice(args);
+    let Ok(parsed) = Cli::try_parse_from(full) else {
+        return (Err(CliError::Usage("parse".into())), String::new());
+    };
+    let env: HashMap<String, String> =
+        HashMap::from([("FLEET_CLIENT_TOKEN".to_owned(), TOKEN.to_owned())]);
+    let mut out = Vec::new();
+    let result = run_with(
+        parsed,
+        move |name| env.get(name).cloned(),
+        false,
+        &mut b"".as_slice(),
+        &mut out,
+    )
+    .await;
+    (result, String::from_utf8_lossy(&out).into_owned())
+}
+
+fn info(host: &str, kind: &str, allow_private: bool) -> HostInfo {
+    HostInfo {
+        host: host.to_owned(),
+        kind: kind.to_owned(),
+        allow_private,
+        ..HostInfo::default()
+    }
+}
+
+fn refusal(result: Result<(), CliError>) -> (u8, String) {
+    let err = result.unwrap_err();
+    (err.exit_code(), err.to_string())
+}
+
+fn failed(message: &str) -> Status {
+    Status::failed_precondition(message)
+}
+
+#[tokio::test]
+async fn add_prints_the_row_then_the_added_notice() -> TestResult {
+    let stub = Stub::default();
+    *stub.add.lock().unwrap() = Some(Ok(info("git.example.org", "forgejo", false)));
+    let url = serve(stub.clone()).await?;
+    let (res, out) = cli(&url, &["host", "add", "git.example.org"]).await;
+    res?;
+    let lines: Vec<&str> = out.lines().collect();
+    assert_eq!(
+        lines,
+        [
+            "git.example.org\tforgejo\tno",
+            CredentialNotice::HostAdded.text()
+        ]
+    );
+    assert_eq!(stub.seen(), ["add git.example.org"]);
+    Ok(())
+}
+
+#[tokio::test]
+async fn add_sends_the_normalised_punycode_form_and_prints_it() -> TestResult {
+    let stub = Stub::default();
+    *stub.add.lock().unwrap() = Some(Ok(info("xn--bcher-kva.example", "forgejo", false)));
+    let url = serve(stub.clone()).await?;
+    let (res, out) = cli(&url, &["host", "add", "B\u{fc}cher.Example."]).await;
+    res?;
+    assert_eq!(stub.seen(), ["add xn--bcher-kva.example"]);
+    assert!(
+        out.starts_with("xn--bcher-kva.example\tforgejo\tno\n"),
+        "{out}"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn add_shows_the_private_flag_of_an_approved_host() -> TestResult {
+    let stub = Stub::default();
+    *stub.add.lock().unwrap() = Some(Ok(info("git.example.org", "forgejo", true)));
+    let url = serve(stub).await?;
+    let (res, out) = cli(&url, &["host", "add", "git.example.org"]).await;
+    res?;
+    assert!(out.starts_with("git.example.org\tforgejo\tyes\n"), "{out}");
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_refused_host_prints_the_shared_text_with_the_ask_an_admin_hint() -> TestResult {
+    let stub = Stub::default();
+    *stub.add.lock().unwrap() = Some(Err(failed(PRECONDITION_REPO_NOT_ALLOWED_HOST)));
+    let url = serve(stub).await?;
+    let (res, out) = cli(&url, &["host", "add", "git.example.org"]).await;
+    let (code, text) = refusal(res);
+    assert_eq!(code, 1);
+    assert_eq!(text, CredentialNotice::HostRefused.text());
+    assert!(text.contains("ask an admin to approve it"), "{text}");
+    assert_eq!(out, "");
+    Ok(())
+}
+
+#[tokio::test]
+async fn every_add_refusal_prints_its_shared_notice_and_exits_one() -> TestResult {
+    let table = [
+        (
+            failed(PRECONDITION_HOST_NOT_FORGE),
+            CredentialNotice::HostNotForge,
+        ),
+        (
+            failed(PRECONDITION_HOST_UNKNOWN),
+            CredentialNotice::HostUnknown,
+        ),
+        (Status::invalid_argument("x"), CredentialNotice::HostInvalid),
+        (
+            Status::resource_exhausted(ERR_HOST_LIMIT),
+            CredentialNotice::HostLimit,
+        ),
+        (Status::unavailable("x"), CredentialNotice::Unavailable),
+        (Status::internal("x"), CredentialNotice::Failed),
+    ];
+    for (status, notice) in table {
+        let stub = Stub::default();
+        *stub.add.lock().unwrap() = Some(Err(status));
+        let url = serve(stub).await?;
+        let (res, _) = cli(&url, &["host", "add", "git.example.org"]).await;
+        assert_eq!(refusal(res), (1, notice.text().to_owned()), "{notice:?}");
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_server_message_never_reaches_the_terminal() -> TestResult {
+    let hostile = format!("{MARKER}\u{1b}[31m\r\n");
+    for status in [
+        Status::new(Code::FailedPrecondition, hostile.clone()),
+        Status::new(Code::InvalidArgument, hostile.clone()),
+        Status::new(Code::PermissionDenied, hostile.clone()),
+        Status::new(Code::NotFound, hostile.clone()),
+    ] {
+        let stub = Stub::default();
+        *stub.add.lock().unwrap() = Some(Err(status.clone()));
+        *stub.remove.lock().unwrap() = Some(Err(status));
+        let url = serve(stub).await?;
+        for args in [
+            ["host", "add", "git.example.org"],
+            ["host", "remove", "git.example.org"],
+        ] {
+            let (res, out) = cli(&url, &args).await;
+            let (code, text) = refusal(res);
+            assert_eq!(code, 1);
+            assert!(!text.contains(MARKER) && !out.contains(MARKER), "{text}");
+        }
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn list_prints_host_kind_and_private_flag_per_row() -> TestResult {
+    let stub = Stub::default();
+    *stub.list.lock().unwrap() = Some(Ok(vec![
+        info("github.com", "github", false),
+        info("git.example.org", "forgejo", true),
+    ]));
+    let url = serve(stub.clone()).await?;
+    let (res, out) = cli(&url, &["host", "list"]).await;
+    res?;
+    assert_eq!(
+        out.lines().collect::<Vec<_>>(),
+        ["github.com\tgithub\tno", "git.example.org\tforgejo\tyes"]
+    );
+    assert_eq!(stub.seen(), ["list"]);
+    Ok(())
+}
+
+#[tokio::test]
+async fn list_of_no_hosts_prints_nothing() -> TestResult {
+    let stub = Stub::default();
+    *stub.list.lock().unwrap() = Some(Ok(Vec::new()));
+    let url = serve(stub).await?;
+    let (res, out) = cli(&url, &["host", "list"]).await;
+    res?;
+    assert_eq!(out, "");
+    Ok(())
+}
+
+#[tokio::test]
+async fn list_shows_a_stored_unicode_host_in_ascii_form_and_strips_controls() -> TestResult {
+    let stub = Stub::default();
+    *stub.list.lock().unwrap() = Some(Ok(vec![
+        info("b\u{fc}cher.example", "forgejo", false),
+        info("a.example\u{85}\u{2028}", "for\u{1b}gejo", false),
+    ]));
+    let url = serve(stub).await?;
+    let (res, out) = cli(&url, &["host", "list"]).await;
+    res?;
+    let rows: Vec<&str> = out.lines().collect();
+    assert_eq!(rows.len(), 2, "{out:?}");
+    assert!(rows[0].starts_with("b\\u{fc}cher.example\t"), "{out:?}");
+    assert!(
+        !out.contains('\u{1b}') && !out.contains('\u{85}') && !out.contains('\u{2028}'),
+        "{out:?}"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn list_refusals_print_a_fixed_notice() -> TestResult {
+    let stub = Stub::default();
+    *stub.list.lock().unwrap() = Some(Err(Status::unavailable(MARKER)));
+    let url = serve(stub).await?;
+    let (res, _) = cli(&url, &["host", "list"]).await;
+    assert_eq!(
+        refusal(res),
+        (1, CredentialNotice::Unavailable.text().to_owned())
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn remove_prints_the_removed_notice() -> TestResult {
+    let stub = Stub::default();
+    *stub.remove.lock().unwrap() = Some(Ok(()));
+    let url = serve(stub.clone()).await?;
+    let (res, out) = cli(&url, &["host", "remove", "Git.Example.ORG."]).await;
+    res?;
+    assert_eq!(out, format!("{}\n", CredentialNotice::HostRemoved.text()));
+    assert_eq!(stub.seen(), ["remove git.example.org"]);
+    Ok(())
+}
+
+#[tokio::test]
+async fn every_remove_refusal_prints_its_shared_notice() -> TestResult {
+    let table = [
+        (
+            failed(PRECONDITION_HOST_IN_USE),
+            CredentialNotice::HostInUse,
+        ),
+        (
+            Status::not_found(ERR_HOST_NOT_FOUND),
+            CredentialNotice::HostMissing,
+        ),
+        (
+            failed(PRECONDITION_HOST_UNKNOWN),
+            CredentialNotice::HostUnknown,
+        ),
+        (Status::invalid_argument("x"), CredentialNotice::HostInvalid),
+    ];
+    for (status, notice) in table {
+        let stub = Stub::default();
+        *stub.remove.lock().unwrap() = Some(Err(status));
+        let url = serve(stub).await?;
+        let (res, _) = cli(&url, &["host", "remove", "git.example.org"]).await;
+        assert_eq!(refusal(res), (1, notice.text().to_owned()), "{notice:?}");
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_non_admin_remove_prints_the_fixed_admin_only_text() -> TestResult {
+    let stub = Stub::default();
+    *stub.remove.lock().unwrap() = Some(Err(Status::permission_denied("admin required")));
+    let url = serve(stub).await?;
+    let (res, out) = cli(&url, &["host", "remove", "git.example.org"]).await;
+    assert_eq!(refusal(res), (1, ADMIN_ONLY.to_owned()));
+    assert_eq!(out, "");
+    Ok(())
+}
+
+#[tokio::test]
+async fn another_permission_denial_is_not_reported_as_admin_only() -> TestResult {
+    let stub = Stub::default();
+    *stub.remove.lock().unwrap() = Some(Err(Status::permission_denied(MARKER)));
+    let url = serve(stub).await?;
+    let (res, _) = cli(&url, &["host", "remove", "git.example.org"]).await;
+    let (code, text) = refusal(res);
+    assert_eq!(code, 1);
+    assert_ne!(text, ADMIN_ONLY);
+    assert!(!text.contains(MARKER), "{text}");
+    Ok(())
+}
+
+fn hostile_hosts() -> Vec<String> {
+    vec![
+        "git.example.com\r".to_owned(),
+        "git.example.com\n".to_owned(),
+        "git.example.com\r\nx.example.com".to_owned(),
+        format!("{MARKER}\u{85}.example.com"),
+        format!("{MARKER}\u{2028}.example.com"),
+        format!("{MARKER}\u{2029}.example.com"),
+        format!("{MARKER}user@git.example.com"),
+        format!("{MARKER}user:{MARKER}pw@git.example.com"),
+        format!("{MARKER}.example.com\\x"),
+        "[::1]".to_owned(),
+        "::1".to_owned(),
+        "git..example.com".to_owned(),
+        ".git.example.com".to_owned(),
+        String::new(),
+        format!("{}.example.com", "a".repeat(300)),
+        "a".repeat(2000),
+        "git example.com".to_owned(),
+        format!(" {MARKER}.example.com"),
+        format!("{MARKER}.example.com\t"),
+        format!("{MARKER}\u{430}.example.com"),
+        format!("{MARKER}.example.com:443"),
+        format!("https://{MARKER}.example.com"),
+        format!("{MARKER}.example.com/path"),
+        "localhost".to_owned(),
+        "192.168.3.1".to_owned(),
+        "*.example.com".to_owned(),
+        format!("{MARKER}.example.com\u{0}"),
+    ]
+}
+
+#[tokio::test]
+async fn a_hostile_host_exits_two_before_any_request_and_is_never_echoed() -> TestResult {
+    let stub = Stub::default();
+    *stub.add.lock().unwrap() = Some(Ok(info("git.example.org", "forgejo", false)));
+    *stub.remove.lock().unwrap() = Some(Ok(()));
+    let url = serve(stub.clone()).await?;
+    for host in hostile_hosts() {
+        for action in ["add", "remove"] {
+            let (res, out) = cli(&url, &["host", action, &host]).await;
+            assert!(res.is_err(), "{action} accepted {host:?}");
+            let (code, text) = refusal(res);
+            assert_eq!(code, 2, "{action} {host:?}: {text}");
+            assert!(text.starts_with("host: "), "{host:?}: {text}");
+            assert!(
+                !text.contains(MARKER) && !text.contains(&host) || host.is_empty(),
+                "{host:?}: {text}"
+            );
+            assert_eq!(out, "");
+        }
+    }
+    assert_eq!(stub.seen(), Vec::<String>::new());
+    Ok(())
+}
+
+#[tokio::test]
+async fn case_and_a_trailing_dot_normalise_and_reach_the_server() -> TestResult {
+    let stub = Stub::default();
+    *stub.add.lock().unwrap() = Some(Ok(info("git.example.org", "forgejo", false)));
+    let url = serve(stub.clone()).await?;
+    for typed in ["GIT.Example.ORG", "git.example.org."] {
+        let (res, _) = cli(&url, &["host", "add", typed]).await;
+        res?;
+    }
+    assert_eq!(stub.seen(), ["add git.example.org", "add git.example.org"]);
+    Ok(())
+}
+
+#[tokio::test]
+async fn stray_arguments_exit_two_with_fixed_text_and_no_request() -> TestResult {
+    let stub = Stub::default();
+    let url = serve(stub.clone()).await?;
+    let table = [
+        (
+            vec!["host", "add", "git.example.org", MARKER],
+            "this action takes one host name",
+        ),
+        (
+            vec!["host", "remove", "git.example.org", MARKER],
+            "this action takes one host name",
+        ),
+        (
+            vec!["host", "list", MARKER],
+            "this action takes no arguments",
+        ),
+    ];
+    for (args, text) in table {
+        let (res, _) = cli(&url, &args).await;
+        assert_eq!(refusal(res), (2, text.to_owned()), "{args:?}");
+    }
+    assert_eq!(stub.seen(), Vec::<String>::new());
+    Ok(())
+}
+
+#[tokio::test]
+async fn missing_arguments_exit_two_without_a_request() -> TestResult {
+    let stub = Stub::default();
+    let url = serve(stub.clone()).await?;
+    for args in [vec!["host", "add"], vec!["host", "remove"], vec!["host"]] {
+        let (res, _) = cli(&url, &args).await;
+        assert_eq!(res.unwrap_err().exit_code(), 2, "{args:?}");
+    }
+    assert_eq!(stub.seen(), Vec::<String>::new());
+    Ok(())
+}

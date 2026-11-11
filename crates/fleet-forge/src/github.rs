@@ -13,8 +13,9 @@ use serde_json::{Value, json};
 use crate::ci::{Rank, Tally, entries, valid_sha};
 use crate::git::{ref_name, run};
 use crate::{
-    ForgeApi, ForgeError, ForgeGit, Git, GitOp, Http, HttpError, HttpRequest, HttpResponse,
-    MAX_BODY_BYTES, Method, Permission, PushTarget, RepoAccess, RepoRef, Token, Verified,
+    CiCheck, ForgeApi, ForgeError, ForgeGit, Git, GitOp, Http, HttpError, HttpRequest,
+    HttpResponse, MAX_BODY_BYTES, Method, Permission, PushTarget, RepoAccess, RepoRef, Token,
+    Verified,
 };
 
 const API_HOST: &str = "api.github.com";
@@ -136,6 +137,15 @@ impl<H: Http, G: Send + Sync> GitHubForge<H, G> {
             .ok_or(ForgeError::Rejected)?;
         pr_number(&first, repo)?;
         Ok(first)
+    }
+
+    async fn collect(&self, target: &PushTarget, pr_url: &str) -> Result<Tally, ForgeError> {
+        let (repo, token) = bound(target.access())?;
+        let number = pr_number(pr_url, repo)?;
+        let sha = self.pull_head(repo, token, number).await?;
+        let mut tally = Tally::default();
+        self.check_tally(repo, token, &sha, &mut tally).await?;
+        Ok(tally)
     }
 
     async fn check_tally(
@@ -273,12 +283,15 @@ impl<H: Http, G: Send + Sync> ForgeApi for GitHubForge<H, G> {
     }
 
     async fn ci_result(&self, target: &PushTarget, pr_url: &str) -> Result<CiResult, ForgeError> {
-        let (repo, token) = bound(target.access())?;
-        let number = pr_number(pr_url, repo)?;
-        let sha = self.pull_head(repo, token, number).await?;
-        let mut tally = Tally::default();
-        self.check_tally(repo, token, &sha, &mut tally).await?;
-        Ok(tally.result())
+        Ok(self.collect(target, pr_url).await?.result())
+    }
+
+    async fn ci_checks(
+        &self,
+        target: &PushTarget,
+        pr_url: &str,
+    ) -> Result<Vec<CiCheck>, ForgeError> {
+        self.collect(target, pr_url).await?.checks()
     }
 }
 
@@ -398,7 +411,7 @@ impl Tally {
                 Some("pending") => Rank::Running,
                 _ => return Err(ForgeError::Malformed),
             };
-            self.note(rank);
+            self.note_entry(status, "context", rank);
         }
         Ok(())
     }

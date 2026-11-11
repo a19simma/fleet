@@ -7,7 +7,7 @@ use std::error::Error;
 
 use fleet_core::forge::CiResult;
 use fleet_core::host::{HostKind, HostName};
-use fleet_forge::contract::{Calls, Case, Op, Outcome};
+use fleet_forge::contract::{Calls, Case, ChecksSeen, Op, Outcome};
 use fleet_forge::fake::{Fake, MissingScenario, Shape};
 use fleet_forge::{
     Credential, ForgeError, Git, GitCommand, GitError, GitOp, Http, HttpError, HttpRequest,
@@ -68,7 +68,7 @@ async fn json(
 #[expect(clippy::too_many_lines, reason = "one literal table of every case")]
 fn the_expected_outcome_table_is_pinned() {
     use ForgeError::{
-        HostMismatch, NonFastForward, NotFound, Redirected, Rejected, Timeout, TooLarge,
+        HostMismatch, Malformed, NonFastForward, NotFound, Redirected, Rejected, Timeout, TooLarge,
         Unauthorized, Unavailable, WrongKind,
     };
     let rows: &[(Case, Op, Calls, Outcome)] = &[
@@ -204,6 +204,36 @@ fn the_expected_outcome_table_is_pinned() {
             Op::CiResult,
             Calls::Any,
             Outcome::Failed(NotFound),
+        ),
+        (
+            Case::CiChecksMixed,
+            Op::CiChecks,
+            Calls::Any,
+            Outcome::Checks(ChecksSeen::Mixed),
+        ),
+        (
+            Case::CiChecksNone,
+            Op::CiChecks,
+            Calls::Any,
+            Outcome::Checks(ChecksSeen::Empty),
+        ),
+        (
+            Case::CiChecks404,
+            Op::CiChecks,
+            Calls::Any,
+            Outcome::Failed(NotFound),
+        ),
+        (
+            Case::CiChecksBadName,
+            Op::CiChecks,
+            Calls::Any,
+            Outcome::Failed(Malformed),
+        ),
+        (
+            Case::CiChecksOverCap,
+            Op::CiChecks,
+            Calls::Any,
+            Outcome::Failed(Malformed),
         ),
         (Case::PushOk, Op::Push, Calls::Any, Outcome::Pushed),
         (
@@ -469,6 +499,46 @@ async fn gitea_combined_status_reports_the_expected_state() -> TestResult {
             .map(|a| a.iter().filter_map(|s| s["status"].as_str()).collect())
             .unwrap_or_default();
         assert_eq!(&listed, statuses);
+    }
+    Ok(())
+}
+
+fn listed_names(shape: Shape, body: &Value) -> Vec<String> {
+    let (key, field) = match shape {
+        Shape::GitHub => ("check_runs", "name"),
+        Shape::Gitea => ("statuses", "context"),
+    };
+    body[key]
+        .as_array()
+        .map(|a| {
+            a.iter()
+                .filter_map(|e| e[field].as_str().map(str::to_owned))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+#[tokio::test]
+async fn ci_checks_cases_serve_named_entries_on_both_shapes() -> TestResult {
+    for shape in SHAPES {
+        let suffix = match shape {
+            Shape::GitHub => "/commits/abc123/check-runs",
+            Shape::Gitea => "/commits/abc123/status",
+        };
+        let (status, body) = json(shape, Case::CiChecksMixed, Method::Get, suffix).await?;
+        assert_eq!(status, 200);
+        assert_eq!(listed_names(shape, &body), ["build", "lint", "build"]);
+        let (_, body) = json(shape, Case::CiChecksNone, Method::Get, suffix).await?;
+        assert_eq!(listed_names(shape, &body), Vec::<String>::new());
+        let (_, body) = json(shape, Case::CiChecksBadName, Method::Get, suffix).await?;
+        assert_eq!(listed_names(shape, &body), ["bu\nild"]);
+        let (_, body) = json(shape, Case::CiChecksOverCap, Method::Get, suffix).await?;
+        assert_eq!(listed_names(shape, &body).len(), 51);
+        assert_eq!(body["total_count"], 51);
+        let (status, _) = json(shape, Case::CiChecks404, Method::Get, "/pulls/7").await?;
+        assert_eq!(status, 404);
+        let (status, _) = json(shape, Case::CiChecks404, Method::Get, suffix).await?;
+        assert_eq!(status, 404);
     }
     Ok(())
 }

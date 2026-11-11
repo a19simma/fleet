@@ -11,9 +11,9 @@ use fleet_core::host::{HostKind, HostName};
 use fleet_forge::contract::{AdapterSubject, Case, Op, run_contract};
 use fleet_forge::fake::{Fake, Shape};
 use fleet_forge::{
-    Credential, ForgeApi, ForgeError, ForgeGit, Git, GitCommand, GitError, GitHubForge, GitOp,
-    GitOutput, Http, HttpError, HttpRequest, HttpResponse, MAX_BODY_BYTES, Method, Permission,
-    PushTarget, RepoAccess, RepoRef, Token,
+    CheckState, Credential, ForgeApi, ForgeError, ForgeGit, Git, GitCommand, GitError, GitHubForge,
+    GitOp, GitOutput, Http, HttpError, HttpRequest, HttpResponse, MAX_BODY_BYTES,
+    MAX_CHECK_NAME_BYTES, MAX_CHECKS, Method, Permission, PushTarget, RepoAccess, RepoRef, Token,
 };
 
 type TestResult = Result<(), Box<dyn Error>>;
@@ -29,7 +29,7 @@ async fn every_case_passes_on_the_github_fake() {
     let findings: Vec<String> = report.findings.iter().map(ToString::to_string).collect();
     assert!(findings.is_empty(), "{findings:?}");
     assert_eq!(report.ran.len(), Case::ALL.len());
-    assert_eq!(Case::ALL.len(), 30);
+    assert_eq!(Case::ALL.len(), 35);
     let git_cases = Case::ALL
         .iter()
         .filter(|c| matches!(c.op(), Op::Push | Op::Fetch))
@@ -878,6 +878,226 @@ async fn ci_result_maps_status_and_cap_on_every_step() -> TestResult {
         forge(&script).ci_result(&target, PR_URL).await.err(),
         Some(ForgeError::TooLarge)
     );
+    Ok(())
+}
+
+fn named_runs(items: &[(&str, &str, Option<&str>)]) -> String {
+    let list: Vec<String> = items
+        .iter()
+        .map(|(name, status, conclusion)| {
+            let conclusion = conclusion.map_or_else(|| "null".to_owned(), |c| format!("\"{c}\""));
+            let name = serde_json::Value::from(*name);
+            format!(r#"{{"name":{name},"status":"{status}","conclusion":{conclusion}}}"#)
+        })
+        .collect();
+    format!(
+        r#"{{"total_count":{},"check_runs":[{}]}}"#,
+        list.len(),
+        list.join(",")
+    )
+}
+
+fn named_statuses(items: &[(&str, &str)]) -> String {
+    let list: Vec<String> = items
+        .iter()
+        .map(|(context, state)| {
+            let context = serde_json::Value::from(*context);
+            format!(r#"{{"context":{context},"state":"{state}"}}"#)
+        })
+        .collect();
+    format!(
+        r#"{{"state":"x","total_count":{},"statuses":[{}]}}"#,
+        list.len(),
+        list.join(",")
+    )
+}
+
+async fn checks_of(runs: &str, statuses: &str) -> Result<Vec<(String, CheckState)>, ForgeError> {
+    let script = Script::default()
+        .reply(200, &pull("abc123"))
+        .reply(200, runs)
+        .reply(200, statuses);
+    let target = target().map_err(|_| ForgeError::Malformed)?;
+    let list = forge(&script).ci_checks(&target, PR_URL).await?;
+    Ok(list
+        .iter()
+        .map(|c| (c.name().to_owned(), c.state()))
+        .collect())
+}
+
+fn pair(name: &str, state: CheckState) -> (String, CheckState) {
+    (name.to_owned(), state)
+}
+
+#[tokio::test]
+async fn ci_checks_lists_runs_then_statuses_in_order_and_keeps_duplicates() -> TestResult {
+    let got = checks_of(
+        &named_runs(&[
+            ("build", "completed", Some("success")),
+            ("build", "in_progress", None),
+            ("docs", "completed", Some("skipped")),
+            ("deploy", "queued", None),
+            ("e2e", "completed", Some("timed_out")),
+        ]),
+        &named_statuses(&[("lint", "failure"), ("lint", "pending")]),
+    )
+    .await?;
+    assert_eq!(
+        got,
+        [
+            pair("build", CheckState::Success),
+            pair("build", CheckState::Running),
+            pair("docs", CheckState::Neutral),
+            pair("deploy", CheckState::Queued),
+            pair("e2e", CheckState::Failed),
+            pair("lint", CheckState::Failed),
+            pair("lint", CheckState::Running),
+        ]
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn ci_checks_reads_the_same_three_requests_as_ci_result() -> TestResult {
+    let script = Script::default()
+        .reply(200, &pull("abc123"))
+        .reply(200, &named_runs(&[]))
+        .reply(404, "{}");
+    assert_eq!(forge(&script).ci_checks(&target()?, PR_URL).await?.len(), 0);
+    let seen = script.seen();
+    let paths: Vec<&str> = seen.iter().map(|r| r.path.as_str()).collect();
+    assert_eq!(
+        paths,
+        [
+            "/repos/octo/widgets/pulls/7",
+            "/repos/octo/widgets/commits/abc123/check-runs?per_page=100",
+            "/repos/octo/widgets/commits/abc123/status",
+        ]
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn ci_checks_caps_the_list_across_runs_and_statuses() -> TestResult {
+    let many = |n: usize| -> Vec<(String, &'static str, Option<&'static str>)> {
+        (0..n)
+            .map(|i| (format!("run-{i}"), "completed", Some("success")))
+            .collect()
+    };
+    let to_refs = |v: &[(String, &'static str, Option<&'static str>)]| -> String {
+        let refs: Vec<(&str, &str, Option<&str>)> =
+            v.iter().map(|(n, s, c)| (n.as_str(), *s, *c)).collect();
+        named_runs(&refs)
+    };
+    let exactly = checks_of(&to_refs(&many(MAX_CHECKS)), &named_statuses(&[])).await?;
+    assert_eq!(exactly.len(), MAX_CHECKS);
+    let over = checks_of(&to_refs(&many(MAX_CHECKS + 1)), &named_statuses(&[])).await;
+    assert_eq!(over.err(), Some(ForgeError::Malformed));
+    let split = checks_of(
+        &to_refs(&many(MAX_CHECKS)),
+        &named_statuses(&[("one-more", "success")]),
+    )
+    .await;
+    assert_eq!(split.err(), Some(ForgeError::Malformed));
+    Ok(())
+}
+
+#[tokio::test]
+async fn ci_checks_refuses_a_missing_or_hostile_name_and_ci_result_does_not() -> TestResult {
+    let long = "x".repeat(MAX_CHECK_NAME_BYTES + 1);
+    for name in [
+        "",
+        "a\nb",
+        "a\u{2028}b",
+        "a\u{202e}b",
+        "a\u{85}b",
+        "a\rb",
+        long.as_str(),
+    ] {
+        let got = checks_of(
+            &named_runs(&[(name, "completed", Some("success"))]),
+            &named_statuses(&[]),
+        )
+        .await;
+        assert_eq!(got.err(), Some(ForgeError::Malformed), "run {name:?}");
+        let got = checks_of(&named_runs(&[]), &named_statuses(&[(name, "success")])).await;
+        assert_eq!(got.err(), Some(ForgeError::Malformed), "status {name:?}");
+        let script = Script::default()
+            .reply(200, &pull("abc123"))
+            .reply(200, &named_runs(&[(name, "completed", Some("success"))]))
+            .reply(200, &named_statuses(&[]));
+        assert_eq!(
+            forge(&script).ci_result(&target()?, PR_URL).await?,
+            CiResult::Success,
+            "{name:?}"
+        );
+    }
+    let nameless =
+        r#"{"total_count":1,"check_runs":[{"status":"completed","conclusion":"success"}]}"#;
+    assert_eq!(
+        checks_of(nameless, &named_statuses(&[])).await.err(),
+        Some(ForgeError::Malformed)
+    );
+    let numeric = r#"{"total_count":1,"check_runs":[{"name":7,"status":"completed","conclusion":"success"}]}"#;
+    assert_eq!(
+        checks_of(numeric, &named_statuses(&[])).await.err(),
+        Some(ForgeError::Malformed)
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn ci_checks_fails_closed_exactly_where_ci_result_does() -> TestResult {
+    let bad_runs = r#"{"total_count":1,"check_runs":[{"name":"a","status":"completed"}]}"#;
+    assert_eq!(
+        checks_of(bad_runs, &named_statuses(&[])).await.err(),
+        Some(ForgeError::Malformed)
+    );
+    let short = r#"{"total_count":2,"check_runs":[{"name":"a","status":"queued"}]}"#;
+    assert_eq!(
+        checks_of(short, &named_statuses(&[])).await.err(),
+        Some(ForgeError::Malformed)
+    );
+    let bad_status = named_statuses(&[("a", "weird")]);
+    assert_eq!(
+        checks_of(&named_runs(&[]), &bad_status).await.err(),
+        Some(ForgeError::Malformed)
+    );
+    for status in [401, 403, 404, 429, 503] {
+        let script = Script::default().reply(status, "{}");
+        let ours = forge(&script).ci_checks(&target()?, PR_URL).await.err();
+        let script = Script::default().reply(status, "{}");
+        let theirs = forge(&script).ci_result(&target()?, PR_URL).await.err();
+        assert_eq!(ours, theirs, "{status}");
+        assert!(ours.is_some(), "{status}");
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn ci_checks_refuses_a_foreign_pull_url_before_any_request() -> TestResult {
+    for url in [
+        "",
+        "https://github.com/octo/other/pull/7",
+        "https://github.com@evil.example/octo/widgets/pull/7",
+        "https://github.com/octo/widgets/pull/0",
+    ] {
+        let script = Script::default();
+        let got = forge(&script).ci_checks(&target()?, url).await;
+        assert_eq!(got.err(), Some(ForgeError::Malformed), "{url:?}");
+        assert!(script.seen().is_empty(), "{url:?}");
+    }
+    let script = Script::default();
+    let off = PushTarget::new(
+        access_on("github.example", "github.example")?,
+        "fleet/job-1",
+        "main",
+    )?;
+    assert_eq!(
+        forge(&script).ci_checks(&off, PR_URL).await.err(),
+        Some(ForgeError::WrongKind)
+    );
+    assert_eq!(script.seen().len(), 0);
     Ok(())
 }
 

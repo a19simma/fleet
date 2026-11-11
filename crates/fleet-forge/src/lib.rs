@@ -17,6 +17,7 @@ mod model;
 mod seam;
 
 pub use api::{ForgeApi, ForgeGit};
+pub use ci::{CiCheck, MAX_CHECK_NAME_BYTES, MAX_CHECKS, Rank as CheckState};
 pub use error::ForgeError;
 pub use fleet_core::forge::CiResult;
 pub use gitea::{GiteaForge, GiteaGit};
