@@ -7,6 +7,7 @@
 #![expect(clippy::unwrap_used, reason = "test code asserts by panicking")]
 
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use fleet_core::capability::Capability;
 use fleet_core::credential::{CredentialKind, CredentialShape, Secret};
@@ -55,10 +56,24 @@ async fn user(pool: &PgPool, name: &str, admin: bool) -> i64 {
         .unwrap()
 }
 
+static KEY_FILES: AtomicUsize = AtomicUsize::new(0);
+
+fn key_path(prefix: &str) -> std::path::PathBuf {
+    std::env::temp_dir().join(format!(
+        "{prefix}-{}-{}.keys",
+        std::process::id(),
+        KEY_FILES.fetch_add(1, Ordering::Relaxed)
+    ))
+}
+
+#[test]
+fn key_paths_are_distinct_per_call() {
+    assert_ne!(key_path("fleet-x"), key_path("fleet-x"));
+}
+
 async fn world(pool: PgPool, tag: &str) -> World {
     Store::new(pool.clone()).migrate().await.unwrap();
-    let path =
-        std::env::temp_dir().join(format!("fleet-cred-gate-{}-{tag}.keys", std::process::id()));
+    let path = key_path(&format!("fleet-cred-gate-{tag}"));
     std::fs::write(&path, format!("k1:{}\n", "ab".repeat(32))).unwrap();
     let sealer = FileSealer::load(&path);
     std::fs::remove_file(&path).unwrap();
