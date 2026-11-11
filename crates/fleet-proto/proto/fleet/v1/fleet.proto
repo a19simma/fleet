@@ -95,8 +95,8 @@ service FleetBoxTokens {
 message IssueBoxTokenRequest {
   string box = 1;
   string label = 2;
-  // 0 means 90 days. The maximum is 365.
-  uint32 ttl_days = 3;
+  // Absent means 90 days. Otherwise 1 to 365; 0 is refused.
+  optional uint32 ttl_days = 3;
 }
 
 // The only reply that carries the token value. It is not stored and cannot be read again.

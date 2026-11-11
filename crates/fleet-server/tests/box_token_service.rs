@@ -49,7 +49,7 @@ async fn service(pool: &PgPool) -> FleetService {
     FleetService::new(store)
 }
 
-fn issue(box_name: &str, label: &str, ttl_days: u32) -> IssueBoxTokenRequest {
+fn issue(box_name: &str, label: &str, ttl_days: Option<u32>) -> IssueBoxTokenRequest {
     IssueBoxTokenRequest {
         r#box: box_name.to_owned(),
         label: label.to_owned(),
@@ -98,7 +98,7 @@ async fn an_api_token_reaches_the_service_and_a_box_token_does_not(pool: PgPool)
     }
     let svc = service(&pool).await;
     let issued = svc
-        .issue_box_token(as_user(alice, issue(&name(1), "ci", 0)))
+        .issue_box_token(as_user(alice, issue(&name(1), "ci", None)))
         .await
         .unwrap()
         .into_inner();
@@ -115,7 +115,7 @@ async fn an_api_token_reaches_the_service_and_a_box_token_does_not(pool: PgPool)
 async fn a_handler_without_a_caller_refuses(pool: PgPool) {
     let svc = service(&pool).await;
     let err = svc
-        .issue_box_token(Request::new(issue(&name(1), "", 0)))
+        .issue_box_token(Request::new(issue(&name(1), "", None)))
         .await
         .unwrap_err();
     assert_eq!(err.code(), Code::PermissionDenied);
@@ -138,7 +138,7 @@ async fn issue_returns_a_working_token_once_and_list_never_shows_it(pool: PgPool
     let alice = user(&pool, "alice").await;
     let svc = service(&pool).await;
     let issued = svc
-        .issue_box_token(as_user(alice, issue(&name(1), "ci", 30)))
+        .issue_box_token(as_user(alice, issue(&name(1), "ci", Some(30))))
         .await
         .unwrap()
         .into_inner();
@@ -168,23 +168,24 @@ async fn hostile_input_is_refused_before_any_row(pool: PgPool) {
     let svc = service(&pool).await;
     let long = "x".repeat(65);
     let table = [
-        (name(1) + "\n", "", 0),
-        (name(1) + " ", "", 0),
-        (String::new(), "", 0),
-        ("box-".to_owned(), "", 0),
-        ("Box-1".to_owned(), "", 0),
-        (format!("{}a", name(1)), "", 0),
-        ("worker".to_owned(), "", 0),
-        ("box-\u{0661}".to_owned(), "", 0),
-        (name(1), "a\nb", 0),
-        (name(1), "a\r\nb", 0),
-        (name(1), "a\u{2028}b", 0),
-        (name(1), "a\u{85}b", 0),
-        (name(1), "a\0b", 0),
-        (name(1), "a\u{202e}b", 0),
-        (name(1), long.as_str(), 0),
-        (name(1), "", 366),
-        (name(1), "", u32::MAX),
+        (name(1) + "\n", "", None),
+        (name(1) + " ", "", None),
+        (String::new(), "", None),
+        ("box-".to_owned(), "", None),
+        ("Box-1".to_owned(), "", None),
+        (format!("{}a", name(1)), "", None),
+        ("worker".to_owned(), "", None),
+        ("box-\u{0661}".to_owned(), "", None),
+        (name(1), "a\nb", None),
+        (name(1), "a\r\nb", None),
+        (name(1), "a\u{2028}b", None),
+        (name(1), "a\u{85}b", None),
+        (name(1), "a\0b", None),
+        (name(1), "a\u{202e}b", None),
+        (name(1), long.as_str(), None),
+        (name(1), "", Some(366)),
+        (name(1), "", Some(0)),
+        (name(1), "", Some(u32::MAX)),
     ];
     for (box_name, label, ttl) in table {
         let err = svc
@@ -194,7 +195,7 @@ async fn hostile_input_is_refused_before_any_row(pool: PgPool) {
         assert_eq!(
             err.code(),
             Code::InvalidArgument,
-            "{box_name:?} {label:?} {ttl}"
+            "{box_name:?} {label:?} {ttl:?}"
         );
     }
     let rows: i64 = sqlx::query_scalar("SELECT count(*) FROM box_tokens")
@@ -202,7 +203,7 @@ async fn hostile_input_is_refused_before_any_row(pool: PgPool) {
         .await
         .unwrap();
     assert_eq!(rows, 0);
-    svc.issue_box_token(as_user(alice, issue(&name(1), &"é".repeat(64), 365)))
+    svc.issue_box_token(as_user(alice, issue(&name(1), &"é".repeat(64), Some(365))))
         .await
         .unwrap();
 }
@@ -212,15 +213,15 @@ async fn a_taken_name_does_not_reveal_the_holder(pool: PgPool) {
     let alice = user(&pool, "alice").await;
     let bob = user(&pool, "bob").await;
     let svc = service(&pool).await;
-    svc.issue_box_token(as_user(alice, issue(&name(1), "", 0)))
+    svc.issue_box_token(as_user(alice, issue(&name(1), "", None)))
         .await
         .unwrap();
     let by_other = svc
-        .issue_box_token(as_user(bob, issue(&name(1), "", 0)))
+        .issue_box_token(as_user(bob, issue(&name(1), "", None)))
         .await
         .unwrap_err();
     let by_self = svc
-        .issue_box_token(as_user(alice, issue(&name(1), "", 0)))
+        .issue_box_token(as_user(alice, issue(&name(1), "", None)))
         .await
         .unwrap_err();
     assert_eq!(by_other.code(), Code::AlreadyExists);
@@ -236,7 +237,7 @@ async fn revoke_is_owner_scoped_and_ends_the_token(pool: PgPool) {
     let bob = user(&pool, "bob").await;
     let svc = service(&pool).await;
     let issued = svc
-        .issue_box_token(as_user(alice, issue(&name(1), "", 0)))
+        .issue_box_token(as_user(alice, issue(&name(1), "", None)))
         .await
         .unwrap()
         .into_inner();
@@ -278,7 +279,7 @@ async fn revoke_is_owner_scoped_and_ends_the_token(pool: PgPool) {
         .await
         .unwrap_err();
     assert_eq!(again.code(), Code::NotFound);
-    svc.issue_box_token(as_user(bob, issue(&name(1), "", 0)))
+    svc.issue_box_token(as_user(bob, issue(&name(1), "", None)))
         .await
         .unwrap();
 }
@@ -290,16 +291,16 @@ async fn the_cap_is_per_user(pool: PgPool) {
     let svc = service(&pool).await;
     let cap = u32::try_from(MAX_ACTIVE_BOX_TOKENS).unwrap();
     for n in 1..=cap {
-        svc.issue_box_token(as_user(alice, issue(&name(n), "", 0)))
+        svc.issue_box_token(as_user(alice, issue(&name(n), "", None)))
             .await
             .unwrap();
     }
     let err = svc
-        .issue_box_token(as_user(alice, issue(&name(cap + 1), "", 0)))
+        .issue_box_token(as_user(alice, issue(&name(cap + 1), "", None)))
         .await
         .unwrap_err();
     assert_eq!(err.code(), Code::ResourceExhausted);
-    svc.issue_box_token(as_user(bob, issue(&name(cap + 1), "", 0)))
+    svc.issue_box_token(as_user(bob, issue(&name(cap + 1), "", None)))
         .await
         .unwrap();
 }

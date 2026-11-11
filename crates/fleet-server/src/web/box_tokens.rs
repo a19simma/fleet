@@ -33,7 +33,7 @@ SELECT id, box_name, label, \
 to_char(created_at AT TIME ZONE 'UTC', 'YYYY-MM-DD HH24:MI \"UTC\"'), \
 to_char(expires_at AT TIME ZONE 'UTC', 'YYYY-MM-DD HH24:MI \"UTC\"'), \
 to_char(last_used_at AT TIME ZONE 'UTC', 'YYYY-MM-DD HH24:MI \"UTC\"'), \
-CASE WHEN revoked_at IS NOT NULL THEN 'revoked' WHEN expires_at <= now() THEN 'expired' \
+CASE WHEN revoked_at < expires_at THEN 'revoked' WHEN expires_at <= now() THEN 'expired' \
 ELSE 'active' END FROM box_tokens WHERE user_id = $1 ORDER BY id DESC";
 
 fn notice_text(code: &str) -> Option<&'static str> {
@@ -182,12 +182,15 @@ async fn issue(cx: &Cx, Form(form): Form<HashMap<String, String>>) -> Result<imp
     let Ok(label) = BoxTokenLabel::new(field("label")) else {
         return Err(back("invalid").into());
     };
-    let days = match field("days") {
-        "" => Some(0),
-        text if text.bytes().all(|b| b.is_ascii_digit()) => text.parse::<u32>().ok(),
-        _ => None,
+    let ttl = match field("days") {
+        "" => Ok(BoxTokenTtl::default()),
+        text if text.bytes().all(|b| b.is_ascii_digit()) => text
+            .parse::<u32>()
+            .map_err(|_| UserError::InvalidTtl)
+            .and_then(BoxTokenTtl::new),
+        _ => Err(UserError::InvalidTtl),
     };
-    let Some(Ok(ttl)) = days.map(BoxTokenTtl::new) else {
+    let Ok(ttl) = ttl else {
         return Err(back("invalid").into());
     };
     let made = match tokens

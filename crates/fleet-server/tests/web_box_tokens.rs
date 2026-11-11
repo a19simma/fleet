@@ -489,6 +489,7 @@ async fn the_lifetime_field_is_range_checked_and_defaults(pool: PgPool) {
         "1%0A2",
         "%2B5",
         "%EF%BC%91",
+        "0",
     ];
     for days in hostile {
         let body = format!("{}&days={days}", issue_body(&alice, &bx(1), ""));
@@ -496,7 +497,7 @@ async fn the_lifetime_field_is_range_checked_and_defaults(pool: PgPool) {
         assert_eq!(made.location(), "/box-tokens?notice=invalid", "{days}");
     }
     assert_eq!(count(&h, "SELECT count(*) FROM box_tokens").await, 0);
-    for (n, days) in [(1, ""), (2, "1"), (3, "365"), (4, "0")] {
+    for (n, days) in [(1, ""), (2, "1"), (3, "365")] {
         let body = format!("{}&days={days}", issue_body(&alice, &bx(n), ""));
         let made = h.post(&alice, "/box-tokens/issue", &body).await;
         assert_eq!(made.status, 200, "{days}");
@@ -508,7 +509,7 @@ async fn the_lifetime_field_is_range_checked_and_defaults(pool: PgPool) {
     .fetch_all(&h.pool)
     .await
     .unwrap();
-    assert_eq!(spans, [90, 1, 365, 90]);
+    assert_eq!(spans, [90, 1, 365]);
     h.finish().await;
 }
 
@@ -535,5 +536,27 @@ async fn names_are_trimmed_and_the_status_column_tracks_time_and_use(pool: PgPoo
     let old = h.get(&alice, "/box-tokens").await;
     assert!(old.body.contains("expired"));
     assert!(!old.body.contains("action=\"/box-tokens/revoke\""));
+    h.finish().await;
+}
+
+#[sqlx::test]
+async fn a_token_closed_by_a_reissue_after_expiry_reads_expired_not_revoked(pool: PgPool) {
+    let h = Harness::start(pool).await;
+    let alice = h.session("alice", 'a').await;
+    let made = h
+        .post(&alice, "/box-tokens/issue", &issue_body(&alice, &bx(1), ""))
+        .await;
+    assert_eq!(made.status, 200);
+    sqlx::query("UPDATE box_tokens SET expires_at = now() - interval '1 hour', created_at = now() - interval '2 hours'")
+        .execute(&h.pool)
+        .await
+        .unwrap();
+    let again = h
+        .post(&alice, "/box-tokens/issue", &issue_body(&alice, &bx(1), ""))
+        .await;
+    assert_eq!(again.status, 200);
+    let page = h.get(&alice, "/box-tokens").await;
+    assert!(page.body.contains("expired"));
+    assert!(!page.body.contains("revoked"));
     h.finish().await;
 }

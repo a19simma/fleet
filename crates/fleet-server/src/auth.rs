@@ -107,6 +107,14 @@ fn is_admin_path(path: &str) -> bool {
         || HOST_ADMIN_RPCS.contains(&path)
 }
 
+fn out_of_scope(path: &str) -> Status {
+    if is_admin_path(path) {
+        Status::permission_denied(ADMIN_REQUIRED)
+    } else {
+        Status::permission_denied("bearer token not valid for this service")
+    }
+}
+
 static SHARED_BOX_TOKEN_WARNING: Once = Once::new();
 
 fn warn_shared_box_token() {
@@ -355,6 +363,12 @@ impl BearerAuth {
                 .is_some_and(|t| t.starts_with(BOX_TOKEN_PREFIX.as_bytes())) =>
             {
                 let token = header.strip_prefix(b"Bearer ").unwrap_or_default();
+                if !std::str::from_utf8(token).is_ok_and(fleet_core::box_token::is_token) {
+                    return Err(Status::unauthenticated("missing or invalid bearer token"));
+                }
+                if !Self::allows(Scope::Box, path) {
+                    return Err(out_of_scope(path));
+                }
                 let found = match self.users.as_ref() {
                     Some(users) => users.resolve_box_token(token).await.map_err(unavailable)?,
                     None => None,
@@ -397,9 +411,7 @@ impl BearerAuth {
             };
         }
         if !Self::allows(scope, path) {
-            return Err(Status::permission_denied(
-                "bearer token not valid for this service",
-            ));
+            return Err(out_of_scope(path));
         }
         if path == DECIDE_EDIT && caller.is_none() {
             return Err(Status::permission_denied(USER_TOKEN_REQUIRED));

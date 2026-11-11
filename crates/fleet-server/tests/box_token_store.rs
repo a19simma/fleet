@@ -25,7 +25,7 @@ fn label() -> BoxTokenLabel {
 }
 
 fn ttl() -> BoxTokenTtl {
-    BoxTokenTtl::new(0).unwrap()
+    BoxTokenTtl::default()
 }
 
 #[sqlx::test]
@@ -78,6 +78,7 @@ async fn default_ttl_is_90_days_and_max_is_365(pool: PgPool) {
     .unwrap();
     assert!((days - 90.0).abs() < 0.01, "{days}");
     assert!(BoxTokenTtl::new(365).is_ok());
+    assert!(matches!(BoxTokenTtl::new(0), Err(UserError::InvalidTtl)));
     assert!(matches!(BoxTokenTtl::new(366), Err(UserError::InvalidTtl)));
     assert!(matches!(
         BoxTokenTtl::new(u32::MAX),
@@ -374,4 +375,57 @@ fn labels_are_validated() {
             "{bad:?}"
         );
     }
+}
+
+#[sqlx::test]
+async fn closing_an_expired_token_audits_expired_and_lists_it_unrevoked(pool: PgPool) {
+    let users = Users::new(pool.clone());
+    let alice = user(&pool, "alice").await;
+    let bob = user(&pool, "bob").await;
+    let old = users
+        .issue_box_token(alice, &name(1), &label(), ttl())
+        .await
+        .unwrap();
+    sqlx::query("UPDATE box_tokens SET created_at = now() - interval '2 days', expires_at = now() - interval '1 day' WHERE id = $1")
+        .bind(old.id)
+        .execute(&pool)
+        .await
+        .unwrap();
+    users
+        .issue_box_token(bob, &name(1), &label(), ttl())
+        .await
+        .unwrap();
+    let audit: Vec<(i64, i64, String, String)> = sqlx::query_as(
+        "SELECT token_id, user_id, box_name, action FROM box_token_audit \
+         WHERE action = 'expired' ORDER BY id",
+    )
+    .fetch_all(&pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        audit,
+        [(
+            old.id,
+            alice,
+            name(1).as_str().to_owned(),
+            "expired".to_owned()
+        )]
+    );
+    let rows = users.list_box_tokens(alice).await.unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].revoked_at, None);
+    users.revoke_box_token(alice, rows[0].id).await.unwrap_err();
+    let revoked = users
+        .issue_box_token(alice, &name(2), &label(), ttl())
+        .await
+        .unwrap();
+    users.revoke_box_token(alice, revoked.id).await.unwrap();
+    let rows = users.list_box_tokens(alice).await.unwrap();
+    assert!(
+        rows.iter()
+            .find(|r| r.id == revoked.id)
+            .unwrap()
+            .revoked_at
+            .is_some()
+    );
 }

@@ -70,7 +70,7 @@ UPDATE api_tokens SET revoked_at = now() WHERE id = $1 AND user_id = $2 AND revo
 const LOCK_BOX_TOKEN_OWNER: &str = "SELECT id FROM users WHERE id = $1 FOR UPDATE";
 const EXPIRE_BOX_TOKENS: &str = "\
 UPDATE box_tokens SET revoked_at = expires_at \
-WHERE box_name = $1 AND revoked_at IS NULL AND expires_at <= now()";
+WHERE box_name = $1 AND revoked_at IS NULL AND expires_at <= now() RETURNING id, user_id";
 const COUNT_BOX_TOKENS: &str = "\
 SELECT count(*) FROM box_tokens WHERE user_id = $1 AND revoked_at IS NULL AND expires_at > now()";
 const INSERT_BOX_TOKEN: &str = "\
@@ -89,7 +89,8 @@ const REVOKE_BOX_TOKEN: &str = "\
 UPDATE box_tokens SET revoked_at = now() \
 WHERE id = $1 AND user_id = $2 AND revoked_at IS NULL RETURNING box_name";
 const LIST_BOX_TOKENS: &str = "\
-SELECT id, box_name, label, created_at::text, expires_at::text, last_used_at::text, revoked_at::text \
+SELECT id, box_name, label, created_at::text, expires_at::text, last_used_at::text, \
+CASE WHEN revoked_at < expires_at THEN revoked_at::text END \
 FROM box_tokens WHERE user_id = $1 ORDER BY id";
 
 /// The user an API token belongs to and whether that user is an admin right now.
@@ -122,7 +123,7 @@ pub enum UserError {
     BootstrapNotAdmin,
     /// A per-Box token label is too long or holds control or hostile characters.
     InvalidLabel,
-    /// A per-Box token lifetime is above [`MAX_BOX_TOKEN_DAYS`].
+    /// A per-Box token lifetime is zero or above [`MAX_BOX_TOKEN_DAYS`].
     InvalidTtl,
     /// An active per-Box token already exists for the Box name.
     BoxNameTaken,
@@ -221,15 +222,14 @@ impl BoxTokenLabel {
 pub struct BoxTokenTtl(u32);
 
 impl BoxTokenTtl {
-    /// Validates a lifetime. Zero means [`DEFAULT_BOX_TOKEN_DAYS`].
+    /// Validates a lifetime of 1 to [`MAX_BOX_TOKEN_DAYS`] days. Callers use
+    /// [`BoxTokenTtl::default`] when the lifetime is absent.
     ///
     /// # Errors
     ///
-    /// Returns [`UserError::InvalidTtl`] above [`MAX_BOX_TOKEN_DAYS`].
+    /// Returns [`UserError::InvalidTtl`] for zero and above [`MAX_BOX_TOKEN_DAYS`].
     pub const fn new(days: u32) -> Result<Self, UserError> {
-        if days == 0 {
-            Ok(Self(DEFAULT_BOX_TOKEN_DAYS))
-        } else if fleet_core::box_token::days_are_valid(days) {
+        if fleet_core::box_token::days_are_valid(days) {
             Ok(Self(days))
         } else {
             Err(UserError::InvalidTtl)
@@ -239,6 +239,12 @@ impl BoxTokenTtl {
     /// The lifetime in days.
     pub const fn days(self) -> u32 {
         self.0
+    }
+}
+
+impl Default for BoxTokenTtl {
+    fn default() -> Self {
+        Self(DEFAULT_BOX_TOKEN_DAYS)
     }
 }
 
@@ -709,8 +715,14 @@ impl Users {
     /// Issues a per-Box token for `user_id` bound to `box_name`.
     ///
     /// The user row is locked `FOR UPDATE`, so two issues cannot both pass the cap. Expired
-    /// tokens of the name are closed first, because the partial unique index cannot see time.
-    /// The audit row is written in the same transaction.
+    /// tokens of the name are closed first, because the partial unique index cannot see time:
+    /// the close sets `revoked_at` to `expires_at`, writes an `expired` audit row for each and
+    /// lists as expired, not revoked. The audit row is written in the same transaction.
+    ///
+    /// The caller authenticated before this call. A passkey reset that commits while the issue
+    /// waits on the lock revokes the credentials the caller used, and the issue still commits a
+    /// token for that user. Closing the gap needs the credential id in `Caller`, which no
+    /// handler carries; ADR-0069 records it as a known window.
     ///
     /// # Errors
     ///
@@ -729,10 +741,19 @@ impl Users {
             .fetch_optional(&mut *tx)
             .await?
             .ok_or(UserError::NoSuchUser)?;
-        sqlx::query(EXPIRE_BOX_TOKENS)
+        let closed: Vec<(i64, i64)> = sqlx::query_as(EXPIRE_BOX_TOKENS)
             .bind(box_name.as_str())
-            .execute(&mut *tx)
+            .fetch_all(&mut *tx)
             .await?;
+        for (closed_id, closed_user) in closed {
+            sqlx::query(AUDIT_BOX_TOKEN)
+                .bind(closed_id)
+                .bind(closed_user)
+                .bind(box_name.as_str())
+                .bind("expired")
+                .execute(&mut *tx)
+                .await?;
+        }
         let active: i64 = sqlx::query_scalar(COUNT_BOX_TOKENS)
             .bind(user_id)
             .fetch_one(&mut *tx)
@@ -769,11 +790,12 @@ impl Users {
     }
 
     /// Resolves a bearer value to its per-Box token, or `None` for an unknown, expired or
-    /// revoked one. `last_used_at` moves at most once a minute.
+    /// revoked one. `last_used_at` moves at most once a minute, and a failed update is logged and
+    /// does not fail the lookup.
     ///
     /// # Errors
     ///
-    /// Returns [`UserError::Db`] for a database failure.
+    /// Returns [`UserError::Db`] when the lookup fails.
     pub async fn resolve_box_token(
         &self,
         token: &[u8],
@@ -785,11 +807,13 @@ impl Users {
         let Some((token_id, user_id, box_name, stale)) = row else {
             return Ok(None);
         };
-        if stale {
-            sqlx::query(TOUCH_BOX_TOKEN)
+        if stale
+            && let Err(err) = sqlx::query(TOUCH_BOX_TOKEN)
                 .bind(token_id)
                 .execute(&self.pool)
-                .await?;
+                .await
+        {
+            tracing::warn!(%err, token_id, "box token last_used_at update failed");
         }
         Ok(Some(BoxTokenOwner {
             token_id,

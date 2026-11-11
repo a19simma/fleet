@@ -6,7 +6,7 @@
 use std::convert::Infallible;
 
 use fleet_core::BoxName;
-use fleet_server::auth::{BOX_MISMATCH, BearerAuth, BoxCaller};
+use fleet_server::auth::{ADMIN_REQUIRED, BOX_MISMATCH, BearerAuth, BoxCaller};
 use fleet_server::config::Token;
 use fleet_server::cred::admin::{AdminCommand, run};
 use fleet_server::cred::users::{BoxTokenLabel, BoxTokenTtl, Users};
@@ -44,7 +44,7 @@ async fn issue(pool: &PgPool, users: &Users, who: &str, n: u32) -> (i64, i64, St
             user,
             &name(n),
             &BoxTokenLabel::new("t").unwrap(),
-            BoxTokenTtl::new(0).unwrap(),
+            BoxTokenTtl::default(),
         )
         .await
         .unwrap();
@@ -279,4 +279,101 @@ async fn the_layer_inserts_the_box_caller_extension_and_never_a_caller(pool: PgP
         response.headers().get("grpc-status").unwrap(),
         &(Code::Unauthenticated as i32).to_string()
     );
+}
+
+#[sqlx::test]
+async fn a_malformed_box_token_never_reaches_the_database(pool: PgPool) {
+    let users = Users::new(pool.clone());
+    let (_, _, token) = issue(&pool, &users, "alice", 1).await;
+    let hex = token.strip_prefix("fbx_").unwrap().to_owned();
+    pool.close().await;
+    let malformed: Vec<(&str, Vec<u8>)> = vec![
+        ("prefix only", bearer("fbx_")),
+        ("short", bearer(&token[..token.len() - 1])),
+        ("long", bearer(&format!("{token}0"))),
+        ("uppercase", bearer(&format!("fbx_{}", hex.to_uppercase()))),
+        ("trailing cr", format!("Bearer {token}\r").into_bytes()),
+        ("trailing nel", format!("Bearer {token}\u{85}").into_bytes()),
+        ("non ascii", format!("Bearer {token}\u{e9}").into_bytes()),
+        ("raw 0xff", b"Bearer fbx_\xff\xfe".to_vec()),
+        ("two tokens", format!("Bearer {token} {token}").into_bytes()),
+    ];
+    for (shown, header) in malformed {
+        let err = auth(&users)
+            .resolve(INGEST, Some(&header))
+            .await
+            .unwrap_err();
+        assert_eq!(err.code(), Code::Unauthenticated, "{shown}");
+        assert_eq!(err.message(), UNAUTH, "{shown}");
+    }
+    for control in [token, format!("fbx_{}", "0".repeat(64))] {
+        let err = auth(&users)
+            .resolve(INGEST, Some(&bearer(&control)))
+            .await
+            .unwrap_err();
+        assert_eq!(err.code(), Code::Unavailable, "well formed {control}");
+    }
+}
+
+#[sqlx::test]
+async fn a_denied_path_does_not_move_last_used_at(pool: PgPool) {
+    let users = Users::new(pool.clone());
+    let (_, token_id, token) = issue(&pool, &users, "alice", 1).await;
+    let last_used = || async {
+        sqlx::query_scalar::<_, Option<String>>(
+            "SELECT last_used_at::text FROM box_tokens WHERE id = $1",
+        )
+        .bind(token_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap()
+    };
+    for path in [
+        "/fleet.v1.FleetJobs/ListJobs",
+        "/fleet.v1.FleetCatalogAdmin/UpsertCatalogItem",
+        "/fleet.v1.Unknown/Method",
+    ] {
+        let err = auth(&users)
+            .resolve(path, Some(&bearer(&token)))
+            .await
+            .unwrap_err();
+        assert_eq!(err.code(), Code::PermissionDenied, "{path}");
+        let want = if path.contains("CatalogAdmin") {
+            ADMIN_REQUIRED
+        } else {
+            "bearer token not valid for this service"
+        };
+        assert_eq!(err.message(), want, "{path}");
+        assert_eq!(last_used().await, None, "{path}");
+    }
+    auth(&users)
+        .resolve(WORKER, Some(&bearer(&token)))
+        .await
+        .unwrap();
+    assert!(last_used().await.is_some());
+}
+
+#[sqlx::test]
+async fn a_failed_last_used_update_does_not_fail_authentication(pool: PgPool) {
+    let users = Users::new(pool.clone());
+    let (user, _, token) = issue(&pool, &users, "alice", 1).await;
+    sqlx::raw_sql(
+        "CREATE FUNCTION refuse_touch() RETURNS trigger LANGUAGE plpgsql AS $$ \
+         BEGIN RAISE EXCEPTION 'touch refused'; END; $$; \
+         CREATE TRIGGER refuse_touch BEFORE UPDATE ON box_tokens \
+         FOR EACH ROW EXECUTE FUNCTION refuse_touch();",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+    let touched = sqlx::query("UPDATE box_tokens SET last_used_at = now() WHERE user_id = $1")
+        .bind(user)
+        .execute(&pool)
+        .await;
+    assert!(touched.is_err());
+    let got = auth(&users)
+        .resolve(WORKER, Some(&bearer(&token)))
+        .await
+        .unwrap();
+    assert_eq!(got.box_caller.unwrap().user_id, user);
 }

@@ -785,7 +785,7 @@ fn box_token_error(err: &UserError) -> Status {
     match err {
         UserError::InvalidLabel => Status::invalid_argument("invalid label"),
         UserError::InvalidTtl => Status::invalid_argument(format!(
-            "ttl_days must be at most {}",
+            "ttl_days must be from 1 to {}",
             crate::cred::users::MAX_BOX_TOKEN_DAYS
         )),
         UserError::BoxNameTaken => Status::already_exists("box name is not available"),
@@ -809,7 +809,10 @@ impl FleetBoxTokens for FleetService {
         let name = validate_box(&request.r#box)
             .map_err(|_| Status::invalid_argument("invalid box name"))?;
         let label = BoxTokenLabel::new(&request.label).map_err(|err| box_token_error(&err))?;
-        let ttl = BoxTokenTtl::new(request.ttl_days).map_err(|err| box_token_error(&err))?;
+        let ttl = request
+            .ttl_days
+            .map_or_else(|| Ok(BoxTokenTtl::default()), BoxTokenTtl::new)
+            .map_err(|err| box_token_error(&err))?;
         let issued = Users::new(self.store.pool().clone())
             .issue_box_token(user_id, &name, &label, ttl)
             .await
