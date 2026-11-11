@@ -4,7 +4,7 @@
 #![expect(clippy::unwrap_used, reason = "test code asserts by panicking")]
 
 use std::fs;
-use std::os::unix::fs::{MetadataExt, PermissionsExt};
+use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -858,7 +858,7 @@ async fn a_setup_only_secret_reaches_the_step_and_is_shredded_after_success() ->
 #[tokio::test]
 async fn the_setup_secrets_carry_the_group_modes_of_the_tmpfiles_entry() -> TestResult {
     bounded::bounded(async {
-        let gid = fs::metadata(std::env::temp_dir()).unwrap().gid();
+        let gid = rustix::process::getegid().as_raw();
         let seen = Arc::new(Mutex::new(None));
         let slot = Arc::clone(&seen);
         let (rig, _alias, _keep) = secret_rig(
@@ -870,7 +870,8 @@ async fn the_setup_secrets_carry_the_group_modes_of_the_tmpfiles_entry() -> Test
             vec![script("one", "echo ok", 5)],
             Some(gid),
         );
-        rig.setup.run(JOB, &redactor()).await;
+        let report = rig.setup.run(JOB, &redactor()).await;
+        assert_eq!(report.failed, None);
         let probe = seen.lock().unwrap().clone().unwrap();
         let seen = probe.seen.lock().unwrap().clone();
         assert_eq!(
