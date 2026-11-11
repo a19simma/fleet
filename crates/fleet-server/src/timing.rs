@@ -540,7 +540,7 @@ impl Default for StreamLimits {
 
 const LOCK_LEASED_JOB: &str = "\
 SELECT 1 FROM jobs WHERE job_id = $1 AND attempt = $2 AND state = 'RUNNING' \
-AND lease_expires_at > now() FOR NO KEY UPDATE";
+AND ($3::text IS NULL OR box = $3) AND lease_expires_at > now() FOR NO KEY UPDATE";
 
 const LOG_USAGE: &str = "\
 SELECT count(DISTINCT command_id), COALESCE(sum(octet_length(bytes)), 0)::bigint, \
@@ -574,12 +574,14 @@ fn storage_unavailable(err: &sqlx::Error) -> Status {
 ///
 /// # Errors
 /// `INVALID_ARGUMENT` for a bad `command_id`, `seq`, `bytes` or `status`,
-/// `FAILED_PRECONDITION` when no running lease matches the job and attempt,
+/// `FAILED_PRECONDITION` when no running lease matches the job and attempt, or, when
+/// `leased_to` names the Box a per-Box token is bound to, that Box does not hold it,
 /// `RESOURCE_EXHAUSTED` past [`MAX_LOG_COMMANDS_PER_JOB`] or [`MAX_LOG_BYTES_PER_JOB`],
 /// and `UNAVAILABLE` when a statement fails.
 pub async fn report_shell_log(
     pool: &PgPool,
     request: &ReportShellLogRequest,
+    leased_to: Option<&str>,
 ) -> Result<ReportShellLogReply, Status> {
     if !validate_shell_log_command_id(&request.command_id) {
         return Err(Status::invalid_argument("invalid command id"));
@@ -600,6 +602,7 @@ pub async fn report_shell_log(
     sqlx::query(LOCK_LEASED_JOB)
         .bind(&request.job_id)
         .bind(attempt)
+        .bind(leased_to)
         .fetch_optional(&mut *tx)
         .await
         .map_err(|e| storage_unavailable(&e))?

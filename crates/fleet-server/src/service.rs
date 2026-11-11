@@ -84,7 +84,7 @@ use tonic::{Request, Response, Status};
 use tonic_prost::prost::Message;
 use tower::layer::util::{Identity, Stack};
 
-use crate::auth::{ADMIN_REQUIRED, BearerAuth, Caller};
+use crate::auth::{ADMIN_REQUIRED, BearerAuth, BoxCaller, Caller};
 use crate::catalog;
 use crate::config::Config;
 use crate::cred::capability::{self, Capabilities};
@@ -255,20 +255,29 @@ fn storage_unavailable(err: &StoreError) -> Status {
     Status::unavailable("storage unavailable")
 }
 
-fn same_box(events: &[QueuedEvent]) -> Result<(), Status> {
+/// Refuses a request naming a Box other than the one a per-Box token is bound to. A request
+/// without a [`BoxCaller`] (a static token) passes.
+fn bound_box<T>(request: &Request<T>, requested: &str) -> Result<(), Status> {
+    match request.extensions().get::<BoxCaller>() {
+        Some(bound) => bound.require_box(requested),
+        None => Ok(()),
+    }
+}
+
+fn same_box(events: &[QueuedEvent]) -> Result<Option<&str>, Status> {
     let mut names = events
         .iter()
         .filter_map(|event| event.envelope.as_ref())
         .map(|envelope| envelope.r#box.as_str());
     let Some(first) = names.next() else {
-        return Ok(());
+        return Ok(None);
     };
     if names.any(|other| other != first) {
         return Err(Status::invalid_argument(
             "every event in a request must carry the same box",
         ));
     }
-    Ok(())
+    Ok(Some(first))
 }
 
 fn no_nul(field: &str, value: &str) -> Result<(), Status> {
@@ -398,13 +407,16 @@ impl FleetIngest for FleetService {
         &self,
         request: Request<PushEventsRequest>,
     ) -> Result<Response<PushEventsReply>, Status> {
+        let bound = request.extensions().get::<BoxCaller>().cloned();
         let events = request.into_inner().events;
         if events.len() > MAX_EVENTS_PER_PUSH {
             return Err(Status::invalid_argument(format!(
                 "a request may carry at most {MAX_EVENTS_PER_PUSH} events"
             )));
         }
-        same_box(&events)?;
+        if let (Some(bound), Some(first)) = (bound, same_box(&events)?) {
+            bound.require_box(first)?;
+        }
         let max_seq = events.iter().map(|event| event.seq).max().unwrap_or(0);
 
         let mut valid: Vec<(u64, Envelope)> = Vec::with_capacity(events.len());
@@ -466,6 +478,7 @@ impl FleetIngest for FleetService {
         &self,
         request: Request<HeartbeatRequest>,
     ) -> Result<Response<HeartbeatReply>, Status> {
+        bound_box(&request, &request.get_ref().r#box)?;
         let request = request.into_inner();
         let name = validate_box(&request.r#box)
             .map_err(|err| Status::invalid_argument(err.to_string()))?;
@@ -552,6 +565,7 @@ impl FleetWorker for FleetService {
         &self,
         request: Request<ClaimJobRequest>,
     ) -> Result<Response<ClaimJobReply>, Status> {
+        bound_box(&request, &request.get_ref().r#box)?;
         let name = validate_box(&request.into_inner().r#box)
             .map_err(|err| Status::invalid_argument(err.to_string()))?;
         let job = self
@@ -575,6 +589,7 @@ impl FleetWorker for FleetService {
         &self,
         request: Request<GetProfileBlobRequest>,
     ) -> Result<Response<GetProfileBlobReply>, Status> {
+        bound_box(&request, &request.get_ref().r#box)?;
         let request = request.into_inner();
         let name = validate_box(&request.r#box)
             .map_err(|err| Status::invalid_argument(err.to_string()))?;
@@ -590,6 +605,7 @@ impl FleetWorker for FleetService {
         &self,
         request: Request<GetJobTranscriptRequest>,
     ) -> Result<Response<GetJobTranscriptReply>, Status> {
+        bound_box(&request, &request.get_ref().r#box)?;
         let request = request.into_inner();
         let name = validate_box(&request.r#box)
             .map_err(|err| Status::invalid_argument(err.to_string()))?;
@@ -605,6 +621,7 @@ impl FleetWorker for FleetService {
         &self,
         request: Request<GetJobCredentialsRequest>,
     ) -> Result<Response<GetJobCredentialsReply>, Status> {
+        bound_box(&request, &request.get_ref().r#box)?;
         let service = self
             .credentials
             .as_ref()
@@ -622,6 +639,7 @@ impl FleetWorker for FleetService {
         &self,
         request: Request<GetJobEnvironmentRequest>,
     ) -> Result<Response<GetJobEnvironmentReply>, Status> {
+        bound_box(&request, &request.get_ref().r#box)?;
         let service = self
             .environments
             .as_ref()
@@ -639,6 +657,7 @@ impl FleetWorker for FleetService {
         &self,
         request: Request<ReportJobRequest>,
     ) -> Result<Response<ReportJobReply>, Status> {
+        bound_box(&request, &request.get_ref().r#box)?;
         let request = request.into_inner();
         let name = validate_box(&request.r#box)
             .map_err(|err| Status::invalid_argument(err.to_string()))?;
@@ -654,6 +673,7 @@ impl FleetWorker for FleetService {
         &self,
         request: Request<ReportTimingRequest>,
     ) -> Result<Response<ReportTimingReply>, Status> {
+        bound_box(&request, &request.get_ref().r#box)?;
         let name = report_box(request.get_ref())?;
         timing::store_timing(self.store.pool(), &name, request.get_ref())
             .await
@@ -664,7 +684,12 @@ impl FleetWorker for FleetService {
         &self,
         request: Request<ReportShellLogRequest>,
     ) -> Result<Response<ReportShellLogReply>, Status> {
-        timing::report_shell_log(self.store.pool(), request.get_ref())
+        bound_box(&request, &request.get_ref().r#box)?;
+        let leased_to = request
+            .extensions()
+            .get::<BoxCaller>()
+            .map(|bound| bound.box_name.as_str());
+        timing::report_shell_log(self.store.pool(), request.get_ref(), leased_to)
             .await
             .map(Response::new)
     }
