@@ -237,8 +237,23 @@ async fn connect_pool(config: &Config) -> Result<sqlx::PgPool, BoxError> {
         .await?)
 }
 
+/// Warns once when `FLEET_REPO_HOSTS` changed the operator host list, because `git_hosts` rows
+/// are the source of hosts and the variable no longer decides which hosts are allowed.
+fn warn_repo_hosts_ignored(config: &Config) {
+    if config.repo_hosts.is_non_default() {
+        tracing::warn!(
+            "FLEET_REPO_HOSTS is set but git_hosts rows replace it: add hosts through the git_hosts table"
+        );
+    }
+}
+
 async fn run() -> Result<(), BoxError> {
-    let config = Config::from_env()?;
+    run_with(Config::from_env()?).await
+}
+
+/// Runs the server for `config`. Startup notices are logged before any connection is made.
+async fn run_with(config: Config) -> Result<(), BoxError> {
+    warn_repo_hosts_ignored(&config);
     let github_app = load_github_app(&config).await?;
     let pool = connect_pool(&config).await?;
     let store = configured_store(pool.clone(), &config);
@@ -415,6 +430,83 @@ mod tests {
             _ => None,
         })
         .unwrap()
+    }
+
+    #[derive(Clone, Default)]
+    struct Capture(Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl std::io::Write for Capture {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    fn logged_by_warn(config: &Config) -> String {
+        let capture = Capture::default();
+        let writer = capture.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(move || writer.clone())
+            .with_ansi(false)
+            .finish();
+        tracing::subscriber::with_default(subscriber, || warn_repo_hosts_ignored(config));
+        let bytes = capture.0.lock().unwrap().clone();
+        String::from_utf8(bytes).unwrap()
+    }
+
+    #[test]
+    fn a_set_repo_hosts_variable_logs_one_warning_and_an_unset_one_logs_none() {
+        let set = Config::from_lookup(|var| match var {
+            "FLEET_DATABASE_URL" => Some("postgres://h/db".to_owned()),
+            "FLEET_TOKEN" => Some(TOKEN.to_owned()),
+            "FLEET_REPO_HOSTS" => Some(String::new()),
+            _ => None,
+        })
+        .unwrap();
+        let line = logged_by_warn(&set);
+        assert_eq!(line.matches("WARN").count(), 1, "{line}");
+        assert!(line.contains("FLEET_REPO_HOSTS"), "{line}");
+        assert!(line.contains("git_hosts rows replace it"), "{line}");
+        assert_eq!(logged_by_warn(&config(None)), "");
+    }
+
+    fn unreachable_db(repo_hosts: Option<&'static str>) -> Config {
+        Config::from_lookup(|var| match var {
+            "FLEET_DATABASE_URL" => Some("postgres://127.0.0.1:1/db".to_owned()),
+            "FLEET_TOKEN" => Some(TOKEN.to_owned()),
+            "FLEET_REPO_HOSTS" => repo_hosts.map(str::to_owned),
+            _ => None,
+        })
+        .unwrap()
+    }
+
+    async fn run_logged(config: Config) -> String {
+        let capture = Capture::default();
+        let writer = capture.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(move || writer.clone())
+            .with_ansi(false)
+            .finish();
+        let guard = tracing::subscriber::set_default(subscriber);
+        assert!(run_with(config).await.is_err());
+        drop(guard);
+        let bytes = capture.0.lock().unwrap().clone();
+        String::from_utf8(bytes).unwrap()
+    }
+
+    #[tokio::test]
+    async fn startup_logs_the_repo_hosts_warning_before_connecting() {
+        let set = run_logged(unreachable_db(Some(""))).await;
+        assert_eq!(set.matches("FLEET_REPO_HOSTS is set").count(), 1, "{set}");
+        let unset = run_logged(unreachable_db(None)).await;
+        assert_eq!(unset.matches("FLEET_REPO_HOSTS").count(), 0, "{unset}");
     }
 
     struct Counting(Arc<std::sync::atomic::AtomicUsize>);
