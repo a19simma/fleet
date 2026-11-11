@@ -14,8 +14,8 @@ use fleet_core::host::{HostKind, HostName};
 use fleet_proto::Reason;
 use fleet_proto::v1::fleet_hosts_server::FleetHosts;
 use fleet_proto::v1::{
-    AddHostRequest, ApproveHostPrivateRequest, ListHostRequestsRequest, ListHostsRequest,
-    RemoveHostRequest, RevokeHostPrivateRequest,
+    AddHostRequest, ApproveHostPrivateRequest, HostInfo, ListHostRequestsReply,
+    ListHostRequestsRequest, ListHostsRequest, RemoveHostRequest, RevokeHostPrivateRequest,
 };
 use fleet_server::auth::{ADMIN_REQUIRED, BearerAuth, Caller, HOST_ADMIN_RPCS};
 use fleet_server::config::Token;
@@ -30,6 +30,29 @@ use fleet_server::store::Store;
 use hyper::StatusCode;
 use sqlx::PgPool;
 use tonic::{Code, Request, Status};
+
+const PRIVATE: &str = "192.168.3.1";
+
+#[derive(Clone)]
+struct Switch(Arc<Mutex<Vec<IpAddr>>>);
+
+#[tonic::async_trait]
+impl Resolve for Switch {
+    async fn resolve(&self, _host: &str) -> io::Result<Vec<IpAddr>> {
+        let set = self.0.lock().unwrap().clone();
+        if set.is_empty() {
+            Err(io::Error::from(io::ErrorKind::NotFound))
+        } else {
+            Ok(set)
+        }
+    }
+}
+
+impl Switch {
+    fn set(&self, addrs: &[&str]) {
+        *self.0.lock().unwrap() = addrs.iter().map(|a| a.parse().unwrap()).collect();
+    }
+}
 
 const FORGE: &str = r#"{"version":"17.0.1"}"#;
 const PUBLIC: &str = "93.184.216.34";
@@ -52,11 +75,14 @@ fn dns(addrs: &[&str]) -> Dns {
     Dns(addrs.iter().map(|a| a.parse().unwrap()).collect())
 }
 
+type Pin = (bool, Vec<IpAddr>);
+
 #[derive(Clone)]
 struct Wire {
     reply: Result<(u16, String), FetchError>,
     calls: Arc<AtomicUsize>,
     seen: Arc<Mutex<Vec<String>>>,
+    pins: Arc<Mutex<Vec<Pin>>>,
 }
 
 fn wire(status: u16, body: &str) -> Wire {
@@ -64,6 +90,7 @@ fn wire(status: u16, body: &str) -> Wire {
         reply: Ok((status, body.to_owned())),
         calls: Arc::new(AtomicUsize::new(0)),
         seen: Arc::new(Mutex::new(Vec::new())),
+        pins: Arc::new(Mutex::new(Vec::new())),
     }
 }
 
@@ -72,6 +99,10 @@ impl ForgeTransport for Wire {
     async fn get(&self, request: &ForgeGet<'_>) -> Result<ForgeReply, FetchError> {
         self.calls.fetch_add(1, Ordering::SeqCst);
         self.seen.lock().unwrap().push(request.host.to_owned());
+        self.pins
+            .lock()
+            .unwrap()
+            .push((request.allow_private, request.approved_ips.to_vec()));
         self.reply.clone().map(|(status, body)| ForgeReply {
             status: StatusCode::from_u16(status).unwrap(),
             body: body.into_bytes(),
@@ -91,6 +122,18 @@ impl HostProbe for Fixed {
         self.calls.fetch_add(1, Ordering::SeqCst);
         self.verdict
     }
+
+    async fn resolve(&self, _host: &HostName) -> Vec<IpAddr> {
+        Vec::new()
+    }
+
+    async fn probe_approved(
+        &self,
+        _host: &HostName,
+        _approved: &[IpAddr],
+    ) -> Result<HostKind, HostRefusal> {
+        self.verdict
+    }
 }
 
 struct Stall;
@@ -99,6 +142,18 @@ struct Stall;
 impl HostProbe for Stall {
     async fn probe(&self, _host: &HostName) -> Result<HostKind, HostRefusal> {
         tokio::time::sleep(Duration::from_secs(600)).await;
+        Ok(HostKind::Forgejo)
+    }
+
+    async fn resolve(&self, _host: &HostName) -> Vec<IpAddr> {
+        Vec::new()
+    }
+
+    async fn probe_approved(
+        &self,
+        _host: &HostName,
+        _approved: &[IpAddr],
+    ) -> Result<HostKind, HostRefusal> {
         Ok(HostKind::Forgejo)
     }
 }
@@ -151,7 +206,7 @@ fn as_user<T>(user_id: i64, is_admin: bool, message: T) -> Request<T> {
     request
 }
 
-async fn add(world: &World, user_id: i64, host: &str) -> Result<fleet_proto::v1::HostInfo, Status> {
+async fn add(world: &World, user_id: i64, host: &str) -> Result<HostInfo, Status> {
     world
         .svc
         .add_host(as_user(
@@ -680,17 +735,9 @@ async fn remove_refuses_in_use_unknown_and_builtin_hosts(pool: PgPool) {
 }
 
 #[sqlx::test(migrations = false)]
-async fn the_unbuilt_admin_rpcs_are_admin_gated_in_the_handler(pool: PgPool) {
+async fn the_revoke_and_list_rpcs_are_admin_gated_in_the_handler(pool: PgPool) {
     let w = world(pool, dns(&[PUBLIC]), wire(200, FORGE)).await;
     let denied = [
-        w.svc
-            .approve_host_private(as_user(
-                w.alice,
-                false,
-                ApproveHostPrivateRequest::default(),
-            ))
-            .await
-            .unwrap_err(),
         w.svc
             .revoke_host_private(as_user(w.alice, false, RevokeHostPrivateRequest::default()))
             .await
@@ -771,4 +818,605 @@ async fn a_token_of_a_deleted_user_cannot_add(pool: PgPool) {
     assert_eq!(err.code(), Code::PermissionDenied);
     assert_eq!(err.message(), fleet_proto::ERR_NEEDS_USER_TOKEN);
     assert_eq!(host_count(&w.pool).await, 1);
+}
+
+async fn approve(
+    w: &World,
+    caller: (i64, bool),
+    host: &str,
+    ips: &[&str],
+) -> Result<HostInfo, Status> {
+    w.svc
+        .approve_host_private(as_user(
+            caller.0,
+            caller.1,
+            ApproveHostPrivateRequest {
+                host: host.to_owned(),
+                approved_ips: ips.iter().map(|ip| (*ip).to_owned()).collect(),
+            },
+        ))
+        .await
+        .map(tonic::Response::into_inner)
+}
+
+async fn revoke(w: &World, caller: (i64, bool), host: &str) -> Result<HostInfo, Status> {
+    w.svc
+        .revoke_host_private(as_user(
+            caller.0,
+            caller.1,
+            RevokeHostPrivateRequest {
+                host: host.to_owned(),
+            },
+        ))
+        .await
+        .map(tonic::Response::into_inner)
+}
+
+async fn requests(pool: &PgPool) -> Vec<(String, i64, Vec<String>, String)> {
+    sqlx::query_as(
+        "SELECT host, user_id, ARRAY(SELECT host(a) FROM unnest(resolved) AS a)::text[], status \
+         FROM git_host_requests ORDER BY id",
+    )
+    .fetch_all(pool)
+    .await
+    .unwrap()
+}
+
+async fn private_audit(pool: &PgPool) -> Vec<(i64, String, String, String, Vec<String>)> {
+    sqlx::query_as(
+        "SELECT user_id, host, action, outcome, \
+         ARRAY(SELECT host(a) FROM unnest(addresses) AS a)::text[] \
+         FROM host_audit WHERE action IN ('approve_private', 'revoke_private') ORDER BY id",
+    )
+    .fetch_all(pool)
+    .await
+    .unwrap()
+}
+
+async fn grant_state(pool: &PgPool, host: &str) -> Option<(bool, Vec<String>)> {
+    sqlx::query_as(
+        "SELECT allow_private, ARRAY(SELECT host(a) FROM unnest(approved_ips) AS a)::text[] \
+         FROM git_hosts WHERE host = $1",
+    )
+    .bind(host)
+    .fetch_optional(pool)
+    .await
+    .unwrap()
+}
+
+fn strings(items: &[&str]) -> Vec<String> {
+    items.iter().map(|item| (*item).to_owned()).collect()
+}
+
+#[sqlx::test(migrations = false)]
+async fn a_private_add_gets_the_plain_refusal_and_one_pending_request(pool: PgPool) {
+    let net = wire(200, FORGE);
+    let w = world(pool, dns(&[PRIVATE]), net.clone()).await;
+    let first = add(&w, w.alice, "git.example.com").await.unwrap_err();
+    assert_eq!(parts(&first), closed(Reason::RepoNotAllowedHost));
+    let again = add(&w, w.alice, "git.example.com").await.unwrap_err();
+    assert_eq!(parts(&again), closed(Reason::RepoNotAllowedHost));
+    assert_eq!(
+        requests(&w.pool).await,
+        vec![(
+            "git.example.com".to_owned(),
+            w.alice,
+            strings(&[PRIVATE]),
+            "pending".to_owned()
+        )]
+    );
+    assert_eq!(host_count(&w.pool).await, 1);
+    assert_eq!(net.calls.load(Ordering::SeqCst), 0);
+    let bob = add(&w, w.bob, "git.example.com").await.unwrap_err();
+    assert_eq!(parts(&bob), closed(Reason::RepoNotAllowedHost));
+    assert_eq!(requests(&w.pool).await.len(), 2);
+}
+
+#[sqlx::test(migrations = false)]
+async fn only_a_private_resolution_records_a_request_and_the_reply_never_differs(pool: PgPool) {
+    let cgnat = format!("{}.64.0.1", 100);
+    let switch = Switch(Arc::new(Mutex::new(Vec::new())));
+    let s = switch.clone();
+    let w = world_with(pool, move |store| {
+        HostService::new(store, Arc::new(PinnedProbe::new(s, wire(200, FORGE))))
+    })
+    .await;
+    let cases: Vec<(&str, Vec<&str>)> = vec![
+        ("unresolvable.example.com", vec![]),
+        ("public.example.com", vec![PUBLIC]),
+        ("loopback.example.com", vec!["127.0.0.1"]),
+        ("v6loop.example.com", vec!["::1"]),
+        ("linklocal.example.com", vec!["169.254.1.1"]),
+        ("metadata.example.com", vec!["169.254.169.254"]),
+        ("cgnat.example.com", vec![cgnat.as_str()]),
+        ("mixed.example.com", vec![PRIVATE, "127.0.0.1"]),
+        ("private.example.com", vec![PRIVATE]),
+        ("ula.example.com", vec!["fd00::1"]),
+    ];
+    let mut replies = Vec::new();
+    for (host, addrs) in &cases {
+        switch.set(addrs);
+        let net_probe = add(&w, w.alice, host).await;
+        replies.push((host, net_probe.map(|_| ())));
+    }
+    for (host, reply) in &replies {
+        if **host == "public.example.com" {
+            assert!(reply.is_ok(), "{host}");
+        } else {
+            let err = reply.as_ref().unwrap_err();
+            assert_eq!(parts(err), closed(Reason::RepoNotAllowedHost), "{host}");
+        }
+    }
+    let recorded: Vec<String> = requests(&w.pool)
+        .await
+        .into_iter()
+        .map(|row| row.0)
+        .collect();
+    assert_eq!(
+        recorded,
+        strings(&["private.example.com", "ula.example.com"])
+    );
+}
+
+#[sqlx::test(migrations = false)]
+async fn pending_requests_are_capped_per_user_without_changing_the_reply(pool: PgPool) {
+    let switch = Switch(Arc::new(Mutex::new(vec![PRIVATE.parse().unwrap()])));
+    let s = switch.clone();
+    let w = world_with(pool, move |store| {
+        HostService::new(
+            store.with_caps(2, 500),
+            Arc::new(PinnedProbe::new(s, wire(200, FORGE))),
+        )
+    })
+    .await;
+    for host in ["a.example.com", "b.example.com", "c.example.com"] {
+        let err = add(&w, w.alice, host).await.unwrap_err();
+        assert_eq!(parts(&err), closed(Reason::RepoNotAllowedHost), "{host}");
+    }
+    assert_eq!(requests(&w.pool).await.len(), 2);
+    switch.set(&["192.168.3.9"]);
+    let err = add(&w, w.alice, "a.example.com").await.unwrap_err();
+    assert_eq!(parts(&err), closed(Reason::RepoNotAllowedHost));
+    let held = requests(&w.pool).await;
+    assert_eq!(held.len(), 2);
+    assert_eq!(held[0].2, strings(&["192.168.3.9"]));
+    assert_eq!(held[1].2, strings(&[PRIVATE]));
+    switch.set(&[PRIVATE]);
+    let other = add(&w, w.bob, "c.example.com").await.unwrap_err();
+    assert_eq!(parts(&other), closed(Reason::RepoNotAllowedHost));
+    assert_eq!(requests(&w.pool).await.len(), 3);
+}
+
+#[sqlx::test(migrations = false)]
+async fn approve_records_the_fresh_resolve_and_audits_the_addresses(pool: PgPool) {
+    let net = wire(200, FORGE);
+    let w = world(pool, dns(&[PRIVATE]), net.clone()).await;
+    add(&w, w.alice, "git.example.com").await.unwrap_err();
+    let info = approve(&w, (w.admin, true), "git.example.com", &[PRIVATE])
+        .await
+        .unwrap();
+    assert_eq!(info.host, "git.example.com");
+    assert_eq!(info.kind, "forgejo");
+    assert!(info.allow_private);
+    assert_eq!(info.approved_ips, strings(&[PRIVATE]));
+    assert_eq!(info.approved_by, Some(w.admin.try_into().unwrap()));
+    assert_eq!(info.added_by, u64::try_from(w.alice).unwrap());
+    assert_eq!(
+        grant_state(&w.pool, "git.example.com").await,
+        Some((true, strings(&[PRIVATE])))
+    );
+    assert_eq!(
+        private_audit(&w.pool).await,
+        vec![(
+            w.admin,
+            "git.example.com".to_owned(),
+            "approve_private".to_owned(),
+            "approved".to_owned(),
+            strings(&[PRIVATE])
+        )]
+    );
+    assert_eq!(requests(&w.pool).await[0].3, "approved");
+    let pins = net.pins.lock().unwrap().clone();
+    assert_eq!(pins, vec![(true, vec![PRIVATE.parse::<IpAddr>().unwrap()])]);
+}
+
+#[sqlx::test(migrations = false)]
+async fn after_approval_an_add_succeeds_and_a_second_admin_view_lists_the_grant(pool: PgPool) {
+    let w = world(pool, dns(&[PRIVATE]), wire(200, FORGE)).await;
+    add(&w, w.alice, "git.example.com").await.unwrap_err();
+    approve(&w, (w.admin, true), "git.example.com", &[PRIVATE])
+        .await
+        .unwrap();
+    let info = add(&w, w.alice, "git.example.com").await.unwrap();
+    assert!(info.allow_private);
+    assert_eq!(info.approved_ips, Vec::<String>::new());
+    let listed = w
+        .svc
+        .list_hosts(as_user(w.admin, true, ListHostsRequest {}))
+        .await;
+    let hosts = listed.unwrap().into_inner().hosts;
+    let row = hosts.iter().find(|h| h.host == "git.example.com").unwrap();
+    assert_eq!(row.approved_ips, strings(&[PRIVATE]));
+}
+
+#[sqlx::test(migrations = false)]
+async fn a_non_admin_and_an_unknown_host_get_the_same_not_found(pool: PgPool) {
+    let w = world(pool, dns(&[PRIVATE]), wire(200, FORGE)).await;
+    add(&w, w.alice, "git.example.com").await.unwrap_err();
+    let member = approve(&w, (w.alice, false), "git.example.com", &[PRIVATE])
+        .await
+        .unwrap_err();
+    let unknown = approve(&w, (w.admin, true), "nope.example.com", &[PRIVATE])
+        .await
+        .unwrap_err();
+    assert_eq!(member.code(), Code::NotFound);
+    assert_eq!(member.message(), fleet_proto::ERR_HOST_NOT_FOUND);
+    assert_eq!(parts(&member), parts(&unknown));
+    for host in [
+        "",
+        "not a host",
+        "git.example.com\r\n",
+        "git.example.com:443",
+        "a/b",
+        "github.com",
+    ] {
+        let err = approve(&w, (w.admin, true), host, &[PRIVATE])
+            .await
+            .unwrap_err();
+        assert_eq!(parts(&err), parts(&unknown), "{host:?}");
+    }
+    assert_eq!(grant_state(&w.pool, "git.example.com").await, None);
+    assert_eq!(
+        grant_state(&w.pool, "github.com").await,
+        Some((false, Vec::new()))
+    );
+    assert_eq!(private_audit(&w.pool).await.len(), 0);
+}
+
+#[sqlx::test(migrations = false)]
+async fn approve_refuses_a_named_set_that_differs_from_the_fresh_resolve(pool: PgPool) {
+    let switch = Switch(Arc::new(Mutex::new(Vec::new())));
+    let s = switch.clone();
+    let w = world_with(pool, move |store| {
+        HostService::new(store, Arc::new(PinnedProbe::new(s, wire(200, FORGE))))
+    })
+    .await;
+    switch.set(&[PRIVATE]);
+    add(&w, w.alice, "git.example.com").await.unwrap_err();
+    switch.set(&["192.168.3.2"]);
+    let hostile: Vec<Vec<String>> = vec![
+        strings(&[PRIVATE]),
+        Vec::new(),
+        strings(&["192.168.3.2", PRIVATE]),
+        strings(&["192.168.3.2 "]),
+        strings(&["192.168.3.2\r\n"]),
+        strings(&["192.168.3.2\u{2028}"]),
+        strings(&["192.168.3.2/32"]),
+        strings(&["192.168.003.002"]),
+        strings(&["0xc0.168.3.2"]),
+        strings(&["[fd00::1]"]),
+        strings(&["fe80::1%eth0"]),
+        strings(&["\u{ff11}92.168.3.2"]),
+        strings(&["1".repeat(1000).as_str()]),
+        (0..65).map(|n| format!("192.168.4.{n}")).collect(),
+    ];
+    for named in hostile {
+        let refs: Vec<&str> = named.iter().map(String::as_str).collect();
+        let err = approve(&w, (w.admin, true), "git.example.com", &refs)
+            .await
+            .unwrap_err();
+        assert_eq!(
+            parts(&err),
+            closed(Reason::HostAddressMismatch),
+            "{named:?}"
+        );
+    }
+    assert_eq!(grant_state(&w.pool, "git.example.com").await, None);
+    assert_eq!(requests(&w.pool).await[0].3, "pending");
+    let rows = private_audit(&w.pool).await;
+    assert_eq!(rows.len(), 14);
+    assert!(
+        rows.iter()
+            .all(|r| r.2 == "approve_private" && r.3 == "refused")
+    );
+    approve(&w, (w.admin, true), "git.example.com", &["192.168.3.2"])
+        .await
+        .unwrap();
+    let mapped = approve(
+        &w,
+        (w.admin, true),
+        "git.example.com",
+        &["::ffff:192.168.3.2"],
+    )
+    .await;
+    assert!(mapped.is_ok());
+}
+
+#[sqlx::test(migrations = false)]
+async fn approve_never_grants_a_forbidden_range(pool: PgPool) {
+    let cgnat = format!("{}.64.0.1", 100);
+    let switch = Switch(Arc::new(Mutex::new(Vec::new())));
+    let s = switch.clone();
+    let net = wire(200, FORGE);
+    let n = net.clone();
+    let w = world_with(pool, move |store| {
+        HostService::new(store, Arc::new(PinnedProbe::new(s, n)))
+    })
+    .await;
+    sqlx::query("INSERT INTO git_host_requests (host, user_id, resolved) VALUES ('git.example.com', $1, '{}')")
+        .bind(w.alice)
+        .execute(&w.pool)
+        .await
+        .unwrap();
+    let forbidden: Vec<Vec<&str>> = vec![
+        vec!["127.0.0.1"],
+        vec!["::1"],
+        vec!["169.254.1.1"],
+        vec!["fe80::1"],
+        vec!["169.254.169.254"],
+        vec!["fd00:ec2::254"],
+        vec![cgnat.as_str()],
+        vec!["0.0.0.0"],
+        vec!["224.0.0.1"],
+        vec!["255.255.255.255"],
+        vec![PRIVATE, "127.0.0.1"],
+        vec!["fd00::1", "fe80::1"],
+        vec!["64:ff9b::c0a8:301"],
+        vec!["2002:c0a8:301::1"],
+        vec![PUBLIC],
+        vec![],
+    ];
+    for addrs in forbidden {
+        switch.set(&addrs);
+        let err = approve(&w, (w.admin, true), "git.example.com", &addrs)
+            .await
+            .unwrap_err();
+        let expected = if addrs.is_empty() {
+            Reason::HostAddressMismatch
+        } else {
+            Reason::RepoNotAllowedHost
+        };
+        assert_eq!(parts(&err), closed(expected), "{addrs:?}");
+        assert_eq!(
+            grant_state(&w.pool, "git.example.com").await,
+            None,
+            "{addrs:?}"
+        );
+    }
+    assert_eq!(net.calls.load(Ordering::SeqCst), 0);
+    for addrs in [vec![PRIVATE], vec!["fd00::1"], vec![PRIVATE, PUBLIC]] {
+        switch.set(&addrs);
+        approve(&w, (w.admin, true), "git.example.com", &addrs)
+            .await
+            .unwrap();
+    }
+}
+
+#[sqlx::test(migrations = false)]
+async fn approve_refuses_a_host_that_is_not_a_forge_and_stores_nothing(pool: PgPool) {
+    let w = world(pool, dns(&[PRIVATE]), wire(404, "")).await;
+    add(&w, w.alice, "git.example.com").await.unwrap_err();
+    let err = approve(&w, (w.admin, true), "git.example.com", &[PRIVATE])
+        .await
+        .unwrap_err();
+    assert_eq!(parts(&err), closed(Reason::HostNotForge));
+    assert_eq!(grant_state(&w.pool, "git.example.com").await, None);
+    assert_eq!(requests(&w.pool).await[0].3, "pending");
+    let rows = private_audit(&w.pool).await;
+    assert_eq!(rows.len(), 1);
+    assert_eq!(
+        (rows[0].2.as_str(), rows[0].3.as_str()),
+        ("approve_private", "refused")
+    );
+}
+
+#[sqlx::test(migrations = false)]
+async fn revoke_clears_the_grant_marks_repositories_stale_and_audits(pool: PgPool) {
+    let w = world(pool, dns(&[PRIVATE]), wire(200, FORGE)).await;
+    add(&w, w.alice, "git.example.com").await.unwrap_err();
+    approve(&w, (w.admin, true), "git.example.com", &[PRIVATE])
+        .await
+        .unwrap();
+    for host in ["git.example.com", "github.com"] {
+        sqlx::query(
+            "INSERT INTO user_repos (user_id, host, path, forge_kind) VALUES ($1, $2, 'o/r', 'forgejo')",
+        )
+        .bind(w.alice)
+        .bind(host)
+        .execute(&w.pool)
+        .await
+        .unwrap();
+    }
+    let info = revoke(&w, (w.admin, true), "git.example.com")
+        .await
+        .unwrap();
+    assert!(!info.allow_private);
+    assert_eq!(info.approved_ips, Vec::<String>::new());
+    assert_eq!(info.approved_by, None);
+    assert_eq!(
+        grant_state(&w.pool, "git.example.com").await,
+        Some((false, Vec::new()))
+    );
+    let stale: Vec<(String, bool)> = sqlx::query_as(
+        "SELECT host, verified_at < now() - interval '1 year' FROM user_repos ORDER BY host",
+    )
+    .fetch_all(&w.pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        stale,
+        vec![
+            ("git.example.com".to_owned(), true),
+            ("github.com".to_owned(), false)
+        ]
+    );
+    let rows = private_audit(&w.pool).await;
+    assert_eq!(rows.len(), 2);
+    assert_eq!(
+        rows[1],
+        (
+            w.admin,
+            "git.example.com".to_owned(),
+            "revoke_private".to_owned(),
+            "revoked".to_owned(),
+            strings(&[PRIVATE])
+        )
+    );
+}
+
+#[sqlx::test(migrations = false)]
+async fn revoke_of_an_unknown_host_is_not_found_and_of_an_ungranted_host_changes_nothing(
+    pool: PgPool,
+) {
+    let w = world(pool, dns(&[PUBLIC]), wire(200, FORGE)).await;
+    add(&w, w.alice, "git.example.com").await.unwrap();
+    sqlx::query(
+        "INSERT INTO user_repos (user_id, host, path, forge_kind) VALUES ($1, 'git.example.com', 'o/r', 'forgejo')",
+    )
+    .bind(w.alice)
+    .execute(&w.pool)
+    .await
+    .unwrap();
+    let unknown = revoke(&w, (w.admin, true), "nope.example.com")
+        .await
+        .unwrap_err();
+    assert_eq!(unknown.code(), Code::NotFound);
+    assert_eq!(unknown.message(), fleet_proto::ERR_HOST_NOT_FOUND);
+    let github = revoke(&w, (w.admin, true), "github.com").await.unwrap_err();
+    assert_eq!(parts(&github), parts(&unknown));
+    let info = revoke(&w, (w.admin, true), "git.example.com")
+        .await
+        .unwrap();
+    assert!(!info.allow_private);
+    let fresh: bool =
+        sqlx::query_scalar("SELECT verified_at > now() - interval '1 day' FROM user_repos")
+            .fetch_one(&w.pool)
+            .await
+            .unwrap();
+    assert!(fresh);
+    let rows = private_audit(&w.pool).await;
+    assert_eq!(rows.len(), 1);
+    assert_eq!(
+        (rows[0].2.as_str(), rows[0].3.as_str()),
+        ("revoke_private", "refused")
+    );
+}
+
+#[sqlx::test(migrations = false)]
+async fn list_requests_shows_pending_rows_to_an_admin_only(pool: PgPool) {
+    let w = world(pool, dns(&[PRIVATE, "fd00::1"]), wire(200, FORGE)).await;
+    add(&w, w.alice, "a.example.com").await.unwrap_err();
+    add(&w, w.bob, "b.example.com").await.unwrap_err();
+    let reply: ListHostRequestsReply = w
+        .svc
+        .list_host_requests(as_user(w.admin, true, ListHostRequestsRequest {}))
+        .await
+        .unwrap()
+        .into_inner();
+    let seen: Vec<(String, u64, Vec<String>)> = reply
+        .requests
+        .iter()
+        .map(|r| (r.host.clone(), r.requested_by, r.resolved_ips.clone()))
+        .collect();
+    assert_eq!(
+        seen,
+        vec![
+            (
+                "a.example.com".to_owned(),
+                w.alice.try_into().unwrap(),
+                strings(&[PRIVATE, "fd00::1"])
+            ),
+            (
+                "b.example.com".to_owned(),
+                w.bob.try_into().unwrap(),
+                strings(&[PRIVATE, "fd00::1"])
+            ),
+        ]
+    );
+    assert!(reply.requests.iter().all(|r| r.requested_at_ms > 0));
+    approve(&w, (w.admin, true), "a.example.com", &[PRIVATE, "fd00::1"])
+        .await
+        .unwrap();
+    let after = w
+        .svc
+        .list_host_requests(as_user(w.admin, true, ListHostRequestsRequest {}))
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(after.requests.len(), 1);
+    assert_eq!(after.requests[0].host, "b.example.com");
+}
+
+#[sqlx::test(migrations = false)]
+async fn approve_queues_behind_a_lock_on_the_host_row(pool: PgPool) {
+    let w = world(pool, dns(&[PRIVATE]), wire(200, FORGE)).await;
+    add(&w, w.alice, "git.example.com").await.unwrap_err();
+    approve(&w, (w.admin, true), "git.example.com", &[PRIVATE])
+        .await
+        .unwrap();
+    let mut holder = w.pool.begin().await.unwrap();
+    sqlx::query("SELECT host FROM git_hosts WHERE host = 'git.example.com' FOR UPDATE")
+        .execute(&mut *holder)
+        .await
+        .unwrap();
+    let svc = w.svc.clone();
+    let admin = w.admin;
+    let task = tokio::spawn(async move {
+        svc.revoke_host_private(as_user(
+            admin,
+            true,
+            RevokeHostPrivateRequest {
+                host: "git.example.com".to_owned(),
+            },
+        ))
+        .await
+    });
+    tokio::time::sleep(Duration::from_millis(400)).await;
+    assert!(!task.is_finished());
+    holder.rollback().await.unwrap();
+    tokio::time::timeout(Duration::from_secs(30), task)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+}
+
+#[sqlx::test(migrations = false)]
+async fn the_probe_pins_to_the_approved_addresses_only(pool: PgPool) {
+    let _ = pool;
+    let net = wire(200, FORGE);
+    let name = HostName::normalise("git.example.com").unwrap();
+    let approved: Vec<IpAddr> = vec![PRIVATE.parse().unwrap()];
+    let cases: Vec<(Vec<&str>, Result<HostKind, HostRefusal>)> = vec![
+        (vec![PRIVATE], Ok(HostKind::Forgejo)),
+        (vec![PRIVATE, PUBLIC], Ok(HostKind::Forgejo)),
+        (vec!["192.168.3.2"], Err(HostRefusal::NotAllowedHost)),
+        (
+            vec![PRIVATE, "192.168.3.2"],
+            Err(HostRefusal::NotAllowedHost),
+        ),
+        (vec!["10.0.0.1"], Err(HostRefusal::NotAllowedHost)),
+        (vec!["127.0.0.1"], Err(HostRefusal::NotAllowedHost)),
+        (vec![PRIVATE, "127.0.0.1"], Err(HostRefusal::NotAllowedHost)),
+        (vec![], Err(HostRefusal::NotAllowedHost)),
+    ];
+    for (resolved, expected) in cases {
+        let before = net.calls.load(Ordering::SeqCst);
+        let probe = PinnedProbe::new(dns(&resolved), net.clone());
+        assert_eq!(
+            probe.probe_approved(&name, &approved).await,
+            expected,
+            "{resolved:?}"
+        );
+        let sent = net.calls.load(Ordering::SeqCst) - before;
+        assert_eq!(sent, usize::from(expected.is_ok()), "{resolved:?}");
+    }
+    let probe = PinnedProbe::new(dns(&["127.0.0.1"]), net.clone());
+    let loopback: Vec<IpAddr> = vec!["127.0.0.1".parse().unwrap()];
+    assert_eq!(
+        probe.probe_approved(&name, &loopback).await,
+        Err(HostRefusal::NotAllowedHost)
+    );
+    let plain = PinnedProbe::new(dns(&[PRIVATE]), net.clone());
+    assert_eq!(plain.probe(&name).await, Err(HostRefusal::NotAllowedHost));
 }
