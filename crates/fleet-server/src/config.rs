@@ -240,6 +240,12 @@ impl Default for RepoHosts {
 }
 
 impl RepoHosts {
+    /// Whether the list differs from the default, which is true when `FLEET_REPO_HOSTS` is set
+    /// to anything but the default entry.
+    pub fn is_non_default(&self) -> bool {
+        *self != Self::default()
+    }
+
     /// A list with no hosts, which refuses every repository.
     pub fn none() -> Self {
         Self { hosts: Vec::new() }
@@ -2026,6 +2032,24 @@ mod tests {
         assert_eq!(github.api_base, "https://api.github.com");
         assert!(!github.allow_private);
         assert_eq!(config.repo_hosts, RepoHosts::default());
+    }
+
+    #[test]
+    fn repo_hosts_is_non_default_only_when_the_variable_changes_the_list() {
+        assert!(!with(&[]).unwrap().repo_hosts.is_non_default());
+        assert!(
+            with(&[("FLEET_REPO_HOSTS", "")])
+                .unwrap()
+                .repo_hosts
+                .is_non_default()
+        );
+        let raw = "host=git.example.org,forge=forgejo,api=https://git.example.org/api/v1";
+        assert!(
+            with(&[("FLEET_REPO_HOSTS", raw)])
+                .unwrap()
+                .repo_hosts
+                .is_non_default()
+        );
     }
 
     #[test]

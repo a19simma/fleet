@@ -85,6 +85,7 @@ use tonic::{Code, Request, Status};
 use zeroize::Zeroizing;
 
 use crate::Error;
+use crate::netguard::is_approvable_address;
 use crate::poller::{CALL_BACKSTOP, TOKEN_ENV};
 
 mod book;
@@ -634,7 +635,7 @@ fn host_entry(
         .iter()
         .map(|text| IpAddr::from_str(text).map_err(|_| malformed))
         .collect::<Result<Vec<_>, _>>()?;
-    if approved_ips.iter().any(|ip| !is_approvable(ip)) {
+    if approved_ips.iter().any(|ip| !is_approvable_address(*ip)) {
         return Err(malformed);
     }
     let sent = wire.credential.ok_or(malformed)?;
@@ -686,18 +687,6 @@ fn forge_wire_kind(kind: CredentialKind) -> &'static str {
         GITHUB_INSTALLATION_TOKEN_KIND
     } else {
         kind.wire_name()
-    }
-}
-
-fn is_approvable(ip: &IpAddr) -> bool {
-    let ip = ip.to_canonical();
-    !(ip.is_loopback() || ip.is_unspecified() || ip.is_multicast() || is_link_local(&ip))
-}
-
-fn is_link_local(ip: &IpAddr) -> bool {
-    match ip {
-        IpAddr::V4(v4) => v4.is_link_local() || v4.is_broadcast(),
-        IpAddr::V6(v6) => (v6.segments()[0] & 0xffc0) == 0xfe80,
     }
 }
 
