@@ -1,6 +1,7 @@
 //! The name and state rules of [`CiCheck`], shared by both adapters.
 
 use fleet_forge::{CheckState, CiCheck, ForgeError, MAX_CHECK_NAME_BYTES, MAX_CHECKS};
+use unicode_general_category::{GeneralCategory, get_general_category};
 
 #[test]
 fn a_check_name_with_a_hostile_character_is_malformed() {
@@ -81,9 +82,25 @@ fn allowed(c: char) -> bool {
     if c.is_ascii() {
         ascii_allowed(c)
     } else {
-        (c.is_alphabetic() || c.is_numeric()) && !FILLERS.contains(&c)
+        letter_or_number(c)
     }
 }
+
+fn letter_or_number(c: char) -> bool {
+    matches!(
+        get_general_category(c),
+        GeneralCategory::UppercaseLetter
+            | GeneralCategory::LowercaseLetter
+            | GeneralCategory::TitlecaseLetter
+            | GeneralCategory::ModifierLetter
+            | GeneralCategory::OtherLetter
+            | GeneralCategory::DecimalNumber
+            | GeneralCategory::LetterNumber
+            | GeneralCategory::OtherNumber
+    ) && !FILLERS.contains(&c)
+}
+
+const EXPECTED: u32 = 142_968;
 
 const FILLERS: [char; 4] = ['\u{115f}', '\u{1160}', '\u{3164}', '\u{ffa0}'];
 
@@ -91,13 +108,14 @@ fn has_letter_or_digit(c: char) -> bool {
     if c.is_ascii() {
         c.is_ascii_alphanumeric()
     } else {
-        (c.is_alphabetic() || c.is_numeric()) && !FILLERS.contains(&c)
+        letter_or_number(c)
     }
 }
 
 #[test]
 fn every_code_point_is_judged_by_the_allowlist() {
     let mut refused = 0_u32;
+    let mut accepted = 0_u32;
     for code in 0..=0x0010_FFFF_u32 {
         let Some(c) = char::from_u32(code) else {
             continue;
@@ -105,6 +123,7 @@ fn every_code_point_is_judged_by_the_allowlist() {
         let inside = format!("a{c}b");
         let got = CiCheck::new(&inside, CheckState::Success);
         if allowed(c) {
+            accepted += 1;
             assert_eq!(
                 got.as_ref().map(CiCheck::name).ok(),
                 Some(inside.as_str()),
@@ -118,7 +137,24 @@ fn every_code_point_is_judged_by_the_allowlist() {
         let got = CiCheck::new(&alone, CheckState::Success);
         assert_eq!(got.is_ok(), has_letter_or_digit(c), "alone U+{code:04X}");
     }
+    assert!(accepted > 100_000);
     assert!(refused > 800_000);
+    assert_eq!(accepted + refused, 0x0010_F800);
+    assert_eq!(accepted, EXPECTED);
+}
+
+#[test]
+fn a_combining_mark_is_refused_inside_a_name() {
+    for mark in ['\u{300}', '\u{93e}', '\u{20dd}'] {
+        let name = format!("a{mark}b");
+        assert_eq!(
+            CiCheck::new(&name, CheckState::Success).err(),
+            Some(ForgeError::Malformed),
+            "{mark:?}"
+        );
+    }
+    let alone = '\u{300}'.to_string();
+    assert!(CiCheck::new(&alone, CheckState::Success).is_err());
 }
 
 #[test]
