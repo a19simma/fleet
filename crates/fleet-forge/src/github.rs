@@ -167,7 +167,7 @@ impl<H: Http, G: Send + Sync> GitHubForge<H, G> {
         }
         tally.add_runs(&parse(&runs)?, "check_runs")?;
         let statuses = self
-            .get(format!("{base}/commits/{sha}/status"), token)
+            .get(format!("{base}/commits/{sha}/status?per_page=100"), token)
             .await?;
         match statuses.status {
             200 => tally.add_statuses(&parse(&statuses)?),
