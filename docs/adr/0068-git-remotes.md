@@ -60,7 +60,7 @@ Two traits, one adapter type per forge:
 
 `GitHubForge` and `GiteaForge` each implement both. The `Http` seam is a trait the caller injects: the server injects `cred::pinned`, fleetd injects its own pinned client (`netguard`). The `Git` seam is an injected command runner, so tests use a fake. No adapter reads the environment.
 
-`verify` answers read evidence and, when the forge reports it, push permission. `ci_result` returns the normalised `CiResult` of ADR-0028. On Forgejo it reads the combined commit status of the pull request head first and reads Actions runs only if the statuses are empty, which the live e2e task (FGJ-28) must prove. `ci_result` is in the first slice. `push` and `create_pr` take the same `PushTarget`. The broker dispatches through the trait only: `Forges::for_host(host)` returns the adapter by the host row's kind. The broker contains no `gh` call and no forge-specific branch. For GitHub, `create_pr` and `ci_result` use the REST API so one fake HTTP server serves both adapters; `push` and `fetch` stay git over HTTPS with askpass.
+`verify` answers read evidence and, when the forge reports it, push permission. `ci_result` returns the normalised `CiResult` of ADR-0028. On Forgejo it reads the combined commit status of the pull request head first and reads Actions runs only if the statuses are empty. The live e2e task (FGJ-28) proved this on the dev Forgejo 17.0.1: a commit with no status answers `statuses: null` with `total_count: 0`, and the adapter then reads Actions runs, which answer `{"total_count": 0, "workflow_runs": []}`. `ci_result` is in the first slice. `push` and `create_pr` take the same `PushTarget`. The broker dispatches through the trait only: `Forges::for_host(host)` returns the adapter by the host row's kind. The broker contains no `gh` call and no forge-specific branch. For GitHub, `create_pr` and `ci_result` use the REST API so one fake HTTP server serves both adapters; `push` and `fetch` stay git over HTTPS with askpass.
 
 Documented exceptions, GitHub only, outside the trait and outside the parity suite:
 
@@ -102,7 +102,7 @@ Per-adapter extra tests (not in the suite) cover each forge's wire details.
 
 Migration 0045 adds `credentials.host` and the kind `forgejo_pat` (shape `static_secret`, 40 lowercase hex, opaque, no prefix check). The `github_pat` and `github_app` kinds keep `host = 'github.com'`. The unique key becomes `(user, kind, host)`. `PutCredential` takes the host and refuses a host not in the table. `GetJobCredentials` returns one credential per host the Job needs, tagged with the host, and the credential holder keys by host.
 
-Token scopes for Forgejo: `read:repository`, `write:repository`, `write:issue`. The e2e task confirms them on the live instance and the ADR records the result.
+Token scopes for Forgejo: `read:repository`, `write:repository`, `write:issue`. The live run on the dev Forgejo 17.0.1 observed that creating a repository over REST also needs `write:user`. The e2e token held `read:repository`, `write:repository`, `write:issue`, `read:issue`, `read:user`, `read:organization`, `read:notification` and `read:package`, plus `write:user` (its repository creation succeeded). The run shows what that token is granted, not the minimum that suffices for push, pull request and CI read.
 
 ### Per-job delivery
 
@@ -169,7 +169,7 @@ Every row is a test at the host normaliser and at the add RPC. Each result is `N
 
 ## Live results
 
-Run 2026-11-11 by `mise run live:forgejo` (`crates/fleet-forge/tests/live`) against the dev Forgejo 17.0.1, reached over HTTPS with the token from fnox. The token now carries `write:user`, so the suite creates and deletes its own throwaway repositories. Of the 35 contract cases 22 run live and 13 are skipped with a reason (an injected fault or a second account or host is needed); the 22 pass.
+Run 2026-11-11 by `mise run live:forgejo` (`crates/fleet-forge/tests/live`) against the dev Forgejo 17.0.1, reached over HTTPS with the token from fnox. The token now carries `write:user`, so the suite creates and deletes its own throwaway repositories. Of the 35 contract cases 22 run live and pass, and 13 are skipped, each with the reason recorded in the live plan (`crates/fleet-forge/tests/live/cases.rs`). The skipped cases are listed under Not run live.
 
 | Probe | Result |
 |---|---|
@@ -197,9 +197,31 @@ Findings:
 - Push, non-fast-forward push, fetch with a valid and with a bad token, pull request creation, the second creation that returns the existing pull request, and the rejected creation from `main` onto `main` all match the contract.
 - Cleanup of a renamed repository must delete the newest name first, because the old name answers 301 on `DELETE`.
 
-## Not verified
+## Not run live
+
+The 13 skipped contract cases, one row each:
+
+| Case | Reason recorded |
+|---|---|
+| `identify-non-forge` | needs a second host that is not Forgejo |
+| `identify-wrong-kind` | needs a second host that is not Forgejo |
+| `verify-read-only` | needs a token without write permission |
+| `verify-no-permissions` | the live forge always reports permissions |
+| `verify-403` | needs a second account; the anonymous probe records it |
+| `verify-5xx` | needs a fault the live forge cannot be told to inject |
+| `verify-reset` | needs a fault the live forge cannot be told to inject |
+| `verify-slow` | needs a fault the live forge cannot be told to inject |
+| `verify-over-cap` | needs a fault the live forge cannot be told to inject |
+| `redacted-error` | needs a fault the live forge cannot be told to inject |
+| `ci-checks-bad-name` | needs a fault the live forge cannot be told to inject |
+| `ci-checks-over-cap` | needs a fault the live forge cannot be told to inject |
+| `ci-checks-mixed` | commit status contexts are unique, so no duplicate name can be posted |
+
+Consequences for what stays unverified:
 
 - The 403 against 404 split for a repository the token cannot see: it needs a second account. Only the anonymous 404 on a private repository is verified.
 - `permissions` on a token without write access: the live token is the owner's, so only the owner shape is verified.
-- That the three token scopes above are the minimum for push, pull request and CI read: the live token carries more, and the probe shows what it is granted, not what suffices.
+- The minimum scopes for push, pull request and CI read: only the granted set above was observed.
+- The fault-injection behaviour (5xx, reset, slow body, over-cap body, bad check name, redacted error text) holds in the fake only.
+- `identify` against a non-Forgejo host or a wrong kind holds in the fake only.
 - A Forgejo host behind a subpath is unsupported until a later ADR.

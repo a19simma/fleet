@@ -29,7 +29,7 @@ statuses a repository call adds. A refusal exits 1. Hosts print in punycode form
 whatever the grammar of its owner. The CLI and the page show the verified time as the UTC stamp of
 `fleet_core::stamp::utc_stamp`, `YYYY-MM-DD HH:MM UTC`. `crates/fleet-cli/tests/parity_repos.rs`
 holds one scenario per action and outcome, each run through the CLI and the page on one server, plus
-a separate test for the box token, which the page cannot send. Not built: the Forgejo verifier, the `credentials.host` column and the `forgejo_pat` kind (ADR-0068, migration 0045). The `path`
+a separate test for the box token, which the page cannot send. The Forgejo verifier, the `credentials.host` column and the `forgejo_pat` kind are specified by ADR-0068 (migration 0045). The `path`
 column holds at most 141 bytes: a Forgejo owner of 40, a slash and a name of 100.
 
 A User names the repositories they work on, so the CLI and the web page can list them and later
@@ -112,13 +112,15 @@ are 40 hex characters with no prefix, and a repository the token cannot see answ
 the [Forgejo API usage guide](https://forgejo.org/docs/latest/user/api-usage/) and the
 [Forgejo token scope page](https://forgejo.org/docs/latest/user/token-scope/) (official docs).
 
-Unverified, to confirm on a live instance:
+Checked live on 2026-11-11 against the dev Forgejo 17.0.1 (ADR-0068, Live results):
 
-- the status for an invalid token (401 is assumed),
-- whether a renamed repository redirects over REST,
-- 403 against 404 when the token lacks a scope,
-- the API path under an instance served from a subpath,
-- whether `permissions` is present on every reply.
+- the status for an invalid token: verified live, 401 with the message `token is malformed: token contains an invalid number of segments`,
+- whether a renamed repository redirects over REST: verified live, the old name answers 301 with a relative `Location`, and the client follows no redirect (ADR-0068 decision 3),
+- 403 against 404 when the token lacks a scope: a token without the needed scope answers 403 with a scope message (observed on repository creation, which needs `write:user`). The 403 against 404 split on a private repository for a second account was not run and stays unverified; only the anonymous 404 is verified,
+- whether `permissions` is present on every reply: verified live only for the owner's token on its own repository (`{"admin":true,"pull":true,"push":true}`). A read-only token was not run and stays unverified,
+- the API path under an instance served from a subpath: not run, and unsupported until a later ADR.
+
+Not run live and unverified: `identify` against a non-Forgejo host or the wrong kind, and the fault-injection cases (5xx, reset, slow body, over-cap body, bad name, redacted error). They hold in the fake only.
 
 ### Credentials
 
