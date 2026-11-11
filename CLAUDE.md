@@ -10,6 +10,10 @@ Run the project verify before every commit: `cargo fmt --check`, `cargo clippy -
 
 A mise task that needs a secret runs its command through `fnox exec --`, as `mise run fleet` does. `mise exec` alone exports no fnox secrets here, and the `_.fnox-env` plugin is archived upstream. Keep secret values out of `mise.toml`; only names live in `fnox.toml` in plaintext.
 
+## Environments
+
+The Fleet server behind `FLEET_SERVER_URL` (in `fnox.toml`) is the development instance, not production. An agent may deploy to it, grant flags on it with `fleet-server admin` and release builds to it without asking. The maintainer says when a production instance exists and when a real release happens; until then nothing here is production. An agent acts on the dev instance as the `claude` service user, an admin with its own API token. It never uses the maintainer's passkey or session.
+
 ## Common review failures
 
 These sent earlier work back for a retry. Check each before you commit.
