@@ -866,6 +866,17 @@ mod tests {
     }
 
     #[test]
+    fn a_holder_with_a_forgejo_host_and_no_app_token_cannot_be_refreshed() {
+        let mut held = with_hosts(true, &[&private_addr(1)]);
+        held.items.clear();
+        let fresh = with_hosts(false, &[]);
+        assert_eq!(
+            held.refreshed(&fresh).err(),
+            Some(CredentialFailure::Malformed)
+        );
+    }
+
+    #[test]
     fn a_refresh_that_turns_allow_private_on_is_refused() {
         let held = with_hosts(false, &[]);
         let fresh = with_hosts(true, &[]);
