@@ -13,7 +13,7 @@ use fleet_core::credential::{
     BotIdentity, CredentialError, CredentialKind, CredentialShape, GITHUB_HOST, Secret,
     fingerprint, validate,
 };
-use fleet_core::host::{HostError, HostName};
+use fleet_core::host::{HostError, HostKind, HostName};
 use fleet_proto::MAX_CREDENTIALS_PER_USER;
 use sqlx::{PgPool, Row};
 
@@ -94,6 +94,18 @@ AND lease_expires_at > now() FOR SHARE";
 const SELECT_RELEASABLE: &str = "\
 SELECT id, kind, (expires_at IS NOT NULL AND expires_at <= now()) AS expired \
 FROM credentials WHERE user_id = $1 AND kind = ANY($2) AND host = 'github.com' AND tombstoned_at IS NULL ORDER BY id";
+
+const SELECT_JOB_HOST: &str = "\
+SELECT kind, allow_private, ARRAY(SELECT host(a) FROM unnest(approved_ips) AS a)::text[] AS approved_ips \
+FROM git_hosts WHERE host = $1 FOR SHARE";
+
+const REPO_REVOKED: &str = "\
+SELECT EXISTS (SELECT 1 FROM user_repos WHERE user_id = $1 AND host = $2 AND path = $3 \
+AND verified_at <= to_timestamp(0))";
+
+const SELECT_HOST_PAT: &str = "\
+SELECT id, (expires_at IS NOT NULL AND expires_at <= now()) AS expired \
+FROM credentials WHERE user_id = $1 AND kind = 'forgejo_pat' AND host = $2 AND tombstoned_at IS NULL";
 
 const LATEST_JOB: &str = "\
 SELECT job_id, repo FROM jobs WHERE user_id = $1 ORDER BY created_at DESC, job_id DESC LIMIT 1";
@@ -708,6 +720,72 @@ pub struct ReleasedCredential {
     pub git_identity: Option<BotIdentity>,
 }
 
+/// What `GetJobCredentials` releases for one leased Job: the agent and GitHub credentials the
+/// reply lists directly, and the facts of the Job repository host.
+#[derive(Debug)]
+pub struct JobRelease {
+    /// The agent credentials and, for a GitHub host, the forge credential.
+    pub credentials: Vec<ReleasedCredential>,
+    /// The Job repository host, read when the reply was built.
+    pub host: ReleasedHost,
+}
+
+/// The Job repository host and its delivery facts, read live from `git_hosts`.
+#[derive(Debug)]
+pub struct ReleasedHost {
+    /// The normalised host name of the Job repository.
+    pub host: String,
+    /// The kind stored for the host.
+    pub kind: HostKind,
+    /// Whether an admin approved the host for private addresses.
+    pub allow_private: bool,
+    /// The addresses approved with `allow_private`, as canonical text.
+    pub approved_ips: Vec<String>,
+    /// The owner's `forgejo_pat` for exactly this host, set on a Forgejo host only. A GitHub
+    /// host's forge credential is the forge entry of [`JobRelease::credentials`].
+    pub forgejo: Option<ReleasedCredential>,
+}
+
+struct JobTarget {
+    host: String,
+    path: String,
+}
+
+fn is_file_repo(repo: &str) -> bool {
+    repo.starts_with("file://") || repo.starts_with('/')
+}
+
+fn hostless_host() -> ReleasedHost {
+    ReleasedHost {
+        host: String::new(),
+        kind: HostKind::Github,
+        allow_private: false,
+        approved_ips: Vec::new(),
+        forgejo: None,
+    }
+}
+
+fn plain_release(kind: CredentialKind, value: Secret) -> ReleasedCredential {
+    ReleasedCredential {
+        kind,
+        shape: CredentialShape::StaticSecret,
+        value,
+        expires_at_ms: None,
+        git_identity: None,
+    }
+}
+
+fn job_target(repo: &str) -> Option<JobTarget> {
+    if let Some(github) = super::app_policy::RepoRef::parse(repo) {
+        return Some(JobTarget {
+            host: GITHUB_HOST.to_owned(),
+            path: format!("{}/{}", github.owner(), github.name()),
+        });
+    }
+    let (host, path) = fleet_core::repo::RepoRef::locate(repo).ok()?;
+    Some(JobTarget { host, path })
+}
+
 impl fmt::Debug for ReleasedCredential {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("ReleasedCredential")
@@ -786,6 +864,9 @@ pub enum StoreError {
     LeaseDenied,
     /// The job owner stored no GitHub credential.
     NoGithub,
+    /// The job repository host is not in the host table, lost its grant, or the owner stored no
+    /// credential for it. One fixed error covers every cause (ADR-0068, ADR-0033).
+    NoHostCredential,
     /// The job owner stored no credential of a kind the job agent accepts.
     NoAgentCredential,
     /// A credential the job needs is past its expiry.
@@ -833,6 +914,7 @@ impl fmt::Display for StoreError {
             Self::TooMany => f.write_str("too many credentials"),
             Self::LeaseDenied => f.write_str(fleet_proto::ERR_LEASE_MISMATCH),
             Self::NoGithub => f.write_str("no github credential"),
+            Self::NoHostCredential => f.write_str(fleet_proto::PRECONDITION_HOST_NO_CREDENTIAL),
             Self::NoAgentCredential => f.write_str("no agent credential"),
             Self::Expired => f.write_str("credential expired"),
             Self::CapabilityDenied => f.write_str(ERR_CAPABILITY_NOT_GRANTED),
@@ -865,6 +947,7 @@ impl StoreError {
             Self::TooMany => tonic::Code::ResourceExhausted,
             Self::LeaseDenied | Self::CapabilityDenied => tonic::Code::PermissionDenied,
             Self::NoGithub
+            | Self::NoHostCredential
             | Self::NoAgentCredential
             | Self::Expired
             | Self::MintFailed
@@ -921,6 +1004,7 @@ pub struct CredentialStore {
     gate: fn(CredentialKind) -> Option<Capability>,
     app: Option<Arc<AppLane>>,
     policy: MintPolicy,
+    file_repos: bool,
 }
 
 impl fmt::Debug for CredentialStore {
@@ -998,6 +1082,27 @@ fn summaries(rows: &[sqlx::postgres::PgRow]) -> Result<Vec<CredentialSummary>, S
     Ok(out)
 }
 
+impl CredentialStore {
+    async fn releasable(
+        tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+        user_id: i64,
+        wanted: &[&'static str],
+    ) -> Result<Vec<(i64, CredentialKind, bool)>, StoreError> {
+        let rows = sqlx::query(SELECT_RELEASABLE)
+            .bind(user_id)
+            .bind(wanted)
+            .fetch_all(&mut **tx)
+            .await?;
+        let mut found = Vec::with_capacity(rows.len());
+        for row in &rows {
+            let name: String = row.try_get("kind")?;
+            let expired: bool = row.try_get("expired")?;
+            found.push((row.try_get::<i64, _>("id")?, kind_of(&name)?, expired));
+        }
+        Ok(found)
+    }
+}
+
 fn kind_of(name: &str) -> Result<CredentialKind, StoreError> {
     CredentialKind::from_wire_name(name).ok_or(StoreError::Seal(SealError::Open))
 }
@@ -1025,7 +1130,19 @@ impl CredentialStore {
             gate: required_capability,
             app: None,
             policy: MintPolicy::default(),
+            file_repos: false,
         }
+    }
+
+    /// Lets a Job whose repository is a local `file://` url or an absolute path release the
+    /// GitHub credential with an empty host entry, which a Job on a real host never does.
+    ///
+    /// Off by default. A seam for a daemon that runs with its own `allow_file_repos` set: the
+    /// server cannot see that flag, so the caller that builds the store passes it here.
+    #[must_use]
+    pub const fn with_file_repos(mut self) -> Self {
+        self.file_repos = true;
+        self
     }
 
     /// Replaces the mint limits, [`MintPolicy::default`] by default.
@@ -1447,6 +1564,18 @@ impl CredentialStore {
     /// credential. One use row is written per credential, in the same transaction as the reads
     /// on the PAT path.
     ///
+    /// The Job repository host comes from the job row and is read live from `git_hosts` under
+    /// `FOR SHARE` in the same transaction, so `allow_private` and `approved_ips` in the reply
+    /// are the stored values and an approve or revoke in flight waits. A host with no row, a
+    /// GitHub row for any host but `github.com`, and a Forgejo host without `allow_private` whose
+    /// registered repository of this owner has the epoch `verified_at` that a revoke writes, are
+    /// refused with [`StoreError::NoHostCredential`] before any credential is opened. A `file://`
+    /// url or absolute path has no host: it is refused the same way, unless the store was built
+    /// with [`Self::with_file_repos`], which releases the GitHub credential with an empty host
+    /// entry. A Forgejo
+    /// host releases the owner's `forgejo_pat` stored for exactly that host and no GitHub
+    /// credential; a GitHub host releases no `forgejo_pat`.
+    ///
     /// The lease read takes `FOR SHARE` on the job row. A reclaim, a finish or any other write
     /// to that row waits until this transaction commits or rolls back, so the credentials are
     /// released against a lease that stays valid for the whole transaction. The lease expiring
@@ -1493,6 +1622,8 @@ impl CredentialStore {
     /// Returns [`StoreError::LeaseDenied`] when no job matches the lease, which also happens
     /// after the mint when the recheck fails.
     /// Returns [`StoreError::NoGithub`] when the owner has no GitHub credential.
+    /// Returns [`StoreError::NoHostCredential`] for the host refusals above and when the owner
+    /// has no `forgejo_pat` for a Forgejo host.
     /// Returns [`StoreError::Expired`] when a needed credential is past its expiry.
     /// Returns [`StoreError::CapabilityDenied`] when the owner lacks the capability a stored
     /// kind needs, which also happens after the mint when the recheck fails.
@@ -1520,7 +1651,7 @@ impl CredentialStore {
         job_id: &str,
         attempt: u32,
         box_name: &str,
-    ) -> Result<Vec<ReleasedCredential>, StoreError> {
+    ) -> Result<JobRelease, StoreError> {
         let attempt = i32::try_from(attempt).map_err(|_| StoreError::LeaseDenied)?;
         let mut tx = self.pool.begin().await?;
         let lease = sqlx::query(SELECT_LEASE)
@@ -1533,20 +1664,24 @@ impl CredentialStore {
         let user_id: i64 = lease.try_get("user_id")?;
         let agent: String = lease.try_get("agent")?;
         let repo: String = lease.try_get("repo")?;
-        let wanted = wanted_kinds(&agent);
-        let rows = sqlx::query(SELECT_RELEASABLE)
-            .bind(user_id)
-            .bind(&wanted)
-            .fetch_all(&mut *tx)
+        let target = job_target(&repo);
+        let host = self
+            .host_for(&mut tx, user_id, &repo, target.as_ref())
             .await?;
-        let mut found = Vec::with_capacity(rows.len());
-        for row in &rows {
-            let name: String = row.try_get("kind")?;
-            let expired: bool = row.try_get("expired")?;
-            found.push((row.try_get::<i64, _>("id")?, kind_of(&name)?, expired));
+        let forgejo = host.kind == HostKind::Forgejo;
+        let wanted = wanted_kinds(&agent);
+        let mut found = Self::releasable(&mut tx, user_id, &wanted).await?;
+        if forgejo {
+            found.retain(|(_, kind, _)| !kind.is_forge());
         }
         for (_, kind, _) in &found {
             self.require_capability(&mut tx, user_id, *kind).await?;
+        }
+        if forgejo {
+            let target = target.ok_or(StoreError::NoHostCredential)?;
+            return self
+                .release_forgejo(tx, job_id, user_id, found, host, &target)
+                .await;
         }
         let forge = found
             .iter()
@@ -1589,33 +1724,130 @@ impl CredentialStore {
         for (id, _, _) in found {
             let (kind, value) = self.unseal(&mut tx, user_id, id).await?;
             ids.push(id);
-            released.push(ReleasedCredential {
-                kind,
-                shape: CredentialShape::StaticSecret,
-                value,
-                expires_at_ms: None,
-                git_identity: None,
-            });
+            released.push(plain_release(kind, value));
         }
         let Some(app) = lane else {
             record_uses(&mut tx, &ids, job_id).await?;
             tx.commit().await?;
-            return Ok(released);
+            return Ok(JobRelease {
+                credentials: released,
+                host,
+            });
         };
-        self.mint_released(
-            tx,
-            &Release {
-                job_id,
-                attempt,
-                box_name,
-                user_id,
-                repo: &repo,
-            },
-            app,
-            released,
-            ids,
-        )
-        .await
+        let credentials = self
+            .mint_released(
+                tx,
+                &Release {
+                    job_id,
+                    attempt,
+                    box_name,
+                    user_id,
+                    repo: &repo,
+                },
+                app,
+                released,
+                ids,
+            )
+            .await?;
+        Ok(JobRelease { credentials, host })
+    }
+
+    async fn host_for(
+        &self,
+        tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+        user_id: i64,
+        repo: &str,
+        target: Option<&JobTarget>,
+    ) -> Result<ReleasedHost, StoreError> {
+        match target {
+            Some(target) => Self::job_host(tx, user_id, target).await,
+            None if self.file_repos && is_file_repo(repo) => Ok(hostless_host()),
+            None => Err(StoreError::NoHostCredential),
+        }
+    }
+
+    async fn job_host(
+        tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+        user_id: i64,
+        target: &JobTarget,
+    ) -> Result<ReleasedHost, StoreError> {
+        let row = sqlx::query(SELECT_JOB_HOST)
+            .bind(&target.host)
+            .fetch_optional(&mut **tx)
+            .await?
+            .ok_or(StoreError::NoHostCredential)?;
+        let stored: String = row.try_get("kind")?;
+        let kind = HostKind::from_stored(&stored).ok_or(StoreError::NoHostCredential)?;
+        let allow_private: bool = row.try_get("allow_private")?;
+        let approved_ips: Vec<String> = row.try_get("approved_ips")?;
+        match kind {
+            HostKind::Github if target.host != GITHUB_HOST => {
+                return Err(StoreError::NoHostCredential);
+            }
+            HostKind::Forgejo if !allow_private => {
+                let revoked: bool = sqlx::query_scalar(REPO_REVOKED)
+                    .bind(user_id)
+                    .bind(&target.host)
+                    .bind(&target.path)
+                    .fetch_one(&mut **tx)
+                    .await?;
+                if revoked {
+                    return Err(StoreError::NoHostCredential);
+                }
+            }
+            HostKind::Github | HostKind::Forgejo => {}
+        }
+        Ok(ReleasedHost {
+            host: target.host.clone(),
+            kind,
+            allow_private,
+            approved_ips,
+            forgejo: None,
+        })
+    }
+
+    async fn release_forgejo(
+        &self,
+        mut tx: sqlx::Transaction<'_, sqlx::Postgres>,
+        job_id: &str,
+        user_id: i64,
+        mut found: Vec<(i64, CredentialKind, bool)>,
+        mut host: ReleasedHost,
+        target: &JobTarget,
+    ) -> Result<JobRelease, StoreError> {
+        let pat = sqlx::query(SELECT_HOST_PAT)
+            .bind(user_id)
+            .bind(&target.host)
+            .fetch_optional(&mut *tx)
+            .await?
+            .ok_or(StoreError::NoHostCredential)?;
+        let pat_id: i64 = pat.try_get("id")?;
+        let pat_expired: bool = pat.try_get("expired")?;
+        self.require_capability(&mut tx, user_id, CredentialKind::ForgejoPat)
+            .await?;
+        if found.is_empty() {
+            return Err(StoreError::NoAgentCredential);
+        }
+        found.retain(|(_, _, expired)| !*expired);
+        if pat_expired || found.is_empty() {
+            return Err(StoreError::Expired);
+        }
+        let mut released = Vec::with_capacity(found.len());
+        let mut ids = Vec::with_capacity(found.len() + 1);
+        for (id, _, _) in found {
+            let (kind, value) = self.unseal(&mut tx, user_id, id).await?;
+            ids.push(id);
+            released.push(plain_release(kind, value));
+        }
+        let (kind, value) = self.unseal(&mut tx, user_id, pat_id).await?;
+        ids.push(pat_id);
+        host.forgejo = Some(plain_release(kind, value));
+        record_uses(&mut tx, &ids, job_id).await?;
+        tx.commit().await?;
+        Ok(JobRelease {
+            credentials: released,
+            host,
+        })
     }
 
     async fn mint_released(

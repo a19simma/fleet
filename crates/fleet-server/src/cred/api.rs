@@ -8,15 +8,17 @@ use std::sync::Arc;
 use fleet_core::credential::{CredentialKind, CredentialShape, Secret, validate};
 use fleet_proto::v1::{
     CredentialInfo, DeleteCredentialReply, DeleteCredentialRequest, GetJobCredentialsReply,
-    GitIdentity, JobCredential, ListCredentialsReply, PutCredentialRequest, VerifyCredentialReply,
-    VerifyCredentialRequest,
+    GitIdentity, JobCredential, JobHostCredential, ListCredentialsReply, PutCredentialRequest,
+    VerifyCredentialReply, VerifyCredentialRequest,
 };
 use fleet_proto::{MAX_CREDENTIAL_VALUE_BYTES, MAX_CREDENTIALS_PER_USER};
 use tonic::Status;
 
 use super::github::{GithubApi, GithubError, GithubUser, MAX_EXPIRY_MS};
 use super::repo_api::RepoService;
-use super::store::{CredentialStore, CredentialSummary, StoreError, credential_host};
+use super::store::{
+    CredentialStore, CredentialSummary, ReleasedCredential, StoreError, credential_host,
+};
 
 /// The credential RPC logic over a sealed store and a GitHub seam.
 #[derive(Clone)]
@@ -71,6 +73,23 @@ fn wire_kind(kind: CredentialKind) -> &'static str {
     } else {
         kind.wire_name()
     }
+}
+
+fn wire_credential(item: &ReleasedCredential) -> Result<JobCredential, Status> {
+    let value = String::from_utf8(item.value.expose().to_vec()).map_err(|_| {
+        tracing::error!("released credential is not text");
+        Status::internal("credential store error")
+    })?;
+    Ok(JobCredential {
+        kind: wire_kind(item.kind).to_owned(),
+        shape: item.shape.wire_name().to_owned(),
+        value,
+        expires_at_ms: item.expires_at_ms,
+        git_identity: item.git_identity.as_ref().map(|identity| GitIdentity {
+            name: identity.name().to_owned(),
+            email: identity.email().to_owned(),
+        }),
+    })
 }
 
 fn row_id(id: u64) -> Result<i64, Status> {
@@ -239,10 +258,19 @@ impl CredentialService {
     /// A released `github_app` credential carries `expires_at_ms` and the bot `GitIdentity`; a
     /// PAT carries neither.
     ///
+    /// `hosts` holds exactly one entry, for the Job repository host: its name, kind,
+    /// `allow_private` and `approved_ips` as stored when the reply is built, and the owner's
+    /// credential for that host. On a Forgejo host that credential is the `forgejo_pat` and
+    /// `credentials` holds agent credentials only; on `github.com` it repeats the forge entry of
+    /// `credentials`. No credential of another host is released (ADR-0068).
+    ///
     /// # Errors
     ///
     /// `PERMISSION_DENIED` with [`fleet_proto::ERR_LEASE_MISMATCH`] for any lease mismatch, and
     /// with `ERR_CAPABILITY_NOT_GRANTED` when the owner lost the capability a stored kind needs.
+    ///
+    /// `FAILED_PRECONDITION` with `PRECONDITION_HOST_NO_CREDENTIAL` when the Job repository host
+    /// has no row, lost its private grant, or the owner holds no `forgejo_pat` for it.
     ///
     /// `FAILED_PRECONDITION` with `PRECONDITION_APP_MINT` when the App token cannot be minted,
     /// with `PRECONDITION_APP_INSTALLATION` when the installation is off the allowlist or fails
@@ -266,32 +294,35 @@ impl CredentialService {
         attempt: u32,
         box_name: &str,
     ) -> Result<GetJobCredentialsReply, Status> {
-        let released = self
+        let release = self
             .store
             .release_for_job(job_id, attempt, box_name)
             .await
             .map_err(|e| store_status(&e))?;
-        let mut credentials = Vec::with_capacity(released.len());
-        for item in released {
-            let value = String::from_utf8(item.value.expose().to_vec()).map_err(|_| {
-                tracing::error!("released credential is not text");
-                Status::internal("credential store error")
-            })?;
-            credentials.push(JobCredential {
-                kind: wire_kind(item.kind).to_owned(),
-                shape: item.shape.wire_name().to_owned(),
-                value,
-                expires_at_ms: item.expires_at_ms,
-                git_identity: item.git_identity.map(|identity| GitIdentity {
-                    name: identity.name().to_owned(),
-                    email: identity.email().to_owned(),
-                }),
-            });
-        }
-        Ok(GetJobCredentialsReply {
-            credentials,
-            hosts: Vec::new(),
-        })
+        let host_credential = match release.host.forgejo.as_ref() {
+            Some(item) => item,
+            None => release
+                .credentials
+                .iter()
+                .find(|item| item.kind.is_forge())
+                .ok_or_else(|| {
+                    tracing::error!("released job holds no forge credential");
+                    Status::internal("credential store error")
+                })?,
+        };
+        let hosts = vec![JobHostCredential {
+            host: release.host.host.clone(),
+            host_kind: release.host.kind.as_str().to_owned(),
+            allow_private: release.host.allow_private,
+            approved_ips: release.host.approved_ips.clone(),
+            credential: Some(wire_credential(host_credential)?),
+        }];
+        let credentials = release
+            .credentials
+            .iter()
+            .map(wire_credential)
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(GetJobCredentialsReply { credentials, hosts })
     }
 
     /// Checks a stored GitHub credential against GitHub. No use row is written.
@@ -474,6 +505,15 @@ mod tests {
                 assert_eq!(status.message(), message, "{err}");
             }
         }
+    }
+
+    #[test]
+    fn a_missing_host_credential_is_a_failed_precondition_with_the_fixed_message() {
+        let err = StoreError::NoHostCredential;
+        let status = store_status(&err);
+        assert_eq!(status.code(), Code::FailedPrecondition);
+        assert_eq!(err.code(), Code::FailedPrecondition);
+        assert_eq!(status.message(), "no credential for the job host");
     }
 
     #[test]

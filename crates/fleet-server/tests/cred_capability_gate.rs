@@ -163,7 +163,8 @@ async fn release_with_the_grant_succeeds_and_revoke_then_refuses(pool: PgPool) {
         .creds
         .release_for_job(&job, attempt, "alpha")
         .await
-        .unwrap();
+        .unwrap()
+        .credentials;
     assert_eq!(released.len(), 2);
     assert_eq!(w.count("credential_use").await, 2);
     w.caps.revoke(w.admin, w.alice, CAP).await.unwrap();

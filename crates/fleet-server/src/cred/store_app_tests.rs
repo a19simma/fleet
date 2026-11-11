@@ -401,7 +401,12 @@ async fn the_app_wins_over_the_pat_and_the_reply_carries_the_token(pool: PgPool)
     let fake = fake("201 Created", None).await;
     let w = world(pool, Some(client(&fake))).await;
     w.seed(true).await;
-    let released = w.creds.release_for_job(JOB, 1, "alpha").await.unwrap();
+    let released = w
+        .creds
+        .release_for_job(JOB, 1, "alpha")
+        .await
+        .unwrap()
+        .credentials;
     let mut kinds: Vec<_> = released.iter().map(|c| c.kind.wire_name()).collect();
     kinds.sort_unstable();
     assert_eq!(kinds, ["anthropic_api_key", "github_app"]);
@@ -610,7 +615,12 @@ async fn a_user_without_the_app_credential_still_gets_the_pat(pool: PgPool) {
         .execute(&w.pool)
         .await
         .unwrap();
-    let released = w.creds.release_for_job(JOB, 1, "alpha").await.unwrap();
+    let released = w
+        .creds
+        .release_for_job(JOB, 1, "alpha")
+        .await
+        .unwrap()
+        .credentials;
     assert!(released.iter().any(|c| c.kind == CredentialKind::GithubPat));
     assert_eq!(fake.mints(), 0);
     assert_eq!(w.uses().await, 2);
@@ -2307,7 +2317,7 @@ async fn a_job_repository_with_another_owner_is_refused(pool: PgPool) {
 }
 
 #[sqlx::test]
-async fn a_hostile_job_repository_is_refused_and_audited_within_the_column_cap(pool: PgPool) {
+async fn a_hostile_job_repository_is_refused_before_any_mint_or_audit(pool: PgPool) {
     let fake = fake("201 Created", None).await;
     let w = world(pool, Some(client(&fake))).await;
     w.seed(true).await;
@@ -2328,9 +2338,18 @@ async fn a_hostile_job_repository_is_refused_and_audited_within_the_column_cap(p
             .await
             .unwrap();
         let err = w.creds.release_for_job(JOB, 1, "alpha").await.unwrap_err();
-        assert!(matches!(err, StoreError::RepoDenied), "{hostile:?} {err:?}");
+        assert!(
+            matches!(err, StoreError::NoHostCredential),
+            "{hostile:?} {err:?}"
+        );
     }
     assert_eq!(fake.mints(), 0);
+    assert_eq!(w.uses().await, 0);
+    let audit: i64 = sqlx::query_scalar("SELECT count(*) FROM github_app_mint")
+        .fetch_one(&w.pool)
+        .await
+        .unwrap();
+    assert_eq!(audit, 0);
 }
 
 async fn binding_refused(pool: PgPool, body: String) {

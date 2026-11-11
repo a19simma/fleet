@@ -135,7 +135,7 @@ async fn a_submitted_job_runs_to_a_pushed_branch_and_a_pull_request(pool: PgPool
     let keys = dir.path().join("sealer.keys");
     std::fs::write(&keys, format!("k1:{}\n", "ab".repeat(32)))?;
     let sealer = FileSealer::load(&keys)?;
-    let creds = CredentialStore::new(pool.clone(), Arc::new(sealer));
+    let creds = CredentialStore::new(pool.clone(), Arc::new(sealer)).with_file_repos();
     let service = CredentialService::new(creds.clone(), Arc::new(NoGithub));
     let incoming = TcpIncoming::bind("127.0.0.1:0".parse()?)?;
     let url = format!("http://{}", incoming.local_addr()?);

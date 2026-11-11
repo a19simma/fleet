@@ -36,7 +36,7 @@ fn box_b() -> String {
     format!("box-{}", 2)
 }
 const CLIENT: &str = "client-token-0123456789abcdef012345";
-const REPO: &str = "https://example.com/org/repo.git";
+const REPO: &str = "https://github.com/org/repo.git";
 const PAT: &str = "github_pat_11ABCDEFG0abcdefghijklmnop";
 const ANT: &str = "sk-ant-api03-abcdefghijklmnopqrstuv";
 const OAT: &str = "sk-ant-oat01-abcdefghijklmnopqrstuv";
@@ -84,6 +84,10 @@ async fn user(pool: &PgPool, name: &str) -> i64 {
 }
 
 async fn world_with(pool: PgPool, configured: bool) -> World {
+    world_opts(pool, configured, false).await
+}
+
+async fn world_opts(pool: PgPool, configured: bool, file_repos: bool) -> World {
     let store = Store::new(pool.clone());
     store.migrate().await.unwrap();
     let alice = user(&pool, "alice").await;
@@ -96,7 +100,10 @@ async fn world_with(pool: PgPool, configured: bool) -> World {
     std::fs::write(&path, format!("k1:{}\n", "ab".repeat(32))).unwrap();
     let sealer = FileSealer::load(&path);
     std::fs::remove_file(&path).unwrap();
-    let creds = CredentialStore::new(pool.clone(), Arc::new(sealer.unwrap()));
+    let mut creds = CredentialStore::new(pool.clone(), Arc::new(sealer.unwrap()));
+    if file_repos {
+        creds = creds.with_file_repos();
+    }
     let service = CredentialService::new(creds.clone(), Arc::new(NoGithub));
     let auth = BearerAuth::new(
         &Token::new(BOX.to_owned()).unwrap(),
@@ -140,13 +147,17 @@ impl World {
     }
 
     async fn running(&mut self, owner: i64, agent: &str, key: &str) -> Job {
+        self.running_at(owner, agent, key, REPO).await
+    }
+
+    async fn running_at(&mut self, owner: i64, agent: &str, key: &str, repo: &str) -> Job {
         self.store
             .submit_job_for(
                 Some(owner),
                 &SubmitJobRequest {
                     idempotency_key: key.to_owned(),
                     prompt: "add hello.txt".to_owned(),
-                    repo: REPO.to_owned(),
+                    repo: repo.to_owned(),
                     base_ref: "main".to_owned(),
                     open_pr: false,
                     agent: String::new(),
@@ -427,7 +438,8 @@ async fn released_credentials_never_print_their_value(pool: PgPool) {
         .creds
         .release_for_job(&job.job_id, job.attempt, &box_a())
         .await
-        .unwrap();
+        .unwrap()
+        .credentials;
     assert_eq!(released.len(), 2);
     for text in [format!("{released:?}"), format!("{released:#?}")] {
         assert!(!text.contains(ANT) && !text.contains(PAT), "{text}");
@@ -569,7 +581,8 @@ async fn job_writers_wait_while_a_release_is_open(pool: PgPool) {
         .await
         .unwrap()
         .unwrap()
-        .unwrap();
+        .unwrap()
+        .credentials;
     assert_eq!(released.len(), 2);
 }
 
@@ -629,4 +642,395 @@ async fn a_github_credential_stored_for_another_host_is_not_released(pool: PgPoo
     assert_eq!(err.code(), Code::FailedPrecondition);
     assert_eq!(err.message(), "no github credential");
     assert_eq!(w.uses().await, 0);
+}
+
+const FGJ_B: &str = "89abcdef0123456789abcdef0123456789abcdef";
+const FGJ_HOST_B: &str = "code.example.net";
+const FGJ_REPO: &str = "https://git.example.com/org/repo.git";
+const FGJ_REPO_B: &str = "https://code.example.net/org/repo.git";
+const NO_HOST_CREDENTIAL: &str = fleet_proto::PRECONDITION_HOST_NO_CREDENTIAL;
+
+impl World {
+    async fn put_forgejo(&self, user_id: i64, host: &str, value: &str, expires: Option<i64>) {
+        self.creds
+            .put_for_host(
+                user_id,
+                host,
+                CredentialKind::ForgejoPat,
+                STATIC,
+                Secret::new(value.into()),
+                None,
+                expires,
+            )
+            .await
+            .unwrap();
+    }
+
+    async fn grant(&self, host: &str, ips: &[&str]) {
+        sqlx::query(
+            "UPDATE git_hosts SET allow_private = true, \
+             approved_ips = ARRAY(SELECT unnest($2::text[])::inet) WHERE host = $1",
+        )
+        .bind(host)
+        .bind(ips)
+        .execute(&self.pool)
+        .await
+        .unwrap();
+    }
+
+    async fn register(&self, user_id: i64, host: &str, verified: &str) {
+        sqlx::query(
+            "INSERT INTO user_repos (user_id, host, path, forge_kind, verified_at) \
+             VALUES ($1, $2, 'org/repo', 'forgejo', $3::timestamptz)",
+        )
+        .bind(user_id)
+        .bind(host)
+        .bind(verified)
+        .execute(&self.pool)
+        .await
+        .unwrap();
+    }
+
+    async fn forgejo_job(&mut self, repo: &str) -> Job {
+        forgejo_host(&self.pool).await;
+        self.put(self.alice, CredentialKind::AnthropicApiKey, ANT, None)
+            .await;
+        self.running_at(self.alice, "claude", "k1", repo).await
+    }
+}
+
+async fn other_host(pool: &PgPool) {
+    sqlx::query("INSERT INTO git_hosts (host, kind) VALUES ($1, 'forgejo')")
+        .bind(FGJ_HOST_B)
+        .execute(pool)
+        .await
+        .unwrap();
+}
+
+fn host_entry(reply: &GetJobCredentialsReply) -> &fleet_proto::v1::JobHostCredential {
+    assert_eq!(reply.hosts.len(), 1);
+    reply.hosts.first().unwrap()
+}
+
+fn assert_refused(err: &Status, message: &str) {
+    assert_eq!(err.code(), Code::FailedPrecondition);
+    assert_eq!(err.message(), message);
+}
+
+#[sqlx::test]
+async fn a_github_job_reply_names_the_github_host(pool: PgPool) {
+    let mut w = world(pool).await;
+    w.put(w.alice, CredentialKind::AnthropicApiKey, ANT, None)
+        .await;
+    w.put(w.alice, CredentialKind::GithubPat, PAT, None).await;
+    let job = w.running(w.alice, "claude", "k1").await;
+    let reply = w.fetch(&job, job.attempt, &box_a()).await.unwrap();
+    let host = host_entry(&reply);
+    assert_eq!(host.host, "github.com");
+    assert_eq!(host.host_kind, "github");
+    assert!(!host.allow_private);
+    assert_eq!(host.approved_ips, Vec::<String>::new());
+    let credential = host.credential.as_ref().unwrap();
+    assert_eq!(
+        (credential.kind.as_str(), credential.value.as_str()),
+        ("github_pat", PAT)
+    );
+    assert_eq!(
+        pairs(&reply),
+        vec![entry("anthropic_api_key", ANT), entry("github_pat", PAT)]
+    );
+}
+
+#[sqlx::test]
+async fn a_bare_owner_name_job_is_a_github_job(pool: PgPool) {
+    let mut w = world(pool).await;
+    w.put(w.alice, CredentialKind::AnthropicApiKey, ANT, None)
+        .await;
+    w.put(w.alice, CredentialKind::GithubPat, PAT, None).await;
+    let job = w.running(w.alice, "claude", "k1").await;
+    sqlx::query("UPDATE jobs SET repo = 'org/repo'")
+        .execute(&w.pool)
+        .await
+        .unwrap();
+    let reply = w.fetch(&job, job.attempt, &box_a()).await.unwrap();
+    assert_eq!(host_entry(&reply).host, "github.com");
+}
+
+#[sqlx::test]
+async fn a_forgejo_job_gets_its_pat_in_the_host_entry_only(pool: PgPool) {
+    let mut w = world(pool).await;
+    let job = w.forgejo_job(FGJ_REPO).await;
+    w.put(w.alice, CredentialKind::GithubPat, PAT, None).await;
+    w.put_forgejo(w.alice, FGJ_HOST, FGJ, None).await;
+    w.grant(FGJ_HOST, &["192.168.3.1", "10.0.0.7"]).await;
+    let reply = w.fetch(&job, job.attempt, &box_a()).await.unwrap();
+    assert_eq!(pairs(&reply), vec![entry("anthropic_api_key", ANT)]);
+    let host = host_entry(&reply);
+    assert_eq!(host.host, FGJ_HOST);
+    assert_eq!(host.host_kind, "forgejo");
+    assert!(host.allow_private);
+    assert_eq!(host.approved_ips, vec!["192.168.3.1", "10.0.0.7"]);
+    let credential = host.credential.as_ref().unwrap();
+    assert_eq!(
+        (credential.kind.as_str(), credential.value.as_str()),
+        ("forgejo_pat", FGJ)
+    );
+    assert_eq!(w.uses().await, 2);
+}
+
+#[sqlx::test]
+async fn a_forgejo_job_without_a_private_grant_carries_no_addresses(pool: PgPool) {
+    let mut w = world(pool).await;
+    let job = w.forgejo_job(FGJ_REPO).await;
+    w.put_forgejo(w.alice, FGJ_HOST, FGJ, None).await;
+    let reply = w.fetch(&job, job.attempt, &box_a()).await.unwrap();
+    let host = host_entry(&reply);
+    assert!(!host.allow_private);
+    assert_eq!(host.approved_ips, Vec::<String>::new());
+}
+
+#[sqlx::test]
+async fn a_forgejo_job_without_its_pat_fails_with_the_fixed_error(pool: PgPool) {
+    let mut w = world(pool).await;
+    let job = w.forgejo_job(FGJ_REPO).await;
+    other_host(&w.pool).await;
+    w.put(w.alice, CredentialKind::GithubPat, PAT, None).await;
+    w.put_forgejo(w.alice, FGJ_HOST_B, FGJ_B, None).await;
+    let err = w.fetch(&job, job.attempt, &box_a()).await.unwrap_err();
+    assert_refused(&err, NO_HOST_CREDENTIAL);
+    assert!(!err.message().contains(PAT) && !err.message().contains(FGJ_B));
+    assert_eq!(w.uses().await, 0);
+}
+
+#[sqlx::test]
+async fn only_the_job_hosts_token_is_released(pool: PgPool) {
+    let mut w = world(pool).await;
+    other_host(&w.pool).await;
+    let job = w.forgejo_job(FGJ_REPO_B).await;
+    w.put_forgejo(w.alice, FGJ_HOST, FGJ, None).await;
+    w.put_forgejo(w.alice, FGJ_HOST_B, FGJ_B, None).await;
+    w.put(w.alice, CredentialKind::GithubPat, PAT, None).await;
+    let reply = w.fetch(&job, job.attempt, &box_a()).await.unwrap();
+    let host = host_entry(&reply);
+    assert_eq!(host.host, FGJ_HOST_B);
+    assert_eq!(host.credential.as_ref().unwrap().value, FGJ_B);
+    let text = format!("{reply:?}");
+    assert!(!text.contains(FGJ) && !text.contains(PAT), "{text}");
+}
+
+#[sqlx::test]
+async fn a_forgejo_job_of_another_owner_never_sees_the_owners_token(pool: PgPool) {
+    let mut w = world(pool).await;
+    let job = w.forgejo_job(FGJ_REPO).await;
+    w.put_forgejo(w.bob, FGJ_HOST, FGJ_B, None).await;
+    let err = w.fetch(&job, job.attempt, &box_a()).await.unwrap_err();
+    assert_refused(&err, NO_HOST_CREDENTIAL);
+}
+
+#[sqlx::test]
+async fn an_expired_forgejo_pat_is_refused(pool: PgPool) {
+    let mut w = world(pool).await;
+    let job = w.forgejo_job(FGJ_REPO).await;
+    w.put_forgejo(w.alice, FGJ_HOST, FGJ, Some(1_700_000_000_000))
+        .await;
+    sqlx::query(
+        "UPDATE credentials SET expires_at = now() - interval '1 hour' WHERE kind = 'forgejo_pat'",
+    )
+    .execute(&w.pool)
+    .await
+    .unwrap();
+    let err = w.fetch(&job, job.attempt, &box_a()).await.unwrap_err();
+    assert_refused(&err, "credential expired");
+    assert_eq!(w.uses().await, 0);
+}
+
+#[sqlx::test]
+async fn a_forgejo_job_with_no_agent_credential_is_refused(pool: PgPool) {
+    let mut w = world(pool).await;
+    let job = w.forgejo_job(FGJ_REPO).await;
+    w.put_forgejo(w.alice, FGJ_HOST, FGJ, None).await;
+    sqlx::query("DELETE FROM credentials WHERE kind = 'anthropic_api_key'")
+        .execute(&w.pool)
+        .await
+        .unwrap();
+    let err = w.fetch(&job, job.attempt, &box_a()).await.unwrap_err();
+    assert_refused(&err, "no agent credential");
+}
+
+#[sqlx::test]
+async fn a_host_row_removed_before_the_fetch_releases_nothing(pool: PgPool) {
+    let mut w = world(pool).await;
+    let job = w.forgejo_job(FGJ_REPO).await;
+    w.put_forgejo(w.alice, FGJ_HOST, FGJ, None).await;
+    sqlx::query("DELETE FROM git_hosts WHERE host = $1")
+        .bind(FGJ_HOST)
+        .execute(&w.pool)
+        .await
+        .unwrap();
+    let err = w.fetch(&job, job.attempt, &box_a()).await.unwrap_err();
+    assert_refused(&err, NO_HOST_CREDENTIAL);
+    assert_eq!(w.uses().await, 0);
+}
+
+#[sqlx::test]
+async fn a_github_row_on_another_host_releases_no_github_token(pool: PgPool) {
+    let mut w = world(pool).await;
+    w.put(w.alice, CredentialKind::AnthropicApiKey, ANT, None)
+        .await;
+    w.put(w.alice, CredentialKind::GithubPat, PAT, None).await;
+    sqlx::query("INSERT INTO git_hosts (host, kind) VALUES ('ghe.example.com', 'github')")
+        .execute(&w.pool)
+        .await
+        .unwrap();
+    let job = w
+        .running_at(
+            w.alice,
+            "claude",
+            "k1",
+            "https://ghe.example.com/org/repo.git",
+        )
+        .await;
+    let err = w.fetch(&job, job.attempt, &box_a()).await.unwrap_err();
+    assert_refused(&err, NO_HOST_CREDENTIAL);
+    assert_eq!(w.uses().await, 0);
+}
+
+#[sqlx::test]
+async fn an_unreadable_job_repository_releases_nothing(pool: PgPool) {
+    let mut w = world(pool).await;
+    w.put(w.alice, CredentialKind::AnthropicApiKey, ANT, None)
+        .await;
+    w.put(w.alice, CredentialKind::GithubPat, PAT, None).await;
+    let job = w.running(w.alice, "claude", "k1").await;
+    sqlx::query("UPDATE jobs SET repo = 'not a repository'")
+        .execute(&w.pool)
+        .await
+        .unwrap();
+    let err = w.fetch(&job, job.attempt, &box_a()).await.unwrap_err();
+    assert_refused(&err, NO_HOST_CREDENTIAL);
+}
+
+#[sqlx::test]
+async fn a_revoked_private_host_is_refused_before_claim(pool: PgPool) {
+    let mut w = world(pool).await;
+    let job = w.forgejo_job(FGJ_REPO).await;
+    w.put_forgejo(w.alice, FGJ_HOST, FGJ, None).await;
+    w.grant(FGJ_HOST, &["192.168.3.1"]).await;
+    w.register(w.alice, FGJ_HOST, "now()").await;
+    let admin = user(&w.pool, "admin").await;
+    let host = fleet_core::host::HostName::normalise(FGJ_HOST).unwrap();
+    fleet_server::hosts::HostStore::new(w.pool.clone())
+        .revoke(admin, &host)
+        .await
+        .unwrap();
+    let err = w.fetch(&job, job.attempt, &box_a()).await.unwrap_err();
+    assert_refused(&err, NO_HOST_CREDENTIAL);
+    assert_eq!(w.uses().await, 0);
+}
+
+#[sqlx::test]
+async fn a_revoke_without_a_registered_repository_clears_the_reply_addresses(pool: PgPool) {
+    let mut w = world(pool).await;
+    let job = w.forgejo_job(FGJ_REPO).await;
+    w.put_forgejo(w.alice, FGJ_HOST, FGJ, None).await;
+    w.grant(FGJ_HOST, &["192.168.3.1"]).await;
+    sqlx::query("UPDATE git_hosts SET allow_private = false, approved_ips = '{}'")
+        .execute(&w.pool)
+        .await
+        .unwrap();
+    let reply = w.fetch(&job, job.attempt, &box_a()).await.unwrap();
+    let host = host_entry(&reply);
+    assert!(!host.allow_private);
+    assert_eq!(host.approved_ips, Vec::<String>::new());
+}
+
+#[sqlx::test]
+async fn a_verified_repository_without_a_grant_still_gets_its_token(pool: PgPool) {
+    let mut w = world(pool).await;
+    let job = w.forgejo_job(FGJ_REPO).await;
+    w.put_forgejo(w.alice, FGJ_HOST, FGJ, None).await;
+    w.register(w.alice, FGJ_HOST, "now()").await;
+    let reply = w.fetch(&job, job.attempt, &box_a()).await.unwrap();
+    assert_eq!(host_entry(&reply).credential.as_ref().unwrap().value, FGJ);
+}
+
+#[sqlx::test]
+async fn a_stale_repository_on_a_granted_host_still_gets_its_token(pool: PgPool) {
+    let mut w = world(pool).await;
+    let job = w.forgejo_job(FGJ_REPO).await;
+    w.put_forgejo(w.alice, FGJ_HOST, FGJ, None).await;
+    w.grant(FGJ_HOST, &["192.168.3.1"]).await;
+    w.register(w.alice, FGJ_HOST, "1970-01-01T00:00:00Z").await;
+    let reply = w.fetch(&job, job.attempt, &box_a()).await.unwrap();
+    assert!(host_entry(&reply).allow_private);
+}
+
+async fn file_repo_world(file_repos: bool, pool: PgPool, repo: &str) -> (World, Job) {
+    let mut w = world_opts(pool, true, file_repos).await;
+    w.put(w.alice, CredentialKind::AnthropicApiKey, ANT, None)
+        .await;
+    w.put(w.alice, CredentialKind::GithubPat, PAT, None).await;
+    let job = w.running(w.alice, "claude", "k1").await;
+    sqlx::query("UPDATE jobs SET repo = $1")
+        .bind(repo)
+        .execute(&w.pool)
+        .await
+        .unwrap();
+    (w, job)
+}
+
+#[sqlx::test]
+async fn a_file_url_job_releases_the_github_credential_when_file_repos_are_on(pool: PgPool) {
+    let (mut w, job) = file_repo_world(true, pool, "file:///srv/origin.git").await;
+    let reply = w.fetch(&job, job.attempt, &box_a()).await.unwrap();
+    assert_eq!(
+        pairs(&reply),
+        vec![entry("anthropic_api_key", ANT), entry("github_pat", PAT)]
+    );
+    let host = host_entry(&reply);
+    assert_eq!(host.host, "");
+    assert_eq!(host.host_kind, "github");
+    assert!(!host.allow_private);
+    assert_eq!(host.approved_ips, Vec::<String>::new());
+    assert_eq!(w.uses().await, 2);
+}
+
+#[sqlx::test]
+async fn an_absolute_path_job_releases_the_github_credential_when_file_repos_are_on(pool: PgPool) {
+    let (mut w, job) = file_repo_world(true, pool, "/srv/origin.git").await;
+    let reply = w.fetch(&job, job.attempt, &box_a()).await.unwrap();
+    assert_eq!(host_entry(&reply).host, "");
+    assert_eq!(pairs(&reply).len(), 2);
+}
+
+async fn assert_repo_refused(file_repos: bool, pool: PgPool, repo: &str) {
+    let (mut w, job) = file_repo_world(file_repos, pool, repo).await;
+    let err = w.fetch(&job, job.attempt, &box_a()).await.unwrap_err();
+    assert_refused(&err, fleet_proto::PRECONDITION_HOST_NO_CREDENTIAL);
+    assert_eq!(w.uses().await, 0);
+}
+
+#[sqlx::test]
+async fn a_file_url_job_is_refused_when_file_repos_are_off(pool: PgPool) {
+    assert_repo_refused(false, pool, "file:///srv/origin.git").await;
+}
+
+#[sqlx::test]
+async fn an_absolute_path_job_is_refused_when_file_repos_are_off(pool: PgPool) {
+    assert_repo_refused(false, pool, "/srv/origin.git").await;
+}
+
+#[sqlx::test]
+async fn file_repos_on_do_not_relax_an_unregistered_real_host(pool: PgPool) {
+    assert_repo_refused(true, pool, "https://git.unregistered.example/org/repo.git").await;
+}
+
+#[sqlx::test]
+async fn file_repos_on_do_not_relax_junk_text(pool: PgPool) {
+    assert_repo_refused(true, pool, "not a repo").await;
+}
+
+#[sqlx::test]
+async fn file_repos_on_do_not_relax_a_relative_path(pool: PgPool) {
+    assert_repo_refused(true, pool, "relative/dir/origin.git").await;
 }
