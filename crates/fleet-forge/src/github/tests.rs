@@ -3,6 +3,7 @@ use std::error::Error;
 use fleet_core::host::HostName;
 
 use super::*;
+use crate::ci::MAX_SHA_BYTES;
 
 type TestResult = Result<(), Box<dyn Error>>;
 

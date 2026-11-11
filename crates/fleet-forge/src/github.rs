@@ -10,6 +10,7 @@ use fleet_core::forge::CiResult;
 use fleet_core::host::{HostKind, HostName};
 use serde_json::{Value, json};
 
+use crate::ci::{Rank, Tally, entries, valid_sha};
 use crate::{
     ForgeApi, ForgeError, ForgeGit, Git, GitCommand, GitError, GitOp, GitOutput, Http, HttpError,
     HttpRequest, HttpResponse, MAX_BODY_BYTES, Method, Permission, PushTarget, RepoAccess, RepoRef,
@@ -22,7 +23,6 @@ const API_VERSION: &str = "2022-11-28";
 const USER_AGENT: &str = "fleet-forge";
 const MAX_SEGMENT_BYTES: usize = 100;
 const MAX_NUMBER_DIGITS: usize = 10;
-const MAX_SHA_BYTES: usize = 64;
 const LOCK_SUFFIX: &str = ".lock";
 const MAX_STDERR_BYTES: usize = 8 * 1024;
 const AUTH_MARKERS: [&str; 7] = [
@@ -166,7 +166,7 @@ impl<H: Http, G: Send + Sync> GitHubForge<H, G> {
         if runs.status != 200 {
             return Err(status_error(runs.status));
         }
-        tally.add_runs(&parse(&runs)?)?;
+        tally.add_runs(&parse(&runs)?, "check_runs")?;
         let statuses = self
             .get(format!("{base}/commits/{sha}/status"), token)
             .await?;
@@ -451,10 +451,6 @@ fn encode(text: &str) -> String {
     out
 }
 
-fn valid_sha(text: &str) -> bool {
-    !text.is_empty() && text.len() <= MAX_SHA_BYTES && text.bytes().all(|b| b.is_ascii_hexdigit())
-}
-
 /// The pull request number of `url`, which must be `https://github.com/{owner}/{repo}/pull/{n}`
 /// for `repo`, compared without regard to ASCII case.
 fn pr_number(url: &str, repo: &RepoRef) -> Result<u64, ForgeError> {
@@ -476,56 +472,7 @@ fn pr_number(url: &str, repo: &RepoRef) -> Result<u64, ForgeError> {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
-enum Rank {
-    Neutral,
-    Success,
-    Queued,
-    Running,
-    Failed,
-}
-
-#[derive(Debug, Default)]
-struct Tally(Option<Rank>);
-
-fn entries<'a>(body: &'a Value, key: &str) -> Result<&'a [Value], ForgeError> {
-    let list = body
-        .get(key)
-        .and_then(Value::as_array)
-        .ok_or(ForgeError::Malformed)?;
-    let incomplete = body
-        .get("total_count")
-        .and_then(Value::as_u64)
-        .is_some_and(|total| total > list.len() as u64);
-    if incomplete {
-        return Err(ForgeError::Malformed);
-    }
-    Ok(list)
-}
-
 impl Tally {
-    fn note(&mut self, rank: Rank) {
-        self.0 = self.0.max(Some(rank));
-    }
-
-    fn add_runs(&mut self, body: &Value) -> Result<(), ForgeError> {
-        for run in entries(body, "check_runs")? {
-            let rank = match run.get("status").and_then(Value::as_str) {
-                Some("completed") => match run.get("conclusion").and_then(Value::as_str) {
-                    Some("success") => Rank::Success,
-                    Some("neutral" | "skipped" | "stale") => Rank::Neutral,
-                    Some(_) => Rank::Failed,
-                    None => return Err(ForgeError::Malformed),
-                },
-                Some("in_progress") => Rank::Running,
-                Some("queued" | "waiting" | "requested" | "pending") => Rank::Queued,
-                _ => return Err(ForgeError::Malformed),
-            };
-            self.note(rank);
-        }
-        Ok(())
-    }
-
     fn add_statuses(&mut self, body: &Value) -> Result<(), ForgeError> {
         for status in entries(body, "statuses")? {
             let rank = match status.get("state").and_then(Value::as_str) {
@@ -537,17 +484,6 @@ impl Tally {
             self.note(rank);
         }
         Ok(())
-    }
-
-    const fn result(&self) -> CiResult {
-        match self.0 {
-            None => CiResult::NoChecks,
-            Some(Rank::Neutral) => CiResult::Neutral,
-            Some(Rank::Success) => CiResult::Success,
-            Some(Rank::Queued) => CiResult::Queued,
-            Some(Rank::Running) => CiResult::InProgress,
-            Some(Rank::Failed) => CiResult::Failure,
-        }
     }
 }
 

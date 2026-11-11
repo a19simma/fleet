@@ -6,6 +6,7 @@
 //! Gitea and Forgejo.
 
 mod api;
+mod ci;
 pub mod contract;
 mod error;
 pub mod fake;
