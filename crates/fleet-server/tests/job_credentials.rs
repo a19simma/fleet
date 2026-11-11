@@ -1071,13 +1071,48 @@ async fn assert_hostless_release(pool: PgPool, repo: &str) {
 }
 
 #[sqlx::test]
-async fn file_repos_on_release_hostless_for_a_file_url_naming_a_host(pool: PgPool) {
-    assert_hostless_release(pool, "file://evil.example/x").await;
+async fn file_repos_on_refuse_a_file_url_naming_a_host(pool: PgPool) {
+    assert_repo_refused(true, pool, "file://evil.example/x").await;
 }
 
 #[sqlx::test]
-async fn file_repos_on_release_hostless_for_a_double_slash_path(pool: PgPool) {
-    assert_hostless_release(pool, "//evil.example/a/b").await;
+async fn file_repos_on_refuse_a_double_slash_path(pool: PgPool) {
+    assert_repo_refused(true, pool, "//evil.example/a/b").await;
+}
+
+#[sqlx::test]
+async fn file_repos_on_release_hostless_for_an_empty_authority_file_url(pool: PgPool) {
+    assert_hostless_release(pool, "file:///srv/origin.git").await;
+}
+
+#[sqlx::test]
+async fn file_repos_on_release_hostless_for_a_single_slash_path(pool: PgPool) {
+    assert_hostless_release(pool, "/srv/origin.git").await;
+}
+
+#[sqlx::test]
+async fn file_repos_on_refuse_a_file_url_with_four_slashes(pool: PgPool) {
+    assert_repo_refused(true, pool, "file:////x").await;
+}
+
+#[sqlx::test]
+async fn file_repos_on_refuse_a_triple_slash_path(pool: PgPool) {
+    assert_repo_refused(true, pool, "///x").await;
+}
+
+#[sqlx::test]
+async fn file_repos_on_refuse_a_localhost_file_url(pool: PgPool) {
+    assert_repo_refused(true, pool, "file://localhost/x").await;
+}
+
+#[sqlx::test]
+async fn file_repos_on_refuse_a_bare_slash(pool: PgPool) {
+    assert_repo_refused(true, pool, "/").await;
+}
+
+#[sqlx::test]
+async fn file_repos_on_refuse_an_empty_path_file_url(pool: PgPool) {
+    assert_repo_refused(true, pool, "file:///").await;
 }
 
 #[sqlx::test]

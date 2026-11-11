@@ -751,8 +751,17 @@ struct JobTarget {
     path: String,
 }
 
+/// Whether `repo` names a path on the local filesystem, the only form the file-repo seam serves.
+///
+/// Accepted: `file://` followed by an absolute path (an empty authority, so `file:///srv/x.git`),
+/// or an absolute path itself. The path must start with exactly one `/` and name something
+/// after it. Refused: any authority (`file://host/x`, `file://localhost/x`), a leading `//`
+/// (`//host/a/b`, `///x`, `file:////x`), a bare `/` or `file:///`, and any other prefix. The
+/// match is case-sensitive and does not trim.
 fn is_file_repo(repo: &str) -> bool {
-    repo.starts_with("file://") || repo.starts_with('/')
+    let path = repo.strip_prefix("file://").unwrap_or(repo);
+    path.strip_prefix('/')
+        .is_some_and(|rest| !rest.is_empty() && !rest.starts_with('/'))
 }
 
 fn hostless_host() -> ReleasedHost {
