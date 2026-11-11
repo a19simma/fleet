@@ -15,7 +15,7 @@ use fleet_proto::v1::fleet_worker_server::{FleetWorker, FleetWorkerServer};
 use fleet_proto::v1::{
     ClaimJobReply, ClaimJobRequest, GetJobCredentialsReply, GetJobCredentialsRequest,
     GetJobTranscriptReply, GetJobTranscriptRequest, GetProfileBlobReply, GetProfileBlobRequest,
-    Job, JobCredential, JobState, ProfileRef, ReportJobReply, ReportJobRequest,
+    Job, JobCredential, JobHostCredential, JobState, ProfileRef, ReportJobReply, ReportJobRequest,
 };
 use fleet_proto::{
     ERR_LEASE_MISMATCH, PRECONDITION_APP_INSTALLATION, PRECONDITION_APP_MINT_CAP,
@@ -2392,5 +2392,537 @@ async fn a_first_fetch_does_not_retry_the_job_cap() -> TestResult {
     let got = book.fetch("job1", 1, &box_name()).await;
     assert_eq!(got.err(), Some(CredentialFailure::MintCap));
     assert_eq!(calls(&fake), 1);
+    Ok(())
+}
+
+const FORGEJO_PAT: &str = "0123456789abcdef0123456789abcdef01234567";
+const OTHER_PAT: &str = "fedcba9876543210fedcba9876543210fedcba98";
+const FORGEJO_HOST: &str = "git.example.org";
+
+fn host_entry(host: &str, kind: &str, credential: Option<JobCredential>) -> JobHostCredential {
+    JobHostCredential {
+        host: host.into(),
+        host_kind: kind.into(),
+        allow_private: false,
+        approved_ips: Vec::new(),
+        credential,
+    }
+}
+
+fn forgejo_entry(host: &str) -> JobHostCredential {
+    host_entry(
+        host,
+        "forgejo",
+        Some(wire("forgejo_pat", "static_secret", FORGEJO_PAT)),
+    )
+}
+
+fn github_entry(host: &str, credential: JobCredential) -> JobHostCredential {
+    host_entry(host, "github", Some(credential))
+}
+
+fn pat_entry() -> JobHostCredential {
+    github_entry("github.com", wire("github_pat", "static_secret", GITHUB))
+}
+
+fn forgejo_reply(hosts: Vec<JobHostCredential>) -> GetJobCredentialsReply {
+    GetJobCredentialsReply {
+        credentials: vec![agent_wire()],
+        hosts,
+    }
+}
+
+fn pat_reply(hosts: Vec<JobHostCredential>) -> GetJobCredentialsReply {
+    GetJobCredentialsReply { hosts, ..good() }
+}
+
+async fn fetch_reply(
+    reply: GetJobCredentialsReply,
+) -> Result<Result<Arc<fleetd::cred::JobCredentials>, CredentialFailure>, Box<dyn std::error::Error>>
+{
+    let (book, _fake) = serve(Ok(reply)).await?;
+    Ok(book.fetch("job1", 1, &box_name()).await)
+}
+
+async fn held_for(
+    reply: GetJobCredentialsReply,
+) -> Result<Arc<fleetd::cred::JobCredentials>, Box<dyn std::error::Error>> {
+    Ok(fetch_reply(reply).await??)
+}
+
+async fn assert_malformed(
+    label: &str,
+    reply: GetJobCredentialsReply,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let got = fetch_reply(reply).await?;
+    assert_eq!(got.err(), Some(CredentialFailure::Malformed), "{label}");
+    Ok(())
+}
+
+#[tokio::test]
+async fn the_holder_returns_the_forgejo_token_for_its_host_and_no_other() -> TestResult {
+    let mut entry = forgejo_entry(FORGEJO_HOST);
+    entry.allow_private = true;
+    entry.approved_ips = vec!["192.168.3.1".into(), "fd00::1".into()];
+    let held = held_for(forgejo_reply(vec![entry])).await?;
+    assert_eq!(
+        held.token_for(FORGEJO_HOST).map(Secret::expose),
+        Some(FORGEJO_PAT.as_bytes())
+    );
+    assert_eq!(held.token_str_for("GIT.Example.ORG."), Some(FORGEJO_PAT));
+    for other in ["github.com", "other.example.org", "example.org"] {
+        assert!(held.token_for(other).is_none(), "{other}");
+    }
+    assert!(held.github().is_none());
+    let policy = held.host(FORGEJO_HOST).ok_or("no entry")?;
+    assert_eq!(policy.host(), Some(FORGEJO_HOST));
+    assert_eq!(policy.kind(), fleet_core::host::HostKind::Forgejo);
+    assert!(policy.allow_private());
+    let ips: Vec<String> = policy
+        .approved_ips()
+        .iter()
+        .map(ToString::to_string)
+        .collect();
+    assert_eq!(ips, ["192.168.3.1", "fd00::1"]);
+    let text = format!("{held:?}");
+    assert!(!text.contains(FORGEJO_PAT), "{text}");
+    let clean = held
+        .redactor()
+        .redact_str(&format!("x {FORGEJO_PAT} y"))
+        .into_owned();
+    assert_eq!(clean, "x [REDACTED] y");
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_lookup_outside_the_host_grammar_returns_no_token() -> TestResult {
+    let held = held_for(forgejo_reply(vec![forgejo_entry(FORGEJO_HOST)])).await?;
+    let long = format!("{}.example.org", "a".repeat(300));
+    let lookups = [
+        String::new(),
+        format!("user@{FORGEJO_HOST}"),
+        format!("user:pw@{FORGEJO_HOST}"),
+        format!("{FORGEJO_HOST}:443"),
+        format!("{FORGEJO_HOST}:8443"),
+        format!("https://{FORGEJO_HOST}"),
+        format!("{FORGEJO_HOST}/path"),
+        format!("{FORGEJO_HOST}\r\n"),
+        format!("{FORGEJO_HOST}\n"),
+        format!("{FORGEJO_HOST} "),
+        format!(" {FORGEJO_HOST}"),
+        format!("{FORGEJO_HOST}\u{2028}"),
+        format!("{FORGEJO_HOST}\u{85}"),
+        format!("{FORGEJO_HOST}\0"),
+        format!("{FORGEJO_HOST}\\"),
+        "[::1]".to_owned(),
+        "[fd00::1]".to_owned(),
+        "192.168.3.1".to_owned(),
+        "git.exämple.org".to_owned(),
+        "xn--bcher-kva.example".to_owned(),
+        format!("a..{FORGEJO_HOST}"),
+        format!(".{FORGEJO_HOST}"),
+        format!("*.{FORGEJO_HOST}"),
+        long,
+    ];
+    for lookup in &lookups {
+        assert!(held.token_for(lookup).is_none(), "{lookup:?}");
+        assert!(held.host(lookup).is_none(), "{lookup:?}");
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn the_github_entry_repeats_the_forge_credential_and_keeps_the_pat_path() -> TestResult {
+    let held = held_for(pat_reply(vec![pat_entry()])).await?;
+    assert_eq!(
+        held.token_for("github.com").map(Secret::expose),
+        Some(GITHUB.as_bytes())
+    );
+    assert_eq!(held.github().map(Secret::expose), Some(GITHUB.as_bytes()));
+    assert!(held.token_for(FORGEJO_HOST).is_none());
+    let policy = held.host("GITHUB.COM").ok_or("no entry")?;
+    assert_eq!(policy.kind(), fleet_core::host::HostKind::Github);
+    assert!(!policy.allow_private());
+    assert_eq!(policy.approved_ips().len(), 0);
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_github_entry_that_differs_from_the_forge_credential_is_malformed() -> TestResult {
+    let other = wire(
+        "github_pat",
+        "static_secret",
+        "gh-pat-other-0123456789abcdef",
+    );
+    let app = app_wire(APP_TOKEN, BOT_NAME, BOT_EMAIL);
+    assert_malformed(
+        "other value",
+        pat_reply(vec![github_entry("github.com", other)]),
+    )
+    .await?;
+    assert_malformed(
+        "other kind",
+        pat_reply(vec![github_entry("github.com", app)]),
+    )
+    .await?;
+    assert_malformed(
+        "missing credential",
+        pat_reply(vec![host_entry("github.com", "github", None)]),
+    )
+    .await?;
+    assert_malformed(
+        "no forge credential to repeat",
+        forgejo_reply(vec![pat_entry()]),
+    )
+    .await
+}
+
+#[tokio::test]
+async fn an_installation_token_job_keeps_the_app_rules_with_a_host_entry() -> TestResult {
+    let app = || app_wire(APP_TOKEN, BOT_NAME, BOT_EMAIL);
+    let held = held_for(GetJobCredentialsReply {
+        credentials: vec![app(), agent_wire()],
+        hosts: vec![github_entry("github.com", app())],
+    })
+    .await?;
+    assert_eq!(
+        held.token_for("github.com").map(Secret::expose),
+        Some(APP_TOKEN.as_bytes())
+    );
+    let identity = held.git_identity().ok_or("no identity")?;
+    assert_eq!(identity.name(), BOT_NAME);
+    assert_eq!(held.app_expires_at_ms(), Some(1_700_000_000_000));
+    let mut no_identity = app();
+    no_identity.git_identity = None;
+    let got = fetch_reply(GetJobCredentialsReply {
+        credentials: vec![no_identity.clone(), agent_wire()],
+        hosts: vec![github_entry("github.com", no_identity)],
+    })
+    .await?;
+    assert_eq!(got.err(), Some(CredentialFailure::AppIdentityMissing));
+    let mut no_expiry = app();
+    no_expiry.expires_at_ms = None;
+    assert_malformed(
+        "no expiry",
+        GetJobCredentialsReply {
+            credentials: vec![no_expiry.clone(), agent_wire()],
+            hosts: vec![github_entry("github.com", no_expiry)],
+        },
+    )
+    .await?;
+    assert_malformed(
+        "app token on a forgejo host",
+        GetJobCredentialsReply {
+            credentials: vec![agent_wire()],
+            hosts: vec![host_entry(FORGEJO_HOST, "forgejo", Some(app()))],
+        },
+    )
+    .await
+}
+
+#[tokio::test]
+async fn a_refresh_swaps_the_token_and_keeps_the_host_entry() -> TestResult {
+    let reply = |token: &str, expires_ms: u64| {
+        let app = |t: &str| JobCredential {
+            expires_at_ms: Some(expires_ms),
+            ..app_wire(t, BOT_NAME, BOT_EMAIL)
+        };
+        GetJobCredentialsReply {
+            credentials: vec![app(token), agent_wire()],
+            hosts: vec![github_entry("github.com", app(token))],
+        }
+    };
+    let (url, fake) = spawn_fake(Ok(reply(APP_TOKEN, NOW_MS + 5 * MINUTE_MS))).await?;
+    let clock = TestClock::at(NOW_MS);
+    let client = CredentialClient::new(channel(&url)?, TOKEN)?;
+    let book = Arc::new(CredentialBook::new(client).with_clock(clock));
+    book.fetch("job1", 1, &box_name()).await?;
+    set_reply(&fake, Ok(reply(NEW_TOKEN, NOW_MS + 60 * MINUTE_MS)));
+    let fresh = book.refresh_if_due("job1").await?.ok_or("not refreshed")?;
+    assert_eq!(
+        fresh.token_for("github.com").map(Secret::expose),
+        Some(NEW_TOKEN.as_bytes())
+    );
+    let held = book.get("job1").ok_or("not held")?;
+    assert_eq!(
+        held.token_for("github.com").map(Secret::expose),
+        Some(NEW_TOKEN.as_bytes())
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_refresh_that_changes_the_host_set_is_refused_and_keeps_the_held_token() -> TestResult {
+    let reply = |token: &str, hosts: Vec<JobHostCredential>| {
+        let app = |t: &str| JobCredential {
+            expires_at_ms: Some(NOW_MS + 5 * MINUTE_MS),
+            ..app_wire(t, BOT_NAME, BOT_EMAIL)
+        };
+        GetJobCredentialsReply {
+            credentials: vec![app(token), agent_wire()],
+            hosts: hosts
+                .into_iter()
+                .map(|h| JobHostCredential {
+                    credential: h.credential.map(|_| app(token)),
+                    ..h
+                })
+                .collect(),
+        }
+    };
+    let (url, fake) = spawn_fake(Ok(reply(
+        APP_TOKEN,
+        vec![github_entry("github.com", agent_wire())],
+    )))
+    .await?;
+    let clock = TestClock::at(NOW_MS);
+    let client = CredentialClient::new(channel(&url)?, TOKEN)?;
+    let book = Arc::new(CredentialBook::new(client).with_clock(clock));
+    book.fetch("job1", 1, &box_name()).await?;
+    set_reply(&fake, Ok(reply(NEW_TOKEN, Vec::new())));
+    let got = book.refresh_if_due("job1").await;
+    assert_eq!(got.err(), Some(CredentialFailure::Malformed));
+    assert_eq!(github_text(&book).as_deref(), Some(APP_TOKEN));
+    Ok(())
+}
+
+#[tokio::test]
+async fn the_empty_host_entry_is_no_host_policy_and_never_a_host() -> TestResult {
+    let empty = |allow_private: bool| JobHostCredential {
+        allow_private,
+        ..github_entry("", wire("github_pat", "static_secret", GITHUB))
+    };
+    let held = held_for(pat_reply(vec![empty(false)])).await?;
+    assert_eq!(held.github().map(Secret::expose), Some(GITHUB.as_bytes()));
+    assert_eq!(held.hosts().len(), 1);
+    assert_eq!(held.hosts()[0].host(), None);
+    for lookup in ["", "github.com", FORGEJO_HOST] {
+        assert!(held.token_for(lookup).is_none(), "{lookup:?}");
+        assert!(held.host(lookup).is_none(), "{lookup:?}");
+    }
+    assert!(held.check_job_host(None).is_ok());
+    assert!(held.check_job_host(Some("github.com")).is_err());
+    assert!(held.check_job_host(Some("")).is_err());
+    assert_malformed(
+        "empty host with allow_private",
+        pat_reply(vec![empty(true)]),
+    )
+    .await?;
+    assert_malformed(
+        "empty host of kind forgejo",
+        forgejo_reply(vec![host_entry(
+            "",
+            "forgejo",
+            Some(wire("forgejo_pat", "static_secret", FORGEJO_PAT)),
+        )]),
+    )
+    .await?;
+    assert_malformed(
+        "empty host beside a named host",
+        pat_reply(vec![empty(false), pat_entry()]),
+    )
+    .await?;
+    let mut with_ips = empty(false);
+    with_ips.approved_ips = vec!["192.168.3.1".into()];
+    assert_malformed("empty host with addresses", pat_reply(vec![with_ips])).await
+}
+
+#[tokio::test]
+async fn a_reply_naming_another_host_than_the_job_repository_host_is_refused() -> TestResult {
+    let held = held_for(forgejo_reply(vec![forgejo_entry(FORGEJO_HOST)])).await?;
+    for ok in [FORGEJO_HOST, "GIT.EXAMPLE.ORG", "git.example.org."] {
+        assert!(held.check_job_host(Some(ok)).is_ok(), "{ok}");
+    }
+    let bad = [
+        Some("github.com"),
+        Some("other.example.org"),
+        Some("git.example.org.evil.example"),
+        Some(""),
+        Some("user@git.example.org"),
+        Some("git.example.org:443"),
+        Some("git.example.org\r\n"),
+        None,
+    ];
+    for repo in bad {
+        assert_eq!(
+            held.check_job_host(repo).err(),
+            Some(CredentialFailure::Malformed),
+            "{repo:?}"
+        );
+    }
+    let pat = held_for(pat_reply(Vec::new())).await?;
+    assert_eq!(
+        pat.check_job_host(Some("github.com")).err(),
+        Some(CredentialFailure::Malformed)
+    );
+    let two = fetch_reply(pat_reply(vec![
+        pat_entry(),
+        host_entry(
+            "other.example.org",
+            "forgejo",
+            Some(wire("forgejo_pat", "static_secret", OTHER_PAT)),
+        ),
+    ]))
+    .await?;
+    assert_eq!(two.err(), Some(CredentialFailure::Malformed));
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_host_entry_outside_the_grammar_or_kind_rules_is_malformed() -> TestResult {
+    let long = format!("{}.example.org", "a".repeat(300));
+    let hosts = [
+        "GIT.Example.ORG".to_owned(),
+        "git.example.org.".to_owned(),
+        "user@git.example.org".to_owned(),
+        "git.example.org:443".to_owned(),
+        "https://git.example.org".to_owned(),
+        "git.example.org/x".to_owned(),
+        "[::1]".to_owned(),
+        "10.0.0.1".to_owned(),
+        "git.example.org\r\n".to_owned(),
+        "git.example.org ".to_owned(),
+        "git.exämple.org".to_owned(),
+        "git..example.org".to_owned(),
+        "localhost".to_owned(),
+        "git.local".to_owned(),
+        long,
+    ];
+    for host in hosts {
+        assert_malformed(&host, forgejo_reply(vec![forgejo_entry(&host)])).await?;
+    }
+    let pat = wire("github_pat", "static_secret", GITHUB);
+    assert_malformed(
+        "unknown kind",
+        forgejo_reply(vec![host_entry(
+            FORGEJO_HOST,
+            "gitea",
+            Some(wire("forgejo_pat", "static_secret", FORGEJO_PAT)),
+        )]),
+    )
+    .await?;
+    assert_malformed(
+        "forgejo kind on github.com",
+        forgejo_reply(vec![host_entry(
+            "github.com",
+            "forgejo",
+            Some(wire("forgejo_pat", "static_secret", FORGEJO_PAT)),
+        )]),
+    )
+    .await?;
+    assert_malformed(
+        "github kind on another host",
+        pat_reply(vec![github_entry(FORGEJO_HOST, pat)]),
+    )
+    .await?;
+    assert_malformed(
+        "missing credential",
+        forgejo_reply(vec![host_entry(FORGEJO_HOST, "forgejo", None)]),
+    )
+    .await
+}
+
+#[tokio::test]
+async fn a_forgejo_host_credential_must_be_a_plain_forgejo_pat() -> TestResult {
+    let bad_credentials = [
+        wire("forgejo_pat", "refreshing_file", FORGEJO_PAT),
+        wire("forgejo_pat", "static_secret", &FORGEJO_PAT.to_uppercase()),
+        wire("forgejo_pat", "static_secret", &FORGEJO_PAT[1..]),
+        wire("forgejo_pat", "static_secret", &format!("{FORGEJO_PAT} ")),
+        wire("github_pat", "static_secret", FORGEJO_PAT),
+        JobCredential {
+            expires_at_ms: Some(1),
+            ..wire("forgejo_pat", "static_secret", FORGEJO_PAT)
+        },
+        JobCredential {
+            git_identity: Some(fleet_proto::v1::GitIdentity {
+                name: BOT_NAME.into(),
+                email: BOT_EMAIL.into(),
+            }),
+            ..wire("forgejo_pat", "static_secret", FORGEJO_PAT)
+        },
+    ];
+    for credential in bad_credentials {
+        let label = format!("{credential:?}");
+        assert_malformed(
+            &label,
+            forgejo_reply(vec![host_entry(FORGEJO_HOST, "forgejo", Some(credential))]),
+        )
+        .await?;
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_reply_with_two_forge_credentials_or_a_repeated_host_is_malformed() -> TestResult {
+    assert_malformed(
+        "two forgejo hosts",
+        forgejo_reply(vec![
+            forgejo_entry(FORGEJO_HOST),
+            forgejo_entry("other.example.org"),
+        ]),
+    )
+    .await?;
+    assert_malformed(
+        "same host twice",
+        forgejo_reply(vec![
+            forgejo_entry(FORGEJO_HOST),
+            forgejo_entry("GIT.example.org"),
+        ]),
+    )
+    .await?;
+    assert_malformed(
+        "github entry twice",
+        pat_reply(vec![pat_entry(), pat_entry()]),
+    )
+    .await?;
+    assert_malformed(
+        "github pat beside a forgejo pat",
+        pat_reply(vec![forgejo_entry(FORGEJO_HOST)]),
+    )
+    .await?;
+    let got = fetch_reply(forgejo_reply(Vec::new())).await?;
+    assert_eq!(got.err(), Some(CredentialFailure::NoGithub));
+    Ok(())
+}
+
+#[tokio::test]
+async fn approved_addresses_follow_the_private_flag_and_the_address_rules() -> TestResult {
+    let with = |allow_private: bool, ips: &[&str]| JobHostCredential {
+        allow_private,
+        approved_ips: ips.iter().map(|ip| (*ip).to_owned()).collect(),
+        ..forgejo_entry(FORGEJO_HOST)
+    };
+    let seventeen: Vec<String> = (1..=17).map(|n| format!("10.0.0.{n}")).collect();
+    let seventeen: Vec<&str> = seventeen.iter().map(String::as_str).collect();
+    let sixteen = &seventeen[..16];
+    let held = held_for(forgejo_reply(vec![with(true, sixteen)])).await?;
+    assert_eq!(
+        held.host(FORGEJO_HOST)
+            .ok_or("no entry")?
+            .approved_ips()
+            .len(),
+        16
+    );
+    held_for(forgejo_reply(vec![with(true, &[])])).await?;
+    held_for(forgejo_reply(vec![with(false, &[])])).await?;
+    let table: [(&str, bool, &[&str]); 14] = [
+        ("addresses without the flag", false, &["192.168.3.1"]),
+        ("over the cap", true, &seventeen),
+        ("not an address", true, &["git.example.org"]),
+        ("with a port", true, &["192.168.3.1:443"]),
+        ("with a space", true, &["192.168.3.1 "]),
+        ("with a zone", true, &["fe80::1%en0"]),
+        ("loopback", true, &["127.0.0.1"]),
+        ("v6 loopback", true, &["::1"]),
+        ("v4 mapped loopback", true, &["::ffff:127.0.0.1"]),
+        ("link local", true, &["169.254.169.254"]),
+        ("v6 link local", true, &["fe80::1"]),
+        ("unspecified", true, &["0.0.0.0"]),
+        ("multicast", true, &["224.0.0.1"]),
+        ("empty text", true, &[""]),
+    ];
+    for (label, allow_private, ips) in table {
+        assert_malformed(label, forgejo_reply(vec![with(allow_private, ips)])).await?;
+    }
     Ok(())
 }

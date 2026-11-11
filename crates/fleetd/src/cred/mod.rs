@@ -42,24 +42,40 @@
 //! A [`TokenLease`] holds a replaced token live until the child that started with it exits, up
 //! to [`DRAIN_LIMIT`].
 //!
+//! The server also sends the Job repository host (`hosts`): its name, kind, `allow_private`,
+//! `approved_ips` and that host's credential (ADR-0068). The holder keys that policy and token by
+//! the normalised host. [`JobCredentials::token_for`] returns the token for the one host asked
+//! about and nothing for any other string, so a name taken from a Job field or a git prompt never
+//! selects another host's token. A Forgejo host carries its `forgejo_pat` only in the host entry;
+//! the `github.com` entry repeats the forge credential of `credentials` and must equal it. An
+//! entry whose `host` is empty is the file-repo form: it carries no host policy, is never a host,
+//! and [`JobCredentials::token_for`] never returns it. It is refused beside a named host.
+//! [`JobCredentials::check_job_host`] refuses a reply whose entries name a host other than the Job
+//! repository host.
+//!
 //! Each revoke runs on its own task, is best effort and never fails the job; a failure logs
 //! [`REVOKE_FAILED`] and nothing else. A PAT job revokes nothing.
 
 use std::collections::HashSet;
 use std::fmt;
+use std::net::IpAddr;
+use std::str::FromStr;
 use std::sync::Arc;
 use std::time::Duration;
 
-use fleet_core::Redactor;
 use fleet_core::credential::{
-    BotIdentity, CredentialKind, CredentialShape, GITHUB_INSTALLATION_TOKEN_PREFIX,
-    MAX_CREDENTIAL_LEN, MIN_CREDENTIAL_LEN, Secret,
+    BotIdentity, CredentialKind, CredentialShape, GITHUB_HOST, GITHUB_INSTALLATION_TOKEN_PREFIX,
+    MAX_CREDENTIAL_LEN, MIN_CREDENTIAL_LEN, Secret, validate,
 };
+use fleet_core::host::{HostKind, HostName};
+use fleet_core::{Redactor, constant_time_eq};
 use fleet_proto::v1::fleet_worker_client::FleetWorkerClient;
-use fleet_proto::v1::{GetJobCredentialsReply, GetJobCredentialsRequest};
+use fleet_proto::v1::{
+    GetJobCredentialsReply, GetJobCredentialsRequest, JobCredential, JobHostCredential,
+};
 use fleet_proto::{
-    GITHUB_INSTALLATION_TOKEN_KIND, MAX_CREDENTIAL_VALUE_BYTES, MAX_CREDENTIALS_PER_USER, Reason,
-    classify,
+    GITHUB_INSTALLATION_TOKEN_KIND, MAX_CREDENTIAL_VALUE_BYTES, MAX_CREDENTIALS_PER_USER,
+    MAX_HOST_APPROVED_IPS, Reason, classify,
 };
 use tonic::metadata::MetadataValue;
 use tonic::service::Interceptor;
@@ -290,11 +306,48 @@ impl Credential {
     }
 }
 
-/// The credentials of one job, one per kind.
+/// The policy and credential the server sent for one host of a job.
+#[derive(Debug, Clone)]
+pub struct HostEntry {
+    host: Option<HostName>,
+    kind: HostKind,
+    allow_private: bool,
+    approved_ips: Vec<IpAddr>,
+    credential: Option<Credential>,
+}
+
+impl HostEntry {
+    /// The normalised host. `None` for the file-repo form, which carries no host policy.
+    #[must_use]
+    pub fn host(&self) -> Option<&str> {
+        self.host.as_ref().map(HostName::as_str)
+    }
+
+    /// The kind of the host.
+    #[must_use]
+    pub const fn kind(&self) -> HostKind {
+        self.kind
+    }
+
+    /// True when an admin approved the host for private addresses.
+    #[must_use]
+    pub const fn allow_private(&self) -> bool {
+        self.allow_private
+    }
+
+    /// The private addresses the admin approved. Empty unless [`HostEntry::allow_private`].
+    #[must_use]
+    pub fn approved_ips(&self) -> &[IpAddr] {
+        &self.approved_ips
+    }
+}
+
+/// The credentials of one job, one per kind, and the policy and token of each host.
 #[derive(Debug)]
 pub struct JobCredentials {
     items: Vec<Credential>,
     identity: Option<BotIdentity>,
+    hosts: Vec<HostEntry>,
 }
 
 impl JobCredentials {
@@ -335,19 +388,93 @@ impl JobCredentials {
         if items.iter().filter(|c| c.kind.is_forge()).count() > 1 {
             return Err(CredentialFailure::Malformed);
         }
+        let forge = items.iter().find(|c| c.kind.is_forge());
+        let hosts = reply
+            .hosts
+            .into_iter()
+            .map(|wire| host_entry(wire, forge))
+            .collect::<Result<Vec<_>, _>>()?;
+        let mut seen_hosts = HashSet::new();
+        let forgejo = hosts.iter().filter(|h| h.credential.is_some()).count();
+        if !hosts.iter().all(|h| seen_hosts.insert(h.host.clone()))
+            || forgejo > 1
+            || (hosts.len() > 1 && hosts.iter().any(|h| h.host.is_none()))
+            || (forgejo == 1 && forge.is_some())
+        {
+            return Err(CredentialFailure::Malformed);
+        }
         let identity = identity
             .map(|wire| {
                 BotIdentity::new(&wire.name, &wire.email)
                     .map_err(|_| CredentialFailure::AppIdentityInvalid)
             })
             .transpose()?;
-        if !items.iter().any(|c| c.kind.is_forge()) {
+        if forgejo == 0 && forge.is_none() {
             return Err(CredentialFailure::NoGithub);
         }
         if items.iter().all(|c| c.kind.is_forge()) {
             return Err(CredentialFailure::NoAgent);
         }
-        Ok(Self { items, identity })
+        Ok(Self {
+            items,
+            identity,
+            hosts,
+        })
+    }
+
+    /// The policy entries the server sent, in reply order.
+    #[must_use]
+    pub fn hosts(&self) -> &[HostEntry] {
+        &self.hosts
+    }
+
+    /// The entry for `host`, matched on its normalised form. `None` for an empty string, a
+    /// string outside the host grammar (userinfo, port, scheme, whitespace, an IP literal), and
+    /// a host the reply did not name. The file-repo entry is never returned.
+    #[must_use]
+    pub fn host(&self, host: &str) -> Option<&HostEntry> {
+        let name = HostName::normalise(host).ok()?;
+        self.hosts
+            .iter()
+            .find(|entry| entry.host.as_ref() == Some(&name))
+    }
+
+    /// The token stored for `host` and no other: the forge credential for `github.com`, the
+    /// `forgejo_pat` for a Forgejo host. `None` for any host the reply did not name.
+    #[must_use]
+    pub fn token_for(&self, host: &str) -> Option<&Secret> {
+        let entry = self.host(host)?;
+        match entry.kind {
+            HostKind::Github => self.github(),
+            HostKind::Forgejo => entry.credential.as_ref().map(Credential::value),
+        }
+    }
+
+    /// [`JobCredentials::token_for`] as text. `None` when the token is not UTF-8.
+    #[must_use]
+    pub fn token_str_for(&self, host: &str) -> Option<&str> {
+        self.token_for(host)
+            .and_then(|secret| std::str::from_utf8(secret.expose()).ok())
+    }
+
+    /// Checks that the reply names the Job repository host and no other host.
+    ///
+    /// `repo_host` is `None` for a file repository, whose reply holds one entry with an empty
+    /// host. A repository host that is outside the host grammar, a reply with no entry, an entry
+    /// for another host and an empty-host entry beside a real repository host all fail.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CredentialFailure::Malformed`] when the entries do not match `repo_host`.
+    pub fn check_job_host(&self, repo_host: Option<&str>) -> Result<(), CredentialFailure> {
+        let want = repo_host
+            .map(HostName::normalise)
+            .transpose()
+            .map_err(|_| CredentialFailure::Malformed)?;
+        if self.hosts.is_empty() || self.hosts.iter().any(|entry| entry.host != want) {
+            return Err(CredentialFailure::Malformed);
+        }
+        Ok(())
     }
 
     /// The credential of `kind`, if the job has one.
@@ -405,6 +532,15 @@ impl JobCredentials {
         if token.expires_at_ms.is_none() {
             return Err(CredentialFailure::Malformed);
         }
+        let same_hosts = self.hosts.len() == fresh.hosts.len()
+            && self
+                .hosts
+                .iter()
+                .zip(&fresh.hosts)
+                .all(|(held, new)| held.host == new.host && held.kind == new.kind);
+        if !same_hosts {
+            return Err(CredentialFailure::Malformed);
+        }
         let items = self
             .items
             .iter()
@@ -413,6 +549,7 @@ impl JobCredentials {
         Ok(Self {
             items,
             identity: fresh.identity.clone(),
+            hosts: fresh.hosts.clone(),
         })
     }
 
@@ -441,7 +578,11 @@ impl JobCredentials {
     /// drops. The copies live as long as the redactor, so drop it when the job ends.
     #[must_use]
     pub fn redactor(&self) -> Redactor {
-        let redactor = Redactor::new(self.items.iter().filter_map(|c| {
+        let held = self
+            .items
+            .iter()
+            .chain(self.hosts.iter().filter_map(|h| h.credential.as_ref()));
+        let redactor = Redactor::new(held.filter_map(|c| {
             std::str::from_utf8(c.value.expose())
                 .ok()
                 .map(str::to_owned)
@@ -460,6 +601,103 @@ impl<'a> IntoIterator for &'a JobCredentials {
 
     fn into_iter(self) -> Self::IntoIter {
         self.iter()
+    }
+}
+
+fn host_entry(
+    wire: JobHostCredential,
+    forge: Option<&Credential>,
+) -> Result<HostEntry, CredentialFailure> {
+    let malformed = CredentialFailure::Malformed;
+    let kind = HostKind::from_stored(&wire.host_kind).ok_or(malformed)?;
+    let host = if wire.host.is_empty() {
+        None
+    } else {
+        let name = HostName::normalise(&wire.host).map_err(|_| malformed)?;
+        if name.as_str() != wire.host {
+            return Err(malformed);
+        }
+        Some(name)
+    };
+    let is_github = host.as_ref().is_none_or(|h| h.as_str() == GITHUB_HOST);
+    if is_github != (kind == HostKind::Github) {
+        return Err(malformed);
+    }
+    if !wire.allow_private && !wire.approved_ips.is_empty() {
+        return Err(malformed);
+    }
+    if wire.approved_ips.len() > MAX_HOST_APPROVED_IPS || (host.is_none() && wire.allow_private) {
+        return Err(malformed);
+    }
+    let approved_ips = wire
+        .approved_ips
+        .iter()
+        .map(|text| IpAddr::from_str(text).map_err(|_| malformed))
+        .collect::<Result<Vec<_>, _>>()?;
+    if approved_ips.iter().any(|ip| !is_approvable(ip)) {
+        return Err(malformed);
+    }
+    let sent = wire.credential.ok_or(malformed)?;
+    let credential = match kind {
+        HostKind::Github => {
+            let forge = forge.ok_or(malformed)?;
+            if sent.kind != forge_wire_kind(forge.kind)
+                || !constant_time_eq(sent.value.as_bytes(), forge.value.expose())
+            {
+                return Err(malformed);
+            }
+            None
+        }
+        HostKind::Forgejo => Some(forgejo_credential(sent)?),
+    };
+    Ok(HostEntry {
+        host,
+        kind,
+        allow_private: wire.allow_private,
+        approved_ips,
+        credential,
+    })
+}
+
+fn forgejo_credential(wire: JobCredential) -> Result<Credential, CredentialFailure> {
+    let value = Zeroizing::new(wire.value);
+    if wire.kind != CredentialKind::ForgejoPat.wire_name()
+        || wire.shape != CredentialShape::StaticSecret.wire_name()
+        || wire.expires_at_ms.is_some()
+        || wire.git_identity.is_some()
+        || validate(
+            CredentialKind::ForgejoPat,
+            CredentialShape::StaticSecret,
+            &value,
+        )
+        .is_err()
+    {
+        return Err(CredentialFailure::Malformed);
+    }
+    Ok(Credential {
+        kind: CredentialKind::ForgejoPat,
+        value: Arc::new(Secret::new(value.to_string())),
+        expires_at_ms: None,
+    })
+}
+
+fn forge_wire_kind(kind: CredentialKind) -> &'static str {
+    if kind == CredentialKind::GithubApp {
+        GITHUB_INSTALLATION_TOKEN_KIND
+    } else {
+        kind.wire_name()
+    }
+}
+
+fn is_approvable(ip: &IpAddr) -> bool {
+    let ip = ip.to_canonical();
+    !(ip.is_loopback() || ip.is_unspecified() || ip.is_multicast() || is_link_local(&ip))
+}
+
+fn is_link_local(ip: &IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(v4) => v4.is_link_local() || v4.is_broadcast(),
+        IpAddr::V6(v6) => (v6.segments()[0] & 0xffc0) == 0xfe80,
     }
 }
 
