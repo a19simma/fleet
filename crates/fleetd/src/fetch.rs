@@ -34,7 +34,7 @@ use tokio_rustls::TlsConnector;
 use tokio_rustls::client::TlsStream;
 
 use crate::fetch_policy::{FetchCaps, FetchPolicy};
-use crate::netguard::{ParsedTarget, UrlRefusal, precheck_url};
+use crate::netguard::{ParsedTarget, RepoHostAdmission, UrlRefusal, precheck_url};
 
 /// Why a fetch ended without a body. Display text is fixed and holds nothing from the network.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -481,9 +481,25 @@ impl<R: Resolver, D: Dialer> Fetcher<R, D> {
     /// [`FetchError::BodyTooLarge`] or [`FetchError::DecodedTooLarge`] for the body, and
     /// [`FetchError::Timeout`] past the total deadline.
     pub async fn fetch(&self, url: &str) -> Result<Fetched, FetchError> {
-        let landed = timeout(self.caps.total_timeout, self.follow(url, Mode::Text))
-            .await
-            .map_err(|_| FetchError::Timeout)??;
+        self.fetch_for(url, None).await
+    }
+
+    /// [`Fetcher::fetch`] for a Job that holds a repository host admission: that one host passes
+    /// the host policy, and its approved addresses pass the address check, on every hop.
+    ///
+    /// # Errors
+    /// The [`FetchError`] of [`Fetcher::fetch`].
+    pub async fn fetch_for(
+        &self,
+        url: &str,
+        admission: Option<&RepoHostAdmission>,
+    ) -> Result<Fetched, FetchError> {
+        let landed = timeout(
+            self.caps.total_timeout,
+            self.follow(url, Mode::Text, admission),
+        )
+        .await
+        .map_err(|_| FetchError::Timeout)??;
         match landed {
             Landed::Text(fetched) => Ok(fetched),
             Landed::Stream(_) => Err(FetchError::Protocol),
@@ -498,7 +514,7 @@ impl<R: Resolver, D: Dialer> Fetcher<R, D> {
     /// Returns the [`FetchError`] for the first rule the open breaks.
     pub async fn open(&self, url: &str) -> Result<FetchStream, FetchError> {
         let deadline = Instant::now() + self.caps.total_timeout;
-        let landed = timeout_at(deadline, self.follow(url, Mode::Stream))
+        let landed = timeout_at(deadline, self.follow(url, Mode::Stream, None))
             .await
             .map_err(|_| FetchError::Timeout)??;
         match landed {
@@ -510,14 +526,19 @@ impl<R: Resolver, D: Dialer> Fetcher<R, D> {
         }
     }
 
-    async fn follow(&self, url: &str, mode: Mode) -> Result<Landed, FetchError> {
+    async fn follow(
+        &self,
+        url: &str,
+        mode: Mode,
+        admission: Option<&RepoHostAdmission>,
+    ) -> Result<Landed, FetchError> {
         if !self.caps.url_within_cap(url) {
             return Err(FetchError::Refused(UrlRefusal::TooLong));
         }
         let mut target = precheck_url(url).map_err(FetchError::Refused)?;
         let mut redirects = 0_u8;
         loop {
-            match self.hop(&target, mode).await? {
+            match self.hop(&target, mode, admission).await? {
                 Hop::Done(mut landed) => {
                     match &mut landed {
                         Landed::Text(fetched) => fetched.redirects = redirects,
@@ -536,11 +557,18 @@ impl<R: Resolver, D: Dialer> Fetcher<R, D> {
         }
     }
 
-    async fn hop(&self, target: &ParsedTarget, mode: Mode) -> Result<Hop, FetchError> {
-        if !self.policy.permits_host(&target.host) {
+    async fn hop(
+        &self,
+        target: &ParsedTarget,
+        mode: Mode,
+        admission: Option<&RepoHostAdmission>,
+    ) -> Result<Hop, FetchError> {
+        if !self.policy.permits_host(&target.host)
+            && !admission.is_some_and(|a| a.permits_host(&target.host))
+        {
             return Err(FetchError::HostNotPermitted);
         }
-        let ips = self.checked_addresses(&target.host).await?;
+        let ips = self.checked_addresses(&target.host, admission).await?;
         let stream = timeout(self.caps.connect_timeout, self.connect(target, &ips))
             .await
             .map_err(|_| FetchError::ConnectTimeout)??;
@@ -576,7 +604,11 @@ impl<R: Resolver, D: Dialer> Fetcher<R, D> {
         })
     }
 
-    async fn checked_addresses(&self, host: &str) -> Result<Vec<IpAddr>, FetchError> {
+    async fn checked_addresses(
+        &self,
+        host: &str,
+        admission: Option<&RepoHostAdmission>,
+    ) -> Result<Vec<IpAddr>, FetchError> {
         let ips = match host.parse::<IpAddr>() {
             Ok(ip) => vec![ip],
             Err(_) => self
@@ -588,7 +620,10 @@ impl<R: Resolver, D: Dialer> Fetcher<R, D> {
         if ips.is_empty() {
             return Err(FetchError::Resolve);
         }
-        if !ips.iter().all(|ip| self.policy.permits_address(*ip)) {
+        if !ips.iter().all(|ip| {
+            self.policy.permits_address(*ip)
+                || admission.is_some_and(|a| a.permits_address(host, *ip))
+        }) {
             return Err(FetchError::NonPublicAddress);
         }
         Ok(ips)
@@ -985,6 +1020,87 @@ mod tests {
 
     async fn run(f: &Fetcher<Arc<Fake>, Arc<Local>>, url: &str) -> Result<Fetched, FetchError> {
         timeout(OUTER, f.fetch(url)).await.expect("outer timeout")
+    }
+
+    fn repo(host: &str, ips: &[IpAddr]) -> RepoHostAdmission {
+        RepoHostAdmission::new(host, !ips.is_empty(), ips).expect("admission")
+    }
+
+    async fn run_for(
+        f: &Fetcher<Arc<Fake>, Arc<Local>>,
+        url: &str,
+        admission: Option<&RepoHostAdmission>,
+    ) -> Result<Fetched, FetchError> {
+        timeout(OUTER, f.fetch_for(url, admission))
+            .await
+            .expect("outer timeout")
+    }
+
+    #[tokio::test]
+    async fn the_admitted_host_passes_an_allowlist_that_omits_it_and_no_other_does() {
+        let server = serve(text("repo page")).await;
+        let resolver = Arc::new(Fake::new(vec![public()]));
+        let policy = FetchPolicy::Allowlist(vec![HostPattern::parse("c.example.test").unwrap()]);
+        let f = fetcher(&server, &resolver, policy, caps());
+        let a = repo("a.example.test", &[]);
+        assert!(matches!(
+            run_for(&f, "https://a.example.test/", None).await,
+            Err(FetchError::HostNotPermitted)
+        ));
+        assert_eq!(
+            run_for(&f, "https://a.example.test/", Some(&a))
+                .await
+                .expect("admitted")
+                .body,
+            "repo page"
+        );
+        assert!(matches!(
+            run_for(&f, "https://b.example.test/", Some(&a)).await,
+            Err(FetchError::HostNotPermitted)
+        ));
+        assert!(matches!(
+            run_for(&f, "https://A.example.test./", Some(&a)).await,
+            Err(FetchError::Refused(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn an_approved_private_address_passes_for_the_admitted_host_only() {
+        let server = serve(text("private page")).await;
+        let private = IpAddr::V4(PRIVATE);
+        let other = IpAddr::V4(Ipv4Addr::new(10, 0, 0, 6));
+        let resolver = Arc::new(Fake::new(vec![vec![private]]));
+        let f = fetcher(&server, &resolver, FetchPolicy::default(), caps());
+        let a = repo("a.example.test", &[private]);
+        assert!(matches!(
+            run_for(&f, "https://a.example.test/", None).await,
+            Err(FetchError::NonPublicAddress)
+        ));
+        assert_eq!(
+            run_for(&f, "https://a.example.test/", Some(&a))
+                .await
+                .expect("approved")
+                .body,
+            "private page"
+        );
+        assert_eq!(server.local.dialed(), vec![SocketAddr::new(private, 443)]);
+        assert!(matches!(
+            run_for(&f, "https://b.example.test/", Some(&a)).await,
+            Err(FetchError::NonPublicAddress)
+        ));
+        let rebinding = Arc::new(Fake::new(vec![vec![other]]));
+        let g = fetcher(&server, &rebinding, FetchPolicy::default(), caps());
+        assert!(matches!(
+            run_for(&g, "https://a.example.test/", Some(&a)).await,
+            Err(FetchError::NonPublicAddress)
+        ));
+        let mixed = Arc::new(Fake::new(vec![vec![private, other]]));
+        let h = fetcher(&server, &mixed, FetchPolicy::default(), caps());
+        assert!(matches!(
+            run_for(&h, "https://a.example.test/", Some(&a)).await,
+            Err(FetchError::NonPublicAddress)
+        ));
+        assert_eq!(server.local.dialed().len(), 1);
     }
 
     #[tokio::test]

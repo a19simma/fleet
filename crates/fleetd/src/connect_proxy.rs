@@ -40,7 +40,7 @@ use tokio::time::{Instant, sleep_until, timeout};
 use crate::fetch::{Dialer, Resolver};
 use crate::fetch_policy::HostPattern;
 use crate::jobsock::{JobContext, ServeFuture, Service};
-use crate::netguard::is_public_address;
+use crate::netguard::{RepoHostAdmission, RepoHostBook, RepoHostGuard, addresses_permitted};
 
 /// The model API host of the claude runner, allowed to a Job that was never narrowed.
 pub const MODEL_API_HOST: &str = "api.anthropic.com";
@@ -225,6 +225,7 @@ pub struct ConnectProxy<R, D> {
     resolver: R,
     dialer: D,
     jobs: Jobs,
+    repo_hosts: RepoHostBook,
     observe: bool,
     observed: Mutex<HashSet<String>>,
 }
@@ -249,6 +250,7 @@ impl<R: Resolver, D: Dialer> ConnectProxy<R, D> {
             resolver,
             dialer,
             jobs: Mutex::default(),
+            repo_hosts: RepoHostBook::default(),
             observe: false,
             observed: Mutex::default(),
         }
@@ -289,8 +291,18 @@ impl<R: Resolver, D: Dialer> ConnectProxy<R, D> {
             .unwrap_or_default()
     }
 
-    /// Drops the counters of a finished Job.
+    /// Admits the Job repository host for `job_id` beyond the `egress_allow` ceiling and beyond a
+    /// [`ConnectProxy::set_job_hosts`] narrowing: that one host, and for an `allow_private` host
+    /// its approved addresses, for this Job only. No other host is admitted. The guard clears the
+    /// admission when dropped; [`ConnectProxy::forget`] clears it too.
+    #[must_use]
+    pub fn admit_repo_host(&self, job_id: &str, admission: RepoHostAdmission) -> RepoHostGuard {
+        self.repo_hosts.admit(job_id, admission)
+    }
+
+    /// Drops the counters and the repository host admission of a finished Job.
     pub fn forget(&self, job_id: &str) {
+        self.repo_hosts.forget(job_id);
         self.jobs
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
@@ -330,6 +342,13 @@ impl<R: Resolver, D: Dialer> ConnectProxy<R, D> {
     }
 
     fn allowed(&self, job_id: &str, host: &str) -> bool {
+        if self
+            .repo_hosts
+            .get(job_id)
+            .is_some_and(|admission| admission.permits_host(host))
+        {
+            return true;
+        }
         let jobs = self.jobs.lock().unwrap_or_else(PoisonError::into_inner);
         jobs.get(job_id)
             .and_then(|counts| counts.hosts.as_ref())
@@ -387,10 +406,11 @@ impl<R: Resolver, D: Dialer> ConnectProxy<R, D> {
         timeout(self.limits.header_timeout, read).await.ok()?
     }
 
-    async fn connect(&self, host: &str) -> Option<TcpStream> {
+    async fn connect(&self, job_id: &str, host: &str) -> Option<TcpStream> {
+        let admission = self.repo_hosts.get(job_id);
         let attempt = async {
             let ips = self.resolver.resolve(host).await.ok()?;
-            if ips.is_empty() || !ips.iter().all(|ip| is_public_address(*ip)) {
+            if !addresses_permitted(host, &ips, admission.as_deref()) {
                 return None;
             }
             for ip in ips {
@@ -425,7 +445,7 @@ impl<R: Resolver, D: Dialer> ConnectProxy<R, D> {
                 return None;
             }
             let tunnel = self.reserve(job_id)?;
-            let upstream = self.connect(&host).await?;
+            let upstream = self.connect(job_id, &host).await?;
             Some((tunnel, upstream))
         }
         .await;
@@ -1871,6 +1891,119 @@ mod tests {
             assert!(proxy.allowed("job1", "api.example"));
             assert!(!proxy.allowed("job1", literal), "{literal}");
         }
+    }
+
+    const REPO: &str = "git.example.test";
+    const PRIVATE: IpAddr = IpAddr::V4(Ipv4Addr::new(10, 0, 0, 5));
+    const OTHER_PRIVATE: IpAddr = IpAddr::V4(Ipv4Addr::new(10, 0, 0, 6));
+
+    fn repo_admission(
+        ips: &[IpAddr],
+    ) -> Result<RepoHostAdmission, crate::netguard::AdmissionError> {
+        RepoHostAdmission::new(REPO, !ips.is_empty(), ips)
+    }
+
+    #[tokio::test]
+    async fn the_repo_host_is_admitted_beyond_the_ceiling_and_a_declared_host_is_not() -> TestResult
+    {
+        let rig = Rig::start(Setup::default()).await?;
+        let _guard = rig.proxy.admit_repo_host("job1", repo_admission(&[])?);
+        assert_eq!(rig.proxy.set_job_hosts("job1", &["script.example.test"]), 0);
+        assert!(connect_status(&rig, REPO).await?);
+        assert!(connect_status(&rig, "GIT.Example.Test.").await?);
+        assert!(!connect_status(&rig, "script.example.test").await?);
+        assert!(!connect_status(&rig, "x.git.example.test").await?);
+        assert!(!connect_status(&rig, "api.anthropic.com").await?);
+        assert!(rig.resolver.queries().iter().all(|query| query == REPO));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn an_approved_private_address_is_dialled_for_the_repo_host_only() -> TestResult {
+        let rig = Rig::start(Setup {
+            allow: vec!["other.example.test"],
+            answers: vec![vec![PRIVATE]],
+            ..Setup::default()
+        })
+        .await?;
+        assert!(!connect_status(&rig, REPO).await?);
+        let _guard = rig
+            .proxy
+            .admit_repo_host("job1", repo_admission(&[PRIVATE])?);
+        assert!(connect_status(&rig, REPO).await?);
+        assert_eq!(rig.dialer.dialed(), vec![SocketAddr::new(PRIVATE, 443)]);
+        assert!(!connect_status(&rig, "other.example.test").await?);
+        assert_eq!(rig.dialer.dialed().len(), 1);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn the_address_is_checked_at_connect_time_against_every_answer() -> TestResult {
+        let rig = Rig::start(Setup {
+            answers: vec![
+                vec![PRIVATE],
+                vec![OTHER_PRIVATE],
+                vec![PRIVATE, PUBLIC],
+                vec![PRIVATE, OTHER_PRIVATE],
+            ],
+            ..Setup::default()
+        })
+        .await?;
+        let _guard = rig
+            .proxy
+            .admit_repo_host("job1", repo_admission(&[PRIVATE])?);
+        assert!(connect_status(&rig, REPO).await?);
+        assert!(!connect_status(&rig, REPO).await?);
+        assert!(connect_status(&rig, REPO).await?);
+        assert!(!connect_status(&rig, REPO).await?);
+        assert_eq!(rig.dialer.dialed().len(), 2);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_private_answer_is_refused_without_the_private_flag() -> TestResult {
+        let rig = Rig::start(Setup {
+            answers: vec![vec![PRIVATE]],
+            ..Setup::default()
+        })
+        .await?;
+        let _guard = rig.proxy.admit_repo_host("job1", repo_admission(&[])?);
+        assert!(!connect_status(&rig, REPO).await?);
+        assert_eq!(rig.dialer.dialed().len(), 0);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn the_admission_is_per_job_and_ends_with_the_guard_or_forget() -> TestResult {
+        let rig = Rig::start(Setup::default()).await?;
+        let guard = rig.proxy.admit_repo_host("job1", repo_admission(&[])?);
+        assert!(rig.proxy.allowed("job1", REPO));
+        assert!(!rig.proxy.allowed("job2", REPO));
+        drop(guard);
+        assert!(!rig.proxy.allowed("job1", REPO));
+        assert!(!connect_status(&rig, REPO).await?);
+        let _held = rig.proxy.admit_repo_host("job1", repo_admission(&[])?);
+        rig.proxy.forget("job1");
+        assert!(!connect_status(&rig, REPO).await?);
+        assert_eq!(rig.dialer.dialed().len(), 0);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_second_job_does_not_inherit_the_first_jobs_admission() -> TestResult {
+        let rig = Rig::start(Setup::default()).await?;
+        let first = rig.proxy.admit_repo_host("job1", repo_admission(&[])?);
+        rig.proxy.forget("job1");
+        drop(first);
+        assert!(!rig.proxy.allowed("job1", REPO));
+        let _second = rig.proxy.admit_repo_host(
+            "job2",
+            RepoHostAdmission::new("other.example.test", false, &[])?,
+        );
+        assert!(!rig.proxy.allowed("job1", "other.example.test"));
+        assert!(!rig.proxy.allowed("job2", REPO));
+        assert!(rig.proxy.allowed("job2", "other.example.test"));
+        Ok(())
     }
 
     #[tokio::test]

@@ -44,6 +44,7 @@ use crate::feed::Feed;
 use crate::fetch::{Dialer, FetchError, Fetcher, Resolver};
 use crate::fetch_policy::{FetchCaps, FetchPolicy};
 use crate::jobsock::{JobContext, MAX_FRAME_BYTES, ServeFuture, Service, read_frame, write_frame};
+use crate::netguard::{RepoHostAdmission, RepoHostBook, RepoHostGuard};
 use crate::netguard::{UrlRefusal, precheck_url};
 use crate::telemetry::{FetchPhase, FetchRecordError};
 
@@ -245,6 +246,7 @@ pub struct FetchService<Rec, R, D> {
     fetcher: Fetcher<R, D>,
     recorder: Rec,
     jobs: Mutex<HashMap<String, JobCounts>>,
+    repo_hosts: RepoHostBook,
 }
 
 impl<Rec, R, D> fmt::Debug for FetchService<Rec, R, D> {
@@ -274,11 +276,21 @@ impl<Rec: FetchRecorder, R: Resolver, D: Dialer> FetchService<Rec, R, D> {
             fetcher,
             recorder,
             jobs: Mutex::default(),
+            repo_hosts: RepoHostBook::default(),
         }
     }
 
-    /// Drops the counters of a finished Job.
+    /// Admits the Job repository host for `job_id`: that one host passes the host policy, and
+    /// its approved private addresses pass the address check, for this Job only. The guard
+    /// clears the admission when dropped; [`FetchService::forget`] clears it too.
+    #[must_use]
+    pub fn admit_repo_host(&self, job_id: &str, admission: RepoHostAdmission) -> RepoHostGuard {
+        self.repo_hosts.admit(job_id, admission)
+    }
+
+    /// Drops the counters and the repository host admission of a finished Job.
     pub fn forget(&self, job_id: &str) {
+        self.repo_hosts.forget(job_id);
         self.jobs
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
@@ -301,7 +313,8 @@ impl<Rec: FetchRecorder, R: Resolver, D: Dialer> FetchService<Rec, R, D> {
             return Err(Refusal::LeaseLost.message().to_owned());
         }
         let request = Request::parse(frame).map_err(|refusal| refusal.message().to_owned())?;
-        self.precheck(&request.url)?;
+        let admission = self.repo_hosts.get(job_id);
+        self.precheck(&request.url, admission.as_deref())?;
         let _slot = self
             .reserve(job_id)
             .map_err(|refusal| refusal.message().to_owned())?;
@@ -323,7 +336,10 @@ impl<Rec: FetchRecorder, R: Resolver, D: Dialer> FetchService<Rec, R, D> {
             url: &request.url,
             armed: true,
         };
-        let result = self.fetcher.fetch(&request.url).await;
+        let result = self
+            .fetcher
+            .fetch_for(&request.url, admission.as_deref())
+            .await;
         let phase = match &result {
             Ok(fetched) => FetchPhase::Succeeded {
                 status: fetched.status,
@@ -350,13 +366,15 @@ impl<Rec: FetchRecorder, R: Resolver, D: Dialer> FetchService<Rec, R, D> {
         }
     }
 
-    fn precheck(&self, url: &str) -> Result<(), String> {
+    fn precheck(&self, url: &str, admission: Option<&RepoHostAdmission>) -> Result<(), String> {
         if !self.caps.url_within_cap(url) {
             return Err(FetchError::Refused(UrlRefusal::TooLong).to_string());
         }
         let target =
             precheck_url(url).map_err(|refusal| FetchError::Refused(refusal).to_string())?;
-        if !self.policy.permits_host(&target.host) {
+        if !self.policy.permits_host(&target.host)
+            && !admission.is_some_and(|a| a.permits_host(&target.host))
+        {
             return Err(FetchError::HostNotPermitted.to_string());
         }
         Ok(())
@@ -765,6 +783,44 @@ mod tests {
         );
         assert_eq!(count.network(), 0);
         assert_eq!(entries(&log), Vec::<String>::new());
+    }
+
+    #[tokio::test]
+    async fn the_admitted_repo_host_passes_the_allowlist_for_its_job_only_until_the_guard_drops() {
+        let log = Log::default();
+        let count = Count::new(&log);
+        let recorder = Recorder::new(&log, false);
+        let policy = FetchPolicy::Allowlist(vec![HostPattern::parse("docs.example.test").unwrap()]);
+        let svc = build(
+            policy,
+            caps(),
+            MAX_CONCURRENT_FETCHES,
+            &count,
+            RootCertStore::empty(),
+            Arc::clone(&recorder),
+        );
+        let refused = Err("fetch host not permitted".to_owned());
+        let guard = svc.admit_repo_host(
+            "j",
+            RepoHostAdmission::new("a.example.test", false, &[]).unwrap(),
+        );
+        assert_eq!(
+            run(&svc, "j", GOOD).await.err().as_deref(),
+            Some("fetch connect failed")
+        );
+        assert_eq!(run(&svc, "other", GOOD).await, refused);
+        assert_eq!(
+            run(&svc, "j", br#"{"url":"https://b.example.test/"}"#).await,
+            refused
+        );
+        drop(guard);
+        assert_eq!(run(&svc, "j", GOOD).await, refused);
+        let _held = svc.admit_repo_host(
+            "j",
+            RepoHostAdmission::new("a.example.test", false, &[]).unwrap(),
+        );
+        svc.forget("j");
+        assert_eq!(run(&svc, "j", GOOD).await, refused);
     }
 
     #[tokio::test]

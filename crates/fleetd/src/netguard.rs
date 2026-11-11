@@ -8,7 +8,11 @@
 //! AS112 ranges) and `2002::/16` (6to4, which can embed a global IPv4 address). The `ORCHIDv2`
 //! block `2001:20::/28` is not listed.
 
+use std::collections::HashMap;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+use std::sync::{Arc, Mutex, PoisonError};
+
+use fleet_core::host::HostName;
 
 /// An IPv4 block as a base address and a prefix length.
 pub type V4Block = (Ipv4Addr, u8);
@@ -81,6 +85,223 @@ pub fn is_public_address(ip: IpAddr) -> bool {
     match ip {
         IpAddr::V4(v4) => public_v4(v4),
         IpAddr::V6(v6) => v6.to_ipv4_mapped().map_or_else(|| public_v6(v6), public_v4),
+    }
+}
+
+/// Why a [`RepoHostAdmission`] was refused. Display text is fixed and holds no part of the input.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AdmissionError {
+    /// The host is empty or fails the shared [`HostName`] grammar.
+    Host,
+    /// `approved_ips` is non-empty without `allow_private`, or holds more than
+    /// [`MAX_ADMISSION_IPS`] addresses.
+    Approval,
+    /// An approved address is loopback, link-local, unspecified, multicast, broadcast, a metadata
+    /// address, or a form that embeds one (v4-mapped, v4-compatible, NAT64, 6to4).
+    Address,
+}
+
+impl std::fmt::Display for AdmissionError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::Host => "repository host is invalid",
+            Self::Approval => "repository host approval is invalid",
+            Self::Address => "repository host approved address is refused",
+        })
+    }
+}
+
+impl std::error::Error for AdmissionError {}
+
+/// Most approved addresses one admission holds.
+pub const MAX_ADMISSION_IPS: usize = 16;
+
+const METADATA_V4: &[Ipv4Addr] = &[
+    Ipv4Addr::new(169, 254, 169, 254),
+    Ipv4Addr::new(100, 100, 100, 200),
+    Ipv4Addr::new(192, 0, 0, 192),
+    Ipv4Addr::new(168, 63, 129, 16),
+];
+
+const METADATA_V6: Ipv6Addr = Ipv6Addr::new(0xfd00, 0x0ec2, 0, 0, 0, 0, 0, 0x0254);
+
+fn approvable_v4(ip: Ipv4Addr) -> bool {
+    !(ip.is_loopback()
+        || ip.is_unspecified()
+        || ip.is_multicast()
+        || ip.is_link_local()
+        || ip.is_broadcast()
+        || in_v4((Ipv4Addr::UNSPECIFIED, 8), ip)
+        || in_v4((Ipv4Addr::new(240, 0, 0, 0), 4), ip)
+        || METADATA_V4.contains(&ip))
+}
+
+/// Whether an address may be approved for a private host.
+///
+/// Never loopback, link-local, unspecified, multicast, a metadata address, or a v4-mapped,
+/// v4-compatible, NAT64 or 6to4 form of those. This is the box's own rule and does not trust
+/// the server's validation.
+#[must_use]
+pub fn is_approvable_address(ip: IpAddr) -> bool {
+    match ip.to_canonical() {
+        IpAddr::V4(v4) => approvable_v4(v4),
+        IpAddr::V6(v6) => {
+            let seg = v6.segments();
+            let embeds = seg.iter().take(6).all(|s| *s == 0)
+                || in_v6((Ipv6Addr::new(0x64, 0xff9b, 0, 0, 0, 0, 0, 0), 96), v6)
+                || in_v6((Ipv6Addr::new(0x64, 0xff9b, 1, 0, 0, 0, 0, 0), 48), v6)
+                || in_v6((Ipv6Addr::new(0x2002, 0, 0, 0, 0, 0, 0, 0), 16), v6);
+            !(embeds
+                || v6.is_loopback()
+                || v6.is_unspecified()
+                || v6.is_multicast()
+                || (seg[0] & 0xffc0) == 0xfe80
+                || v6 == METADATA_V6)
+        }
+    }
+}
+
+/// The one host a Job's repository policy admits beyond the operator ceiling, and the private
+/// addresses the admin approved for it.
+///
+/// The host is the Job repository host only, normalised through [`HostName`]. A host that a
+/// script, tool or profile names is never an admission. An address is admitted only when the
+/// candidate host equals this host, `allow_private` is set, the address is in the approved list
+/// and the box re-validates it with [`is_approvable_address`]. Callers check the address
+/// each answer of the resolver gives, at connect time, never an earlier lookup.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RepoHostAdmission {
+    host: String,
+    approved: Vec<IpAddr>,
+}
+
+impl RepoHostAdmission {
+    /// Builds an admission for `host`. `approved_ips` must be empty unless `allow_private`.
+    ///
+    /// # Errors
+    ///
+    /// [`AdmissionError`] for a bad host, an approval without the flag or over the cap, or any
+    /// approved address that is not approvable. One bad address refuses the whole admission.
+    pub fn new(
+        host: &str,
+        allow_private: bool,
+        approved_ips: &[IpAddr],
+    ) -> Result<Self, AdmissionError> {
+        let name = HostName::normalise(host).map_err(|_| AdmissionError::Host)?;
+        if name.as_str() != host {
+            return Err(AdmissionError::Host);
+        }
+        if (!allow_private && !approved_ips.is_empty()) || approved_ips.len() > MAX_ADMISSION_IPS {
+            return Err(AdmissionError::Approval);
+        }
+        if approved_ips.iter().any(|ip| !is_approvable_address(*ip)) {
+            return Err(AdmissionError::Address);
+        }
+        Ok(Self {
+            host: name.as_str().to_owned(),
+            approved: approved_ips.iter().map(IpAddr::to_canonical).collect(),
+        })
+    }
+
+    /// The normalised host.
+    #[must_use]
+    pub fn host(&self) -> &str {
+        &self.host
+    }
+
+    /// Whether `host` is this host. Case-insensitive; a trailing dot, port or IP literal never
+    /// matches.
+    #[must_use]
+    pub fn permits_host(&self, host: &str) -> bool {
+        self.host.eq_ignore_ascii_case(host)
+    }
+
+    /// Whether `ip` may be dialled for `host` beyond [`is_public_address`]: `host` is this host
+    /// and `ip` is in the approved list, which [`RepoHostAdmission::new`] checked.
+    #[must_use]
+    pub fn permits_address(&self, host: &str, ip: IpAddr) -> bool {
+        self.permits_host(host) && self.approved.contains(&ip.to_canonical())
+    }
+}
+
+/// Whether every answer of a lookup for `host` may be dialled: each is public, or approved by
+/// `admission`. An empty answer is refused.
+#[must_use]
+pub fn addresses_permitted(
+    host: &str,
+    ips: &[IpAddr],
+    admission: Option<&RepoHostAdmission>,
+) -> bool {
+    !ips.is_empty()
+        && ips.iter().all(|ip| {
+            is_public_address(*ip) || admission.is_some_and(|a| a.permits_address(host, *ip))
+        })
+}
+
+type Admissions = Mutex<HashMap<String, Arc<RepoHostAdmission>>>;
+
+/// The per-Job admissions of one service. One Job holds at most one.
+#[derive(Debug, Default)]
+pub struct RepoHostBook {
+    admissions: Arc<Admissions>,
+}
+
+impl RepoHostBook {
+    /// Admits `admission` for `job_id`, replacing any earlier one. The returned guard clears it
+    /// when dropped, on every path, unless a later admission replaced it.
+    #[must_use]
+    pub fn admit(&self, job_id: &str, admission: RepoHostAdmission) -> RepoHostGuard {
+        let admission = Arc::new(admission);
+        self.admissions
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .insert(job_id.to_owned(), Arc::clone(&admission));
+        RepoHostGuard {
+            admissions: Arc::clone(&self.admissions),
+            job_id: job_id.to_owned(),
+            admission,
+        }
+    }
+
+    /// The admission of a Job, if one is held.
+    #[must_use]
+    pub fn get(&self, job_id: &str) -> Option<Arc<RepoHostAdmission>> {
+        self.admissions
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .get(job_id)
+            .cloned()
+    }
+
+    /// Drops the admission of a finished Job.
+    pub fn forget(&self, job_id: &str) {
+        self.admissions
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .remove(job_id);
+    }
+}
+
+/// Clears one Job admission on drop.
+#[derive(Debug)]
+pub struct RepoHostGuard {
+    admissions: Arc<Admissions>,
+    job_id: String,
+    admission: Arc<RepoHostAdmission>,
+}
+
+impl Drop for RepoHostGuard {
+    fn drop(&mut self) {
+        let mut map = self
+            .admissions
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        if map
+            .get(&self.job_id)
+            .is_some_and(|held| Arc::ptr_eq(held, &self.admission))
+        {
+            map.remove(&self.job_id);
+        }
     }
 }
 
@@ -277,6 +498,184 @@ pub fn precheck_url(input: &str) -> Result<ParsedTarget, UrlRefusal> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn ip(s: &str) -> IpAddr {
+        s.parse().expect("ip")
+    }
+
+    fn admission(host: &str, ips: &[&str]) -> RepoHostAdmission {
+        let ips: Vec<IpAddr> = ips.iter().map(|s| ip(s)).collect();
+        RepoHostAdmission::new(host, !ips.is_empty(), &ips).expect("admission")
+    }
+
+    #[test]
+    fn approvable_refuses_every_hostile_address_form() {
+        for s in [
+            "127.0.0.1",
+            "127.255.255.254",
+            "::1",
+            "0.0.0.0",
+            "0.1.2.3",
+            "::",
+            "169.254.1.1",
+            "169.254.169.254",
+            "fe80::1",
+            "febf::1",
+            "224.0.0.1",
+            "239.255.255.255",
+            "ff02::1",
+            "255.255.255.255",
+            "240.0.0.1",
+            "::ffff:127.0.0.1",
+            "::ffff:169.254.169.254",
+            "::ffff:0.0.0.0",
+            "::ffff:224.0.0.1",
+            "::127.0.0.1",
+            "::a00:5",
+            "64:ff9b::7f00:1",
+            "64:ff9b:1::1",
+            "2002:7f00:1::",
+            "fd00:ec2::254",
+            "192.0.0.192",
+            "168.63.129.16",
+        ] {
+            assert!(!is_approvable_address(ip(s)), "{s}");
+        }
+        let alibaba = format!("{0}.{0}.{0}.200", 100);
+        assert!(!is_approvable_address(ip(&alibaba)));
+        let cgnat = format!("{}.64.0.1", 100);
+        for s in [
+            "10.0.0.5",
+            "192.168.1.1",
+            "172.16.0.9",
+            cgnat.as_str(),
+            "fd00::1",
+            "8.8.8.8",
+        ] {
+            assert!(is_approvable_address(ip(s)), "{s}");
+        }
+    }
+
+    #[test]
+    fn admission_refuses_hostile_host_strings() {
+        let long = format!("{}.example", "a".repeat(300));
+        for raw in [
+            "",
+            "Git.Example",
+            "git.example.",
+            "user@git.example",
+            "git.example:443",
+            "git.example:80",
+            "[::1]",
+            "::1",
+            "127.0.0.1",
+            "0x7f.1",
+            "0177.0.0.1",
+            "2130706433",
+            "git.example\r\n",
+            "git.example\n",
+            "git.example\r",
+            " git.example",
+            "git.example ",
+            "git example",
+            "git.example\u{2028}",
+            "g\u{ef}t.example",
+            "git.example/path",
+            "git.example\\x",
+            "fe80::1%en0",
+            long.as_str(),
+        ] {
+            assert_eq!(
+                RepoHostAdmission::new(raw, false, &[]),
+                Err(AdmissionError::Host),
+                "{raw:?}"
+            );
+        }
+        assert!(RepoHostAdmission::new("git.example", false, &[]).is_ok());
+    }
+
+    #[test]
+    fn admission_refuses_a_bad_approval_whole() {
+        let ok = ip("10.0.0.5");
+        let seventeen: Vec<IpAddr> = (1..=17).map(|n| ip(&format!("10.0.0.{n}"))).collect();
+        assert_eq!(
+            RepoHostAdmission::new("git.example", false, &[ok]),
+            Err(AdmissionError::Approval)
+        );
+        assert_eq!(
+            RepoHostAdmission::new("git.example", true, &seventeen),
+            Err(AdmissionError::Approval)
+        );
+        assert!(RepoHostAdmission::new("git.example", true, &seventeen[..16]).is_ok());
+        assert_eq!(
+            RepoHostAdmission::new("git.example", true, &[ok, ip("127.0.0.1")]),
+            Err(AdmissionError::Address)
+        );
+        assert!(RepoHostAdmission::new("git.example", true, &[]).is_ok());
+    }
+
+    #[test]
+    fn admission_admits_its_host_only_and_approved_addresses_for_it_only() {
+        let a = admission("git.example", &["10.0.0.5"]);
+        assert_eq!(a.host(), "git.example");
+        assert!(a.permits_host("git.example"));
+        assert!(a.permits_host("GIT.Example"));
+        for other in [
+            "git.example.",
+            "other.example",
+            "x.git.example",
+            "git.example:443",
+            "10.0.0.5",
+        ] {
+            assert!(!a.permits_host(other), "{other}");
+        }
+        assert!(a.permits_address("git.example", ip("10.0.0.5")));
+        assert!(a.permits_address("git.example", ip("::ffff:10.0.0.5")));
+        assert!(!a.permits_address("git.example", ip("10.0.0.6")));
+        assert!(!a.permits_address("other.example", ip("10.0.0.5")));
+        let none = admission("git.example", &[]);
+        assert!(!none.permits_address("git.example", ip("10.0.0.5")));
+    }
+
+    #[test]
+    fn every_answer_must_be_public_or_approved() {
+        let a = admission("git.example", &["10.0.0.5"]);
+        let public = ip("93.184.216.34");
+        let approved = ip("10.0.0.5");
+        let other = ip("10.0.0.6");
+        assert!(addresses_permitted("git.example", &[public], None));
+        assert!(!addresses_permitted("git.example", &[], Some(&a)));
+        assert!(!addresses_permitted("git.example", &[approved], None));
+        assert!(addresses_permitted(
+            "git.example",
+            &[approved, public],
+            Some(&a)
+        ));
+        assert!(!addresses_permitted(
+            "git.example",
+            &[approved, other],
+            Some(&a)
+        ));
+        assert!(!addresses_permitted("other.example", &[approved], Some(&a)));
+    }
+
+    #[test]
+    fn the_guard_clears_its_own_admission_and_never_a_later_one() {
+        let book = RepoHostBook::default();
+        let first = book.admit("job1", admission("a.example", &[]));
+        assert!(book.get("job1").is_some_and(|a| a.host() == "a.example"));
+        assert!(book.get("job2").is_none());
+        drop(first);
+        assert!(book.get("job1").is_none());
+        let old = book.admit("job1", admission("a.example", &[]));
+        let newer = book.admit("job1", admission("b.example", &[]));
+        drop(old);
+        assert!(book.get("job1").is_some_and(|a| a.host() == "b.example"));
+        book.forget("job1");
+        assert!(book.get("job1").is_none());
+        drop(newer);
+        assert!(book.get("job1").is_none());
+    }
 
     fn refusal(s: &str) -> Option<UrlRefusal> {
         precheck_url(s).err()
