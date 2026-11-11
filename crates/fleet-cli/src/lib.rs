@@ -1,6 +1,7 @@
 //! The `fleet` command line client: job submission and inspection over gRPC.
 
 pub mod batch;
+pub mod box_token;
 pub mod catalog;
 pub mod config;
 pub mod credential;
@@ -28,6 +29,7 @@ use clap::{Parser, Subcommand};
 use fleet_core::environment::EnvironmentName;
 use fleet_core::text::{Cap, sanitise_lines, sanitise_text};
 use fleet_proto::v1::fleet_batches_client::FleetBatchesClient;
+use fleet_proto::v1::fleet_box_tokens_client::FleetBoxTokensClient;
 use fleet_proto::v1::fleet_credentials_client::FleetCredentialsClient;
 use fleet_proto::v1::fleet_edit_client::FleetEditClient;
 use fleet_proto::v1::fleet_environments_client::FleetEnvironmentsClient;
@@ -224,6 +226,13 @@ pub enum Command {
         /// The host action.
         #[command(subcommand)]
         action: host::HostAction,
+    },
+    /// Issue, list and revoke per-box tokens. Needs a per-user API token.
+    #[command(name = "box-token")]
+    BoxToken {
+        /// The box-token action.
+        #[command(subcommand)]
+        action: box_token::BoxTokenAction,
     },
     /// Add, list and remove the repositories you work on. Each add is checked with the forge.
     Repo {
@@ -428,14 +437,21 @@ fn strip_lines(text: &str) -> String {
 
 /// Scrubs server text of the client token. Every path that prints server-supplied job text
 /// goes through one of these.
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug)]
 pub struct Scrub {
     redactor: fleet_core::Redactor,
     secret: String,
 }
 
+impl Default for Scrub {
+    fn default() -> Self {
+        Self::new(None)
+    }
+}
+
 impl Scrub {
-    /// A scrubber for `secret`. A secret [`fleet_core::Redactor`] ignores scrubs nothing.
+    /// A scrubber for `secret`. A secret [`fleet_core::Redactor`] ignores scrubs nothing. Every
+    /// scrubber also masks a per-Box token by its shape.
     #[must_use]
     pub fn new(secret: Option<&str>) -> Self {
         let redactor = fleet_core::Redactor::new(secret.map(str::to_owned));
@@ -444,7 +460,10 @@ impl Scrub {
         } else {
             secret.unwrap_or_default().to_owned()
         };
-        Self { redactor, secret }
+        Self {
+            redactor: redactor.with_box_tokens(),
+            secret,
+        }
     }
 
     fn of(config: &Config) -> Self {
@@ -491,7 +510,26 @@ impl Scrub {
             .filter(|at| text.ends_with(&self.secret[..*at]))
             .max()
             .unwrap_or(0)
+            .max(box_token_hold(text))
     }
+}
+
+/// The length of the suffix of `text` that could be the start of a per-Box token: the prefix
+/// and any hex digits after it, or a proper prefix of the prefix.
+fn box_token_hold(text: &str) -> usize {
+    const PREFIX: &str = fleet_core::BOX_TOKEN_PREFIX;
+    let run = text
+        .bytes()
+        .rev()
+        .take_while(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
+        .count();
+    if text[..text.len() - run].ends_with(PREFIX) {
+        return run + PREFIX.len();
+    }
+    (1..PREFIX.len())
+        .rev()
+        .find(|n| text.ends_with(&PREFIX[..*n]))
+        .unwrap_or(0)
 }
 
 /// Scrubs a stream piece by piece. A suffix that could start the token is held back until the
@@ -619,6 +657,7 @@ struct Session {
     batches: batch::BatchesClient,
     credentials: credential::CredentialsClient,
     hosts: host::HostsClient,
+    box_tokens: box_token::BoxTokensClient,
     repos: repo::ReposClient,
     work: work::WorkClient,
     retro: retro::RetroClient,
@@ -799,6 +838,8 @@ async fn session(env: &Resolution, timeouts: bool) -> Result<Session, CliError> 
         credentials: FleetCredentialsClient::with_interceptor(channel.clone(), token.clone())
             .max_decoding_message_size(MAX_DECODE_BYTES),
         hosts: FleetHostsClient::with_interceptor(channel.clone(), token.clone())
+            .max_decoding_message_size(MAX_DECODE_BYTES),
+        box_tokens: FleetBoxTokensClient::with_interceptor(channel.clone(), token.clone())
             .max_decoding_message_size(MAX_DECODE_BYTES),
         repos: FleetReposClient::with_interceptor(channel.clone(), token.clone())
             .max_decoding_message_size(MAX_DECODE_BYTES),
@@ -999,6 +1040,35 @@ async fn run_host(
         host::HostAction::Requests { .. } => {
             let mut session = session(env, timeouts).await?;
             host::requests(&mut session.hosts, &session.scrub, out).await
+        }
+    }
+}
+
+async fn run_box_token(
+    action: box_token::BoxTokenAction,
+    env: &Resolution,
+    timeouts: bool,
+    out: &mut impl Write,
+) -> Result<(), CliError> {
+    match action {
+        box_token::BoxTokenAction::Issue {
+            box_name,
+            label,
+            ttl_days,
+        } => {
+            let args = box_token::parse_issue(&box_name, label.as_deref(), ttl_days.as_deref())?;
+            let mut session = session(env, timeouts).await?;
+            box_token::issue(&mut session.box_tokens, &session.scrub, args, out).await
+        }
+        box_token::BoxTokenAction::List => {
+            let mut session = session(env, timeouts).await?;
+            let now = stats::now_seconds();
+            box_token::list(&mut session.box_tokens, &session.scrub, now, out).await
+        }
+        box_token::BoxTokenAction::Revoke { id } => {
+            let id = box_token::parse_id(&id)?;
+            let mut session = session(env, timeouts).await?;
+            box_token::revoke(&mut session.box_tokens, id, out).await
         }
     }
 }
@@ -1363,6 +1433,7 @@ async fn dispatch(
         Command::Credential { action } => run_credential(action, env, timeouts, stdin, out).await?,
         Command::Env { action } => run_env(action, env, timeouts, tty, stdin, out).await?,
         Command::Host { action } => run_host(action, env, timeouts, out).await?,
+        Command::BoxToken { action } => run_box_token(action, env, timeouts, out).await?,
         Command::Repo { action } => run_repo(action, env, timeouts, out).await?,
         Command::Work(args) => run_work(args, env, timeouts, stdin, out).await?,
         family @ (Command::Retro(_)
@@ -1801,5 +1872,72 @@ mod tests {
         let mut stream = scrub.stream();
         assert_eq!(stream.push("end client-tok"), "end ");
         assert_eq!(stream.finish(), "client-tok");
+    }
+
+    fn box_token() -> String {
+        format!("fbx_{}", "ab12".repeat(16))
+    }
+
+    #[test]
+    fn every_scrub_constructor_masks_a_box_token_by_shape() {
+        let token = box_token();
+        let line = format!("see {token} end");
+        for scrub in [
+            Scrub::new(None),
+            Scrub::default(),
+            Scrub::new(Some(TOKEN)),
+            Scrub::new(Some("short")),
+        ] {
+            assert_eq!(scrub.text(&line), "see [REDACTED] end");
+            assert_eq!(scrub.ident(&line), "see [REDACTED] end");
+            assert_eq!(scrub.free(&line), "see [REDACTED] end");
+        }
+    }
+
+    #[test]
+    fn a_status_message_holding_a_box_token_is_masked() {
+        let status = Status::internal(format!("bad {}", box_token()));
+        let shown = CliError::Rpc(status)
+            .scrubbed(Some(&Scrub::new(Some(TOKEN))))
+            .to_string();
+        assert!(!shown.contains("ab12ab12"), "{shown}");
+        assert!(shown.contains("[REDACTED]"), "{shown}");
+    }
+
+    #[test]
+    fn scrub_stream_masks_a_box_token_split_at_every_position() {
+        let scrub = Scrub::new(Some(TOKEN));
+        let whole = format!("x {} y", box_token());
+        for at in 0..=whole.len() {
+            let mut stream = scrub.stream();
+            let mut out = stream.push(&whole[..at]);
+            out.push_str(&stream.push(&whole[at..]));
+            out.push_str(&stream.finish());
+            assert_eq!(out, "x [REDACTED] y", "split at {at}");
+        }
+    }
+
+    #[test]
+    fn scrub_stream_masks_a_box_token_split_into_single_characters() {
+        let scrub = Scrub::default();
+        let mut stream = scrub.stream();
+        let mut out = String::new();
+        for c in format!("a {} b", box_token()).chars() {
+            out.push_str(&stream.push(&c.to_string()));
+        }
+        out.push_str(&stream.finish());
+        assert_eq!(out, "a [REDACTED] b");
+    }
+
+    #[test]
+    fn scrub_stream_releases_a_held_box_token_prefix_that_never_completes() {
+        let scrub = Scrub::default();
+        let mut stream = scrub.stream();
+        assert_eq!(stream.push("see fb"), "see ");
+        assert_eq!(stream.push("ar"), "fbar");
+        assert_eq!(stream.push("go fbx_ab12"), "go ");
+        assert_eq!(stream.push("zz"), "fbx_ab12zz");
+        assert_eq!(stream.push("end fbx_"), "end ");
+        assert_eq!(stream.finish_cut(), "");
     }
 }

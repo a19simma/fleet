@@ -23,13 +23,13 @@ pub const MAX_USERNAME_LEN: usize = 64;
 pub const MAX_ACTIVE_BOX_TOKENS: i64 = 20;
 
 /// The default lifetime of a per-Box token in days.
-pub const DEFAULT_BOX_TOKEN_DAYS: u32 = 90;
+pub const DEFAULT_BOX_TOKEN_DAYS: u32 = fleet_core::box_token::DEFAULT_DAYS;
 
 /// The longest lifetime of a per-Box token in days.
-pub const MAX_BOX_TOKEN_DAYS: u32 = 365;
+pub const MAX_BOX_TOKEN_DAYS: u32 = fleet_core::box_token::MAX_DAYS;
 
 /// The longest per-Box token label in characters.
-pub const MAX_BOX_TOKEN_LABEL_CHARS: usize = 64;
+pub const MAX_BOX_TOKEN_LABEL_CHARS: usize = fleet_core::box_token::MAX_LABEL_CHARS;
 
 const TOKEN_PREFIX: &str = "flt_";
 const RANDOM_BYTES: usize = 32;
@@ -203,11 +203,7 @@ impl BoxTokenLabel {
     ///
     /// Returns [`UserError::InvalidLabel`].
     pub fn new(raw: &str) -> Result<Self, UserError> {
-        let ok = raw.chars().count() <= MAX_BOX_TOKEN_LABEL_CHARS
-            && !raw
-                .chars()
-                .any(|c| c.is_control() || fleet_core::text::is_hostile(c));
-        if ok {
+        if fleet_core::box_token::label_is_valid(raw) {
             Ok(Self(raw.to_owned()))
         } else {
             Err(UserError::InvalidLabel)
@@ -231,10 +227,12 @@ impl BoxTokenTtl {
     ///
     /// Returns [`UserError::InvalidTtl`] above [`MAX_BOX_TOKEN_DAYS`].
     pub const fn new(days: u32) -> Result<Self, UserError> {
-        match days {
-            0 => Ok(Self(DEFAULT_BOX_TOKEN_DAYS)),
-            1..=MAX_BOX_TOKEN_DAYS => Ok(Self(days)),
-            _ => Err(UserError::InvalidTtl),
+        if days == 0 {
+            Ok(Self(DEFAULT_BOX_TOKEN_DAYS))
+        } else if fleet_core::box_token::days_are_valid(days) {
+            Ok(Self(days))
+        } else {
+            Err(UserError::InvalidTtl)
         }
     }
 

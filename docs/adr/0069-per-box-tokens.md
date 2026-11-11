@@ -1,6 +1,6 @@
 # Per-Box tokens
 
-Status: Accepted 2026-11-11. Server side built: storage, interceptor, per-RPC binding, ownership and `FleetBoxTokens`. Not built yet: CLI, web page, enroll script and deprecation of the static Box token. The user decided: any signed-in User may issue, a Box is scoped to its User, expiry is mandatory, one active token per Box name, a cap of 20 active tokens per User, and the static `FLEET_TOKEN` keeps working as a shared pool. Amends ADR-0014, ADR-0023, ADR-0033 and ADR-0042.
+Status: Accepted 2026-11-11. Built: storage, interceptor, per-RPC binding, ownership, `FleetBoxTokens` and the `fleet box-token` CLI. Not built yet: web page, enroll script and deprecation of the static Box token. The user decided: any signed-in User may issue, a Box is scoped to its User, expiry is mandatory, one active token per Box name, a cap of 20 active tokens per User, and the static `FLEET_TOKEN` keeps working as a shared pool. Amends ADR-0014, ADR-0023, ADR-0033 and ADR-0042.
 
 ADR-0014 gives every Box one shared bearer token. A holder can ingest and claim as any Box, and `GetJobCredentials` releases the stored credentials of any live Job (ADR-0033). The user accepted this for one Box and one User. With several Users and Boxes the shared token is the largest credential in the system.
 
