@@ -3,8 +3,10 @@
 //! Two static tokens plus per-user API tokens, scoped by gRPC path. The box token covers
 //! `FleetIngest` and `FleetWorker`. The client scope covers `FleetQuery`, `FleetJobs`,
 //! `FleetJudge`, `FleetProfiles`, `FleetBatches`, `FleetCredentials`, `FleetRepos`,
-//! `FleetCatalog`, `FleetWork`, `FleetRetro`, `FleetEdit` and `FleetEnvironments`. Any other path
-//! is denied.
+//! `FleetCatalog`, `FleetWork`, `FleetRetro`, `FleetEdit`, `FleetEnvironments`, `FleetHosts` and
+//! `FleetBoxTokens`. Any other path is denied. `FleetBoxTokens` refuses the shared client token
+//! with [`BOX_TOKENS_NEED_USER_TOKEN`]. A per-Box `fbx_` token reaches only the box scope and
+//! rides the request as a [`BoxCaller`] (ADR-0069).
 //! `FleetEdit.DecideEdit` is the one client-scope path the shared client token cannot reach: it
 //! passes only for a per-user API token, because the client token acts as the bootstrap user and
 //! names no person (ADR-0066). `FleetCatalog` passes the scope, then its handler requires an admin user.
@@ -59,6 +61,12 @@ const RETRO: &str = "/fleet.v1.FleetRetro/";
 const EDIT: &str = "/fleet.v1.FleetEdit/";
 const ENVIRONMENTS: &str = "/fleet.v1.FleetEnvironments/";
 const HOSTS: &str = "/fleet.v1.FleetHosts/";
+const BOX_TOKENS: &str = "/fleet.v1.FleetBoxTokens/";
+
+/// The fixed `PERMISSION_DENIED` reason when a token that names no person asks to manage
+/// per-Box tokens.
+pub const BOX_TOKENS_NEED_USER_TOKEN: &str =
+    "a per-user API token is required to manage box tokens";
 
 /// The one edit RPC that needs a signed-in user.
 pub const DECIDE_EDIT: &str = "/fleet.v1.FleetEdit/DecideEdit";
@@ -262,6 +270,7 @@ impl BearerAuth {
                     || path.starts_with(EDIT)
                     || path.starts_with(ENVIRONMENTS)
                     || path.starts_with(HOSTS)
+                    || path.starts_with(BOX_TOKENS)
             }
         }
     }
@@ -288,6 +297,8 @@ impl BearerAuth {
             Err(Status::permission_denied(
                 fleet_proto::ERR_ENV_NEEDS_USER_TOKEN,
             ))
+        } else if path.starts_with(BOX_TOKENS) && Self::allows(scope, path) {
+            Err(Status::permission_denied(BOX_TOKENS_NEED_USER_TOKEN))
         } else if Self::allows(scope, path) {
             Ok(())
         } else {
@@ -400,6 +411,9 @@ impl BearerAuth {
             return Err(Status::permission_denied(
                 fleet_proto::ERR_ENV_NEEDS_USER_TOKEN,
             ));
+        }
+        if path.starts_with(BOX_TOKENS) && caller.is_none() {
+            return Err(Status::permission_denied(BOX_TOKENS_NEED_USER_TOKEN));
         }
         if let (Scope::Client, None, Some(users)) = (scope, caller, self.users.as_ref()) {
             let user_id = users.bootstrap_user().await.map_err(unavailable)?;

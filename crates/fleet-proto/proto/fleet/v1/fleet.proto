@@ -84,6 +84,51 @@ service FleetHosts {
   rpc ListHostRequests(ListHostRequestsRequest) returns (ListHostRequestsReply);
 }
 
+// Per-Box tokens (ADR-0069). Client scope, per-user API token only: the static client token is
+// refused. Every RPC is owner scoped. A token binds to one Box name and the issuing user.
+service FleetBoxTokens {
+  rpc IssueBoxToken(IssueBoxTokenRequest) returns (IssueBoxTokenReply);
+  rpc ListBoxTokens(ListBoxTokensRequest) returns (ListBoxTokensReply);
+  rpc RevokeBoxToken(RevokeBoxTokenRequest) returns (RevokeBoxTokenReply);
+}
+
+message IssueBoxTokenRequest {
+  string box = 1;
+  string label = 2;
+  // 0 means 90 days. The maximum is 365.
+  uint32 ttl_days = 3;
+}
+
+// The only reply that carries the token value. It is not stored and cannot be read again.
+message IssueBoxTokenReply {
+  int64 id = 1;
+  string token = 2;
+  string box = 3;
+  string expires_at = 4;
+}
+
+message ListBoxTokensRequest {}
+
+message BoxTokenInfo {
+  int64 id = 1;
+  string box = 2;
+  string label = 3;
+  string created_at = 4;
+  string expires_at = 5;
+  optional string last_used_at = 6;
+  optional string revoked_at = 7;
+}
+
+message ListBoxTokensReply {
+  repeated BoxTokenInfo tokens = 1;
+}
+
+message RevokeBoxTokenRequest {
+  int64 id = 1;
+}
+
+message RevokeBoxTokenReply {}
+
 // Server-side work tracker (ADR-0064). Every mutating request carries a client `key`: a repeat with
 // the same `(project, key)` returns the first result. Items are addressed by their key within a
 // project and projects by name within the caller's account.

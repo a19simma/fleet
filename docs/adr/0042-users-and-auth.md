@@ -88,3 +88,7 @@ Postgres also holds users, passkeys, sessions and API tokens. Auth on `FleetQuer
 ## Amendment (ADR-0069)
 
 A User issues per-Box tokens, and `reset-passkeys` revokes them with the User's other credentials. See ADR-0069.
+
+`FleetBoxTokens` joins the Client scope and stays out of the Box scope. `IssueBoxToken`, `ListBoxTokens` and `RevokeBoxToken` accept only a per-user API token: the auth layer refuses the static Client token with a fixed reason. All three are owner scoped, and a foreign or unknown token id gives the same `NOT_FOUND`.
+
+A per-Box token reaches only the Box scope. Every Box-scope RPC refuses a request that names a Box other than the bound one with `PERMISSION_DENIED`. `ClaimJob` claims only the token user's jobs, and `GetJobCredentials` and `GetJobEnvironment` release only for a job that user owns.

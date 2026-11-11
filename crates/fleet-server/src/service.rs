@@ -9,6 +9,7 @@ use fleet_core::ProfileError;
 use fleet_core::graph;
 use fleet_core::{Envelope, Redactor};
 use fleet_proto::v1::fleet_batches_server::{FleetBatches, FleetBatchesServer};
+use fleet_proto::v1::fleet_box_tokens_server::{FleetBoxTokens, FleetBoxTokensServer};
 use fleet_proto::v1::fleet_capability_admin_server::{
     FleetCapabilityAdmin, FleetCapabilityAdminServer,
 };
@@ -56,6 +57,10 @@ use fleet_proto::v1::{
     VerifyCredentialRequest, WorkAttempt, WorkDefer, WorkEvent, WorkItem, WorkProject,
 };
 use fleet_proto::v1::{
+    BoxTokenInfo, IssueBoxTokenReply, IssueBoxTokenRequest, ListBoxTokensReply,
+    ListBoxTokensRequest, RevokeBoxTokenReply, RevokeBoxTokenRequest,
+};
+use fleet_proto::v1::{
     ClearEnvironmentDefaultReply, ClearEnvironmentDefaultRequest, GetEnvironmentDefaultReply,
     GetEnvironmentDefaultRequest, SetEnvironmentDefaultReply, SetEnvironmentDefaultRequest,
 };
@@ -84,12 +89,13 @@ use tonic::{Request, Response, Status};
 use tonic_prost::prost::Message;
 use tower::layer::util::{Identity, Stack};
 
-use crate::auth::{ADMIN_REQUIRED, BearerAuth, BoxCaller, Caller};
+use crate::auth::{ADMIN_REQUIRED, BOX_TOKENS_NEED_USER_TOKEN, BearerAuth, BoxCaller, Caller};
 use crate::catalog;
 use crate::config::Config;
 use crate::cred::capability::{self, Capabilities};
 use crate::cred::limiter::Limiter;
 use crate::cred::password::BootstrapPassword;
+use crate::cred::users::{BoxTokenLabel, BoxTokenTtl, UserError};
 use crate::cred::{CredentialService, RepoService, Users};
 use crate::environments::EnvironmentService;
 use crate::hosts::HostService;
@@ -759,6 +765,90 @@ impl FleetCredentials for FleetService {
             service.verify(user_id, request.get_ref()).await?,
         ))
     }
+}
+
+fn box_token_error(err: &UserError) -> Status {
+    match err {
+        UserError::InvalidLabel => Status::invalid_argument("invalid label"),
+        UserError::InvalidTtl => Status::invalid_argument(format!(
+            "ttl_days must be at most {}",
+            crate::cred::users::MAX_BOX_TOKEN_DAYS
+        )),
+        UserError::BoxNameTaken => Status::already_exists("box name is not available"),
+        UserError::TooManyBoxTokens => Status::resource_exhausted("too many active box tokens"),
+        UserError::NotFound => Status::not_found("token not found"),
+        other => {
+            tracing::error!(%other, "box token storage failed");
+            Status::unavailable("storage unavailable")
+        }
+    }
+}
+
+#[tonic::async_trait]
+impl FleetBoxTokens for FleetService {
+    async fn issue_box_token(
+        &self,
+        request: Request<IssueBoxTokenRequest>,
+    ) -> Result<Response<IssueBoxTokenReply>, Status> {
+        let user_id = box_token_user(&request)?;
+        let request = request.into_inner();
+        let name = validate_box(&request.r#box)
+            .map_err(|_| Status::invalid_argument("invalid box name"))?;
+        let label = BoxTokenLabel::new(&request.label).map_err(|err| box_token_error(&err))?;
+        let ttl = BoxTokenTtl::new(request.ttl_days).map_err(|err| box_token_error(&err))?;
+        let issued = Users::new(self.store.pool().clone())
+            .issue_box_token(user_id, &name, &label, ttl)
+            .await
+            .map_err(|err| box_token_error(&err))?;
+        let token = String::from_utf8(issued.token.expose().to_vec())
+            .map_err(|_| Status::internal("token encoding"))?;
+        Ok(Response::new(IssueBoxTokenReply {
+            id: issued.id,
+            token,
+            r#box: name.as_str().to_owned(),
+            expires_at: issued.expires_at,
+        }))
+    }
+
+    async fn list_box_tokens(
+        &self,
+        request: Request<ListBoxTokensRequest>,
+    ) -> Result<Response<ListBoxTokensReply>, Status> {
+        let user_id = box_token_user(&request)?;
+        let rows = Users::new(self.store.pool().clone())
+            .list_box_tokens(user_id)
+            .await
+            .map_err(|err| box_token_error(&err))?;
+        let tokens = rows
+            .into_iter()
+            .map(|row| BoxTokenInfo {
+                id: row.id,
+                r#box: row.box_name,
+                label: row.label,
+                created_at: row.created_at,
+                expires_at: row.expires_at,
+                last_used_at: row.last_used_at,
+                revoked_at: row.revoked_at,
+            })
+            .collect();
+        Ok(Response::new(ListBoxTokensReply { tokens }))
+    }
+
+    async fn revoke_box_token(
+        &self,
+        request: Request<RevokeBoxTokenRequest>,
+    ) -> Result<Response<RevokeBoxTokenReply>, Status> {
+        let user_id = box_token_user(&request)?;
+        Users::new(self.store.pool().clone())
+            .revoke_box_token(user_id, request.get_ref().id)
+            .await
+            .map_err(|err| box_token_error(&err))?;
+        Ok(Response::new(RevokeBoxTokenReply {}))
+    }
+}
+
+fn box_token_user<T>(request: &Request<T>) -> Result<i64, Status> {
+    caller_of(request).ok_or_else(|| Status::permission_denied(BOX_TOKENS_NEED_USER_TOKEN))
 }
 
 #[tonic::async_trait]
@@ -2112,6 +2202,7 @@ fn routes(
     let environments =
         FleetEnvironmentsServer::new(service.clone()).max_decoding_message_size(MAX_MESSAGE_BYTES);
     let hosts = FleetHostsServer::new(service.clone());
+    let box_tokens = FleetBoxTokensServer::new(service.clone());
     let catalog = FleetCatalogServer::new(service.clone());
     let catalog_admin = FleetCatalogAdminServer::new(service.clone())
         .max_decoding_message_size(MAX_PROFILE_MESSAGE_BYTES);
@@ -2132,6 +2223,7 @@ fn routes(
         .add_service(edit)
         .add_service(environments)
         .add_service(hosts)
+        .add_service(box_tokens)
         .add_service(catalog)
         .add_service(catalog_admin)
         .add_service(capability_admin)
