@@ -10,11 +10,13 @@ use axum::Router;
 use axum::routing::get;
 use fleet_server::auth::BearerAuth;
 use fleet_server::config::{
-    Config, CredentialsState, Forge, UpdateRepo, exposed_binds, is_loopback,
+    Config, CredentialsState, Forge, RepoHosts, UpdateRepo, exposed_binds, is_loopback,
 };
 use fleet_server::cred::admin::{AdminError, SETUP_CODE_TTL_HOURS, parse_args, run as run_admin};
 use fleet_server::cred::app_mint::AppClient;
+use fleet_server::cred::forge_verify::{ForgejoVerifier, PgHostDirectory};
 use fleet_server::cred::github::HttpsGithub;
+use fleet_server::cred::https::ForgeTransport;
 use fleet_server::cred::password::BootstrapPassword;
 use fleet_server::cred::pinned::PinnedHttps;
 use fleet_server::cred::release::ReleaseFetcher;
@@ -102,17 +104,31 @@ async fn credential_service(
         store = store.with_github_app(lane);
     }
     let transport = PinnedHttps::system()?;
-    let github_verifier = GithubVerifier::new(Arc::new(transport), Some(Arc::new(store.clone())));
-    let verifiers = RepoVerifiers::new(config.repo_hosts.clone())
-        .with(Forge::Github, Arc::new(github_verifier));
-    let repos = RepoService::new(
-        RepoStore::new(pool.clone(), store.clone()),
-        Arc::new(verifiers),
-    );
+    let repos = repo_service(pool, &store, Arc::new(transport));
     Ok((
         Some(CredentialService::new(store, Arc::new(github)).with_repos(repos)),
         Some(environments),
     ))
+}
+
+/// The repository registry service: verification dispatches by the `git_hosts` row of the
+/// repository host through `transport`, and the operator host list is not consulted.
+fn repo_service(
+    pool: &sqlx::PgPool,
+    store: &CredentialStore,
+    transport: Arc<dyn ForgeTransport>,
+) -> RepoService {
+    let directory = Arc::new(PgHostDirectory::new(pool.clone()));
+    let github = GithubVerifier::new(transport.clone(), Some(Arc::new(store.clone())));
+    let forgejo = ForgejoVerifier::new(transport, directory.clone());
+    let verifiers = RepoVerifiers::new(RepoHosts::none())
+        .with(Forge::Github, Arc::new(github))
+        .with(Forge::Forgejo, Arc::new(forgejo))
+        .with_directory(directory);
+    RepoService::new(
+        RepoStore::new(pool.clone(), store.clone()),
+        Arc::new(verifiers),
+    )
 }
 
 /// Starts the release feed poller when `repo` is set and returns the cache it fills with its task.
@@ -484,5 +500,150 @@ mod tests {
             configured_store(pool, &config(None)).model_allowlist(),
             None
         );
+    }
+
+    mod repo_wiring {
+        use std::sync::Mutex;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        use fleet_core::credential::{CredentialKind, CredentialShape, Secret};
+        use fleet_proto::v1::AddRepoRequest;
+        use fleet_server::cred::https::{FetchError, ForgeGet, ForgeReply};
+        use fleet_server::cred::seal::FileSealer;
+        use sqlx::PgPool;
+
+        use super::*;
+
+        const TOKEN: &str = "0123456789abcdef0123456789abcdef01234567";
+        const HOST: &str = "git.example.org";
+
+        static FILES: AtomicUsize = AtomicUsize::new(0);
+
+        struct Upstream {
+            seen: Mutex<Vec<(String, String, String)>>,
+        }
+
+        #[tonic::async_trait]
+        impl ForgeTransport for Upstream {
+            async fn get(&self, request: &ForgeGet<'_>) -> Result<ForgeReply, FetchError> {
+                let auth = request.authorization.map_or_else(String::new, |value| {
+                    String::from_utf8_lossy(value.as_bytes()).into_owned()
+                });
+                self.seen.lock().unwrap().push((
+                    request.host.to_owned(),
+                    request.path.to_owned(),
+                    auth,
+                ));
+                Ok(ForgeReply {
+                    status: hyper::StatusCode::OK,
+                    body: br#"{"permissions":{"push":true}}"#.to_vec(),
+                    location: None,
+                })
+            }
+        }
+
+        struct World {
+            pool: PgPool,
+            service: RepoService,
+            store: CredentialStore,
+            upstream: Arc<Upstream>,
+            user: i64,
+        }
+
+        async fn world(pool: PgPool) -> World {
+            Store::new(pool.clone()).migrate().await.unwrap();
+            let path = std::env::temp_dir().join(format!(
+                "fleet-main-wiring-{}-{}.keys",
+                std::process::id(),
+                FILES.fetch_add(1, Ordering::Relaxed)
+            ));
+            std::fs::write(&path, format!("k1:{}\n", "ab".repeat(32))).unwrap();
+            let sealer = FileSealer::load(&path);
+            std::fs::remove_file(&path).unwrap();
+            let store = CredentialStore::new(pool.clone(), Arc::new(sealer.unwrap()));
+            let upstream = Arc::new(Upstream {
+                seen: Mutex::new(Vec::new()),
+            });
+            let service = repo_service(&pool, &store, upstream.clone());
+            let user: i64 = sqlx::query_scalar("SELECT bootstrap_user_id()")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+            World {
+                pool,
+                service,
+                store,
+                upstream,
+                user,
+            }
+        }
+
+        async fn add(w: &World, repo: &str) -> Result<fleet_proto::v1::RepoInfo, tonic::Status> {
+            w.service
+                .add(
+                    w.user,
+                    &AddRepoRequest {
+                        repo: repo.to_owned(),
+                    },
+                )
+                .await
+        }
+
+        #[sqlx::test]
+        async fn a_forgejo_row_and_pat_verify_through_the_production_wiring(pool: PgPool) {
+            let w = world(pool).await;
+            sqlx::query("INSERT INTO git_hosts (host, kind) VALUES ($1, 'forgejo')")
+                .bind(HOST)
+                .execute(&w.pool)
+                .await
+                .unwrap();
+            w.store
+                .put_for_host(
+                    w.user,
+                    HOST,
+                    CredentialKind::ForgejoPat,
+                    CredentialShape::StaticSecret,
+                    Secret::new(TOKEN.to_owned()),
+                    None,
+                    None,
+                )
+                .await
+                .unwrap();
+            let info = add(&w, "git.example.org/Octo/Hello").await.unwrap();
+            assert_eq!(info.forge_kind, "forgejo");
+            assert_eq!(info.path, "octo/hello");
+            assert_eq!(info.push, Some(true));
+            let seen = w.upstream.seen.lock().unwrap().clone();
+            assert_eq!(
+                seen,
+                vec![(
+                    HOST.to_owned(),
+                    "/api/v1/repos/octo/hello".to_owned(),
+                    format!("token {TOKEN}")
+                )]
+            );
+            let rows: i64 = sqlx::query_scalar("SELECT count(*) FROM user_repos WHERE host = $1")
+                .bind(HOST)
+                .fetch_one(&w.pool)
+                .await
+                .unwrap();
+            assert_eq!(rows, 1);
+        }
+
+        #[sqlx::test]
+        async fn a_host_without_a_row_is_refused_before_any_request(pool: PgPool) {
+            let w = world(pool).await;
+            let err = add(&w, "git.unlisted.org/o/r").await.unwrap_err();
+            assert_eq!(
+                err.message(),
+                fleet_proto::PRECONDITION_REPO_NOT_ALLOWED_HOST
+            );
+            assert_eq!(w.upstream.seen.lock().unwrap().len(), 0);
+            let rows: i64 = sqlx::query_scalar("SELECT count(*) FROM user_repos")
+                .fetch_one(&w.pool)
+                .await
+                .unwrap();
+            assert_eq!(rows, 0);
+        }
     }
 }
