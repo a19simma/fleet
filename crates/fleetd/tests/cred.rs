@@ -2905,7 +2905,8 @@ async fn approved_addresses_follow_the_private_flag_and_the_address_rules() -> T
     );
     held_for(forgejo_reply(vec![with(true, &[])])).await?;
     held_for(forgejo_reply(vec![with(false, &[])])).await?;
-    let table: [(&str, bool, &[&str]); 14] = [
+    let alibaba_metadata = format!("{0}.{0}.{0}.200", 100);
+    let table: [(&str, bool, &[&str]); 18] = [
         ("addresses without the flag", false, &["192.168.3.1"]),
         ("over the cap", true, &seventeen),
         ("not an address", true, &["git.example.org"]),
@@ -2920,9 +2921,16 @@ async fn approved_addresses_follow_the_private_flag_and_the_address_rules() -> T
         ("unspecified", true, &["0.0.0.0"]),
         ("multicast", true, &["224.0.0.1"]),
         ("empty text", true, &[""]),
+        ("nat64 loopback", true, &["64:ff9b::7f00:1"]),
+        ("6to4 loopback", true, &["2002:7f00:1::"]),
+        ("this network", true, &["0.1.2.3"]),
+        ("cloud metadata", true, &[alibaba_metadata.as_str()]),
     ];
     for (label, allow_private, ips) in table {
         assert_malformed(label, forgejo_reply(vec![with(allow_private, ips)])).await?;
+    }
+    for ip in ["10.0.0.5", "172.16.0.9", "fd00::1"] {
+        held_for(forgejo_reply(vec![with(true, &[ip])])).await?;
     }
     Ok(())
 }
