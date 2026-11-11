@@ -393,6 +393,12 @@ pub enum CliError {
     Refused(&'static str),
     /// `edit apply` refused or failed. The message is fixed text and scrubbed git output.
     Apply(String),
+    /// The server issued a per-Box token and writing it to the output failed. The token is lost,
+    /// so the error names its id for `fleet box-token revoke`.
+    TokenNotDelivered {
+        /// The id of the issued token.
+        id: i64,
+    },
 }
 
 impl CliError {
@@ -419,6 +425,7 @@ impl CliError {
             | Self::JobEnded(_)
             | Self::Apply(_)
             | Self::Refused(_)
+            | Self::TokenNotDelivered { .. }
             | Self::Credential(_) => 1,
         }
     }
@@ -623,6 +630,10 @@ impl fmt::Display for CliError {
             Self::JobEnded(state) => write!(f, "job ended {state}"),
             Self::NoTimingReport => write!(f, "no timing report for this job"),
             Self::Credential(notice) => f.write_str(notice.text()),
+            Self::TokenNotDelivered { id } => write!(
+                f,
+                "box token {id} was issued but could not be written; revoke it with: fleet box-token revoke {id}"
+            ),
         }
     }
 }

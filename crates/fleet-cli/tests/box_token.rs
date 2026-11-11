@@ -80,7 +80,10 @@ impl FleetBoxTokens for Stub {
         let body = request.get_ref();
         self.note(format!(
             "issue {} [{}] {}",
-            body.r#box, body.label, body.ttl_days
+            body.r#box,
+            body.label,
+            body.ttl_days
+                .map_or_else(|| "default".to_owned(), |days| days.to_string())
         ));
         scripted(&self.issue).map(Response::new)
     }
@@ -115,24 +118,40 @@ async fn serve(stub: Stub) -> Result<String, Box<dyn std::error::Error>> {
     Ok(url)
 }
 
+struct BrokenPipe;
+
+impl std::io::Write for BrokenPipe {
+    fn write(&mut self, _: &[u8]) -> std::io::Result<usize> {
+        Err(std::io::Error::other("closed"))
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Err(std::io::Error::other("closed"))
+    }
+}
+
 async fn cli(url: &str, args: &[&str]) -> (Result<(), CliError>, String) {
+    let mut out = Vec::new();
+    let result = cli_into(url, args, &mut out).await;
+    (result, String::from_utf8_lossy(&out).into_owned())
+}
+
+async fn cli_into(url: &str, args: &[&str], out: &mut impl std::io::Write) -> Result<(), CliError> {
     let mut full = vec!["fleet", "--server", url];
     full.extend_from_slice(args);
     let Ok(parsed) = Cli::try_parse_from(full) else {
-        return (Err(CliError::Usage("parse".into())), String::new());
+        return Err(CliError::Usage("parse".into()));
     };
     let env: HashMap<String, String> =
         HashMap::from([("FLEET_CLIENT_TOKEN".to_owned(), API_TOKEN.to_owned())]);
-    let mut out = Vec::new();
-    let result = run_with(
+    run_with(
         parsed,
         move |var| env.get(var).cloned(),
         false,
         &mut b"".as_slice(),
-        &mut out,
+        out,
     )
-    .await;
-    (result, String::from_utf8_lossy(&out).into_owned())
+    .await
 }
 
 fn refusal(result: Result<(), CliError>) -> (u8, String) {
@@ -176,7 +195,7 @@ async fn issue_prints_the_token_alone_on_stdout() -> TestResult {
     let (res, out) = cli(&url, &["box-token", "issue", &name(5)]).await;
     res?;
     assert_eq!(out, format!("{}\n", secret()));
-    assert_eq!(stub.seen(), [format!("issue {} [] 0", name(5))]);
+    assert_eq!(stub.seen(), [format!("issue {} [] default", name(5))]);
     Ok(())
 }
 
@@ -663,5 +682,18 @@ async fn list_shows_a_malformed_or_pre_epoch_time_as_a_dash() -> TestResult {
         let cells: Vec<&str> = out.lines().nth(1).unwrap().split('\t').collect();
         assert_eq!(cells[3], "-", "{given}");
     }
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_token_that_cannot_be_written_names_its_id_and_the_revoke_command() -> TestResult {
+    let stub = Stub::default();
+    *stub.issue.lock().unwrap() = Some(Ok(issued(&secret())));
+    let url = serve(stub.clone()).await?;
+    let result = cli_into(&url, &["box-token", "issue", &name(5)], &mut BrokenPipe).await;
+    let (code, message) = refusal(result);
+    assert_eq!(code, 1);
+    assert!(message.contains("fleet box-token revoke 7"), "{message}");
+    assert!(!message.contains(&secret()), "{message}");
     Ok(())
 }

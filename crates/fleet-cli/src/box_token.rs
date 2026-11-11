@@ -72,7 +72,7 @@ fn refuse(status: &Status) -> CliError {
 pub(crate) struct IssueArgs {
     box_name: String,
     label: String,
-    ttl_days: u32,
+    ttl_days: Option<u32>,
 }
 
 fn digits(text: &str) -> bool {
@@ -99,20 +99,20 @@ pub(crate) fn parse_issue(
             "label: at most {MAX_LABEL_CHARS} characters and no control characters"
         )));
     }
-    let days = match ttl_days {
-        None => 0,
-        Some(text) => text
-            .bytes()
-            .all(|b| b.is_ascii_digit())
-            .then(|| text.parse::<u32>().ok())
-            .flatten()
-            .filter(|days| days_are_valid(*days))
-            .ok_or_else(|| {
-                CliError::Usage(format!(
-                    "ttl-days: a whole number from 1 to {MAX_DAYS}, default {DEFAULT_DAYS}"
-                ))
-            })?,
-    };
+    let days = ttl_days
+        .map(|text| {
+            text.bytes()
+                .all(|b| b.is_ascii_digit())
+                .then(|| text.parse::<u32>().ok())
+                .flatten()
+                .filter(|days| days_are_valid(*days))
+                .ok_or_else(|| {
+                    CliError::Usage(format!(
+                        "ttl-days: a whole number from 1 to {MAX_DAYS}, default {DEFAULT_DAYS}"
+                    ))
+                })
+        })
+        .transpose()?;
     Ok(IssueArgs {
         box_name: name.as_str().to_owned(),
         label: label.to_owned(),
@@ -138,8 +138,8 @@ pub(crate) fn parse_id(text: &str) -> Result<i64, CliError> {
 /// # Errors
 ///
 /// Returns [`CliError::Refused`] with fixed text for a server refusal or a reply that does not
-/// hold exactly one token, and [`CliError::Io`] when writing fails. Nothing is written on an
-/// error before the check.
+/// hold exactly one token, and [`CliError::TokenNotDelivered`] when writing the token fails after
+/// the server committed it. Nothing is written on an error before the check.
 pub(crate) async fn issue(
     client: &mut BoxTokensClient,
     scrub: &Scrub,
@@ -158,8 +158,12 @@ pub(crate) async fn issue(
     if !fleet_core::box_token::is_token(&reply.token) {
         return Err(CliError::Refused("the server returned a malformed token"));
     }
-    writeln!(out, "{}", reply.token)?;
-    out.flush()?;
+    if writeln!(out, "{}", reply.token)
+        .and_then(|()| out.flush())
+        .is_err()
+    {
+        return Err(CliError::TokenNotDelivered { id: reply.id });
+    }
     let _ = writeln!(
         std::io::stderr(),
         "fleet: issued box token {} for {}, expires {}; it is shown once",
