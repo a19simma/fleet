@@ -7,7 +7,7 @@
 use std::time::Duration;
 
 use fleet_core::host::{Host, HostName};
-use fleet_server::hosts::{AddOutcome, HostStore, RemoveOutcome};
+use fleet_server::hosts::{AddOutcome, ApproveOutcome, HostStore, RemoveOutcome};
 use fleet_server::store::Store;
 use sqlx::PgPool;
 use tokio::time::{sleep, timeout};
@@ -546,4 +546,43 @@ async fn add_queues_behind_a_lock_on_the_user_row(pool: PgPool) {
 async fn add_queues_behind_the_global_cap_lock(pool: PgPool) {
     migrated(&pool).await;
     add_waits_while(&pool, "SELECT pg_advisory_xact_lock(6850, 1)", None).await;
+}
+
+#[sqlx::test(migrations = false)]
+async fn approve_and_add_run_concurrently_without_a_deadlock(pool: PgPool) {
+    migrated(&pool).await;
+    let alice = user(&pool, "alice").await;
+    let admin = user(&pool, "admin").await;
+    let store = HostStore::new(pool.clone()).with_caps(1000, 1000);
+    let private: Vec<std::net::IpAddr> = vec!["10.0.0.5".parse().unwrap()];
+    for n in 0..200 {
+        let pending = name(&format!("p{n}.example.com"));
+        assert!(
+            store
+                .record_request(alice, &pending, &private)
+                .await
+                .unwrap()
+        );
+        let approver = {
+            let store = store.clone();
+            let private = private.clone();
+            tokio::spawn(async move { store.approve(admin, &pending, &private).await })
+        };
+        let adder = {
+            let store = store.clone();
+            tokio::spawn(async move { store.add(alice, &host(&format!("a{n}.example.com"))).await })
+        };
+        let approved = timeout(Duration::from_secs(20), approver)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert!(matches!(approved, ApproveOutcome::Approved(_)), "{n}");
+        let added = timeout(Duration::from_secs(20), adder)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert!(matches!(added, AddOutcome::Added(_)), "{n}");
+    }
 }
