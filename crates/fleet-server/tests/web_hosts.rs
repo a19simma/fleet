@@ -14,7 +14,7 @@ use std::time::Duration;
 
 use fleet_core::credential::Secret;
 use fleet_core::host::{HostKind, HostName};
-use fleet_proto::CredentialNotice;
+use fleet_proto::{CredentialNotice, MAX_HOST_APPROVED_IPS};
 use fleet_server::auth::BearerAuth;
 use fleet_server::config::{Forge, RepoHosts, Token};
 use fleet_server::cred::github::{GithubApi, GithubError, GithubUser};
@@ -801,7 +801,19 @@ async fn the_request_row_names_the_addresses_and_approve_revoke_call_the_service
         CredentialNotice::HostAddressMismatch.code()
     );
     assert_eq!(rig.grant().await, (false, Vec::new()));
-    let repeated = [PRIVATE_IP; 20].join(",");
+    let over_cap = [PRIVATE_IP; MAX_HOST_APPROVED_IPS + 1].join(",");
+    let refused = rig
+        .post_form(&admin, "/hosts/approve", FORGE, &over_cap)
+        .await;
+    assert_eq!(refused.notice(), CredentialNotice::HostInvalid.code());
+    let page = rig
+        .http("GET", &refused.location(), &admin.cookie, "")
+        .await
+        .body;
+    assert!(page.contains(CredentialNotice::HostInvalid.text()));
+    assert!(!page.contains(&over_cap));
+    assert_eq!(rig.grant().await, (false, Vec::new()));
+    let repeated = [PRIVATE_IP; MAX_HOST_APPROVED_IPS].join(",");
     let approved = rig
         .post_form(&admin, "/hosts/approve", FORGE, &repeated)
         .await;

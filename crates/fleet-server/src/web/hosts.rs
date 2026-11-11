@@ -349,9 +349,12 @@ fn address_field(form: &HashMap<String, String>) -> Option<Vec<IpAddr>> {
         .map(str::parse::<IpAddr>)
         .collect::<Result<Vec<_>, _>>()
         .ok()?;
+    if parsed.len() > MAX_HOST_APPROVED_IPS {
+        return None;
+    }
     parsed.sort();
     parsed.dedup();
-    (parsed.len() <= MAX_HOST_APPROVED_IPS).then_some(parsed)
+    Some(parsed)
 }
 
 /// Admin gate for the private-host posts: a caller who is not an admin gets 404, read from the
