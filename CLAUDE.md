@@ -6,6 +6,10 @@ Rust workspace: `fleetd` (box daemon), `fleet-server` (gRPC on Postgres), `fleet
 
 Run the project verify before every commit: `cargo fmt --check`, `cargo clippy --workspace --all-targets -- -D warnings`, `cargo nextest run --workspace --no-fail-fast`, `cargo test --workspace --doc`, `mise run css:check` and the private-pattern scan below. Server tests need `DATABASE_URL` pointing at Postgres 17 (`#[sqlx::test]`).
 
+## Secrets in tasks
+
+A mise task that needs a secret runs its command through `fnox exec --`, as `mise run fleet` does. `mise exec` alone exports no fnox secrets here, and the `_.fnox-env` plugin is archived upstream. Keep secret values out of `mise.toml`; only names live in `fnox.toml` in plaintext.
+
 ## Common review failures
 
 These sent earlier work back for a retry. Check each before you commit.
