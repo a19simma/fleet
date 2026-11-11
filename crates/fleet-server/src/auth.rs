@@ -31,7 +31,9 @@ use std::future::Future;
 use std::pin::Pin;
 use std::task::{Context, Poll};
 
-use fleet_core::{Redactor, constant_time_eq};
+use std::sync::Once;
+
+use fleet_core::{BOX_TOKEN_PREFIX, Redactor, constant_time_eq};
 use tonic::Status;
 use tonic::body::Body;
 use tonic::codegen::http::{HeaderValue, Request, Response};
@@ -97,6 +99,14 @@ fn is_admin_path(path: &str) -> bool {
         || HOST_ADMIN_RPCS.contains(&path)
 }
 
+static SHARED_BOX_TOKEN_WARNING: Once = Once::new();
+
+fn warn_shared_box_token() {
+    SHARED_BOX_TOKEN_WARNING.call_once(|| {
+        tracing::warn!("a request used the shared box token; issue per-box tokens (ADR-0069)");
+    });
+}
+
 /// The user a request acts as, set by [`BearerAuth`] on every client-scope request when it has a
 /// [`Users`] store.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -120,6 +130,46 @@ impl Caller {
             Err(Status::permission_denied(ADMIN_REQUIRED))
         }
     }
+}
+
+/// The fixed `PERMISSION_DENIED` reason when a per-Box token names a different Box.
+pub const BOX_MISMATCH: &str = "token is not valid for this box";
+
+/// The Box a per-Box token is bound to, set by [`BearerAuth`] when a request carries an `fbx_`
+/// token (ADR-0069). It is never a [`Caller`]: no client-scope handler can read it as a user.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BoxCaller {
+    /// The `box_tokens` row id.
+    pub token_id: i64,
+    /// The user the token was issued to.
+    pub user_id: i64,
+    /// The one Box name the token is bound to.
+    pub box_name: String,
+}
+
+impl BoxCaller {
+    /// Refuses a request that names a Box other than the bound one.
+    ///
+    /// # Errors
+    ///
+    /// Returns `PERMISSION_DENIED` with [`BOX_MISMATCH`], never echoing the requested name.
+    pub fn require_box(&self, requested: &str) -> Result<(), Status> {
+        if constant_time_eq(self.box_name.as_bytes(), requested.as_bytes()) {
+            Ok(())
+        } else {
+            Err(Status::permission_denied(BOX_MISMATCH))
+        }
+    }
+}
+
+/// What [`BearerAuth::resolve`] found: a user caller, a per-Box token, or neither (a static
+/// token with no user store).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Resolved {
+    /// The user the request acts as.
+    pub caller: Option<Caller>,
+    /// The Box binding of a per-Box token.
+    pub box_caller: Option<BoxCaller>,
 }
 
 /// Which token a request carried.
@@ -163,7 +213,9 @@ impl BearerAuth {
         let tokens = std::iter::once(&self.box_token)
             .chain(self.client_token.as_ref())
             .map(raw);
-        Redactor::new(tokens).with_installation_tokens()
+        Redactor::new(tokens)
+            .with_installation_tokens()
+            .with_box_tokens()
     }
 
     /// Adds user resolution: API tokens authenticate as their user and the client token as
@@ -264,11 +316,47 @@ impl BearerAuth {
         path: &str,
         header: Option<&[u8]>,
     ) -> Result<Option<Caller>, Status> {
+        Ok(self.resolve(path, header).await?.caller)
+    }
+
+    /// Like [`BearerAuth::authenticate`], and also resolves a per-Box token.
+    ///
+    /// The lookup order is the static Box token, the static client token, a per-Box token (the
+    /// `fbx_` prefix), then an API token. A per-Box token has the Box scope and yields a
+    /// [`BoxCaller`] and no [`Caller`].
+    ///
+    /// # Errors
+    ///
+    /// The same as [`BearerAuth::authenticate`]; an unknown, expired or revoked per-Box token is
+    /// `UNAUTHENTICATED` with the text of any bad token.
+    pub async fn resolve(&self, path: &str, header: Option<&[u8]>) -> Result<Resolved, Status> {
         let header = header.unwrap_or_default();
         let unavailable = |_| Status::unavailable("user lookup unavailable");
+        let mut box_caller = None;
         let (scope, caller) = match self.scope_of(header) {
-            Some(Scope::Box) => (Scope::Box, None),
+            Some(Scope::Box) => {
+                warn_shared_box_token();
+                (Scope::Box, None)
+            }
             Some(Scope::Client) => (Scope::Client, None),
+            None if header
+                .strip_prefix(b"Bearer ")
+                .is_some_and(|t| t.starts_with(BOX_TOKEN_PREFIX.as_bytes())) =>
+            {
+                let token = header.strip_prefix(b"Bearer ").unwrap_or_default();
+                let found = match self.users.as_ref() {
+                    Some(users) => users.resolve_box_token(token).await.map_err(unavailable)?,
+                    None => None,
+                };
+                let owner = found
+                    .ok_or_else(|| Status::unauthenticated("missing or invalid bearer token"))?;
+                box_caller = Some(BoxCaller {
+                    token_id: owner.token_id,
+                    user_id: owner.user_id,
+                    box_name: owner.box_name,
+                });
+                (Scope::Box, None)
+            }
             None => {
                 let users = self.users.as_ref();
                 let token = header.strip_prefix(b"Bearer ");
@@ -289,7 +377,10 @@ impl BearerAuth {
                     if caller.is_admin
                         && (ADMIN_RPCS.contains(&path) || HOST_ADMIN_RPCS.contains(&path)) =>
                 {
-                    Ok(Some(caller))
+                    Ok(Resolved {
+                        caller: Some(caller),
+                        box_caller,
+                    })
                 }
                 _ => Err(Status::permission_denied(ADMIN_REQUIRED)),
             };
@@ -312,12 +403,15 @@ impl BearerAuth {
         }
         if let (Scope::Client, None, Some(users)) = (scope, caller, self.users.as_ref()) {
             let user_id = users.bootstrap_user().await.map_err(unavailable)?;
-            return Ok(Some(Caller {
-                user_id,
-                is_admin: false,
-            }));
+            return Ok(Resolved {
+                caller: Some(Caller {
+                    user_id,
+                    is_admin: false,
+                }),
+                box_caller: None,
+            });
         }
-        Ok(caller)
+        Ok(Resolved { caller, box_caller })
     }
 }
 
@@ -364,10 +458,13 @@ where
                 .headers()
                 .get("authorization")
                 .map(HeaderValue::as_bytes);
-            match auth.authenticate(request.uri().path(), header).await {
-                Ok(caller) => {
+            match auth.resolve(request.uri().path(), header).await {
+                Ok(Resolved { caller, box_caller }) => {
                     if let Some(caller) = caller {
                         request.extensions_mut().insert(caller);
+                    }
+                    if let Some(box_caller) = box_caller {
+                        request.extensions_mut().insert(box_caller);
                     }
                     inner.call(request).await
                 }
@@ -430,6 +527,17 @@ mod tests {
                 .ok_or_else(|| format!("{case:?} passed"))?;
             assert_eq!(status.code(), Code::Unauthenticated, "{case:?}");
         }
+        Ok(())
+    }
+
+    #[test]
+    fn the_work_redactor_masks_a_box_token() -> Result<(), String> {
+        let token = format!("fbx_{}", "ab".repeat(32));
+        let redactor = auth()?.redactor();
+        assert_eq!(
+            redactor.redact_str(&format!("x {token} y")),
+            format!("x {} y", fleet_core::PLACEHOLDER)
+        );
         Ok(())
     }
 

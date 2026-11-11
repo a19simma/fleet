@@ -305,7 +305,9 @@ impl FleetService {
             hosts: None,
             update: UpdateRelay::default(),
             timing_reply_cap: MAX_JOB_TIMING_REPLY_BYTES,
-            work_redactor: Redactor::default().with_installation_tokens(),
+            work_redactor: Redactor::default()
+                .with_installation_tokens()
+                .with_box_tokens(),
         }
     }
 

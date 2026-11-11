@@ -39,7 +39,10 @@ pub use profile::{
     ProfileError, ProfileHash, PromptText, PromptTextError, Selection, SelectionError, Settings,
     SettingsPermissions, Skill, Visibility, VisibilityError,
 };
-pub use redact::{INSTALLATION_TOKEN_MIN_BODY, MIN_SECRET_LEN, PLACEHOLDER, Redactor};
+pub use redact::{
+    BOX_TOKEN_HEX_LEN, BOX_TOKEN_PREFIX, INSTALLATION_TOKEN_MIN_BODY, MIN_SECRET_LEN, PLACEHOLDER,
+    Redactor,
+};
 pub use validate::{
     ENV_FLAG_ALLOWLIST, MAX_BUDGET_CENTS, MAX_COMPONENT_BYTES, MAX_ENTRIES, MAX_FILE_BYTES,
     MAX_MODEL_BYTES, MAX_PATH_BYTES, MAX_RULE_BYTES, MAX_RULES, MAX_SKILL_NAME_LEN, MAX_TOOLS,

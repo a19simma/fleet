@@ -16,6 +16,12 @@ pub const MIN_SECRET_LEN: usize = 8;
 /// credential, 20 bytes.
 pub const INSTALLATION_TOKEN_MIN_BODY: usize = 16;
 
+/// The prefix of a per-Box token.
+pub const BOX_TOKEN_PREFIX: &str = "fbx_";
+
+/// The hex digits after [`BOX_TOKEN_PREFIX`] in a per-Box token.
+pub const BOX_TOKEN_HEX_LEN: usize = 64;
+
 /// Text that replaces a scrubbed value.
 pub const PLACEHOLDER: &str = "[REDACTED]";
 
@@ -38,6 +44,7 @@ pub struct Redactor {
     secrets: Vec<String>,
     skipped: Vec<String>,
     installation_tokens: bool,
+    box_tokens: bool,
 }
 
 impl std::fmt::Debug for Redactor {
@@ -46,6 +53,7 @@ impl std::fmt::Debug for Redactor {
             .field("secrets", &self.secrets.len())
             .field("skipped_keys", &self.skipped)
             .field("installation_tokens", &self.installation_tokens)
+            .field("box_tokens", &self.box_tokens)
             .finish()
     }
 }
@@ -91,6 +99,7 @@ impl Redactor {
             secrets,
             skipped,
             installation_tokens: false,
+            box_tokens: false,
         }
     }
 
@@ -104,6 +113,15 @@ impl Redactor {
     #[must_use]
     pub const fn with_installation_tokens(mut self) -> Self {
         self.installation_tokens = true;
+        self
+    }
+
+    /// Also masks per-Box tokens by shape: [`BOX_TOKEN_PREFIX`] followed by at least
+    /// [`BOX_TOKEN_HEX_LEN`] lowercase hex digits. The whole hex run is masked, so a longer run
+    /// leaks no tail. The flag survives [`Redactor::merged`] and a clone.
+    #[must_use]
+    pub const fn with_box_tokens(mut self) -> Self {
+        self.box_tokens = true;
         self
     }
 
@@ -132,6 +150,7 @@ impl Redactor {
             secrets,
             skipped,
             installation_tokens: self.installation_tokens || other.installation_tokens,
+            box_tokens: self.box_tokens || other.box_tokens,
         }
     }
 
@@ -175,6 +194,9 @@ impl Redactor {
         if self.installation_tokens {
             installation_token_ranges(input, &mut ranges);
         }
+        if self.box_tokens {
+            box_token_ranges(input, &mut ranges);
+        }
         if ranges.is_empty() {
             return Cow::Borrowed(input);
         }
@@ -206,7 +228,7 @@ impl Redactor {
 
     /// Scrubs every string, object key included, in a JSON value.
     pub fn redact_value(&self, value: &mut Value) {
-        if self.secrets.is_empty() && !self.installation_tokens {
+        if self.secrets.is_empty() && !self.installation_tokens && !self.box_tokens {
             return;
         }
         match value {
@@ -233,6 +255,25 @@ impl Redactor {
         {
             self.scrub(text);
         }
+    }
+}
+
+fn box_token_ranges(input: &str, ranges: &mut Vec<(usize, usize)>) {
+    let mut from = 0;
+    while let Some(found) = input
+        .get(from..)
+        .and_then(|rest| rest.find(BOX_TOKEN_PREFIX))
+    {
+        let body = from + found + BOX_TOKEN_PREFIX.len();
+        let run = input.get(body..).map_or(0, |rest| {
+            rest.bytes()
+                .take_while(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
+                .count()
+        });
+        if run >= BOX_TOKEN_HEX_LEN {
+            ranges.push((from + found, body + run));
+        }
+        from = body;
     }
 }
 
@@ -337,6 +378,43 @@ mod tests {
         assert_eq!(overlap.redact_str("abcdefgh-one-ijklmn"), PLACEHOLDER);
         assert_eq!(a.len(), 2);
         assert!(Redactor::default().merged(&Redactor::default()).is_empty());
+    }
+
+    #[test]
+    fn the_box_token_mode_masks_a_token_by_shape_and_nothing_shorter() {
+        let hex = "0123456789abcdef".repeat(4);
+        let token = format!("fbx_{hex}");
+        let on = Redactor::default().with_box_tokens();
+        assert_eq!(
+            on.redact_str(&format!("a {token} b")),
+            format!("a {PLACEHOLDER} b")
+        );
+        assert_eq!(
+            on.redact_str(&format!("{token}{token}")),
+            PLACEHOLDER,
+            "a longer hex run is one token"
+        );
+        assert_eq!(
+            on.redact_str(&format!("{token}abcd")),
+            PLACEHOLDER,
+            "a hex tail leaks nothing"
+        );
+        let short = format!("fbx_{}", &hex[..63]);
+        assert_eq!(on.redact_str(&short), short);
+        let upper = format!("fbx_{}", hex.to_uppercase());
+        assert_eq!(on.redact_str(&upper), upper);
+        let wrong_prefix = format!("flt_{hex}");
+        assert_eq!(on.redact_str(&wrong_prefix), wrong_prefix);
+        let off = Redactor::default();
+        assert_eq!(off.redact_str(&token), token);
+        let merged = Redactor::default().merged(&on);
+        assert_eq!(merged.redact_str(&token), PLACEHOLDER);
+        let mut value = serde_json::json!({ "k": format!("x {token}") });
+        on.redact_value(&mut value);
+        assert_eq!(
+            value,
+            serde_json::json!({ "k": format!("x {PLACEHOLDER}") })
+        );
     }
 
     const APP: &str = "ghs_AbCdEfGhIjKlMnOpQrStUvWxYz0123456789";

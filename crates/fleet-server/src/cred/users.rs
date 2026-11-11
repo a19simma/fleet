@@ -8,8 +8,8 @@ use std::sync::Arc;
 
 use chacha20poly1305::aead::OsRng;
 use chacha20poly1305::aead::rand_core::RngCore;
-use fleet_core::constant_time_eq;
 use fleet_core::credential::Secret;
+use fleet_core::{BOX_TOKEN_PREFIX, constant_time_eq};
 use sqlx::PgPool;
 use tokio::sync::{Mutex, OnceCell, OwnedMutexGuard};
 
@@ -30,9 +30,6 @@ pub const MAX_BOX_TOKEN_DAYS: u32 = 365;
 
 /// The longest per-Box token label in characters.
 pub const MAX_BOX_TOKEN_LABEL_CHARS: usize = 64;
-
-/// The prefix of a per-Box token.
-pub const BOX_TOKEN_PREFIX: &str = "fbx_";
 
 const TOKEN_PREFIX: &str = "flt_";
 const RANDOM_BYTES: usize = 32;
