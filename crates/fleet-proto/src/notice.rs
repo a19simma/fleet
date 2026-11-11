@@ -297,7 +297,8 @@ impl CredentialNotice {
     /// `NOT_FOUND` to [`Self::HostMissing`] and `RESOURCE_EXHAUSTED` to [`Self::HostLimit`], and
     /// the host reasons to their own notice. A private or refused host reads as
     /// [`Self::HostRefused`], the same notice for every cause. Every other status reads the same
-    /// closed set as [`Self::for_status`].
+    /// closed set as [`Self::for_status`]. The admin-only denial text is not a notice: the CLI
+    /// prints its own fixed `ADMIN_ONLY` and `ADMIN_ONLY_PRIVATE` strings from `fleet_cli::host`.
     #[must_use]
     pub fn for_host_status(status: &Status) -> Self {
         match status.code() {

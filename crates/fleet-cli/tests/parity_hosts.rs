@@ -1,15 +1,14 @@
-//! Parity of `fleet host add|list|remove|approve-private|revoke-private|requests` and the web git
-//! remotes page, both over one
-//! `HostService` shape on one Postgres.
+//! Parity of `fleet host add|list|remove|approve-private|revoke-private|requests` and the web
+//! git remotes page, both over one `HostService` shape on one Postgres.
 //!
 //! `ROWS` is the operation table, one row per operation and scenario, each with exactly one
 //! classification. Both surfaces end in a notice code from `CredentialNotice` or list the
 //! registered hosts. `Same` means both ended in the same code or list and left the same hosts in
 //! the database. `Differs` names a documented gap with the label each surface gives, and passes
-//! only while the two still disagree in exactly that way. A label is `notice:<code>`,
-//! `listed`, `usage`, `refused`, `403`, `404`, `hidden` or `unexpected:<text>`. The CLI reaches the service through
-//! a `FleetHosts` server that sets the caller from the bearer token, the web page through
-//! a session cookie, and both through a probe fake that answers a fixed verdict.
+//! only while the two still disagree in exactly that way. A label is `notice:<code>`, `listed`,
+//! `usage`, `refused`, `403`, `404`, `hidden` or `unexpected:<text>`. The CLI reaches the
+//! service through a `FleetHosts` server that sets the caller from the bearer token, the web
+//! page through a session cookie, and both through a probe fake that answers a fixed verdict.
 //!
 //! The tests need a Postgres superuser URL in `DATABASE_URL` and live in their own binary
 //! because they bind sockets.

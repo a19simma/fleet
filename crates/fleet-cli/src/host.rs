@@ -1,4 +1,5 @@
-//! `fleet host`: add, list, remove and approve private git hosts.
+//! `fleet host add|list|remove|approve-private|revoke-private|requests`: manage git hosts and
+//! the approval of their private addresses.
 //!
 //! `add` and `remove` normalise the argument with [`HostName::normalise`] for fast feedback and
 //! send the punycode form. The server checks again and its answer decides. Every server refusal
@@ -7,9 +8,11 @@
 //! carries the ask-an-admin hint: the reply never says why a host was refused, so the hint is the
 //! same for all of them and the command never tells a private name from any other refused name.
 //! `remove` is admin-only: the server's fixed `admin required` denial prints [`ADMIN_ONLY`].
-//! `approve-private`, `revoke-private` and `requests` are admin-only. Each address argument is
-//! parsed as an IP address before any request. The server answers `approve-private` with
-//! `NOT_FOUND` for a non-admin and for an unknown host alike, so both print the same fixed
+//! `approve-private`, `revoke-private` and `requests` are admin-only too. `revoke-private` and
+//! `requests` print [`ADMIN_ONLY_PRIVATE`]. The shared `FLEET_CLIENT_TOKEN` acts as the
+//! bootstrap user, which is never an admin, so the admin actions need a per-user API token. Each
+//! address argument is parsed as an IP address before any request. The server answers
+//! `approve-private` with `NOT_FOUND` for a non-admin and for an unknown host alike, so both print the same fixed
 //! [`CredentialNotice::HostMissing`] text. Approval prints the addresses the server stored.
 //! Hosts print through [`fleet_core::repo::ascii_form`], so a host is always shown in its ASCII
 //! form.
