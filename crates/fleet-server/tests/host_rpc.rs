@@ -1074,6 +1074,30 @@ async fn a_non_admin_and_an_unknown_host_get_the_same_not_found(pool: PgPool) {
 }
 
 #[sqlx::test(migrations = false)]
+async fn approve_counts_the_raw_named_list_before_dropping_duplicates(pool: PgPool) {
+    let switch = Switch(Arc::new(Mutex::new(Vec::new())));
+    let s = switch.clone();
+    let w = world_with(pool, move |store| {
+        HostService::new(store, Arc::new(PinnedProbe::new(s, wire(200, FORGE))))
+    })
+    .await;
+    switch.set(&[PRIVATE]);
+    add(&w, w.alice, "git.example.com").await.unwrap_err();
+    let cap = fleet_proto::MAX_HOST_APPROVED_IPS;
+    let over = vec![PRIVATE; cap + 1];
+    let err = approve(&w, (w.admin, true), "git.example.com", &over)
+        .await
+        .unwrap_err();
+    assert_eq!(parts(&err), closed(Reason::HostAddressMismatch));
+    assert_eq!(grant_state(&w.pool, "git.example.com").await, None);
+    let at = vec![PRIVATE; cap];
+    approve(&w, (w.admin, true), "git.example.com", &at)
+        .await
+        .unwrap();
+    assert!(grant_state(&w.pool, "git.example.com").await.is_some());
+}
+
+#[sqlx::test(migrations = false)]
 async fn approve_refuses_a_named_set_that_differs_from_the_fresh_resolve(pool: PgPool) {
     let switch = Switch(Arc::new(Mutex::new(Vec::new())));
     let s = switch.clone();
