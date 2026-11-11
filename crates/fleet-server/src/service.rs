@@ -748,16 +748,25 @@ impl FleetHosts for FleetService {
         &self,
         request: Request<ApproveHostPrivateRequest>,
     ) -> Result<Response<HostInfo>, Status> {
-        admin_of(&request)?;
-        Err(Status::unimplemented("approve host private"))
+        let admin_id = match request.extensions().get::<Caller>() {
+            Some(caller) if caller.is_admin => caller.user_id,
+            _ => return Err(Status::not_found(fleet_proto::ERR_HOST_NOT_FOUND)),
+        };
+        let hosts = self.hosts_service()?;
+        Ok(Response::new(
+            hosts.approve(admin_id, request.get_ref()).await?,
+        ))
     }
 
     async fn revoke_host_private(
         &self,
         request: Request<RevokeHostPrivateRequest>,
     ) -> Result<Response<HostInfo>, Status> {
-        admin_of(&request)?;
-        Err(Status::unimplemented("revoke host private"))
+        let admin_id = admin_of(&request)?;
+        let hosts = self.hosts_service()?;
+        Ok(Response::new(
+            hosts.revoke(admin_id, request.get_ref()).await?,
+        ))
     }
 
     async fn list_host_requests(
@@ -765,7 +774,8 @@ impl FleetHosts for FleetService {
         request: Request<ListHostRequestsRequest>,
     ) -> Result<Response<ListHostRequestsReply>, Status> {
         admin_of(&request)?;
-        Err(Status::unimplemented("list host requests"))
+        let hosts = self.hosts_service()?;
+        Ok(Response::new(hosts.list_requests().await?))
     }
 }
 

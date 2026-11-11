@@ -20,6 +20,8 @@ const RECHECK_CREDENTIAL: &str =
 const EXISTS: &str =
     "SELECT EXISTS (SELECT 1 FROM user_repos WHERE user_id = $1 AND host = $2 AND path = $3)";
 
+const NOW_MS: &str = "SELECT (EXTRACT(EPOCH FROM clock_timestamp()) * 1000)::bigint";
+
 const COUNT: &str = "SELECT count(*) FROM user_repos WHERE user_id = $1";
 
 const UPSERT: &str = "\
@@ -167,6 +169,39 @@ impl RepoStore {
             RepoCredential::Pat(secret)
         };
         Ok(Some((id, credential)))
+    }
+
+    /// The user's `forgejo_pat` for exactly `host` and its row id. A credential stored for another
+    /// host, an unknown or malformed host and an expired credential are `None`; the expiry is read
+    /// against the database clock.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RepoStoreError::Credential`] when the value cannot be opened or storage fails.
+    pub async fn forgejo_credential(
+        &self,
+        user_id: i64,
+        host: &str,
+    ) -> Result<Option<(i64, RepoCredential)>, RepoStoreError> {
+        let opened = self
+            .credentials
+            .open_for_host(user_id, CredentialKind::ForgejoPat, host)
+            .await;
+        let (summary, secret) = match opened {
+            Ok(opened) => opened,
+            Err(
+                StoreError::NotFound
+                | StoreError::HostUnknown
+                | StoreError::HostInvalid(_)
+                | StoreError::HostKindMismatch,
+            ) => return Ok(None),
+            Err(err) => return Err(RepoStoreError::Credential(err)),
+        };
+        let now: i64 = sqlx::query_scalar(NOW_MS).fetch_one(&self.pool).await?;
+        if summary.expires_at_ms.is_some_and(|expires| expires <= now) {
+            return Ok(None);
+        }
+        Ok(Some((summary.id, RepoCredential::Pat(secret))))
     }
 
     /// Registers `repo` for `user_id`, or refreshes `push` and `verified_at` of an existing row.
