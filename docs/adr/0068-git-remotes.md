@@ -10,7 +10,7 @@ Target host for the first slice: the dev Forgejo 17.0.1 on the Gitea 1.22 API, v
 
 ### Git host table
 
-A new `git_hosts` table replaces `FLEET_REPO_HOSTS` as the source of hosts (migration 0045). A row holds: `host` (primary key, normalised), `kind` (`github` or `forgejo`), `allow_private` (default false), `approved_ips` (the private addresses an admin approved, empty unless `allow_private`), `added_by`, `approved_by`, `approved_at` and timestamps. Migration 0045 seeds `github.com` as kind `github` and, for each entry of an existing `FLEET_REPO_HOSTS`, one row; the variable is then read once at startup for seeding only and is deprecated.
+A new `git_hosts` table replaces `FLEET_REPO_HOSTS` as the source of hosts (migration 0045). A row holds: `host` (primary key, normalised), `kind` (`github` or `forgejo`), `allow_private` (default false), `approved_ips` (the private addresses an admin approved, empty unless `allow_private`), `added_by`, `approved_by`, `approved_at` and timestamps. Migration 0045 seeds one row, `github.com` as kind `github`. The server parses `FLEET_REPO_HOSTS` into `config.repo_hosts` (`crates/fleet-server/src/config.rs:592`) and nothing else reads that field, so the variable seeds no row and `git_hosts` replaces it. An operator adds any other host with `fleet host add`, and a host with `allow_private` needs an admin approval.
 
 - Any User adds a host: `fleet host add <host>` and the Git remotes page. No capability gates it and the admin is not involved for a public host.
 - A User-added host has kind `forgejo`. The Gitea API is the only one probed. Kind `github` rows exist only for `github.com`, seeded by migration. GitHub Enterprise Server is out of scope. A User cannot choose a kind, so a hostile host cannot claim to be GitHub.
@@ -44,10 +44,10 @@ A host whose records are not all public is refused unless an admin approved that
 - `allow_private` is a flag on the host row. Only an admin sets it, by `fleet host approve-private <host>` or the admin button on the Git remotes page. Both are audited and both name the resolved addresses the admin is approving.
 - Approval records `approved_ips`, the private addresses seen at approval. A later call whose resolved set holds a private address outside `approved_ips` is refused, with the reason `NOT_ALLOWED_HOST`, until an admin re-approves. This blocks a host that an admin approved for one private address from moving to another internal service.
 - Loopback, link-local and cloud-metadata addresses stay refused with the flag set (the rule of ADR-0059).
-- The flag is a revocable grant: `fleet host revoke-private`. Revoking marks the host's registered repositories stale and a running Job keeps its already-open connections only until job end.
-- A User who adds a private-resolving host gets the plain refusal and the hint "ask an admin to approve this host". No row is created until approval, so the admin approves from a pending request: the refusal inserts a `pending` request row (host, user, resolved set) that the admin lists.
+- The flag is a revocable grant: `fleet host revoke-private`. Revoking marks the host's registered repositories stale by moving their `verified_at` to the Unix epoch, and a running Job keeps its already-open connections only until job end. Job start detects a revoke through that epoch on a registered repository of the owner. With no registered repository on the host, the PAT still releases with `allow_private` false and empty `approved_ips`.
+- A User who adds a private-resolving host gets the plain refusal and the hint "ask an admin to approve this host". No `git_hosts` row is created until approval, so the admin approves from a pending request: the refusal inserts a `pending` row in `git_host_requests` (host, user, resolved set) that the admin lists. Approving a pending request creates the host row, kind `forgejo`, with `approved_ips` set. Approve vets stricter than the list above: the whole resolved set must pass the ADR-0059 rule with private ranges approved, and the named set must equal the fresh resolve, or the call is refused with `HOST_ADDRESS_MISMATCH`. A caller who is not an admin gets `NOT_FOUND` from `ApproveHostPrivate`.
 
-Choice A for the dev Forgejo 17.0.1: it resolves to a private address, so it needs this approval. Its certificate is public, so no private CA is needed.
+The dev Forgejo 17.0.1 resolves to a private address, so it needs this approval. Its certificate is public, so no private CA is needed.
 
 ### One Forge interface for GitHub and Forgejo
 
@@ -89,7 +89,7 @@ Every other feature of a forge that the Fleet uses appears on the trait. A new o
 | create_pr ok | URL returned |
 | create_pr already exists | existing URL returned or a fixed error, same on both |
 | create_pr rejected | fixed error, no token echoed |
-| ci_result pending, success, failure, none, mixed | the five `CiResult` variants |
+| ci_result pending, success, failure, none, mixed | `InProgress`, `Success`, `Failure`, `NoChecks`, `Failure`; `Queued` and `Neutral` of the six `CiResult` variants are left to adapter tests |
 | ci_result 404 | fixed error |
 | push ok, non-fast-forward, revoked token | status line, fixed errors |
 | fetch ok, auth failure | status, fixed error |
@@ -102,18 +102,18 @@ Per-adapter extra tests (not in the suite) cover each forge's wire details.
 
 Migration 0045 adds `credentials.host` and the kind `forgejo_pat` (shape `static_secret`, 40 lowercase hex, opaque, no prefix check). The `github_pat` and `github_app` kinds keep `host = 'github.com'`. The unique key becomes `(user, kind, host)`. `PutCredential` takes the host and refuses a host not in the table. `GetJobCredentials` returns one credential per host the Job needs, tagged with the host, and the credential holder keys by host.
 
-Token scopes for Forgejo: `read:repository`, `write:repository`, `write:issue`. The live run on the dev Forgejo 17.0.1 observed that creating a repository over REST also needs `write:user`. The e2e token held `read:repository`, `write:repository`, `write:issue`, `read:issue`, `read:user`, `read:organization`, `read:notification` and `read:package`, plus `write:user` (its repository creation succeeded). The run shows what that token is granted, not the minimum that suffices for push, pull request and CI read.
+Token scopes for Forgejo: `read:repository`, `write:repository`, `write:issue`, and `write:user` when the token must create repositories, as the live suite does for its throwaway repositories. The live run on the dev Forgejo 17.0.1 observed that creating a repository over REST needs `write:user`. The e2e token held `read:repository`, `write:repository`, `write:issue`, `read:issue`, `read:user`, `read:organization`, `read:notification` and `read:package`, plus `write:user` (its repository creation succeeded). The run shows what that token is granted, not the minimum that suffices for push, pull request and CI read.
 
 ### Per-job delivery
 
-- Server: `GetJobCredentials` adds, for the Job's repository host, the host name, its kind, `allow_private` and `approved_ips`, and the owner's `forgejo_pat` for that host. A Job whose repository host has no credential for its owner fails with the fixed error of ADR-0033. The server sends the token for the Job's repository host only, never for another host.
+- Server: `GetJobCredentials` adds, for the Job's repository host, the host name, its kind, `allow_private` and `approved_ips`, and the owner's `forgejo_pat` for that host. A Job whose repository host has no credential for its owner fails with the fixed error of ADR-0033. A Job repository that does not parse as a host is refused with the same host fixed error (`PRECONDITION_HOST_NO_CREDENTIAL`) before any GitHub App mint, so it writes no `github_app_mint` denied row; the `audit_repo` cap guards only parseable repositories. The server sends the token for the Job's repository host only, never for another host.
 - fleetd: `RepoPolicy` gets one token host per host (ADR-0024). Askpass answers a git request for host H with the token stored for H and refuses any other host. Clone and mirror fetch use the same rule.
 - Box egress (ADR-0038): the per-job host list (`ConnectProxy::set_job_hosts` and the fetch policy) receives the Job's repository host from the server. The host is admitted for that Job even though it is outside the operator `egress_allow` ceiling, and only that host. For an `allow_private` host, fleetd's address check admits only the `approved_ips` of that host for that Job. A job end clears the host. fleetd never trusts a host name from a Job field.
 
 ### Surfaces
 
 - CLI: `fleet host add|list|remove|approve-private|revoke-private`, and `fleet credential` accepts `--host` and the kind `forgejo_pat`. `fleet repo add` accepts any host in the table.
-- Web: a credentials page for per-host tokens and a Git remotes page for hosts, pending private requests (admin sees approve and deny) and registered repositories. Every action has a CLI twin and a row in the parity tests.
+- Web: a credentials page for per-host tokens and a Git remotes page for hosts, pending private requests (an admin sees an approve button; the page has no deny button, and a pending request stays until an admin approves it) and registered repositories. Every action has a CLI twin and a row in the parity tests.
 
 ### Runnable
 
@@ -144,7 +144,7 @@ Every row is a test at the host normaliser and at the add RPC. Each result is `N
 | 30x carrying `Location` to another host with the token sent | no second request, no `Authorization` replay |
 | Approved private host later resolving to a different private address | refused until re-approved |
 | Approved private host resolving to loopback or link-local | refused even with `allow_private` |
-| Reply body over `MAX_BODY_BYTES`, or slow past `REPO_CHECK_BUDGET` | fails closed, `TIMEOUT` on time |
+| Reply body over `MAX_BODY_BYTES`, or slow past `REPO_CHECK_BUDGET` | fails closed; at host add an over-cap body is refused with `PRECONDITION_HOST_NOT_FORGE`, and `TIMEOUT` on time |
 | Token for host A sent to host B | impossible, test selects by `(user, host)` and asserts no request to B |
 
 ## Consequences
@@ -189,7 +189,7 @@ Run 2026-11-11 by `mise run live:forgejo` (`crates/fleet-forge/tests/live`) agai
 
 Findings:
 
-- A token without the needed scope answers 403 with a scope message, and a malformed token answers 401. `status_error` maps both to `Unauthorized`, and `verify` maps both to `NotFound`, as the contract table owes.
+- A token without the needed scope answered 403 with a scope message, observed once on the dev Forgejo 17.0.1 when repository creation ran without `write:user`. No probe row above records it. A malformed token answers 401. `status_error` maps both to `Unauthorized`, and `verify` maps both to `NotFound`, as the contract table owes.
 - Creating a repository over REST needs `write:user`.
 - Renaming a repository leaves the old name answering 301 with a relative `Location`. `verify` makes one request and returns `Redirected`, because decision 3 follows no redirect, so the token never leaves the first request. The contract case `verify-redirect` owes exactly one request and the live run meets it. The rename changes the name a stored credential's repository is known by, so the user must update the remote after a rename.
 - A commit with no status makes the dev Forgejo 17.0.1 send `statuses: null` with `total_count: 0`, where the fake sent `[]`. The adapter read the null as malformed. It now reads `null` as an empty list only when `total_count` is the number zero, and then reads Actions runs, which answer an empty list. The fake serves the live shape, so `ci-none` and `ci-checks-none` hold live and in the fake.
@@ -215,7 +215,7 @@ The 13 skipped contract cases, one row each:
 | `redacted-error` | needs a fault the live forge cannot be told to inject |
 | `ci-checks-bad-name` | needs a fault the live forge cannot be told to inject |
 | `ci-checks-over-cap` | needs a fault the live forge cannot be told to inject |
-| `ci-checks-mixed` | commit status contexts are unique, so no duplicate name can be posted |
+| `ci-checks-mixed` | commit status contexts are unique, so no duplicate name |
 
 Consequences for what stays unverified:
 
