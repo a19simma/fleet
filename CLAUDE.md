@@ -14,6 +14,12 @@ A mise task that needs a secret runs its command through `fnox exec --`, as `mis
 
 The Fleet server behind `FLEET_SERVER_URL` (in `fnox.toml`) is the development instance, not production. An agent may deploy to it, grant flags on it with `fleet-server admin` and release builds to it without asking. The maintainer says when a production instance exists and when a real release happens; until then nothing here is production. An agent acts on the dev instance as the `claude` service user, an admin with its own API token. It never uses the maintainer's passkey or session.
 
+## Git
+
+This file overrides the global "never push, create no tags" rule for this repo. An agent may push the default branch (`main`) to `origin` and create and push release tags (`vX.Y.Z`, matching `release.yml` and `image.yml`) without asking. The default branch only takes fast-forward merges of verified work. A tag points at a commit that passed the full verify.
+
+Everything else in the global git rule still holds: never force-push, never rewrite `main` history, never push any other branch to `origin`, never delete a tag, and run `git branch --show-current` before any commit.
+
 ## Common review failures
 
 These sent earlier work back for a retry. Check each before you commit.
