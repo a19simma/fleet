@@ -16,6 +16,7 @@ dist = false
 axum.workspace = true
 chacha20poly1305.workspace = true
 fleet-core.workspace = true
+fleet-forge.workspace = true
 fleet-proto.workspace = true
 serde.workspace = true
 serde_json.workspace = true

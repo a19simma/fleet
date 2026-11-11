@@ -17,6 +17,7 @@ use fleet_proto::v1::fleet_catalog_server::{FleetCatalog, FleetCatalogServer};
 use fleet_proto::v1::fleet_credentials_server::{FleetCredentials, FleetCredentialsServer};
 use fleet_proto::v1::fleet_edit_server::{FleetEdit, FleetEditServer};
 use fleet_proto::v1::fleet_environments_server::{FleetEnvironments, FleetEnvironmentsServer};
+use fleet_proto::v1::fleet_hosts_server::{FleetHosts, FleetHostsServer};
 use fleet_proto::v1::fleet_ingest_server::{FleetIngest, FleetIngestServer};
 use fleet_proto::v1::fleet_jobs_server::{FleetJobs, FleetJobsServer};
 use fleet_proto::v1::fleet_judge_server::{FleetJudge, FleetJudgeServer};
@@ -27,30 +28,32 @@ use fleet_proto::v1::fleet_retro_server::{FleetRetro, FleetRetroServer};
 use fleet_proto::v1::fleet_work_server::{FleetWork, FleetWorkServer};
 use fleet_proto::v1::fleet_worker_server::{FleetWorker, FleetWorkerServer};
 use fleet_proto::v1::{
-    AddRepoRequest, AddWorkDepRequest, AddWorkItemRequest, AddWorkNoteRequest, CancelJobRequest,
-    CancelWorkRequest, CatalogItem, ClaimJobReply, ClaimJobRequest, ClaimWorkRequest,
-    CreateProfileRequest, CreateWorkProjectRequest, CredentialInfo, DeleteCredentialReply,
-    DeleteCredentialRequest, GetBatchReply, GetBatchRequest, GetJobCredentialsReply,
-    GetJobCredentialsRequest, GetJobEnvironmentReply, GetJobEnvironmentRequest, GetJobRequest,
-    GetJobTimingReply, GetJobTimingRequest, GetJobTranscriptReply, GetJobTranscriptRequest,
-    GetProfileBlobReply, GetProfileBlobRequest, GetProfileRequest, GetStatsReply, GetStatsRequest,
-    GetWorkItemReply, GetWorkItemRequest, GrantCapabilityRequest, HeartbeatReply, HeartbeatRequest,
-    Job, ListCapabilitiesReply, ListCapabilitiesRequest, ListCatalogReply, ListCatalogRequest,
-    ListCredentialsReply, ListCredentialsRequest, ListFleetReply, ListFleetRequest, ListJobsReply,
-    ListJobsRequest, ListProfilesReply, ListProfilesRequest, ListReposReply, ListReposRequest,
-    ListWorkDefersReply, ListWorkDefersRequest, ListWorkItemsReply, ListWorkItemsRequest,
-    ListWorkProjectsReply, ListWorkProjectsRequest, NextWorkReply, NextWorkRequest, Profile,
-    ProfileVersion, PushEventsReply, PushEventsRequest, PutCredentialRequest, QueuedEvent,
-    ReadJobEventsReply, ReadJobEventsRequest, ReadTranscriptReply, ReadTranscriptRequest,
-    RecordWorkDeferRequest, Rejection, RemoveRepoReply, RemoveRepoRequest, RemoveWorkDepRequest,
-    RenewLeaseRequest, RepoInfo, ReportAttemptRequest, ReportJobReply, ReportJobRequest,
-    ReportShellLogReply, ReportShellLogRequest, ReportTimingReply, ReportTimingRequest,
-    ResolveWorkDeferRequest, RevokeCapabilityReply, RevokeCapabilityRequest,
-    SetCatalogItemEnabledRequest, SetWorkSlicesRequest, ShareProfileRequest, StreamShellLogChunk,
-    StreamShellLogRequest, SubmitBatchReply, SubmitBatchRequest, SubmitJobRequest,
-    SubmitJudgeRequest, UnblockWorkRequest, UnshareProfileRequest, UpsertCatalogItemRequest,
-    UserCapability, VerifyCredentialReply, VerifyCredentialRequest, WorkAttempt, WorkDefer,
-    WorkEvent, WorkItem, WorkProject,
+    AddHostRequest, AddRepoRequest, AddWorkDepRequest, AddWorkItemRequest, AddWorkNoteRequest,
+    ApproveHostPrivateRequest, CancelJobRequest, CancelWorkRequest, CatalogItem, ClaimJobReply,
+    ClaimJobRequest, ClaimWorkRequest, CreateProfileRequest, CreateWorkProjectRequest,
+    CredentialInfo, DeleteCredentialReply, DeleteCredentialRequest, GetBatchReply, GetBatchRequest,
+    GetJobCredentialsReply, GetJobCredentialsRequest, GetJobEnvironmentReply,
+    GetJobEnvironmentRequest, GetJobRequest, GetJobTimingReply, GetJobTimingRequest,
+    GetJobTranscriptReply, GetJobTranscriptRequest, GetProfileBlobReply, GetProfileBlobRequest,
+    GetProfileRequest, GetStatsReply, GetStatsRequest, GetWorkItemReply, GetWorkItemRequest,
+    GrantCapabilityRequest, HeartbeatReply, HeartbeatRequest, HostInfo, Job, ListCapabilitiesReply,
+    ListCapabilitiesRequest, ListCatalogReply, ListCatalogRequest, ListCredentialsReply,
+    ListCredentialsRequest, ListFleetReply, ListFleetRequest, ListHostRequestsReply,
+    ListHostRequestsRequest, ListHostsReply, ListHostsRequest, ListJobsReply, ListJobsRequest,
+    ListProfilesReply, ListProfilesRequest, ListReposReply, ListReposRequest, ListWorkDefersReply,
+    ListWorkDefersRequest, ListWorkItemsReply, ListWorkItemsRequest, ListWorkProjectsReply,
+    ListWorkProjectsRequest, NextWorkReply, NextWorkRequest, Profile, ProfileVersion,
+    PushEventsReply, PushEventsRequest, PutCredentialRequest, QueuedEvent, ReadJobEventsReply,
+    ReadJobEventsRequest, ReadTranscriptReply, ReadTranscriptRequest, RecordWorkDeferRequest,
+    Rejection, RemoveHostReply, RemoveHostRequest, RemoveRepoReply, RemoveRepoRequest,
+    RemoveWorkDepRequest, RenewLeaseRequest, RepoInfo, ReportAttemptRequest, ReportJobReply,
+    ReportJobRequest, ReportShellLogReply, ReportShellLogRequest, ReportTimingReply,
+    ReportTimingRequest, ResolveWorkDeferRequest, RevokeCapabilityReply, RevokeCapabilityRequest,
+    RevokeHostPrivateRequest, SetCatalogItemEnabledRequest, SetWorkSlicesRequest,
+    ShareProfileRequest, StreamShellLogChunk, StreamShellLogRequest, SubmitBatchReply,
+    SubmitBatchRequest, SubmitJobRequest, SubmitJudgeRequest, UnblockWorkRequest,
+    UnshareProfileRequest, UpsertCatalogItemRequest, UserCapability, VerifyCredentialReply,
+    VerifyCredentialRequest, WorkAttempt, WorkDefer, WorkEvent, WorkItem, WorkProject,
 };
 use fleet_proto::v1::{
     ClearEnvironmentDefaultReply, ClearEnvironmentDefaultRequest, GetEnvironmentDefaultReply,
@@ -89,6 +92,7 @@ use crate::cred::limiter::Limiter;
 use crate::cred::password::BootstrapPassword;
 use crate::cred::{CredentialService, RepoService, Users};
 use crate::environments::EnvironmentService;
+use crate::hosts::HostService;
 use crate::jobs::validate_job_id;
 use crate::profiles::{self, ProfileContent, ProfileFault, Viewer};
 use crate::store::{Store, StoreError, WorkFault};
@@ -283,6 +287,7 @@ pub struct FleetService {
     store: Store,
     credentials: Option<CredentialService>,
     environments: Option<EnvironmentService>,
+    hosts: Option<HostService>,
     capabilities: Capabilities,
     update: UpdateRelay,
     timing_reply_cap: usize,
@@ -297,6 +302,7 @@ impl FleetService {
             store,
             credentials: None,
             environments: None,
+            hosts: None,
             update: UpdateRelay::default(),
             timing_reply_cap: MAX_JOB_TIMING_REPLY_BYTES,
             work_redactor: Redactor::default().with_installation_tokens(),
@@ -329,6 +335,13 @@ impl FleetService {
     #[must_use]
     pub fn with_credentials(mut self, credentials: Option<CredentialService>) -> Self {
         self.credentials = credentials;
+        self
+    }
+
+    /// Enables the host RPCs.
+    #[must_use]
+    pub fn with_hosts(mut self, hosts: Option<HostService>) -> Self {
+        self.hosts = hosts;
         self
     }
 
@@ -692,6 +705,75 @@ impl FleetCredentials for FleetService {
         Ok(Response::new(
             service.verify(user_id, request.get_ref()).await?,
         ))
+    }
+}
+
+#[tonic::async_trait]
+impl FleetHosts for FleetService {
+    async fn add_host(
+        &self,
+        request: Request<AddHostRequest>,
+    ) -> Result<Response<HostInfo>, Status> {
+        let user_id = caller_of(&request)
+            .ok_or_else(|| Status::permission_denied(fleet_proto::ERR_NEEDS_USER_TOKEN))?;
+        let hosts = self.hosts_service()?;
+        Ok(Response::new(hosts.add(user_id, request.get_ref()).await?))
+    }
+
+    async fn list_hosts(
+        &self,
+        request: Request<ListHostsRequest>,
+    ) -> Result<Response<ListHostsReply>, Status> {
+        let caller = request
+            .extensions()
+            .get::<Caller>()
+            .copied()
+            .ok_or_else(|| Status::permission_denied(fleet_proto::ERR_NEEDS_USER_TOKEN))?;
+        let hosts = self.hosts_service()?;
+        Ok(Response::new(hosts.list(caller.is_admin).await?))
+    }
+
+    async fn remove_host(
+        &self,
+        request: Request<RemoveHostRequest>,
+    ) -> Result<Response<RemoveHostReply>, Status> {
+        let admin_id = admin_of(&request)?;
+        let hosts = self.hosts_service()?;
+        Ok(Response::new(
+            hosts.remove(admin_id, request.get_ref()).await?,
+        ))
+    }
+
+    async fn approve_host_private(
+        &self,
+        request: Request<ApproveHostPrivateRequest>,
+    ) -> Result<Response<HostInfo>, Status> {
+        admin_of(&request)?;
+        Err(Status::unimplemented("approve host private"))
+    }
+
+    async fn revoke_host_private(
+        &self,
+        request: Request<RevokeHostPrivateRequest>,
+    ) -> Result<Response<HostInfo>, Status> {
+        admin_of(&request)?;
+        Err(Status::unimplemented("revoke host private"))
+    }
+
+    async fn list_host_requests(
+        &self,
+        request: Request<ListHostRequestsRequest>,
+    ) -> Result<Response<ListHostRequestsReply>, Status> {
+        admin_of(&request)?;
+        Err(Status::unimplemented("list host requests"))
+    }
+}
+
+impl FleetService {
+    fn hosts_service(&self) -> Result<&HostService, Status> {
+        self.hosts
+            .as_ref()
+            .ok_or_else(|| Status::failed_precondition(fleet_proto::PRECONDITION_NOT_CONFIGURED))
     }
 }
 
@@ -1935,8 +2017,16 @@ fn routes(
     environments: Option<EnvironmentService>,
     update: UpdateRelay,
 ) -> Routes {
+    let hosts = match HostService::system(store.pool().clone()) {
+        Ok(hosts) => Some(hosts),
+        Err(error) => {
+            tracing::error!(%error, "host RPCs disabled");
+            None
+        }
+    };
     let service = FleetService::new(store.clone())
         .with_work_redactor(auth.redactor())
+        .with_hosts(hosts)
         .with_credentials(credentials)
         .with_environments(environments)
         .with_update(update);
@@ -1958,6 +2048,7 @@ fn routes(
     let edit = FleetEditServer::new(service.clone());
     let environments =
         FleetEnvironmentsServer::new(service.clone()).max_decoding_message_size(MAX_MESSAGE_BYTES);
+    let hosts = FleetHostsServer::new(service.clone());
     let catalog = FleetCatalogServer::new(service.clone());
     let catalog_admin = FleetCatalogAdminServer::new(service.clone())
         .max_decoding_message_size(MAX_PROFILE_MESSAGE_BYTES);
@@ -1977,6 +2068,7 @@ fn routes(
         .add_service(retro)
         .add_service(edit)
         .add_service(environments)
+        .add_service(hosts)
         .add_service(catalog)
         .add_service(catalog_admin)
         .add_service(capability_admin)

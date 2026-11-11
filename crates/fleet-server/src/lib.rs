@@ -6,6 +6,7 @@ pub mod catalog;
 pub mod config;
 pub mod cred;
 pub mod environments;
+pub mod hosts;
 pub mod jobs;
 pub mod profiles;
 pub mod projection;
