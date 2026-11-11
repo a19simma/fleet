@@ -8,6 +8,7 @@
 //! and suggested-edit pages in `review` (ADR 0065, ADR 0066). The environment pages live in `env`
 //! and the job submit form in `submit` (ADR 0067).
 
+mod box_tokens;
 mod capabilities;
 mod catalog;
 mod clientip;

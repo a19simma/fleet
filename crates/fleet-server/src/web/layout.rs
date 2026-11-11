@@ -18,6 +18,7 @@ pub(super) enum Nav {
     Jobs,
     Profiles,
     Tokens,
+    BoxTokens,
     Credentials,
     Environments,
     Hosts,
@@ -28,10 +29,11 @@ pub(super) enum Nav {
     Account,
 }
 
-const NAV_ITEMS: [(Nav, &str, &str); 11] = [
+const NAV_ITEMS: [(Nav, &str, &str); 12] = [
     (Nav::Jobs, "/jobs", "Jobs"),
     (Nav::Profiles, "/profiles", "Profiles"),
     (Nav::Tokens, "/tokens", "Tokens"),
+    (Nav::BoxTokens, "/box-tokens", "Box tokens"),
     (Nav::Credentials, "/credentials", "Credentials"),
     (Nav::Environments, "/environments", "Environments"),
     (Nav::Hosts, "/hosts", "Git remotes"),

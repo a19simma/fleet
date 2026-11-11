@@ -40,7 +40,7 @@ pub(super) struct Tokens {
     pub pool: PgPool,
 }
 
-fn tokens(cx: &Cx) -> Result<&Tokens> {
+pub(super) fn tokens(cx: &Cx) -> Result<&Tokens> {
     app_context::<TokenSlot>(cx)
         .0
         .as_deref()
@@ -56,7 +56,7 @@ fn notice_text(code: &str) -> Option<&'static str> {
     })
 }
 
-fn notice_code(cx: &Cx) -> Option<&str> {
+pub(super) fn notice_code(cx: &Cx) -> Option<&str> {
     uri(cx)
         .query()?
         .split('&')
