@@ -898,20 +898,31 @@ async fn run_credential(
 ) -> Result<(), CliError> {
     credential::no_stray(action.rest())?;
     match action {
-        credential::CredentialAction::List { .. } => {
+        credential::CredentialAction::List { host, .. } => {
+            let only = host.as_deref().map(credential::parse_host).transpose()?;
             let mut session = session(env, timeouts).await?;
-            credential::list(&mut session.credentials, &session.scrub, out).await
+            credential::list(&mut session.credentials, &session.scrub, only.as_ref(), out).await
         }
-        credential::CredentialAction::Put { kind, .. } => {
+        credential::CredentialAction::Put { kind, host, .. } => {
             let kind = credential::parse_kind(&kind)?;
+            let host = credential::put_host(kind, host.as_deref())?;
             let value = credential::read_secret(stdin)?;
             let mut session = session(env, timeouts).await?;
-            credential::put(&mut session.credentials, &session.scrub, kind, value, out).await
+            credential::put(
+                &mut session.credentials,
+                &session.scrub,
+                kind,
+                &host,
+                value,
+                out,
+            )
+            .await
         }
-        credential::CredentialAction::Delete { id, .. } => {
+        credential::CredentialAction::Delete { id, host, .. } => {
             let id = credential::parse_id(&id)?;
+            let host = host.as_deref().map(credential::parse_host).transpose()?;
             let mut session = session(env, timeouts).await?;
-            credential::delete(&mut session.credentials, id, out).await
+            credential::delete(&mut session.credentials, id, host.as_ref(), out).await
         }
         credential::CredentialAction::Verify { id, .. } => {
             let id = credential::parse_id(&id)?;

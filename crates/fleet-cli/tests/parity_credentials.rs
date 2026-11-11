@@ -71,6 +71,7 @@ const KIMI_MEMBER: &str = "sk-kimi-abcdefghijklmnopqrstuv";
 const KIMI_PLATFORM: &str = "sk-abcdefghijklmnopqrstuvwxyz0";
 const CODEX: &str = "sk-proj-abcdefghijklmnopqrstuv";
 const CODEX_ALT: &str = "sk-proj-zyxwvutsrqponmlkjihgfe";
+const FORGEJO_HOST: &str = "git.example.com";
 const FORGEJO: &str = "0123456789abcdef0123456789abcdef01234567";
 const CLASSIC: &str = "ghp_abcdefghijklmnopqrstuvwxyz0123456789";
 const SHORT: &str = "short";
@@ -103,6 +104,8 @@ const CAPABILITY_TEXT: &str =
 const D_NEWLINE: &str = "stdin carries a line ending the shell added, so the CLI strips exactly one trailing newline; the web form posts the value as typed and refuses any whitespace";
 const D_NON_UTF8: &str =
     "the CLI reads raw bytes from stdin and refuses invalid UTF-8; a web form always posts text";
+const D_HOST_FLAG: &str = "the CLI sends --host with a forgejo_pat and the server stores it for that host; the web form has no host field until FGJ-25, so it sends none and the server refuses a forgejo_pat without one";
+const D_HOST_USAGE: &str = "the CLI refuses a forgejo_pat without --host, and any host but github.com for a github kind, before a request; the web form sends no host, so the server refuses the first and stores the second for github.com";
 const D_ARGV: &str = "the CLI refuses a secret given as an argument, with a fixed usage error; the web form has no argument";
 const D_NOT_CONFIGURED: &str = "a server without a credential store answers the CLI with the fixed not-configured notice and the web page with a 404";
 const D_STATIC_TOKEN: &str = "the shared client token acts as the bootstrap user, so the CLI lists that user's credentials; the web page is only reachable with a user session";
@@ -214,7 +217,28 @@ const ROWS: &[Row] = &[
     same("put/kimi_membership_key", "put"),
     same("put/kimi_platform_key", "put"),
     same("put/codex_api_key", "put"),
-    same("put/forgejo_pat", "put"),
+    differs(
+        "put/forgejo_pat",
+        "put",
+        D_HOST_FLAG,
+        "notice:saved",
+        "notice:invalid",
+    ),
+    differs(
+        "put/forgejo_pat-no-host",
+        "put",
+        D_HOST_USAGE,
+        "usage",
+        "notice:invalid",
+    ),
+    differs(
+        "put/github_pat-other-host",
+        "put",
+        D_HOST_USAGE,
+        "usage",
+        "notice:saved",
+    ),
+    same("put/github_pat-explicit-host", "put"),
     same("put/replace-existing", "put"),
     same("put/github_pat-classic", "put"),
     same("put/github_pat-github-refuses", "put"),
@@ -640,6 +664,7 @@ enum Act {
     ListOther,
     ListStatic,
     Put(&'static str, &'static [u8]),
+    PutHost(&'static str, &'static str, &'static [u8]),
     PutArgv(&'static str, &'static str),
     Delete(Target),
     Verify(Target),
@@ -655,6 +680,7 @@ struct Case {
     done: &'static [&'static str],
     saved: Option<(&'static str, &'static str)>,
     web_absent: bool,
+    forgejo_host: bool,
 }
 
 const fn case(act: Act) -> Case {
@@ -667,6 +693,7 @@ const fn case(act: Act) -> Case {
         done: &[],
         saved: None,
         web_absent: false,
+        forgejo_host: false,
     }
 }
 
@@ -679,6 +706,7 @@ fn value_of(kind: &str) -> &'static str {
         "kimi_membership_key" => KIMI_MEMBER,
         "kimi_platform_key" => KIMI_PLATFORM,
         "codex_api_key" => CODEX,
+        "forgejo_pat" => FORGEJO,
         _ => CODEX_ALT,
     }
 }
@@ -717,7 +745,9 @@ fn cli_outcome(act: Act, result: &Result<(), CliError>, out: &str) -> Outcome {
             Act::ListOwn | Act::ListOther | Act::ListStatic => {
                 Outcome::Listed(kinds_in_cli_list(out))
             }
-            Act::Put(..) | Act::PutArgv(..) => Outcome::Notice("saved".to_owned()),
+            Act::Put(..) | Act::PutHost(..) | Act::PutArgv(..) => {
+                Outcome::Notice("saved".to_owned())
+            }
             Act::Delete(_) => Outcome::Notice("deleted".to_owned()),
             Act::Verify(_) => Outcome::Notice("verified".to_owned()),
         },
@@ -770,6 +800,15 @@ async fn run_case(rig: &Rig, surface: Surface, case: Case) -> Outcome {
             .grant(rig.admin, owner.id, CAPABILITY)
             .await
             .unwrap();
+    }
+    if case.forgejo_host {
+        sqlx::query(
+            "INSERT INTO git_hosts (host, kind) VALUES ($1, 'forgejo') ON CONFLICT DO NOTHING",
+        )
+        .bind(FORGEJO_HOST)
+        .execute(&rig.pool)
+        .await
+        .unwrap();
     }
     for kind in case.seed {
         rig.seed(owner.id, kind, value_of(kind)).await;
@@ -834,6 +873,16 @@ async fn cli_step(rig: &Rig, owner: &Persona, other: &Persona, case: Case) -> Ou
                 .await;
             (r, o, owner.token.as_str())
         }
+        Act::PutHost(kind, host, value) => {
+            let (r, o) = rig
+                .cli(
+                    &owner.token,
+                    &["credential", "put", kind, "--host", host],
+                    value,
+                )
+                .await;
+            (r, o, owner.token.as_str())
+        }
         Act::PutArgv(kind, secret) => {
             let (r, o) = rig
                 .cli(&owner.token, &["credential", "put", kind, secret], b"")
@@ -888,7 +937,7 @@ async fn web_step(rig: &Rig, owner: &Persona, other: &Persona, case: Case) -> Ou
     let reply = match case.act {
         Act::ListOwn => rig.http("GET", "/credentials", owner, "").await,
         Act::ListOther => rig.http("GET", "/credentials", other, "").await,
-        Act::Put(kind, value) => {
+        Act::Put(kind, value) | Act::PutHost(kind, _, value) => {
             rig.post(
                 owner,
                 "/credentials/put",
@@ -985,6 +1034,7 @@ const fn one(kind: &str) -> &'static [&'static str] {
         b"kimi_membership_key" => &["kimi_membership_key"],
         b"kimi_platform_key" => &["kimi_platform_key"],
         b"codex_api_key" => &["codex_api_key"],
+        b"forgejo_pat" => &["forgejo_pat"],
         _ => &[],
     }
 }
@@ -1057,7 +1107,10 @@ rows! {
     put_kimi_member: "put/kimi_membership_key", DEFAULT, put_ok("kimi_membership_key", KIMI_MEMBER, Cap::Never);
     put_kimi_platform: "put/kimi_platform_key", DEFAULT, put_ok("kimi_platform_key", KIMI_PLATFORM, Cap::Never);
     put_codex: "put/codex_api_key", DEFAULT, put_ok("codex_api_key", CODEX, Cap::Never);
-    put_forgejo: "put/forgejo_pat", DEFAULT, put_refused("forgejo_pat", FORGEJO.as_bytes());
+    put_forgejo: "put/forgejo_pat", DEFAULT, Case { forgejo_host: true, done: &["forgejo_pat"], saved: Some(("forgejo_pat", FORGEJO)), ..case(Act::PutHost("forgejo_pat", FORGEJO_HOST, FORGEJO.as_bytes())) };
+    put_forgejo_no_host: "put/forgejo_pat-no-host", DEFAULT, Case { forgejo_host: true, ..put_refused("forgejo_pat", FORGEJO.as_bytes()) };
+    put_pat_other_host: "put/github_pat-other-host", DEFAULT, Case { done: &["github_pat"], ..case(Act::PutHost("github_pat", FORGEJO_HOST, PAT.as_bytes())) };
+    put_pat_explicit_host: "put/github_pat-explicit-host", DEFAULT, Case { done: &["github_pat"], saved: Some(("github_pat", PAT)), ..case(Act::PutHost("github_pat", "GitHub.com", PAT.as_bytes())) };
     put_replace: "put/replace-existing", DEFAULT, Case { seed: &["anthropic_api_key"], done: &["anthropic_api_key"], saved: Some(("anthropic_api_key", ANT_NEW)), ..case(Act::Put("anthropic_api_key", ANT_NEW.as_bytes())) };
     put_classic: "put/github_pat-classic", DEFAULT, put_refused("github_pat", CLASSIC.as_bytes());
     put_gh_rejects: "put/github_pat-github-refuses", DEFAULT, Case { github: Gh::Rejects, ..put_refused("github_pat", PAT.as_bytes()) };
@@ -1545,4 +1598,149 @@ fn a_credential_notice_exits_with_code_one_and_usage_with_two() {
         assert_eq!(CliError::Credential(*notice).exit_code(), 1);
     }
     assert_eq!(CliError::Usage("x".to_owned()).exit_code(), 2);
+}
+
+#[sqlx::test]
+async fn list_and_delete_take_a_host_and_put_stores_for_it(pool: PgPool) {
+    let rig = Box::pin(Rig::start(pool, DEFAULT)).await;
+    let owner = rig.persona("hosta", 'a').await;
+    sqlx::query("INSERT INTO git_hosts (host, kind) VALUES ($1, 'forgejo')")
+        .bind(FORGEJO_HOST)
+        .execute(&rig.pool)
+        .await
+        .unwrap();
+    let token = owner.token.as_str();
+    let put_pat = rig
+        .cli(token, &["credential", "put", "github_pat"], PAT.as_bytes())
+        .await;
+    assert!(put_pat.0.is_ok());
+    assert!(
+        put_pat.1.trim_end().ends_with("\tgithub.com"),
+        "{}",
+        put_pat.1
+    );
+    let put_fj = rig
+        .cli(
+            token,
+            &[
+                "credential",
+                "put",
+                "forgejo_pat",
+                "--host",
+                "Git.Example.COM.",
+            ],
+            FORGEJO.as_bytes(),
+        )
+        .await;
+    assert!(put_fj.0.is_ok(), "{:?}", put_fj.0);
+    assert!(
+        put_fj.1.trim_end().ends_with("\tgit.example.com"),
+        "{}",
+        put_fj.1
+    );
+    assert!(!put_fj.1.contains(FORGEJO));
+
+    let all = rig.cli(token, &["credential", "list"], b"").await;
+    let hosts: Vec<&str> = all.1.lines().filter_map(|l| l.split('\t').nth(5)).collect();
+    assert_eq!(hosts.len(), 2, "{}", all.1);
+    assert!(hosts.contains(&"github.com") && hosts.contains(&"git.example.com"));
+
+    let only = rig
+        .cli(
+            token,
+            &["credential", "list", "--host", "GIT.example.com"],
+            b"",
+        )
+        .await;
+    assert_eq!(only.1.lines().count(), 1, "{}", only.1);
+    assert!(only.1.contains("forgejo_pat") && !only.1.contains("github_pat"));
+    let none = rig
+        .cli(
+            token,
+            &["credential", "list", "--host", "other.example.com"],
+            b"",
+        )
+        .await;
+    assert!(none.0.is_ok() && none.1.is_empty());
+
+    let fj_id = rig.id_of(owner.id, "forgejo_pat").await;
+    let wrong = rig
+        .cli(
+            token,
+            &[
+                "credential",
+                "delete",
+                &fj_id,
+                "--host",
+                "other.example.com",
+            ],
+            b"",
+        )
+        .await;
+    assert!(wrong.0.is_err());
+    assert_eq!(rig.kinds(owner.id).await, ["forgejo_pat", "github_pat"]);
+    let missing_host = rig.cli(token, &["credential", "delete", &fj_id], b"").await;
+    assert!(missing_host.0.is_err());
+    assert_eq!(rig.kinds(owner.id).await, ["forgejo_pat", "github_pat"]);
+    let right = rig
+        .cli(
+            token,
+            &["credential", "delete", &fj_id, "--host", "git.example.com"],
+            b"",
+        )
+        .await;
+    assert!(right.0.is_ok(), "{:?}", right.0);
+    assert_eq!(rig.kinds(owner.id).await, ["github_pat"]);
+    let pat_id = rig.id_of(owner.id, "github_pat").await;
+    let default_host = rig
+        .cli(token, &["credential", "delete", &pat_id], b"")
+        .await;
+    assert!(default_host.0.is_ok(), "{:?}", default_host.0);
+    assert_eq!(rig.kinds(owner.id).await, Vec::<String>::new());
+}
+
+#[sqlx::test]
+async fn a_bad_host_is_refused_before_any_request_and_never_echoed(pool: PgPool) {
+    let rig = Box::pin(Rig::start(pool, DEFAULT)).await;
+    let owner = rig.persona("hostb", 'a').await;
+    let token = owner.token.as_str();
+    let cases: [&[&str]; 6] = [
+        &["credential", "put", "forgejo_pat"],
+        &[
+            "credential",
+            "put",
+            "forgejo_pat",
+            "--host",
+            "zqxuser@git.example.com",
+        ],
+        &[
+            "credential",
+            "put",
+            "github_pat",
+            "--host",
+            "git.example.com",
+        ],
+        &[
+            "credential",
+            "put",
+            "forgejo_pat",
+            "--host",
+            "https://git.example.com",
+        ],
+        &["credential", "list", "--host", "git.example.com:443"],
+        &["credential", "delete", "1", "--host", "git.example.com/x"],
+    ];
+    for args in cases {
+        let (result, out) = rig.cli(token, args, FORGEJO.as_bytes()).await;
+        let Err(CliError::Usage(text)) = result else {
+            panic!("{args:?}: not a usage error");
+        };
+        assert_eq!(out, "");
+        assert!(
+            !text.contains("zqxuser") && !text.contains("https"),
+            "{text}"
+        );
+        assert!(!text.contains(FORGEJO));
+    }
+    assert_eq!(rig.kinds(owner.id).await, Vec::<String>::new());
 }
